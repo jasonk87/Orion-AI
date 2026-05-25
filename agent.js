@@ -8,23 +8,31 @@ CRITICAL RULES:
 1. PLANNING MODE DECISION: You must decide if the user's request warrants an implementation plan before taking action:
    - WHEN TO PLAN: If the request is complex, involves creating a new codebase/project, major architectural changes, or significant decision-making. You MUST first create an "implementation_plan.md" file detailing your design, use "set_task_checklist" to load subtasks, and ask the user for approval. Do NOT modify source files or run commands until approved. After writing the plan, clearly tell the user you are paused for approval and that they can reply "approve" or "go ahead" to continue.
    - WHEN NOT TO PLAN (BYPASS): If the request is a simple fix (e.g., tweaking styling, fixing a syntax error, adding a comment, or minor follow-up). In this case, you can bypass plan creation and execute immediately. To do so, you MUST first call the "set_task_checklist" tool with a single task starting with "[SIMPLE]" (e.g. "[SIMPLE] Fix typo in index.html") to automatically unlock file editing and command execution.
-2. TESTING AND REGRESSION DISCIPLINE: When you create or change code, you are responsible for producing run-ready code. Before meaningful edits, inspect existing tests and the detected regression command when relevant. After edits, run the appropriate tests or smoke checks using "run_tests", "run_command", or the long-running command tools. If tests fail, read the output, fix the issue, and rerun tests until they pass or you can clearly explain a blocker. For long tests or servers, use "start_command", wait for completion or use "get_command_status"/"read_command_output", and stop hung processes with "kill_command". Do not claim code works unless you ran a relevant check or state exactly why you could not.
+2. TESTING AND REGRESSION DISCIPLINE: When you create or change code, you are responsible for producing run-ready code. Before meaningful edits, inspect existing tests and the detected regression command when relevant. After edits, run the appropriate tests or smoke checks using "run_tests", "run_command", or the long-running command tools. If tests fail, read the output, fix the issue, and rerun tests until they pass or you can clearly explain a blocker. For long tests, training, games, and servers, use "start_command" with a sensible timeout, check status/output, and stop processes with "kill_command" when finished. Do not start multiple copies of the same long-running program unless the previous one is stopped. Do not use an interactive command as a test unless you pipe/provide input or intentionally kill it after a short smoke check. Do not claim code works unless you ran a relevant check or state exactly why you could not.
 3. WEB RESEARCH: If you are unsure about an API, library, framework, command, model parameter, error message, current behavior, or documentation detail, use "google_search" and then "fetch_web_page" on the most relevant official docs or primary source before editing. Do not invent configuration files or API shapes when files are missing or the correct implementation is unclear. Do not say you reviewed, checked, verified, or confirmed documentation unless you actually used these web tools in the current task and can name the source URL. If docs appear to say something surprising, quote or paraphrase the exact relevant rule before changing files.
 4. CONTEXT INTEGRITY: Keep files clean, respect formatting, and preserve comments that are unrelated to your edits.
 5. NOTES AND MEMORY: Use project/standalone notes as durable working memory. Read them when orienting, and update them when you learn durable facts: architecture, important files, commands, decisions, user preferences, gotchas, open tasks, test status, and future repair notes. Project notes are shared across every conversation in the same project; standalone notes belong only to that standalone conversation. Keep notes concise and useful, not a transcript.
 6. DESIGN QUALITY: When creating apps, games, dashboards, or visual tools, make them visually polished and pleasant by default. Treat beauty, layout, typography, color, spacing, motion, and interaction feedback as part of "working." Avoid bare black boxes, default controls, tiny unstyled text, and placeholder-looking screens unless the user explicitly asks for minimal output. For games, include a cohesive visual theme, clear HUD, start/game-over states, readable controls, animation polish, and a satisfying feel.
-7. FOLLOW-UP TIMERS: If you say you will wait, check back, continue after N seconds/minutes, or inspect long-running training/tests later, you MUST call "schedule_followup". Do not merely say you will wait.
+7. FOLLOW-UP TIMERS: If you say you will wait, check back, continue after N seconds/minutes, or inspect long-running training/tests later, you MUST call "schedule_followup". Do not merely say you will wait. Schedule only one active follow-up for the same purpose; when the follow-up runs, actually inspect status/output and either continue work, stop the process, or clearly finish.
 8. BE CONCISE: Explain your technical decisions briefly. The user can see your tools running and thoughts.
 9. AUTONOMOUS WORKFLOW: Once the user approves your plan, execute all required file creations, edits, and test runs consecutively in a single session without yielding or waiting for further conversational input. Do not stop to explain intermediate steps, and do not ask "should I proceed?". Keep calling tools until the entire task is fully complete.
 10. TASK COMPLETION: You must use the "set_task_checklist" tool to update the status of each subtask as you work on them. Once all tasks are complete, update the checklist to show all tasks are 'completed', and then present your final summary.
-11. RESPONSE FORMAT: Use clean GitHub-flavored Markdown. Prefer short sections with level-2 headings like "Summary", "Findings", "Plan", "Changes", "Tests", and "Next Steps". Use bullets for scan-friendly details, numbered lists only for ordered steps, and fenced code blocks for code. Do not write giant unbroken paragraphs. For code reviews or "look through the code" requests, lead with a brief summary, then specific findings with file/function references, then prioritized recommendations. When creating an implementation plan, put the detailed plan in implementation_plan.md and summarize it in chat in 3-6 bullets instead of pasting the whole plan.
+11. RESPONSE FORMAT: Use clean GitHub-flavored Markdown. Prefer short sections with level-2 headings like "Summary", "Findings", "Plan", "Changes", "Tests", and "Next Steps". Use bullets for scan-friendly details, numbered lists only for ordered steps, and fenced code blocks for code. Do not write giant unbroken paragraphs. For code reviews or "look through the code" requests, lead with a brief summary, then specific findings with file/function references, then prioritized recommendations. When creating an implementation plan, put the detailed plan in implementation_plan.md and also show a readable approval summary in chat. At the end of any task that used tools, include a "Work Walkthrough" explaining what you actually did: files touched, commands/tests run, results, and remaining follow-up.
 12. SECRETS AND ENVIRONMENT: When a project needs the user's Gemini API key, Google API key, or Google Search Engine ID, use "sync_workspace_env" to create or update workspace environment files. Do not hardcode secrets into source files, do not print secret values, and do not ask the user to paste keys you can sync from settings. Make code read secrets from environment variables such as GEMINI_API_KEY, GOOGLE_API_KEY, GOOGLE_SEARCH_API_KEY, GOOGLE_SEARCH_ENGINE_ID, and GOOGLE_CSE_ID. For browser-only/static apps, do not expose private API keys in client-side code; add a small local/server API layer instead.
+13. GEMINI APP DEFAULTS: For new Gemini Python projects, prefer the current "google-genai" package and "from google import genai" unless local files already use a different SDK. The model "gemini-2.5-flash-lite" is valid; do not downgrade it to older model names unless official docs or an API error proves it is unavailable.
+14. USER-REQUESTED LOCAL/GIT OPERATIONS: When the user asks for the active directory, to open the folder, to launch/run the program, or to push to GitHub/Git, use the dedicated tools for those actions. Do not push to Git or launch apps unless the user asked for it. If the user asks to push without specifying a branch, push the current branch to the default remote.
 
 Tools available:
 - list_files: List all files in the workspace (excluding node_modules).
-- read_file: Read a file's content.
+- get_workspace_info: Return the active workspace directory and conversation scope.
+- open_workspace_folder: Open the active workspace folder in the OS file explorer.
+- launch_workspace_app: Launch the active workspace app using Orion's app detection.
+- set_workspace_entrypoint: Set or clear the launch entry point command for this workspace.
+- git_push: Push the current Git branch, or the current branch to a requested remote branch, when the user asks.
+- read_file: Read a file's content. Use startLine/endLine or maxChars for large files.
 - write_file: Write a new file or overwrite a file.
 - modify_file: Edit a specific section of a file (search and replace).
+- patch_file: Targeted file update using line ranges, anchors, exact replacement, or regex. Prefer this over rewriting large files.
 - run_command: Run a command line in Powershell.
 - run_tests: Execute the workspace regression tests.
 - start_command: Start a shell command asynchronously with a timeout and return immediately.
@@ -50,12 +58,27 @@ const GEMINI_THINKING_BUDGET = 24576;
 window.steeringQueue = [];
 window.promptQueue = [];
 window.followupTimers = window.followupTimers || {};
+window.followupTimerMeta = window.followupTimerMeta || {};
 window.isAgentRunning = () => isAgentRunning;
 window.getRunningConversationId = () => runningConversationId;
 window.getAgentSubStatus = () => agentSubStatus;
 window.stopAgentExecution = () => {
   isStopRequested = true;
-  window.appendSystemMessage("🛑 Stop requested... task will abort on next turn.");
+  const targetConversationId = runningConversationId;
+  if (targetConversationId) {
+    if (window.api.killCommandsForConversation) {
+      window.api.killCommandsForConversation(targetConversationId).then((result) => {
+        if (result && result.killed) {
+          window.appendSystemMessage(`Stop requested. Killed ${result.killed} running command(s) for this conversation.`);
+        }
+      }).catch(() => {});
+    }
+    cancelFollowupsForConversation(targetConversationId);
+    if (window.promptQueue) {
+      window.promptQueue = window.promptQueue.filter(item => item.conversationId !== targetConversationId);
+    }
+  }
+  window.appendSystemMessage("Stop requested... task will abort on next turn.");
 };
 
 // EXPOSE AGENT LOOP TO RENDERER
@@ -145,8 +168,16 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
     );
   }
 
+  messages.push({
+    role: 'user',
+    parts: [{
+      text: buildToolUseContractPrompt()
+    }]
+  });
+
   let lastTextResponse = "Thinking...";
   let aiMessageIndex = conversation.messages.length;
+  let workWalkthrough = [];
   // Initialize AI message state in conversation list
   conversation.messages.push({ role: 'assistant', text: 'Thinking...', logs: [], turns: [] });
   
@@ -170,17 +201,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
       console.error("Token count/compacting error:", e);
     }
     
-    // Set up planning approval status
-    // If user says "approve" or similar keywords, set planApproved to true
-    const lowerPrompt = userPrompt.toLowerCase();
-    const approveKeywords = ['approve', 'yes', 'go ahead', 'looks good', 'run', 'do it', 'sounds good', 'ok', 'okay', 'lets go'];
-    const hasApproval = approveKeywords.some(keyword => {
-      const escapedKeyword = keyword.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
-      const regex = new RegExp(`\\b${escapedKeyword}\\b`, 'i');
-      return regex.test(lowerPrompt);
-    });
+    // Set up planning approval status from conversation state, not phrase lists.
+    const hasApproval = conversation.awaitingPlanApproval && isApprovalResponse(userPrompt);
     if (hasApproval) {
       conversation.planApproved = true;
+      conversation.awaitingPlanApproval = false;
       window.appendSystemMessage("Planning mode: Approved. Full execution enabled.");
     }
     
@@ -238,6 +263,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
       } catch (e) {
         console.error(e);
         lastTextResponse = `Error contacting Model API: ${e.message}`;
+        const retryDelayMs = parseRetryDelayMs(e.message);
+        if (retryDelayMs) {
+          lastTextResponse += `\n\nThis is a temporary quota/rate-limit window. It should reset after about ${Math.ceil(retryDelayMs / 1000)} seconds.`;
+        }
         currentAgentLogs.push({ type: 'thought', content: `API Error: ${e.message}` });
         conversation.messages[aiMessageIndex].text = lastTextResponse;
         break;
@@ -309,14 +338,32 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
       }
       
       // Update live chat bubbles
-      conversation.messages[aiMessageIndex].text = lastTextResponse;
+      conversation.messages[aiMessageIndex].text = withWorkWalkthrough(lastTextResponse, workWalkthrough, false);
       conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
-      window.renderAiMessage(lastTextResponse, currentAgentLogs);
+      window.renderAiMessage(conversation.messages[aiMessageIndex].text, currentAgentLogs);
       
       // If no tool calls, the agent is done, unless there are pending tasks in the checklist
       if (functionCalls.length === 0) {
         consecutiveNoToolCalls++;
         const pendingTasks = conversation.tasks ? conversation.tasks.filter(t => t.status !== 'completed' && t.status !== 'x') : [];
+        if (config.planningMode && !conversation.planApproved && !hasAnyChecklist(conversation) && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
+          messages.push({
+            role: 'user',
+            parts: [{
+              text: '[SYSTEM: Planning Mode is active and no checklist or implementation plan has been created for this request. Either create the implementation plan and checklist with tools now, or give a complete non-workspace answer that does not promise later action.]'
+            }]
+          });
+          continue;
+        }
+        if (shouldHaveUsedToolsButDidNot(textVal, workWalkthrough) && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
+          messages.push({
+            role: 'user',
+            parts: [{
+              text: '[SYSTEM: Your response appeared to promise or report workspace work, but no tools were called. If the task requires looking at files, running commands/tests, editing code, creating files, or verifying behavior, call the appropriate tools now. If no tools are needed, answer explicitly that no workspace action was needed and why.]'
+            }]
+          });
+          continue;
+        }
         if (pendingTasks.length > 0 && conversation.planApproved && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
           console.log(`No tool calls, but there are ${pendingTasks.length} pending tasks. Continuing loop automatically.`);
           
@@ -347,7 +394,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
           params: args,
           status: 'running'
         });
-        window.renderAiMessage(lastTextResponse, currentAgentLogs);
+        const walkthroughItem = summarizeToolStart(toolName, args);
+        if (walkthroughItem) {
+          workWalkthrough.push(walkthroughItem);
+          conversation.messages[aiMessageIndex].text = withWorkWalkthrough(lastTextResponse, workWalkthrough, false);
+        }
+        window.renderAiMessage(conversation.messages[aiMessageIndex].text || lastTextResponse, currentAgentLogs);
         
         // Safety gate for planning mode
         if (config.planningMode && !conversation.planApproved) {
@@ -360,7 +412,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
         }
         
         if (config.planningMode && !conversation.planApproved) {
-          const destructiveTools = ['write_file', 'modify_file', 'run_command', 'start_command', 'run_tests', 'sync_workspace_env'];
+          const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'run_command', 'start_command', 'run_tests', 'sync_workspace_env', 'launch_workspace_app', 'git_push'];
           if (destructiveTools.includes(toolName)) {
             // Allow writing the implementation plan file itself before approval
             const isPlanWrite = toolName === 'write_file' && args.path && args.path.toLowerCase().includes('implementation_plan');
@@ -389,11 +441,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
           result = await executeTool(toolName, args, workspacePath, config, conversation);
           currentAgentLogs[logIndex].status = 'success';
           currentAgentLogs[logIndex].result = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
+          updateWalkthroughItem(walkthroughItem, toolName, args, result, null);
         } catch (err) {
           console.error(err);
           currentAgentLogs[logIndex].status = 'error';
           currentAgentLogs[logIndex].result = err.message;
           result = { error: err.message };
+          updateWalkthroughItem(walkthroughItem, toolName, args, result, err);
         }
         
         toolResponseParts.push({
@@ -404,7 +458,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
         });
         
         // Re-render UI with logs
-        window.renderAiMessage(lastTextResponse, currentAgentLogs);
+        conversation.messages[aiMessageIndex].text = withWorkWalkthrough(lastTextResponse, workWalkthrough, false);
+        window.renderAiMessage(conversation.messages[aiMessageIndex].text, currentAgentLogs);
       }
       
       // Append tool response parts to message history
@@ -413,15 +468,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
       // Save api response details to current turn
       currentTurn.toolResponseParts = toolResponseParts;
       
-      conversation.messages[aiMessageIndex].text = lastTextResponse;
+      conversation.messages[aiMessageIndex].text = withWorkWalkthrough(lastTextResponse, workWalkthrough, false);
       conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
       window.saveConversationsToStorage();
       
       if (forceYield) {
         console.log("Plan written. Forcing yield to wait for user approval.");
-        if (lastTextResponse === "Thinking...") {
-          lastTextResponse = "I created `implementation_plan.md` and paused because Planning Mode is on. Reply `approve` or `go ahead` to let me build it, or turn off Planning Mode in settings for small tasks you want me to execute immediately.";
-        }
+        conversation.awaitingPlanApproval = true;
+        const planItem = workWalkthrough.find(item => item.kind === 'plan');
+        lastTextResponse = buildPlanApprovalMessage(planItem, lastTextResponse);
         break;
       }
     }
@@ -439,6 +494,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
     if (lastTextResponse === "Thinking...") {
       lastTextResponse = "Task finished.";
     }
+    lastTextResponse = withWorkWalkthrough(lastTextResponse, workWalkthrough, true);
     
     // Ensure the final text and logs are written and rendered
     conversation.messages[aiMessageIndex].text = lastTextResponse;
@@ -471,6 +527,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
           if (!nextTask.alreadyRendered && window.renderUserMessageInChat) {
             window.renderUserMessageInChat(nextTask.prompt);
           }
+          if (!nextTask.alreadyRendered && activeConv.messages) {
+            activeConv.messages.push({ role: 'user', text: nextTask.prompt });
+            if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+          }
           await window.runAgentLoop(nextTask.prompt, nextTask.modelSelectValue, activeConv);
         }
       }
@@ -483,6 +543,54 @@ async function executeTool(name, args, workspace, config, conversation) {
   console.log(`Executing tool ${name} with args:`, args);
   
   switch (name) {
+    case 'get_workspace_info': {
+      const entryResult = await window.api.getWorkspaceEntrypoint(workspace);
+      return {
+        success: true,
+        workspace,
+        conversationId: conversation.id,
+        title: conversation.title,
+        projectPath: conversation.projectPath || '',
+        scope: conversation.projectPath ? 'project' : 'standalone',
+        entrypoint: entryResult && entryResult.success ? entryResult.entrypoint : null
+      };
+    }
+
+    case 'open_workspace_folder': {
+      const result = await window.api.openWorkspaceFolder(workspace);
+      if (!result.success) throw new Error(result.error || 'Failed to open workspace folder');
+      return result;
+    }
+
+    case 'launch_workspace_app': {
+      const result = await window.api.launchWorkspaceApp(workspace);
+      if (!result.success) throw new Error(result.error || 'Failed to launch workspace app');
+      return result;
+    }
+
+    case 'set_workspace_entrypoint': {
+      const command = args.command ? String(args.command).trim() : '';
+      const result = await window.api.setWorkspaceEntrypoint(workspace, command ? { command, label: args.label || '' } : null);
+      if (!result.success) throw new Error(result.error || 'Failed to set workspace entry point');
+      if (window.refreshWorkspaceEntrypoint) window.refreshWorkspaceEntrypoint();
+      return {
+        success: true,
+        message: command ? `Workspace entry point set to: ${command}` : 'Workspace entry point cleared.',
+        entrypoint: result.entrypoint
+      };
+    }
+
+    case 'git_push': {
+      const result = await window.api.gitPush(
+        workspace,
+        args.remote || 'origin',
+        args.branch || '',
+        args.setUpstream !== false
+      );
+      if (!result.success) throw new Error(result.error || 'Git push failed');
+      return result;
+    }
+
     case 'list_files': {
       const files = await window.api.listFiles(workspace);
       return files.map(f => ({ path: f.path, isDir: f.isDir, size: f.size }));
@@ -490,7 +598,11 @@ async function executeTool(name, args, workspace, config, conversation) {
     
     case 'read_file': {
       if (!args.path) throw new Error("Missing 'path' parameter");
-      const content = await window.api.readFile(workspace, args.path);
+      const content = await window.api.readFile(workspace, args.path, {
+        startLine: args.startLine,
+        endLine: args.endLine,
+        maxChars: args.maxChars
+      });
       if (content.error) throw new Error(content.error);
       return { content: content };
     }
@@ -520,7 +632,11 @@ async function executeTool(name, args, workspace, config, conversation) {
         }
       }
       
-      return { success: true, message: `File written to ${args.path} successfully.${testFeedback}` };
+      return {
+        success: true,
+        message: `File written to ${args.path} successfully.${testFeedback}`,
+        backupPath: writeRes.backupPath || null
+      };
     }
     
     case 'modify_file': {
@@ -561,7 +677,37 @@ async function executeTool(name, args, workspace, config, conversation) {
         }
       }
       
-      return { success: true, message: `File modified successfully.${testFeedback}` };
+      return {
+        success: true,
+        message: `File modified successfully.${testFeedback}`,
+        backupPath: writeRes.backupPath || null
+      };
+    }
+
+    case 'patch_file': {
+      if (!args.path) throw new Error("Missing 'path' parameter");
+      if (!args.operation || !args.operation.type) throw new Error("Missing 'operation' parameter");
+
+      let beforePass = true;
+      if (config.autoTest) {
+        const testRes = await window.runRegressionTests();
+        beforePass = testRes.success;
+      }
+
+      const patchRes = await window.api.patchFile(workspace, args.path, args.operation);
+      if (patchRes.error) throw new Error(patchRes.error);
+
+      if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
+
+      let testFeedback = "";
+      if (config.autoTest) {
+        const testRes = await window.runRegressionTests();
+        if (beforePass && !testRes.success) {
+          testFeedback = "\n[WARNING] REGRESSION DETECTED: Regression tests failed after this patch. Please inspect your change.";
+        }
+      }
+
+      return { ...patchRes, message: `${patchRes.message || 'File patched successfully.'}${testFeedback}` };
     }
     
     case 'run_command': {
@@ -589,7 +735,10 @@ async function executeTool(name, args, workspace, config, conversation) {
 
     case 'start_command': {
       if (!args.command) throw new Error("Missing 'command' parameter");
-      const processId = args.processId || (`cmd_${conversation.id}_${Date.now()}`);
+      const requestedId = args.processId ? String(args.processId).replace(/[^a-zA-Z0-9_.-]/g, '_') : '';
+      const processId = requestedId && requestedId.includes(conversation.id)
+        ? requestedId
+        : `cmd_${conversation.id}_${requestedId || Date.now()}`;
       const timeoutMs = args.timeoutMs || config.commandTimeoutMs || 120000;
       const result = await window.api.startCommand(args.command, workspace, processId, timeoutMs);
       if (!result.success) throw new Error(result.error || 'Failed to start command');
@@ -889,15 +1038,40 @@ function persistCompactedConversation(conversation, summary) {
 function scheduleAgentFollowup(args = {}) {
   const delaySeconds = Math.min(Math.max(Number(args.delaySeconds || 60), 1), 3600);
   const prompt = args.prompt || 'Continue the previous task. Check any long-running command or training progress, inspect output, fix issues if needed, and keep working until the task is complete.';
-  const timerId = 'followup_' + Date.now();
   const targetConversationId = (typeof activeConversationId !== 'undefined') ? activeConversationId : null;
   const modelSelectValue = window.getSelectedModel ? window.getSelectedModel() : undefined;
+  const purpose = normalizeFollowupPurpose(args.purpose || prompt);
+  const existingTimerId = Object.keys(window.followupTimerMeta || {}).find((id) => {
+    const meta = window.followupTimerMeta[id];
+    return meta && meta.conversationId === targetConversationId && meta.purpose === purpose;
+  });
+
+  if (existingTimerId && window.followupTimers[existingTimerId]) {
+    clearTimeout(window.followupTimers[existingTimerId]);
+    delete window.followupTimers[existingTimerId];
+    delete window.followupTimerMeta[existingTimerId];
+  }
+
+  const timerId = 'followup_' + targetConversationId + '_' + Date.now();
+  window.followupTimerMeta[timerId] = {
+    conversationId: targetConversationId,
+    purpose,
+    prompt,
+    scheduledAt: Date.now(),
+    delaySeconds
+  };
   
   window.followupTimers[timerId] = setTimeout(async () => {
     delete window.followupTimers[timerId];
+    delete window.followupTimerMeta[timerId];
     
     if (window.isAgentRunning && window.isAgentRunning()) {
-      window.promptQueue.push({ prompt, modelSelectValue, conversationId: targetConversationId });
+      const alreadyQueued = window.promptQueue && window.promptQueue.some(item =>
+        item.conversationId === targetConversationId && item.prompt === prompt
+      );
+      if (!alreadyQueued) {
+        window.promptQueue.push({ prompt, modelSelectValue, conversationId: targetConversationId, source: 'followup' });
+      }
       return;
     }
     
@@ -915,6 +1089,10 @@ function scheduleAgentFollowup(args = {}) {
     if (window.renderUserMessageInChat) {
       window.renderUserMessageInChat(prompt);
     }
+    if (targetConv.messages) {
+      targetConv.messages.push({ role: 'user', text: prompt });
+      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    }
     await window.runAgentLoop(prompt, modelSelectValue || (window.getSelectedModel ? window.getSelectedModel() : 'gemini-2.5-flash-lite'), targetConv);
   }, delaySeconds * 1000);
   
@@ -922,8 +1100,203 @@ function scheduleAgentFollowup(args = {}) {
     success: true,
     timerId,
     delaySeconds,
+    replacedExisting: !!existingTimerId,
     message: `Scheduled follow-up in ${delaySeconds} seconds.`
   };
+}
+
+function cancelFollowupsForConversation(conversationId) {
+  if (!conversationId || !window.followupTimerMeta) return 0;
+  let cancelled = 0;
+  Object.keys(window.followupTimerMeta).forEach((timerId) => {
+    const meta = window.followupTimerMeta[timerId];
+    if (meta && meta.conversationId === conversationId) {
+      if (window.followupTimers[timerId]) {
+        clearTimeout(window.followupTimers[timerId]);
+        delete window.followupTimers[timerId];
+      }
+      delete window.followupTimerMeta[timerId];
+      cancelled++;
+    }
+  });
+  return cancelled;
+}
+
+function normalizeFollowupPurpose(value) {
+  const text = String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!text) return 'general-followup';
+  if (/(training|train\.py|training_log|score|record|agent progress)/.test(text)) return 'training-progress';
+  if (/(test|pytest|unittest|regression|spec|suite)/.test(text)) return 'test-progress';
+  if (/(server|localhost|dev server|npm run dev|web app)/.test(text)) return 'server-progress';
+  if (/(quota|429|rate|retry)/.test(text)) return 'quota-retry';
+  return text.slice(0, 160);
+}
+
+function buildToolUseContractPrompt() {
+  return `[SYSTEM: Before answering, decide whether the user's request requires interacting with the workspace or runtime. If it requires files, commands, tests, external docs, app state, timers, notes, or code changes, use the relevant tools before giving a final answer. If no tool is needed, answer normally and do not claim that work was performed. Never end with a generic completion message unless the Work Walkthrough shows what actually happened.]`;
+}
+
+function summarizeToolStart(toolName, args = {}) {
+  if (toolName === 'read_file') return { toolName, status: 'running', label: `Read \`${args.path || 'file'}\`` };
+  if (toolName === 'list_files') return { toolName, status: 'running', label: 'Listed workspace files' };
+  if (toolName === 'get_workspace_info') return { toolName, status: 'running', label: 'Checked active workspace directory' };
+  if (toolName === 'open_workspace_folder') return { toolName, status: 'running', label: 'Opened workspace folder' };
+  if (toolName === 'launch_workspace_app') return { toolName, status: 'running', label: 'Launched workspace app' };
+  if (toolName === 'set_workspace_entrypoint') return { toolName, status: 'running', label: args.command ? `Set entry point to \`${args.command}\`` : 'Cleared workspace entry point' };
+  if (toolName === 'git_push') return { toolName, kind: 'git', status: 'running', label: `Pushed Git branch${args.branch ? ` to \`${args.branch}\`` : ''}` };
+  if (toolName === 'write_file') {
+    const isPlan = args.path && args.path.toLowerCase().includes('implementation_plan');
+    return {
+      toolName,
+      kind: isPlan ? 'plan' : 'file',
+      status: 'running',
+      path: args.path,
+      content: isPlan ? String(args.content || '') : '',
+      label: isPlan ? 'Created implementation plan' : `Wrote \`${args.path || 'file'}\``
+    };
+  }
+  if (toolName === 'modify_file' || toolName === 'patch_file') {
+    return { toolName, kind: 'file', status: 'running', path: args.path, label: `Updated \`${args.path || 'file'}\`` };
+  }
+  if (toolName === 'run_command' || toolName === 'start_command') {
+    return { toolName, kind: 'command', status: 'running', command: args.command, label: `${toolName === 'start_command' ? 'Started' : 'Ran'} \`${args.command || 'command'}\`` };
+  }
+  if (toolName === 'run_tests') return { toolName, kind: 'test', status: 'running', label: 'Ran regression tests' };
+  if (toolName === 'set_task_checklist') {
+    const count = Array.isArray(args.tasks) ? args.tasks.length : 0;
+    return { toolName, kind: 'checklist', status: 'running', label: `Updated task checklist${count ? ` (${count} items)` : ''}` };
+  }
+  if (toolName === 'schedule_followup') return { toolName, kind: 'followup', status: 'running', label: `Scheduled follow-up in ${args.delaySeconds || 60}s` };
+  if (toolName === 'sync_workspace_env') return { toolName, kind: 'env', status: 'running', label: 'Synced workspace environment secrets' };
+  if (toolName === 'google_search') return { toolName, kind: 'research', status: 'running', label: `Searched Google for "${args.query || ''}"` };
+  if (toolName === 'fetch_web_page') return { toolName, kind: 'research', status: 'running', label: `Fetched docs page ${args.url || ''}` };
+  return { toolName, status: 'running', label: `Used \`${toolName}\`` };
+}
+
+function updateWalkthroughItem(item, toolName, args, result, error) {
+  if (!item) return;
+  item.status = error ? 'error' : 'done';
+  if (error) {
+    item.detail = error.message;
+    return;
+  }
+  if (toolName === 'write_file' || toolName === 'modify_file' || toolName === 'patch_file') {
+    item.detail = result && result.backupPath ? `Backup: \`${result.backupPath}\`` : '';
+  } else if (toolName === 'get_workspace_info') {
+    item.detail = result && result.workspace ? `Directory: \`${result.workspace}\`` : '';
+  } else if (toolName === 'launch_workspace_app') {
+    item.detail = result && result.message ? result.message : '';
+  } else if (toolName === 'set_workspace_entrypoint') {
+    item.detail = result && result.message ? result.message : '';
+  } else if (toolName === 'open_workspace_folder') {
+    item.detail = result && result.path ? `Opened \`${result.path}\`` : '';
+  } else if (toolName === 'git_push') {
+    item.detail = result && result.command ? result.command : '';
+  } else if (toolName === 'run_command') {
+    const timedOut = result && result.timedOut ? ', timed out' : '';
+    const killed = result && result.killed ? ', stopped' : '';
+    item.detail = `Exit: ${result && result.exitCode !== undefined ? result.exitCode : 'unknown'}${timedOut}${killed}`;
+  } else if (toolName === 'start_command') {
+    item.detail = result && result.id ? `Session: \`${result.id}\`, timeout: ${result.timeoutMs || 'default'}ms` : '';
+  } else if (toolName === 'run_tests') {
+    item.detail = result && result.success ? 'Passed' : 'Failed or unavailable';
+  } else if (toolName === 'schedule_followup') {
+    item.detail = result && result.replacedExisting ? 'Replaced an existing related timer' : '';
+  }
+}
+
+function withWorkWalkthrough(text, items, final = false) {
+  const meaningfulItems = (items || []).filter(Boolean);
+  if (meaningfulItems.length === 0) return text;
+  const base = stripWorkWalkthrough(String(text || ''));
+  const heading = final ? '## Work Walkthrough' : '## Work Walkthrough';
+  const lines = meaningfulItems.slice(-12).map(item => {
+    const marker = item.status === 'error' ? 'Failed' : (item.status === 'running' ? 'Working' : 'Done');
+    const detail = item.detail ? ` - ${item.detail}` : '';
+    return `- **${marker}:** ${item.label}${detail}`;
+  });
+  const suffix = final
+    ? ''
+    : '\n\n_I will keep this updated as I work._';
+  return `${base.trim() || 'Working on it.'}\n\n${heading}\n${lines.join('\n')}${suffix}`;
+}
+
+function stripWorkWalkthrough(text) {
+  const marker = '\n\n## Work Walkthrough';
+  const index = text.indexOf(marker);
+  return index === -1 ? text : text.slice(0, index);
+}
+
+function buildPlanApprovalMessage(planItem, fallbackText) {
+  const planContent = planItem && planItem.content ? formatPlanContentForChat(planItem.content) : '';
+  const intro = 'I created [`implementation_plan.md`](orion-file:implementation_plan.md) and paused because Planning Mode is on. Review the plan below, then reply with approval to let me build it.';
+  if (!planContent) return intro;
+  return `${intro}\n\n## Implementation Plan\n\n${planContent}`;
+}
+
+function formatPlanContentForChat(content) {
+  const text = String(content || '').trim();
+  if (!text) return '';
+  const maxChars = 24000;
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}\n\n_The plan continues in [implementation_plan.md](orion-file:implementation_plan.md). I showed the first ${maxChars.toLocaleString()} characters here._`;
+}
+
+function hasAnyChecklist(conversation) {
+  return !!(conversation && Array.isArray(conversation.tasks) && conversation.tasks.length > 0);
+}
+
+function isApprovalResponse(userPrompt) {
+  const text = String(userPrompt || '').trim();
+  if (!text) return false;
+  if (text.includes('?')) return false;
+  return text.length <= 120;
+}
+
+function shouldHaveUsedToolsButDidNot(text, workWalkthrough) {
+  if ((workWalkthrough || []).length > 0) return false;
+  const response = String(text || '').trim();
+  if (!response) return true;
+  return response.length < 80;
+}
+
+function parseRetryDelayMs(errorText) {
+  if (!errorText) return null;
+  try {
+    const parsed = JSON.parse(errorText);
+    const details = parsed.error && Array.isArray(parsed.error.details) ? parsed.error.details : [];
+    const retryInfo = details.find(d => d['@type'] && d['@type'].includes('RetryInfo') && d.retryDelay);
+    if (retryInfo) {
+      const seconds = parseFloat(String(retryInfo.retryDelay).replace(/s$/, ''));
+      if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
+    }
+  } catch (e) {}
+
+  const retryInMatch = errorText.match(/retry in\s+([0-9.]+)s/i);
+  if (retryInMatch) {
+    const seconds = parseFloat(retryInMatch[1]);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
+  }
+
+  const retryDelayMatch = errorText.match(/"retryDelay"\s*:\s*"([0-9.]+)s"/i);
+  if (retryDelayMatch) {
+    const seconds = parseFloat(retryDelayMatch[1]);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
+  }
+
+  return null;
+}
+
+function describeModelApiError(status, errorText) {
+  let message = errorText;
+  let retryDelayMs = parseRetryDelayMs(errorText);
+  try {
+    const parsed = JSON.parse(errorText);
+    if (parsed.error && parsed.error.message) {
+      message = parsed.error.message;
+    }
+  } catch (e) {}
+  return { status, message, retryDelayMs };
 }
 
 // OLLAMA API UTILITIES & TRANSLATION HELPERS
@@ -1024,12 +1397,53 @@ async function callOllamaAPI(messages, modelName, onWarning) {
           parameters: { type: "OBJECT", properties: {} }
         },
         {
+          name: "get_workspace_info",
+          description: "Returns the active workspace directory, conversation scope, and project metadata. Use when the user asks where the project/program is or asks for the directory.",
+          parameters: { type: "OBJECT", properties: {} }
+        },
+        {
+          name: "open_workspace_folder",
+          description: "Opens the active workspace directory in the operating system file explorer.",
+          parameters: { type: "OBJECT", properties: {} }
+        },
+        {
+          name: "launch_workspace_app",
+          description: "Launches/runs the active workspace app using Orion's app detection. Use when the user asks to run, launch, or open the program.",
+          parameters: { type: "OBJECT", properties: {} }
+        },
+        {
+          name: "set_workspace_entrypoint",
+          description: "Sets or clears the saved launch entry point command for the active workspace. Use after identifying the correct way to run a project, or when the user asks to set the entry point.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              command: { type: "STRING", description: "Command to run from the workspace root, such as python app.py or npm run dev. Leave blank to clear." },
+              label: { type: "STRING", description: "Optional human-readable label." }
+            }
+          }
+        },
+        {
+          name: "git_push",
+          description: "Pushes the current Git branch to GitHub/Git when the user explicitly asks. If branch is omitted, pushes the current branch to the same branch name on the remote.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              remote: { type: "STRING", description: "Git remote name. Defaults to origin." },
+              branch: { type: "STRING", description: "Remote branch name to push to. Defaults to current branch." },
+              setUpstream: { type: "BOOLEAN", description: "Whether to set upstream with -u. Defaults to true." }
+            }
+          }
+        },
+        {
           name: "read_file",
           description: "Reads the entire content of a file located at path relative to the workspace root.",
           parameters: {
             type: "OBJECT",
             properties: {
-              path: { type: "STRING", description: "Relative path of the file to read" }
+              path: { type: "STRING", description: "Relative path of the file to read" },
+              startLine: { type: "NUMBER", description: "Optional 1-based start line for targeted reads." },
+              endLine: { type: "NUMBER", description: "Optional 1-based end line for targeted reads." },
+              maxChars: { type: "NUMBER", description: "Optional maximum characters to return." }
             },
             required: ["path"]
           }
@@ -1060,6 +1474,34 @@ async function callOllamaAPI(messages, modelName, onWarning) {
           }
         },
         {
+          name: "patch_file",
+          description: "Applies a targeted file patch without rewriting the whole file. Prefer this for large files. Supports operation.type values: replace, replace_regex, insert, replace_range.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              path: { type: "STRING", description: "Relative path of the file to patch" },
+              operation: {
+                type: "OBJECT",
+                properties: {
+                  type: { type: "STRING", description: "replace, replace_regex, insert, or replace_range" },
+                  target: { type: "STRING", description: "Exact text for replace" },
+                  replacement: { type: "STRING", description: "Replacement text for replace or replace_regex" },
+                  pattern: { type: "STRING", description: "JavaScript regex pattern for replace_regex" },
+                  flags: { type: "STRING", description: "Regex flags such as gim" },
+                  anchor: { type: "STRING", description: "Anchor text for insert" },
+                  position: { type: "STRING", description: "before or after for insert" },
+                  content: { type: "STRING", description: "Inserted content or replacement range content" },
+                  startLine: { type: "NUMBER", description: "1-based start line for replace_range" },
+                  endLine: { type: "NUMBER", description: "1-based end line for replace_range" },
+                  count: { type: "NUMBER", description: "Maximum replacements for replace" }
+                },
+                required: ["type"]
+              }
+            },
+            required: ["path", "operation"]
+          }
+        },
+        {
           name: "run_command",
           description: "Runs a command in powershell in the workspace directory, waits for completion, and returns code, stdout, stderr, and timeout status.",
           parameters: {
@@ -1073,7 +1515,7 @@ async function callOllamaAPI(messages, modelName, onWarning) {
         },
         {
           name: "start_command",
-          description: "Starts a shell command asynchronously with a timeout and returns immediately with a processId. Use for long-running tests, dev servers, or commands that may take a while.",
+          description: "Starts a shell command asynchronously with a timeout and returns immediately with a processId. Use for long-running tests, dev servers, or commands that may take a while. Use the returned id for later status/output/kill calls.",
           parameters: {
             type: "OBJECT",
             properties: {
@@ -1125,7 +1567,8 @@ async function callOllamaAPI(messages, modelName, onWarning) {
             type: "OBJECT",
             properties: {
               delaySeconds: { type: "NUMBER", description: "Delay before continuing, in seconds. Maximum 3600." },
-              prompt: { type: "STRING", description: "Instruction Orion should run when the timer fires." }
+              prompt: { type: "STRING", description: "Instruction Orion should run when the timer fires." },
+              purpose: { type: "STRING", description: "Optional stable dedupe key, e.g. training-progress or test-check." }
             },
             required: ["delaySeconds", "prompt"]
           }
@@ -1347,12 +1790,53 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning) {
             parameters: { type: "OBJECT", properties: {} }
           },
           {
+            name: "get_workspace_info",
+            description: "Returns the active workspace directory, conversation scope, and project metadata. Use when the user asks where the project/program is or asks for the directory.",
+            parameters: { type: "OBJECT", properties: {} }
+          },
+          {
+            name: "open_workspace_folder",
+            description: "Opens the active workspace directory in the operating system file explorer.",
+            parameters: { type: "OBJECT", properties: {} }
+          },
+          {
+            name: "launch_workspace_app",
+            description: "Launches/runs the active workspace app using Orion's app detection. Use when the user asks to run, launch, or open the program.",
+            parameters: { type: "OBJECT", properties: {} }
+          },
+          {
+            name: "set_workspace_entrypoint",
+            description: "Sets or clears the saved launch entry point command for the active workspace. Use after identifying the correct way to run a project, or when the user asks to set the entry point.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                command: { type: "STRING", description: "Command to run from the workspace root, such as python app.py or npm run dev. Leave blank to clear." },
+                label: { type: "STRING", description: "Optional human-readable label." }
+              }
+            }
+          },
+          {
+            name: "git_push",
+            description: "Pushes the current Git branch to GitHub/Git when the user explicitly asks. If branch is omitted, pushes the current branch to the same branch name on the remote.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                remote: { type: "STRING", description: "Git remote name. Defaults to origin." },
+                branch: { type: "STRING", description: "Remote branch name to push to. Defaults to current branch." },
+                setUpstream: { type: "BOOLEAN", description: "Whether to set upstream with -u. Defaults to true." }
+              }
+            }
+          },
+          {
             name: "read_file",
             description: "Reads the entire content of a file located at path relative to the workspace root.",
             parameters: {
               type: "OBJECT",
               properties: {
-                path: { type: "STRING", description: "Relative path of the file to read" }
+                path: { type: "STRING", description: "Relative path of the file to read" },
+                startLine: { type: "NUMBER", description: "Optional 1-based start line for targeted reads." },
+                endLine: { type: "NUMBER", description: "Optional 1-based end line for targeted reads." },
+                maxChars: { type: "NUMBER", description: "Optional maximum characters to return." }
               },
               required: ["path"]
             }
@@ -1383,6 +1867,34 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning) {
             }
           },
           {
+            name: "patch_file",
+            description: "Applies a targeted file patch without rewriting the whole file. Prefer this for large files. Supports operation.type values: replace, replace_regex, insert, replace_range.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                path: { type: "STRING", description: "Relative path of the file to patch" },
+                operation: {
+                  type: "OBJECT",
+                  properties: {
+                    type: { type: "STRING", description: "replace, replace_regex, insert, or replace_range" },
+                    target: { type: "STRING", description: "Exact text for replace" },
+                    replacement: { type: "STRING", description: "Replacement text for replace or replace_regex" },
+                    pattern: { type: "STRING", description: "JavaScript regex pattern for replace_regex" },
+                    flags: { type: "STRING", description: "Regex flags such as gim" },
+                    anchor: { type: "STRING", description: "Anchor text for insert" },
+                    position: { type: "STRING", description: "before or after for insert" },
+                    content: { type: "STRING", description: "Inserted content or replacement range content" },
+                    startLine: { type: "NUMBER", description: "1-based start line for replace_range" },
+                    endLine: { type: "NUMBER", description: "1-based end line for replace_range" },
+                    count: { type: "NUMBER", description: "Maximum replacements for replace" }
+                  },
+                  required: ["type"]
+                }
+              },
+              required: ["path", "operation"]
+            }
+          },
+          {
             name: "run_command",
             description: "Runs a command in powershell in the workspace directory, waits for completion, and returns code, stdout, stderr, and timeout status.",
             parameters: {
@@ -1396,7 +1908,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning) {
           },
           {
             name: "start_command",
-            description: "Starts a shell command asynchronously with a timeout and returns immediately with a processId. Use for long-running tests, dev servers, or commands that may take a while.",
+            description: "Starts a shell command asynchronously with a timeout and returns immediately with a processId. Use for long-running tests, dev servers, or commands that may take a while. Use the returned id for later status/output/kill calls.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -1448,7 +1960,8 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning) {
               type: "OBJECT",
               properties: {
                 delaySeconds: { type: "NUMBER", description: "Delay before continuing, in seconds. Maximum 3600." },
-                prompt: { type: "STRING", description: "Instruction Orion should run when the timer fires." }
+                prompt: { type: "STRING", description: "Instruction Orion should run when the timer fires." },
+                purpose: { type: "STRING", description: "Optional stable dedupe key, e.g. training-progress or test-check." }
               },
               required: ["delaySeconds", "prompt"]
             }
@@ -1556,18 +2069,22 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning) {
       
       const errorText = await response.text();
       const status = response.status;
+      const apiError = describeModelApiError(status, errorText);
+      const retryDelayMs = apiError.retryDelayMs || delay;
       
       const isTransient = [429, 500, 502, 503, 504].includes(status);
       if (!isTransient || i === attempts) {
-        throw new Error(`HTTP ${status}: ${errorText}`);
+        const retryText = apiError.retryDelayMs ? ` Retry after about ${Math.ceil(apiError.retryDelayMs / 1000)} seconds.` : '';
+        throw new Error(`HTTP ${status}: ${apiError.message}${retryText}`);
       }
       
       if (onWarning) {
-        onWarning(`Gemini API returned HTTP ${status} (${status === 503 ? 'High Demand' : 'Transient Error'}). Retrying in ${(delay / 1000).toFixed(1)}s (Attempt ${i}/${attempts})...`);
+        const kind = status === 429 ? 'Quota/rate limit' : (status === 503 ? 'High Demand' : 'Transient Error');
+        onWarning(`Gemini API returned HTTP ${status} (${kind}). Retrying in ${(retryDelayMs / 1000).toFixed(1)}s (Attempt ${i}/${attempts})...`);
       }
       
-      await new Promise(resolve => setTimeout(resolve, delay));
-      delay = delay * 2 + Math.random() * 500; // Exponential backoff + jitter
+      await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+      delay = Math.max(delay * 2 + Math.random() * 500, retryDelayMs); // Exponential backoff + API retry hint
       
     } catch (e) {
       if (i === attempts) throw e;

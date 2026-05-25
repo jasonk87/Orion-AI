@@ -12,5 +12,8 @@
     "default": 128000
   },
   "commandTimeoutMs": 120000,
+  "workspaceEntrypoints": {},
+  "phoneCompanionPort": 5000,
+  "phoneCompanionToken": "",
   "regressionTestCommand": "npm test"
 }

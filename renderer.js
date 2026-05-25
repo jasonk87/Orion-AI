@@ -78,15 +78,26 @@ const el = {
   testResults: document.getElementById('test-results-container'),
   btnRunTestsManually: document.getElementById('btn-run-tests-manually'),
   fileTree: document.getElementById('file-tree-container'),
-  fileCountBadge: document.getElementById('file-count-badge')
+  fileCountBadge: document.getElementById('file-count-badge'),
+  workspaceEntrypointInput: document.getElementById('workspace-entrypoint-input'),
+  btnSaveEntrypoint: document.getElementById('btn-save-entrypoint'),
+  fileViewerModal: document.getElementById('file-viewer-modal'),
+  fileViewerTitle: document.getElementById('file-viewer-title'),
+  fileViewerContent: document.getElementById('file-viewer-content'),
+  btnFileViewerClose: document.getElementById('btn-file-viewer-close'),
+  btnFileViewerMention: document.getElementById('btn-file-viewer-mention')
 };
+
+let viewedFilePath = '';
 
 // INITIALIZE APP
 document.addEventListener('DOMContentLoaded', async () => {
   setupWindowControls();
   await loadSettings();
   setupSettingsModal();
+  setupFileViewerModal();
   setupWorkspaceHandlers();
+  setupEntrypointControls();
   setupChatHandlers();
   
   // Bind manual task checklist add button
@@ -379,6 +390,7 @@ function saveProjectsToStorage() {
 async function syncWorkspaceFiles() {
   if (!currentWorkspace) return;
   el.fileTree.innerHTML = '<p class="empty-state">Scanning directory...</p>';
+  loadWorkspaceEntrypoint();
   
   const files = await window.api.listFiles(currentWorkspace);
   el.fileCountBadge.textContent = files.length;
@@ -422,6 +434,45 @@ async function syncWorkspaceFiles() {
   });
   
   autoDetectTestCommand(files);
+}
+
+function setupEntrypointControls() {
+  if (!el.btnSaveEntrypoint || !el.workspaceEntrypointInput) return;
+  el.btnSaveEntrypoint.addEventListener('click', saveWorkspaceEntrypointFromInput);
+  el.workspaceEntrypointInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      saveWorkspaceEntrypointFromInput();
+    }
+  });
+}
+
+async function loadWorkspaceEntrypoint() {
+  if (!el.workspaceEntrypointInput) return;
+  if (!currentWorkspace) {
+    el.workspaceEntrypointInput.value = '';
+    return;
+  }
+  const result = await window.api.getWorkspaceEntrypoint(currentWorkspace);
+  if (result && result.success && result.entrypoint) {
+    el.workspaceEntrypointInput.value = result.entrypoint.command || '';
+  } else {
+    el.workspaceEntrypointInput.value = '';
+  }
+}
+
+async function saveWorkspaceEntrypointFromInput() {
+  if (!currentWorkspace) {
+    alert('Please choose a workspace first.');
+    return;
+  }
+  const command = (el.workspaceEntrypointInput.value || '').trim();
+  const result = await window.api.setWorkspaceEntrypoint(currentWorkspace, command ? { command } : null);
+  if (result.success) {
+    appendSystemMessage(command ? `Workspace entry point set to: ${command}` : 'Workspace entry point cleared.');
+  } else {
+    alert(`Failed to save entry point: ${result.error}`);
+  }
 }
 
 function renderFileTree(files) {
@@ -480,6 +531,7 @@ function renderFileTreeChildren(childrenMap, container, depth) {
       <span class="file-caret">${caret}</span>
       <span class="file-icon">${icon}</span>
       <span class="file-name" title="${escapeHtml(node.path)}">${escapeHtml(node.name)}</span>
+      ${node.isDir ? '' : '<button class="file-mention-btn" title="Mention this file in chat">@</button>'}
     `;
     
     if (node.isDir) {
@@ -493,7 +545,14 @@ function renderFileTreeChildren(childrenMap, container, depth) {
         renderFileTree(currentFileTreeItems);
       });
     } else {
-      row.addEventListener('click', () => insertFileReference(node.path));
+      row.addEventListener('click', () => openFileViewer(node.path));
+      const mentionButton = row.querySelector('.file-mention-btn');
+      if (mentionButton) {
+        mentionButton.addEventListener('click', (event) => {
+          event.stopPropagation();
+          insertFileReference(node.path);
+        });
+      }
     }
     
     container.appendChild(row);
@@ -549,7 +608,10 @@ async function autoDetectTestCommand(files) {
         if (el.lblTestCmd) el.lblTestCmd.textContent = detectedCmd;
         if (el.settingTestCmd) el.settingTestCmd.value = detectedCmd;
         await window.api.writeConfig(appConfig);
-        appendSystemMessage(`Detected workspace test suite. Regression test command updated to: "${detectedCmd}"`);
+        appendSystemMessage(`Detected workspace test suite. Regression test command updated to: "${detectedCmd}"`, {
+          dedupeKey: `detected-test-command:${currentWorkspace}:${detectedCmd}`,
+          windowMs: 60000
+        });
       }
     }
   } catch (e) {
@@ -561,6 +623,38 @@ function insertFileReference(relPath) {
   const currentText = el.chatInput.value;
   el.chatInput.value = currentText + ` @${relPath} `;
   el.chatInput.focus();
+}
+
+function setupFileViewerModal() {
+  if (!el.fileViewerModal) return;
+  el.btnFileViewerClose.addEventListener('click', closeFileViewer);
+  el.fileViewerModal.addEventListener('click', (event) => {
+    if (event.target === el.fileViewerModal) closeFileViewer();
+  });
+  el.btnFileViewerMention.addEventListener('click', () => {
+    if (viewedFilePath) insertFileReference(viewedFilePath);
+    closeFileViewer();
+  });
+}
+
+async function openFileViewer(relPath) {
+  if (!currentWorkspace || !relPath) return;
+  viewedFilePath = relPath;
+  el.fileViewerTitle.textContent = relPath;
+  el.fileViewerContent.textContent = 'Loading...';
+  el.fileViewerModal.classList.add('active');
+  
+  const content = await window.api.readFile(currentWorkspace, relPath, { maxChars: 200000 });
+  if (content && content.error) {
+    el.fileViewerContent.textContent = `Error loading file: ${content.error}`;
+    return;
+  }
+  el.fileViewerContent.textContent = content || '';
+}
+
+function closeFileViewer() {
+  viewedFilePath = '';
+  if (el.fileViewerModal) el.fileViewerModal.classList.remove('active');
 }
 
 // --- CHAT INTERFACE & RENDERERS ---
@@ -947,9 +1041,27 @@ function renderUserMessage(text) {
   el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
 }
 
-function appendSystemMessage(text) {
-  renderSystemBubble(text);
+function appendSystemMessage(text, options = {}) {
+  const dedupeKey = options.dedupeKey || text;
+  const windowMs = Number(options.windowMs || 1500);
+  window.recentSystemMessages = window.recentSystemMessages || {};
+  const now = Date.now();
+  const lastAt = window.recentSystemMessages[dedupeKey] || 0;
+  if (now - lastAt < windowMs) {
+    return;
+  }
   const conv = conversations.find(c => c.id === activeConversationId);
+  if (conv && options.dedupeKey) {
+    conv.systemMessageDedupe = conv.systemMessageDedupe || {};
+    const convLastAt = conv.systemMessageDedupe[dedupeKey] || 0;
+    if (now - convLastAt < windowMs) {
+      return;
+    }
+    conv.systemMessageDedupe[dedupeKey] = now;
+  }
+  window.recentSystemMessages[dedupeKey] = now;
+  
+  renderSystemBubble(text);
   if (conv) {
     conv.messages.push({ role: 'system', text: text });
     saveConversationsToStorage();
@@ -1066,6 +1178,14 @@ function renderAiMessage(text, logs = []) {
   if (isNew) {
     el.messagesContainer.appendChild(bubble);
   }
+  bubble.querySelectorAll('a[href^="orion-file:"]').forEach(link => {
+    link.addEventListener('click', (event) => {
+      event.preventDefault();
+      const href = link.getAttribute('href') || '';
+      const relPath = decodeURIComponent(href.replace('orion-file:', ''));
+      openFileViewer(relPath);
+    });
+  });
   Prism.highlightAllUnder(bubble);
   
   // Inject copy & edit buttons into pre blocks
@@ -1249,6 +1369,7 @@ window.runRegressionTests = runRegressionTests;
 window.renderAiMessage = renderAiMessage;
 window.appendSystemMessage = appendSystemMessage;
 window.syncWorkspaceFiles = syncWorkspaceFiles;
+window.refreshWorkspaceEntrypoint = loadWorkspaceEntrypoint;
 
 window.clearActiveAiBubble = () => {
   activeAiBubble = null;
@@ -1272,6 +1393,35 @@ window.onAgentStatusChange = (running) => {
   }
 };
 window.renderUserMessageInChat = renderUserMessage;
+window.getPhoneCompanionState = () => {
+  const conv = conversations.find(c => c.id === activeConversationId);
+  const messages = conv && conv.messages ? conv.messages.slice(-40).map(msg => ({
+    role: msg.role,
+    text: msg.role === 'assistant' && msg.text === 'Thinking...' && msg.logs && msg.logs.length
+      ? msg.logs.map(log => log.content || log.result || '').filter(Boolean).join('\n')
+      : (msg.text || '')
+  })) : [];
+  
+  return {
+    conversationId: activeConversationId,
+    title: conv ? conv.title : '',
+    workspace: conv ? (conv.workspace || conv.projectPath || currentWorkspace || '') : currentWorkspace,
+    running: window.isAgentRunning ? window.isAgentRunning() : false,
+    model: window.getSelectedModel(),
+    messages
+  };
+};
+
+window.submitPhoneCompanionPrompt = async (prompt) => {
+  const text = String(prompt || '').trim();
+  if (!text) return { success: false, error: 'Missing prompt' };
+  if (!activeConversationId || !conversations.find(c => c.id === activeConversationId)) {
+    createNewConversation();
+  }
+  el.chatInput.value = text;
+  await submitMessage();
+  return { success: true, queued: window.isAgentRunning && window.isAgentRunning() };
+};
 
 function deleteConversation(id) {
   const convToDelete = conversations.find(c => c.id === id);

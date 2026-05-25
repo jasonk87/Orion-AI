@@ -1114,6 +1114,37 @@ code {
   justify-content: flex-end;
 }
 
+.entrypoint-row {
+  display: flex;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.entrypoint-row input {
+  min-width: 0;
+  flex: 1;
+  height: 28px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  padding: 0 8px;
+  font-size: 0.72rem;
+}
+
+.entrypoint-row button {
+  height: 28px;
+  border: 1px solid var(--accent-color);
+  border-radius: 4px;
+  background: var(--accent-glow);
+  color: var(--accent-color);
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 0 8px;
+  cursor: pointer;
+}
+
 /* File Tree Styling */
 .file-tree {
   display: flex;
@@ -1168,11 +1199,58 @@ code {
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+  flex: 1;
 }
 
 .file-node.folder .file-name {
   color: var(--text-primary);
   font-weight: 500;
+}
+
+.file-mention-btn {
+  border: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 0.68rem;
+  line-height: 1.2;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.file-node:hover .file-mention-btn,
+.file-mention-btn:focus {
+  opacity: 1;
+}
+
+.file-mention-btn:hover {
+  color: var(--accent-color);
+  border-color: var(--accent-color);
+}
+
+.file-viewer-card {
+  width: min(980px, 86vw);
+  height: min(760px, 84vh);
+}
+
+.file-viewer-body {
+  padding: 0;
+  overflow: hidden;
+}
+
+.file-viewer-content {
+  height: 100%;
+  margin: 0;
+  padding: 18px;
+  overflow: auto;
+  background: #08080b;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* SETTINGS MODAL */

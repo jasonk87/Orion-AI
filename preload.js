@@ -10,9 +10,14 @@ contextBridge.exposeInMainWorld('api', {
   selectWorkspace: () => ipcRenderer.invoke('select-workspace'),
   showConfirmDialog: (message, title) => ipcRenderer.invoke('show-confirm-dialog', { message, title }),
   launchWorkspaceApp: (workspacePath) => ipcRenderer.invoke('launch-workspace-app', workspacePath),
+  getWorkspaceEntrypoint: (workspacePath) => ipcRenderer.invoke('get-workspace-entrypoint', workspacePath),
+  setWorkspaceEntrypoint: (workspacePath, entrypoint) => ipcRenderer.invoke('set-workspace-entrypoint', { workspacePath, entrypoint }),
+  openWorkspaceFolder: (workspacePath) => ipcRenderer.invoke('open-workspace-folder', workspacePath),
+  gitPush: (workspacePath, remote, branch, setUpstream) => ipcRenderer.invoke('git-push', { workspacePath, remote, branch, setUpstream }),
   listFiles: (dirPath) => ipcRenderer.invoke('list-files', dirPath),
-  readFile: (workspacePath, relativePath) => ipcRenderer.invoke('read-file', { workspacePath, relativePath }),
+  readFile: (workspacePath, relativePath, options) => ipcRenderer.invoke('read-file', { workspacePath, relativePath, options }),
   writeFile: (workspacePath, relativePath, content) => ipcRenderer.invoke('write-file', { workspacePath, relativePath, content }),
+  patchFile: (workspacePath, relativePath, operation) => ipcRenderer.invoke('patch-file', { workspacePath, relativePath, operation }),
   googleSearch: (query, apiKey, searchEngineId, numResults) => ipcRenderer.invoke('google-search', { query, apiKey, searchEngineId, numResults }),
   fetchWebPage: (url) => ipcRenderer.invoke('fetch-web-page', { url }),
   
@@ -26,6 +31,7 @@ contextBridge.exposeInMainWorld('api', {
   getCommandStatus: (processId) => ipcRenderer.invoke('get-command-status', processId),
   readCommandOutput: (processId, maxChars) => ipcRenderer.invoke('read-command-output', { processId, maxChars }),
   killCommand: (processId) => ipcRenderer.invoke('kill-command', processId),
+  killCommandsForConversation: (conversationId) => ipcRenderer.invoke('kill-commands-for-conversation', conversationId),
   onCommandOutput: (processId, callback) => {
     const listener = (event, data) => callback(data);
     ipcRenderer.on(`cmd-output-${processId}`, listener);

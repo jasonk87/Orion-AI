@@ -180,6 +180,10 @@
             <span class="badge" id="task-completion-badge">0%</span>
           </div>
         </div>
+        <div class="entrypoint-row">
+          <input id="workspace-entrypoint-input" type="text" placeholder="Entry point command, e.g. python app.py">
+          <button id="btn-save-entrypoint" title="Save entry point for this workspace">Set</button>
+        </div>
         <div class="panel-content scrollable">
           <div id="task-checklist-container">
             <p class="empty-state">No tasks active. Start a conversation with a plan to see items here.</p>
@@ -204,6 +208,22 @@
       </div>
     </aside>
 
+  </div>
+
+  <!-- FILE VIEWER MODAL -->
+  <div id="file-viewer-modal" class="modal-overlay">
+    <div class="modal-card file-viewer-card">
+      <div class="modal-header">
+        <h2 id="file-viewer-title">File Preview</h2>
+        <button class="modal-close" id="btn-file-viewer-close">&times;</button>
+      </div>
+      <div class="modal-body file-viewer-body">
+        <pre id="file-viewer-content" class="file-viewer-content"></pre>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-file-viewer-mention" class="btn-secondary">Mention in Chat</button>
+      </div>
+    </div>
   </div>
 
   <!-- SETTINGS MODAL -->
