@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Orion AI</title>
+  <!-- Google Fonts for premium typography -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,100..800;1,100..800&family=Outfit:wght@100..900&display=swap" rel="stylesheet">
+  <!-- PrismJS for high-quality code syntax highlighting -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- Custom Title Bar for borderless Electron Window -->
+  <header id="titlebar">
+    <div class="titlebar-left">
+      <span class="app-logo">🌌</span>
+      <span class="app-title">Orion AI</span>
+      <span class="menu-item">File</span>
+      <span class="menu-item">View</span>
+      <span class="menu-item">Window</span>
+    </div>
+    <div class="titlebar-center">
+      <span class="workspace-indicator" id="workspace-label">No Workspace Loaded - Click to Choose</span>
+    </div>
+    <div class="titlebar-right">
+      <button class="win-btn" id="btn-minimize">&#128469;&#xFE0E;</button>
+      <button class="win-btn" id="btn-maximize">&#128470;&#xFE0E;</button>
+      <button class="win-btn btn-close" id="btn-close">&#128473;&#xFE0E;</button>
+    </div>
+  </header>
+
+  <!-- Main Container -->
+  <div id="main-container">
+    
+    <!-- LEFT SIDEBAR -->
+    <aside id="left-sidebar">
+      <div class="sidebar-top">
+        <div class="sidebar-nav-actions">
+          <button id="sidebar-toggle" title="Toggle Sidebar">☰</button>
+          <button id="nav-back" title="Go Back">←</button>
+          <button id="nav-forward" title="Go Forward">→</button>
+        </div>
+        
+        <button id="btn-new-chat" class="btn-primary">
+          <span class="plus-icon">+</span> New Conversation
+        </button>
+
+        <ul class="nav-links">
+          <li class="active" id="nav-history"><span class="icon">🕒</span> Conversation History</li>
+          <li id="nav-tasks"><span class="icon">📅</span> Scheduled Tasks</li>
+        </ul>
+      </div>
+
+      <!-- Projects Section -->
+      <div class="sidebar-section">
+        <div class="section-header">
+          <span>Projects</span>
+          <div class="section-actions">
+            <button id="btn-project-filter" title="Filter Projects">🔍</button>
+            <button id="btn-add-project" title="Add Project Folder">📁</button>
+          </div>
+        </div>
+        <div class="project-list" id="project-list">
+          <div class="project-item active" id="default-proj-item">
+            <span class="folder-icon">📁</span>
+            <div class="project-details">
+              <span class="project-name" id="project-name-label">Default Workspace</span>
+              <span class="project-subtext" id="project-status-label">Select folder to start</span>
+            </div>
+          </div>
+          <!-- Dynamically populated projects list -->
+        </div>
+      </div>
+
+      <!-- Conversations Section -->
+      <div class="sidebar-section">
+        <div class="section-header">
+          <span>Conversations</span>
+          <div class="section-actions">
+            <button id="btn-add-conversation" title="New Standalone Conversation">+</button>
+          </div>
+        </div>
+        <div class="conversation-list" id="conversation-list">
+          <!-- Dynamic conversation list -->
+        </div>
+      </div>
+
+      <!-- Sidebar Footer -->
+      <div class="sidebar-footer">
+        <button id="btn-settings"><span class="icon">⚙</span> Settings</button>
+      </div>
+    </aside>
+
+    <!-- CENTRAL WORKSPACE -->
+    <main id="chat-workspace">
+      <!-- Conversation Top Bar -->
+      <div id="conversation-header">
+        <div class="header-title-container">
+          <span id="chat-title">New Conversation</span>
+          <span class="dropdown-arrow">▼</span>
+        </div>
+        
+        <!-- Workspace File Bar -->
+        <div class="workspace-action-bar">
+          <button id="btn-change-workspace" class="btn-secondary">Change Workspace</button>
+          <button id="btn-sync-files" class="btn-secondary" title="Scan file directory">🔄 Sync Files</button>
+        </div>
+      </div>
+
+      <!-- CHAT CONTENT FEED -->
+      <div id="chat-feed">
+        <!-- Welcoming splash or history messages -->
+        <div class="welcome-splash" id="welcome-splash">
+          <h1>✦ Orion AI</h1>
+          <p>Your Ultimate Pair Programmer. Let's build something exceptional.</p>
+          <div class="quick-tips">
+            <div class="tip-card">
+              <h3>⚡ Full Context</h3>
+              <p>Understands your entire folder structure automatically, compacting context to optimize costs.</p>
+            </div>
+            <div class="tip-card">
+              <h3>🛡️ Regression Tests</h3>
+              <p>Automatically runs your test suite after code edits to ensure nothing breaks.</p>
+            </div>
+            <div class="tip-card">
+              <h3>📝 Planning Mode</h3>
+              <p>Drafts detailed blueprints and task checklists for approval before touching code.</p>
+            </div>
+          </div>
+        </div>
+        
+        <div class="messages-container" id="messages-container" style="display: none;">
+          <!-- Messages will load here -->
+        </div>
+      </div>
+
+      <!-- CHAT INPUT CONTAINER -->
+      <div id="chat-input-wrapper">
+        <div class="chat-input-container">
+          <textarea id="chat-input" placeholder="Ask anything, @ to mention files, / for actions..." rows="1"></textarea>
+          
+          <div class="chat-input-toolbar">
+            <div class="toolbar-left">
+              <button class="tool-btn" id="btn-add-file" title="Add file contextual reference">+</button>
+              <div class="model-select-wrapper">
+                <select id="model-select">
+                  <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+                  <option value="gemini-2.5-flash-lite" selected>Gemini 2.5 Flash Lite</option>
+                  <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
+                </select>
+              </div>
+            </div>
+            <div class="toolbar-right">
+              <button class="btn-steer" id="btn-steer" title="Send steering feedback directly to active task">🎯 Steer</button>
+              <button class="btn-queue" id="btn-queue" title="Queue this prompt to run after the active task finishes">⏳ Queue</button>
+              <button class="tool-btn mic-btn" id="btn-voice" title="Speech to text input">🎙️</button>
+              <button id="btn-submit" class="btn-send" title="Send message">✦</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- RIGHT SIDEBAR: Task Planner and Workspace Files -->
+    <aside id="right-sidebar">
+      <div class="sidebar-header">
+        <h3>⚡ Agent Panel</h3>
+      </div>
+      
+      <!-- Planning & Task Checklist -->
+      <div class="panel-section">
+        <div class="panel-section-title" style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
+          <span>Active Tasks / Checklist</span>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <button id="btn-add-task-manual" style="background: rgba(255, 255, 255, 0.05); border: none; border-radius: 4px; color: var(--text-secondary); cursor: pointer; font-size: 0.7rem; padding: 2px 6px;">+ Add Task</button>
+            <span class="badge" id="task-completion-badge">0%</span>
+          </div>
+        </div>
+        <div class="panel-content scrollable">
+          <div id="task-checklist-container">
+            <p class="empty-state">No tasks active. Start a conversation with a plan to see items here.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Workspace Files Panel -->
+      <div class="panel-section flex-grow">
+        <div class="panel-section-title" style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
+          <span>Workspace Files</span>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <button id="btn-launch-app" title="Launch application for testing" style="background: var(--success-glow); border: 1px solid var(--success-color); border-radius: 4px; color: var(--success-color); cursor: pointer; font-size: 0.7rem; padding: 2px 6px; font-weight: 600; display: flex; align-items: center; gap: 3px; border-style: solid;">▶ Launch</button>
+            <span class="badge" id="file-count-badge">0</span>
+          </div>
+        </div>
+        <div class="panel-content scrollable">
+          <div class="file-tree" id="file-tree-container">
+            <p class="empty-state">Choose a workspace directory to browse files.</p>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+  </div>
+
+  <!-- SETTINGS MODAL -->
+  <div id="settings-modal" class="modal-overlay">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2>Settings</h2>
+        <button class="modal-close" id="btn-settings-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="setting-api-key">Google Gemini API Key:</label>
+          <input type="password" id="setting-api-key" placeholder="AIzaSy...">
+          <small class="form-help">Your API key is saved locally in the config file.</small>
+        </div>
+
+        <div class="form-group">
+          <label for="setting-google-search-engine-id">Google Search Engine ID:</label>
+          <input type="text" id="setting-google-search-engine-id" placeholder="3354e92e98ab54b31">
+          <small class="form-help">Used by the web search tool for API docs and technical references.</small>
+        </div>
+
+        <div class="form-group">
+          <label for="setting-google-search-api-key">Google Search API Key:</label>
+          <input type="password" id="setting-google-search-api-key" placeholder="Leave blank to use Gemini key">
+          <small class="form-help">Requires Google Programmable Search JSON API access.</small>
+        </div>
+
+        <div class="form-group">
+          <label for="setting-workspace-path">Default Workspace Path:</label>
+          <div class="input-with-button">
+            <input type="text" id="setting-workspace-path" placeholder="C:\Users\Owner\Projects...">
+            <button id="btn-browse-default-workspace">Browse</button>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="setting-test-cmd">Regression Test Command:</label>
+          <input type="text" id="setting-test-cmd" placeholder="npm test">
+          <small class="form-help">Shell command run automatically before and after the agent changes files.</small>
+        </div>
+
+        <div class="form-group">
+          <label for="setting-command-timeout">Command Timeout (ms):</label>
+          <input type="number" id="setting-command-timeout" value="120000">
+          <small class="form-help">Stops tests or shell commands that run too long.</small>
+        </div>
+
+        <div class="form-group">
+          <label for="setting-compact-threshold">Context Compaction Threshold (Tokens):</label>
+          <input type="number" id="setting-compact-threshold" value="100000">
+          <small class="form-help">Triggers conversation history summarizing when the conversation exceeds this size.</small>
+        </div>
+
+        <div class="form-group checkbox-group">
+          <label>
+            <input type="checkbox" id="setting-planning-mode" checked>
+            Enforce Planning Mode (Always create plan & task list first)
+          </label>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-settings-save" class="btn-primary">Save Settings</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- SCRIPTS -->
+  <script src="node_modules/marked/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-css.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="renderer.js"></script>
+  <script src="agent.js"></script>
+</body>
+</html>
