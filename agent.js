@@ -5,9 +5,7 @@ const SYSTEM_INSTRUCTION = `You are Orion AI, the ultimate pair programmer agent
 Your goal is to solve the task given by the user with high quality, precision, and trust.
 
 CRITICAL RULES:
-1. PLANNING MODE DECISION: You must decide if the user's request warrants an implementation plan before taking action:
-   - WHEN TO PLAN: If the request is complex, involves creating a new codebase/project, major architectural changes, or significant decision-making. You MUST first create an "implementation_plan.md" file detailing your design, use "set_task_checklist" to load subtasks, and ask the user for approval. Do NOT modify source files or run commands until approved. After writing the plan, clearly tell the user you are paused for approval and that they can reply "approve" or "go ahead" to continue.
-   - WHEN NOT TO PLAN (BYPASS): If the request is a simple fix (e.g., tweaking styling, fixing a syntax error, adding a comment, or minor follow-up). In this case, you can bypass plan creation and execute immediately. To do so, you MUST first call the "set_task_checklist" tool with a single task starting with "[SIMPLE]" (e.g. "[SIMPLE] Fix typo in index.html") to automatically unlock file editing and command execution.
+1. PLANNING MODE DECISION: Match the process to the size of the request. Use an implementation plan only when the task is genuinely complex: new projects, multi-file builds, architecture changes, risky migrations, broad bug hunts, security-sensitive work, or requests where the user should review direction before code changes. For small fixes, running/opening a program, running tests, setting an entry point, showing paths, pushing when explicitly asked, or narrow follow-ups, act directly without creating implementation_plan.md. If a plan is needed, create "implementation_plan.md", set the checklist, show the plan in chat, and pause for explicit user approval or requested revisions before modifying source files or running commands.
 2. TESTING AND REGRESSION DISCIPLINE: When you create or change code, you are responsible for producing run-ready code. Before meaningful edits, inspect existing tests and the detected regression command when relevant. After edits, run the appropriate tests or smoke checks using "run_tests", "run_command", or the long-running command tools. If tests fail, read the output, fix the issue, and rerun tests until they pass or you can clearly explain a blocker. For long tests, training, games, and servers, use "start_command" with a sensible timeout, check status/output, and stop processes with "kill_command" when finished. Do not start multiple copies of the same long-running program unless the previous one is stopped. Do not use an interactive command as a test unless you pipe/provide input or intentionally kill it after a short smoke check. Do not claim code works unless you ran a relevant check or state exactly why you could not.
 3. WEB RESEARCH: If you are unsure about an API, library, framework, command, model parameter, error message, current behavior, or documentation detail, use "google_search" and then "fetch_web_page" on the most relevant official docs or primary source before editing. Do not invent configuration files or API shapes when files are missing or the correct implementation is unclear. Do not say you reviewed, checked, verified, or confirmed documentation unless you actually used these web tools in the current task and can name the source URL. If docs appear to say something surprising, quote or paraphrase the exact relevant rule before changing files.
 4. CONTEXT INTEGRITY: Keep files clean, respect formatting, and preserve comments that are unrelated to your edits.
@@ -15,7 +13,7 @@ CRITICAL RULES:
 6. DESIGN QUALITY: When creating apps, games, dashboards, or visual tools, make them visually polished and pleasant by default. Treat beauty, layout, typography, color, spacing, motion, and interaction feedback as part of "working." Avoid bare black boxes, default controls, tiny unstyled text, and placeholder-looking screens unless the user explicitly asks for minimal output. For games, include a cohesive visual theme, clear HUD, start/game-over states, readable controls, animation polish, and a satisfying feel.
 7. FOLLOW-UP TIMERS: If you say you will wait, check back, continue after N seconds/minutes, or inspect long-running training/tests later, you MUST call "schedule_followup". Do not merely say you will wait. Schedule only one active follow-up for the same purpose; when the follow-up runs, actually inspect status/output and either continue work, stop the process, or clearly finish.
 8. BE CONCISE: Explain your technical decisions briefly. The user can see your tools running and thoughts.
-9. AUTONOMOUS WORKFLOW: Once the user approves your plan, execute all required file creations, edits, and test runs consecutively in a single session without yielding or waiting for further conversational input. Do not stop to explain intermediate steps, and do not ask "should I proceed?". Keep calling tools until the entire task is fully complete.
+9. AUTONOMOUS WORKFLOW: Once the user approves your plan, execute all required file creations, edits, and test runs consecutively in a single session without yielding or waiting for further conversational input. For direct tasks that do not need a plan, execute them immediately and report the result. Keep calling tools until the entire task is fully complete.
 10. TASK COMPLETION: You must use the "set_task_checklist" tool to update the status of each subtask as you work on them. Once all tasks are complete, update the checklist to show all tasks are 'completed', and then present your final summary.
 11. RESPONSE FORMAT: Use clean GitHub-flavored Markdown. Prefer short sections with level-2 headings like "Summary", "Findings", "Plan", "Changes", "Tests", and "Next Steps". Use bullets for scan-friendly details, numbered lists only for ordered steps, and fenced code blocks for code. Do not write giant unbroken paragraphs. For code reviews or "look through the code" requests, lead with a brief summary, then specific findings with file/function references, then prioritized recommendations. When creating an implementation plan, put the detailed plan in implementation_plan.md and also show a readable approval summary in chat. At the end of any task that used tools, include a "Work Walkthrough" explaining what you actually did: files touched, commands/tests run, results, and remaining follow-up.
 12. SECRETS AND ENVIRONMENT: When a project needs the user's Gemini API key, Google API key, or Google Search Engine ID, use "sync_workspace_env" to create or update workspace environment files. Do not hardcode secrets into source files, do not print secret values, and do not ask the user to paste keys you can sync from settings. Make code read secrets from environment variables such as GEMINI_API_KEY, GOOGLE_API_KEY, GOOGLE_SEARCH_API_KEY, GOOGLE_SEARCH_ENGINE_ID, and GOOGLE_CSE_ID. For browser-only/static apps, do not expose private API keys in client-side code; add a small local/server API layer instead.
@@ -51,6 +49,7 @@ Tools available:
 let isAgentRunning = false;
 let runningConversationId = null;
 let agentSubStatus = '';
+let agentExecutionMode = 'idle';
 let currentAgentLogs = [];
 let isStopRequested = false;
 const GEMINI_THINKING_BUDGET = 24576;
@@ -62,6 +61,7 @@ window.followupTimerMeta = window.followupTimerMeta || {};
 window.isAgentRunning = () => isAgentRunning;
 window.getRunningConversationId = () => runningConversationId;
 window.getAgentSubStatus = () => agentSubStatus;
+window.getAgentExecutionMode = () => agentExecutionMode;
 window.stopAgentExecution = () => {
   isStopRequested = true;
   const targetConversationId = runningConversationId;
@@ -90,6 +90,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
   
   isAgentRunning = true;
   runningConversationId = conversation.id;
+  agentExecutionMode = 'planning';
   isStopRequested = false;
   window.currentLoopCount = 0;
   currentAgentLogs = [];
@@ -148,7 +149,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
   
   // If the last message is user prompt, it's already in history. 
   // Let's make sure it's correct
-  if (messages.length === 0 || messages[messages.length - 1].role !== 'user') {
+  const lastMessageText = messages.length > 0 && messages[messages.length - 1].role === 'user'
+    ? ((messages[messages.length - 1].parts || []).map(part => part.text || '').join(''))
+    : '';
+  if (messages.length === 0 || messages[messages.length - 1].role !== 'user' || lastMessageText !== userPrompt) {
     messages.push({ role: 'user', parts: [{ text: userPrompt }] });
   }
 
@@ -168,12 +172,59 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
     );
   }
 
+  let approvalIntent = null;
+  if (conversation.awaitingPlanApproval && !conversation.planApproved) {
+    approvalIntent = await classifyPlanApprovalIntent(userPrompt, modelName, config.geminiApiKey);
+    if (approvalIntent.intent === 'approve') {
+      conversation.planApproved = true;
+      conversation.awaitingPlanApproval = false;
+      window.appendSystemMessage("Plan approved. Continuing implementation.");
+    } else if (approvalIntent.intent === 'deny') {
+      conversation.awaitingPlanApproval = false;
+      window.saveConversationsToStorage();
+    }
+  }
+
+  let planningDecision = { mode: 'plan', reason: 'Planning mode is active.' };
+  let planningBypassedForTask = false;
+  if (config.planningMode !== false && !conversation.planApproved && !conversation.awaitingPlanApproval && !(approvalIntent && approvalIntent.intent === 'approve')) {
+    planningDecision = await classifyPlanningNeed(userPrompt, modelName, config.geminiApiKey);
+    if (planningDecision.mode === 'direct') {
+      planningBypassedForTask = true;
+      agentExecutionMode = 'direct';
+      window.appendSystemMessage(`Planning mode: direct task, no implementation plan required. ${planningDecision.reason || ''}`.trim());
+    } else if (planningDecision.mode === 'answer') {
+      agentExecutionMode = 'answer';
+    }
+  } else if (conversation.planApproved) {
+    planningDecision = { mode: 'direct', reason: 'An implementation plan has already been approved.' };
+    agentExecutionMode = 'executing';
+  }
+
   messages.push({
     role: 'user',
     parts: [{
       text: buildToolUseContractPrompt()
     }]
   });
+
+  if (config.planningMode !== false) {
+    messages.push({
+      role: 'user',
+      parts: [{
+        text: `[SYSTEM: Planning decision for this user request: ${planningDecision.mode}. Reason: ${planningDecision.reason || 'No reason provided.'} ${planningBypassedForTask ? 'This is a direct task, so do not create implementation_plan.md unless new complexity appears during inspection.' : 'If this requires workspace changes and no plan is approved, create a real implementation plan and pause.'}]`
+      }]
+    });
+  }
+
+  if (conversation.awaitingPlanApproval && !conversation.planApproved && approvalIntent && approvalIntent.intent === 'revise') {
+    messages.push({
+      role: 'user',
+      parts: [{
+        text: '[SYSTEM: An implementation plan is awaiting approval. The latest user message was classified as plan feedback/revision, not approval. Do not execute destructive tools. Update or replace the plan if needed, then pause again.]'
+      }]
+    });
+  }
 
   let lastTextResponse = "Thinking...";
   let aiMessageIndex = conversation.messages.length;
@@ -182,6 +233,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
   conversation.messages.push({ role: 'assistant', text: 'Thinking...', logs: [], turns: [] });
   
   try {
+    if (approvalIntent && approvalIntent.intent === 'deny') {
+      lastTextResponse = `Understood. I will not proceed with that implementation plan.\n\nReason interpreted: ${approvalIntent.reason || 'The message was a denial or rejection of the plan.'}`;
+      conversation.messages[aiMessageIndex].text = lastTextResponse;
+      return;
+    }
+    if (approvalIntent && approvalIntent.intent === 'unclear') {
+      lastTextResponse = `I’m not sure whether you want me to approve and execute the current plan, revise it, or cancel it. Please clarify what you want changed or whether I should proceed.`;
+      conversation.messages[aiMessageIndex].text = lastTextResponse;
+      return;
+    }
+
     // Check if we need to compact context
     try {
       const tokenCount = await countTokens(messages, modelName, config.geminiApiKey);
@@ -201,14 +263,6 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
       console.error("Token count/compacting error:", e);
     }
     
-    // Set up planning approval status from conversation state, not phrase lists.
-    const hasApproval = conversation.awaitingPlanApproval && isApprovalResponse(userPrompt);
-    if (hasApproval) {
-      conversation.planApproved = true;
-      conversation.awaitingPlanApproval = false;
-      window.appendSystemMessage("Planning mode: Approved. Full execution enabled.");
-    }
-    
     // Run the agent execution loop (up to 15 steps to prevent runaway bills)
     let loopCount = 0;
     let maxLoops = 20;
@@ -216,6 +270,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
     let consecutiveNoToolCalls = 0;
     let malformedCallsCount = 0;
     const maxMalformedToolRetries = 5;
+    const canExecuteThisTask = () => !config.planningMode || conversation.planApproved || planningBypassedForTask;
     
     // Clear active bubble tracking so we start a new one
     window.clearActiveAiBubble();
@@ -346,7 +401,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
       if (functionCalls.length === 0) {
         consecutiveNoToolCalls++;
         const pendingTasks = conversation.tasks ? conversation.tasks.filter(t => t.status !== 'completed' && t.status !== 'x') : [];
-        if (config.planningMode && !conversation.planApproved && !hasAnyChecklist(conversation) && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
+        if (config.planningMode && !canExecuteThisTask() && !hasAnyChecklist(conversation) && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
           messages.push({
             role: 'user',
             parts: [{
@@ -364,7 +419,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
           });
           continue;
         }
-        if (pendingTasks.length > 0 && conversation.planApproved && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
+        if (pendingTasks.length > 0 && canExecuteThisTask() && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
           console.log(`No tool calls, but there are ${pendingTasks.length} pending tasks. Continuing loop automatically.`);
           
           // Append a system message instructing the model to continue
@@ -402,22 +457,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
         window.renderAiMessage(conversation.messages[aiMessageIndex].text || lastTextResponse, currentAgentLogs);
         
         // Safety gate for planning mode
-        if (config.planningMode && !conversation.planApproved) {
-          // Auto-approve if the model declares it as a simple task
-          const hasSimpleTask = conversation.tasks && conversation.tasks.some(t => t.title && t.title.startsWith('[SIMPLE]'));
-          if (hasSimpleTask) {
-            conversation.planApproved = true;
-            window.appendSystemMessage("Planning mode: Bypassed for simple task.");
-          }
-        }
-        
-        if (config.planningMode && !conversation.planApproved) {
+        if (config.planningMode && !canExecuteThisTask()) {
           const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'run_command', 'start_command', 'run_tests', 'sync_workspace_env', 'launch_workspace_app', 'git_push'];
           if (destructiveTools.includes(toolName)) {
             // Allow writing the implementation plan file itself before approval
             const isPlanWrite = toolName === 'write_file' && args.path && args.path.toLowerCase().includes('implementation_plan');
             if (!isPlanWrite) {
-              const errMsg = "Planning Mode Active: File edits and command execution are blocked until the user explicitly approves your plan (e.g. types 'approve'). Create implementation_plan.md and task checklists first, then wait.";
+              const errMsg = "Planning Mode Active: this request needs an implementation plan before file edits or command execution. Create implementation_plan.md, show the plan in chat, set the checklist, then pause for explicit approval or requested revisions.";
               
               currentAgentLogs[logIndex].status = 'error';
               currentAgentLogs[logIndex].result = errMsg;
@@ -488,6 +534,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
   } finally {
     isAgentRunning = false;
     runningConversationId = null;
+    agentExecutionMode = 'idle';
     agentSubStatus = '';
     if (window.onAgentStatusChange) window.onAgentStatusChange(false);
     
@@ -1229,7 +1276,7 @@ function stripWorkWalkthrough(text) {
 
 function buildPlanApprovalMessage(planItem, fallbackText) {
   const planContent = planItem && planItem.content ? formatPlanContentForChat(planItem.content) : '';
-  const intro = 'I created [`implementation_plan.md`](orion-file:implementation_plan.md) and paused because Planning Mode is on. Review the plan below, then reply with approval to let me build it.';
+  const intro = 'I created [`implementation_plan.md`](orion-file:implementation_plan.md) and paused for review. The plan is shown below; approve it when you want me to start, or tell me what to change.';
   if (!planContent) return intro;
   return `${intro}\n\n## Implementation Plan\n\n${planContent}`;
 }
@@ -1246,11 +1293,97 @@ function hasAnyChecklist(conversation) {
   return !!(conversation && Array.isArray(conversation.tasks) && conversation.tasks.length > 0);
 }
 
-function isApprovalResponse(userPrompt) {
-  const text = String(userPrompt || '').trim();
-  if (!text) return false;
-  if (text.includes('?')) return false;
-  return text.length <= 120;
+async function classifyPlanApprovalIntent(userPrompt, modelName, apiKey) {
+  const fallback = { intent: 'unclear', reason: 'Could not classify plan approval intent.' };
+  const prompt = `Classify the user's latest message about a pending implementation plan.
+
+Return only compact JSON with:
+{"intent":"approve"|"deny"|"revise"|"unclear","reason":"short reason"}
+
+Definitions:
+- approve: the user clearly wants execution of the existing pending plan to begin.
+- deny: the user clearly rejects, cancels, or stops the pending plan.
+- revise: the user asks for more review, a different plan, changes, additions, or clarification before execution.
+- unclear: the user intent is ambiguous.
+
+User message:
+${JSON.stringify(String(userPrompt || ''))}`;
+
+  try {
+    if (modelName && !modelName.startsWith('gemini-')) {
+      return fallback;
+    }
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName || 'gemini-2.5-flash-lite'}:generateContent?key=${apiKey}`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0,
+          responseMimeType: 'application/json'
+        }
+      })
+    });
+    if (!response.ok) return fallback;
+    const data = await response.json();
+    const text = data.candidates && data.candidates[0] && data.candidates[0].content &&
+      data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
+      data.candidates[0].content.parts[0].text;
+    const parsed = JSON.parse(text || '{}');
+    const intent = ['approve', 'deny', 'revise', 'unclear'].includes(parsed.intent) ? parsed.intent : 'unclear';
+    return { intent, reason: String(parsed.reason || '') };
+  } catch (e) {
+    console.error('Plan approval classifier failed:', e);
+    return fallback;
+  }
+}
+
+async function classifyPlanningNeed(userPrompt, modelName, apiKey) {
+  const fallback = { mode: 'plan', reason: 'Could not safely classify task complexity.' };
+  const prompt = `Classify whether this Orion AI request should require an implementation plan before acting.
+
+Return only compact JSON with:
+{"mode":"plan"|"direct"|"answer","reason":"short reason"}
+
+Definitions:
+- plan: broad or complex work where the user should review direction first, such as creating a substantial new project, major redesign/refactor, large bug hunt, architecture change, risky migration, security-sensitive change, or ambiguous multi-step coding task.
+- direct: concrete low-risk work that should be executed immediately, such as running/opening a program, running tests, showing a directory, setting an entry point, pushing to Git when explicitly requested, viewing a file, making a narrow edit, fixing a small bug, or continuing an already-approved task.
+- answer: a question or explanation that can be answered in chat without workspace changes or command execution.
+
+Be practical and avoid ceremony. If the user asks for a simple local action, choose direct.
+
+User message:
+${JSON.stringify(String(userPrompt || ''))}`;
+
+  try {
+    if (modelName && !modelName.startsWith('gemini-')) {
+      return fallback;
+    }
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName || 'gemini-2.5-flash-lite'}:generateContent?key=${apiKey}`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0,
+          responseMimeType: 'application/json'
+        }
+      })
+    });
+    if (!response.ok) return fallback;
+    const data = await response.json();
+    const text = data.candidates && data.candidates[0] && data.candidates[0].content &&
+      data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
+      data.candidates[0].content.parts[0].text;
+    const parsed = JSON.parse(text || '{}');
+    const mode = ['plan', 'direct', 'answer'].includes(parsed.mode) ? parsed.mode : 'plan';
+    return { mode, reason: String(parsed.reason || '') };
+  } catch (e) {
+    console.error('Planning need classifier failed:', e);
+    return fallback;
+  }
 }
 
 function shouldHaveUsedToolsButDidNot(text, workWalkthrough) {

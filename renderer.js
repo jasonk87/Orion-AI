@@ -1133,21 +1133,34 @@ function renderAiMessage(text, logs = []) {
   const renderedMarkdown = typeof marked !== 'undefined' ? marked.parse(text) : escapeHtml(text);
   
   let runningIndicatorHtml = '';
+  let planApprovalHtml = '';
   const runningConversationId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+  const activeConv = typeof conversations !== 'undefined'
+    ? conversations.find(c => c.id === activeConversationId)
+    : null;
+  if (activeConv && activeConv.awaitingPlanApproval && !activeConv.planApproved && !(window.isAgentRunning && window.isAgentRunning())) {
+    planApprovalHtml = `
+      <div class="plan-approval-actions">
+        <div class="plan-approval-copy">
+          <span class="plan-approval-title">Plan ready for review</span>
+          <span class="plan-approval-subtitle">Start when the direction looks right.</span>
+        </div>
+        <button class="btn-approve-plan" type="button">Start Implementation</button>
+      </div>
+    `;
+  }
   if (window.isAgentRunning && window.isAgentRunning() && runningConversationId === activeConversationId) {
     const stepNum = window.currentLoopCount || 1;
     
     // Check if the current conversation's plan has been approved
     let isApproved = false;
-    if (typeof conversations !== 'undefined' && typeof activeConversationId !== 'undefined') {
-      const activeConv = conversations.find(c => c.id === activeConversationId);
-      if (activeConv && activeConv.planApproved) {
-        isApproved = true;
-      }
+    if (activeConv && activeConv.planApproved) {
+      isApproved = true;
     }
     
-    const statusLabel = isApproved 
-      ? `Executing autonomously (Step ${stepNum})...` 
+    const executionMode = window.getAgentExecutionMode ? window.getAgentExecutionMode() : 'planning';
+    const statusLabel = isApproved || executionMode === 'direct' || executionMode === 'executing' || executionMode === 'answer'
+      ? `Working (Step ${stepNum})...`
       : `Preparing implementation plan (Step ${stepNum})...`;
       
     const subStatus = window.getAgentSubStatus ? window.getAgentSubStatus() : '';
@@ -1170,6 +1183,7 @@ function renderAiMessage(text, logs = []) {
     ${logsHtml}
     <div class="message-body">
       ${renderedMarkdown}
+      ${planApprovalHtml}
       ${runningIndicatorHtml}
     </div>
   `;
@@ -1186,6 +1200,10 @@ function renderAiMessage(text, logs = []) {
       openFileViewer(relPath);
     });
   });
+  const approveButton = bubble.querySelector('.btn-approve-plan');
+  if (approveButton) {
+    approveButton.addEventListener('click', approveCurrentPlanAndContinue);
+  }
   Prism.highlightAllUnder(bubble);
   
   // Inject copy & edit buttons into pre blocks
@@ -1407,6 +1425,10 @@ window.getPhoneCompanionState = () => {
     title: conv ? conv.title : '',
     workspace: conv ? (conv.workspace || conv.projectPath || currentWorkspace || '') : currentWorkspace,
     running: window.isAgentRunning ? window.isAgentRunning() : false,
+    runningConversationId: window.getRunningConversationId ? window.getRunningConversationId() : null,
+    subStatus: window.getAgentSubStatus ? window.getAgentSubStatus() : '',
+    awaitingPlanApproval: !!(conv && conv.awaitingPlanApproval && !conv.planApproved),
+    tasks: conv && Array.isArray(conv.tasks) ? conv.tasks : [],
     model: window.getSelectedModel(),
     messages
   };
@@ -1422,6 +1444,42 @@ window.submitPhoneCompanionPrompt = async (prompt) => {
   await submitMessage();
   return { success: true, queued: window.isAgentRunning && window.isAgentRunning() };
 };
+
+window.approvePhoneCompanionPlan = async () => {
+  return await approveCurrentPlanAndContinue();
+};
+
+async function approveCurrentPlanAndContinue() {
+  const conv = conversations.find(c => c.id === activeConversationId);
+  if (!conv) return { success: false, error: 'No active conversation' };
+  if (!conv.awaitingPlanApproval) return { success: false, error: 'No plan is awaiting approval' };
+  if (!appConfig.geminiApiKey) {
+    el.settingsModal.classList.add('active');
+    appendSystemMessage("Please enter and save your Gemini API Key first.");
+    return { success: false, error: 'Missing Gemini API key' };
+  }
+
+  conv.planApproved = true;
+  conv.awaitingPlanApproval = false;
+  saveConversationsToStorage();
+  appendSystemMessage("Plan approved. Continuing implementation.");
+
+  const prompt = 'The implementation plan was explicitly approved. Continue execution from the approved plan, update the checklist as you work, run verification, and provide a Work Walkthrough.';
+  renderUserMessage('[Start implementation]');
+  conv.messages.push({ role: 'user', text: '[Start implementation]' });
+  saveConversationsToStorage();
+
+  if (window.runAgentLoop) {
+    if (window.isAgentRunning && window.isAgentRunning()) {
+      window.promptQueue.push({ prompt, modelSelectValue: el.modelSelect.value, conversationId: conv.id, alreadyRendered: true });
+      appendSystemMessage("Another task is currently running. Approved plan execution was queued.");
+      return { success: true, queued: true };
+    }
+    await window.runAgentLoop(prompt, el.modelSelect.value, conv);
+    return { success: true, queued: false };
+  }
+  return { success: false, error: 'Agent engine is not ready' };
+}
 
 function deleteConversation(id) {
   const convToDelete = conversations.find(c => c.id === id);

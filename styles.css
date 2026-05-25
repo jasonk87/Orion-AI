@@ -1498,6 +1498,58 @@ code {
 }
 
 /* ANIMATED AGENT RUNNING INDICATOR */
+.plan-approval-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  width: min(100%, 620px);
+  margin-top: 14px;
+  padding: 12px 14px;
+  background: rgba(25, 25, 34, 0.78);
+  border: 1px solid rgba(167, 139, 250, 0.22);
+  border-radius: 8px;
+  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.18);
+}
+
+.plan-approval-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.plan-approval-title {
+  color: var(--text-primary);
+  font-size: 0.82rem;
+  font-weight: 650;
+}
+
+.plan-approval-subtitle {
+  color: var(--text-secondary);
+  font-size: 0.74rem;
+}
+
+.btn-approve-plan {
+  flex: 0 0 auto;
+  border: 1px solid rgba(167, 139, 250, 0.5);
+  background: rgba(167, 139, 250, 0.16);
+  color: var(--text-primary);
+  border-radius: 7px;
+  padding: 8px 12px;
+  font-family: var(--font-sans);
+  font-size: 0.78rem;
+  font-weight: 650;
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.btn-approve-plan:hover {
+  background: rgba(167, 139, 250, 0.24);
+  border-color: var(--accent-hover);
+  box-shadow: 0 0 16px rgba(167, 139, 250, 0.18);
+}
+
 .agent-running-indicator {
   display: flex;
   align-items: center;

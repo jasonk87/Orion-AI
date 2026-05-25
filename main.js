@@ -109,85 +109,191 @@ function ensureCompanionToken(config) {
   return config.phoneCompanionToken;
 }
 
+function companionManifest(token) {
+  return {
+    name: 'Orion AI Phone Companion',
+    short_name: 'Orion',
+    description: 'Control Orion AI from your phone on your local Wi-Fi.',
+    start_url: `/?token=${encodeURIComponent(token)}`,
+    scope: '/',
+    display: 'standalone',
+    background_color: '#09090d',
+    theme_color: '#8b5cf6',
+    orientation: 'portrait',
+    icons: [
+      { src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any maskable' }
+    ]
+  };
+}
+
+function companionServiceWorker() {
+  return `const CACHE = 'orion-phone-companion-v1';
+const SHELL = ['/icon.svg'];
+self.addEventListener('install', event => {
+  event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));
+});
+self.addEventListener('activate', event => {
+  event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(key => key !== CACHE).map(key => caches.delete(key)))).then(() => self.clients.claim()));
+});
+self.addEventListener('fetch', event => {
+  const url = new URL(event.request.url);
+  if (url.pathname.startsWith('/api/')) return;
+  event.respondWith(fetch(event.request).catch(() => caches.match(event.request).then(response => response || caches.match('/'))));
+});`;
+}
+
+function companionIconSvg() {
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <radialGradient id="g" cx="30%" cy="20%" r="80%">
+      <stop offset="0%" stop-color="#60a5fa"/>
+      <stop offset="42%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </radialGradient>
+    <filter id="s" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#000" flood-opacity=".35"/>
+    </filter>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#09090d"/>
+  <path filter="url(#s)" d="M256 68c103.8 0 188 84.2 188 188s-84.2 188-188 188S68 359.8 68 256 152.2 68 256 68Z" fill="url(#g)"/>
+  <path d="M258 134c64 0 117 50 121 113 4 70-52 132-123 132-37 0-70-16-93-42l50-50c9 13 24 22 42 22 29 0 53-24 53-53s-24-53-53-53c-18 0-34 9-44 23l-50-50c23-26 57-42 97-42Z" fill="#fff"/>
+</svg>`;
+}
+
 function companionHtml(token) {
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Orion AI Phone Companion</title>
+  <meta name="theme-color" content="#8b5cf6">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="/manifest.webmanifest?token=${encodeURIComponent(token)}">
+  <link rel="icon" href="/icon.svg">
   <style>
-    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background: #09090d; color: #f4f2ff; }
+    :root { color-scheme: dark; --bg:#08080d; --panel:rgba(18,17,28,.78); --panel-strong:rgba(24,23,36,.96); --line:rgba(167,139,250,.18); --text:#f7f4ff; --muted:#a7a0c4; --accent:#a78bfa; --accent-strong:#8b5cf6; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
     * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 20% 0%, rgba(128, 90, 213, .24), transparent 30%), #09090d; }
-    header { position: sticky; top: 0; z-index: 2; padding: 16px; border-bottom: 1px solid #252235; background: rgba(9, 9, 13, .92); backdrop-filter: blur(16px); }
-    h1 { margin: 0; font-size: 1.05rem; letter-spacing: 0; }
-    .meta { margin-top: 6px; color: #9d96b8; font-size: .78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    main { padding: 14px; padding-bottom: 150px; }
-    .status { color: #a78bfa; font-size: .78rem; margin-bottom: 10px; min-height: 18px; }
-    .message { padding: 12px; border: 1px solid #252235; border-radius: 8px; margin: 10px 0; line-height: 1.45; white-space: pre-wrap; word-break: break-word; background: #111019; }
-    .message.user { border-color: rgba(167,139,250,.4); background: #171326; }
-    .message.assistant { border-color: rgba(72,187,120,.25); }
-    .message.system { color: #a9a3bf; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .78rem; }
-    .role { display: block; margin-bottom: 6px; color: #b8a7ff; font-size: .72rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
-    form { position: fixed; left: 0; right: 0; bottom: 0; padding: 12px; border-top: 1px solid #252235; background: rgba(9, 9, 13, .96); backdrop-filter: blur(16px); }
-    textarea { width: 100%; min-height: 72px; resize: vertical; border: 1px solid #312b46; border-radius: 8px; padding: 12px; background: #12111a; color: #fff; font: inherit; }
-    button { width: 100%; margin-top: 10px; min-height: 44px; border: 0; border-radius: 8px; background: #8b5cf6; color: #fff; font-weight: 800; font-size: .95rem; }
-    button:disabled { opacity: .55; }
-    .empty { color: #9d96b8; text-align: center; padding: 48px 12px; }
+    body { margin:0; min-height:100vh; background: radial-gradient(circle at 16% -8%, rgba(96,165,250,.24), transparent 34%), radial-gradient(circle at 86% 0%, rgba(167,139,250,.22), transparent 36%), linear-gradient(180deg,#0b0b12 0%,#08080d 45%,#06060a 100%); overflow-x:hidden; }
+    body::before { content:""; position:fixed; inset:0; pointer-events:none; background-image:linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px); background-size:32px 32px; mask-image:linear-gradient(to bottom, rgba(0,0,0,.9), transparent 65%); }
+    .app-shell { min-height:100vh; padding-bottom:calc(164px + env(safe-area-inset-bottom)); }
+    header { position:sticky; top:0; z-index:5; padding:calc(14px + env(safe-area-inset-top)) 16px 12px; border-bottom:1px solid rgba(255,255,255,.08); background:rgba(8,8,13,.82); backdrop-filter:blur(20px); }
+    .topline { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    .brand { display:flex; align-items:center; min-width:0; gap:10px; }
+    .mark { width:36px; height:36px; border-radius:12px; display:grid; place-items:center; background:linear-gradient(145deg,#60a5fa,#8b5cf6 55%,#171827); box-shadow:0 10px 30px rgba(139,92,246,.28); font-weight:900; }
+    h1 { margin:0; font-size:1.02rem; letter-spacing:0; line-height:1.1; }
+    .meta { margin-top:4px; color:var(--muted); font-size:.76rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:68vw; }
+    .status-pill { flex:0 0 auto; padding:7px 9px; border-radius:999px; border:1px solid var(--line); background:rgba(18,17,28,.66); color:var(--muted); font-size:.72rem; font-weight:700; }
+    .status-pill.running { color:#e8ddff; border-color:rgba(52,211,153,.28); background:rgba(52,211,153,.12); }
+    .context-card { margin-top:12px; padding:12px; border:1px solid rgba(255,255,255,.08); border-radius:14px; background:linear-gradient(180deg,rgba(24,23,36,.86),rgba(13,13,20,.7)); }
+    .context-row { display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--muted); font-size:.75rem; }
+    .model { color:var(--text); font-weight:700; }
+    .substatus { margin-top:8px; color:var(--accent); font-size:.76rem; min-height:18px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .install-tip { display:none; margin-top:10px; padding:9px 10px; border:1px dashed rgba(167,139,250,.36); border-radius:12px; color:#ddd6fe; background:rgba(167,139,250,.09); font-size:.76rem; line-height:1.35; }
+    .install-tip.visible { display:block; }
+    main { position:relative; z-index:1; padding:14px; }
+    .plan-panel { display:none; margin-bottom:12px; padding:13px; border-radius:16px; border:1px solid rgba(251,191,36,.28); background:linear-gradient(135deg,rgba(251,191,36,.12),rgba(167,139,250,.08)); }
+    .plan-panel.visible { display:block; }
+    .plan-title { font-size:.86rem; font-weight:800; margin-bottom:4px; }
+    .plan-copy { color:var(--muted); font-size:.78rem; line-height:1.35; margin-bottom:10px; }
+    .task-strip { display:flex; gap:8px; overflow-x:auto; padding:2px 0 10px; margin-bottom:4px; }
+    .task-chip { flex:0 0 auto; max-width:220px; padding:7px 9px; border:1px solid rgba(255,255,255,.08); border-radius:999px; color:var(--muted); background:rgba(18,17,28,.76); font-size:.72rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .task-chip.completed { color:rgba(209,250,229,.9); border-color:rgba(52,211,153,.25); }
+    .task-chip.in-progress { color:#ddd6fe; border-color:rgba(167,139,250,.36); }
+    .messages { display:flex; flex-direction:column; gap:12px; }
+    .message { max-width:92%; padding:12px 13px; border:1px solid rgba(255,255,255,.08); border-radius:17px; line-height:1.48; white-space:pre-wrap; word-break:break-word; background:rgba(17,16,25,.86); box-shadow:0 12px 30px rgba(0,0,0,.12); }
+    .message.user { align-self:flex-end; border-color:rgba(167,139,250,.36); background:linear-gradient(135deg,rgba(139,92,246,.22),rgba(37,34,58,.92)); }
+    .message.assistant { align-self:flex-start; border-color:rgba(52,211,153,.18); }
+    .message.system { align-self:center; max-width:100%; color:var(--muted); font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:.75rem; background:rgba(12,12,18,.72); }
+    .role { display:block; margin-bottom:6px; color:#c4b5fd; font-size:.66rem; font-weight:850; text-transform:uppercase; letter-spacing:.08em; }
+    form { position:fixed; z-index:8; left:0; right:0; bottom:0; padding:12px 12px calc(12px + env(safe-area-inset-bottom)); border-top:1px solid rgba(255,255,255,.08); background:rgba(8,8,13,.9); backdrop-filter:blur(22px); }
+    .composer { display:flex; gap:10px; align-items:flex-end; }
+    textarea { width:100%; min-height:54px; max-height:132px; resize:none; border:1px solid rgba(167,139,250,.25); border-radius:15px; padding:12px 13px; background:rgba(18,17,28,.94); color:var(--text); font:inherit; line-height:1.35; outline:none; }
+    textarea:focus { border-color:rgba(167,139,250,.58); box-shadow:0 0 0 3px rgba(167,139,250,.12); }
+    button { border:0; border-radius:14px; background:var(--accent-strong); color:#fff; font-weight:850; font-size:.9rem; min-height:48px; padding:0 15px; box-shadow:0 12px 26px rgba(139,92,246,.28); }
+    .send-button { flex:0 0 auto; min-width:72px; }
+    .approve-button { width:100%; background:#f59e0b; box-shadow:0 12px 26px rgba(245,158,11,.18); }
+    button:disabled { opacity:.55; }
+    .empty { color:var(--muted); text-align:center; padding:54px 12px; }
+    @media (min-width:700px) { .app-shell { max-width:760px; margin:0 auto; border-left:1px solid rgba(255,255,255,.06); border-right:1px solid rgba(255,255,255,.06); } form { left:50%; transform:translateX(-50%); max-width:760px; } .meta { max-width:520px; } }
   </style>
 </head>
 <body>
-  <header>
-    <h1>Orion AI</h1>
-    <div class="meta" id="meta">Connecting...</div>
-  </header>
-  <main>
-    <div class="status" id="status"></div>
-    <div id="messages"><div class="empty">Loading conversation...</div></div>
-  </main>
-  <form id="prompt-form">
-    <textarea id="prompt" placeholder="Send a prompt to Orion..." autocomplete="off"></textarea>
-    <button id="send" type="submit">Send to Orion</button>
-  </form>
+  <div class="app-shell">
+    <header>
+      <div class="topline">
+        <div class="brand"><div class="mark">O</div><div><h1>Orion AI</h1><div class="meta" id="meta">Connecting...</div></div></div>
+        <div class="status-pill" id="status-pill">Offline</div>
+      </div>
+      <div class="context-card">
+        <div class="context-row"><span>Model</span><span class="model" id="model">-</span></div>
+        <div class="substatus" id="status"></div>
+        <div class="install-tip" id="install-tip">Install this companion from your browser menu with Add to Home Screen. Full PWA install support may require HTTPS on some phones.</div>
+      </div>
+    </header>
+    <main>
+      <section class="plan-panel" id="plan-panel"><div class="plan-title">Plan waiting for approval</div><div class="plan-copy">Review the latest plan in chat. Start it here when the direction looks right.</div><button class="approve-button" id="approve-plan" type="button">Start Implementation</button></section>
+      <div class="task-strip" id="tasks"></div>
+      <div class="messages" id="messages"><div class="empty">Loading conversation...</div></div>
+    </main>
+  </div>
+  <form id="prompt-form"><div class="composer"><textarea id="prompt" placeholder="Ask Orion..." autocomplete="off" rows="2"></textarea><button class="send-button" id="send" type="submit">Send</button></div></form>
   <script>
     const token = ${JSON.stringify(token)};
     const messagesEl = document.getElementById('messages');
     const metaEl = document.getElementById('meta');
+    const modelEl = document.getElementById('model');
     const statusEl = document.getElementById('status');
+    const statusPillEl = document.getElementById('status-pill');
+    const installTipEl = document.getElementById('install-tip');
+    const planPanelEl = document.getElementById('plan-panel');
+    const approvePlanEl = document.getElementById('approve-plan');
+    const tasksEl = document.getElementById('tasks');
     const form = document.getElementById('prompt-form');
     const promptEl = document.getElementById('prompt');
     const sendEl = document.getElementById('send');
     let lastSignature = '';
-
-    function escapeHtml(value) {
-      return String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch]));
-    }
-
+    function escapeHtml(value) { return String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch])); }
+    function taskClass(status) { return String(status || '').replace(/[^a-z0-9_-]/gi, '-').toLowerCase(); }
     async function loadState() {
       try {
         const res = await fetch('/api/state?token=' + encodeURIComponent(token));
         const state = await res.json();
         if (!state.success) throw new Error(state.error || 'Failed to load state');
-        metaEl.textContent = (state.title || 'No active conversation') + (state.workspace ? ' · ' + state.workspace : '');
-        statusEl.textContent = state.running ? 'Orion is working...' : '';
-        const signature = JSON.stringify({ running: state.running, messages: state.messages });
+        metaEl.textContent = state.title || 'No active conversation';
+        modelEl.textContent = state.model || '-';
+        statusPillEl.textContent = state.running ? 'Working' : 'Ready';
+        statusPillEl.classList.toggle('running', !!state.running);
+        statusEl.textContent = state.subStatus || state.workspace || '';
+        planPanelEl.classList.toggle('visible', !!state.awaitingPlanApproval);
+        tasksEl.innerHTML = Array.isArray(state.tasks) && state.tasks.length ? state.tasks.map(task => '<span class="task-chip ' + taskClass(task.status) + '">' + escapeHtml(task.title || 'Task') + '</span>').join('') : '';
+        const signature = JSON.stringify({ running: state.running, subStatus: state.subStatus, plan: state.awaitingPlanApproval, tasks: state.tasks, messages: state.messages });
         if (signature !== lastSignature) {
           lastSignature = signature;
-          if (!state.messages || state.messages.length === 0) {
-            messagesEl.innerHTML = '<div class="empty">No messages yet.</div>';
-          } else {
-            messagesEl.innerHTML = state.messages.map(msg => (
-              '<div class="message ' + escapeHtml(msg.role) + '"><span class="role">' + escapeHtml(msg.role) + '</span>' + escapeHtml(msg.text) + '</div>'
-            )).join('');
-            window.scrollTo(0, document.body.scrollHeight);
-          }
+          messagesEl.innerHTML = !state.messages || state.messages.length === 0 ? '<div class="empty">No messages yet.</div>' : state.messages.map(msg => '<div class="message ' + escapeHtml(msg.role) + '"><span class="role">' + escapeHtml(msg.role) + '</span>' + escapeHtml(msg.text) + '</div>').join('');
+          window.scrollTo(0, document.body.scrollHeight);
         }
       } catch (error) {
         statusEl.textContent = error.message;
+        statusPillEl.textContent = 'Offline';
+        statusPillEl.classList.remove('running');
       }
     }
-
+    approvePlanEl.addEventListener('click', async () => {
+      approvePlanEl.disabled = true;
+      statusEl.textContent = 'Starting approved plan...';
+      try {
+        const res = await fetch('/api/approve-plan?token=' + encodeURIComponent(token), { method: 'POST' });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Approval failed');
+        await loadState();
+      } catch (error) {
+        statusEl.textContent = error.message;
+      } finally {
+        approvePlanEl.disabled = false;
+      }
+    });
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
       const prompt = promptEl.value.trim();
@@ -195,11 +301,7 @@ function companionHtml(token) {
       sendEl.disabled = true;
       statusEl.textContent = 'Sending...';
       try {
-        const res = await fetch('/api/prompt?token=' + encodeURIComponent(token), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt })
-        });
+        const res = await fetch('/api/prompt?token=' + encodeURIComponent(token), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt }) });
         const data = await res.json();
         if (!data.success) throw new Error(data.error || 'Send failed');
         promptEl.value = '';
@@ -210,9 +312,11 @@ function companionHtml(token) {
         sendEl.disabled = false;
       }
     });
-
+    promptEl.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); form.requestSubmit(); } });
+    window.addEventListener('beforeinstallprompt', event => { event.preventDefault(); installTipEl.classList.add('visible'); installTipEl.textContent = 'This companion is installable. Open your browser menu and choose Install app or Add to Home Screen.'; });
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js?token=' + encodeURIComponent(token)).catch(() => {});
     loadState();
-    setInterval(loadState, 2500);
+    setInterval(loadState, 1500);
   </script>
 </body>
 </html>`;
@@ -280,15 +384,38 @@ async function callRendererFunction(functionName, arg) {
 function startPhoneCompanionServer() {
   if (companionServer) return;
   const config = readAppConfig();
-  const port = Number(config.phoneCompanionPort || 5000);
+  const port = Number(config.phoneCompanionPort || 1122);
   companionToken = ensureCompanionToken(config);
 
   companionServer = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
       if (url.pathname === '/') {
+        if (url.searchParams.get('token') !== companionToken) {
+          res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+          res.end('<!doctype html><title>Orion AI</title><body style="font-family:system-ui;background:#09090d;color:#f7f4ff;padding:24px"><h1>Orion AI Phone Companion</h1><p>This companion link needs the private token from Orion on your desktop.</p></body>');
+          return;
+        }
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
         res.end(companionHtml(companionToken));
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/manifest.webmanifest') {
+        res.writeHead(200, { 'Content-Type': 'application/manifest+json; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(companionManifest(companionToken), null, 2));
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/sw.js') {
+        res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store', 'Service-Worker-Allowed': '/' });
+        res.end(companionServiceWorker());
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/icon.svg') {
+        res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Cache-Control': 'public, max-age=86400' });
+        res.end(companionIconSvg());
         return;
       }
 
@@ -312,6 +439,12 @@ function startPhoneCompanionServer() {
           return;
         }
         const result = await callRendererFunction('submitPhoneCompanionPrompt', prompt);
+        sendJson(res, 200, { success: true, ...result });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/approve-plan') {
+        const result = await callRendererFunction('approvePhoneCompanionPlan');
         sendJson(res, 200, { success: true, ...result });
         return;
       }
