@@ -630,6 +630,11 @@ function escapePowerShellSingle(value) {
 }
 
 function launchCommandInWorkspace(workspacePath, command) {
+  if (!command) throw new Error('Missing command');
+  if (isDestructiveCommand(command)) {
+    throw new Error('Command is in the deny-list and cannot be executed.');
+  }
+
   if (process.platform === 'win32') {
     const commandText = `Set-Location -LiteralPath '${escapePowerShellSingle(workspacePath)}'; ${command}`;
     spawn('powershell.exe', [
@@ -1014,12 +1019,26 @@ function killProcessTree(child, callback) {
   }, 1000);
 }
 
-const DESTRUCTIVE_COMMANDS = ['rm -rf /', 'mkfs', 'format'];
+const DESTRUCTIVE_PATTERNS = [
+  /\brm\s+-r[fF]?\b/i,          // rm -rf anywhere
+  /\bdel\s+\/s\s+\/q\b/i,       // del /s /q anywhere
+  /\bRemove-Item\s+-Recurse\b/i,// PowerShell Remove-Item -Recurse
+  /\bgit\s+reset\s+--hard\b/i,  // git reset --hard
+  /\bgit\s+clean\s+-fdx\b/i,    // git clean -fdx
+  /\bmkfs\b/i,                  // mkfs
+  /\bformat\b/i                 // format
+];
+
+function isDestructiveCommand(command) {
+  // Split commands by chaining operators to check parts, or check entire string.
+  // Actually, checking the full string is safer to catch chained destructive commands.
+  return DESTRUCTIVE_PATTERNS.some(pattern => pattern.test(command));
+}
 
 function startCommandSession({ command, cwd, processId, timeoutMs }) {
   if (!command) throw new Error('Missing command');
 
-  if (DESTRUCTIVE_COMMANDS.some(cmd => command.trim().startsWith(cmd))) {
+  if (isDestructiveCommand(command)) {
     throw new Error('Command is in the deny-list and cannot be executed.');
   }
 
@@ -1210,4 +1229,8 @@ if (process.env.NODE_ENV === 'test') {
 
 if (process.env.NODE_ENV === 'test') {
   module.exports.applyPatch = applyPatch;
+}
+
+if (process.env.NODE_ENV === 'test') {
+  module.exports.isDestructiveCommand = isDestructiveCommand;
 }
