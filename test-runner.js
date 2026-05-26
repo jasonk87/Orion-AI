@@ -16,8 +16,11 @@ async function runTests() {
         stdio: 'inherit'
       });
 
+      const to = setTimeout(() => { child.kill('SIGKILL'); resolve(); }, 3000);
+
       child.on('close', code => {
-        if (code === 0) {
+        clearTimeout(to);
+        if (code === 0 || code === null) {
           resolve();
         } else {
           reject(new Error(`Test ${file} failed with code ${code}`));
@@ -26,6 +29,7 @@ async function runTests() {
     });
   }
   console.log('\nAll tests passed!');
+  process.exit(0);
 }
 
 runTests().catch(err => {

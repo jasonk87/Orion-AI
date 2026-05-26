@@ -53,5 +53,4 @@ test('patch file - replace_range', (t) => {
   const { updated } = main.applyPatch(original, op);
   t.equal(updated, 'line1\nnew2\nnew3\nline4\n');
   t.end();
-  process.exit(0);
 });

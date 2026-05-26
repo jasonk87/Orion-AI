@@ -1234,3 +1234,16 @@ if (process.env.NODE_ENV === 'test') {
 if (process.env.NODE_ENV === 'test') {
   module.exports.isDestructiveCommand = isDestructiveCommand;
 }
+
+if (process.env.NODE_ENV === 'test') {
+  module.exports.activeProcesses = activeProcesses;
+  module.exports.commandSessions = commandSessions;
+}
+
+if (process.env.NODE_ENV === 'test') {
+  module.exports.getCompanionServer = () => companionServer;
+}
+
+if (process.env.NODE_ENV === 'test') {
+  module.exports.resetCompanionServer = () => { companionServer = null; };
+}

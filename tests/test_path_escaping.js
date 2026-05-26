@@ -34,5 +34,4 @@ test('escapePowerShellSingle escapes single quotes correctly', (t) => {
   });
 
   t.end();
-  process.exit(0);
 });
