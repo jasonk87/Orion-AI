@@ -461,7 +461,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
           const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'run_command', 'start_command', 'run_tests', 'sync_workspace_env', 'launch_workspace_app', 'git_push'];
           if (destructiveTools.includes(toolName)) {
             // Allow writing the implementation plan file itself before approval
-            const isPlanWrite = toolName === 'write_file' && args.path && args.path.toLowerCase().includes('implementation_plan');
+            const isPlanWrite = toolName === 'write_file' && args.path && args.path.split(/[\\/]/).pop().toLowerCase() === 'implementation_plan.md';
             if (!isPlanWrite) {
               const errMsg = "Planning Mode Active: this request needs an implementation plan before file edits or command execution. Create implementation_plan.md, show the plan in chat, set the checklist, then pause for explicit approval or requested revisions.";
               
@@ -1192,7 +1192,7 @@ function summarizeToolStart(toolName, args = {}) {
   if (toolName === 'set_workspace_entrypoint') return { toolName, status: 'running', label: args.command ? `Set entry point to \`${args.command}\`` : 'Cleared workspace entry point' };
   if (toolName === 'git_push') return { toolName, kind: 'git', status: 'running', label: `Pushed Git branch${args.branch ? ` to \`${args.branch}\`` : ''}` };
   if (toolName === 'write_file') {
-    const isPlan = args.path && args.path.toLowerCase().includes('implementation_plan');
+    const isPlan = args.path && args.path.split(/[\\/]/).pop().toLowerCase() === 'implementation_plan.md';
     return {
       toolName,
       kind: isPlan ? 'plan' : 'file',
@@ -2356,4 +2356,15 @@ ${conversationLogsText}`;
     messages: newHistory,
     summary: compactedSummary
   };
+}
+
+if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
+  module.exports = {
+    classifyPlanApprovalIntent,
+    classifyPlanningNeed
+  };
+}
+
+if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
+  module.exports.executeTool = executeTool; // So we can test it specifically
 }

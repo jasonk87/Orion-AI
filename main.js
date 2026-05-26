@@ -794,6 +794,65 @@ ipcMain.handle('write-file', async (event, { workspacePath, relativePath, conten
   }
 });
 
+function applyPatch(original, operation) {
+  let updated = original;
+  let details = {};
+
+  if (operation.type === 'replace') {
+    if (!operation.target) throw new Error('replace requires target');
+    if (operation.replacement === undefined) throw new Error('replace requires replacement');
+    const count = Math.max(parseInt(operation.count, 10) || 1, 1);
+    let replacements = 0;
+    while (replacements < count) {
+      const index = updated.indexOf(operation.target);
+      if (index === -1) break;
+      updated = updated.slice(0, index) + operation.replacement + updated.slice(index + operation.target.length);
+      replacements++;
+    }
+    if (replacements === 0) throw new Error('Target content block not found');
+    details = { replacements };
+  } else if (operation.type === 'replace_regex') {
+    if (!operation.pattern) throw new Error('replace_regex requires pattern');
+    if (operation.replacement === undefined) throw new Error('replace_regex requires replacement');
+    const flags = operation.flags || '';
+    const safeFlags = Array.from(new Set(flags.replace(/[^gimsuy]/g, '').split(''))).join('');
+    const regex = new RegExp(operation.pattern, safeFlags.includes('g') ? safeFlags : safeFlags + 'g');
+    const matches = updated.match(regex);
+    const replacements = matches ? matches.length : 0;
+    updated = updated.replace(regex, operation.replacement);
+    if (replacements === 0) throw new Error('Regex pattern did not match');
+    details = { replacements };
+  } else if (operation.type === 'insert') {
+    if (!operation.anchor) throw new Error('insert requires anchor');
+    if (operation.content === undefined) throw new Error('insert requires content');
+    const position = operation.position === 'before' ? 'before' : 'after';
+    const index = updated.indexOf(operation.anchor);
+    if (index === -1) throw new Error('Anchor content not found');
+    const insertAt = position === 'before' ? index : index + operation.anchor.length;
+    updated = updated.slice(0, insertAt) + operation.content + updated.slice(insertAt);
+    details = { position };
+  } else if (operation.type === 'replace_range') {
+    const startLine = parseInt(operation.startLine, 10);
+    const endLine = parseInt(operation.endLine, 10);
+    if (!Number.isInteger(startLine) || !Number.isInteger(endLine) || startLine < 1 || endLine < startLine) {
+      throw new Error('replace_range requires valid 1-based startLine and endLine');
+    }
+    if (operation.content === undefined) throw new Error('replace_range requires content');
+    const hasFinalNewline = updated.endsWith('\n');
+    const lines = updated.split(/\r?\n/);
+    if (hasFinalNewline) lines.pop();
+    if (endLine > lines.length) throw new Error(`Line range exceeds file length (${lines.length} lines)`);
+    const newLines = String(operation.content).split(/\r?\n/);
+    lines.splice(startLine - 1, endLine - startLine + 1, ...newLines);
+    updated = lines.join('\n') + (hasFinalNewline ? '\n' : '');
+    details = { startLine, endLine };
+  } else {
+    throw new Error(`Unsupported patch operation: ${operation.type}`);
+  }
+
+  return { updated, details };
+}
+
 ipcMain.handle('patch-file', async (event, { workspacePath, relativePath, operation }) => {
   try {
     if (!operation || !operation.type) throw new Error('Missing patch operation');
@@ -802,60 +861,7 @@ ipcMain.handle('patch-file', async (event, { workspacePath, relativePath, operat
     if (!fs.existsSync(fullPath)) throw new Error('File does not exist');
 
     const original = fs.readFileSync(fullPath, 'utf8');
-    let updated = original;
-    let details = {};
-
-    if (operation.type === 'replace') {
-      if (!operation.target) throw new Error('replace requires target');
-      if (operation.replacement === undefined) throw new Error('replace requires replacement');
-      const count = Math.max(parseInt(operation.count, 10) || 1, 1);
-      let replacements = 0;
-      while (replacements < count) {
-        const index = updated.indexOf(operation.target);
-        if (index === -1) break;
-        updated = updated.slice(0, index) + operation.replacement + updated.slice(index + operation.target.length);
-        replacements++;
-      }
-      if (replacements === 0) throw new Error('Target content block not found');
-      details = { replacements };
-    } else if (operation.type === 'replace_regex') {
-      if (!operation.pattern) throw new Error('replace_regex requires pattern');
-      if (operation.replacement === undefined) throw new Error('replace_regex requires replacement');
-      const flags = operation.flags || '';
-      const safeFlags = Array.from(new Set(flags.replace(/[^gimsuy]/g, '').split(''))).join('');
-      const regex = new RegExp(operation.pattern, safeFlags.includes('g') ? safeFlags : safeFlags + 'g');
-      const matches = updated.match(regex);
-      const replacements = matches ? matches.length : 0;
-      updated = updated.replace(regex, operation.replacement);
-      if (replacements === 0) throw new Error('Regex pattern did not match');
-      details = { replacements };
-    } else if (operation.type === 'insert') {
-      if (!operation.anchor) throw new Error('insert requires anchor');
-      if (operation.content === undefined) throw new Error('insert requires content');
-      const position = operation.position === 'before' ? 'before' : 'after';
-      const index = updated.indexOf(operation.anchor);
-      if (index === -1) throw new Error('Anchor content not found');
-      const insertAt = position === 'before' ? index : index + operation.anchor.length;
-      updated = updated.slice(0, insertAt) + operation.content + updated.slice(insertAt);
-      details = { position };
-    } else if (operation.type === 'replace_range') {
-      const startLine = parseInt(operation.startLine, 10);
-      const endLine = parseInt(operation.endLine, 10);
-      if (!Number.isInteger(startLine) || !Number.isInteger(endLine) || startLine < 1 || endLine < startLine) {
-        throw new Error('replace_range requires valid 1-based startLine and endLine');
-      }
-      if (operation.content === undefined) throw new Error('replace_range requires content');
-      const hasFinalNewline = updated.endsWith('\n');
-      const lines = updated.split(/\r?\n/);
-      if (hasFinalNewline) lines.pop();
-      if (endLine > lines.length) throw new Error(`Line range exceeds file length (${lines.length} lines)`);
-      const newLines = String(operation.content).split(/\r?\n/);
-      lines.splice(startLine - 1, endLine - startLine + 1, ...newLines);
-      updated = lines.join('\n') + (hasFinalNewline ? '\n' : '');
-      details = { startLine, endLine };
-    } else {
-      throw new Error(`Unsupported patch operation: ${operation.type}`);
-    }
+    const { updated, details } = applyPatch(original, operation);
 
     if (updated === original) {
       return { success: true, changed: false, message: 'Patch produced no content changes.', details };
@@ -1200,4 +1206,8 @@ if (process.env.NODE_ENV === 'test') {
     ensureCompanionToken,
     getCompanionServer: () => companionServer
   };
+}
+
+if (process.env.NODE_ENV === 'test') {
+  module.exports.applyPatch = applyPatch;
 }

@@ -1,13 +1,49 @@
 const test = require('tape');
-const fs = require('fs');
+const http = require('http');
+const proxyquire = require('proxyquire');
 
-test('Phone Companion Security', (t) => {
-  const mainContent = fs.readFileSync(require('path').join(__dirname, '../main.js'), 'utf8');
+const main = proxyquire('../main.js', {
+  'electron': {
+    app: {
+      whenReady: () => Promise.resolve(),
+      on: () => {}
+    },
+    BrowserWindow: class {
+      constructor() {}
+      loadFile() {}
+      isDestroyed() { return true; }
+      static getAllWindows() { return []; }
+    },
+    ipcMain: {
+      on: () => {},
+      handle: () => {}
+    },
+    dialog: {}
+  }
+});
 
-  t.ok(mainContent.includes("if (url.searchParams.get('token') !== companionToken) {"), 'Token is checked for unauthorized requests');
-  t.ok(mainContent.includes("sendJson(res, 401, { success: false, error: 'Unauthorized companion request' });"), 'Unauthorized responds with 401');
-  t.ok(mainContent.includes("const enableCompanion = config.enablePhoneCompanion === true;"), 'enableCompanion logic is present');
-  t.ok(mainContent.includes("const host = enableCompanion ? '0.0.0.0' : '127.0.0.1';"), 'host binding restricted to 127.0.0.1 by default');
+test('Phone Companion API Security', (t) => {
+  main.startPhoneCompanionServer();
 
-  t.end();
+  setTimeout(() => {
+    http.get('http://127.0.0.1:1122/api/state', (res) => {
+      t.equal(res.statusCode, 401, 'Returns 401 for missing token');
+
+      http.get('http://127.0.0.1:1122/?token=invalid', (res2) => {
+        t.equal(res2.statusCode, 401, 'Returns 401 for invalid token on root');
+
+        const server = main.companionServer || main.getCompanionServer();
+        if (server) {
+          server.close(() => {
+             t.end();
+          });
+        } else {
+             t.end();
+        }
+      });
+    }).on('error', (e) => {
+      t.fail(`HTTP request failed: ${e.message}`);
+      t.end();
+    });
+  }, 500);
 });

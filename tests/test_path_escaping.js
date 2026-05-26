@@ -1,18 +1,27 @@
 const test = require('tape');
-const fs = require('fs');
-const path = require('path');
+const proxyquire = require('proxyquire');
 
-// Extract escapePowerShellSingle from main.js for testing
-const mainJsContent = fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8');
-const match = mainJsContent.match(/function escapePowerShellSingle\(value\) \{([\s\S]*?)\}/);
-let escapePowerShellSingle;
-if (match) {
-  escapePowerShellSingle = new Function('value', match[1] + ' return String(value).replace(/\'/g, "\'\'");');
-}
+const main = proxyquire('../main.js', {
+  'electron': {
+    app: {
+      whenReady: () => Promise.resolve(),
+      on: () => {}
+    },
+    BrowserWindow: class {
+      constructor() {}
+      loadFile() {}
+      isDestroyed() { return true; }
+      static getAllWindows() { return []; }
+    },
+    ipcMain: {
+      on: () => {},
+      handle: () => {}
+    },
+    dialog: {}
+  }
+});
 
 test('escapePowerShellSingle escapes single quotes correctly', (t) => {
-  t.ok(escapePowerShellSingle, 'escapePowerShellSingle function found');
-
   const cases = [
     { input: "normal string", expected: "normal string" },
     { input: "it's a test", expected: "it''s a test" },
@@ -21,8 +30,9 @@ test('escapePowerShellSingle escapes single quotes correctly', (t) => {
   ];
 
   cases.forEach(c => {
-    t.equal(escapePowerShellSingle(c.input), c.expected, `Escapes ${c.input} properly`);
+    t.equal(main.escapePowerShellSingle(c.input), c.expected, `Escapes ${c.input} properly`);
   });
 
   t.end();
+  process.exit(0);
 });

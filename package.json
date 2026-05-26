@@ -6,7 +6,7 @@
   "scripts": {
     "start": "electron .",
     "package": "electron-packager . OrionAI --platform=win32 --arch=x64 --out=dist --overwrite --icon=assets/icon.ico",
-    "test": "tape tests/**/*.js"
+    "test": "./run_tests.sh"
   },
   "keywords": [
     "orion",

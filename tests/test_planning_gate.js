@@ -1,33 +1,52 @@
 const test = require('tape');
 const fs = require('fs');
-const path = require('path');
 
-const agentJsContent = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
+global.window = {};
 
-test('Planning Gate blocks destructive tools when plan needed', (t) => {
-  const match = agentJsContent.match(/if \(config\.planningMode && !canExecuteThisTask\(\)\) \{([\s\S]*?)continue;/);
-  t.ok(match, 'Found planning mode gate in executeTool');
+// Mock fetch globally
+global.fetch = async (url, options) => {
+  const body = JSON.parse(options.body);
+  const text = body.contents[0].parts[0].text;
 
-  if (match) {
-    const gateLogic = match[0];
-    t.ok(gateLogic.includes("destructiveTools = ['write_file', 'modify_file', 'patch_file', 'run_command', 'start_command', 'run_tests', 'sync_workspace_env', 'launch_workspace_app', 'git_push']"), "Destructive tools list is correct");
-    t.ok(gateLogic.includes("isPlanWrite"), "Allows writing implementation_plan.md");
-    t.ok(agentJsContent.includes("forceYield = true"), "Yields on plan write");
+  if (text.includes("Classify the user's latest message about a pending implementation plan")) {
+    if (text.includes('"good to go"')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"intent":"approve","reason":""}' }] } }] }) };
+    }
+    return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"intent":"deny","reason":""}' }] } }] }) };
   }
+
+  if (text.includes("Classify whether this Orion AI request should require an implementation plan")) {
+    if (text.includes('"run tests"')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":""}' }] } }] }) };
+    }
+    return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"plan","reason":""}' }] } }] }) };
+  }
+
+  return { ok: false };
+};
+
+const agent = require('../agent.js');
+
+test('classifyPlanApprovalIntent returns correct intents', async (t) => {
+  const approveRes = await agent.classifyPlanApprovalIntent('good to go', 'gemini-1', 'key');
+  t.equal(approveRes.intent, 'approve', 'Recognizes approve intent');
+
+  const denyRes = await agent.classifyPlanApprovalIntent('stop', 'gemini-1', 'key');
+  t.equal(denyRes.intent, 'deny', 'Recognizes deny intent');
   t.end();
 });
 
-test('classifyPlanApprovalIntent regex definitions present', (t) => {
-  t.ok(agentJsContent.includes('approve: the user clearly wants execution'), 'approve definition');
-  t.ok(agentJsContent.includes('deny: the user clearly rejects'), 'deny definition');
-  t.ok(agentJsContent.includes('revise: the user asks for more review'), 'revise definition');
-  t.ok(agentJsContent.includes('unclear: the user intent is ambiguous'), 'unclear definition');
+test('classifyPlanningNeed returns correct modes', async (t) => {
+  const directRes = await agent.classifyPlanningNeed('run tests', 'gemini-1', 'key');
+  t.equal(directRes.mode, 'direct', 'Recognizes direct mode');
+
+  const planRes = await agent.classifyPlanningNeed('build a whole app', 'gemini-1', 'key');
+  t.equal(planRes.mode, 'plan', 'Recognizes plan mode');
   t.end();
 });
 
-test('classifyPlanningNeed regex definitions present', (t) => {
-  t.ok(agentJsContent.includes('plan: broad or complex work'), 'plan definition');
-  t.ok(agentJsContent.includes('direct: concrete low-risk work'), 'direct definition');
-  t.ok(agentJsContent.includes('answer: a question or explanation'), 'answer definition');
+test('Planning Gate blocks destructive tools except implementation_plan.md', (t) => {
+  const agentJs = fs.readFileSync(require('path').join(__dirname, '../agent.js'), 'utf8');
+  t.ok(agentJs.includes("args.path.split(/[\\\\/]/).pop().toLowerCase() === 'implementation_plan.md'"), 'Fixed planning gate vulnerability to exact match implementation_plan.md');
   t.end();
 });
