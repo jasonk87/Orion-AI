@@ -4,7 +4,7 @@ const proxyquire = require('proxyquire');
 const main = proxyquire('../main.js', {
   'electron': {
     app: {
-      whenReady: () => Promise.resolve(),
+      whenReady: () => ({ then: () => {} }),
       on: () => {}
     },
     BrowserWindow: class {
@@ -47,6 +47,9 @@ test('startCommandSession runs and killProcessTree kills', (t) => {
   t.ok(main.isDestructiveCommand('echo test | git clean -fdx'), 'Catches git clean -fdx');
   t.ok(main.isDestructiveCommand('del /s /q'), 'Catches del /s /q');
   t.ok(main.isDestructiveCommand('Remove-Item -Recurse -Force'), 'Catches Remove-Item -Recurse');
+  t.deepEqual(main.classifyCommandRequest('npm test', { source: 'freeform' }).category, 'freeform', 'Classifies safe freeform command');
+  t.equal(main.classifyCommandRequest('echo ok && rm -rf .', { source: 'freeform' }).allowed, false, 'Blocks chained destructive command');
+  t.equal(main.classifyCommandRequest('npm start', { source: 'internal' }).category, 'internal', 'Classifies internal command separately');
 
   main.killProcessTree(child, (err) => {
     t.error(err, 'killProcessTree executed without error');

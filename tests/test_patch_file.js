@@ -4,7 +4,7 @@ const proxyquire = require('proxyquire');
 const main = proxyquire('../main.js', {
   'electron': {
     app: {
-      whenReady: () => Promise.resolve(),
+      whenReady: () => ({ then: () => {} }),
       on: () => {}
     },
     BrowserWindow: class {
@@ -52,5 +52,15 @@ test('patch file - replace_range', (t) => {
   const op = { type: 'replace_range', startLine: 2, endLine: 3, content: 'new2\nnew3' };
   const { updated } = main.applyPatch(original, op);
   t.equal(updated, 'line1\nnew2\nnew3\nline4\n');
+  t.end();
+});
+
+test('patch file - proof shows changed range and snippets', (t) => {
+  const original = 'line1\nline2\nline3\nline4\n';
+  const updated = 'line1\nnew2\nnew3\nline4\n';
+  const proof = main.buildPatchProof(original, updated);
+  t.equal(proof.startLine, 2, 'proof starts at first changed line');
+  t.ok(proof.originalSnippet.includes('line2'), 'proof includes original content');
+  t.ok(proof.updatedSnippet.includes('new2'), 'proof includes updated content');
   t.end();
 });

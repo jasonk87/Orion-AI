@@ -29,8 +29,94 @@ function createFileBackup(fullPath, workspaceRoot) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   const backupPath = path.join(backupRoot, `${safeRelative}.${timestamp}.bak`);
   fs.mkdirSync(path.dirname(backupPath), { recursive: true });
-  fs.copyFileSync(fullPath, backupPath);
+  const stat = fs.statSync(fullPath);
+  if (stat.isDirectory()) {
+    fs.cpSync(fullPath, backupPath, { recursive: true });
+  } else {
+    fs.copyFileSync(fullPath, backupPath);
+  }
   return path.relative(workspaceRoot, backupPath);
+}
+
+function getArtifactRoot() {
+  const base = app && app.getPath ? app.getPath('userData') : __dirname;
+  return path.join(base, 'artifacts');
+}
+
+function sanitizeArtifactSegment(value) {
+  return String(value || 'unknown').replace(/[^a-z0-9._-]+/gi, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'unknown';
+}
+
+function writeRunArtifact(payload = {}) {
+  const conversationId = sanitizeArtifactSegment(payload.conversationId);
+  const runId = sanitizeArtifactSegment(payload.runId || new Date().toISOString());
+  const artifactDir = path.join(getArtifactRoot(), conversationId);
+  fs.mkdirSync(artifactDir, { recursive: true });
+  const artifactPath = path.join(artifactDir, `${runId}.json`);
+  fs.writeFileSync(artifactPath, JSON.stringify({
+    createdAt: new Date().toISOString(),
+    ...payload
+  }, null, 2), 'utf8');
+  return artifactPath;
+}
+
+function listRunArtifacts(conversationId) {
+  const root = getArtifactRoot();
+  const entries = [];
+  if (!fs.existsSync(root)) return entries;
+  const conversationDirs = conversationId
+    ? [sanitizeArtifactSegment(conversationId)]
+    : fs.readdirSync(root).filter(name => fs.statSync(path.join(root, name)).isDirectory());
+  conversationDirs.forEach(dirName => {
+    const dirPath = path.join(root, dirName);
+    if (!fs.existsSync(dirPath)) return;
+    fs.readdirSync(dirPath).filter(name => name.endsWith('.json')).forEach(fileName => {
+      const fullPath = path.join(dirPath, fileName);
+      const stat = fs.statSync(fullPath);
+      entries.push({
+        conversationId: dirName,
+        fileName,
+        artifactPath: fullPath,
+        createdAt: stat.mtime.toISOString(),
+        size: stat.size
+      });
+    });
+  });
+  return entries.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, 50);
+}
+
+function deleteWorkspacePath(workspacePath, relativePath) {
+  const workspaceRoot = path.resolve(workspacePath);
+  const fullPath = resolveWorkspacePath(workspacePath, relativePath);
+  if (!fs.existsSync(fullPath)) throw new Error('Path does not exist');
+  const backupPath = createFileBackup(fullPath, workspaceRoot);
+  fs.rmSync(fullPath, { recursive: true, force: false });
+  return { success: true, backupPath };
+}
+
+function moveWorkspacePath(workspacePath, fromPath, toPath) {
+  const fromFullPath = resolveWorkspacePath(workspacePath, fromPath);
+  const toFullPath = resolveWorkspacePath(workspacePath, toPath);
+  if (!fs.existsSync(fromFullPath)) throw new Error('Source path does not exist');
+  if (fs.existsSync(toFullPath)) throw new Error('Destination already exists');
+  fs.mkdirSync(path.dirname(toFullPath), { recursive: true });
+  fs.renameSync(fromFullPath, toFullPath);
+  return { success: true };
+}
+
+function copyWorkspacePath(workspacePath, fromPath, toPath) {
+  const fromFullPath = resolveWorkspacePath(workspacePath, fromPath);
+  const toFullPath = resolveWorkspacePath(workspacePath, toPath);
+  if (!fs.existsSync(fromFullPath)) throw new Error('Source path does not exist');
+  if (fs.existsSync(toFullPath)) throw new Error('Destination already exists');
+  fs.mkdirSync(path.dirname(toFullPath), { recursive: true });
+  const stat = fs.statSync(fromFullPath);
+  if (stat.isDirectory()) {
+    fs.cpSync(fromFullPath, toFullPath, { recursive: true });
+  } else {
+    fs.copyFileSync(fromFullPath, toFullPath);
+  }
+  return { success: true };
 }
 
 function createWindow() {
@@ -118,12 +204,12 @@ function ensureCompanionToken(config) {
   return config.phoneCompanionToken;
 }
 
-function companionManifest(token) {
+function companionManifest() {
   return {
     name: 'Orion AI Phone Companion',
     short_name: 'Orion',
     description: 'Control Orion AI from your phone on your local Wi-Fi.',
-    start_url: `/?token=${encodeURIComponent(token)}`,
+    start_url: '/',
     scope: '/',
     display: 'standalone',
     background_color: '#09090d',
@@ -146,8 +232,8 @@ self.addEventListener('activate', event => {
 });
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
-  if (url.pathname.startsWith('/api/')) return;
-  event.respondWith(fetch(event.request).catch(() => caches.match(event.request).then(response => response || caches.match('/'))));
+  if (url.pathname.startsWith('/api/') || url.pathname === '/' || url.pathname === '/manifest.webmanifest' || url.pathname === '/sw.js') return;
+  event.respondWith(fetch(event.request).catch(() => caches.match(event.request)));
 });`;
 }
 
@@ -199,6 +285,8 @@ function companionHtml(token) {
     .context-row { display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--muted); font-size:.75rem; }
     .model { color:var(--text); font-weight:700; }
     .substatus { margin-top:8px; color:var(--accent); font-size:.76rem; min-height:18px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .queue-line { margin-top:6px; color:var(--muted); font-size:.72rem; }
+    .output-panel { margin-bottom:12px; padding:10px; border:1px solid rgba(255,255,255,.08); border-radius:12px; background:rgba(12,12,18,.72); color:var(--muted); font-size:.74rem; line-height:1.35; max-height:120px; overflow:auto; white-space:pre-wrap; }
     .install-tip { display:none; margin-top:10px; padding:9px 10px; border:1px dashed rgba(167,139,250,.36); border-radius:12px; color:#ddd6fe; background:rgba(167,139,250,.09); font-size:.76rem; line-height:1.35; }
     .install-tip.visible { display:block; }
     main { position:relative; z-index:1; padding:14px; }
@@ -222,6 +310,8 @@ function companionHtml(token) {
     textarea:focus { border-color:rgba(167,139,250,.58); box-shadow:0 0 0 3px rgba(167,139,250,.12); }
     button { border:0; border-radius:14px; background:var(--accent-strong); color:#fff; font-weight:850; font-size:.9rem; min-height:48px; padding:0 15px; box-shadow:0 12px 26px rgba(139,92,246,.28); }
     .send-button { flex:0 0 auto; min-width:72px; }
+    .control-row { display:flex; gap:8px; margin-bottom:12px; }
+    .control-row button { flex:1; min-height:38px; border-radius:12px; background:rgba(18,17,28,.94); border:1px solid rgba(167,139,250,.22); color:var(--text); box-shadow:none; }
     .approve-button { width:100%; background:#f59e0b; box-shadow:0 12px 26px rgba(245,158,11,.18); }
     button:disabled { opacity:.55; }
     .empty { color:var(--muted); text-align:center; padding:54px 12px; }
@@ -242,7 +332,10 @@ function companionHtml(token) {
       </div>
     </header>
     <main>
-      <section class="plan-panel" id="plan-panel"><div class="plan-title">Plan waiting for approval</div><div class="plan-copy">Review the latest plan in chat. Start it here when the direction looks right.</div><button class="approve-button" id="approve-plan" type="button">Start Implementation</button></section>
+      <section class="plan-panel" id="plan-panel"><div class="plan-title">Plan waiting for approval</div><div class="plan-copy">Review the latest plan in chat. Start it here when the direction looks right.</div><button class="approve-button" id="approve-plan" type="button">Start Implementation</button><div class="control-row"><button id="deny-plan" type="button">Deny</button><button id="revise-plan" type="button">Revise</button></div></section>
+      <div class="control-row"><button id="refresh-state" type="button">Refresh</button><button id="stop-task" type="button">Pause / Stop</button><button id="resume-task" type="button">Resume</button></div>
+      <div class="queue-line" id="queue-line"></div>
+      <div class="output-panel" id="latest-output">Latest output will appear here.</div>
       <div class="task-strip" id="tasks"></div>
       <div class="messages" id="messages"><div class="empty">Loading conversation...</div></div>
     </main>
@@ -258,7 +351,14 @@ function companionHtml(token) {
     const installTipEl = document.getElementById('install-tip');
     const planPanelEl = document.getElementById('plan-panel');
     const approvePlanEl = document.getElementById('approve-plan');
+    const denyPlanEl = document.getElementById('deny-plan');
+    const revisePlanEl = document.getElementById('revise-plan');
+    const refreshStateEl = document.getElementById('refresh-state');
+    const stopTaskEl = document.getElementById('stop-task');
+    const resumeTaskEl = document.getElementById('resume-task');
     const tasksEl = document.getElementById('tasks');
+    const queueLineEl = document.getElementById('queue-line');
+    const latestOutputEl = document.getElementById('latest-output');
     const form = document.getElementById('prompt-form');
     const promptEl = document.getElementById('prompt');
     const sendEl = document.getElementById('send');
@@ -275,6 +375,8 @@ function companionHtml(token) {
         statusPillEl.textContent = state.running ? 'Working' : 'Ready';
         statusPillEl.classList.toggle('running', !!state.running);
         statusEl.textContent = state.subStatus || state.workspace || '';
+        queueLineEl.textContent = state.queuedPrompts ? (state.queuedPrompts + ' queued prompt(s): ' + (state.queuedPromptPreview || []).join(' | ')) : '';
+        latestOutputEl.textContent = state.latestOutput || 'Latest output will appear here.';
         planPanelEl.classList.toggle('visible', !!state.awaitingPlanApproval);
         tasksEl.innerHTML = Array.isArray(state.tasks) && state.tasks.length ? state.tasks.map(task => '<span class="task-chip ' + taskClass(task.status) + '">' + escapeHtml(task.title || 'Task') + '</span>').join('') : '';
         const signature = JSON.stringify({ running: state.running, subStatus: state.subStatus, plan: state.awaitingPlanApproval, tasks: state.tasks, messages: state.messages });
@@ -301,6 +403,49 @@ function companionHtml(token) {
         statusEl.textContent = error.message;
       } finally {
         approvePlanEl.disabled = false;
+      }
+    });
+    denyPlanEl.addEventListener('click', async () => {
+      const res = await fetch('/api/deny-plan?token=' + encodeURIComponent(token), { method: 'POST' });
+      const data = await res.json();
+      if (!data.success) statusEl.textContent = data.error || 'Deny failed';
+      await loadState();
+    });
+    revisePlanEl.addEventListener('click', async () => {
+      const feedback = prompt('Revision note for Orion:', 'Revise the plan before implementing.');
+      if (!feedback) return;
+      const res = await fetch('/api/revise-plan?token=' + encodeURIComponent(token), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ feedback }) });
+      const data = await res.json();
+      if (!data.success) statusEl.textContent = data.error || 'Revision failed';
+      await loadState();
+    });
+    refreshStateEl.addEventListener('click', loadState);
+    stopTaskEl.addEventListener('click', async () => {
+      stopTaskEl.disabled = true;
+      statusEl.textContent = 'Stopping active work...';
+      try {
+        const res = await fetch('/api/stop?token=' + encodeURIComponent(token), { method: 'POST' });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Stop failed');
+        await loadState();
+      } catch (error) {
+        statusEl.textContent = error.message;
+      } finally {
+        stopTaskEl.disabled = false;
+      }
+    });
+    resumeTaskEl.addEventListener('click', async () => {
+      resumeTaskEl.disabled = true;
+      statusEl.textContent = 'Resuming work...';
+      try {
+        const res = await fetch('/api/resume?token=' + encodeURIComponent(token), { method: 'POST' });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Resume failed');
+        await loadState();
+      } catch (error) {
+        statusEl.textContent = error.message;
+      } finally {
+        resumeTaskEl.disabled = false;
       }
     });
     form.addEventListener('submit', async (event) => {
@@ -380,6 +525,19 @@ function runGitCommand(cwd, args, timeoutMs = 30000) {
   });
 }
 
+function spawnInternalCommand(workspacePath, executable, args = []) {
+  if (!executable) throw new Error('Missing executable');
+  const child = spawn(executable, args, {
+    cwd: workspacePath,
+    env: { ...process.env, PAGER: 'cat' },
+    windowsHide: true,
+    detached: true,
+    stdio: 'ignore'
+  });
+  child.unref();
+  return child;
+}
+
 async function callRendererFunction(functionName, arg) {
   if (!mainWindow || mainWindow.isDestroyed()) throw new Error('Orion window is not ready');
   const script = arg === undefined
@@ -412,18 +570,6 @@ function startPhoneCompanionServer() {
         return;
       }
 
-      if (req.method === 'GET' && url.pathname === '/manifest.webmanifest') {
-        res.writeHead(200, { 'Content-Type': 'application/manifest+json; charset=utf-8', 'Cache-Control': 'no-store' });
-        res.end(JSON.stringify(companionManifest(companionToken), null, 2));
-        return;
-      }
-
-      if (req.method === 'GET' && url.pathname === '/sw.js') {
-        res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store', 'Service-Worker-Allowed': '/' });
-        res.end(companionServiceWorker());
-        return;
-      }
-
       if (req.method === 'GET' && url.pathname === '/icon.svg') {
         res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Cache-Control': 'public, max-age=86400' });
         res.end(companionIconSvg());
@@ -432,6 +578,18 @@ function startPhoneCompanionServer() {
 
       if (url.searchParams.get('token') !== companionToken) {
         sendJson(res, 401, { success: false, error: 'Unauthorized companion request' });
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/manifest.webmanifest') {
+        res.writeHead(200, { 'Content-Type': 'application/manifest+json; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(companionManifest(), null, 2));
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/sw.js') {
+        res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store', 'Service-Worker-Allowed': '/' });
+        res.end(companionServiceWorker());
         return;
       }
 
@@ -456,6 +614,32 @@ function startPhoneCompanionServer() {
 
       if (req.method === 'POST' && url.pathname === '/api/approve-plan') {
         const result = await callRendererFunction('approvePhoneCompanionPlan');
+        sendJson(res, 200, { success: true, ...result });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/deny-plan') {
+        const result = await callRendererFunction('denyPhoneCompanionPlan');
+        sendJson(res, 200, { success: true, ...result });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/revise-plan') {
+        const bodyText = await readRequestBody(req);
+        const body = bodyText ? JSON.parse(bodyText) : {};
+        const result = await callRendererFunction('revisePhoneCompanionPlan', String(body.feedback || '').trim());
+        sendJson(res, 200, { success: true, ...result });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/stop') {
+        const result = await callRendererFunction('stopPhoneCompanionTask');
+        sendJson(res, 200, { success: true, ...result });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/resume') {
+        const result = await callRendererFunction('resumePhoneCompanionTask');
         sendJson(res, 200, { success: true, ...result });
         return;
       }
@@ -567,7 +751,11 @@ ipcMain.handle('launch-workspace-app', async (event, workspacePath) => {
       }
       
       if (cmd) {
-        launchCommandInWorkspace(workspacePath, cmd);
+        if (cmd === 'npm start') {
+          launchInternalCommandInWorkspace(workspacePath, 'npm', ['start']);
+        } else {
+          launchInternalCommandInWorkspace(workspacePath, 'npm', ['run', 'dev']);
+        }
         return { success: true, message: `Started background server with command: "${cmd}"` };
       }
     }
@@ -576,19 +764,19 @@ ipcMain.handle('launch-workspace-app', async (event, workspacePath) => {
     const pythonFiles = ['main.py', 'app.py', 'index.py', 'game.py'];
     const foundPy = pythonFiles.find(f => files.includes(f));
     if (foundPy) {
-      launchCommandInWorkspace(workspacePath, `python ${foundPy}`);
+      launchInternalCommandInWorkspace(workspacePath, 'python', [foundPy]);
       return { success: true, message: `Started Python application: "python ${foundPy}"` };
     }
     
     // 4. Check for Cargo.toml (Rust)
     if (files.includes('Cargo.toml')) {
-      launchCommandInWorkspace(workspacePath, 'cargo run');
+      launchInternalCommandInWorkspace(workspacePath, 'cargo', ['run']);
       return { success: true, message: 'Started Cargo application: "cargo run"' };
     }
     
     // 5. Check for Go files
     if (files.includes('go.mod') || files.some(f => f.endsWith('.go'))) {
-      launchCommandInWorkspace(workspacePath, 'go run .');
+      launchInternalCommandInWorkspace(workspacePath, 'go', ['run', '.']);
       return { success: true, message: 'Started Go application: "go run ."' };
     }
     
@@ -645,6 +833,10 @@ function launchCommandInWorkspace(workspacePath, command) {
   } else {
     spawn('bash', ['-lc', command], { cwd: workspacePath, detached: true, stdio: 'ignore' });
   }
+}
+
+function launchInternalCommandInWorkspace(workspacePath, executable, args = []) {
+  spawnInternalCommand(workspacePath, executable, args);
 }
 
 ipcMain.handle('get-workspace-entrypoint', async (event, workspacePath) => {
@@ -784,6 +976,46 @@ ipcMain.handle('read-file', async (event, { workspacePath, relativePath, options
   }
 });
 
+ipcMain.handle('delete-path', async (event, { workspacePath, relativePath }) => {
+  try {
+    return deleteWorkspacePath(workspacePath, relativePath);
+  } catch (e) {
+    console.error('Error deleting path:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('move-path', async (event, { workspacePath, fromPath, toPath }) => {
+  try {
+    return moveWorkspacePath(workspacePath, fromPath, toPath);
+  } catch (e) {
+    console.error('Error moving path:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('rename-path', async (event, { workspacePath, relativePath, newName }) => {
+  try {
+    const safeName = String(newName || '').trim();
+    if (!safeName || /[\\/]/.test(safeName)) throw new Error('Rename requires a plain file or folder name');
+    const parent = path.dirname(relativePath);
+    const toPath = parent === '.' ? safeName : path.join(parent, safeName);
+    return moveWorkspacePath(workspacePath, relativePath, toPath);
+  } catch (e) {
+    console.error('Error renaming path:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('copy-path', async (event, { workspacePath, fromPath, toPath }) => {
+  try {
+    return copyWorkspacePath(workspacePath, fromPath, toPath);
+  } catch (e) {
+    console.error('Error copying path:', e);
+    return { success: false, error: e.message };
+  }
+});
+
 ipcMain.handle('write-file', async (event, { workspacePath, relativePath, content }) => {
   try {
     const workspaceRoot = path.resolve(workspacePath);
@@ -858,6 +1090,31 @@ function applyPatch(original, operation) {
   return { updated, details };
 }
 
+function buildPatchProof(original, updated) {
+  const originalLines = String(original).split(/\r?\n/);
+  const updatedLines = String(updated).split(/\r?\n/);
+  let start = 0;
+  while (start < originalLines.length && start < updatedLines.length && originalLines[start] === updatedLines[start]) {
+    start++;
+  }
+  let endOriginal = originalLines.length - 1;
+  let endUpdated = updatedLines.length - 1;
+  while (endOriginal >= start && endUpdated >= start && originalLines[endOriginal] === updatedLines[endUpdated]) {
+    endOriginal--;
+    endUpdated--;
+  }
+  const contextStart = Math.max(start - 2, 0);
+  const contextEndOriginal = Math.min(endOriginal + 2, originalLines.length - 1);
+  const contextEndUpdated = Math.min(endUpdated + 2, updatedLines.length - 1);
+  return {
+    startLine: start + 1,
+    originalEndLine: Math.max(endOriginal + 1, start + 1),
+    updatedEndLine: Math.max(endUpdated + 1, start + 1),
+    originalSnippet: originalLines.slice(contextStart, contextEndOriginal + 1).join('\n'),
+    updatedSnippet: updatedLines.slice(contextStart, contextEndUpdated + 1).join('\n')
+  };
+}
+
 ipcMain.handle('patch-file', async (event, { workspacePath, relativePath, operation }) => {
   try {
     if (!operation || !operation.type) throw new Error('Missing patch operation');
@@ -874,10 +1131,29 @@ ipcMain.handle('patch-file', async (event, { workspacePath, relativePath, operat
 
     const backupPath = createFileBackup(fullPath, workspaceRoot);
     fs.writeFileSync(fullPath, updated, 'utf8');
-    return { success: true, changed: true, message: `Patched ${relativePath} successfully.`, details, backupPath };
+    return { success: true, changed: true, message: `Patched ${relativePath} successfully.`, details, proof: buildPatchProof(original, updated), backupPath };
   } catch (e) {
     console.error('Error patching file:', e);
     return { error: e.message };
+  }
+});
+
+ipcMain.handle('write-run-artifact', async (event, payload) => {
+  try {
+    const artifactPath = writeRunArtifact(payload || {});
+    return { success: true, artifactPath };
+  } catch (e) {
+    console.error('Error writing run artifact:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('list-run-artifacts', async (event, conversationId) => {
+  try {
+    return { success: true, artifacts: listRunArtifacts(conversationId) };
+  } catch (e) {
+    console.error('Error listing run artifacts:', e);
+    return { success: false, error: e.message, artifacts: [] };
   }
 });
 
@@ -1035,11 +1311,21 @@ function isDestructiveCommand(command) {
   return DESTRUCTIVE_PATTERNS.some(pattern => pattern.test(command));
 }
 
+function classifyCommandRequest(command, options = {}) {
+  const text = String(command || '');
+  const source = options.source || 'freeform';
+  if (!text.trim()) return { category: source, allowed: false, reason: 'Missing command' };
+  if (source === 'internal') return { category: 'internal', allowed: true, reason: 'Internal executable/args command' };
+  if (isDestructiveCommand(text)) return { category: 'destructive', allowed: false, reason: 'Command matches destructive deny rules' };
+  return { category: 'freeform', allowed: true, reason: 'Allowed freeform terminal command' };
+}
+
 function startCommandSession({ command, cwd, processId, timeoutMs }) {
   if (!command) throw new Error('Missing command');
 
-  if (isDestructiveCommand(command)) {
-    throw new Error('Command is in the deny-list and cannot be executed.');
+  const classification = classifyCommandRequest(command, { source: 'freeform' });
+  if (!classification.allowed) {
+    throw new Error(classification.reason);
   }
 
   if (!processId) processId = 'cmd_' + Date.now();
@@ -1061,7 +1347,8 @@ function startCommandSession({ command, cwd, processId, timeoutMs }) {
     timedOut: false,
     killed: false,
     stdout: '',
-    stderr: ''
+    stderr: '',
+    commandCategory: classification.category
   };
   const child = spawn(shell, [...shellArgs, command], {
     cwd: cwd,
@@ -1129,6 +1416,7 @@ function commandSessionSummary(session, maxChars = 8000) {
     startedAt: session.startedAt,
     finishedAt: session.finishedAt,
     timeoutMs: session.timeoutMs,
+    commandCategory: session.commandCategory,
     exitCode: session.exitCode,
     error: session.error,
     timedOut: session.timedOut,
@@ -1223,12 +1511,21 @@ if (process.env.NODE_ENV === 'test') {
     killProcessTree,
     startPhoneCompanionServer,
     ensureCompanionToken,
+    writeRunArtifact,
+    resolveWorkspacePath,
+    deleteWorkspacePath,
+    moveWorkspacePath,
+    copyWorkspacePath,
+    listRunArtifacts,
+    classifyCommandRequest,
+    spawnInternalCommand,
     getCompanionServer: () => companionServer
   };
 }
 
 if (process.env.NODE_ENV === 'test') {
   module.exports.applyPatch = applyPatch;
+  module.exports.buildPatchProof = buildPatchProof;
 }
 
 if (process.env.NODE_ENV === 'test') {

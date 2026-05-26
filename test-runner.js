@@ -3,7 +3,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 const testsDir = path.join(__dirname, 'tests');
-const testFiles = fs.readdirSync(testsDir).filter(f => f.endsWith('.js'));
+const testFiles = fs.readdirSync(testsDir).filter(f => f.endsWith('.js')).sort();
 
 async function runTests() {
   for (const file of testFiles) {
@@ -16,10 +16,18 @@ async function runTests() {
         stdio: 'inherit'
       });
 
-      const to = setTimeout(() => { child.kill('SIGKILL'); resolve(); }, 3000);
+      let timedOut = false;
+      const to = setTimeout(() => {
+        timedOut = true;
+        child.kill('SIGKILL');
+      }, 10000);
 
       child.on('close', code => {
         clearTimeout(to);
+        if (timedOut) {
+          reject(new Error(`Test ${file} timed out`));
+          return;
+        }
         if (code === 0 || code === null) {
           resolve();
         } else {

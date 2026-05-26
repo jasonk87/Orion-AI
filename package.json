@@ -21,10 +21,10 @@
     "marked": "^12.0.1"
   },
   "devDependencies": {
-    "electron": "^30.0.1",
+    "electron": "^42.2.0",
     "electron-packager": "^17.1.2",
     "proxyquire": "^2.1.3",
-    "sinon": "^19.0.2",
+    "sinon": "^22.0.0",
     "tape": "^5.9.0"
   }
 }

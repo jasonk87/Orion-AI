@@ -4,7 +4,7 @@ const proxyquire = require('proxyquire');
 const main = proxyquire('../main.js', {
   'electron': {
     app: {
-      whenReady: () => Promise.resolve(),
+      whenReady: () => ({ then: () => {} }),
       on: () => {}
     },
     BrowserWindow: class {

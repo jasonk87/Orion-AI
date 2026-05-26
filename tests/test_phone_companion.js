@@ -4,7 +4,7 @@ const proxyquire = require('proxyquire').noPreserveCache();
 
 const electronMock = {
   app: {
-    whenReady: () => Promise.resolve(),
+    whenReady: () => ({ then: () => {} }),
     on: () => {}
   },
   BrowserWindow: class {
@@ -55,7 +55,8 @@ test('Phone Companion API Security (127.0.0.1)', (t) => {
     existsSync: (p) => true,
     readFileSync: (p, e) => JSON.stringify({
       enablePhoneCompanion: false,
-      phoneCompanionPort: 1126 // Different port to avoid EADDRINUSE just in case
+      phoneCompanionPort: 1126, // Different port to avoid EADDRINUSE just in case
+      phoneCompanionToken: '1234567890123456'
     })
   };
   const main = proxyquire('../main.js', { 'electron': electronMock, 'fs': fsMock });
@@ -73,21 +74,54 @@ test('Phone Companion API Security (127.0.0.1)', (t) => {
         http.get('http://127.0.0.1:1126/api/approve-plan', (res3) => {
           t.equal(res3.statusCode, 401, 'Returns 401 for missing token on /api/approve-plan');
 
+          http.get('http://127.0.0.1:1126/api/stop', (resStop) => {
+            t.equal(resStop.statusCode, 401, 'Returns 401 for missing token on /api/stop');
+
+          http.get('http://127.0.0.1:1126/api/resume', (resResume) => {
+            t.equal(resResume.statusCode, 401, 'Returns 401 for missing token on /api/resume');
+
+          http.get('http://127.0.0.1:1126/api/deny-plan', (resDeny) => {
+            t.equal(resDeny.statusCode, 401, 'Returns 401 for missing token on /api/deny-plan');
+
+          http.get('http://127.0.0.1:1126/api/revise-plan', (resRevise) => {
+            t.equal(resRevise.statusCode, 401, 'Returns 401 for missing token on /api/revise-plan');
+
           http.get('http://127.0.0.1:1126/?token=invalid', (res4) => {
             t.equal(res4.statusCode, 401, 'Returns 401 for invalid token on root');
 
-            const server = main.getCompanionServer();
-            if (server) {
-              const address = server.address();
-              t.ok(address, 'Server has bound address');
-              t.equal(address.address, '127.0.0.1', 'Server is strictly bound to 127.0.0.1 when enablePhoneCompanion is false');
-              server.close(() => {
-                 t.end();
+            http.get('http://127.0.0.1:1126/manifest.webmanifest', (res5) => {
+              t.equal(res5.statusCode, 401, 'Returns 401 for missing token on manifest');
+
+              http.get('http://127.0.0.1:1126/sw.js', (res6) => {
+                t.equal(res6.statusCode, 401, 'Returns 401 for missing token on service worker');
+
+                http.get('http://127.0.0.1:1126/manifest.webmanifest?token=1234567890123456', (res7) => {
+                  let body = '';
+                  res7.on('data', chunk => { body += chunk; });
+                  res7.on('end', () => {
+                    t.equal(res7.statusCode, 200, 'Returns manifest for valid token');
+                    t.notOk(body.includes('1234567890123456'), 'Manifest does not leak companion token');
+
+                    const server = main.getCompanionServer();
+                    if (server) {
+                      const address = server.address();
+                      t.ok(address, 'Server has bound address');
+                      t.equal(address.address, '127.0.0.1', 'Server is strictly bound to 127.0.0.1 when enablePhoneCompanion is false');
+                      server.close(() => {
+                         t.end();
+                      });
+                    } else {
+                         t.fail('Server not running');
+                         t.end();
+                    }
+                  });
+                });
               });
-            } else {
-                 t.fail('Server not running');
-                 t.end();
-            }
+            });
+          });
+          });
+          });
+          });
           });
         });
       });

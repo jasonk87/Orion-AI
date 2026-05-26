@@ -1,6 +1,4 @@
 const test = require('tape');
-const fs = require('fs');
-
 global.window = {};
 
 // Mock fetch globally
@@ -65,8 +63,24 @@ test('classifyPlanningNeed returns correct modes', async (t) => {
   t.end();
 });
 
-test('Planning Gate blocks destructive tools except implementation_plan.md', (t) => {
-  const agentJs = fs.readFileSync(require('path').join(__dirname, '../agent.js'), 'utf8');
-  t.ok(agentJs.includes("args.path.split(/[\\\\/]/).pop().toLowerCase() === 'implementation_plan.md'"), 'Fixed planning gate vulnerability to exact match implementation_plan.md');
+test('Planning Gate behavior blocks destructive tools except implementation_plan.md', (t) => {
+  const config = { planningMode: true };
+
+  const readGate = agent.getPlanningToolGate(config, false, 'read_file', { path: 'app.js' });
+  t.equal(readGate.allowed, true, 'allows non-destructive read before approval');
+
+  const planGate = agent.getPlanningToolGate(config, false, 'write_file', { path: 'plans/implementation_plan.md' });
+  t.equal(planGate.allowed, true, 'allows exact implementation_plan.md write before approval');
+  t.equal(planGate.forceYield, true, 'plan write forces pause/yield');
+
+  const bypassGate = agent.getPlanningToolGate(config, false, 'write_file', { path: 'implementation_plan.md.bak' });
+  t.equal(bypassGate.allowed, false, 'blocks filename suffix bypass');
+
+  const commandGate = agent.getPlanningToolGate(config, false, 'run_command', { command: 'npm test' });
+  t.equal(commandGate.allowed, false, 'blocks command execution before approval');
+
+  const approvedGate = agent.getPlanningToolGate(config, true, 'run_command', { command: 'npm test' });
+  t.equal(approvedGate.allowed, true, 'allows destructive tools after approval/direct classification');
+
   t.end();
 });
