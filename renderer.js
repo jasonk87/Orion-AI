@@ -372,17 +372,29 @@ async function setWorkspace(folderPath) {
 // PROJECTS LIST STORAGE & MANAGEMENT
 function loadProjectsFromStorage() {
   const raw = localStorage.getItem('ag2_projects');
-  if (raw) {
+  const backup = localStorage.getItem('ag2_projects_backup');
+  try {
+    projects = JSON.parse(raw);
+    if (!Array.isArray(projects)) throw new Error('Not an array');
+  } catch (e) {
+    console.warn("Failed to parse ag2_projects, trying backup", e);
     try {
-      projects = JSON.parse(raw);
-    } catch (e) {
+      projects = JSON.parse(backup);
+      if (!Array.isArray(projects)) throw new Error('Not an array');
+    } catch (e2) {
       projects = [];
     }
   }
 }
 
 function saveProjectsToStorage() {
-  localStorage.setItem('ag2_projects', JSON.stringify(projects));
+  try {
+    const serialized = JSON.stringify(projects);
+    localStorage.setItem('ag2_projects', serialized);
+    localStorage.setItem('ag2_projects_backup', serialized);
+  } catch (e) {
+    console.error("Failed to save projects to storage", e);
+  }
 }
 
 // PROJECTS LIST ARCHITECTURE COMPLETED - DUPES REMOVED
@@ -808,10 +820,16 @@ function createNewConversationUnderProject(projectPath) {
 
 function loadConversationsFromStorage() {
   const raw = localStorage.getItem('ag2_conversations');
-  if (raw) {
+  const backup = localStorage.getItem('ag2_conversations_backup');
+  try {
+    conversations = JSON.parse(raw);
+    if (!Array.isArray(conversations)) throw new Error('Not an array');
+  } catch(e) {
+    console.warn("Failed to parse ag2_conversations, trying backup", e);
     try {
-      conversations = JSON.parse(raw);
-    } catch(e) {
+      conversations = JSON.parse(backup);
+      if (!Array.isArray(conversations)) throw new Error('Not an array');
+    } catch (e2) {
       conversations = [];
     }
   }
@@ -839,7 +857,13 @@ function migrateConversations() {
 }
 
 function saveConversationsToStorage() {
-  localStorage.setItem('ag2_conversations', JSON.stringify(conversations));
+  try {
+    const serialized = JSON.stringify(conversations);
+    localStorage.setItem('ag2_conversations', serialized);
+    localStorage.setItem('ag2_conversations_backup', serialized);
+  } catch (e) {
+    console.error("Failed to save conversations to storage", e);
+  }
 }
 
 function renderConversationList() {

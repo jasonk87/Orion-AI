@@ -85,7 +85,16 @@ function readAppConfig() {
 
 function writeAppConfig(config) {
   const configPath = path.join(__dirname, 'config.json');
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+  const tempPath = path.join(__dirname, 'config.tmp.json');
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(config, null, 2), 'utf8');
+    fs.renameSync(tempPath, configPath);
+  } catch (e) {
+    console.error('Error writing config:', e);
+    if (fs.existsSync(tempPath)) {
+      try { fs.unlinkSync(tempPath); } catch(err) {}
+    }
+  }
 }
 
 function getLocalWifiAddress() {
@@ -385,6 +394,8 @@ function startPhoneCompanionServer() {
   if (companionServer) return;
   const config = readAppConfig();
   const port = Number(config.phoneCompanionPort || 1122);
+  const enableCompanion = config.enablePhoneCompanion === true;
+  const host = enableCompanion ? '0.0.0.0' : '127.0.0.1';
   companionToken = ensureCompanionToken(config);
 
   companionServer = http.createServer(async (req, res) => {
@@ -455,10 +466,10 @@ function startPhoneCompanionServer() {
     }
   });
 
-  companionServer.listen(port, '0.0.0.0', () => {
-    const address = getLocalWifiAddress();
+  companionServer.listen(port, host, () => {
+    const address = enableCompanion ? getLocalWifiAddress() : '127.0.0.1';
     const url = `http://${address}:${port}/?token=${companionToken}`;
-    console.log(`Orion phone companion listening at ${url}`);
+    console.log(`Orion phone companion listening at ${url} (Host: ${host})`);
     setTimeout(() => {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.executeJavaScript(
@@ -621,8 +632,11 @@ function escapePowerShellSingle(value) {
 function launchCommandInWorkspace(workspacePath, command) {
   if (process.platform === 'win32') {
     const commandText = `Set-Location -LiteralPath '${escapePowerShellSingle(workspacePath)}'; ${command}`;
-    const runCmd = `Start-Process powershell -ArgumentList '-NoExit', '-Command', '${escapePowerShellSingle(commandText)}'`;
-    exec(runCmd);
+    spawn('powershell.exe', [
+      '-NoProfile',
+      '-Command',
+      `Start-Process powershell -ArgumentList '-NoExit', '-Command', '${escapePowerShellSingle(commandText)}'`
+    ], { windowsHide: true, detached: true, stdio: 'ignore' });
   } else {
     spawn('bash', ['-lc', command], { cwd: workspacePath, detached: true, stdio: 'ignore' });
   }
@@ -962,28 +976,47 @@ function killProcessTree(child, callback) {
   }
 
   if (process.platform === 'win32') {
-    exec(`taskkill /PID ${child.pid} /T /F`, (error) => {
-      if (error) {
+    spawn('taskkill', ['/PID', child.pid, '/T', '/F'], { windowsHide: true }).on('close', (code) => {
+      if (code !== 0) {
         try { child.kill(); } catch (e) {}
       }
-      if (callback) callback(error);
+      if (callback) callback(code !== 0 ? new Error('Taskkill failed') : null);
     });
     return;
   }
 
   try {
-    child.kill('SIGTERM');
-  } catch (e) {}
+    if (child.pid) {
+      process.kill(-child.pid, 'SIGTERM');
+    } else {
+      child.kill('SIGTERM');
+    }
+  } catch (e) {
+    try { child.kill('SIGTERM'); } catch(e2) {}
+  }
   setTimeout(() => {
     try {
-      if (!child.killed) child.kill('SIGKILL');
+      if (!child.killed) {
+        if (child.pid) {
+          process.kill(-child.pid, 'SIGKILL');
+        } else {
+          child.kill('SIGKILL');
+        }
+      }
     } catch (e) {}
     if (callback) callback();
   }, 1000);
 }
 
+const DESTRUCTIVE_COMMANDS = ['rm -rf /', 'mkfs', 'format'];
+
 function startCommandSession({ command, cwd, processId, timeoutMs }) {
   if (!command) throw new Error('Missing command');
+
+  if (DESTRUCTIVE_COMMANDS.some(cmd => command.trim().startsWith(cmd))) {
+    throw new Error('Command is in the deny-list and cannot be executed.');
+  }
+
   if (!processId) processId = 'cmd_' + Date.now();
   
   const shell = process.platform === 'win32' ? 'powershell.exe' : 'bash';
@@ -1008,7 +1041,8 @@ function startCommandSession({ command, cwd, processId, timeoutMs }) {
   const child = spawn(shell, [...shellArgs, command], {
     cwd: cwd,
     env: { ...process.env, PAGER: 'cat' },
-    windowsHide: true
+    windowsHide: true,
+    detached: process.platform !== 'win32'
   });
   
   registerCommandSession(processId, session, child);
@@ -1156,3 +1190,14 @@ ipcMain.handle('kill-commands-for-conversation', (event, conversationId) => {
   });
   return { success: true, killed };
 });
+
+if (process.env.NODE_ENV === 'test') {
+  module.exports = {
+    escapePowerShellSingle,
+    startCommandSession,
+    killProcessTree,
+    startPhoneCompanionServer,
+    ensureCompanionToken,
+    getCompanionServer: () => companionServer
+  };
+}
