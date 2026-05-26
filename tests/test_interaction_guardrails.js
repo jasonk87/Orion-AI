@@ -21,7 +21,18 @@ test('steering and scheduled follow-ups are not persisted as fake user messages'
   t.notOk(/role:\s*'user'[^}]+Steering/.test(rendererJs), 'steering is not stored as a user message');
   t.ok(agentJs.includes("nextTask.source === 'followup'"), 'follow-up queue items are detected');
   t.ok(agentJs.includes("Executing scheduled follow-up."), 'follow-up execution uses system wording');
+  t.ok(agentJs.includes('[ORION INTERNAL FOLLOW-UP - not a user message]'), 'follow-up prompt is tagged as internal model context');
+  t.ok(agentJs.includes('Do not quote this as something the user said'), 'internal follow-up explicitly forbids user attribution');
   t.notOk(agentJs.includes("targetConv.messages.push({ role: 'user', text: prompt })"), 'scheduled follow-up prompt is not persisted as user input');
+  t.end();
+});
+
+test('plan approval continuation is not stored as a fake user message', (t) => {
+  t.ok(rendererJs.includes("source: 'plan-approval'"), 'plan approval has a distinct internal source');
+  t.ok(rendererJs.includes("role: 'system', source: 'plan-approval'"), 'plan approval is stored as a system event');
+  t.ok(rendererJs.includes("internalPrompt: true"), 'plan approval run is passed as internal prompt');
+  t.notOk(rendererJs.includes("conv.messages.push({ role: 'user', text: '[Start implementation]' })"), 'synthetic start implementation is not persisted as user');
+  t.notOk(rendererJs.includes("renderUserMessage('[Start implementation]')"), 'synthetic start implementation is not rendered as user');
   t.end();
 });
 

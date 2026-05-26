@@ -82,11 +82,14 @@ window.stopAgentExecution = () => {
       window.promptQueue = window.promptQueue.filter(item => item.conversationId !== targetConversationId);
     }
   }
-  window.appendSystemMessage("Stop requested... task will abort on next turn.");
+  window.appendSystemMessage("Stop requested... task will abort on next turn.", {
+    dedupeKey: `stop-requested-${targetConversationId || 'global'}`,
+    windowMs: 3000
+  });
 };
 
 // EXPOSE AGENT LOOP TO RENDERER
-window.runAgentLoop = async function(userPrompt, modelName, conversation) {
+window.runAgentLoop = async function(userPrompt, modelName, conversation, options = {}) {
   if (isAgentRunning) {
     window.appendSystemMessage("An agent task is already running.");
     return;
@@ -102,6 +105,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
   
   const config = window.getAppConfig();
   const workspacePath = conversation.workspace || window.getCurrentWorkspace();
+  const promptSource = options.source || 'user';
+  const isInternalPrompt = !!options.internalPrompt || promptSource === 'followup' || promptSource === 'system' || promptSource === 'plan-approval';
+  const promptForModel = isInternalPrompt
+    ? `[ORION INTERNAL FOLLOW-UP - not a user message]\n${userPrompt}\n\nContinue from the saved conversation/task state. Do not quote this as something the user said.`
+    : userPrompt;
   
   // Format message history for Gemini API
   let messages = [];
@@ -151,12 +159,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
     }
   });
   
-  // If the last message is user prompt, it's already in history. 
-  // Let's make sure it's correct
+  // If the last message is the real user prompt, it's already in history.
+  // Internal follow-ups are injected as system-like instructions, never as user-authored turns.
   const lastMessageText = messages.length > 0 && messages[messages.length - 1].role === 'user'
     ? ((messages[messages.length - 1].parts || []).map(part => part.text || '').join(''))
     : '';
-  if (messages.length === 0 || messages[messages.length - 1].role !== 'user' || lastMessageText !== userPrompt) {
+  if (isInternalPrompt) {
+    messages.push({ role: 'user', parts: [{ text: promptForModel }] });
+  } else if (messages.length === 0 || messages[messages.length - 1].role !== 'user' || lastMessageText !== userPrompt) {
     messages.push({ role: 'user', parts: [{ text: userPrompt }] });
   }
 
@@ -177,7 +187,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
   }
 
   let approvalIntent = null;
-  if (conversation.awaitingPlanApproval && !conversation.planApproved) {
+  if (!isInternalPrompt && conversation.awaitingPlanApproval && !conversation.planApproved) {
     approvalIntent = await classifyPlanApprovalIntent(userPrompt, modelName, config.geminiApiKey);
     if (approvalIntent.intent === 'approve') {
       conversation.planApproved = true;
@@ -191,7 +201,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
 
   let planningDecision = { mode: 'plan', reason: 'Planning mode is active.' };
   let planningBypassedForTask = false;
-  if (config.planningMode !== false && !conversation.planApproved && !conversation.awaitingPlanApproval && !(approvalIntent && approvalIntent.intent === 'approve')) {
+  if (!isInternalPrompt && config.planningMode !== false && !conversation.planApproved && !conversation.awaitingPlanApproval && !(approvalIntent && approvalIntent.intent === 'approve')) {
     planningDecision = await classifyPlanningNeed(userPrompt, modelName, config.geminiApiKey);
     if (planningDecision.mode === 'direct') {
       planningBypassedForTask = true;
@@ -200,8 +210,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
     } else if (planningDecision.mode === 'answer') {
       agentExecutionMode = 'answer';
     }
-  } else if (conversation.planApproved) {
-    planningDecision = { mode: 'direct', reason: 'An implementation plan has already been approved.' };
+  } else if (conversation.planApproved || isInternalPrompt) {
+    planningDecision = {
+      mode: 'direct',
+      reason: isInternalPrompt
+        ? 'This is an internal follow-up to continue existing work, not a new user request.'
+        : 'An implementation plan has already been approved.'
+    };
     agentExecutionMode = 'executing';
   }
 
@@ -447,7 +462,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
           console.log(`No tool calls, but there are ${pendingTasks.length} pending tasks. Continuing loop automatically.`);
           
           // Append a system message instructing the model to continue
-          const prompt = `[SYSTEM: You returned a response without calling any tools, but there are still pending tasks in the checklist: ${pendingTasks.map(t => `"${t.title}"`).join(', ')}. Please continue executing tools to complete the remaining tasks. If you believe a task is complete, use the "set_task_checklist" tool to update its status. When everything is fully complete and verified, output your final summary.]`;
+          const prompt = `[SYSTEM: You returned a response without calling any tools, but there are still pending tasks in the checklist: ${pendingTasks.map(t => `"${t.title}"`).join(', ')}. Continue with the next concrete tool action if one is needed. Do not call set_task_checklist merely to mark in-progress work. If the pending task is already complete, mark it completed; if you are blocked, explain the blocker and the next recovery step. When everything is fully complete and verified, output your final summary.]`;
           
           messages.push({ role: 'user', parts: [{ text: prompt }] });
           continue;
@@ -631,16 +646,22 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
           } else {
             activeConversationId = targetId;
           }
-          const isInternalFollowup = nextTask.source === 'followup';
-          window.appendSystemMessage(isInternalFollowup ? 'Executing scheduled follow-up.' : `Executing queued prompt: "${nextTask.prompt}"`);
-          if (!isInternalFollowup && !nextTask.alreadyRendered && window.renderUserMessageInChat) {
+          const isInternalQueueItem = nextTask.source === 'followup' || nextTask.source === 'plan-approval' || nextTask.source === 'system';
+          const queueLabel = nextTask.source === 'followup'
+            ? 'Executing scheduled follow-up.'
+            : (nextTask.source === 'plan-approval' ? 'Continuing approved plan.' : `Executing queued prompt: "${nextTask.prompt}"`);
+          window.appendSystemMessage(queueLabel);
+          if (!isInternalQueueItem && !nextTask.alreadyRendered && window.renderUserMessageInChat) {
             window.renderUserMessageInChat(nextTask.prompt);
           }
-          if (!isInternalFollowup && !nextTask.alreadyRendered && activeConv.messages) {
+          if (!isInternalQueueItem && !nextTask.alreadyRendered && activeConv.messages) {
             activeConv.messages.push({ role: 'user', source: nextTask.source || 'queue', text: nextTask.prompt, createdAt: Date.now() });
             if (window.saveConversationsToStorage) window.saveConversationsToStorage();
           }
-          await window.runAgentLoop(nextTask.prompt, nextTask.modelSelectValue, activeConv);
+          await window.runAgentLoop(nextTask.prompt, nextTask.modelSelectValue, activeConv, {
+            source: nextTask.source || 'queue',
+            internalPrompt: isInternalQueueItem
+          });
         }
       }
     }
@@ -1266,7 +1287,12 @@ function scheduleAgentFollowup(args = {}) {
     }
     
     window.appendSystemMessage(`Scheduled follow-up running after ${delaySeconds} seconds.`);
-    await window.runAgentLoop(prompt, modelSelectValue || (window.getSelectedModel ? window.getSelectedModel() : 'gemini-2.5-flash-lite'), targetConv);
+    await window.runAgentLoop(
+      prompt,
+      modelSelectValue || (window.getSelectedModel ? window.getSelectedModel() : 'gemini-2.5-flash-lite'),
+      targetConv,
+      { source: 'followup', internalPrompt: true }
+    );
   }, delaySeconds * 1000);
   
   return {
@@ -1806,7 +1832,7 @@ async function callOllamaAPI(messages, modelName, onWarning) {
         },
         {
           name: "write_file",
-          description: "Creates a new file or overwrites an existing file with the provided text content.",
+          description: "Creates a new file. Existing non-plan files require allowOverwrite=true and overwriteReason; prefer patch_file for edits.",
           parameters: {
             type: "OBJECT",
             properties: {
@@ -1993,7 +2019,7 @@ async function callOllamaAPI(messages, modelName, onWarning) {
         },
         {
           name: "set_task_checklist",
-          description: "Sets the task checklist in the side panel to keep track of the subtasks. Pass an array of items with a status ('pending', 'in-progress', 'completed').",
+          description: "Sets the task checklist in the side panel for meaningful milestones only. Pass an array of items with a status ('pending', 'in-progress', 'completed'); do not call this just to refresh in-progress state.",
           parameters: {
             type: "OBJECT",
             properties: {
@@ -2201,7 +2227,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning) {
           },
           {
             name: "write_file",
-            description: "Creates a new file or overwrites an existing file with the provided text content.",
+            description: "Creates a new file. Existing non-plan files require allowOverwrite=true and overwriteReason; prefer patch_file for edits.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -2388,7 +2414,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning) {
           },
           {
             name: "set_task_checklist",
-            description: "Sets the task checklist in the side panel to keep track of the subtasks. Pass an array of items with a status ('pending', 'in-progress', 'completed').",
+            description: "Sets the task checklist in the side panel for meaningful milestones only. Pass an array of items with a status ('pending', 'in-progress', 'completed'); do not call this just to refresh in-progress state.",
             parameters: {
               type: "OBJECT",
               properties: {

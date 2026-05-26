@@ -1691,11 +1691,10 @@ window.revisePhoneCompanionPlan = async (feedback) => {
 
 window.stopPhoneCompanionTask = async () => {
   if (window.stopAgentExecution) window.stopAgentExecution();
-  const convId = window.getRunningConversationId ? window.getRunningConversationId() : activeConversationId;
-  if (convId && window.api.killCommandsForConversation) {
-    await window.api.killCommandsForConversation(convId);
-  }
-  appendSystemMessage("Phone companion requested pause/stop.");
+  appendSystemMessage("Phone companion requested pause/stop.", {
+    dedupeKey: `phone-stop-${activeConversationId || 'global'}`,
+    windowMs: 3000
+  });
   return { success: true, stopped: true };
 };
 
@@ -1719,18 +1718,18 @@ async function approveCurrentPlanAndContinue() {
   saveConversationsToStorage();
   appendSystemMessage("Plan approved. Continuing implementation.");
 
-  const prompt = 'The implementation plan was explicitly approved. Continue execution from the approved plan, update the checklist as you work, run verification, and provide a Work Walkthrough.';
-  renderUserMessage('[Start implementation]');
-  conv.messages.push({ role: 'user', text: '[Start implementation]' });
+  const prompt = 'The implementation plan was explicitly approved. Continue execution from the approved plan, update the checklist only for completed/material milestones, run verification, and provide a Work Walkthrough.';
+  renderSystemBubble('[Plan approval] Start implementation');
+  conv.messages.push({ role: 'system', source: 'plan-approval', text: '[Plan approval] Start implementation', createdAt: Date.now() });
   saveConversationsToStorage();
 
   if (window.runAgentLoop) {
     if (window.isAgentRunning && window.isAgentRunning()) {
-      window.promptQueue.push({ prompt, modelSelectValue: el.modelSelect.value, conversationId: conv.id, alreadyRendered: true });
+      window.promptQueue.push({ prompt, modelSelectValue: el.modelSelect.value, conversationId: conv.id, alreadyRendered: true, source: 'plan-approval' });
       appendSystemMessage("Another task is currently running. Approved plan execution was queued.");
       return { success: true, queued: true };
     }
-    await window.runAgentLoop(prompt, el.modelSelect.value, conv);
+    await window.runAgentLoop(prompt, el.modelSelect.value, conv, { source: 'plan-approval', internalPrompt: true });
     return { success: true, queued: false };
   }
   return { success: false, error: 'Agent engine is not ready' };
