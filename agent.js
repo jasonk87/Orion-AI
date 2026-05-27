@@ -12,13 +12,14 @@ CRITICAL RULES:
 5. NOTES AND MEMORY: Use project/standalone notes as durable working memory. Read them when orienting, and update them when you learn durable facts: architecture, important files, commands, decisions, user preferences, gotchas, open tasks, test status, and future repair notes. Project notes are shared across every conversation in the same project; standalone notes belong only to that standalone conversation. Keep notes concise and useful, not a transcript.
 6. DESIGN QUALITY: When creating apps, games, dashboards, or visual tools, make them visually polished and pleasant by default. Treat beauty, layout, typography, color, spacing, motion, and interaction feedback as part of "working." Avoid bare black boxes, default controls, tiny unstyled text, and placeholder-looking screens unless the user explicitly asks for minimal output. For games, include a cohesive visual theme, clear HUD, start/game-over states, readable controls, animation polish, and a satisfying feel.
 7. FOLLOW-UP TIMERS: If you say you will wait, check back, continue after N seconds/minutes, or inspect long-running training/tests later, you MUST call "schedule_followup". Do not merely say you will wait. Schedule only one active follow-up for the same purpose; when the follow-up runs, actually inspect status/output and either continue work, stop the process, or clearly finish.
+7A. ADAPT INSTEAD OF QUITTING: Do not abandon a task after ordinary errors. If an edit, command, test, or route check fails, inspect fresh state, group repeated failures, look up official/current docs when needed, and try a different strategy. Stop only for hard blockers such as missing credentials, unavailable model access, explicit user stop, or a hard-destructive command block; when stopping, preserve state and explain the exact next recovery step.
 8. BE CONCISE: Explain your technical decisions briefly. The user can see your tools running and thoughts.
 9. AUTONOMOUS WORKFLOW: Once the user approves your plan, execute all required file creations, edits, and test runs consecutively in a single session without yielding or waiting for further conversational input. For direct tasks that do not need a plan, execute them immediately and report the result. Keep calling tools until the entire task is fully complete.
-10. TASK COMPLETION: You must use the "set_task_checklist" tool to update the status of each subtask as you work on them. Once all tasks are complete, update the checklist to show all tasks are 'completed', and then present your final summary.
+10. TASK COMPLETION: Create a checklist during planning when a task has meaningful milestones. During execution, use "set_task_checklist" sparingly: update it only when a milestone is completed, blocked, added, removed, or materially revised. Do not call it just to mark an item "in-progress" after reading/searching files or to refresh the same state. If exploration gives enough evidence, move to the next action instead of repeating checklist updates. Once all tasks are complete, update the checklist to show all tasks are 'completed', and then present your final summary.
 11. RESPONSE FORMAT: Use clean GitHub-flavored Markdown. Prefer short sections with level-2 headings like "Summary", "Findings", "Plan", "Changes", "Tests", and "Next Steps". Use bullets for scan-friendly details, numbered lists only for ordered steps, and fenced code blocks for code. Do not write giant unbroken paragraphs. For code reviews or "look through the code" requests, lead with a brief summary, then specific findings with file/function references, then prioritized recommendations. When creating an implementation plan, put the detailed plan in implementation_plan.md and also show a readable approval summary in chat. At the end of any task that used tools, include a "Work Walkthrough" explaining what you actually did: files touched, commands/tests run, results, and remaining follow-up.
 12. SECRETS AND ENVIRONMENT: When a project needs the user's Gemini API key, Google API key, or Google Search Engine ID, use "sync_workspace_env" to create or update workspace environment files. Do not hardcode secrets into source files, do not print secret values, and do not ask the user to paste keys you can sync from settings. Make code read secrets from environment variables such as GEMINI_API_KEY, GOOGLE_API_KEY, GOOGLE_SEARCH_API_KEY, GOOGLE_SEARCH_ENGINE_ID, and GOOGLE_CSE_ID. For browser-only/static apps, do not expose private API keys in client-side code; add a small local/server API layer instead.
 13. GEMINI APP DEFAULTS: For new Gemini Python projects, prefer the current "google-genai" package and "from google import genai" unless local files already use a different SDK. The model "gemini-2.5-flash-lite" is valid; do not downgrade it to older model names unless official docs or an API error proves it is unavailable.
-14. USER-REQUESTED LOCAL/GIT OPERATIONS: When the user asks for the active directory, to open the folder, to launch/run the program, or to push to GitHub/Git, use the dedicated tools for those actions. Do not push to Git or launch apps unless the user asked for it. If the user asks to push without specifying a branch, push the current branch to the default remote.
+14. USER-REQUESTED LOCAL/GIT OPERATIONS: When the user asks for the active directory, to open the folder, to launch/run the program, or to push to GitHub/Git, use the dedicated tools for those actions. Do not push to Git or launch apps unless the user asked for it. If the user explicitly asks you to run a command, run it directly unless it matches Orion's hard destructive block list; do not interrupt with extra approval prompts for ordinary user-requested commands. If the user asks to push without specifying a branch, push the current branch to the default remote.
 
 Tools available:
 - list_files: List all files in the workspace (excluding node_modules).
@@ -28,7 +29,7 @@ Tools available:
 - set_workspace_entrypoint: Set or clear the launch entry point command for this workspace.
 - git_push: Push the current Git branch, or the current branch to a requested remote branch, when the user asks.
 - read_file: Read a file's content. Use startLine/endLine or maxChars for large files.
-- write_file: Write a new file or overwrite a file.
+- write_file: Write a new file. Existing non-plan files require allowOverwrite=true and overwriteReason; prefer patch_file for edits.
 - modify_file: Edit a specific section of a file (search and replace).
 - patch_file: Targeted file update using line ranges, anchors, exact replacement, or regex. Prefer this over rewriting large files.
 - run_command: Run a command line in Powershell.
@@ -43,7 +44,7 @@ Tools available:
 - google_search: Search Google for current docs, API references, examples, and troubleshooting.
 - fetch_web_page: Fetch the text content of a specific web page found via search.
 - sync_workspace_env: Safely write configured API keys/search IDs into .env-style files without exposing the secret values in chat or tool output.
-- set_task_checklist: Set the UI checklist of tasks (array of {title, status}). Status can be 'pending', 'in-progress', 'completed'.`;
+- set_task_checklist: Set the UI checklist of tasks (array of {title, status}). Status can be 'pending', 'in-progress', 'completed'. Use only for milestone changes, not routine progress churn.`;
 
 // Keep track of active agent running state
 let isAgentRunning = false;
@@ -53,6 +54,9 @@ let agentExecutionMode = 'idle';
 let currentAgentLogs = [];
 let isStopRequested = false;
 const GEMINI_THINKING_BUDGET = 24576;
+const MODEL_API_REQUEST_TIMEOUT_MS = 60000;
+const MODEL_API_MAX_RETRY_WAIT_MS = 45000;
+const MODEL_API_MAX_ATTEMPTS = 3;
 
 window.steeringQueue = [];
 window.promptQueue = [];
@@ -78,11 +82,14 @@ window.stopAgentExecution = () => {
       window.promptQueue = window.promptQueue.filter(item => item.conversationId !== targetConversationId);
     }
   }
-  window.appendSystemMessage("Stop requested... task will abort on next turn.");
+  window.appendSystemMessage("Stop requested... task will abort on next turn.", {
+    dedupeKey: `stop-requested-${targetConversationId || 'global'}`,
+    windowMs: 3000
+  });
 };
 
 // EXPOSE AGENT LOOP TO RENDERER
-window.runAgentLoop = async function(userPrompt, modelName, conversation) {
+window.runAgentLoop = async function(userPrompt, modelName, conversation, options = {}) {
   if (isAgentRunning) {
     window.appendSystemMessage("An agent task is already running.");
     return;
@@ -98,6 +105,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
   
   const config = window.getAppConfig();
   const workspacePath = conversation.workspace || window.getCurrentWorkspace();
+  const promptSource = options.source || 'user';
+  const isInternalPrompt = !!options.internalPrompt || promptSource === 'followup' || promptSource === 'system' || promptSource === 'plan-approval';
+  const promptForModel = isInternalPrompt
+    ? `[ORION INTERNAL FOLLOW-UP - not a user message]\n${userPrompt}\n\nContinue from the saved conversation/task state. Do not quote this as something the user said.`
+    : userPrompt;
   
   // Format message history for Gemini API
   let messages = [];
@@ -147,12 +159,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
     }
   });
   
-  // If the last message is user prompt, it's already in history. 
-  // Let's make sure it's correct
+  // If the last message is the real user prompt, it's already in history.
+  // Internal follow-ups are injected as system-like instructions, never as user-authored turns.
   const lastMessageText = messages.length > 0 && messages[messages.length - 1].role === 'user'
     ? ((messages[messages.length - 1].parts || []).map(part => part.text || '').join(''))
     : '';
-  if (messages.length === 0 || messages[messages.length - 1].role !== 'user' || lastMessageText !== userPrompt) {
+  if (isInternalPrompt) {
+    messages.push({ role: 'user', parts: [{ text: promptForModel }] });
+  } else if (messages.length === 0 || messages[messages.length - 1].role !== 'user' || lastMessageText !== userPrompt) {
     messages.push({ role: 'user', parts: [{ text: userPrompt }] });
   }
 
@@ -173,7 +187,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
   }
 
   let approvalIntent = null;
-  if (conversation.awaitingPlanApproval && !conversation.planApproved) {
+  if (!isInternalPrompt && conversation.awaitingPlanApproval && !conversation.planApproved) {
     approvalIntent = await classifyPlanApprovalIntent(userPrompt, modelName, config.geminiApiKey);
     if (approvalIntent.intent === 'approve') {
       conversation.planApproved = true;
@@ -187,7 +201,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
 
   let planningDecision = { mode: 'plan', reason: 'Planning mode is active.' };
   let planningBypassedForTask = false;
-  if (config.planningMode !== false && !conversation.planApproved && !conversation.awaitingPlanApproval && !(approvalIntent && approvalIntent.intent === 'approve')) {
+  if (!isInternalPrompt && config.planningMode !== false && !conversation.planApproved && !conversation.awaitingPlanApproval && !(approvalIntent && approvalIntent.intent === 'approve')) {
     planningDecision = await classifyPlanningNeed(userPrompt, modelName, config.geminiApiKey);
     if (planningDecision.mode === 'direct') {
       planningBypassedForTask = true;
@@ -196,8 +210,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
     } else if (planningDecision.mode === 'answer') {
       agentExecutionMode = 'answer';
     }
-  } else if (conversation.planApproved) {
-    planningDecision = { mode: 'direct', reason: 'An implementation plan has already been approved.' };
+  } else if (conversation.planApproved || isInternalPrompt) {
+    planningDecision = {
+      mode: 'direct',
+      reason: isInternalPrompt
+        ? 'This is an internal follow-up to continue existing work, not a new user request.'
+        : 'An implementation plan has already been approved.'
+    };
     agentExecutionMode = 'executing';
   }
 
@@ -269,6 +288,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
     let forceYield = false;
     let consecutiveNoToolCalls = 0;
     let malformedCallsCount = 0;
+    const repeatedToolFailures = new Map();
     const maxMalformedToolRetries = 5;
     const canExecuteThisTask = () => !config.planningMode || conversation.planApproved || planningBypassedForTask;
     
@@ -300,15 +320,23 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
       try {
         agentSubStatus = `Calling ${modelName.startsWith('gemini-') ? 'Gemini' : 'Ollama (' + modelName + ')'} API...`;
         window.renderAiMessage(lastTextResponse, currentAgentLogs);
+        const modelCallDelayMs = Math.min(Math.max(parseInt(config.modelCallDelayMs, 10) || 0, 0), 60000);
+        if (modelCallDelayMs > 0) {
+          agentSubStatus = `Waiting ${modelCallDelayMs}ms before the next model call...`;
+          window.renderAiMessage(lastTextResponse, currentAgentLogs);
+          await sleep(modelCallDelayMs);
+        }
         
         if (modelName.startsWith('gemini-')) {
           response = await callGeminiAPI(messages, modelName, config.geminiApiKey, (warningMsg) => {
+            agentSubStatus = warningMsg;
             currentAgentLogs.push({ type: 'thought', content: `⚠️ ${warningMsg}` });
             conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
             window.renderAiMessage(lastTextResponse, currentAgentLogs);
           });
         } else {
           response = await callOllamaAPI(messages, modelName, (warningMsg) => {
+            agentSubStatus = warningMsg;
             currentAgentLogs.push({ type: 'thought', content: `⚠️ ${warningMsg}` });
             conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
             window.renderAiMessage(lastTextResponse, currentAgentLogs);
@@ -321,6 +349,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
         const retryDelayMs = parseRetryDelayMs(e.message);
         if (retryDelayMs) {
           lastTextResponse += `\n\nThis is a temporary quota/rate-limit window. It should reset after about ${Math.ceil(retryDelayMs / 1000)} seconds.`;
+          const retrySeconds = Math.min(Math.max(Math.ceil(retryDelayMs / 1000), 10), 3600);
+          scheduleAgentFollowup({
+            delaySeconds: retrySeconds,
+            purpose: 'model-api-retry',
+            prompt: 'Retry the previous task after the model/API cooldown. First inspect the latest state and avoid repeating any failed action blindly.'
+          });
+          lastTextResponse += `\n\nI scheduled a follow-up retry in about ${retrySeconds} seconds instead of hammering the API.`;
+        }
+        const advice = diagnoseModelApiFailure(e.message);
+        if (advice) {
+          lastTextResponse += `\n\n${advice}`;
         }
         currentAgentLogs.push({ type: 'thought', content: `API Error: ${e.message}` });
         conversation.messages[aiMessageIndex].text = lastTextResponse;
@@ -423,7 +462,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
           console.log(`No tool calls, but there are ${pendingTasks.length} pending tasks. Continuing loop automatically.`);
           
           // Append a system message instructing the model to continue
-          const prompt = `[SYSTEM: You returned a response without calling any tools, but there are still pending tasks in the checklist: ${pendingTasks.map(t => `"${t.title}"`).join(', ')}. Please continue executing tools to complete the remaining tasks. If you believe a task is complete, use the "set_task_checklist" tool to update its status. When everything is fully complete and verified, output your final summary.]`;
+          const prompt = `[SYSTEM: You returned a response without calling any tools, but there are still pending tasks in the checklist: ${pendingTasks.map(t => `"${t.title}"`).join(', ')}. Continue with the next concrete tool action if one is needed. Do not call set_task_checklist merely to mark in-progress work. If the pending task is already complete, mark it completed; if you are blocked, explain the blocker and the next recovery step. When everything is fully complete and verified, output your final summary.]`;
           
           messages.push({ role: 'user', parts: [{ text: prompt }] });
           continue;
@@ -457,28 +496,21 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
         window.renderAiMessage(conversation.messages[aiMessageIndex].text || lastTextResponse, currentAgentLogs);
         
         // Safety gate for planning mode
-        if (config.planningMode && !canExecuteThisTask()) {
-          const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'run_command', 'start_command', 'run_tests', 'sync_workspace_env', 'launch_workspace_app', 'git_push'];
-          if (destructiveTools.includes(toolName)) {
-            // Allow writing the implementation plan file itself before approval
-            const isPlanWrite = toolName === 'write_file' && args.path && args.path.toLowerCase().includes('implementation_plan');
-            if (!isPlanWrite) {
-              const errMsg = "Planning Mode Active: this request needs an implementation plan before file edits or command execution. Create implementation_plan.md, show the plan in chat, set the checklist, then pause for explicit approval or requested revisions.";
-              
-              currentAgentLogs[logIndex].status = 'error';
-              currentAgentLogs[logIndex].result = errMsg;
-              
-              toolResponseParts.push({
-                functionResponse: {
-                  name: toolName,
-                  response: { error: errMsg }
-                }
-              });
-              continue;
-            } else {
-              forceYield = true;
+        const planningGate = getPlanningToolGate(config, canExecuteThisTask(), toolName, args);
+        if (!planningGate.allowed) {
+          currentAgentLogs[logIndex].status = 'error';
+          currentAgentLogs[logIndex].result = planningGate.reason;
+          
+          toolResponseParts.push({
+            functionResponse: {
+              name: toolName,
+              response: { error: planningGate.reason }
             }
-          }
+          });
+          continue;
+        }
+        if (planningGate.forceYield) {
+          forceYield = true;
         }
         
         // Execute the tool
@@ -494,6 +526,34 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
           currentAgentLogs[logIndex].result = err.message;
           result = { error: err.message };
           updateWalkthroughItem(walkthroughItem, toolName, args, result, err);
+        }
+
+        const resultError = result && (result.error || (result.success === false && result.message));
+        if (resultError) {
+          const failureKey = `${toolName}:${stableStringify(args)}:${String(resultError).slice(0, 240)}`;
+          const failureCount = (repeatedToolFailures.get(failureKey) || 0) + 1;
+          repeatedToolFailures.set(failureKey, failureCount);
+          if (failureCount >= 3) {
+            const errMsg = `Repeated failure guard paused ${toolName} after ${failureCount} identical failures. Do not quit the task: step back, diagnose the cause, inspect fresh context, and choose a different strategy before retrying.`;
+            currentAgentLogs.push({ type: 'thought', content: errMsg });
+            toolResponseParts.push({
+              functionResponse: {
+                name: toolName,
+                response: { error: errMsg, repeatedFailure: true }
+              }
+            });
+            forceYield = true;
+            break;
+          }
+          if (failureCount === 2) {
+            const patchAdvice = toolName === 'patch_file'
+              ? ' Re-read the surrounding lines and use a narrower exact target or line range before trying again.'
+              : '';
+            currentAgentLogs.push({ type: 'thought', content: `Repeated ${toolName} failure detected. Orion will adapt strategy instead of blindly retrying.${patchAdvice}` });
+            if (typeof result === 'object' && result !== null && !Array.isArray(result)) {
+              result.repeatedFailureWarning = `The same ${toolName} call failed twice with the same error. Do not retry it blindly. Identify what failed, group the repeated failure, explain the likely cause, and adapt with a different action.${patchAdvice}`;
+            }
+          }
         }
         
         toolResponseParts.push({
@@ -547,6 +607,22 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
     conversation.messages[aiMessageIndex].text = lastTextResponse;
     conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
     window.renderAiMessage(lastTextResponse, currentAgentLogs);
+    if (window.api && window.api.writeRunArtifact && workWalkthrough.length > 0) {
+      const artifactPayload = buildRunArtifactPayload({
+        conversation,
+        userPrompt,
+        modelName,
+        workspacePath,
+        workWalkthrough,
+        finalText: lastTextResponse
+      });
+      window.api.writeRunArtifact(artifactPayload).then((artifactResult) => {
+        if (artifactResult && artifactResult.success) {
+          conversation.lastArtifactPath = artifactResult.artifactPath;
+          window.saveConversationsToStorage();
+        }
+      }).catch(() => {});
+    }
     
     // Clear the active bubble tracking ONLY after the final render has updated it (removing the spinner)
     window.clearActiveAiBubble();
@@ -570,15 +646,22 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation) {
           } else {
             activeConversationId = targetId;
           }
-          window.appendSystemMessage(`Executing queued prompt: "${nextTask.prompt}"`);
-          if (!nextTask.alreadyRendered && window.renderUserMessageInChat) {
+          const isInternalQueueItem = nextTask.source === 'followup' || nextTask.source === 'plan-approval' || nextTask.source === 'system';
+          const queueLabel = nextTask.source === 'followup'
+            ? 'Executing scheduled follow-up.'
+            : (nextTask.source === 'plan-approval' ? 'Continuing approved plan.' : `Executing queued prompt: "${nextTask.prompt}"`);
+          window.appendSystemMessage(queueLabel);
+          if (!isInternalQueueItem && !nextTask.alreadyRendered && window.renderUserMessageInChat) {
             window.renderUserMessageInChat(nextTask.prompt);
           }
-          if (!nextTask.alreadyRendered && activeConv.messages) {
-            activeConv.messages.push({ role: 'user', text: nextTask.prompt });
+          if (!isInternalQueueItem && !nextTask.alreadyRendered && activeConv.messages) {
+            activeConv.messages.push({ role: 'user', source: nextTask.source || 'queue', text: nextTask.prompt, createdAt: Date.now() });
             if (window.saveConversationsToStorage) window.saveConversationsToStorage();
           }
-          await window.runAgentLoop(nextTask.prompt, nextTask.modelSelectValue, activeConv);
+          await window.runAgentLoop(nextTask.prompt, nextTask.modelSelectValue, activeConv, {
+            source: nextTask.source || 'queue',
+            internalPrompt: isInternalQueueItem
+          });
         }
       }
     }
@@ -657,6 +740,14 @@ async function executeTool(name, args, workspace, config, conversation) {
     case 'write_file': {
       if (!args.path) throw new Error("Missing 'path' parameter");
       if (args.content === undefined) throw new Error("Missing 'content' parameter");
+      const isPlanFile = args.path.split(/[\\/]/).pop().toLowerCase() === 'implementation_plan.md';
+      const existingContent = await window.api.readFile(workspace, args.path, { maxChars: 200000 });
+      if (!isPlanFile && existingContent && !existingContent.error && args.allowOverwrite !== true) {
+        throw new Error("write_file refused to overwrite an existing file. Use patch_file for surgical edits, or set allowOverwrite=true with overwriteReason when a full rewrite is explicitly required.");
+      }
+      if (args.allowOverwrite === true && !String(args.overwriteReason || '').trim()) {
+        throw new Error("write_file allowOverwrite requires overwriteReason so the rewrite is auditable.");
+      }
       
       // Optional regression testing BEFORE edit
       let beforePass = true;
@@ -861,16 +952,22 @@ async function executeTool(name, args, workspace, config, conversation) {
     
     case 'set_task_checklist': {
       if (!args.tasks || !Array.isArray(args.tasks)) throw new Error("Missing 'tasks' array parameter");
-      args.tasks = args.tasks.map(task => ({
-        ...task,
-        status: normalizeTaskStatus(task.status)
-      }));
+      args.tasks = normalizeChecklistTasks(args.tasks);
+      const activeConv = conversations.find(c => c.id === activeConversationId);
+      const gate = shouldApplyChecklistUpdate(activeConv && activeConv.tasks, args.tasks);
+      if (!gate.allowed) {
+        return {
+          success: true,
+          skipped: true,
+          reason: gate.reason,
+          message: `Checklist update skipped: ${gate.reason}`
+        };
+      }
       
       // Update UI checklist
       window.updateTasksChecklist(args.tasks);
       
       // Update local storage representation in active conversation
-      const activeConv = conversations.find(c => c.id === activeConversationId);
       if (activeConv) {
         activeConv.tasks = args.tasks;
         window.saveConversationsToStorage();
@@ -991,6 +1088,63 @@ function normalizeTaskStatus(status) {
     return 'in-progress';
   }
   return 'pending';
+}
+
+function normalizeChecklistTasks(tasks = []) {
+  return tasks.map(task => ({
+    ...task,
+    title: String(task.title || '').trim(),
+    status: normalizeTaskStatus(task.status)
+  })).filter(task => task.title);
+}
+
+function checklistTaskKey(task) {
+  return String(task && task.title || '').trim().toLowerCase();
+}
+
+function shouldApplyChecklistUpdate(previousTasks = [], nextTasks = []) {
+  const previous = normalizeChecklistTasks(previousTasks || []);
+  const next = normalizeChecklistTasks(nextTasks || []);
+  if (next.length === 0) {
+    return { allowed: false, reason: 'empty checklist update' };
+  }
+  if (previous.length === 0) {
+    return { allowed: true, reason: 'initial checklist' };
+  }
+
+  const previousByTitle = new Map(previous.map(task => [checklistTaskKey(task), task]));
+  const nextByTitle = new Map(next.map(task => [checklistTaskKey(task), task]));
+  const previousTitles = [...previousByTitle.keys()].sort().join('\n');
+  const nextTitles = [...nextByTitle.keys()].sort().join('\n');
+  if (previousTitles !== nextTitles) {
+    return { allowed: true, reason: 'checklist tasks changed' };
+  }
+
+  let changed = false;
+  let meaningful = false;
+  for (const task of next) {
+    const previousTask = previousByTitle.get(checklistTaskKey(task));
+    if (!previousTask || previousTask.status !== task.status) {
+      changed = true;
+      if (task.status === 'completed' || previousTask.status === 'completed') {
+        meaningful = true;
+      }
+      if (previousTask.status === 'in-progress' && task.status === 'pending') {
+        meaningful = true;
+      }
+    }
+  }
+
+  if (!changed) {
+    return { allowed: false, reason: 'no checklist changes' };
+  }
+  if (meaningful) {
+    return { allowed: true, reason: 'milestone status changed' };
+  }
+  return {
+    allowed: false,
+    reason: 'only in-progress status changed; continue the work instead of refreshing the checklist'
+  };
 }
 
 function getNotesMetadata(conversation) {
@@ -1133,14 +1287,12 @@ function scheduleAgentFollowup(args = {}) {
     }
     
     window.appendSystemMessage(`Scheduled follow-up running after ${delaySeconds} seconds.`);
-    if (window.renderUserMessageInChat) {
-      window.renderUserMessageInChat(prompt);
-    }
-    if (targetConv.messages) {
-      targetConv.messages.push({ role: 'user', text: prompt });
-      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
-    }
-    await window.runAgentLoop(prompt, modelSelectValue || (window.getSelectedModel ? window.getSelectedModel() : 'gemini-2.5-flash-lite'), targetConv);
+    await window.runAgentLoop(
+      prompt,
+      modelSelectValue || (window.getSelectedModel ? window.getSelectedModel() : 'gemini-2.5-flash-lite'),
+      targetConv,
+      { source: 'followup', internalPrompt: true }
+    );
   }, delaySeconds * 1000);
   
   return {
@@ -1183,6 +1335,25 @@ function buildToolUseContractPrompt() {
   return `[SYSTEM: Before answering, decide whether the user's request requires interacting with the workspace or runtime. If it requires files, commands, tests, external docs, app state, timers, notes, or code changes, use the relevant tools before giving a final answer. If no tool is needed, answer normally and do not claim that work was performed. Never end with a generic completion message unless the Work Walkthrough shows what actually happened.]`;
 }
 
+function getPlanningToolGate(config, canExecute, toolName, args = {}) {
+  if (!config || !config.planningMode || canExecute) {
+    return { allowed: true, forceYield: false, reason: '' };
+  }
+  const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'run_command', 'start_command', 'run_tests', 'sync_workspace_env', 'launch_workspace_app', 'git_push'];
+  if (!destructiveTools.includes(toolName)) {
+    return { allowed: true, forceYield: false, reason: '' };
+  }
+  const isPlanWrite = toolName === 'write_file' && args.path && args.path.split(/[\\/]/).pop().toLowerCase() === 'implementation_plan.md';
+  if (isPlanWrite) {
+    return { allowed: true, forceYield: true, reason: 'Writing implementation_plan.md is allowed before approval.' };
+  }
+  return {
+    allowed: false,
+    forceYield: false,
+    reason: "Planning Mode Active: this request needs an implementation plan before file edits or command execution. Create implementation_plan.md, show the plan in chat, set the checklist, then pause for explicit approval or requested revisions."
+  };
+}
+
 function summarizeToolStart(toolName, args = {}) {
   if (toolName === 'read_file') return { toolName, status: 'running', label: `Read \`${args.path || 'file'}\`` };
   if (toolName === 'list_files') return { toolName, status: 'running', label: 'Listed workspace files' };
@@ -1192,7 +1363,7 @@ function summarizeToolStart(toolName, args = {}) {
   if (toolName === 'set_workspace_entrypoint') return { toolName, status: 'running', label: args.command ? `Set entry point to \`${args.command}\`` : 'Cleared workspace entry point' };
   if (toolName === 'git_push') return { toolName, kind: 'git', status: 'running', label: `Pushed Git branch${args.branch ? ` to \`${args.branch}\`` : ''}` };
   if (toolName === 'write_file') {
-    const isPlan = args.path && args.path.toLowerCase().includes('implementation_plan');
+    const isPlan = args.path && args.path.split(/[\\/]/).pop().toLowerCase() === 'implementation_plan.md';
     return {
       toolName,
       kind: isPlan ? 'plan' : 'file',
@@ -1211,7 +1382,7 @@ function summarizeToolStart(toolName, args = {}) {
   if (toolName === 'run_tests') return { toolName, kind: 'test', status: 'running', label: 'Ran regression tests' };
   if (toolName === 'set_task_checklist') {
     const count = Array.isArray(args.tasks) ? args.tasks.length : 0;
-    return { toolName, kind: 'checklist', status: 'running', label: `Updated task checklist${count ? ` (${count} items)` : ''}` };
+    return { toolName, kind: 'checklist', status: 'running', label: `Requested checklist update${count ? ` (${count} items)` : ''}` };
   }
   if (toolName === 'schedule_followup') return { toolName, kind: 'followup', status: 'running', label: `Scheduled follow-up in ${args.delaySeconds || 60}s` };
   if (toolName === 'sync_workspace_env') return { toolName, kind: 'env', status: 'running', label: 'Synced workspace environment secrets' };
@@ -1229,6 +1400,8 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
   }
   if (toolName === 'write_file' || toolName === 'modify_file' || toolName === 'patch_file') {
     item.detail = result && result.backupPath ? `Backup: \`${result.backupPath}\`` : '';
+  } else if (toolName === 'set_task_checklist') {
+    item.detail = result && result.skipped ? result.message : '';
   } else if (toolName === 'get_workspace_info') {
     item.detail = result && result.workspace ? `Directory: \`${result.workspace}\`` : '';
   } else if (toolName === 'launch_workspace_app') {
@@ -1263,9 +1436,42 @@ function withWorkWalkthrough(text, items, final = false) {
     return `- **${marker}:** ${item.label}${detail}`;
   });
   const suffix = final
-    ? ''
+    ? buildFinalVerificationSummary(meaningfulItems)
     : '\n\n_I will keep this updated as I work._';
   return `${base.trim() || 'Working on it.'}\n\n${heading}\n${lines.join('\n')}${suffix}`;
+}
+
+function buildFinalVerificationSummary(items) {
+  const filesTouched = [...new Set(items.filter(item => item.kind === 'file' && item.path).map(item => item.path))];
+  const testsRun = items.filter(item => item.kind === 'test' || item.toolName === 'run_tests' || item.toolName === 'run_command').map(item => item.label);
+  const failures = items.filter(item => item.status === 'error');
+  const lines = ['\n\n## Final Summary'];
+  lines.push(`- **Files touched:** ${filesTouched.length ? filesTouched.map(path => `\`${path}\``).join(', ') : 'None recorded'}`);
+  lines.push(`- **Tests/checks run:** ${testsRun.length ? testsRun.join('; ') : 'None recorded'}`);
+  lines.push(`- **Failures/skipped checks:** ${failures.length ? failures.map(item => item.label).join('; ') : 'None recorded'}`);
+  lines.push('- **How to verify:** Review the files above and rerun the listed tests/checks.');
+  return lines.join('\n');
+}
+
+function buildRunArtifactPayload({ conversation, userPrompt, modelName, workspacePath, workWalkthrough, finalText }) {
+  const filesTouched = [...new Set((workWalkthrough || []).filter(item => item.kind === 'file' && item.path).map(item => item.path))];
+  return {
+    conversationId: conversation.id,
+    runId: `run-${Date.now()}`,
+    type: 'orion-run',
+    task: {
+      prompt: userPrompt,
+      model: modelName,
+      workspace: workspacePath
+    },
+    implementation: {
+      filesTouched,
+      walkthrough: workWalkthrough
+    },
+    walkthrough: {
+      finalText
+    }
+  };
 }
 
 function stripWorkWalkthrough(text) {
@@ -1391,6 +1597,49 @@ function shouldHaveUsedToolsButDidNot(text, workWalkthrough) {
   const response = String(text || '').trim();
   if (!response) return true;
   return response.length < 80;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function sleepWithModelApiStatus(ms, label, onWarning) {
+  const boundedMs = Math.min(Math.max(Number(ms) || 0, 0), MODEL_API_MAX_RETRY_WAIT_MS);
+  const startedAt = Date.now();
+  if (onWarning) {
+    onWarning(`${label} Waiting ${(boundedMs / 1000).toFixed(1)}s before retrying instead of hammering the provider...`);
+  }
+  while (Date.now() - startedAt < boundedMs) {
+    if (isStopRequested) {
+      throw new Error('Model API retry wait cancelled by user stop.');
+    }
+    const remainingMs = Math.max(0, boundedMs - (Date.now() - startedAt));
+    await sleep(Math.min(1000, remainingMs));
+  }
+}
+
+function stableStringify(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = MODEL_API_REQUEST_TIMEOUT_MS, label = 'request') {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error && error.name === 'AbortError') {
+      throw new Error(`${label} timed out after ${Math.ceil(timeoutMs / 1000)} seconds.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function parseRetryDelayMs(errorText) {
@@ -1583,12 +1832,14 @@ async function callOllamaAPI(messages, modelName, onWarning) {
         },
         {
           name: "write_file",
-          description: "Creates a new file or overwrites an existing file with the provided text content.",
+          description: "Creates a new file. Existing non-plan files require allowOverwrite=true and overwriteReason; prefer patch_file for edits.",
           parameters: {
             type: "OBJECT",
             properties: {
               path: { type: "STRING", description: "Relative path of the file to create" },
-              content: { type: "STRING", description: "Text content of the file" }
+              content: { type: "STRING", description: "Text content of the file" },
+              allowOverwrite: { type: "BOOLEAN", description: "Must be true to overwrite an existing non-plan file. Prefer patch_file for edits." },
+              overwriteReason: { type: "STRING", description: "Required when allowOverwrite is true; explain why a full rewrite is necessary." }
             },
             required: ["path", "content"]
           }
@@ -1768,7 +2019,7 @@ async function callOllamaAPI(messages, modelName, onWarning) {
         },
         {
           name: "set_task_checklist",
-          description: "Sets the task checklist in the side panel to keep track of the subtasks. Pass an array of items with a status ('pending', 'in-progress', 'completed').",
+          description: "Sets the task checklist in the side panel for meaningful milestones only. Pass an array of items with a status ('pending', 'in-progress', 'completed'); do not call this just to refresh in-progress state.",
           parameters: {
             type: "OBJECT",
             properties: {
@@ -1976,12 +2227,14 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning) {
           },
           {
             name: "write_file",
-            description: "Creates a new file or overwrites an existing file with the provided text content.",
+            description: "Creates a new file. Existing non-plan files require allowOverwrite=true and overwriteReason; prefer patch_file for edits.",
             parameters: {
               type: "OBJECT",
               properties: {
                 path: { type: "STRING", description: "Relative path of the file to create" },
-                content: { type: "STRING", description: "Text content of the file" }
+                content: { type: "STRING", description: "Text content of the file" },
+                allowOverwrite: { type: "BOOLEAN", description: "Must be true to overwrite an existing non-plan file. Prefer patch_file for edits." },
+                overwriteReason: { type: "STRING", description: "Required when allowOverwrite is true; explain why a full rewrite is necessary." }
               },
               required: ["path", "content"]
             }
@@ -2161,7 +2414,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning) {
           },
           {
             name: "set_task_checklist",
-            description: "Sets the task checklist in the side panel to keep track of the subtasks. Pass an array of items with a status ('pending', 'in-progress', 'completed').",
+            description: "Sets the task checklist in the side panel for meaningful milestones only. Pass an array of items with a status ('pending', 'in-progress', 'completed'); do not call this just to refresh in-progress state.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -2185,16 +2438,16 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning) {
     ]
   };
 
-  const attempts = 5;
+  const attempts = MODEL_API_MAX_ATTEMPTS;
   let delay = 1500; // Start with 1.5s
   
   for (let i = 1; i <= attempts; i++) {
     try {
-      const response = await fetch(url, {
+      const response = await fetchWithTimeout(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody)
-      });
+      }, MODEL_API_REQUEST_TIMEOUT_MS, 'Gemini generateContent request');
       
       if (response.ok) {
         return await response.json();
@@ -2203,7 +2456,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning) {
       const errorText = await response.text();
       const status = response.status;
       const apiError = describeModelApiError(status, errorText);
-      const retryDelayMs = apiError.retryDelayMs || delay;
+      const retryDelayMs = Math.min(apiError.retryDelayMs || delay, MODEL_API_MAX_RETRY_WAIT_MS);
       
       const isTransient = [429, 500, 502, 503, 504].includes(status);
       if (!isTransient || i === attempts) {
@@ -2213,18 +2466,18 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning) {
       
       if (onWarning) {
         const kind = status === 429 ? 'Quota/rate limit' : (status === 503 ? 'High Demand' : 'Transient Error');
-        onWarning(`Gemini API returned HTTP ${status} (${kind}). Retrying in ${(retryDelayMs / 1000).toFixed(1)}s (Attempt ${i}/${attempts})...`);
+        onWarning(`Gemini API returned HTTP ${status} (${kind}). Provider wait/cooldown active (Attempt ${i}/${attempts}).`);
       }
       
-      await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+      await sleepWithModelApiStatus(retryDelayMs, `Gemini API retry ${i}/${attempts}.`, onWarning);
       delay = Math.max(delay * 2 + Math.random() * 500, retryDelayMs); // Exponential backoff + API retry hint
       
     } catch (e) {
       if (i === attempts) throw e;
       if (onWarning) {
-        onWarning(`Connection error: ${e.message}. Retrying in ${(delay / 1000).toFixed(1)}s (Attempt ${i}/${attempts})...`);
+        onWarning(`Connection error: ${e.message}. Provider wait/cooldown active (Attempt ${i}/${attempts}).`);
       }
-      await new Promise(resolve => setTimeout(resolve, delay));
+      await sleepWithModelApiStatus(delay, `Gemini connection retry ${i}/${attempts}.`, onWarning);
       delay = delay * 2 + Math.random() * 500;
     }
   }
@@ -2356,4 +2609,34 @@ ${conversationLogsText}`;
     messages: newHistory,
     summary: compactedSummary
   };
+}
+
+if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
+  module.exports = {
+    classifyPlanApprovalIntent,
+    classifyPlanningNeed,
+    getPlanningToolGate,
+    normalizeChecklistTasks,
+    shouldApplyChecklistUpdate,
+    diagnoseModelApiFailure
+  };
+}
+
+function diagnoseModelApiFailure(errorText) {
+  const text = String(errorText || '').toLowerCase();
+  if (!text) return '';
+  if (text.includes('429') || text.includes('quota') || text.includes('resource has been exhausted')) {
+    return 'Diagnosis: the model provider is rate-limiting or quota-limiting requests. Orion should pause the request loop, preserve state, and resume after cooldown.';
+  }
+  if (text.includes('401') || text.includes('403') || text.includes('api key')) {
+    return 'Diagnosis: the model request looks unauthorized. This is a hard blocker until credentials/config are fixed; Orion should preserve state and explain the exact config to check.';
+  }
+  if (text.includes('fetch') || text.includes('network') || text.includes('econn') || text.includes('timeout')) {
+    return 'Diagnosis: this looks like a network/service availability problem. Orion should stop the repeated request loop, verify connectivity/provider status, then resume from saved state.';
+  }
+  return 'Diagnosis: Orion paused after the model API failed. Preserve the task state, inspect the error, change strategy, and avoid repeating the same request blindly.';
+}
+
+if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
+  module.exports.executeTool = executeTool; // So we can test it specifically
 }

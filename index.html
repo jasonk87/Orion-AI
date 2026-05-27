@@ -115,20 +115,25 @@
       <div id="chat-feed">
         <!-- Welcoming splash or history messages -->
         <div class="welcome-splash" id="welcome-splash">
-          <h1>✦ Orion AI</h1>
-          <p>Your Ultimate Pair Programmer. Let's build something exceptional.</p>
+          <h1>Orion AI</h1>
+          <p>Start with a repo, a task, or an existing conversation.</p>
+          <div class="start-actions">
+            <button id="btn-start-open-repo" class="btn-primary">Open Repo</button>
+            <button id="btn-start-new-task" class="btn-secondary">New Task</button>
+            <button id="btn-start-resume" class="btn-secondary">Resume Work</button>
+          </div>
           <div class="quick-tips">
             <div class="tip-card">
-              <h3>⚡ Full Context</h3>
-              <p>Understands your entire folder structure automatically, compacting context to optimize costs.</p>
+              <h3>Projects</h3>
+              <p>Choose a workspace folder before asking Orion to change files.</p>
             </div>
             <div class="tip-card">
-              <h3>🛡️ Regression Tests</h3>
-              <p>Automatically runs your test suite after code edits to ensure nothing breaks.</p>
+              <h3>Planning</h3>
+              <p>Risky work pauses for approval before edits or commands run.</p>
             </div>
             <div class="tip-card">
-              <h3>📝 Planning Mode</h3>
-              <p>Drafts detailed blueprints and task checklists for approval before touching code.</p>
+              <h3>Companion</h3>
+              <p>Use your phone link to inspect, steer, approve, pause, and resume.</p>
             </div>
           </div>
         </div>
@@ -206,6 +211,18 @@
           </div>
         </div>
       </div>
+
+      <div class="panel-section">
+        <div class="panel-section-title" style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
+          <span>Run Artifacts</span>
+          <span class="badge" id="artifact-count-badge">0</span>
+        </div>
+        <div class="panel-content scrollable artifact-panel">
+          <div id="artifact-list-container">
+            <p class="empty-state">Artifacts are saved outside the project after runs.</p>
+          </div>
+        </div>
+      </div>
     </aside>
 
   </div>
@@ -270,6 +287,12 @@
           <label for="setting-command-timeout">Command Timeout (ms):</label>
           <input type="number" id="setting-command-timeout" value="120000">
           <small class="form-help">Stops tests or shell commands that run too long.</small>
+        </div>
+
+        <div class="form-group">
+          <label for="setting-model-call-delay">Delay Between Model Calls (ms):</label>
+          <input type="number" id="setting-model-call-delay" value="0" min="0" max="60000">
+          <small class="form-help">Adds breathing room between API calls to reduce rate-limit loops.</small>
         </div>
 
         <div class="form-group">

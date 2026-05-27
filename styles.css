@@ -501,7 +501,21 @@ body {
 .welcome-splash p {
   color: var(--text-secondary);
   font-size: 0.95rem;
-  margin-bottom: 24px;
+  margin-bottom: 12px;
+}
+
+.start-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.start-actions button {
+  min-width: 112px;
+  height: 36px;
+  border-radius: 6px;
 }
 
 .quick-tips {
@@ -1167,6 +1181,11 @@ code {
   background-color: var(--bg-secondary);
 }
 
+.file-node.drag-over {
+  outline: 1px solid var(--accent-color);
+  background-color: var(--accent-glow);
+}
+
 .file-node.file {
   cursor: copy;
 }
@@ -1219,14 +1238,55 @@ code {
   opacity: 0;
 }
 
+.file-action-btn {
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 0.68rem;
+  line-height: 1.2;
+  cursor: pointer;
+  opacity: 0;
+}
+
 .file-node:hover .file-mention-btn,
-.file-mention-btn:focus {
+.file-mention-btn:focus,
+.file-node:hover .file-action-btn,
+.file-action-btn:focus {
   opacity: 1;
 }
 
-.file-mention-btn:hover {
+.file-mention-btn:hover,
+.file-action-btn:hover {
   color: var(--accent-color);
   border-color: var(--accent-color);
+}
+
+.artifact-panel {
+  max-height: 150px;
+}
+
+.artifact-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.artifact-name {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-meta {
+  color: var(--text-muted);
+  font-size: 0.68rem;
 }
 
 .file-viewer-card {
