@@ -1436,7 +1436,8 @@ ipcMain.handle('run-command', (event, { command, cwd, processId, timeoutMs }) =>
             code: session.exitCode,
             error: session.error,
             timedOut: session.timedOut,
-            killed: session.killed
+            killed: session.killed,
+            timeoutMs: session.timeoutMs
           });
         }
       }, 200);

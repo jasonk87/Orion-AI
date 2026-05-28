@@ -5,7 +5,7 @@ const SYSTEM_INSTRUCTION = `You are Orion AI, the ultimate pair programmer agent
 Your goal is to solve the task given by the user with high quality, precision, and trust.
 
 CRITICAL RULES:
-1. PLANNING MODE DECISION: Match the process to the size of the request. Use an implementation plan only when the task is genuinely complex: new projects, multi-file builds, architecture changes, risky migrations, broad bug hunts, security-sensitive work, or requests where the user should review direction before code changes. For small fixes, running/opening a program, running tests, setting an entry point, showing paths, pushing when explicitly asked, or narrow follow-ups, act directly without creating implementation_plan.md. If a plan is needed, create "implementation_plan.md", set the checklist, show the plan in chat, and pause for explicit user approval or requested revisions before modifying source files or running commands.
+1. PLANNING MODE DECISION: Match the process to the size of the request. Use an implementation plan only when the task is genuinely complex: new projects, multi-file builds, architecture changes, risky migrations, broad bug hunts, security-sensitive work, or requests where the user should review direction before code changes. For small fixes, running/opening a program, running tests, setting an entry point, showing paths, pushing when explicitly asked, or narrow follow-ups, act directly without creating implementation_plan.md. If a plan is needed, create "implementation_plan.md", set the checklist, show the plan in chat, and pause for explicit user approval or requested revisions before modifying source files or running commands. Every implementation plan MUST include a "## Testing Plan" section that details exact commands/tests to run, expected behaviors, edge cases, success conditions, and manual checks if automated tests are unavailable.
 2. TESTING AND REGRESSION DISCIPLINE: When you create or change code, you are responsible for producing run-ready code. Before meaningful edits, inspect existing tests and the detected regression command when relevant. After edits, run the appropriate tests or smoke checks using "run_tests", "run_command", or the long-running command tools. If tests fail, read the output, fix the issue, and rerun tests until they pass or you can clearly explain a blocker. For long tests, training, games, and servers, use "start_command" with a sensible timeout, check status/output, and stop processes with "kill_command" when finished. Do not start multiple copies of the same long-running program unless the previous one is stopped. Do not use an interactive command as a test unless you pipe/provide input or intentionally kill it after a short smoke check. Do not claim code works unless you ran a relevant check or state exactly why you could not.
 3. WEB RESEARCH: If you are unsure about an API, library, framework, command, model parameter, error message, current behavior, or documentation detail, use "google_search" and then "fetch_web_page" on the most relevant official docs or primary source before editing. Do not invent configuration files or API shapes when files are missing or the correct implementation is unclear. Do not say you reviewed, checked, verified, or confirmed documentation unless you actually used these web tools in the current task and can name the source URL. If docs appear to say something surprising, quote or paraphrase the exact relevant rule before changing files.
 4. CONTEXT INTEGRITY: Keep files clean, respect formatting, and preserve comments that are unrelated to your edits.
@@ -190,10 +190,30 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   if (!isInternalPrompt && conversation.awaitingPlanApproval && !conversation.planApproved) {
     approvalIntent = await classifyPlanApprovalIntent(userPrompt, modelName, config.geminiApiKey);
     if (approvalIntent.intent === 'approve') {
-      conversation.planApproved = true;
-      conversation.awaitingPlanApproval = false;
-      window.appendSystemMessage("Plan approved. Continuing implementation.");
-    } else if (approvalIntent.intent === 'deny') {
+      // Structural Validation: Check for Testing Plan section in implementation_plan.md
+      let planIsValid = false;
+      try {
+        const planContent = await window.api.readFile(workspacePath, 'implementation_plan.md', { maxChars: 100000 });
+        const planText = typeof planContent === 'string'
+          ? planContent
+          : (planContent && !planContent.error && typeof planContent.content === 'string' ? planContent.content : '');
+        planIsValid = hasRequiredTestingPlanSection(planText);
+      } catch (err) {
+        console.error('Error checking implementation_plan.md for testing section:', err);
+      }
+
+      if (planIsValid) {
+        conversation.planApproved = true;
+        conversation.awaitingPlanApproval = false;
+        window.appendSystemMessage("Plan approved. Continuing implementation.");
+      } else {
+        approvalIntent.intent = 'revise';
+        approvalIntent.reason = 'Missing mandatory ## Testing Plan section in implementation_plan.md';
+        window.appendSystemMessage("Approval blocked: The plan is missing the required '## Testing Plan' section. Asking the agent to revise.");
+      }
+    }
+
+    if (approvalIntent.intent === 'deny') {
       conversation.awaitingPlanApproval = false;
       window.saveConversationsToStorage();
     }
@@ -450,10 +470,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           continue;
         }
         if (shouldHaveUsedToolsButDidNot(textVal, workWalkthrough) && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
+          const guidance = buildFailureRecoveryGuidance(classifyAgentFailure({
+            category: 'model_no_tool_use',
+            errorText: textVal
+          }));
           messages.push({
             role: 'user',
             parts: [{
-              text: '[SYSTEM: Your response appeared to promise or report workspace work, but no tools were called. If the task requires looking at files, running commands/tests, editing code, creating files, or verifying behavior, call the appropriate tools now. If no tools are needed, answer explicitly that no workspace action was needed and why.]'
+              text: `[SYSTEM: ${guidance}]`
             }]
           });
           continue;
@@ -498,13 +522,19 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         // Safety gate for planning mode
         const planningGate = getPlanningToolGate(config, canExecuteThisTask(), toolName, args);
         if (!planningGate.allowed) {
+          const failure = classifyAgentFailure({
+            toolName,
+            args,
+            errorText: planningGate.reason
+          });
+          const guidance = buildFailureRecoveryGuidance(failure);
           currentAgentLogs[logIndex].status = 'error';
           currentAgentLogs[logIndex].result = planningGate.reason;
           
           toolResponseParts.push({
             functionResponse: {
               name: toolName,
-              response: { error: planningGate.reason }
+              response: { error: planningGate.reason, failureCategory: failure.category, recoveryGuidance: guidance }
             }
           });
           continue;
@@ -530,28 +560,32 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
         const resultError = result && (result.error || (result.success === false && result.message));
         if (resultError) {
+          const baseFailure = classifyAgentFailure({ toolName, args, result, errorText: resultError });
           const failureKey = `${toolName}:${stableStringify(args)}:${String(resultError).slice(0, 240)}`;
           const failureCount = (repeatedToolFailures.get(failureKey) || 0) + 1;
           repeatedToolFailures.set(failureKey, failureCount);
+          const failure = classifyAgentFailure({ toolName, args, result, errorText: resultError, failureCount });
+          const guidance = buildFailureRecoveryGuidance(failure);
+          if (typeof result === 'object' && result !== null && !Array.isArray(result)) {
+            result.failureCategory = failure.category;
+            result.recoveryGuidance = guidance;
+          }
           if (failureCount >= 3) {
-            const errMsg = `Repeated failure guard paused ${toolName} after ${failureCount} identical failures. Do not quit the task: step back, diagnose the cause, inspect fresh context, and choose a different strategy before retrying.`;
+            const errMsg = `Repeated failure guard paused ${toolName} after ${failureCount} identical failures. ${guidance}`;
             currentAgentLogs.push({ type: 'thought', content: errMsg });
             toolResponseParts.push({
               functionResponse: {
                 name: toolName,
-                response: { error: errMsg, repeatedFailure: true }
+                response: { error: errMsg, repeatedFailure: true, failureCategory: failure.category, recoveryGuidance: guidance }
               }
             });
             forceYield = true;
             break;
           }
           if (failureCount === 2) {
-            const patchAdvice = toolName === 'patch_file'
-              ? ' Re-read the surrounding lines and use a narrower exact target or line range before trying again.'
-              : '';
-            currentAgentLogs.push({ type: 'thought', content: `Repeated ${toolName} failure detected. Orion will adapt strategy instead of blindly retrying.${patchAdvice}` });
+            currentAgentLogs.push({ type: 'thought', content: `Repeated ${toolName} failure detected (${baseFailure.category}). ${guidance}` });
             if (typeof result === 'object' && result !== null && !Array.isArray(result)) {
-              result.repeatedFailureWarning = `The same ${toolName} call failed twice with the same error. Do not retry it blindly. Identify what failed, group the repeated failure, explain the likely cause, and adapt with a different action.${patchAdvice}`;
+              result.repeatedFailureWarning = guidance;
             }
           }
         }
@@ -850,6 +884,17 @@ async function executeTool(name, args, workspace, config, conversation) {
     
     case 'run_command': {
       if (!args.command) throw new Error("Missing 'command' parameter");
+      const timeoutMs = args.timeoutMs || config.commandTimeoutMs || 120000;
+      const interactiveGate = await validateRunCommandForAgentUse(args.command, workspace);
+      if (!interactiveGate.allowed) {
+        return {
+          success: false,
+          error: interactiveGate.reason,
+          failureCategory: 'interactive_command_needs_input',
+          recoveryGuidance: buildFailureRecoveryGuidance({ category: 'interactive_command_needs_input' }),
+          timeoutMs
+        };
+      }
       
       const processId = `cmd_${conversation.id}_${Date.now()}`;
       let cmdOutput = '';
@@ -859,7 +904,7 @@ async function executeTool(name, args, workspace, config, conversation) {
         cmdOutput += data.text;
       });
       
-      const result = await window.api.runCommand(args.command, workspace, processId, args.timeoutMs || config.commandTimeoutMs || 120000);
+      const result = await window.api.runCommand(args.command, workspace, processId, timeoutMs);
       cleanOutput();
       
       return {
@@ -867,7 +912,8 @@ async function executeTool(name, args, workspace, config, conversation) {
         stdout: cmdOutput,
         stderr: result.error || '',
         timedOut: !!result.timedOut,
-        killed: !!result.killed
+        killed: !!result.killed,
+        timeoutMs: result.timeoutMs || timeoutMs
       };
     }
 
@@ -1332,7 +1378,7 @@ function normalizeFollowupPurpose(value) {
 }
 
 function buildToolUseContractPrompt() {
-  return `[SYSTEM: Before answering, decide whether the user's request requires interacting with the workspace or runtime. If it requires files, commands, tests, external docs, app state, timers, notes, or code changes, use the relevant tools before giving a final answer. If no tool is needed, answer normally and do not claim that work was performed. Never end with a generic completion message unless the Work Walkthrough shows what actually happened.]`;
+  return `[SYSTEM: Before answering, decide whether the user's request requires interacting with the workspace or runtime. If it requires files, commands, tests, external docs, app state, timers, notes, or code changes, use the relevant tools before giving a final answer. If no tool is needed, answer normally and do not claim that work was performed. Never end with a generic completion message unless the Work Walkthrough shows what actually happened. Remember, for complex tasks, your final summary must explicitly list what planned tests were run, their results, and reasons for any skipped tests.]`;
 }
 
 function getPlanningToolGate(config, canExecute, toolName, args = {}) {
@@ -1415,7 +1461,8 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
   } else if (toolName === 'run_command') {
     const timedOut = result && result.timedOut ? ', timed out' : '';
     const killed = result && result.killed ? ', stopped' : '';
-    item.detail = `Exit: ${result && result.exitCode !== undefined ? result.exitCode : 'unknown'}${timedOut}${killed}`;
+    const timeout = result && result.timeoutMs ? `, timeout: ${result.timeoutMs}ms` : '';
+    item.detail = `Exit: ${result && result.exitCode !== undefined ? result.exitCode : 'unknown'}${timedOut}${killed}${timeout}`;
   } else if (toolName === 'start_command') {
     item.detail = result && result.id ? `Session: \`${result.id}\`, timeout: ${result.timeoutMs || 'default'}ms` : '';
   } else if (toolName === 'run_tests') {
@@ -1445,10 +1492,18 @@ function buildFinalVerificationSummary(items) {
   const filesTouched = [...new Set(items.filter(item => item.kind === 'file' && item.path).map(item => item.path))];
   const testsRun = items.filter(item => item.kind === 'test' || item.toolName === 'run_tests' || item.toolName === 'run_command').map(item => item.label);
   const failures = items.filter(item => item.status === 'error');
-  const lines = ['\n\n## Final Summary'];
+  const planItems = items.filter(item => item.kind === 'plan');
+  const hasPlan = planItems.length > 0;
+
+  const lines = ['\n\n## Final Pre-Submit Summary'];
   lines.push(`- **Files touched:** ${filesTouched.length ? filesTouched.map(path => `\`${path}\``).join(', ') : 'None recorded'}`);
-  lines.push(`- **Tests/checks run:** ${testsRun.length ? testsRun.join('; ') : 'None recorded'}`);
-  lines.push(`- **Failures/skipped checks:** ${failures.length ? failures.map(item => item.label).join('; ') : 'None recorded'}`);
+  if (hasPlan) {
+    lines.push(`- **Planned Tests Executed:** ${testsRun.length ? testsRun.join('; ') : 'None recorded'}`);
+    lines.push(`- **Failures/Skipped Tests:** ${failures.length ? failures.map(item => item.label).join('; ') : 'None recorded. Note: Any planned tests not run must be justified.'}`);
+  } else {
+    lines.push(`- **Tests/checks run:** ${testsRun.length ? testsRun.join('; ') : 'None recorded'}`);
+    lines.push(`- **Failures/skipped checks:** ${failures.length ? failures.map(item => item.label).join('; ') : 'None recorded'}`);
+  }
   lines.push('- **How to verify:** Review the files above and rerun the listed tests/checks.');
   return lines.join('\n');
 }
@@ -1493,6 +1548,10 @@ function formatPlanContentForChat(content) {
   const maxChars = 24000;
   if (text.length <= maxChars) return text;
   return `${text.slice(0, maxChars)}\n\n_The plan continues in [implementation_plan.md](orion-file:implementation_plan.md). I showed the first ${maxChars.toLocaleString()} characters here._`;
+}
+
+function hasRequiredTestingPlanSection(content) {
+  return /^#{2,3}\s+(testing plan|test plan|validation plan)\b/im.test(String(content || ''));
 }
 
 function hasAnyChecklist(conversation) {
@@ -1557,7 +1616,21 @@ Definitions:
 - direct: concrete low-risk work that should be executed immediately, such as running/opening a program, running tests, showing a directory, setting an entry point, pushing to Git when explicitly requested, viewing a file, making a narrow edit, fixing a small bug, or continuing an already-approved task.
 - answer: a question or explanation that can be answered in chat without workspace changes or command execution.
 
-Be practical and avoid ceremony. If the user asks for a simple local action, choose direct.
+Decision guidance:
+- Prefer direct for read-only local inspection or inventory tasks, including listing installed runtimes, checking versions, checking PATH, finding executables, showing files, or running safe diagnostic commands.
+- Prefer direct for a small number of safe commands that gather facts, even if the answer has several sections.
+- Prefer plan only when the task requires a coordinated implementation, risky changes, many file edits, architecture/design choices, migrations, security-sensitive changes, or user review before modifying the workspace.
+- Prefer answer when no local tools or workspace actions are needed.
+
+Examples:
+- "what python environments do i have installed on this computer" -> direct
+- "where is python installed and which one is first on PATH" -> direct
+- "run the tests" -> direct
+- "explain how PATH works on Windows" -> answer
+- "build me a Python desktop app" -> plan
+- "refactor the authentication flow" -> plan
+
+Be practical and avoid ceremony. Decide from task complexity and risk, not from whether the response may need multiple bullet points.
 
 User message:
 ${JSON.stringify(String(userPrompt || ''))}`;
@@ -1597,6 +1670,91 @@ function shouldHaveUsedToolsButDidNot(text, workWalkthrough) {
   const response = String(text || '').trim();
   if (!response) return true;
   return response.length < 80;
+}
+
+async function validateRunCommandForAgentUse(command, workspace) {
+  const text = String(command || '');
+  if (!looksLikePythonFileRun(text) || commandProvidesInput(text)) {
+    return { allowed: true, reason: '' };
+  }
+
+  const scriptPath = extractPythonScriptPath(text);
+  if (!scriptPath || !window.api || typeof window.api.readFile !== 'function') {
+    return { allowed: true, reason: '' };
+  }
+
+  const content = await window.api.readFile(workspace, scriptPath, { maxChars: 200000 });
+  const source = typeof content === 'string'
+    ? content
+    : (content && !content.error && typeof content.content === 'string' ? content.content : '');
+  if (!/\binput\s*\(/.test(source)) {
+    return { allowed: true, reason: '' };
+  }
+
+  return {
+    allowed: false,
+    reason: `Interactive command '${text}' appears to run ${scriptPath}, which reads from input(). Pipe test input into the command, redirect a prepared input file, or use start_command with a short timeout and then kill/read output for a smoke check.`
+  };
+}
+
+function looksLikePythonFileRun(command) {
+  return !!extractPythonScriptPath(command);
+}
+
+function commandProvidesInput(command) {
+  const text = String(command || '');
+  return /[|<]/.test(text) || /\b(echo|printf|type|Get-Content|gc)\b/i.test(text);
+}
+
+function extractPythonScriptPath(command) {
+  const text = String(command || '');
+  const match = text.match(/(?:^|[;&]\s*)(?:py(?:thon)?|python(?:\d+(?:\.\d+)?)?|py)\s+(?:"([^"]+\.py)"|'([^']+\.py)'|([^\s;&|<>]+\.py))/i);
+  return match ? (match[1] || match[2] || match[3]) : '';
+}
+
+function classifyAgentFailure({ toolName = '', args = {}, result = null, errorText = '', failureCount = 1, category = '' } = {}) {
+  if (category) return { category, toolName, args, errorText: String(errorText || ''), failureCount };
+
+  const text = String(errorText || '').toLowerCase();
+  const command = String((args && args.command) || '');
+
+  let resolved = 'tool_failure';
+  if (failureCount >= 3) {
+    resolved = 'repeated_tool_failure';
+  } else if (toolName === 'patch_file' && /target content block not found|target.*not found|line range|patch.*failed/.test(text)) {
+    resolved = 'patch_target_missing';
+  } else if (/deny-list|destructive|blocked|planning mode blocks|not approved/.test(text)) {
+    resolved = 'command_blocked';
+  } else if (toolName === 'run_tests' || /test .*failed|tests failed|regression detected|npm test/.test(text) || (toolName === 'run_command' && /\b(npm|yarn|pnpm|node)\s+test\b/.test(command))) {
+    resolved = 'test_failure';
+  } else if (/cannot find module|module not found|command not found|not recognized as|enoent|missing dependency|no such file or directory/.test(text)) {
+    resolved = 'missing_dependency';
+  } else if (/401|403|unauthorized|forbidden|api key|credential|auth|permission denied/.test(text)) {
+    resolved = 'auth_missing';
+  } else if (/timed out|timeout|etimedout|aborted/.test(text) || (result && result.timedOut)) {
+    resolved = 'timeout';
+  } else if (/interactive command|reads from input\(\)|pipe test input|requires stdin/.test(text)) {
+    resolved = 'interactive_command_needs_input';
+  }
+
+  return { category: resolved, toolName, args, errorText: String(errorText || ''), failureCount };
+}
+
+function buildFailureRecoveryGuidance(failure) {
+  const category = failure && failure.category ? failure.category : 'tool_failure';
+  const messages = {
+    repeated_tool_failure: 'Do not quit the task. Do not retry it blindly. Pause the repeated call, inspect fresh state and recent output, explain the likely cause, then choose a different strategy before retrying: use a different tool, narrower arguments, or ask for the missing prerequisite.',
+    patch_target_missing: 'Re-read the surrounding file lines before editing. Use a narrower exact target, a line-range patch, or adjust the patch to the current file contents instead of repeating the same patch.',
+    command_blocked: 'The command was blocked by safety or planning rules. Keep the safety behavior intact; use a safer non-destructive command, an internal executable/args path, or ask for explicit plan approval when required.',
+    test_failure: 'Treat this as a regression signal. Read the failing test output, identify the first failing assertion or command, fix the code or test expectation, and rerun the relevant tests before summarizing.',
+    missing_dependency: 'Install or configure the missing dependency only after checking the project manifest and existing package manager. If installation is not appropriate, choose a tool that uses available local capabilities.',
+    auth_missing: 'Stop retrying credential-gated work. Preserve state, name the missing credential or permission, and ask the user to provide or configure it before continuing.',
+    timeout: 'Do not repeat the same long-running action unchanged. Check whether the process is still running, inspect partial output, increase timeout only if justified, or break the work into a smaller command.',
+    interactive_command_needs_input: 'Do not run an interactive command as a blocking test without stdin. Pipe a short scripted input sequence, redirect an input fixture, or use start_command with a short timeout followed by read_command_output and kill_command.',
+    model_no_tool_use: 'Your response appeared to promise or report workspace work, but no tools were called. If the task requires looking at files, running commands/tests, editing code, creating files, or verifying behavior, call the appropriate tools now. If no tools are needed, answer explicitly that no workspace action was needed and why.',
+    tool_failure: 'Inspect the error and current workspace state before trying again. Change one meaningful variable in the next attempt, such as the target path, command, arguments, or verification step.'
+  };
+  return messages[category] || messages.tool_failure;
 }
 
 function sleep(ms) {
@@ -2618,6 +2776,12 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     getPlanningToolGate,
     normalizeChecklistTasks,
     shouldApplyChecklistUpdate,
+    hasRequiredTestingPlanSection,
+    validateRunCommandForAgentUse,
+    extractPythonScriptPath,
+    commandProvidesInput,
+    classifyAgentFailure,
+    buildFailureRecoveryGuidance,
     diagnoseModelApiFailure
   };
 }

@@ -23,6 +23,9 @@ global.fetch = async (url, options) => {
     if (text.includes('"run tests"')) {
       return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":""}' }] } }] }) };
     }
+    if (text.includes('"what all python environments do i have installed on this computer"')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"Read-only local environment inventory."}' }] } }] }) };
+    }
     if (text.includes('"explain"')) {
       return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"answer","reason":""}' }] } }] }) };
     }
@@ -54,6 +57,9 @@ test('classifyPlanningNeed returns correct modes', async (t) => {
   const directRes = await agent.classifyPlanningNeed('run tests', 'gemini-1', 'key');
   t.equal(directRes.mode, 'direct', 'Recognizes direct mode');
 
+  const envRes = await agent.classifyPlanningNeed('what all python environments do i have installed on this computer', 'gemini-1', 'key');
+  t.equal(envRes.mode, 'direct', 'Recognizes local Python environment inventory as direct mode');
+
   const planRes = await agent.classifyPlanningNeed('build a whole app', 'gemini-1', 'key');
   t.equal(planRes.mode, 'plan', 'Recognizes plan mode');
 
@@ -82,5 +88,14 @@ test('Planning Gate behavior blocks destructive tools except implementation_plan
   const approvedGate = agent.getPlanningToolGate(config, true, 'run_command', { command: 'npm test' });
   t.equal(approvedGate.allowed, true, 'allows destructive tools after approval/direct classification');
 
+  t.end();
+});
+
+test('plan approval validation requires a testing plan section', (t) => {
+  t.equal(agent.hasRequiredTestingPlanSection('# Plan\n\n## Testing Plan\n\nRun npm test.'), true, 'accepts required Testing Plan heading');
+  t.equal(agent.hasRequiredTestingPlanSection('# Plan\n\n### Test Plan\n\nRun npm test.'), true, 'accepts Test Plan subheading');
+  t.equal(agent.hasRequiredTestingPlanSection('# Plan\n\n## Validation Plan\n\nManual smoke check.'), true, 'accepts Validation Plan heading');
+  t.equal(agent.hasRequiredTestingPlanSection('# Plan\n\n## Implementation\n\nDo the work.'), false, 'rejects plans without a testing section');
+  t.equal(agent.hasRequiredTestingPlanSection(''), false, 'rejects missing or unreadable plan content');
   t.end();
 });

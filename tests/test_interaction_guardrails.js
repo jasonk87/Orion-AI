@@ -44,6 +44,122 @@ test('model call delay and repeated failure guardrails exist', (t) => {
   t.end();
 });
 
+test('repeated failure guard warns on second failure and pauses on third', (t) => {
+  t.ok(/if\s*\(\s*failureCount\s*===\s*2\s*\)/.test(agentJs), 'second identical failure emits an adaptive warning');
+  t.ok(/if\s*\(\s*failureCount\s*>=\s*3\s*\)/.test(agentJs), 'third identical failure triggers the pause guard');
+  t.ok(agentJs.includes('Do not retry it blindly'), 'second failure warning tells Orion not to repeat blindly');
+  t.ok(agentJs.includes('choose a different strategy before retrying'), 'pause guard requires a different recovery strategy');
+  t.end();
+});
+
+test('failure taxonomy classifies common failure modes', (t) => {
+  t.equal(agent.classifyAgentFailure({
+    toolName: 'patch_file',
+    errorText: 'Target content block not found in file: app.js'
+  }).category, 'patch_target_missing', 'classifies missing patch target');
+
+  t.equal(agent.classifyAgentFailure({
+    toolName: 'run_command',
+    args: { command: 'rm -rf ./build' },
+    errorText: 'Command is in the deny-list and cannot be executed.'
+  }).category, 'command_blocked', 'classifies blocked destructive commands');
+
+  t.equal(agent.classifyAgentFailure({
+    toolName: 'run_tests',
+    result: { success: false },
+    errorText: 'tests failed'
+  }).category, 'test_failure', 'classifies failed regression tests');
+
+  t.equal(agent.classifyAgentFailure({
+    toolName: 'run_command',
+    errorText: 'npm: command not found'
+  }).category, 'missing_dependency', 'classifies missing dependencies');
+
+  t.equal(agent.classifyAgentFailure({
+    toolName: 'google_search',
+    errorText: 'HTTP 401 invalid API key'
+  }).category, 'auth_missing', 'classifies missing auth');
+
+  t.equal(agent.classifyAgentFailure({
+    toolName: 'run_command',
+    result: { timedOut: true },
+    errorText: 'Command timed out'
+  }).category, 'timeout', 'classifies timeouts');
+
+  t.equal(agent.classifyAgentFailure({
+    toolName: 'run_command',
+    errorText: 'Interactive command reads from input(). Pipe test input.'
+  }).category, 'interactive_command_needs_input', 'classifies interactive commands without stdin');
+
+  t.equal(agent.classifyAgentFailure({
+    toolName: 'patch_file',
+    errorText: 'same failure',
+    failureCount: 3
+  }).category, 'repeated_tool_failure', 'repeated failures override specific categories at threshold');
+
+  t.equal(agent.classifyAgentFailure({
+    category: 'model_no_tool_use'
+  }).category, 'model_no_tool_use', 'classifies model no-tool-use follow-up');
+
+  t.end();
+});
+
+test('failure taxonomy produces specific recovery guidance', (t) => {
+  const patchGuidance = agent.buildFailureRecoveryGuidance({ category: 'patch_target_missing' });
+  t.ok(patchGuidance.includes('Re-read the surrounding file lines'), 'patch guidance asks to inspect current file context');
+  t.ok(patchGuidance.includes('line-range patch'), 'patch guidance suggests a narrower edit strategy');
+
+  const commandGuidance = agent.buildFailureRecoveryGuidance({ category: 'command_blocked' });
+  t.ok(commandGuidance.includes('blocked by safety or planning rules'), 'blocked command guidance preserves safety posture');
+  t.ok(commandGuidance.includes('internal executable/args'), 'blocked command guidance points to safe internal boundary');
+
+  const testGuidance = agent.buildFailureRecoveryGuidance({ category: 'test_failure' });
+  t.ok(testGuidance.includes('Read the failing test output'), 'test guidance focuses on failing output');
+  t.ok(testGuidance.includes('rerun the relevant tests'), 'test guidance requires verification rerun');
+
+  const authGuidance = agent.buildFailureRecoveryGuidance({ category: 'auth_missing' });
+  t.ok(authGuidance.includes('Stop retrying credential-gated work'), 'auth guidance stops blind retries');
+
+  const interactiveGuidance = agent.buildFailureRecoveryGuidance({ category: 'interactive_command_needs_input' });
+  t.ok(interactiveGuidance.includes('Pipe a short scripted input sequence'), 'interactive command guidance requires stdin');
+  t.ok(interactiveGuidance.includes('start_command with a short timeout'), 'interactive command guidance allows bounded smoke checks');
+
+  const noToolGuidance = agent.buildFailureRecoveryGuidance({ category: 'model_no_tool_use' });
+  t.ok(noToolGuidance.includes('no tools were called'), 'model no-tool-use guidance explains the failure');
+  t.ok(noToolGuidance.includes('call the appropriate tools now'), 'model no-tool-use guidance prompts concrete action');
+
+  const repeatedGuidance = agent.buildFailureRecoveryGuidance({ category: 'repeated_tool_failure' });
+  t.ok(repeatedGuidance.includes('Do not quit the task'), 'repeated guidance preserves adaptive recovery');
+  t.ok(repeatedGuidance.includes('choose a different strategy before retrying'), 'repeated guidance requires strategy change');
+
+  t.end();
+});
+
+test('run_command guard blocks interactive Python scripts without stdin', async (t) => {
+  const files = {
+    'tic_tac_toe.py': "move = input('move: ')\nprint(move)\n",
+    'report.py': "print('ready')\n"
+  };
+  global.window.api = {
+    readFile: async (workspace, relativePath) => files[relativePath] || { error: 'File does not exist' }
+  };
+
+  t.equal(agent.extractPythonScriptPath('python tic_tac_toe.py'), 'tic_tac_toe.py', 'extracts Python script path');
+  t.equal(agent.commandProvidesInput('echo 1 | python tic_tac_toe.py'), true, 'detects piped stdin');
+
+  const blocked = await agent.validateRunCommandForAgentUse('python tic_tac_toe.py', process.cwd());
+  t.equal(blocked.allowed, false, 'blocks interactive Python command without stdin');
+  t.ok(blocked.reason.includes('Pipe test input'), 'blocked reason tells agent how to recover');
+
+  const piped = await agent.validateRunCommandForAgentUse('echo 1 | python tic_tac_toe.py', process.cwd());
+  t.equal(piped.allowed, true, 'allows interactive Python command with piped stdin');
+
+  const plain = await agent.validateRunCommandForAgentUse('python report.py', process.cwd());
+  t.equal(plain.allowed, true, 'allows non-interactive Python scripts');
+
+  t.end();
+});
+
 test('model API calls cannot sit indefinitely without visible cooldown status', (t) => {
   t.ok(agentJs.includes('MODEL_API_REQUEST_TIMEOUT_MS = 60000'), 'model API requests have a hard timeout');
   t.ok(agentJs.includes('MODEL_API_MAX_ATTEMPTS = 3'), 'Gemini retry attempts are bounded');
