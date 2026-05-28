@@ -470,10 +470,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           continue;
         }
         if (shouldHaveUsedToolsButDidNot(textVal, workWalkthrough) && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
+          const guidance = buildFailureRecoveryGuidance(classifyAgentFailure({
+            category: 'model_no_tool_use',
+            errorText: textVal
+          }));
           messages.push({
             role: 'user',
             parts: [{
-              text: '[SYSTEM: Your response appeared to promise or report workspace work, but no tools were called. If the task requires looking at files, running commands/tests, editing code, creating files, or verifying behavior, call the appropriate tools now. If no tools are needed, answer explicitly that no workspace action was needed and why.]'
+              text: `[SYSTEM: ${guidance}]`
             }]
           });
           continue;
@@ -518,13 +522,19 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         // Safety gate for planning mode
         const planningGate = getPlanningToolGate(config, canExecuteThisTask(), toolName, args);
         if (!planningGate.allowed) {
+          const failure = classifyAgentFailure({
+            toolName,
+            args,
+            errorText: planningGate.reason
+          });
+          const guidance = buildFailureRecoveryGuidance(failure);
           currentAgentLogs[logIndex].status = 'error';
           currentAgentLogs[logIndex].result = planningGate.reason;
           
           toolResponseParts.push({
             functionResponse: {
               name: toolName,
-              response: { error: planningGate.reason }
+              response: { error: planningGate.reason, failureCategory: failure.category, recoveryGuidance: guidance }
             }
           });
           continue;
@@ -550,28 +560,32 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
         const resultError = result && (result.error || (result.success === false && result.message));
         if (resultError) {
+          const baseFailure = classifyAgentFailure({ toolName, args, result, errorText: resultError });
           const failureKey = `${toolName}:${stableStringify(args)}:${String(resultError).slice(0, 240)}`;
           const failureCount = (repeatedToolFailures.get(failureKey) || 0) + 1;
           repeatedToolFailures.set(failureKey, failureCount);
+          const failure = classifyAgentFailure({ toolName, args, result, errorText: resultError, failureCount });
+          const guidance = buildFailureRecoveryGuidance(failure);
+          if (typeof result === 'object' && result !== null && !Array.isArray(result)) {
+            result.failureCategory = failure.category;
+            result.recoveryGuidance = guidance;
+          }
           if (failureCount >= 3) {
-            const errMsg = `Repeated failure guard paused ${toolName} after ${failureCount} identical failures. Do not quit the task: step back, diagnose the cause, inspect fresh context, and choose a different strategy before retrying.`;
+            const errMsg = `Repeated failure guard paused ${toolName} after ${failureCount} identical failures. ${guidance}`;
             currentAgentLogs.push({ type: 'thought', content: errMsg });
             toolResponseParts.push({
               functionResponse: {
                 name: toolName,
-                response: { error: errMsg, repeatedFailure: true }
+                response: { error: errMsg, repeatedFailure: true, failureCategory: failure.category, recoveryGuidance: guidance }
               }
             });
             forceYield = true;
             break;
           }
           if (failureCount === 2) {
-            const patchAdvice = toolName === 'patch_file'
-              ? ' Re-read the surrounding lines and use a narrower exact target or line range before trying again.'
-              : '';
-            currentAgentLogs.push({ type: 'thought', content: `Repeated ${toolName} failure detected. Orion will adapt strategy instead of blindly retrying.${patchAdvice}` });
+            currentAgentLogs.push({ type: 'thought', content: `Repeated ${toolName} failure detected (${baseFailure.category}). ${guidance}` });
             if (typeof result === 'object' && result !== null && !Array.isArray(result)) {
-              result.repeatedFailureWarning = `The same ${toolName} call failed twice with the same error. Do not retry it blindly. Identify what failed, group the repeated failure, explain the likely cause, and adapt with a different action.${patchAdvice}`;
+              result.repeatedFailureWarning = guidance;
             }
           }
         }
@@ -870,6 +884,17 @@ async function executeTool(name, args, workspace, config, conversation) {
     
     case 'run_command': {
       if (!args.command) throw new Error("Missing 'command' parameter");
+      const timeoutMs = args.timeoutMs || config.commandTimeoutMs || 120000;
+      const interactiveGate = await validateRunCommandForAgentUse(args.command, workspace);
+      if (!interactiveGate.allowed) {
+        return {
+          success: false,
+          error: interactiveGate.reason,
+          failureCategory: 'interactive_command_needs_input',
+          recoveryGuidance: buildFailureRecoveryGuidance({ category: 'interactive_command_needs_input' }),
+          timeoutMs
+        };
+      }
       
       const processId = `cmd_${conversation.id}_${Date.now()}`;
       let cmdOutput = '';
@@ -879,7 +904,7 @@ async function executeTool(name, args, workspace, config, conversation) {
         cmdOutput += data.text;
       });
       
-      const result = await window.api.runCommand(args.command, workspace, processId, args.timeoutMs || config.commandTimeoutMs || 120000);
+      const result = await window.api.runCommand(args.command, workspace, processId, timeoutMs);
       cleanOutput();
       
       return {
@@ -887,7 +912,8 @@ async function executeTool(name, args, workspace, config, conversation) {
         stdout: cmdOutput,
         stderr: result.error || '',
         timedOut: !!result.timedOut,
-        killed: !!result.killed
+        killed: !!result.killed,
+        timeoutMs: result.timeoutMs || timeoutMs
       };
     }
 
@@ -1435,7 +1461,8 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
   } else if (toolName === 'run_command') {
     const timedOut = result && result.timedOut ? ', timed out' : '';
     const killed = result && result.killed ? ', stopped' : '';
-    item.detail = `Exit: ${result && result.exitCode !== undefined ? result.exitCode : 'unknown'}${timedOut}${killed}`;
+    const timeout = result && result.timeoutMs ? `, timeout: ${result.timeoutMs}ms` : '';
+    item.detail = `Exit: ${result && result.exitCode !== undefined ? result.exitCode : 'unknown'}${timedOut}${killed}${timeout}`;
   } else if (toolName === 'start_command') {
     item.detail = result && result.id ? `Session: \`${result.id}\`, timeout: ${result.timeoutMs || 'default'}ms` : '';
   } else if (toolName === 'run_tests') {
@@ -1589,7 +1616,21 @@ Definitions:
 - direct: concrete low-risk work that should be executed immediately, such as running/opening a program, running tests, showing a directory, setting an entry point, pushing to Git when explicitly requested, viewing a file, making a narrow edit, fixing a small bug, or continuing an already-approved task.
 - answer: a question or explanation that can be answered in chat without workspace changes or command execution.
 
-Be practical and avoid ceremony. If the user asks for a simple local action, choose direct.
+Decision guidance:
+- Prefer direct for read-only local inspection or inventory tasks, including listing installed runtimes, checking versions, checking PATH, finding executables, showing files, or running safe diagnostic commands.
+- Prefer direct for a small number of safe commands that gather facts, even if the answer has several sections.
+- Prefer plan only when the task requires a coordinated implementation, risky changes, many file edits, architecture/design choices, migrations, security-sensitive changes, or user review before modifying the workspace.
+- Prefer answer when no local tools or workspace actions are needed.
+
+Examples:
+- "what python environments do i have installed on this computer" -> direct
+- "where is python installed and which one is first on PATH" -> direct
+- "run the tests" -> direct
+- "explain how PATH works on Windows" -> answer
+- "build me a Python desktop app" -> plan
+- "refactor the authentication flow" -> plan
+
+Be practical and avoid ceremony. Decide from task complexity and risk, not from whether the response may need multiple bullet points.
 
 User message:
 ${JSON.stringify(String(userPrompt || ''))}`;
@@ -1629,6 +1670,91 @@ function shouldHaveUsedToolsButDidNot(text, workWalkthrough) {
   const response = String(text || '').trim();
   if (!response) return true;
   return response.length < 80;
+}
+
+async function validateRunCommandForAgentUse(command, workspace) {
+  const text = String(command || '');
+  if (!looksLikePythonFileRun(text) || commandProvidesInput(text)) {
+    return { allowed: true, reason: '' };
+  }
+
+  const scriptPath = extractPythonScriptPath(text);
+  if (!scriptPath || !window.api || typeof window.api.readFile !== 'function') {
+    return { allowed: true, reason: '' };
+  }
+
+  const content = await window.api.readFile(workspace, scriptPath, { maxChars: 200000 });
+  const source = typeof content === 'string'
+    ? content
+    : (content && !content.error && typeof content.content === 'string' ? content.content : '');
+  if (!/\binput\s*\(/.test(source)) {
+    return { allowed: true, reason: '' };
+  }
+
+  return {
+    allowed: false,
+    reason: `Interactive command '${text}' appears to run ${scriptPath}, which reads from input(). Pipe test input into the command, redirect a prepared input file, or use start_command with a short timeout and then kill/read output for a smoke check.`
+  };
+}
+
+function looksLikePythonFileRun(command) {
+  return !!extractPythonScriptPath(command);
+}
+
+function commandProvidesInput(command) {
+  const text = String(command || '');
+  return /[|<]/.test(text) || /\b(echo|printf|type|Get-Content|gc)\b/i.test(text);
+}
+
+function extractPythonScriptPath(command) {
+  const text = String(command || '');
+  const match = text.match(/(?:^|[;&]\s*)(?:py(?:thon)?|python(?:\d+(?:\.\d+)?)?|py)\s+(?:"([^"]+\.py)"|'([^']+\.py)'|([^\s;&|<>]+\.py))/i);
+  return match ? (match[1] || match[2] || match[3]) : '';
+}
+
+function classifyAgentFailure({ toolName = '', args = {}, result = null, errorText = '', failureCount = 1, category = '' } = {}) {
+  if (category) return { category, toolName, args, errorText: String(errorText || ''), failureCount };
+
+  const text = String(errorText || '').toLowerCase();
+  const command = String((args && args.command) || '');
+
+  let resolved = 'tool_failure';
+  if (failureCount >= 3) {
+    resolved = 'repeated_tool_failure';
+  } else if (toolName === 'patch_file' && /target content block not found|target.*not found|line range|patch.*failed/.test(text)) {
+    resolved = 'patch_target_missing';
+  } else if (/deny-list|destructive|blocked|planning mode blocks|not approved/.test(text)) {
+    resolved = 'command_blocked';
+  } else if (toolName === 'run_tests' || /test .*failed|tests failed|regression detected|npm test/.test(text) || (toolName === 'run_command' && /\b(npm|yarn|pnpm|node)\s+test\b/.test(command))) {
+    resolved = 'test_failure';
+  } else if (/cannot find module|module not found|command not found|not recognized as|enoent|missing dependency|no such file or directory/.test(text)) {
+    resolved = 'missing_dependency';
+  } else if (/401|403|unauthorized|forbidden|api key|credential|auth|permission denied/.test(text)) {
+    resolved = 'auth_missing';
+  } else if (/timed out|timeout|etimedout|aborted/.test(text) || (result && result.timedOut)) {
+    resolved = 'timeout';
+  } else if (/interactive command|reads from input\(\)|pipe test input|requires stdin/.test(text)) {
+    resolved = 'interactive_command_needs_input';
+  }
+
+  return { category: resolved, toolName, args, errorText: String(errorText || ''), failureCount };
+}
+
+function buildFailureRecoveryGuidance(failure) {
+  const category = failure && failure.category ? failure.category : 'tool_failure';
+  const messages = {
+    repeated_tool_failure: 'Do not quit the task. Do not retry it blindly. Pause the repeated call, inspect fresh state and recent output, explain the likely cause, then choose a different strategy before retrying: use a different tool, narrower arguments, or ask for the missing prerequisite.',
+    patch_target_missing: 'Re-read the surrounding file lines before editing. Use a narrower exact target, a line-range patch, or adjust the patch to the current file contents instead of repeating the same patch.',
+    command_blocked: 'The command was blocked by safety or planning rules. Keep the safety behavior intact; use a safer non-destructive command, an internal executable/args path, or ask for explicit plan approval when required.',
+    test_failure: 'Treat this as a regression signal. Read the failing test output, identify the first failing assertion or command, fix the code or test expectation, and rerun the relevant tests before summarizing.',
+    missing_dependency: 'Install or configure the missing dependency only after checking the project manifest and existing package manager. If installation is not appropriate, choose a tool that uses available local capabilities.',
+    auth_missing: 'Stop retrying credential-gated work. Preserve state, name the missing credential or permission, and ask the user to provide or configure it before continuing.',
+    timeout: 'Do not repeat the same long-running action unchanged. Check whether the process is still running, inspect partial output, increase timeout only if justified, or break the work into a smaller command.',
+    interactive_command_needs_input: 'Do not run an interactive command as a blocking test without stdin. Pipe a short scripted input sequence, redirect an input fixture, or use start_command with a short timeout followed by read_command_output and kill_command.',
+    model_no_tool_use: 'Your response appeared to promise or report workspace work, but no tools were called. If the task requires looking at files, running commands/tests, editing code, creating files, or verifying behavior, call the appropriate tools now. If no tools are needed, answer explicitly that no workspace action was needed and why.',
+    tool_failure: 'Inspect the error and current workspace state before trying again. Change one meaningful variable in the next attempt, such as the target path, command, arguments, or verification step.'
+  };
+  return messages[category] || messages.tool_failure;
 }
 
 function sleep(ms) {
@@ -2651,6 +2777,11 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     normalizeChecklistTasks,
     shouldApplyChecklistUpdate,
     hasRequiredTestingPlanSection,
+    validateRunCommandForAgentUse,
+    extractPythonScriptPath,
+    commandProvidesInput,
+    classifyAgentFailure,
+    buildFailureRecoveryGuidance,
     diagnoseModelApiFailure
   };
 }

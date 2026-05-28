@@ -37,6 +37,7 @@ test('startCommandSession runs and killProcessTree kills', (t) => {
 
   t.equal(session.status, 'running', 'session starts running');
   t.ok(session.id, 'session has id');
+  t.equal(session.timeoutMs, 10000, 'session records explicit timeout');
 
   const child = main.activeProcesses[session.id];
   t.ok(child, 'Real process was spawned and tracked');

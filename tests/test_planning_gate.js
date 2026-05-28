@@ -23,6 +23,9 @@ global.fetch = async (url, options) => {
     if (text.includes('"run tests"')) {
       return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":""}' }] } }] }) };
     }
+    if (text.includes('"what all python environments do i have installed on this computer"')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"Read-only local environment inventory."}' }] } }] }) };
+    }
     if (text.includes('"explain"')) {
       return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"answer","reason":""}' }] } }] }) };
     }
@@ -53,6 +56,9 @@ test('classifyPlanApprovalIntent returns correct intents', async (t) => {
 test('classifyPlanningNeed returns correct modes', async (t) => {
   const directRes = await agent.classifyPlanningNeed('run tests', 'gemini-1', 'key');
   t.equal(directRes.mode, 'direct', 'Recognizes direct mode');
+
+  const envRes = await agent.classifyPlanningNeed('what all python environments do i have installed on this computer', 'gemini-1', 'key');
+  t.equal(envRes.mode, 'direct', 'Recognizes local Python environment inventory as direct mode');
 
   const planRes = await agent.classifyPlanningNeed('build a whole app', 'gemini-1', 'key');
   t.equal(planRes.mode, 'plan', 'Recognizes plan mode');
