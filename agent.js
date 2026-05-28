@@ -5,7 +5,7 @@ const SYSTEM_INSTRUCTION = `You are Orion AI, the ultimate pair programmer agent
 Your goal is to solve the task given by the user with high quality, precision, and trust.
 
 CRITICAL RULES:
-1. PLANNING MODE DECISION: Match the process to the size of the request. Use an implementation plan only when the task is genuinely complex: new projects, multi-file builds, architecture changes, risky migrations, broad bug hunts, security-sensitive work, or requests where the user should review direction before code changes. For small fixes, running/opening a program, running tests, setting an entry point, showing paths, pushing when explicitly asked, or narrow follow-ups, act directly without creating implementation_plan.md. If a plan is needed, create "implementation_plan.md", set the checklist, show the plan in chat, and pause for explicit user approval or requested revisions before modifying source files or running commands.
+1. PLANNING MODE DECISION: Match the process to the size of the request. Use an implementation plan only when the task is genuinely complex: new projects, multi-file builds, architecture changes, risky migrations, broad bug hunts, security-sensitive work, or requests where the user should review direction before code changes. For small fixes, running/opening a program, running tests, setting an entry point, showing paths, pushing when explicitly asked, or narrow follow-ups, act directly without creating implementation_plan.md. If a plan is needed, create "implementation_plan.md", set the checklist, show the plan in chat, and pause for explicit user approval or requested revisions before modifying source files or running commands. Every implementation plan MUST include a "## Testing Plan" section that details exact commands/tests to run, expected behaviors, edge cases, success conditions, and manual checks if automated tests are unavailable.
 2. TESTING AND REGRESSION DISCIPLINE: When you create or change code, you are responsible for producing run-ready code. Before meaningful edits, inspect existing tests and the detected regression command when relevant. After edits, run the appropriate tests or smoke checks using "run_tests", "run_command", or the long-running command tools. If tests fail, read the output, fix the issue, and rerun tests until they pass or you can clearly explain a blocker. For long tests, training, games, and servers, use "start_command" with a sensible timeout, check status/output, and stop processes with "kill_command" when finished. Do not start multiple copies of the same long-running program unless the previous one is stopped. Do not use an interactive command as a test unless you pipe/provide input or intentionally kill it after a short smoke check. Do not claim code works unless you ran a relevant check or state exactly why you could not.
 3. WEB RESEARCH: If you are unsure about an API, library, framework, command, model parameter, error message, current behavior, or documentation detail, use "google_search" and then "fetch_web_page" on the most relevant official docs or primary source before editing. Do not invent configuration files or API shapes when files are missing or the correct implementation is unclear. Do not say you reviewed, checked, verified, or confirmed documentation unless you actually used these web tools in the current task and can name the source URL. If docs appear to say something surprising, quote or paraphrase the exact relevant rule before changing files.
 4. CONTEXT INTEGRITY: Keep files clean, respect formatting, and preserve comments that are unrelated to your edits.
@@ -190,9 +190,29 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   if (!isInternalPrompt && conversation.awaitingPlanApproval && !conversation.planApproved) {
     approvalIntent = await classifyPlanApprovalIntent(userPrompt, modelName, config.geminiApiKey);
     if (approvalIntent.intent === 'approve') {
-      conversation.planApproved = true;
-      conversation.awaitingPlanApproval = false;
-      window.appendSystemMessage("Plan approved. Continuing implementation.");
+      // Structural Validation: Check for Testing Plan section in implementation_plan.md
+      let planIsValid = true;
+      try {
+        const planContent = await window.api.readFile(workspacePath, 'implementation_plan.md', { maxChars: 100000 });
+        if (planContent && !planContent.error && typeof planContent.content === 'string') {
+          const contentLower = planContent.content.toLowerCase();
+          if (!contentLower.includes('## testing plan')) {
+            planIsValid = false;
+          }
+        }
+      } catch (err) {
+        console.error('Error checking implementation_plan.md for testing section:', err);
+      }
+
+      if (planIsValid) {
+        conversation.planApproved = true;
+        conversation.awaitingPlanApproval = false;
+        window.appendSystemMessage("Plan approved. Continuing implementation.");
+      } else {
+        approvalIntent.intent = 'revise';
+        approvalIntent.reason = 'Missing mandatory ## Testing Plan section in implementation_plan.md';
+        window.appendSystemMessage("Approval blocked: The plan is missing the required '## Testing Plan' section. Asking the agent to revise.");
+      }
     } else if (approvalIntent.intent === 'deny') {
       conversation.awaitingPlanApproval = false;
       window.saveConversationsToStorage();
@@ -1332,7 +1352,7 @@ function normalizeFollowupPurpose(value) {
 }
 
 function buildToolUseContractPrompt() {
-  return `[SYSTEM: Before answering, decide whether the user's request requires interacting with the workspace or runtime. If it requires files, commands, tests, external docs, app state, timers, notes, or code changes, use the relevant tools before giving a final answer. If no tool is needed, answer normally and do not claim that work was performed. Never end with a generic completion message unless the Work Walkthrough shows what actually happened.]`;
+  return `[SYSTEM: Before answering, decide whether the user's request requires interacting with the workspace or runtime. If it requires files, commands, tests, external docs, app state, timers, notes, or code changes, use the relevant tools before giving a final answer. If no tool is needed, answer normally and do not claim that work was performed. Never end with a generic completion message unless the Work Walkthrough shows what actually happened. Remember, for complex tasks, your final summary must explicitly list what planned tests were run, their results, and reasons for any skipped tests.]`;
 }
 
 function getPlanningToolGate(config, canExecute, toolName, args = {}) {
@@ -1445,10 +1465,18 @@ function buildFinalVerificationSummary(items) {
   const filesTouched = [...new Set(items.filter(item => item.kind === 'file' && item.path).map(item => item.path))];
   const testsRun = items.filter(item => item.kind === 'test' || item.toolName === 'run_tests' || item.toolName === 'run_command').map(item => item.label);
   const failures = items.filter(item => item.status === 'error');
-  const lines = ['\n\n## Final Summary'];
+  const planItems = items.filter(item => item.kind === 'plan');
+  const hasPlan = planItems.length > 0;
+
+  const lines = ['\n\n## Final Pre-Submit Summary'];
   lines.push(`- **Files touched:** ${filesTouched.length ? filesTouched.map(path => `\`${path}\``).join(', ') : 'None recorded'}`);
-  lines.push(`- **Tests/checks run:** ${testsRun.length ? testsRun.join('; ') : 'None recorded'}`);
-  lines.push(`- **Failures/skipped checks:** ${failures.length ? failures.map(item => item.label).join('; ') : 'None recorded'}`);
+  if (hasPlan) {
+    lines.push(`- **Planned Tests Executed:** ${testsRun.length ? testsRun.join('; ') : 'None recorded'}`);
+    lines.push(`- **Failures/Skipped Tests:** ${failures.length ? failures.map(item => item.label).join('; ') : 'None recorded. Note: Any planned tests not run must be justified.'}`);
+  } else {
+    lines.push(`- **Tests/checks run:** ${testsRun.length ? testsRun.join('; ') : 'None recorded'}`);
+    lines.push(`- **Failures/skipped checks:** ${failures.length ? failures.map(item => item.label).join('; ') : 'None recorded'}`);
+  }
   lines.push('- **How to verify:** Review the files above and rerun the listed tests/checks.');
   return lines.join('\n');
 }
