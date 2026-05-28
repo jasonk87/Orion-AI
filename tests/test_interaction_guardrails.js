@@ -44,6 +44,14 @@ test('model call delay and repeated failure guardrails exist', (t) => {
   t.end();
 });
 
+test('repeated failure guard warns on second failure and pauses on third', (t) => {
+  t.ok(/if\s*\(\s*failureCount\s*===\s*2\s*\)/.test(agentJs), 'second identical failure emits an adaptive warning');
+  t.ok(/if\s*\(\s*failureCount\s*>=\s*3\s*\)/.test(agentJs), 'third identical failure triggers the pause guard');
+  t.ok(agentJs.includes('Do not retry it blindly'), 'second failure warning tells Orion not to repeat blindly');
+  t.ok(agentJs.includes('choose a different strategy before retrying'), 'pause guard requires a different recovery strategy');
+  t.end();
+});
+
 test('model API calls cannot sit indefinitely without visible cooldown status', (t) => {
   t.ok(agentJs.includes('MODEL_API_REQUEST_TIMEOUT_MS = 60000'), 'model API requests have a hard timeout');
   t.ok(agentJs.includes('MODEL_API_MAX_ATTEMPTS = 3'), 'Gemini retry attempts are bounded');

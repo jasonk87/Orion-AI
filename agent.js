@@ -191,15 +191,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     approvalIntent = await classifyPlanApprovalIntent(userPrompt, modelName, config.geminiApiKey);
     if (approvalIntent.intent === 'approve') {
       // Structural Validation: Check for Testing Plan section in implementation_plan.md
-      let planIsValid = true;
+      let planIsValid = false;
       try {
         const planContent = await window.api.readFile(workspacePath, 'implementation_plan.md', { maxChars: 100000 });
-        if (planContent && !planContent.error && typeof planContent.content === 'string') {
-          const testPlanRegex = /^#{2,3}\s+(testing plan|test plan|validation plan)\b/im;
-          if (!testPlanRegex.test(planContent.content)) {
-            planIsValid = false;
-          }
-        }
+        const planText = typeof planContent === 'string'
+          ? planContent
+          : (planContent && !planContent.error && typeof planContent.content === 'string' ? planContent.content : '');
+        planIsValid = hasRequiredTestingPlanSection(planText);
       } catch (err) {
         console.error('Error checking implementation_plan.md for testing section:', err);
       }
@@ -1525,6 +1523,10 @@ function formatPlanContentForChat(content) {
   return `${text.slice(0, maxChars)}\n\n_The plan continues in [implementation_plan.md](orion-file:implementation_plan.md). I showed the first ${maxChars.toLocaleString()} characters here._`;
 }
 
+function hasRequiredTestingPlanSection(content) {
+  return /^#{2,3}\s+(testing plan|test plan|validation plan)\b/im.test(String(content || ''));
+}
+
 function hasAnyChecklist(conversation) {
   return !!(conversation && Array.isArray(conversation.tasks) && conversation.tasks.length > 0);
 }
@@ -2648,6 +2650,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     getPlanningToolGate,
     normalizeChecklistTasks,
     shouldApplyChecklistUpdate,
+    hasRequiredTestingPlanSection,
     diagnoseModelApiFailure
   };
 }

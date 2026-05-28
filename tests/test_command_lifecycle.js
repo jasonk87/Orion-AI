@@ -42,14 +42,18 @@ test('startCommandSession runs and killProcessTree kills', (t) => {
   t.ok(child, 'Real process was spawned and tracked');
 
   t.ok(main.isDestructiveCommand('rm -rf /'), 'Catches rm -rf /');
+  t.ok(main.isDestructiveCommand('rm -rf ./build'), 'Catches rm -rf ./build');
+  t.ok(main.isDestructiveCommand('rm -Rf ./build'), 'Catches mixed-case recursive force rm of ./build');
   t.ok(main.isDestructiveCommand('echo hello && rm -rf "$HOME"'), 'Catches chained rm -rf');
   t.ok(main.isDestructiveCommand('git reset --hard'), 'Catches git reset --hard');
   t.ok(main.isDestructiveCommand('echo test | git clean -fdx'), 'Catches git clean -fdx');
   t.ok(main.isDestructiveCommand('del /s /q'), 'Catches del /s /q');
   t.ok(main.isDestructiveCommand('Remove-Item -Recurse -Force'), 'Catches Remove-Item -Recurse');
   t.deepEqual(main.classifyCommandRequest('npm test', { source: 'freeform' }).category, 'freeform', 'Classifies safe freeform command');
+  t.equal(main.classifyCommandRequest('rm -rf ./build', { source: 'freeform' }).allowed, false, 'Blocks freeform rm -rf ./build');
   t.equal(main.classifyCommandRequest('echo ok && rm -rf .', { source: 'freeform' }).allowed, false, 'Blocks chained destructive command');
   t.equal(main.classifyCommandRequest('npm start', { source: 'internal' }).category, 'internal', 'Classifies internal command separately');
+  t.equal(main.classifyCommandRequest('rm -rf ./build', { source: 'internal' }).allowed, true, 'Allows internal cleanup through executable/args boundary');
 
   main.killProcessTree(child, (err) => {
     t.error(err, 'killProcessTree executed without error');
