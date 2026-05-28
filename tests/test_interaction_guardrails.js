@@ -210,6 +210,27 @@ test('companion polish exposes queue, latest output, and plan controls', (t) => 
   t.end();
 });
 
+test('legacy phone companion token announcements are scrubbed and blocked', (t) => {
+  t.ok(rendererJs.includes('isLegacyPhoneCompanionTokenMessage'), 'renderer detects legacy companion token announcements');
+  t.ok(rendererJs.includes('scrubLegacyPhoneCompanionTokenMessages'), 'renderer migrates old stored token announcements');
+  t.ok(rendererJs.includes('Phone Companion is available on this Wi-Fi at .*[\\?&]token='), 'legacy token URL pattern is explicit');
+  t.ok(/function appendSystemMessage[\s\S]+isLegacyPhoneCompanionTokenMessage\(text\)[\s\S]+return;/.test(rendererJs), 'appendSystemMessage refuses legacy token announcement text');
+  t.ok(rendererJs.includes('showPhoneCompanionPairingCard'), 'renderer updates phone companion pairing UI instead of legacy URL message');
+  t.ok(rendererJs.includes('btnPhoneCompanion'), 'renderer exposes a top-bar phone companion button');
+  t.ok(rendererJs.includes('phoneCompanionModal'), 'phone companion button opens a pairing modal independent of chat messages');
+  t.ok(rendererJs.includes('refreshPhoneCompanionPairing'), 'renderer fetches pairing payload on startup instead of relying only on chat append');
+  t.ok(rendererJs.includes('getPhoneCompanionPairing'), 'renderer uses IPC to populate phone companion button');
+  t.ok(rendererJs.includes('enablePhoneCompanionLan'), 'phone button enables LAN mode before showing a phone QR');
+  t.ok(rendererJs.includes('No localhost QR is shown for phones'), 'disabled LAN state does not render a misleading localhost QR');
+  t.ok(rendererJs.includes('removeLegacyPhoneCompanionTokenBubbles'), 'renderer removes already-rendered legacy token bubbles');
+  t.ok(/function renderSystemBubble[\s\S]+isLegacyPhoneCompanionTokenMessage\(text\)[\s\S]+return;/.test(rendererJs), 'renderSystemBubble refuses legacy token messages during history replay');
+  const pairingFnStart = rendererJs.indexOf('function showPhoneCompanionPairingCard');
+  const pairingFnEnd = rendererJs.indexOf('function updatePhoneCompanionPairingPanel');
+  const pairingFn = rendererJs.slice(pairingFnStart, pairingFnEnd);
+  t.notOk(pairingFn.includes('conv.messages.push'), 'pairing UI is not persisted into chat history');
+  t.end();
+});
+
 test('checklist updates are milestone-only to avoid progress churn', (t) => {
   t.ok(agentJs.includes('Use only for milestone changes'), 'tool description warns against routine checklist churn');
   t.ok(agentJs.includes('Do not call it just to mark an item "in-progress"'), 'system prompt blocks in-progress-only updates');

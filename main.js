@@ -5,10 +5,23 @@ const { exec, spawn } = require('child_process');
 const http = require('http');
 const os = require('os');
 const crypto = require('crypto');
+const QRCode = require('qrcode');
 
 let mainWindow;
 let companionServer = null;
 let companionToken = '';
+
+function stopPhoneCompanionServer() {
+  return new Promise(resolve => {
+    if (!companionServer) {
+      resolve();
+      return;
+    }
+    const server = companionServer;
+    companionServer = null;
+    server.close(() => resolve());
+  });
+}
 
 function resolveWorkspacePath(workspacePath, relativePath = '') {
   if (!workspacePath) throw new Error('Missing workspace path');
@@ -205,12 +218,34 @@ function ensureCompanionToken(config) {
 }
 
 function ensureCompanionPairingCode(config) {
-  if (config.phoneCompanionPairingCode && String(config.phoneCompanionPairingCode).length >= 12) {
+  const expiresAt = Date.parse(config.phoneCompanionPairingExpiresAt || '');
+  if (config.phoneCompanionPairingCode && String(config.phoneCompanionPairingCode).length >= 12 && expiresAt > Date.now()) {
     return config.phoneCompanionPairingCode;
   }
   config.phoneCompanionPairingCode = crypto.randomBytes(12).toString('base64url');
+  config.phoneCompanionPairingExpiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
   writeAppConfig(config);
   return config.phoneCompanionPairingCode;
+}
+
+async function buildCompanionPairingAnnouncement({ address, port, pairingCode, expiresAt }) {
+  const pairUrl = `http://${address}:${port}/?pair=${encodeURIComponent(pairingCode)}`;
+  const qrSvg = await QRCode.toString(pairUrl, {
+    type: 'svg',
+    margin: 1,
+    width: 180,
+    color: { dark: '#111827', light: '#ffffff' }
+  });
+  return {
+    type: 'phone-companion-pairing',
+    pairUrl,
+    pairingCode,
+    expiresAt: expiresAt || '',
+    qrSvg,
+    networkEnabled: address !== '127.0.0.1' && address !== 'localhost',
+    title: 'Pair Phone Companion',
+    description: 'Scan this QR code from your phone, then approve the pairing on this desktop.'
+  };
 }
 
 function getCompanionDevices(config) {
@@ -719,7 +754,8 @@ function startPhoneCompanionServer() {
       if (req.method === 'POST' && url.pathname === '/api/pair') {
         const bodyText = await readRequestBody(req);
         const body = bodyText ? JSON.parse(bodyText) : {};
-        if (String(body.pairingCode || '') !== String(latestConfig.phoneCompanionPairingCode || pairingCode)) {
+        const pairingExpired = Date.parse(latestConfig.phoneCompanionPairingExpiresAt || '') <= Date.now();
+        if (pairingExpired || String(body.pairingCode || '') !== String(latestConfig.phoneCompanionPairingCode || pairingCode)) {
           sendJson(res, 401, { success: false, error: 'Invalid pairing code' });
           return;
         }
@@ -855,11 +891,21 @@ function startPhoneCompanionServer() {
     const address = enableCompanion ? getLocalWifiAddress() : '127.0.0.1';
     const url = `http://${address}:${port}/?pair=${encodeURIComponent(pairingCode)}`;
     console.log(`Orion phone companion listening at ${url} (Host: ${host})`);
-    setTimeout(() => {
+    setTimeout(async () => {
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.executeJavaScript(
-          `window.appendSystemMessage && window.appendSystemMessage(${JSON.stringify(`Phone Companion is available on this Wi-Fi at ${url}`)}, { dedupeKey: 'phone-companion-url', windowMs: 60000 })`
-        ).catch(() => {});
+        try {
+          const payload = await buildCompanionPairingAnnouncement({
+            address,
+            port,
+            pairingCode,
+            expiresAt: readAppConfig().phoneCompanionPairingExpiresAt || ''
+          });
+          mainWindow.webContents.executeJavaScript(
+            `window.showPhoneCompanionPairingCard && window.showPhoneCompanionPairingCard(${JSON.stringify(payload)}, { dedupeKey: 'phone-companion-pairing', windowMs: 60000 })`
+          ).catch(() => {});
+        } catch (e) {
+          console.error('Failed to build phone companion pairing card:', e);
+        }
       }
     }, 2500);
   });
@@ -867,6 +913,58 @@ function startPhoneCompanionServer() {
   companionServer.on('error', (error) => {
     console.error('Phone companion server failed:', error);
   });
+}
+
+async function enablePhoneCompanionLanMode() {
+  const config = readAppConfig();
+  config.enablePhoneCompanion = true;
+  writeAppConfig(config);
+  await stopPhoneCompanionServer();
+  startPhoneCompanionServer();
+  return await getPhoneCompanionPairingPayload();
+}
+
+ipcMain.handle('get-phone-companion-pairing', async () => {
+  return await getPhoneCompanionPairingPayload();
+});
+
+ipcMain.handle('enable-phone-companion-lan', async () => {
+  return await enablePhoneCompanionLanMode();
+});
+
+async function getPhoneCompanionPairingPayload() {
+  const config = readAppConfig();
+  const port = Number(config.phoneCompanionPort || 1122);
+  const enableCompanion = config.enablePhoneCompanion === true;
+  const address = enableCompanion ? getLocalWifiAddress() : '127.0.0.1';
+  const pairingCode = ensureCompanionPairingCode(config);
+  const latestConfig = readAppConfig();
+  if (!enableCompanion) {
+    return {
+      success: true,
+      type: 'phone-companion-pairing',
+      enabled: false,
+      networkEnabled: false,
+      bindHost: '127.0.0.1',
+      address,
+      port,
+      title: 'Pair Phone Companion',
+      description: 'Phone Companion is off. Use the Phone button to enable Wi-Fi pairing.'
+    };
+  }
+  return {
+    success: true,
+    enabled: true,
+    bindHost: '0.0.0.0',
+    address,
+    port,
+    ...(await buildCompanionPairingAnnouncement({
+      address,
+      port,
+      pairingCode,
+      expiresAt: latestConfig.phoneCompanionPairingExpiresAt || ''
+    }))
+  };
 }
 
 // --- IPC WINDOW CONTROLS ---
@@ -1713,6 +1811,7 @@ if (process.env.NODE_ENV === 'test') {
     killProcessTree,
     startPhoneCompanionServer,
     ensureCompanionToken,
+    stopPhoneCompanionServer,
     writeRunArtifact,
     resolveWorkspacePath,
     deleteWorkspacePath,
@@ -1721,6 +1820,9 @@ if (process.env.NODE_ENV === 'test') {
     listRunArtifacts,
     classifyCommandRequest,
     spawnInternalCommand,
+    buildCompanionPairingAnnouncement,
+    enablePhoneCompanionLanMode,
+    getPhoneCompanionPairingForTest: getPhoneCompanionPairingPayload,
     getCompanionServer: () => companionServer
   };
 }

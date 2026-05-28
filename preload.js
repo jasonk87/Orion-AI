@@ -26,6 +26,8 @@ contextBridge.exposeInMainWorld('api', {
   listRunArtifacts: (conversationId) => ipcRenderer.invoke('list-run-artifacts', conversationId),
   googleSearch: (query, apiKey, searchEngineId, numResults) => ipcRenderer.invoke('google-search', { query, apiKey, searchEngineId, numResults }),
   fetchWebPage: (url) => ipcRenderer.invoke('fetch-web-page', { url }),
+  getPhoneCompanionPairing: () => ipcRenderer.invoke('get-phone-companion-pairing'),
+  enablePhoneCompanionLan: () => ipcRenderer.invoke('enable-phone-companion-lan'),
   
   // Config Controls
   readConfig: () => ipcRenderer.invoke('read-config'),

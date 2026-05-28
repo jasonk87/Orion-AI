@@ -108,6 +108,7 @@
         <div class="workspace-action-bar">
           <button id="btn-change-workspace" class="btn-secondary">Change Workspace</button>
           <button id="btn-sync-files" class="btn-secondary" title="Scan file directory">🔄 Sync Files</button>
+          <button id="btn-phone-companion" class="btn-secondary phone-companion-button" title="Pair Phone Companion">Phone</button>
         </div>
       </div>
 
@@ -239,6 +240,20 @@
       </div>
       <div class="modal-footer">
         <button id="btn-file-viewer-mention" class="btn-secondary">Mention in Chat</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="phone-companion-modal" class="modal-overlay">
+    <div class="modal-card phone-companion-card">
+      <div class="modal-header">
+        <h2>Phone Companion Pairing</h2>
+        <button class="modal-close" id="btn-phone-companion-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="phone-companion-qr" class="phone-companion-qr"></div>
+        <div id="phone-companion-pair-url" class="phone-companion-url"></div>
+        <div id="phone-companion-meta" class="phone-companion-meta"></div>
       </div>
     </div>
   </div>

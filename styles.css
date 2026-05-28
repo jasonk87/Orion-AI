@@ -469,6 +469,53 @@ body {
   gap: 8px;
 }
 
+.phone-companion-button.has-pairing {
+  border-color: rgba(52, 211, 153, 0.45);
+  color: var(--success-color);
+  background: var(--success-glow);
+}
+
+.phone-companion-card {
+  max-width: 420px;
+}
+
+.phone-companion-qr {
+  display: grid;
+  place-items: center;
+  padding: 12px;
+  background: #fff;
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+
+.phone-companion-qr svg {
+  width: 180px;
+  height: 180px;
+}
+
+.phone-companion-disabled {
+  display: grid;
+  min-height: 180px;
+  place-items: center;
+  color: #111827;
+  font-weight: 800;
+  text-align: center;
+}
+
+.phone-companion-url {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  word-break: break-all;
+  margin-bottom: 8px;
+}
+
+.phone-companion-meta {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
 /* CHAT FEED */
 #chat-feed {
   flex: 1;

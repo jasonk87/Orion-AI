@@ -103,11 +103,18 @@ async function startMainWithConfig(port, config, handlers) {
     enablePhoneCompanion: false,
     phoneCompanionPort: port,
     phoneCompanionPairingCode: 'pair-code-123456',
+    phoneCompanionPairingExpiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
     phoneCompanionDevices: [],
     ...config
   });
   const electron = makeElectronMock(handlers);
-  const main = proxyquire('../main.js', { electron: electron.mock, fs: fsMock });
+  const osMock = {
+    networkInterfaces: () => ({
+      WiFi: [{ family: 'IPv4', internal: false, address: '192.168.50.25' }],
+      Loopback: [{ family: 'IPv4', internal: true, address: '127.0.0.1' }]
+    })
+  };
+  const main = proxyquire('../main.js', { electron: electron.mock, fs: fsMock, os: osMock });
   main.resetCompanionServer();
   main.startPhoneCompanionServer();
   await new Promise(resolve => setTimeout(resolve, 150));
@@ -130,6 +137,57 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
 
   const state = await request('GET', 1131, '/api/state');
   t.equal(state.statusCode, 401, 'state API rejects unpaired phones');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion startup announcement uses pairing QR metadata, not legacy token URL', async (t) => {
+  const { main, electron } = await startMainWithConfig(1135);
+  await new Promise(resolve => setTimeout(resolve, 2800));
+
+  const announcement = electron.calls.find(call => call.includes('showPhoneCompanionPairingCard'));
+  t.ok(announcement, 'startup uses structured pairing card renderer');
+  t.notOk(electron.calls.some(call => call.includes('appendSystemMessage') && call.includes('Phone Companion')), 'startup does not use legacy appendSystemMessage announcement');
+  t.notOk(announcement.includes('?token='), 'announcement does not include legacy token URL');
+  t.ok(announcement.includes('?pair='), 'announcement includes short-lived pair URL');
+  t.ok(announcement.includes('qrSvg'), 'announcement includes QR SVG metadata');
+  t.ok(announcement.includes("dedupeKey: 'phone-companion-pairing'"), 'announcement carries stable pairing dedupe metadata');
+
+  const payload = await main.buildCompanionPairingAnnouncement({
+    address: '127.0.0.1',
+    port: 1135,
+    pairingCode: 'pair-code-123456',
+    expiresAt: new Date(Date.now() + 60000).toISOString()
+  });
+  t.notOk(payload.pairUrl.includes('?token='), 'pairing payload never exposes token URL');
+  t.ok(payload.pairUrl.includes('?pair='), 'pairing payload exposes pair URL');
+  t.ok(payload.qrSvg.includes('<svg'), 'pairing payload contains scannable QR SVG');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion pairing payload is available through IPC for top-bar button startup', async (t) => {
+  const { main } = await startMainWithConfig(1136);
+  const payload = await main.getPhoneCompanionPairingForTest();
+  t.equal(payload.success, true, 'IPC pairing payload succeeds');
+  t.equal(payload.networkEnabled, false, 'initial top-bar payload does not pretend localhost is phone-reachable');
+  t.notOk(payload.pairUrl, 'disabled LAN payload does not expose a localhost QR URL');
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion button enables LAN server before returning QR pairing URL', async (t) => {
+  const { main, fsMock } = await startMainWithConfig(1137, { enablePhoneCompanion: false });
+  t.equal(main.getCompanionServer().address().address, '127.0.0.1', 'server starts localhost-only by default');
+
+  const payload = await main.enablePhoneCompanionLanMode();
+  await new Promise(resolve => setTimeout(resolve, 150));
+  const serverAddress = main.getCompanionServer().address();
+
+  t.equal(fsMock._config().enablePhoneCompanion, true, 'button action persists LAN companion mode');
+  t.equal(serverAddress.address, '0.0.0.0', 'button action restarts server on all interfaces');
+  t.equal(payload.networkEnabled, true, 'enabled payload is marked network reachable');
+  t.ok(payload.pairUrl.includes('http://192.168.50.25:1137/?pair='), 'enabled payload uses Wi-Fi address');
+  t.notOk(payload.pairUrl.includes('?token='), 'enabled payload still does not expose token URL');
 
   await closeServer(main.getCompanionServer());
 });

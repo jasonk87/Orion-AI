@@ -44,6 +44,7 @@ const el = {
   btnSettings: document.getElementById('btn-settings'),
   btnChangeWorkspace: document.getElementById('btn-change-workspace'),
   btnSyncFiles: document.getElementById('btn-sync-files'),
+  btnPhoneCompanion: document.getElementById('btn-phone-companion'),
   btnAddProject: document.getElementById('btn-add-project'),
   btnProjectFilter: document.getElementById('btn-project-filter'),
   
@@ -83,6 +84,11 @@ const el = {
   fileCountBadge: document.getElementById('file-count-badge'),
   artifactList: document.getElementById('artifact-list-container'),
   artifactCountBadge: document.getElementById('artifact-count-badge'),
+  phoneCompanionModal: document.getElementById('phone-companion-modal'),
+  btnPhoneCompanionClose: document.getElementById('btn-phone-companion-close'),
+  phoneCompanionQr: document.getElementById('phone-companion-qr'),
+  phoneCompanionPairUrl: document.getElementById('phone-companion-pair-url'),
+  phoneCompanionMeta: document.getElementById('phone-companion-meta'),
   workspaceEntrypointInput: document.getElementById('workspace-entrypoint-input'),
   btnSaveEntrypoint: document.getElementById('btn-save-entrypoint'),
   btnStartOpenRepo: document.getElementById('btn-start-open-repo'),
@@ -164,6 +170,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   } else {
     createNewConversation();
   }
+  refreshPhoneCompanionPairing();
+  removeLegacyPhoneCompanionTokenBubbles();
 });
 
 // --- ELECTRON WINDOW BINDINGS ---
@@ -348,6 +356,29 @@ function setupWorkspaceHandlers() {
       triggerWorkspaceSelect();
     }
   });
+  if (el.btnPhoneCompanion) {
+    el.btnPhoneCompanion.addEventListener('click', async () => {
+      if (window.api && typeof window.api.enablePhoneCompanionLan === 'function') {
+        try {
+          const payload = await window.api.enablePhoneCompanionLan();
+          if (payload && payload.success !== false) {
+            updatePhoneCompanionPairingPanel(payload);
+          }
+        } catch (error) {
+          console.warn('Could not enable phone companion LAN mode:', error);
+          await refreshPhoneCompanionPairing();
+        }
+      } else {
+        await refreshPhoneCompanionPairing();
+      }
+      if (el.phoneCompanionModal) el.phoneCompanionModal.classList.add('active');
+    });
+  }
+  if (el.btnPhoneCompanionClose) {
+    el.btnPhoneCompanionClose.addEventListener('click', () => {
+      if (el.phoneCompanionModal) el.phoneCompanionModal.classList.remove('active');
+    });
+  }
   
   if (el.btnRunTestsManually) {
     el.btnRunTestsManually.addEventListener('click', () => {
@@ -1016,6 +1047,7 @@ function loadConversationsFromStorage() {
       conversations = [];
     }
   }
+  scrubLegacyPhoneCompanionTokenMessages();
 }
 
 function migrateConversations() {
@@ -1033,9 +1065,50 @@ function migrateConversations() {
         updated = true;
       }
     }
+    if (Array.isArray(c.messages)) {
+      const before = c.messages.length;
+      c.messages = c.messages.filter(msg => !isLegacyPhoneCompanionTokenMessage(msg && msg.text));
+      if (c.messages.length !== before) updated = true;
+    }
   });
   if (updated) {
     saveConversationsToStorage();
+  }
+}
+
+function isLegacyPhoneCompanionTokenMessage(text) {
+  return /Phone Companion is available on this Wi-Fi at .*[\?&]token=/i.test(String(text || ''));
+}
+
+function removeLegacyPhoneCompanionTokenBubbles() {
+  if (!el.messagesContainer) return;
+  el.messagesContainer.querySelectorAll('.message-bubble').forEach(bubble => {
+    if (isLegacyPhoneCompanionTokenMessage(bubble.textContent || '')) {
+      bubble.remove();
+    }
+  });
+}
+
+function scrubLegacyPhoneCompanionTokenMessages() {
+  let updated = false;
+  conversations.forEach(c => {
+    if (!Array.isArray(c.messages)) return;
+    const before = c.messages.length;
+    c.messages = c.messages.filter(msg => !isLegacyPhoneCompanionTokenMessage(msg && msg.text));
+    if (c.messages.length !== before) updated = true;
+  });
+  if (updated) saveConversationsToStorage();
+}
+
+async function refreshPhoneCompanionPairing() {
+  if (!window.api || typeof window.api.getPhoneCompanionPairing !== 'function') return;
+  try {
+    const payload = await window.api.getPhoneCompanionPairing();
+    if (payload && payload.success !== false) {
+      updatePhoneCompanionPairingPanel(payload);
+    }
+  } catch (error) {
+    console.warn('Phone companion pairing payload unavailable:', error);
   }
 }
 
@@ -1135,6 +1208,7 @@ function selectConversation(id) {
       }
     });
     window.clearActiveAiBubble();
+    removeLegacyPhoneCompanionTokenBubbles();
   }
   
   // Reload tasks & tests
@@ -1251,6 +1325,10 @@ function renderUserMessage(text) {
 }
 
 function appendSystemMessage(text, options = {}) {
+  if (isLegacyPhoneCompanionTokenMessage(text)) {
+    removeLegacyPhoneCompanionTokenBubbles();
+    return;
+  }
   const dedupeKey = options.dedupeKey || text;
   const windowMs = Number(options.windowMs || 1500);
   window.recentSystemMessages = window.recentSystemMessages || {};
@@ -1277,12 +1355,86 @@ function appendSystemMessage(text, options = {}) {
   }
 }
 
+function shouldDedupeSystemCard(dedupeKey, windowMs = 1500) {
+  const key = dedupeKey || 'system-card';
+  const now = Date.now();
+  window.recentSystemMessages = window.recentSystemMessages || {};
+  const lastAt = window.recentSystemMessages[key] || 0;
+  if (now - lastAt < windowMs) return true;
+  const conv = conversations.find(c => c.id === activeConversationId);
+  if (conv) {
+    conv.systemMessageDedupe = conv.systemMessageDedupe || {};
+    const convLastAt = conv.systemMessageDedupe[key] || 0;
+    if (now - convLastAt < windowMs) return true;
+    conv.systemMessageDedupe[key] = now;
+  }
+  window.recentSystemMessages[key] = now;
+  return false;
+}
+
+function showPhoneCompanionPairingCard(payload = {}, options = {}) {
+  updatePhoneCompanionPairingPanel(payload);
+  removeLegacyPhoneCompanionTokenBubbles();
+}
+
+function updatePhoneCompanionPairingPanel(payload = {}) {
+  const pairUrl = String(payload.pairUrl || '');
+  const networkEnabled = payload.networkEnabled !== false && !!pairUrl;
+  const expiresText = payload.expiresAt ? `Expires: ${new Date(payload.expiresAt).toLocaleTimeString()}` : 'Short-lived pairing link';
+  if (el.btnPhoneCompanion) {
+    el.btnPhoneCompanion.style.display = '';
+    el.btnPhoneCompanion.classList.toggle('has-pairing', networkEnabled);
+  }
+  if (el.phoneCompanionQr) {
+    el.phoneCompanionQr.innerHTML = networkEnabled
+      ? String(payload.qrSvg || '')
+      : '<div class="phone-companion-disabled">Wi-Fi pairing is off</div>';
+  }
+  if (el.phoneCompanionPairUrl) {
+    el.phoneCompanionPairUrl.textContent = networkEnabled
+      ? pairUrl
+      : 'Click Phone to enable Wi-Fi pairing for this session.';
+  }
+  if (el.phoneCompanionMeta) {
+    el.phoneCompanionMeta.textContent = networkEnabled
+      ? `${expiresText}. Desktop approval required.`
+      : 'LAN companion mode is disabled by default. No localhost QR is shown for phones.';
+  }
+}
+
 function renderSystemBubble(text) {
+  if (isLegacyPhoneCompanionTokenMessage(text)) {
+    return;
+  }
   const bubble = document.createElement('div');
   bubble.className = 'message-bubble';
   bubble.innerHTML = `
     <div class="message-header" style="color: var(--text-muted);">⚙️ System</div>
     <div class="message-body" style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-muted);">${escapeHtml(text)}</div>
+  `;
+  el.messagesContainer.appendChild(bubble);
+  el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+}
+
+function renderPhoneCompanionPairingCard(payload) {
+  const bubble = document.createElement('div');
+  bubble.className = 'message-bubble companion-pairing-card';
+  const qrSvg = String(payload.qrSvg || '');
+  const pairUrl = String(payload.pairUrl || '');
+  const expiresText = payload.expiresAt ? `Expires: ${new Date(payload.expiresAt).toLocaleTimeString()}` : 'Short-lived pairing link';
+  bubble.innerHTML = `
+    <div class="message-header" style="color: var(--accent-secondary);">Phone Companion Pairing</div>
+    <div class="message-body" style="font-family: var(--font-sans); color: var(--text);">
+      <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+        <div data-companion-qr="true" aria-label="Phone Companion pairing QR code" style="background:#fff; padding:8px; border-radius:8px; line-height:0;">${qrSvg}</div>
+        <div style="min-width:220px; flex:1;">
+          <div style="font-weight:700; margin-bottom:6px;">Scan to pair a phone</div>
+          <div style="color: var(--text-muted); margin-bottom:8px;">Desktop approval is required before this phone can control Orion.</div>
+          <div data-pair-url="${escapeHtml(pairUrl)}" style="font-family: var(--font-mono); font-size:.76rem; word-break:break-all;">${escapeHtml(pairUrl)}</div>
+          <div data-pairing-metadata="true" style="color: var(--text-muted); font-size:.74rem; margin-top:8px;">${escapeHtml(expiresText)}</div>
+        </div>
+      </div>
+    </div>
   `;
   el.messagesContainer.appendChild(bubble);
   el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
@@ -1595,6 +1747,7 @@ window.updateTestResultsPanel = updateTestResultsPanel;
 window.runRegressionTests = runRegressionTests;
 window.renderAiMessage = renderAiMessage;
 window.appendSystemMessage = appendSystemMessage;
+window.showPhoneCompanionPairingCard = showPhoneCompanionPairingCard;
 window.syncWorkspaceFiles = syncWorkspaceFiles;
 window.refreshWorkspaceEntrypoint = loadWorkspaceEntrypoint;
 
