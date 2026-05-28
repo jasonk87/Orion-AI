@@ -195,8 +195,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       try {
         const planContent = await window.api.readFile(workspacePath, 'implementation_plan.md', { maxChars: 100000 });
         if (planContent && !planContent.error && typeof planContent.content === 'string') {
-          const contentLower = planContent.content.toLowerCase();
-          if (!contentLower.includes('## testing plan')) {
+          const testPlanRegex = /^#{2,3}\s+(testing plan|test plan|validation plan)\b/im;
+          if (!testPlanRegex.test(planContent.content)) {
             planIsValid = false;
           }
         }
@@ -213,7 +213,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         approvalIntent.reason = 'Missing mandatory ## Testing Plan section in implementation_plan.md';
         window.appendSystemMessage("Approval blocked: The plan is missing the required '## Testing Plan' section. Asking the agent to revise.");
       }
-    } else if (approvalIntent.intent === 'deny') {
+    }
+
+    if (approvalIntent.intent === 'deny') {
       conversation.awaitingPlanApproval = false;
       window.saveConversationsToStorage();
     }
