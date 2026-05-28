@@ -1629,10 +1629,34 @@ window.getPhoneCompanionState = () => {
       : (msg.text || '')
   })) : [];
   const latestOutput = messages.slice().reverse().find(msg => msg.role === 'assistant' || msg.role === 'system');
+  const latestAssistant = conv && conv.messages ? conv.messages.slice().reverse().find(msg => msg.role === 'assistant') : null;
+  const latestText = latestAssistant ? (latestAssistant.text || '') : '';
+  const changedFiles = [];
+  const testResults = [];
+  (latestAssistant && Array.isArray(latestAssistant.logs) ? latestAssistant.logs : []).forEach(log => {
+    if (log.tool === 'write_file' || log.tool === 'modify_file' || log.tool === 'patch_file') {
+      const params = log.params || {};
+      if (params.path && !changedFiles.includes(params.path)) changedFiles.push(params.path);
+    }
+    if (log.tool === 'run_tests' || log.tool === 'run_command') {
+      testResults.push(log.result || '');
+    }
+  });
+  const walkthroughIndex = latestText.indexOf('\n\n## Work Walkthrough');
+  const workWalkthrough = walkthroughIndex === -1 ? '' : latestText.slice(walkthroughIndex).trim();
+  const conversationsSummary = conversations.map(c => ({
+    id: c.id,
+    title: c.title || 'New Conversation',
+    active: c.id === activeConversationId,
+    awaitingPlanApproval: !!(c.awaitingPlanApproval && !c.planApproved),
+    taskCount: Array.isArray(c.tasks) ? c.tasks.length : 0,
+    updatedAt: c.updatedAt || c.createdAt || 0
+  }));
   
   return {
     conversationId: activeConversationId,
     title: conv ? conv.title : '',
+    conversations: conversationsSummary,
     workspace: conv ? (conv.workspace || conv.projectPath || currentWorkspace || '') : currentWorkspace,
     running: window.isAgentRunning ? window.isAgentRunning() : false,
     runningConversationId: window.getRunningConversationId ? window.getRunningConversationId() : null,
@@ -1643,8 +1667,40 @@ window.getPhoneCompanionState = () => {
     tasks: conv && Array.isArray(conv.tasks) ? conv.tasks : [],
     model: window.getSelectedModel(),
     messages,
-    latestOutput: latestOutput ? latestOutput.text : ''
+    latestOutput: latestOutput ? latestOutput.text : '',
+    preview: {
+      latestAssistantOutput: latestText,
+      workWalkthrough,
+      changedFiles,
+      testResults,
+      appLaunchUrl: window.lastLaunchUrl || ''
+    }
   };
+};
+
+window.approvePhoneCompanionPairing = async (request) => {
+  const name = request && request.deviceName ? request.deviceName : 'Phone';
+  let approved = true;
+  if (window.confirm) {
+    approved = window.confirm(`Allow ${name} to control Orion from Phone Companion?`);
+  }
+  return { approved };
+};
+
+window.switchPhoneCompanionConversation = async (conversationId) => {
+  const conv = conversations.find(c => c.id === conversationId);
+  if (!conv) return { success: false, error: 'Conversation not found' };
+  selectConversation(conversationId);
+  return { success: true, conversationId };
+};
+
+window.startPhoneCompanionTask = async (options = {}) => {
+  createNewConversation();
+  const prompt = String(options.prompt || '').trim();
+  if (prompt) {
+    return await window.submitPhoneCompanionPrompt(prompt);
+  }
+  return { success: true, conversationId: activeConversationId };
 };
 
 window.submitPhoneCompanionPrompt = async (prompt) => {
@@ -1667,6 +1723,18 @@ window.submitPhoneCompanionPrompt = async (prompt) => {
   el.chatInput.value = text;
   await submitMessage();
   return { success: true, queued: false };
+};
+
+window.steerPhoneCompanionTask = async (prompt) => {
+  const text = String(prompt || '').trim();
+  if (!text) return { success: false, error: 'Missing steering prompt' };
+  if (!window.isAgentRunning || !window.isAgentRunning()) {
+    return await window.submitPhoneCompanionPrompt(text);
+  }
+  window.steeringQueue = window.steeringQueue || [];
+  window.steeringQueue.push(text);
+  appendSystemMessage("Phone companion steering note received.");
+  return { success: true, steered: true };
 };
 
 window.approvePhoneCompanionPlan = async () => {

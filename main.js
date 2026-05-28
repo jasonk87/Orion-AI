@@ -204,6 +204,65 @@ function ensureCompanionToken(config) {
   return config.phoneCompanionToken;
 }
 
+function ensureCompanionPairingCode(config) {
+  if (config.phoneCompanionPairingCode && String(config.phoneCompanionPairingCode).length >= 12) {
+    return config.phoneCompanionPairingCode;
+  }
+  config.phoneCompanionPairingCode = crypto.randomBytes(12).toString('base64url');
+  writeAppConfig(config);
+  return config.phoneCompanionPairingCode;
+}
+
+function getCompanionDevices(config) {
+  return Array.isArray(config.phoneCompanionDevices) ? config.phoneCompanionDevices : [];
+}
+
+function saveCompanionDevice(config, device) {
+  const devices = getCompanionDevices(config).filter(d => d.id !== device.id);
+  devices.push(device);
+  config.phoneCompanionDevices = devices;
+  writeAppConfig(config);
+  return device;
+}
+
+function createCompanionDeviceSession(config, deviceName) {
+  const now = new Date().toISOString();
+  const device = {
+    id: crypto.randomBytes(12).toString('base64url'),
+    name: String(deviceName || 'Phone').slice(0, 80),
+    secret: crypto.randomBytes(24).toString('base64url'),
+    approved: true,
+    revoked: false,
+    pairedAt: now,
+    lastSeenAt: now
+  };
+  return saveCompanionDevice(config, device);
+}
+
+function authenticateCompanionRequest(req, config) {
+  const auth = String(req.headers.authorization || '');
+  const bearer = auth.match(/^Bearer\s+(.+)$/i);
+  const session = bearer ? bearer[1] : String(req.headers['x-orion-session'] || '');
+  const deviceId = String(req.headers['x-orion-device-id'] || '');
+  if (!session || !deviceId) return null;
+  const device = getCompanionDevices(config).find(d => d.id === deviceId && d.secret === session && d.approved && !d.revoked);
+  if (!device) return null;
+  device.lastSeenAt = new Date().toISOString();
+  saveCompanionDevice(config, device);
+  return device;
+}
+
+function companionDevicePublic(device) {
+  return {
+    id: device.id,
+    name: device.name,
+    approved: !!device.approved,
+    revoked: !!device.revoked,
+    pairedAt: device.pairedAt || '',
+    lastSeenAt: device.lastSeenAt || ''
+  };
+}
+
 function companionManifest() {
   return {
     name: 'Orion AI Phone Companion',
@@ -255,7 +314,7 @@ function companionIconSvg() {
 </svg>`;
 }
 
-function companionHtml(token) {
+function companionHtml(pairingCode) {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -265,7 +324,7 @@ function companionHtml(token) {
   <meta name="theme-color" content="#8b5cf6">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <link rel="manifest" href="/manifest.webmanifest?token=${encodeURIComponent(token)}">
+  <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icon.svg">
   <style>
     :root { color-scheme: dark; --bg:#08080d; --panel:rgba(18,17,28,.78); --panel-strong:rgba(24,23,36,.96); --line:rgba(167,139,250,.18); --text:#f7f4ff; --muted:#a7a0c4; --accent:#a78bfa; --accent-strong:#8b5cf6; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
@@ -287,6 +346,11 @@ function companionHtml(token) {
     .substatus { margin-top:8px; color:var(--accent); font-size:.76rem; min-height:18px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .queue-line { margin-top:6px; color:var(--muted); font-size:.72rem; }
     .output-panel { margin-bottom:12px; padding:10px; border:1px solid rgba(255,255,255,.08); border-radius:12px; background:rgba(12,12,18,.72); color:var(--muted); font-size:.74rem; line-height:1.35; max-height:120px; overflow:auto; white-space:pre-wrap; }
+    .preview-panel, .conversation-panel { margin-bottom:12px; padding:11px; border:1px solid rgba(255,255,255,.08); border-radius:12px; background:rgba(12,12,18,.72); }
+    .panel-title { margin-bottom:8px; font-size:.72rem; color:#c4b5fd; font-weight:850; text-transform:uppercase; letter-spacing:.08em; }
+    select { width:100%; min-height:38px; border:1px solid rgba(167,139,250,.25); border-radius:10px; padding:0 9px; background:rgba(18,17,28,.94); color:var(--text); }
+    .preview-grid { display:grid; gap:8px; }
+    .preview-item { color:var(--muted); font-size:.72rem; white-space:pre-wrap; max-height:92px; overflow:auto; }
     .install-tip { display:none; margin-top:10px; padding:9px 10px; border:1px dashed rgba(167,139,250,.36); border-radius:12px; color:#ddd6fe; background:rgba(167,139,250,.09); font-size:.76rem; line-height:1.35; }
     .install-tip.visible { display:block; }
     main { position:relative; z-index:1; padding:14px; }
@@ -333,16 +397,21 @@ function companionHtml(token) {
     </header>
     <main>
       <section class="plan-panel" id="plan-panel"><div class="plan-title">Plan waiting for approval</div><div class="plan-copy">Review the latest plan in chat. Start it here when the direction looks right.</div><button class="approve-button" id="approve-plan" type="button">Start Implementation</button><div class="control-row"><button id="deny-plan" type="button">Deny</button><button id="revise-plan" type="button">Revise</button></div></section>
+      <section class="conversation-panel"><div class="panel-title">Tasks</div><select id="conversation-select"></select><div class="control-row" style="margin-top:8px"><button id="new-task" type="button">New Task</button><button id="steer-task" type="button">Steer</button></div></section>
       <div class="control-row"><button id="refresh-state" type="button">Refresh</button><button id="stop-task" type="button">Pause / Stop</button><button id="resume-task" type="button">Resume</button></div>
       <div class="queue-line" id="queue-line"></div>
       <div class="output-panel" id="latest-output">Latest output will appear here.</div>
+      <section class="preview-panel"><div class="panel-title">Preview</div><div class="preview-grid" id="preview-panel"></div></section>
       <div class="task-strip" id="tasks"></div>
       <div class="messages" id="messages"><div class="empty">Loading conversation...</div></div>
     </main>
   </div>
   <form id="prompt-form"><div class="composer"><textarea id="prompt" placeholder="Ask Orion..." autocomplete="off" rows="2"></textarea><button class="send-button" id="send" type="submit">Send</button></div></form>
   <script>
-    const token = ${JSON.stringify(token)};
+    const pairingCode = ${JSON.stringify(pairingCode)};
+    const sessionKey = 'orionPhoneCompanionSession';
+    let deviceSession = null;
+    try { deviceSession = JSON.parse(localStorage.getItem(sessionKey) || 'null'); } catch (e) { deviceSession = null; }
     const messagesEl = document.getElementById('messages');
     const metaEl = document.getElementById('meta');
     const modelEl = document.getElementById('model');
@@ -356,6 +425,10 @@ function companionHtml(token) {
     const refreshStateEl = document.getElementById('refresh-state');
     const stopTaskEl = document.getElementById('stop-task');
     const resumeTaskEl = document.getElementById('resume-task');
+    const newTaskEl = document.getElementById('new-task');
+    const steerTaskEl = document.getElementById('steer-task');
+    const conversationSelectEl = document.getElementById('conversation-select');
+    const previewPanelEl = document.getElementById('preview-panel');
     const tasksEl = document.getElementById('tasks');
     const queueLineEl = document.getElementById('queue-line');
     const latestOutputEl = document.getElementById('latest-output');
@@ -367,7 +440,12 @@ function companionHtml(token) {
     function taskClass(status) { return String(status || '').replace(/[^a-z0-9_-]/gi, '-').toLowerCase(); }
     async function loadState() {
       try {
-        const res = await fetch('/api/state?token=' + encodeURIComponent(token));
+        if (!deviceSession) {
+          statusEl.textContent = 'Pair this phone from Orion desktop approval.';
+          statusPillEl.textContent = 'Pairing';
+          return;
+        }
+        const res = await companionFetch('/api/state');
         const state = await res.json();
         if (!state.success) throw new Error(state.error || 'Failed to load state');
         metaEl.textContent = state.title || 'No active conversation';
@@ -378,6 +456,15 @@ function companionHtml(token) {
         queueLineEl.textContent = state.queuedPrompts ? (state.queuedPrompts + ' queued prompt(s): ' + (state.queuedPromptPreview || []).join(' | ')) : '';
         latestOutputEl.textContent = state.latestOutput || 'Latest output will appear here.';
         planPanelEl.classList.toggle('visible', !!state.awaitingPlanApproval);
+        conversationSelectEl.innerHTML = Array.isArray(state.conversations) && state.conversations.length ? state.conversations.map(conv => '<option value="' + escapeHtml(conv.id) + '"' + (conv.active ? ' selected' : '') + '>' + escapeHtml(conv.title || conv.id) + '</option>').join('') : '<option>No conversations</option>';
+        const preview = state.preview || {};
+        previewPanelEl.innerHTML = [
+          ['Latest', preview.latestAssistantOutput || 'No assistant output yet.'],
+          ['Walkthrough', preview.workWalkthrough || 'No walkthrough yet.'],
+          ['Files', Array.isArray(preview.changedFiles) && preview.changedFiles.length ? preview.changedFiles.join('\\n') : 'No changed files recorded.'],
+          ['Tests', Array.isArray(preview.testResults) && preview.testResults.length ? preview.testResults.join('\\n---\\n') : 'No test results recorded.'],
+          ['Launch', preview.appLaunchUrl || 'No app launch URL recorded.']
+        ].map(item => '<div><div class="panel-title">' + escapeHtml(item[0]) + '</div><div class="preview-item">' + escapeHtml(item[1]) + '</div></div>').join('');
         tasksEl.innerHTML = Array.isArray(state.tasks) && state.tasks.length ? state.tasks.map(task => '<span class="task-chip ' + taskClass(task.status) + '">' + escapeHtml(task.title || 'Task') + '</span>').join('') : '';
         const signature = JSON.stringify({ running: state.running, subStatus: state.subStatus, plan: state.awaitingPlanApproval, tasks: state.tasks, messages: state.messages });
         if (signature !== lastSignature) {
@@ -395,7 +482,7 @@ function companionHtml(token) {
       approvePlanEl.disabled = true;
       statusEl.textContent = 'Starting approved plan...';
       try {
-        const res = await fetch('/api/approve-plan?token=' + encodeURIComponent(token), { method: 'POST' });
+        const res = await companionFetch('/api/approve-plan', { method: 'POST' });
         const data = await res.json();
         if (!data.success) throw new Error(data.error || 'Approval failed');
         await loadState();
@@ -406,7 +493,7 @@ function companionHtml(token) {
       }
     });
     denyPlanEl.addEventListener('click', async () => {
-      const res = await fetch('/api/deny-plan?token=' + encodeURIComponent(token), { method: 'POST' });
+      const res = await companionFetch('/api/deny-plan', { method: 'POST' });
       const data = await res.json();
       if (!data.success) statusEl.textContent = data.error || 'Deny failed';
       await loadState();
@@ -414,17 +501,39 @@ function companionHtml(token) {
     revisePlanEl.addEventListener('click', async () => {
       const feedback = prompt('Revision note for Orion:', 'Revise the plan before implementing.');
       if (!feedback) return;
-      const res = await fetch('/api/revise-plan?token=' + encodeURIComponent(token), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ feedback }) });
+      const res = await companionFetch('/api/revise-plan', { method: 'POST', body: JSON.stringify({ feedback }) });
       const data = await res.json();
       if (!data.success) statusEl.textContent = data.error || 'Revision failed';
       await loadState();
     });
     refreshStateEl.addEventListener('click', loadState);
+    conversationSelectEl.addEventListener('change', async () => {
+      if (!conversationSelectEl.value) return;
+      const res = await companionFetch('/api/conversations/switch', { method:'POST', body: JSON.stringify({ conversationId: conversationSelectEl.value }) });
+      const data = await res.json();
+      if (!data.success) statusEl.textContent = data.error || 'Switch failed';
+      await loadState();
+    });
+    newTaskEl.addEventListener('click', async () => {
+      const prompt = window.prompt('Start a new Orion task:', '');
+      const res = await companionFetch('/api/conversations/new', { method:'POST', body: JSON.stringify({ prompt: prompt || '' }) });
+      const data = await res.json();
+      if (!data.success) statusEl.textContent = data.error || 'New task failed';
+      await loadState();
+    });
+    steerTaskEl.addEventListener('click', async () => {
+      const prompt = window.prompt('Steer active work:', '');
+      if (!prompt) return;
+      const res = await companionFetch('/api/steer', { method:'POST', body: JSON.stringify({ prompt }) });
+      const data = await res.json();
+      if (!data.success) statusEl.textContent = data.error || 'Steer failed';
+      await loadState();
+    });
     stopTaskEl.addEventListener('click', async () => {
       stopTaskEl.disabled = true;
       statusEl.textContent = 'Stopping active work...';
       try {
-        const res = await fetch('/api/stop?token=' + encodeURIComponent(token), { method: 'POST' });
+        const res = await companionFetch('/api/stop', { method: 'POST' });
         const data = await res.json();
         if (!data.success) throw new Error(data.error || 'Stop failed');
         await loadState();
@@ -438,7 +547,7 @@ function companionHtml(token) {
       resumeTaskEl.disabled = true;
       statusEl.textContent = 'Resuming work...';
       try {
-        const res = await fetch('/api/resume?token=' + encodeURIComponent(token), { method: 'POST' });
+        const res = await companionFetch('/api/resume', { method: 'POST' });
         const data = await res.json();
         if (!data.success) throw new Error(data.error || 'Resume failed');
         await loadState();
@@ -455,7 +564,7 @@ function companionHtml(token) {
       sendEl.disabled = true;
       statusEl.textContent = 'Sending...';
       try {
-        const res = await fetch('/api/prompt?token=' + encodeURIComponent(token), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt }) });
+        const res = await companionFetch('/api/prompt', { method: 'POST', body: JSON.stringify({ prompt }) });
         const data = await res.json();
         if (!data.success) throw new Error(data.error || 'Send failed');
         promptEl.value = '';
@@ -468,8 +577,30 @@ function companionHtml(token) {
     });
     promptEl.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); form.requestSubmit(); } });
     window.addEventListener('beforeinstallprompt', event => { event.preventDefault(); installTipEl.classList.add('visible'); installTipEl.textContent = 'This companion is installable. Open your browser menu and choose Install app or Add to Home Screen.'; });
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js?token=' + encodeURIComponent(token)).catch(() => {});
-    loadState();
+    async function companionFetch(url, options = {}) {
+      const headers = Object.assign({ 'Content-Type': 'application/json' }, options.headers || {});
+      if (deviceSession) {
+        headers.Authorization = 'Bearer ' + deviceSession.secret;
+        headers['X-Orion-Device-Id'] = deviceSession.deviceId;
+      }
+      return fetch(url, Object.assign({}, options, { headers }));
+    }
+    async function pairIfNeeded() {
+      if (deviceSession) return true;
+      const code = new URLSearchParams(location.search).get('pair') || pairingCode;
+      const name = (navigator.userAgent || 'Phone').slice(0, 64);
+      const res = await fetch('/api/pair', { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ pairingCode: code, deviceName: name }) });
+      const data = await res.json();
+      if (!data.success) {
+        statusEl.textContent = data.error || 'Pairing pending or denied';
+        return false;
+      }
+      deviceSession = { deviceId: data.device.id, secret: data.sessionSecret };
+      localStorage.setItem(sessionKey, JSON.stringify(deviceSession));
+      return true;
+    }
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+    pairIfNeeded().then(loadState);
     setInterval(loadState, 1500);
   </script>
 </body>
@@ -555,29 +686,21 @@ function startPhoneCompanionServer() {
   const enableCompanion = config.enablePhoneCompanion === true;
   const host = enableCompanion ? '0.0.0.0' : '127.0.0.1';
   companionToken = ensureCompanionToken(config);
+  const pairingCode = ensureCompanionPairingCode(config);
 
   companionServer = http.createServer(async (req, res) => {
     try {
+      const latestConfig = readAppConfig();
       const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
       if (url.pathname === '/') {
-        if (url.searchParams.get('token') !== companionToken) {
-          res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-          res.end('<!doctype html><title>Orion AI</title><body style="font-family:system-ui;background:#09090d;color:#f7f4ff;padding:24px"><h1>Orion AI Phone Companion</h1><p>This companion link needs the private token from Orion on your desktop.</p></body>');
-          return;
-        }
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-        res.end(companionHtml(companionToken));
+        res.end(companionHtml(pairingCode));
         return;
       }
 
       if (req.method === 'GET' && url.pathname === '/icon.svg') {
         res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Cache-Control': 'public, max-age=86400' });
         res.end(companionIconSvg());
-        return;
-      }
-
-      if (url.searchParams.get('token') !== companionToken) {
-        sendJson(res, 401, { success: false, error: 'Unauthorized companion request' });
         return;
       }
 
@@ -593,9 +716,79 @@ function startPhoneCompanionServer() {
         return;
       }
 
+      if (req.method === 'POST' && url.pathname === '/api/pair') {
+        const bodyText = await readRequestBody(req);
+        const body = bodyText ? JSON.parse(bodyText) : {};
+        if (String(body.pairingCode || '') !== String(latestConfig.phoneCompanionPairingCode || pairingCode)) {
+          sendJson(res, 401, { success: false, error: 'Invalid pairing code' });
+          return;
+        }
+        const deviceName = String(body.deviceName || 'Phone').slice(0, 80);
+        let approved = false;
+        try {
+          const approval = await callRendererFunction('approvePhoneCompanionPairing', { deviceName });
+          approved = approval && approval.approved !== false;
+        } catch (e) {
+          approved = false;
+        }
+        if (!approved) {
+          sendJson(res, 403, { success: false, error: 'Desktop approval required' });
+          return;
+        }
+        const writableConfig = readAppConfig();
+        const device = createCompanionDeviceSession(writableConfig, deviceName);
+        sendJson(res, 200, { success: true, device: companionDevicePublic(device), sessionSecret: device.secret });
+        return;
+      }
+
+      const device = authenticateCompanionRequest(req, latestConfig);
+      if (!device) {
+        sendJson(res, 401, { success: false, error: 'Unauthorized companion request' });
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/devices') {
+        sendJson(res, 200, { success: true, devices: getCompanionDevices(latestConfig).map(companionDevicePublic) });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/devices/revoke') {
+        const bodyText = await readRequestBody(req);
+        const body = bodyText ? JSON.parse(bodyText) : {};
+        const revokeId = String(body.deviceId || device.id);
+        const writableConfig = readAppConfig();
+        const devices = getCompanionDevices(writableConfig).map(d => d.id === revokeId ? { ...d, revoked: true } : d);
+        writableConfig.phoneCompanionDevices = devices;
+        writeAppConfig(writableConfig);
+        sendJson(res, 200, { success: true, revoked: revokeId });
+        return;
+      }
+
       if (req.method === 'GET' && url.pathname === '/api/state') {
         const state = await callRendererFunction('getPhoneCompanionState');
-        sendJson(res, 200, { success: true, ...state });
+        sendJson(res, 200, { success: true, device: companionDevicePublic(device), ...state });
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/preview') {
+        const state = await callRendererFunction('getPhoneCompanionState');
+        sendJson(res, 200, { success: true, preview: state.preview || {} });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/conversations/switch') {
+        const bodyText = await readRequestBody(req);
+        const body = bodyText ? JSON.parse(bodyText) : {};
+        const result = await callRendererFunction('switchPhoneCompanionConversation', String(body.conversationId || ''));
+        sendJson(res, 200, { success: true, ...result });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/conversations/new') {
+        const bodyText = await readRequestBody(req);
+        const body = bodyText ? JSON.parse(bodyText) : {};
+        const result = await callRendererFunction('startPhoneCompanionTask', body);
+        sendJson(res, 200, { success: true, ...result });
         return;
       }
 
@@ -618,6 +811,14 @@ function startPhoneCompanionServer() {
         return;
       }
 
+      if (req.method === 'POST' && url.pathname === '/api/steer') {
+        const bodyText = await readRequestBody(req);
+        const body = bodyText ? JSON.parse(bodyText) : {};
+        const result = await callRendererFunction('steerPhoneCompanionTask', String(body.prompt || body.feedback || '').trim());
+        sendJson(res, 200, { success: true, ...result });
+        return;
+      }
+
       if (req.method === 'POST' && url.pathname === '/api/deny-plan') {
         const result = await callRendererFunction('denyPhoneCompanionPlan');
         sendJson(res, 200, { success: true, ...result });
@@ -632,7 +833,7 @@ function startPhoneCompanionServer() {
         return;
       }
 
-      if (req.method === 'POST' && url.pathname === '/api/stop') {
+      if (req.method === 'POST' && (url.pathname === '/api/stop' || url.pathname === '/api/pause')) {
         const result = await callRendererFunction('stopPhoneCompanionTask');
         sendJson(res, 200, { success: true, ...result });
         return;
@@ -652,7 +853,7 @@ function startPhoneCompanionServer() {
 
   companionServer.listen(port, host, () => {
     const address = enableCompanion ? getLocalWifiAddress() : '127.0.0.1';
-    const url = `http://${address}:${port}/?token=${companionToken}`;
+    const url = `http://${address}:${port}/?pair=${encodeURIComponent(pairingCode)}`;
     console.log(`Orion phone companion listening at ${url} (Host: ${host})`);
     setTimeout(() => {
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -1543,5 +1744,10 @@ if (process.env.NODE_ENV === 'test') {
 }
 
 if (process.env.NODE_ENV === 'test') {
-  module.exports.resetCompanionServer = () => { companionServer = null; };
+  module.exports.resetCompanionServer = () => {
+    if (companionServer) {
+      try { companionServer.close(); } catch (e) {}
+    }
+    companionServer = null;
+  };
 }
