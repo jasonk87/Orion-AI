@@ -190,27 +190,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   if (!isInternalPrompt && conversation.awaitingPlanApproval && !conversation.planApproved) {
     approvalIntent = await classifyPlanApprovalIntent(userPrompt, modelName, config.geminiApiKey);
     if (approvalIntent.intent === 'approve') {
-      // Structural Validation: Check for Testing Plan section in implementation_plan.md
-      let planIsValid = false;
-      try {
-        const planContent = await window.api.readFile(workspacePath, 'implementation_plan.md', { maxChars: 100000 });
-        const planText = typeof planContent === 'string'
-          ? planContent
-          : (planContent && !planContent.error && typeof planContent.content === 'string' ? planContent.content : '');
-        planIsValid = hasRequiredTestingPlanSection(planText);
-      } catch (err) {
-        console.error('Error checking implementation_plan.md for testing section:', err);
-      }
-
-      if (planIsValid) {
-        conversation.planApproved = true;
-        conversation.awaitingPlanApproval = false;
-        window.appendSystemMessage("Plan approved. Continuing implementation.");
-      } else {
-        approvalIntent.intent = 'revise';
-        approvalIntent.reason = 'Missing mandatory ## Testing Plan section in implementation_plan.md';
-        window.appendSystemMessage("Approval blocked: The plan is missing the required '## Testing Plan' section. Asking the agent to revise.");
-      }
+      conversation.planApproved = true;
+      conversation.awaitingPlanApproval = false;
+      window.appendSystemMessage("Plan approved. Continuing implementation.");
     }
 
     if (approvalIntent.intent === 'deny') {
@@ -613,6 +595,32 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       window.saveConversationsToStorage();
       
       if (forceYield) {
+        // Structural Validation: Check for Testing Plan section before presenting plan for approval
+        let planIsValid = false;
+        try {
+          const planContent = await window.api.readFile(workspacePath, 'implementation_plan.md', { maxChars: 100000 });
+          const planText = typeof planContent === 'string'
+            ? planContent
+            : (planContent && !planContent.error && typeof planContent.content === 'string' ? planContent.content : '');
+          planIsValid = hasRequiredTestingPlanSection(planText);
+        } catch (err) {
+          console.error('Error checking implementation_plan.md for testing section:', err);
+        }
+
+        if (!planIsValid) {
+          console.log("Plan written, but missing Testing Plan. Requesting auto-revision.");
+          forceYield = false;
+          window.appendSystemMessage("The plan is missing the required '## Testing Plan' section. Asking the agent to revise before approval.");
+
+          messages.push({
+            role: 'user',
+            parts: [{
+              text: `[SYSTEM: The implementation plan you just wrote is structurally invalid. It is missing the mandatory '## Testing Plan' section. Please revise implementation_plan.md to include this section with exact commands/tests to run, expected behaviors, edge cases, success conditions, and manual checks if automated tests are unavailable. Do this before presenting the plan for approval.]`
+            }]
+          });
+          continue;
+        }
+
         console.log("Plan written. Forcing yield to wait for user approval.");
         conversation.awaitingPlanApproval = true;
         const planItem = workWalkthrough.find(item => item.kind === 'plan');
