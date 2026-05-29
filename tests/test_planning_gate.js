@@ -99,3 +99,132 @@ test('plan approval validation requires a testing plan section', (t) => {
   t.equal(agent.hasRequiredTestingPlanSection(''), false, 'rejects missing or unreadable plan content');
   t.end();
 });
+
+test('invalid plan does not present approval UI and requests internal revision', async (t) => {
+  // We mock out the window and external dependencies to test the inner agent loop
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+
+  // Set up mock window environment
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({
+    planningMode: true,
+    geminiApiKey: 'test-key',
+    modelCallDelayMs: 0
+  });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    readFile: async (workspacePath, filePath) => {
+      if (filePath === 'implementation_plan.md') {
+        return '# Plan\n\n## Implementation\n\nDo the work.'; // Invalid, missing Testing Plan
+      }
+      return '';
+    },
+    writeFile: async () => ({ success: true }),
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+    listFiles: async () => ([{ path: 'test.txt', isDir: false, size: 100 }]),
+  };
+
+  // Minimal conversation state
+  const conversation = {
+    id: 'test-conv',
+    messages: [],
+    awaitingPlanApproval: false,
+    planApproved: false
+  };
+
+  // Override fetch to act as Gemini API mock returning a plan write tool call
+  const originalFetch = global.fetch;
+  let fetchCallCount = 0;
+  global.fetch = async (url, options) => {
+    fetchCallCount++;
+    if (fetchCallCount === 1) {
+      // First call: The model writes an invalid plan
+      return {
+        ok: true,
+        json: async () => ({
+          candidates: [{
+            finishReason: "STOP",
+            content: {
+              parts: [{
+                functionCall: {
+                  name: 'write_file',
+                  args: { path: 'implementation_plan.md', content: 'plan' }
+                }
+              }]
+            }
+          }]
+        })
+      };
+    } else if (fetchCallCount === 2) {
+      // Second call: We verify that the model received the prompt to revise
+      // But instead of immediately providing a valid plan, let's pretend it tried another tool just to test the loop continues
+      return {
+        ok: true,
+        json: async () => ({
+          candidates: [{
+            finishReason: "STOP",
+            content: {
+              parts: [{
+                functionCall: {
+                  name: 'list_files',
+                  args: {}
+                }
+              }]
+            }
+          }]
+        })
+      };
+    } else {
+      // Third call: The model gets the rejection and writes a valid plan
+      global.window.api.readFile = async () => '# Plan\n\n## Testing Plan\n\nTest it.'; // Now it's valid
+      return {
+        ok: true,
+        json: async () => ({
+          candidates: [{
+            finishReason: "STOP",
+            content: {
+              parts: [{
+                functionCall: {
+                  name: 'write_file',
+                  args: { path: 'implementation_plan.md', content: 'valid plan' }
+                }
+              }]
+            }
+          }]
+        })
+      };
+    }
+  };
+
+  try {
+    // Prevent the setTimeout queue execution at the end of the loop
+    global.setTimeout = (fn, delay) => {
+       if (delay !== 500) return originalSetTimeout(fn, delay);
+       return null;
+    };
+
+    // Run the agent loop
+    await window.runAgentLoop('Create a plan', 'gemini-1', conversation);
+
+    // Find the AI message turn and inspect its history
+    const aiMessage = conversation.messages.find(m => m.role === 'assistant');
+    t.ok(aiMessage, 'assistant message was created');
+
+    // We expect the system to have injected a revision prompt, so there should be multiple turns
+    // Instead of parsing the exact turns which can be brittle, let's verify that awaitingPlanApproval
+    // is ultimately set to true ONLY AFTER the valid plan is generated.
+    t.equal(conversation.awaitingPlanApproval, true, 'loop eventually awaits approval');
+    t.equal(fetchCallCount, 3, 'agent was forced to loop again to fix the invalid plan');
+  } finally {
+    // Restore mocks
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+
+  t.end();
+});

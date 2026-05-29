@@ -1773,8 +1773,9 @@ window.onAgentStatusChange = (running) => {
   }
 };
 window.renderUserMessageInChat = renderUserMessage;
-window.getPhoneCompanionState = () => {
-  const conv = conversations.find(c => c.id === activeConversationId);
+window.getPhoneCompanionState = (targetConversationId) => {
+  const resolvedId = targetConversationId || activeConversationId;
+  const conv = conversations.find(c => c.id === resolvedId);
   const messages = conv && conv.messages ? conv.messages.slice(-40).map(msg => ({
     role: msg.role,
     text: msg.role === 'assistant' && msg.text === 'Thinking...' && msg.logs && msg.logs.length
@@ -1800,22 +1801,28 @@ window.getPhoneCompanionState = () => {
   const conversationsSummary = conversations.map(c => ({
     id: c.id,
     title: c.title || 'New Conversation',
-    active: c.id === activeConversationId,
+    active: c.id === resolvedId,
+    isDesktopActive: c.id === activeConversationId,
     awaitingPlanApproval: !!(c.awaitingPlanApproval && !c.planApproved),
     taskCount: Array.isArray(c.tasks) ? c.tasks.length : 0,
     updatedAt: c.updatedAt || c.createdAt || 0
   }));
   
+  const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
+  const globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+  const isActiveTargetRunning = isGlobalRunning && globalRunningId === resolvedId;
+
   return {
-    conversationId: activeConversationId,
+    conversationId: resolvedId,
     title: conv ? conv.title : '',
     conversations: conversationsSummary,
     workspace: conv ? (conv.workspace || conv.projectPath || currentWorkspace || '') : currentWorkspace,
-    running: window.isAgentRunning ? window.isAgentRunning() : false,
-    runningConversationId: window.getRunningConversationId ? window.getRunningConversationId() : null,
-    queuedPrompts: window.promptQueue ? window.promptQueue.length : 0,
-    queuedPromptPreview: window.promptQueue ? window.promptQueue.slice(0, 3).map(item => item.prompt) : [],
-    subStatus: window.getAgentSubStatus ? window.getAgentSubStatus() : '',
+    running: isActiveTargetRunning,
+    globalRunning: isGlobalRunning,
+    runningConversationId: globalRunningId,
+    queuedPrompts: window.promptQueue ? window.promptQueue.filter(q => q.conversationId === resolvedId).length : 0,
+    queuedPromptPreview: window.promptQueue ? window.promptQueue.filter(q => q.conversationId === resolvedId).map(q => q.prompt).slice(0, 3) : [],
+    subStatus: isActiveTargetRunning && window.getAgentSubStatus ? window.getAgentSubStatus() : '',
     awaitingPlanApproval: !!(conv && conv.awaitingPlanApproval && !conv.planApproved),
     tasks: conv && Array.isArray(conv.tasks) ? conv.tasks : [],
     model: window.getSelectedModel(),
@@ -1840,88 +1847,174 @@ window.approvePhoneCompanionPairing = async (request) => {
   return { approved };
 };
 
+// No longer switches desktop conversation
 window.switchPhoneCompanionConversation = async (conversationId) => {
   const conv = conversations.find(c => c.id === conversationId);
   if (!conv) return { success: false, error: 'Conversation not found' };
-  selectConversation(conversationId);
+  // We don't call selectConversation(conversationId) because we want the phone to be independent
   return { success: true, conversationId };
 };
 
 window.startPhoneCompanionTask = async (options = {}) => {
-  createNewConversation();
+  const convId = 'conv-' + Date.now();
+  const conv = {
+    id: convId,
+    title: 'New Phone Task',
+    messages: [],
+    createdAt: Date.now(),
+    workspace: currentWorkspace,
+    projectPath: window.getCurrentProject ? window.getCurrentProject() : '',
+    tasks: [],
+    awaitingPlanApproval: false,
+    planApproved: false
+  };
+  conversations.unshift(conv);
+  saveConversationsToStorage();
+
   const prompt = String(options.prompt || '').trim();
   if (prompt) {
-    return await window.submitPhoneCompanionPrompt(prompt);
+    await window.submitPhoneCompanionPrompt({ prompt, conversationId: convId });
   }
-  return { success: true, conversationId: activeConversationId };
+  return { success: true, conversationId: convId };
 };
 
-window.submitPhoneCompanionPrompt = async (prompt) => {
-  const text = String(prompt || '').trim();
+window.submitPhoneCompanionPrompt = async (options) => {
+  // Can be called with either a string or an options object
+  const text = typeof options === 'string' ? options.trim() : String(options.prompt || '').trim();
+  const targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
+
   if (!text) return { success: false, error: 'Missing prompt' };
-  if (!activeConversationId || !conversations.find(c => c.id === activeConversationId)) {
-    createNewConversation();
+
+  let conv = conversations.find(c => c.id === targetId);
+  if (!conv) {
+    conv = {
+      id: targetId,
+      title: 'New Phone Task',
+      messages: [],
+      createdAt: Date.now(),
+      workspace: currentWorkspace,
+      projectPath: window.getCurrentProject ? window.getCurrentProject() : '',
+      tasks: [],
+      awaitingPlanApproval: false,
+      planApproved: false
+    };
+    conversations.unshift(conv);
+    saveConversationsToStorage();
   }
-  if (window.isAgentRunning && window.isAgentRunning()) {
-    const conv = conversations.find(c => c.id === activeConversationId);
-    window.promptQueue.push({ prompt: text, modelSelectValue: el.modelSelect.value, conversationId: activeConversationId, source: 'phone' });
-    renderUserMessage(text);
-    if (conv && conv.messages) {
+
+  // Generate a short title if it's new
+  if (conv.messages.length === 0 || conv.title === 'New Phone Task' || conv.title === 'Untitled Conversation') {
+    conv.title = text.length > 40 ? text.substring(0, 40) + '...' : text;
+  }
+
+  const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
+
+  if (isGlobalRunning) {
+    window.promptQueue.push({ prompt: text, modelSelectValue: window.getSelectedModel(), conversationId: targetId, source: 'phone' });
+    if (conv.messages) {
       conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now() });
       saveConversationsToStorage();
     }
-    appendSystemMessage("Phone companion prompt queued for the active conversation.");
+    if (targetId === activeConversationId) {
+      renderUserMessage(text);
+      appendSystemMessage("Phone companion prompt queued for the active conversation.");
+    }
     return { success: true, queued: true };
   }
-  el.chatInput.value = text;
-  await submitMessage();
+
+  // Directly run agent loop on the target conversation (without forcing desktop UI switch)
+  if (conv.messages) {
+    conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now() });
+    saveConversationsToStorage();
+  }
+  if (targetId === activeConversationId) {
+    renderUserMessage(text);
+  }
+  window.runAgentLoop(text, window.getSelectedModel(), conv, { source: 'phone' });
+
   return { success: true, queued: false };
 };
 
-window.steerPhoneCompanionTask = async (prompt) => {
-  const text = String(prompt || '').trim();
+window.steerPhoneCompanionTask = async (options) => {
+  const text = typeof options === 'string' ? options.trim() : String(options.prompt || '').trim();
+  const targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
   if (!text) return { success: false, error: 'Missing steering prompt' };
-  if (!window.isAgentRunning || !window.isAgentRunning()) {
-    return await window.submitPhoneCompanionPrompt(text);
+
+  const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
+  const globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+
+  if (!isGlobalRunning || globalRunningId !== targetId) {
+    return await window.submitPhoneCompanionPrompt(options);
   }
+
   window.steeringQueue = window.steeringQueue || [];
   window.steeringQueue.push(text);
-  appendSystemMessage("Phone companion steering note received.");
+  if (targetId === activeConversationId) {
+    appendSystemMessage("Phone companion steering note received.");
+  }
   return { success: true, steered: true };
 };
 
-window.approvePhoneCompanionPlan = async () => {
-  return await approveCurrentPlanAndContinue();
+window.approvePhoneCompanionPlan = async (targetId) => {
+  const resolvedId = targetId || activeConversationId;
+  const conv = conversations.find(c => c.id === resolvedId);
+  if (!conv || !conv.awaitingPlanApproval) return { success: false, error: 'No plan waiting for approval' };
+
+  conv.planApproved = true;
+  conv.awaitingPlanApproval = false;
+  saveConversationsToStorage();
+
+  const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
+  if (isGlobalRunning) {
+    window.promptQueue.push({ prompt: "The plan is approved. Execute it.", modelSelectValue: window.getSelectedModel(), conversationId: resolvedId, source: 'plan-approval' });
+    return { success: true, queued: true };
+  }
+
+  window.runAgentLoop("The plan is approved. Execute it.", window.getSelectedModel(), conv, { source: 'plan-approval', internalPrompt: true });
+  return { success: true, queued: false };
 };
 
-window.denyPhoneCompanionPlan = async () => {
-  const conv = conversations.find(c => c.id === activeConversationId);
+window.denyPhoneCompanionPlan = async (targetId) => {
+  const resolvedId = targetId || activeConversationId;
+  const conv = conversations.find(c => c.id === resolvedId);
   if (!conv) return { success: false, error: 'No active conversation' };
   conv.awaitingPlanApproval = false;
   conv.planApproved = false;
-  appendSystemMessage("Phone companion denied the pending plan.");
+  if (resolvedId === activeConversationId) {
+    appendSystemMessage("Phone companion denied the pending plan.");
+  }
   saveConversationsToStorage();
   return { success: true, denied: true };
 };
 
-window.revisePhoneCompanionPlan = async (feedback) => {
-  const text = String(feedback || 'Revise the pending plan before implementing.').trim();
+window.revisePhoneCompanionPlan = async (options) => {
+  const text = typeof options === 'string' ? options.trim() : String(options.feedback || 'Revise the pending plan before implementing.').trim();
+  const targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
   if (!text) return { success: false, error: 'Missing revision feedback' };
-  return await window.submitPhoneCompanionPrompt(`[Plan revision] ${text}`);
+  return await window.submitPhoneCompanionPrompt({ prompt: `[Plan revision] ${text}`, conversationId: targetId });
 };
 
-window.stopPhoneCompanionTask = async () => {
-  if (window.stopAgentExecution) window.stopAgentExecution();
-  appendSystemMessage("Phone companion requested pause/stop.", {
-    dedupeKey: `phone-stop-${activeConversationId || 'global'}`,
-    windowMs: 3000
-  });
-  return { success: true, stopped: true };
+window.stopPhoneCompanionTask = async (targetId) => {
+  const resolvedId = targetId || activeConversationId;
+  const globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+
+  if (globalRunningId === resolvedId && window.stopAgentExecution) {
+    window.stopAgentExecution();
+    if (resolvedId === activeConversationId) {
+      appendSystemMessage("Phone companion requested pause/stop.", {
+        dedupeKey: `phone-stop-${resolvedId}`,
+        windowMs: 3000
+      });
+    }
+    return { success: true, stopped: true };
+  }
+  return { success: true, stopped: false };
 };
 
-window.resumePhoneCompanionTask = async () => {
+window.resumePhoneCompanionTask = async (targetId) => {
+  const resolvedId = targetId || activeConversationId;
   const prompt = 'Continue the previous task. First inspect current state and recent output, then continue only if it is still safe and useful.';
-  return await window.submitPhoneCompanionPrompt(prompt);
+  return await window.submitPhoneCompanionPrompt({ prompt, conversationId: resolvedId });
 };
 
 async function approveCurrentPlanAndContinue() {

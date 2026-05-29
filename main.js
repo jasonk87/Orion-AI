@@ -269,7 +269,8 @@ function createCompanionDeviceSession(config, deviceName) {
     approved: true,
     revoked: false,
     pairedAt: now,
-    lastSeenAt: now
+    lastSeenAt: now,
+    selectedConversationId: null
   };
   return saveCompanionDevice(config, device);
 }
@@ -801,13 +802,13 @@ function startPhoneCompanionServer() {
       }
 
       if (req.method === 'GET' && url.pathname === '/api/state') {
-        const state = await callRendererFunction('getPhoneCompanionState');
+        const state = await callRendererFunction('getPhoneCompanionState', device.selectedConversationId);
         sendJson(res, 200, { success: true, device: companionDevicePublic(device), ...state });
         return;
       }
 
       if (req.method === 'GET' && url.pathname === '/api/preview') {
-        const state = await callRendererFunction('getPhoneCompanionState');
+        const state = await callRendererFunction('getPhoneCompanionState', device.selectedConversationId);
         sendJson(res, 200, { success: true, preview: state.preview || {} });
         return;
       }
@@ -815,8 +816,13 @@ function startPhoneCompanionServer() {
       if (req.method === 'POST' && url.pathname === '/api/conversations/switch') {
         const bodyText = await readRequestBody(req);
         const body = bodyText ? JSON.parse(bodyText) : {};
-        const result = await callRendererFunction('switchPhoneCompanionConversation', String(body.conversationId || ''));
-        sendJson(res, 200, { success: true, ...result });
+        const targetId = String(body.conversationId || '');
+        if (targetId) {
+          device.selectedConversationId = targetId;
+          const writableConfig = readAppConfig();
+          saveCompanionDevice(writableConfig, device);
+        }
+        sendJson(res, 200, { success: true, conversationId: targetId });
         return;
       }
 
@@ -824,6 +830,11 @@ function startPhoneCompanionServer() {
         const bodyText = await readRequestBody(req);
         const body = bodyText ? JSON.parse(bodyText) : {};
         const result = await callRendererFunction('startPhoneCompanionTask', body);
+        if (result && result.success && result.conversationId) {
+          device.selectedConversationId = result.conversationId;
+          const writableConfig = readAppConfig();
+          saveCompanionDevice(writableConfig, device);
+        }
         sendJson(res, 200, { success: true, ...result });
         return;
       }
@@ -836,13 +847,13 @@ function startPhoneCompanionServer() {
           sendJson(res, 400, { success: false, error: 'Missing prompt' });
           return;
         }
-        const result = await callRendererFunction('submitPhoneCompanionPrompt', prompt);
+        const result = await callRendererFunction('submitPhoneCompanionPrompt', { prompt, conversationId: device.selectedConversationId });
         sendJson(res, 200, { success: true, ...result });
         return;
       }
 
       if (req.method === 'POST' && url.pathname === '/api/approve-plan') {
-        const result = await callRendererFunction('approvePhoneCompanionPlan');
+        const result = await callRendererFunction('approvePhoneCompanionPlan', device.selectedConversationId);
         sendJson(res, 200, { success: true, ...result });
         return;
       }
@@ -850,13 +861,13 @@ function startPhoneCompanionServer() {
       if (req.method === 'POST' && url.pathname === '/api/steer') {
         const bodyText = await readRequestBody(req);
         const body = bodyText ? JSON.parse(bodyText) : {};
-        const result = await callRendererFunction('steerPhoneCompanionTask', String(body.prompt || body.feedback || '').trim());
+        const result = await callRendererFunction('steerPhoneCompanionTask', { prompt: String(body.prompt || body.feedback || '').trim(), conversationId: device.selectedConversationId });
         sendJson(res, 200, { success: true, ...result });
         return;
       }
 
       if (req.method === 'POST' && url.pathname === '/api/deny-plan') {
-        const result = await callRendererFunction('denyPhoneCompanionPlan');
+        const result = await callRendererFunction('denyPhoneCompanionPlan', device.selectedConversationId);
         sendJson(res, 200, { success: true, ...result });
         return;
       }
@@ -864,19 +875,19 @@ function startPhoneCompanionServer() {
       if (req.method === 'POST' && url.pathname === '/api/revise-plan') {
         const bodyText = await readRequestBody(req);
         const body = bodyText ? JSON.parse(bodyText) : {};
-        const result = await callRendererFunction('revisePhoneCompanionPlan', String(body.feedback || '').trim());
+        const result = await callRendererFunction('revisePhoneCompanionPlan', { feedback: String(body.feedback || '').trim(), conversationId: device.selectedConversationId });
         sendJson(res, 200, { success: true, ...result });
         return;
       }
 
       if (req.method === 'POST' && (url.pathname === '/api/stop' || url.pathname === '/api/pause')) {
-        const result = await callRendererFunction('stopPhoneCompanionTask');
+        const result = await callRendererFunction('stopPhoneCompanionTask', device.selectedConversationId);
         sendJson(res, 200, { success: true, ...result });
         return;
       }
 
       if (req.method === 'POST' && url.pathname === '/api/resume') {
-        const result = await callRendererFunction('resumePhoneCompanionTask');
+        const result = await callRendererFunction('resumePhoneCompanionTask', device.selectedConversationId);
         sendJson(res, 200, { success: true, ...result });
         return;
       }

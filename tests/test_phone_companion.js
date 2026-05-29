@@ -250,7 +250,7 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
   t.deepEqual(preview.json.preview.changedFiles, ['app.js'], 'preview exposes changed files');
   t.equal(preview.json.preview.appLaunchUrl, 'http://localhost:3000', 'preview exposes app launch URL');
 
-  t.ok(electron.calls.some(call => call.includes('switchPhoneCompanionConversation')), 'desktop bridge switched task');
+  t.ok(!electron.calls.some(call => call.includes('switchPhoneCompanionConversation')), 'desktop bridge no longer switches global active conversation task');
   t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt')), 'desktop bridge submitted prompt');
   t.ok(electron.calls.some(call => call.includes('approvePhoneCompanionPlan')), 'desktop bridge approved plan');
 
