@@ -102,6 +102,8 @@ const el = {
   phoneCompanionMeta: document.getElementById('phone-companion-meta'),
   workspaceEntrypointInput: document.getElementById('workspace-entrypoint-input'),
   btnSaveEntrypoint: document.getElementById('btn-save-entrypoint'),
+  rightSidebar: document.getElementById('right-sidebar'),
+  btnToggleRightSidebar: document.getElementById('btn-toggle-right-sidebar'),
   btnStartOpenRepo: document.getElementById('btn-start-open-repo'),
   btnStartNewTask: document.getElementById('btn-start-new-task'),
   btnStartResume: document.getElementById('btn-start-resume'),
@@ -123,6 +125,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupWorkspaceHandlers();
   setupStartActions();
   setupEntrypointControls();
+  setupRightSidebarToggle();
   setupChatHandlers();
   
   // Bind manual task checklist add button
@@ -512,6 +515,24 @@ function setupEntrypointControls() {
       event.preventDefault();
       saveWorkspaceEntrypointFromInput();
     }
+  });
+}
+
+function setupRightSidebarToggle() {
+  if (!el.btnToggleRightSidebar || !el.rightSidebar) return;
+  
+  const storedCollapsed = localStorage.getItem('rightSidebarCollapsed');
+  const isCollapsed = storedCollapsed === null ? true : (storedCollapsed === 'true');
+  
+  if (isCollapsed) {
+    el.rightSidebar.classList.add('collapsed');
+  } else {
+    el.rightSidebar.classList.remove('collapsed');
+  }
+  
+  el.btnToggleRightSidebar.addEventListener('click', () => {
+    const currentlyCollapsed = el.rightSidebar.classList.toggle('collapsed');
+    localStorage.setItem('rightSidebarCollapsed', currentlyCollapsed.toString());
   });
 }
 

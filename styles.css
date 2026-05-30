@@ -475,6 +475,18 @@ body {
   background: var(--success-glow);
 }
 
+#btn-launch-app {
+  border-color: rgba(52, 211, 153, 0.35);
+  color: var(--success-color);
+  background: rgba(52, 211, 153, 0.05);
+}
+
+#btn-launch-app:hover {
+  border-color: rgba(52, 211, 153, 0.65);
+  background: var(--success-glow);
+  color: var(--success-color);
+}
+
 .phone-companion-card {
   max-width: 420px;
 }
@@ -1030,6 +1042,10 @@ code {
   user-select: none;
 }
 
+#right-sidebar.collapsed {
+  display: none !important;
+}
+
 #right-sidebar .sidebar-header {
   padding: 16px;
   border-bottom: 1px solid var(--border-color);
@@ -1175,36 +1191,7 @@ code {
   justify-content: flex-end;
 }
 
-.entrypoint-row {
-  display: flex;
-  gap: 6px;
-  padding: 8px 10px;
-  border-bottom: 1px solid var(--border-color);
-}
 
-.entrypoint-row input {
-  min-width: 0;
-  flex: 1;
-  height: 28px;
-  border: 1px solid var(--border-color);
-  border-radius: 4px;
-  background: var(--bg-primary);
-  color: var(--text-secondary);
-  padding: 0 8px;
-  font-size: 0.72rem;
-}
-
-.entrypoint-row button {
-  height: 28px;
-  border: 1px solid var(--accent-color);
-  border-radius: 4px;
-  background: var(--accent-glow);
-  color: var(--accent-color);
-  font-size: 0.72rem;
-  font-weight: 700;
-  padding: 0 8px;
-  cursor: pointer;
-}
 
 /* File Tree Styling */
 .file-tree {
