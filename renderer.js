@@ -1951,7 +1951,7 @@ window.switchPhoneCompanionConversation = async (conversationId) => {
 
 function hasRequiredTestingPlanSection(content) {
   if (!content || typeof content !== 'string') return false;
-  const testingPlanRegex = /^#+\s*(?:testing\s+plan|test\s+plan|validation\s+plan)\b/im;
+  const testingPlanRegex = /^#+\s*.*?(?:testing\s+plan|test\s+plan|validation\s+plan)\b/im;
   return testingPlanRegex.test(content);
 }
 

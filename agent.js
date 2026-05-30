@@ -1655,7 +1655,7 @@ function formatPlanContentForChat(content) {
 }
 
 function hasRequiredTestingPlanSection(content) {
-  return /^#{2,3}\s+(testing plan|test plan|validation plan)\b/im.test(String(content || ''));
+  return /^#{2,3}\s+.*?(testing plan|test plan|validation plan)\b/im.test(String(content || ''));
 }
 
 function hasAnyChecklist(conversation) {
