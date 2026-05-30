@@ -195,9 +195,39 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   if (!isInternalPrompt && conversation.awaitingPlanApproval && !conversation.planApproved) {
     approvalIntent = await classifyPlanApprovalIntent(userPrompt, modelName, config.geminiApiKey);
     if (approvalIntent.intent === 'approve') {
+      let planIsValid = false;
+      try {
+        const planContent = await window.api.readFile(workspacePath, 'implementation_plan.md', { maxChars: 100000 });
+        const planText = typeof planContent === 'string'
+          ? planContent
+          : (planContent && !planContent.error && typeof planContent.content === 'string' ? planContent.content : '');
+        planIsValid = hasRequiredTestingPlanSection(planText);
+      } catch (err) {
+        console.error('Error validating implementation_plan.md during chat approval:', err);
+      }
+
+      if (!planIsValid) {
+        if (window.appendSystemMessage) {
+          window.appendSystemMessage("Approval rejected: The implementation plan is missing a valid '## Testing Plan' section. Please revise the plan first.", { conversationId: conversation.id });
+        }
+        conversation.awaitingPlanApproval = true;
+        conversation.planApproved = false;
+        if (window.saveConversationsToStorage) {
+          window.saveConversationsToStorage();
+        }
+        messages.push({
+          role: 'user',
+          parts: [{
+            text: `[SYSTEM: The user attempted to approve the plan, but it is structurally invalid or missing. It must have a '## Testing Plan' section. Please update implementation_plan.md with this section now.]`
+          }]
+        });
+      }
+
       conversation.planApproved = true;
       conversation.awaitingPlanApproval = false;
-      window.appendSystemMessage("Plan approved. Continuing implementation.");
+      if (window.appendSystemMessage) {
+        window.appendSystemMessage("Plan approved. Continuing implementation.", { conversationId: conversation.id });
+      }
       if (window.saveConversationsToStorage) {
         window.saveConversationsToStorage();
       }
@@ -318,9 +348,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         break;
       }
       
-      // Check if user steer input is available
-      if (window.steeringQueue && window.steeringQueue.length > 0) {
-        const steerText = window.steeringQueue.shift();
+      // Check if user steer input is available for this conversation
+      window.steeringQueue = window.steeringQueue || {};
+      const convSteerQueue = window.steeringQueue[conversation.id] || [];
+      if (convSteerQueue.length > 0) {
+        const steerText = convSteerQueue.shift();
         currentAgentLogs.push({ type: 'thought', content: `🎯 Steered: "${steerText}"` });
         messages.push({ role: 'user', parts: [{ text: `[USER STEERING FEEDBACK: ${steerText}]` }] });
       }
@@ -459,7 +491,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           });
           continue;
         }
-        if (shouldHaveUsedToolsButDidNot(textVal, workWalkthrough) && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
+        if (shouldHaveUsedToolsButDidNot(textVal, workWalkthrough, userPrompt) && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
           const guidance = buildFailureRecoveryGuidance(classifyAgentFailure({
             category: 'model_no_tool_use',
             errorText: textVal
@@ -687,21 +719,22 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     if (window.promptQueue && window.promptQueue.length > 0) {
       const nextTask = window.promptQueue.shift();
       // Look up current or targeted conversation reference
-      if (typeof conversations !== 'undefined' && typeof activeConversationId !== 'undefined') {
-        const targetId = nextTask.conversationId || activeConversationId;
+      if (typeof conversations !== 'undefined') {
+        const targetId = nextTask.conversationId || (typeof activeConversationId !== 'undefined' ? activeConversationId : null);
+        if (!targetId) return;
         const activeConv = conversations.find(c => c.id === targetId);
         if (activeConv) {
-          if (window.selectConversationById) {
-            window.selectConversationById(targetId);
-          } else {
-            activeConversationId = targetId;
-          }
           const isInternalQueueItem = nextTask.source === 'followup' || nextTask.source === 'plan-approval' || nextTask.source === 'system';
           const queueLabel = nextTask.source === 'followup'
             ? 'Executing scheduled follow-up.'
             : (nextTask.source === 'plan-approval' ? 'Continuing approved plan.' : `Executing queued prompt: "${nextTask.prompt}"`);
-          window.appendSystemMessage(queueLabel);
-          if (!isInternalQueueItem && !nextTask.alreadyRendered && window.renderUserMessageInChat) {
+          
+          if (window.appendSystemMessage) {
+            window.appendSystemMessage(queueLabel, { conversationId: targetId });
+          }
+          
+          const isActive = window.getActiveConversationId && targetId === window.getActiveConversationId();
+          if (!isInternalQueueItem && !nextTask.alreadyRendered && isActive && window.renderUserMessageInChat) {
             window.renderUserMessageInChat(nextTask.prompt);
           }
           if (!isInternalQueueItem && !nextTask.alreadyRendered && activeConv.messages) {
@@ -920,11 +953,16 @@ async function executeTool(name, args, workspace, config, conversation) {
       }
       
       const processId = `cmd_${conversation.id}_${Date.now()}`;
-      let cmdOutput = '';
+      let stdoutOutput = '';
+      let stderrOutput = '';
       
       // Setup output streamer listener
       const cleanOutput = window.api.onCommandOutput(processId, (data) => {
-        cmdOutput += data.text;
+        if (data.type === 'stderr') {
+          stderrOutput += data.text;
+        } else {
+          stdoutOutput += data.text;
+        }
       });
       
       const result = await window.api.runCommand(args.command, workspace, processId, timeoutMs);
@@ -932,8 +970,8 @@ async function executeTool(name, args, workspace, config, conversation) {
       
       return {
         exitCode: result.code,
-        stdout: cmdOutput,
-        stderr: result.error || '',
+        stdout: stdoutOutput,
+        stderr: stderrOutput || result.error || '',
         timedOut: !!result.timedOut,
         killed: !!result.killed,
         timeoutMs: result.timeoutMs || timeoutMs
@@ -998,8 +1036,10 @@ async function executeTool(name, args, workspace, config, conversation) {
 
     case 'google_search': {
       if (!args.query) throw new Error("Missing 'query' parameter");
-      const apiKey = config.googleSearchApiKey || config.geminiApiKey;
+      const apiKey = config.googleSearchApiKey;
+      if (!apiKey) throw new Error("Google Search API Key is not configured. Please add it in settings.");
       const searchEngineId = config.googleSearchEngineId;
+      if (!searchEngineId) throw new Error("Google Search Engine ID is not configured. Please add it in settings.");
       const result = await window.api.googleSearch(args.query, apiKey, searchEngineId, args.numResults || 5);
       if (!result.success) throw new Error(result.error || 'Google search failed');
       return {
@@ -1022,8 +1062,7 @@ async function executeTool(name, args, workspace, config, conversation) {
     case 'set_task_checklist': {
       if (!args.tasks || !Array.isArray(args.tasks)) throw new Error("Missing 'tasks' array parameter");
       args.tasks = normalizeChecklistTasks(args.tasks);
-      const activeConv = conversations.find(c => c.id === activeConversationId);
-      const gate = shouldApplyChecklistUpdate(activeConv && activeConv.tasks, args.tasks);
+      const gate = shouldApplyChecklistUpdate(conversation.tasks, args.tasks);
       if (!gate.allowed) {
         return {
           success: true,
@@ -1033,12 +1072,15 @@ async function executeTool(name, args, workspace, config, conversation) {
         };
       }
       
-      // Update UI checklist
-      window.updateTasksChecklist(args.tasks);
+      // Update local storage representation in target conversation
+      conversation.tasks = args.tasks;
       
-      // Update local storage representation in active conversation
-      if (activeConv) {
-        activeConv.tasks = args.tasks;
+      // Update UI checklist only if target conversation is active
+      if (window.getActiveConversationId && conversation.id === window.getActiveConversationId()) {
+        window.updateTasksChecklist(args.tasks);
+      }
+      
+      if (window.saveConversationsToStorage) {
         window.saveConversationsToStorage();
       }
       
@@ -1069,7 +1111,7 @@ async function syncWorkspaceEnv(workspace, config, args = {}) {
       values.GOOGLE_SEARCH_ENGINE_ID = config.googleSearchEngineId;
       values.GOOGLE_CSE_ID = config.googleSearchEngineId;
     }
-    const searchApiKey = config.googleSearchApiKey || config.geminiApiKey;
+    const searchApiKey = config.googleSearchApiKey;
     if (searchApiKey) {
       values.GOOGLE_SEARCH_API_KEY = searchApiKey;
     }
@@ -1104,10 +1146,34 @@ async function syncWorkspaceEnv(workspace, config, args = {}) {
   const writtenFiles = [envPath];
   if (createExample) {
     const examplePath = args.examplePath || '.env.example';
-    const exampleContent = Object.keys(values).map(key => `${key}=`).join('\n') + '\n';
-    const exampleWrite = await window.api.writeFile(workspace, examplePath, exampleContent);
-    if (exampleWrite.error) throw new Error(exampleWrite.error);
-    writtenFiles.push(examplePath);
+    let existingExample = '';
+    const readExample = await window.api.readFile(workspace, examplePath);
+    if (typeof readExample === 'string') {
+      existingExample = readExample;
+    }
+    
+    const exampleLines = existingExample.split(/\r?\n/);
+    const existingKeys = new Set();
+    exampleLines.forEach(line => {
+      const cleanLine = line.trim();
+      if (cleanLine && !cleanLine.startsWith('#') && cleanLine.includes('=')) {
+        const key = cleanLine.split('=')[0].trim();
+        if (key) existingKeys.add(key);
+      }
+    });
+
+    const newKeysToAppend = Object.keys(values).filter(key => !existingKeys.has(key));
+    if (newKeysToAppend.length > 0) {
+      if (exampleLines.length > 0 && exampleLines[exampleLines.length - 1].trim() !== '') {
+        exampleLines.push('');
+      }
+      newKeysToAppend.forEach(key => {
+        exampleLines.push(`${key}=`);
+      });
+      const exampleWrite = await window.api.writeFile(workspace, examplePath, exampleLines.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd() + '\n');
+      if (exampleWrite.error) throw new Error(exampleWrite.error);
+      writtenFiles.push(examplePath);
+    }
   }
   
   if (updateGitignore) {
@@ -1349,13 +1415,9 @@ function scheduleAgentFollowup(args = {}) {
     const targetConv = conversations.find(c => c.id === targetConversationId);
     if (!targetConv) return;
     
-    if (window.selectConversationById) {
-      window.selectConversationById(targetConversationId);
-    } else if (typeof activeConversationId !== 'undefined') {
-      activeConversationId = targetConversationId;
+    if (window.appendSystemMessage) {
+      window.appendSystemMessage(`Scheduled follow-up running after ${delaySeconds} seconds.`, { conversationId: targetConversationId });
     }
-    
-    window.appendSystemMessage(`Scheduled follow-up running after ${delaySeconds} seconds.`);
     await window.runAgentLoop(
       prompt,
       modelSelectValue || (window.getSelectedModel ? window.getSelectedModel() : 'gemini-2.5-flash-lite'),
@@ -1688,11 +1750,24 @@ ${JSON.stringify(String(userPrompt || ''))}`;
   }
 }
 
-function shouldHaveUsedToolsButDidNot(text, workWalkthrough) {
+function shouldHaveUsedToolsButDidNot(text, workWalkthrough, userPrompt = '') {
   if ((workWalkthrough || []).length > 0) return false;
   const response = String(text || '').trim();
   if (!response) return true;
-  return response.length < 80;
+  if (response.length < 80) return true;
+
+  const promptLower = String(userPrompt || '').toLowerCase();
+  const workspaceKeywords = ['file', 'test', 'code', 'search', 'index', 'run', 'execute', 'directory', 'folder', 'write', 'modify', 'patch', 'git', 'npm'];
+  const hasWorkspaceKeyword = workspaceKeywords.some(kw => promptLower.includes(kw));
+
+  if (hasWorkspaceKeyword) {
+    const claimsRegex = /\b(checked|verified|inspected|updated|created|found|tested|run|executed|deleted|copied|moved|read|wrote)\b/i;
+    if (claimsRegex.test(response)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 async function validateRunCommandForAgentUse(command, workspace) {

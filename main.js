@@ -1754,7 +1754,7 @@ ipcMain.handle('list-files', async (event, dirPath) => {
   try {
     if (!dirPath) return [];
     if (!fs.existsSync(dirPath)) {
-      fs.mkdirSync(dirPath, { recursive: true });
+      throw new Error(`Directory does not exist: ${dirPath}`);
     }
     
     // Recursive directory helper, excluding node_modules, .git, etc.
@@ -2083,7 +2083,7 @@ function registerCommandSession(processId, session, child) {
   commandSessions[processId] = session;
   activeProcesses[processId] = child;
 
-  const match = processId.match(/^cmd_(conv_\d+)_(.+)$/);
+  const match = processId.match(/^cmd_(conv[_-][a-zA-Z0-9_-]+)_(.+)$/);
   if (match && match[2]) {
     commandAliases[match[2]] = processId;
   }

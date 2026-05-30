@@ -1,3 +1,14 @@
+// Configure marked to escape HTML content to prevent XSS vulnerability in Electron renderer
+if (typeof marked !== 'undefined') {
+  marked.use({
+    renderer: {
+      html(htmlText) {
+        return htmlText.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      }
+    }
+  });
+}
+
 // STATE MANAGEMENT
 let appConfig = {
   geminiApiKey: '',
@@ -983,7 +994,7 @@ function appendQueuedMessage(text) {
 }
 
 function createNewConversation() {
-  const newId = 'conv_' + Date.now();
+  const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
   const title = 'New Conversation';
   
   const newConv = {
@@ -1010,7 +1021,7 @@ function createNewConversation() {
 }
 
 function createNewConversationUnderProject(projectPath) {
-  const newId = 'conv_' + Date.now();
+  const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
   const title = 'New Conversation';
   
   const newConv = {
@@ -1333,6 +1344,8 @@ function appendSystemMessage(text, options = {}) {
     removeLegacyPhoneCompanionTokenBubbles();
     return;
   }
+  const runningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+  const targetId = options.conversationId || runningId || activeConversationId;
   const dedupeKey = options.dedupeKey || text;
   const windowMs = Number(options.windowMs || 1500);
   window.recentSystemMessages = window.recentSystemMessages || {};
@@ -1341,7 +1354,7 @@ function appendSystemMessage(text, options = {}) {
   if (now - lastAt < windowMs) {
     return;
   }
-  const conv = conversations.find(c => c.id === activeConversationId);
+  const conv = conversations.find(c => c.id === targetId);
   if (conv && options.dedupeKey) {
     conv.systemMessageDedupe = conv.systemMessageDedupe || {};
     const convLastAt = conv.systemMessageDedupe[dedupeKey] || 0;
@@ -1352,7 +1365,9 @@ function appendSystemMessage(text, options = {}) {
   }
   window.recentSystemMessages[dedupeKey] = now;
   
-  renderSystemBubble(text);
+  if (targetId === activeConversationId) {
+    renderSystemBubble(text);
+  }
   if (conv) {
     conv.messages.push({ role: 'system', text: text });
     saveConversationsToStorage();
@@ -1496,7 +1511,11 @@ function renderPhoneCompanionPairingCard(payload) {
 }
 
 // Generates structural AI Response with step thought details
-function renderAiMessage(text, logs = []) {
+function renderAiMessage(text, logs = [], conversationId = null) {
+  const targetId = conversationId || activeConversationId;
+  if (targetId !== activeConversationId) {
+    return;
+  }
   let bubble;
   const isNew = !activeAiBubble;
   
@@ -1794,6 +1813,7 @@ function escapeHtml(text) {
 
 // Export config so agent.js can use it
 window.getAppConfig = () => appConfig;
+window.getActiveConversationId = () => activeConversationId;
 window.getCurrentWorkspace = () => currentWorkspace;
 window.getSelectedModel = () => el.modelSelect ? el.modelSelect.value : appConfig.defaultModel;
 window.selectConversationById = selectConversation;
@@ -1929,8 +1949,14 @@ window.switchPhoneCompanionConversation = async (conversationId) => {
   return { success: true, conversationId };
 };
 
+function hasRequiredTestingPlanSection(content) {
+  if (!content || typeof content !== 'string') return false;
+  const testingPlanRegex = /^#+\s*(?:testing\s+plan|test\s+plan|validation\s+plan)\b/im;
+  return testingPlanRegex.test(content);
+}
+
 window.startPhoneCompanionTask = async (options = {}) => {
-  const convId = 'conv-' + Date.now();
+  const convId = 'conv-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
   const conv = {
     id: convId,
     title: 'New Phone Task',
@@ -2004,7 +2030,8 @@ window.submitPhoneCompanionPrompt = async (options) => {
   if (targetId === activeConversationId) {
     renderUserMessage(text);
   }
-  window.runAgentLoop(text, window.getSelectedModel(), conv, { source: 'phone' });
+  window.runAgentLoop(text, window.getSelectedModel(), conv, { source: 'phone' })
+    .catch(err => console.error("Phone-started agent loop failed:", err));
 
   return { success: true, queued: false };
 };
@@ -2021,8 +2048,9 @@ window.steerPhoneCompanionTask = async (options) => {
     return await window.submitPhoneCompanionPrompt(options);
   }
 
-  window.steeringQueue = window.steeringQueue || [];
-  window.steeringQueue.push(text);
+  window.steeringQueue = window.steeringQueue || {};
+  window.steeringQueue[targetId] = window.steeringQueue[targetId] || [];
+  window.steeringQueue[targetId].push(text);
   if (targetId === activeConversationId) {
     appendSystemMessage("Phone companion steering note received.");
   }
@@ -2034,17 +2062,53 @@ window.approvePhoneCompanionPlan = async (targetId) => {
   const conv = conversations.find(c => c.id === resolvedId);
   if (!conv || !conv.awaitingPlanApproval) return { success: false, error: 'No plan waiting for approval' };
 
+  if (!appConfig.geminiApiKey) {
+    return { success: false, error: 'Missing Gemini API key on desktop' };
+  }
+
+  // Re-validate the testing plan section in implementation_plan.md
+  let planIsValid = false;
+  try {
+    const workspace = conv.workspace || currentWorkspace;
+    const planContent = await window.api.readFile(workspace, 'implementation_plan.md', { maxChars: 100000 });
+    const planText = typeof planContent === 'string'
+      ? planContent
+      : (planContent && !planContent.error && typeof planContent.content === 'string' ? planContent.content : '');
+    planIsValid = hasRequiredTestingPlanSection(planText);
+  } catch (err) {
+    console.error('Error validating plan during phone approval:', err);
+  }
+
+  if (!planIsValid) {
+    return { success: false, error: "Missing or invalid '## Testing Plan' section in implementation_plan.md" };
+  }
+
   conv.planApproved = true;
   conv.awaitingPlanApproval = false;
+
+  // Add visible system message to conversation history
+  conv.messages.push({
+    role: 'system',
+    source: 'plan-approval',
+    text: '[Plan approval via Phone Companion] Start implementation',
+    createdAt: Date.now()
+  });
   saveConversationsToStorage();
 
+  if (resolvedId === activeConversationId) {
+    appendSystemMessage("Plan approved via Phone Companion. Continuing implementation.");
+    renderSystemBubble('[Plan approval via Phone Companion] Start implementation');
+  }
+
+  const prompt = 'The implementation plan was explicitly approved via Phone Companion. Continue execution from the approved plan, update the checklist only for completed/material milestones, run verification, and provide a Work Walkthrough.';
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
   if (isGlobalRunning) {
-    window.promptQueue.push({ prompt: "The plan is approved. Execute it.", modelSelectValue: window.getSelectedModel(), conversationId: resolvedId, source: 'plan-approval' });
+    window.promptQueue.push({ prompt, modelSelectValue: window.getSelectedModel(), conversationId: resolvedId, source: 'plan-approval' });
     return { success: true, queued: true };
   }
 
-  window.runAgentLoop("The plan is approved. Execute it.", window.getSelectedModel(), conv, { source: 'plan-approval', internalPrompt: true });
+  window.runAgentLoop(prompt, window.getSelectedModel(), conv, { source: 'plan-approval', internalPrompt: true })
+    .catch(err => console.error("Phone-started agent loop failed:", err));
   return { success: true, queued: false };
 };
 
@@ -2101,6 +2165,24 @@ async function approveCurrentPlanAndContinue() {
     return { success: false, error: 'Missing Gemini API key' };
   }
 
+  // Re-validate the testing plan section in implementation_plan.md
+  let planIsValid = false;
+  try {
+    const workspace = conv.workspace || currentWorkspace;
+    const planContent = await window.api.readFile(workspace, 'implementation_plan.md', { maxChars: 100000 });
+    const planText = typeof planContent === 'string'
+      ? planContent
+      : (planContent && !planContent.error && typeof planContent.content === 'string' ? planContent.content : '');
+    planIsValid = hasRequiredTestingPlanSection(planText);
+  } catch (err) {
+    console.error('Error validating plan during approval:', err);
+  }
+
+  if (!planIsValid) {
+    appendSystemMessage("Approval rejected: The implementation plan is missing a valid '## Testing Plan' section. Please ask the agent to revise the plan.");
+    return { success: false, error: "Missing or invalid '## Testing Plan' section in implementation_plan.md" };
+  }
+
   conv.planApproved = true;
   conv.awaitingPlanApproval = false;
   saveConversationsToStorage();
@@ -2117,7 +2199,8 @@ async function approveCurrentPlanAndContinue() {
       appendSystemMessage("Another task is currently running. Approved plan execution was queued.");
       return { success: true, queued: true };
     }
-    await window.runAgentLoop(prompt, el.modelSelect.value, conv, { source: 'plan-approval', internalPrompt: true });
+    window.runAgentLoop(prompt, el.modelSelect.value, conv, { source: 'plan-approval', internalPrompt: true })
+      .catch(err => console.error("Desktop-started agent loop failed:", err));
     return { success: true, queued: false };
   }
   return { success: false, error: 'Agent engine is not ready' };
