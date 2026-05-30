@@ -326,6 +326,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     let loopCount = 0;
     let maxLoops = 20;
     let forceYield = false;
+    let planValidationRetries = 0;
     let consecutiveNoToolCalls = 0;
     let malformedCallsCount = 0;
     const repeatedToolFailures = new Map();
@@ -648,17 +649,35 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         }
 
         if (!planIsValid) {
-          console.log("Plan written, but missing Testing Plan. Requesting auto-revision.");
-          forceYield = false;
-          window.appendSystemMessage("The plan is missing the required '## Testing Plan' section. Asking the agent to revise before approval.");
+          if (planValidationRetries < 1) {
+            planValidationRetries++;
+            console.log(`Plan written, but missing Testing Plan. Requesting auto-revision (attempt ${planValidationRetries}).`);
+            forceYield = false;
+            if (window.appendSystemMessage) {
+              window.appendSystemMessage("The plan is missing the required '## Testing Plan' section. Asking the agent to revise before approval.", { conversationId: conversation.id });
+            }
 
-          messages.push({
-            role: 'user',
-            parts: [{
-              text: `[SYSTEM: The implementation plan you just wrote is structurally invalid. It is missing the mandatory '## Testing Plan' section. Please revise implementation_plan.md to include this section with exact commands/tests to run, expected behaviors, edge cases, success conditions, and manual checks if automated tests are unavailable. Do this before presenting the plan for approval.]`
-            }]
-          });
-          continue;
+            messages.push({
+              role: 'user',
+              parts: [{
+                text: `[SYSTEM: The implementation plan you just wrote is structurally invalid. It is missing the mandatory '## Testing Plan' section. Please revise implementation_plan.md to include this section with exact commands/tests to run, expected behaviors, edge cases, success conditions, and manual checks if automated tests are unavailable. Do this before presenting the plan for approval.]`
+              }]
+            });
+            continue;
+          } else {
+            console.log("Plan written, but missing Testing Plan. Max revision retries reached. Yielding to user.");
+            if (window.appendSystemMessage) {
+              window.appendSystemMessage("Approval rejected: The implementation plan is missing a valid '## Testing Plan' section. Please revise the plan first.", { conversationId: conversation.id });
+            }
+            conversation.awaitingPlanApproval = true;
+            conversation.planApproved = false;
+            if (window.saveConversationsToStorage) {
+              window.saveConversationsToStorage();
+            }
+            const planItem = workWalkthrough.find(item => item.kind === 'plan');
+            lastTextResponse = buildPlanApprovalMessage(planItem, lastTextResponse);
+            break;
+          }
         }
 
         console.log("Plan written. Forcing yield to wait for user approval.");

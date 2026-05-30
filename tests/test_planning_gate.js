@@ -228,3 +228,83 @@ test('invalid plan does not present approval UI and requests internal revision',
 
   t.end();
 });
+
+test('invalid plan twice eventually yields to the user to prevent infinite loop', async (t) => {
+  // We mock out the window and external dependencies to test the inner agent loop
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+
+  // Set up mock window environment
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({
+    planningMode: true,
+    geminiApiKey: 'test-key',
+    modelCallDelayMs: 0
+  });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    readFile: async (workspacePath, filePath) => {
+      return '# Plan\n\n## Implementation\n\nStill invalid plan.';
+    },
+    writeFile: async () => ({ success: true }),
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+    listFiles: async () => ([{ path: 'test.txt', isDir: false, size: 100 }]),
+  };
+
+  // Minimal conversation state
+  const conversation = {
+    id: 'test-conv-2',
+    messages: [],
+    awaitingPlanApproval: false,
+    planApproved: false
+  };
+
+  const originalFetch = global.fetch;
+  let fetchCallCount = 0;
+  global.fetch = async (url, options) => {
+    fetchCallCount++;
+    return {
+      ok: true,
+      json: async () => ({
+        candidates: [{
+          finishReason: "STOP",
+          content: {
+            parts: [{
+              functionCall: {
+                name: 'write_file',
+                args: { path: 'implementation_plan.md', content: 'invalid plan' }
+              }
+            }]
+          }
+        }]
+      })
+    };
+  };
+
+  try {
+    // Prevent the setTimeout queue execution at the end of the loop
+    global.setTimeout = (fn, delay) => {
+       if (delay !== 500) return originalSetTimeout(fn, delay);
+       return null;
+    };
+
+    // Run the agent loop
+    await window.runAgentLoop('Create a plan', 'gemini-1', conversation);
+
+    // It should yield to the user after 1 retry (so total 2 attempts to write plan)
+    t.equal(conversation.awaitingPlanApproval, true, 'loop yields and sets awaitingPlanApproval to true');
+    t.equal(conversation.planApproved, false, 'plan is marked as NOT approved');
+    t.equal(fetchCallCount, 4, 'agent only tried 2 times in loop before yielding');
+  } finally {
+    // Restore mocks
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+
+  t.end();
+});
+
