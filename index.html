@@ -200,7 +200,10 @@
       <!-- Workspace Files Panel -->
       <div class="panel-section flex-grow">
         <div class="panel-section-title" style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
-          <span>Workspace Files</span>
+          <span style="display: flex; align-items: center; gap: 6px;">
+            Workspace Files
+            <span class="badge muted" id="rag-index-status" style="display: none; font-size: 0.62rem; padding: 1px 4px; font-weight: normal; text-transform: uppercase;"></span>
+          </span>
           <div style="display: flex; align-items: center; gap: 6px;">
             <button id="btn-launch-app" title="Launch application for testing" style="background: var(--success-glow); border: 1px solid var(--success-color); border-radius: 4px; color: var(--success-color); cursor: pointer; font-size: 0.7rem; padding: 2px 6px; font-weight: 600; display: flex; align-items: center; gap: 3px; border-style: solid;">▶ Launch</button>
             <span class="badge" id="file-count-badge">0</span>
@@ -254,6 +257,12 @@
         <div id="phone-companion-qr" class="phone-companion-qr"></div>
         <div id="phone-companion-pair-url" class="phone-companion-url"></div>
         <div id="phone-companion-meta" class="phone-companion-meta"></div>
+        
+        <!-- Desktop paired-device management UI -->
+        <div id="paired-devices-section" style="margin-top: 24px; border-top: 1px solid var(--border-color); padding-top: 16px; display: none;">
+          <h3 style="font-size: 0.95rem; margin-bottom: 12px; color: var(--accent-color); font-family: var(--font-sans);">Paired Devices</h3>
+          <div id="paired-devices-list" style="display: flex; flex-direction: column; gap: 8px;"></div>
+        </div>
       </div>
     </div>
   </div>

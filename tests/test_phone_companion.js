@@ -43,8 +43,10 @@ function makeFsMock(config) {
 
 function makeElectronMock(handlers = {}) {
   const calls = [];
+  const ipcHandlers = {};
   return {
     calls,
+    ipcHandlers,
     mock: {
       app: {
         whenReady: () => ({ then: (cb) => { cb(); } }),
@@ -91,7 +93,9 @@ function makeElectronMock(handlers = {}) {
       },
       ipcMain: {
         on: () => {},
-        handle: () => {}
+        handle: (channel, fn) => {
+          ipcHandlers[channel] = fn;
+        }
       },
       dialog: {}
     }
@@ -264,3 +268,107 @@ test('Phone Companion LAN mode remains disabled by default', async (t) => {
   t.equal(address.address, '127.0.0.1', 'server binds localhost when companion LAN mode is disabled');
   await closeServer(server);
 });
+
+test('Phone Companion v2 task dashboard carries global running, viewed state, queued prompts, and activity panel details', async (t) => {
+  const customState = {
+    conversationId: 'conv1',
+    title: 'Task One',
+    conversations: [
+      { id: 'conv1', title: 'Task One', active: true, awaitingPlanApproval: true },
+      { id: 'conv2', title: 'Task Two', active: false }
+    ],
+    tasks: [{ title: 'Build', status: 'in-progress' }],
+    messages: [],
+    latestOutput: 'latest',
+    globalRunning: true,
+    runningConversationId: 'conv2',
+    queuedPrompts: 2,
+    queuedPromptPreview: ['npm test', 'git status'],
+    subStatus: 'Running webpack...',
+    preview: {
+      latestAssistantOutput: 'latest',
+      workWalkthrough: 'Done: test',
+      changedFiles: ['app.js'],
+      testResults: ['npm test passed'],
+      appLaunchUrl: 'http://localhost:3000',
+      appLaunchLogs: 'Server listening on port 3000'
+    }
+  };
+
+  const { main } = await startMainWithConfig(1138, {}, { state: customState });
+  const pair = await request('POST', 1138, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
+  const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+
+  const stateRes = await request('GET', 1138, '/api/state', null, session);
+  t.equal(stateRes.statusCode, 200, 'state retrieval succeeds');
+  
+  const state = stateRes.json;
+  t.equal(state.globalRunning, true, 'carries globalRunning');
+  t.equal(state.runningConversationId, 'conv2', 'carries runningConversationId');
+  t.equal(state.queuedPrompts, 2, 'carries queuedPrompts count');
+  t.deepEqual(state.queuedPromptPreview, ['npm test', 'git status'], 'carries queuedPromptPreview');
+  t.equal(state.subStatus, 'Running webpack...', 'carries subStatus');
+  
+  t.equal(state.preview.appLaunchLogs, 'Server listening on port 3000', 'carries appLaunchLogs in activity panel');
+  t.equal(state.preview.appLaunchUrl, 'http://localhost:3000', 'carries appLaunchUrl');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion v2 desktop device list and revoke IPC endpoints', async (t) => {
+  const initialDevices = [
+    { id: 'dev1', name: 'iPhone', secret: 'sec1', approved: true, revoked: false },
+    { id: 'dev2', name: 'Android', secret: 'sec2', approved: true, revoked: false }
+  ];
+  
+  const { main, fsMock, electron } = await startMainWithConfig(1139, {
+    phoneCompanionDevices: initialDevices
+  });
+
+  const getDevicesHandler = electron.ipcHandlers['get-phone-companion-devices'];
+  const revokeDeviceHandler = electron.ipcHandlers['revoke-phone-companion-device'];
+
+  t.ok(getDevicesHandler, 'get-phone-companion-devices IPC handler is registered');
+  t.ok(revokeDeviceHandler, 'revoke-phone-companion-device IPC handler is registered');
+
+  // Invoke get-phone-companion-devices
+  const devices = await getDevicesHandler();
+  t.equal(devices.length, 2, 'returns correct number of devices');
+  t.equal(devices[0].name, 'iPhone', 'carries device details');
+
+  // Invoke revoke-phone-companion-device
+  const revokeResult = await revokeDeviceHandler(null, 'dev1');
+  t.equal(revokeResult.success, true, 'revoke operation returns success');
+  t.equal(revokeResult.revoked, 'dev1', 'returns revoked deviceId');
+
+  const updatedDevices = await getDevicesHandler();
+  const dev1 = updatedDevices.find(d => d.id === 'dev1');
+  t.equal(dev1.revoked, true, 'device status is updated to revoked');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion v2 pairing pending and denied states', async (t) => {
+  // Test pending (desktop approval required / rate-limited)
+  const { main: mainPending } = await startMainWithConfig(1140, {}, {
+    pairingApproval: { approved: false, pending: true }
+  });
+  const resPending = await request('POST', 1140, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
+  t.equal(resPending.statusCode, 403, 'pairing pending returns 403');
+  t.equal(resPending.json.success, false, 'pairing pending is unsuccessful');
+  t.equal(resPending.json.pending, true, 'pairing pending carries pending: true');
+  t.equal(resPending.json.error, 'Desktop approval required', 'pairing pending carries desktop approval required error message');
+  await closeServer(mainPending.getCompanionServer());
+
+  // Test denied (user rejected pairing request)
+  const { main: mainDenied } = await startMainWithConfig(1141, {}, {
+    pairingApproval: { approved: false, pending: false }
+  });
+  const resDenied = await request('POST', 1141, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
+  t.equal(resDenied.statusCode, 403, 'pairing denied returns 403');
+  t.equal(resDenied.json.success, false, 'pairing denied is unsuccessful');
+  t.equal(resDenied.json.pending, false, 'pairing denied carries pending: false');
+  t.equal(resDenied.json.error, 'Pairing denied', 'pairing denied carries pairing denied error message');
+  await closeServer(mainDenied.getCompanionServer());
+});
+

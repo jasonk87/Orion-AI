@@ -356,74 +356,306 @@ function companionHtml(pairingCode) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Orion AI Phone Companion</title>
+  <title>Orion Operator Console</title>
   <meta name="theme-color" content="#8b5cf6">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,100..800;1,100..800&family=Outfit:wght@100..900&display=swap" rel="stylesheet">
   <style>
-    :root { color-scheme: dark; --bg:#08080d; --panel:rgba(18,17,28,.78); --panel-strong:rgba(24,23,36,.96); --line:rgba(167,139,250,.18); --text:#f7f4ff; --muted:#a7a0c4; --accent:#a78bfa; --accent-strong:#8b5cf6; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
+    :root {
+      color-scheme: dark;
+      --bg: #07070a;
+      --panel: rgba(20, 20, 31, 0.6);
+      --panel-strong: rgba(28, 28, 43, 0.85);
+      --line: rgba(167, 139, 250, 0.15);
+      --text: #f3f1fe;
+      --muted: #9f9aa7;
+      --accent: #a78bfa;
+      --accent-strong: #8b5cf6;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
     * { box-sizing: border-box; }
-    body { margin:0; min-height:100vh; background: radial-gradient(circle at 16% -8%, rgba(96,165,250,.24), transparent 34%), radial-gradient(circle at 86% 0%, rgba(167,139,250,.22), transparent 36%), linear-gradient(180deg,#0b0b12 0%,#08080d 45%,#06060a 100%); overflow-x:hidden; }
-    body::before { content:""; position:fixed; inset:0; pointer-events:none; background-image:linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px); background-size:32px 32px; mask-image:linear-gradient(to bottom, rgba(0,0,0,.9), transparent 65%); }
-    .app-shell { min-height:100vh; padding-bottom:calc(164px + env(safe-area-inset-bottom)); }
-    header { position:sticky; top:0; z-index:5; padding:calc(14px + env(safe-area-inset-top)) 16px 12px; border-bottom:1px solid rgba(255,255,255,.08); background:rgba(8,8,13,.82); backdrop-filter:blur(20px); }
-    .topline { display:flex; align-items:center; justify-content:space-between; gap:12px; }
-    .brand { display:flex; align-items:center; min-width:0; gap:10px; }
-    .mark { width:36px; height:36px; border-radius:12px; display:grid; place-items:center; background:linear-gradient(145deg,#60a5fa,#8b5cf6 55%,#171827); box-shadow:0 10px 30px rgba(139,92,246,.28); font-weight:900; }
-    h1 { margin:0; font-size:1.02rem; letter-spacing:0; line-height:1.1; }
-    .meta { margin-top:4px; color:var(--muted); font-size:.76rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:68vw; }
-    .status-pill { flex:0 0 auto; padding:7px 9px; border-radius:999px; border:1px solid var(--line); background:rgba(18,17,28,.66); color:var(--muted); font-size:.72rem; font-weight:700; }
-    .status-pill.running { color:#e8ddff; border-color:rgba(52,211,153,.28); background:rgba(52,211,153,.12); }
-    .context-card { margin-top:12px; padding:12px; border:1px solid rgba(255,255,255,.08); border-radius:14px; background:linear-gradient(180deg,rgba(24,23,36,.86),rgba(13,13,20,.7)); }
-    .context-row { display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--muted); font-size:.75rem; }
-    .model { color:var(--text); font-weight:700; }
-    .substatus { margin-top:8px; color:var(--accent); font-size:.76rem; min-height:18px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .queue-line { margin-top:6px; color:var(--muted); font-size:.72rem; }
-    .output-panel { margin-bottom:12px; padding:10px; border:1px solid rgba(255,255,255,.08); border-radius:12px; background:rgba(12,12,18,.72); color:var(--muted); font-size:.74rem; line-height:1.35; max-height:120px; overflow:auto; white-space:pre-wrap; }
-    .preview-panel, .conversation-panel { margin-bottom:12px; padding:11px; border:1px solid rgba(255,255,255,.08); border-radius:12px; background:rgba(12,12,18,.72); }
-    .panel-title { margin-bottom:8px; font-size:.72rem; color:#c4b5fd; font-weight:850; text-transform:uppercase; letter-spacing:.08em; }
-    select { width:100%; min-height:38px; border:1px solid rgba(167,139,250,.25); border-radius:10px; padding:0 9px; background:rgba(18,17,28,.94); color:var(--text); }
-    .preview-grid { display:grid; gap:8px; }
-    .preview-item { color:var(--muted); font-size:.72rem; white-space:pre-wrap; max-height:92px; overflow:auto; }
-    .install-tip { display:none; margin-top:10px; padding:9px 10px; border:1px dashed rgba(167,139,250,.36); border-radius:12px; color:#ddd6fe; background:rgba(167,139,250,.09); font-size:.76rem; line-height:1.35; }
-    .install-tip.visible { display:block; }
-    main { position:relative; z-index:1; padding:14px; }
-    .plan-panel { display:none; margin-bottom:12px; padding:13px; border-radius:16px; border:1px solid rgba(251,191,36,.28); background:linear-gradient(135deg,rgba(251,191,36,.12),rgba(167,139,250,.08)); }
-    .plan-panel.visible { display:block; }
-    .plan-title { font-size:.86rem; font-weight:800; margin-bottom:4px; }
-    .plan-copy { color:var(--muted); font-size:.78rem; line-height:1.35; margin-bottom:10px; }
-    .task-strip { display:flex; gap:8px; overflow-x:auto; padding:2px 0 10px; margin-bottom:4px; }
-    .task-chip { flex:0 0 auto; max-width:220px; padding:7px 9px; border:1px solid rgba(255,255,255,.08); border-radius:999px; color:var(--muted); background:rgba(18,17,28,.76); font-size:.72rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .task-chip.completed { color:rgba(209,250,229,.9); border-color:rgba(52,211,153,.25); }
-    .task-chip.in-progress { color:#ddd6fe; border-color:rgba(167,139,250,.36); }
-    .messages { display:flex; flex-direction:column; gap:12px; }
-    .message { max-width:92%; padding:12px 13px; border:1px solid rgba(255,255,255,.08); border-radius:17px; line-height:1.48; white-space:pre-wrap; word-break:break-word; background:rgba(17,16,25,.86); box-shadow:0 12px 30px rgba(0,0,0,.12); }
-    .message.user { align-self:flex-end; border-color:rgba(167,139,250,.36); background:linear-gradient(135deg,rgba(139,92,246,.22),rgba(37,34,58,.92)); }
-    .message.assistant { align-self:flex-start; border-color:rgba(52,211,153,.18); }
-    .message.system { align-self:center; max-width:100%; color:var(--muted); font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:.75rem; background:rgba(12,12,18,.72); }
-    .role { display:block; margin-bottom:6px; color:#c4b5fd; font-size:.66rem; font-weight:850; text-transform:uppercase; letter-spacing:.08em; }
-    form { position:fixed; z-index:8; left:0; right:0; bottom:0; padding:12px 12px calc(12px + env(safe-area-inset-bottom)); border-top:1px solid rgba(255,255,255,.08); background:rgba(8,8,13,.9); backdrop-filter:blur(22px); }
-    .composer { display:flex; gap:10px; align-items:flex-end; }
-    textarea { width:100%; min-height:54px; max-height:132px; resize:none; border:1px solid rgba(167,139,250,.25); border-radius:15px; padding:12px 13px; background:rgba(18,17,28,.94); color:var(--text); font:inherit; line-height:1.35; outline:none; }
-    textarea:focus { border-color:rgba(167,139,250,.58); box-shadow:0 0 0 3px rgba(167,139,250,.12); }
-    button { border:0; border-radius:14px; background:var(--accent-strong); color:#fff; font-weight:850; font-size:.9rem; min-height:48px; padding:0 15px; box-shadow:0 12px 26px rgba(139,92,246,.28); }
-    .send-button { flex:0 0 auto; min-width:72px; }
-    .control-row { display:flex; gap:8px; margin-bottom:12px; }
-    .control-row button { flex:1; min-height:38px; border-radius:12px; background:rgba(18,17,28,.94); border:1px solid rgba(167,139,250,.22); color:var(--text); box-shadow:none; }
-    .approve-button { width:100%; background:#f59e0b; box-shadow:0 12px 26px rgba(245,158,11,.18); }
-    button:disabled { opacity:.55; }
-    .empty { color:var(--muted); text-align:center; padding:54px 12px; }
-    @media (min-width:700px) { .app-shell { max-width:760px; margin:0 auto; border-left:1px solid rgba(255,255,255,.06); border-right:1px solid rgba(255,255,255,.06); } form { left:50%; transform:translateX(-50%); max-width:760px; } .meta { max-width:520px; } }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: radial-gradient(circle at 16% -8%, rgba(96,165,250,.18), transparent 34%), radial-gradient(circle at 86% 0%, rgba(167,139,250,.16), transparent 36%), linear-gradient(180deg,#0a0a10 0%,#07070a 45%,#050508 100%);
+      overflow-x: hidden;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image: linear-gradient(rgba(255,255,255,.02) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.015) 1px, transparent 1px);
+      background-size: 32px 32px;
+      mask-image: linear-gradient(to bottom, rgba(0,0,0,.8), transparent 65%);
+    }
+    .app-shell { min-height: 100vh; padding-bottom: calc(164px + env(safe-area-inset-bottom)); }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      padding: calc(14px + env(safe-area-inset-top)) 16px 12px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(7,7,10,.82);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+    }
+    .topline { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .brand { display: flex; align-items: center; min-width: 0; gap: 10px; }
+    .mark {
+      width: 36px;
+      height: 36px;
+      border-radius: 12px;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(145deg, #60a5fa, #8b5cf6 55%, #171827);
+      box-shadow: 0 10px 30px rgba(139,92,246,.28);
+      font-weight: 900;
+      color: #fff;
+    }
+    h1 { margin: 0; font-size: 1.05rem; letter-spacing: 0; line-height: 1.1; font-weight: 700; }
+    .meta { margin-top: 4px; color: var(--muted); font-size: .76rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 68vw; }
+    .status-pill {
+      flex: 0 0 auto;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(20,20,31,.6);
+      color: var(--muted);
+      font-size: .72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .status-pill.running {
+      color: #e8ddff;
+      border-color: rgba(16,185,129,.35);
+      background: rgba(16,185,129,.12);
+    }
+    
+    /* Indicator Banner */
+    .indicator-banner {
+      padding: 10px 14px;
+      border-radius: 10px;
+      margin-top: 12px;
+      font-size: 0.78rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border: 1px solid transparent;
+      font-weight: 500;
+    }
+    .indicator-banner.active-running {
+      background: rgba(16, 185, 129, 0.08);
+      border-color: rgba(16, 185, 129, 0.2);
+      color: #34d399;
+    }
+    .indicator-banner.background-running {
+      background: rgba(245, 158, 11, 0.08);
+      border-color: rgba(245, 158, 11, 0.2);
+      color: #fbbf24;
+    }
+    .indicator-banner.background-running button {
+      background: #fbbf24;
+      color: #0c0c0e;
+      font-weight: 700;
+      border: 0;
+      padding: 4px 8px;
+      border-radius: 6px;
+      font-size: 0.72rem;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .indicator-banner.idle {
+      background: rgba(255, 255, 255, 0.02);
+      border-color: rgba(255, 255, 255, 0.05);
+      color: var(--muted);
+    }
+
+    .context-card {
+      margin-top: 12px;
+      padding: 12px;
+      border: 1px solid rgba(255,255,255,.05);
+      border-radius: 14px;
+      background: linear-gradient(180deg, rgba(24,23,36,.5), rgba(13,13,20,.4));
+    }
+    .context-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--muted); font-size: .75rem; }
+    .model { color: var(--text); font-weight: 700; }
+    .substatus { margin-top: 8px; color: var(--accent); font-size: .76rem; min-height: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    
+    .install-tip { display: none; margin-top: 10px; padding: 9px 10px; border: 1px dashed rgba(167,139,250,.36); border-radius: 12px; color: #ddd6fe; background: rgba(167,139,250,.09); font-size: .76rem; line-height: 1.35; }
+    .install-tip.visible { display: block; }
+    
+    main { position: relative; z-index: 1; padding: 14px; display: flex; flex-direction: column; gap: 16px; }
+    
+    /* Plan Panel */
+    .plan-panel {
+      display: none;
+      padding: 14px;
+      border-radius: 14px;
+      border: 1px solid rgba(245, 158, 11, 0.3);
+      background: linear-gradient(135deg, rgba(245, 158, 11, 0.08), rgba(167, 139, 250, 0.04));
+      margin-bottom: 4px;
+    }
+    .plan-panel.visible { display: block; }
+    .plan-title { font-size: .86rem; font-weight: 800; margin-bottom: 4px; color: #fbbf24; }
+    .plan-copy { color: var(--muted); font-size: .78rem; line-height: 1.35; margin-bottom: 10px; }
+    
+    /* Dashboard and Cards */
+    .dashboard-panel { display: flex; flex-direction: column; gap: 12px; }
+    .panel-header-row { display: flex; align-items: center; justify-content: space-between; }
+    .sub-panel-title { font-size: .74rem; color: #c4b5fd; font-weight: 850; text-transform: uppercase; letter-spacing: .08em; }
+    
+    .btn-sm-primary {
+      min-height: 32px;
+      padding: 0 12px;
+      font-size: 0.78rem;
+      border-radius: 8px;
+      font-weight: 700;
+      background: var(--accent-strong);
+      color: #fff;
+      border: 0;
+      box-shadow: 0 4px 12px rgba(139, 92, 246, 0.2);
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .btn-sm {
+      min-height: 28px;
+      padding: 0 10px;
+      font-size: 0.75rem;
+      border-radius: 6px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.1);
+      color: var(--text);
+      cursor: pointer;
+      font-family: inherit;
+    }
+
+    .dashboard-card {
+      padding: 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      background: var(--panel);
+    }
+    .dashboard-card.active-card {
+      border-left: 4px solid var(--accent);
+      background: linear-gradient(180deg, rgba(139, 92, 246, 0.04), rgba(20, 20, 31, 0.6));
+    }
+    .dashboard-cards-grid { display: flex; flex-direction: column; gap: 8px; }
+    .attention-card {
+      border: 1px solid rgba(245, 158, 11, 0.25);
+      background: linear-gradient(135deg, rgba(245, 158, 11, 0.05), rgba(20, 20, 31, 0.6));
+    }
+    .card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+    .card-title { font-size: 0.94rem; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+    .substatus-text { font-size: 0.74rem; color: var(--muted); min-height: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .badge { display: inline-flex; align-items: center; padding: 2px 6px; border-radius: 4px; font-size: 0.64rem; font-weight: 700; text-transform: uppercase; }
+    .badge.success { background: rgba(16, 185, 129, 0.1); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.2); }
+    .badge.warning { background: rgba(245, 158, 11, 0.1); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.2); }
+    .badge.danger { background: rgba(239, 68, 68, 0.1); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.2); }
+    .badge.muted { background: rgba(255, 255, 255, 0.04); color: var(--muted); border: 1px solid rgba(255, 255, 255, 0.06); }
+    .badge.active-view { background: rgba(139, 92, 246, 0.12); color: #c4b5fd; border: 1px solid rgba(139, 92, 246, 0.2); }
+    .badge.pulse { animation: status-pulse 1.8s infinite; }
+    @keyframes status-pulse {
+      0% { opacity: 0.6; }
+      50% { opacity: 1; }
+      100% { opacity: 0.6; }
+    }
+
+    .queued-list { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+    .queued-item { font-size: 0.72rem; color: #d1d5db; background: rgba(255,255,255,0.02); padding: 6px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.04); }
+
+    .recent-tasks-list { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow-y: auto; padding-right: 4px; }
+    .task-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.05); background: rgba(255,255,255,0.01); cursor: pointer; transition: all 0.2s ease; }
+    .task-row:hover { border-color: rgba(167, 139, 250, 0.18); background: rgba(167, 139, 250, 0.02); }
+    .task-row.active-row { border-color: rgba(167, 139, 250, 0.3); background: rgba(167, 139, 250, 0.05); }
+    .task-row-title { font-size: 0.82rem; font-weight: 600; color: var(--text); }
+    .task-row-meta { font-size: 0.7rem; color: var(--muted); margin-top: 2px; }
+
+    /* Upgraded Activity Panel with Tabs */
+    .activity-panel {
+      padding: 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      background: var(--panel);
+    }
+    .tab-header { display: flex; gap: 4px; border-bottom: 1px solid rgba(255,255,255,0.06); padding-bottom: 6px; margin-bottom: 10px; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .tab-btn {
+      flex: 1;
+      min-height: 30px;
+      padding: 0 10px;
+      font-size: 0.72rem;
+      border-radius: 6px;
+      background: transparent;
+      border: 0;
+      color: var(--muted);
+      cursor: pointer;
+      font-weight: 600;
+      text-align: center;
+      white-space: nowrap;
+      box-shadow: none;
+      font-family: inherit;
+    }
+    .tab-btn.active {
+      background: rgba(139, 92, 246, 0.15);
+      color: #c4b5fd;
+      border: 1px solid rgba(139, 92, 246, 0.2);
+    }
+    .tab-content { position: relative; }
+    .tab-pane { display: none; font-size: 0.74rem; color: var(--muted); white-space: pre-wrap; word-break: break-all; max-height: 180px; overflow-y: auto; line-height: 1.4; }
+    .tab-pane.active { display: block; }
+    .terminal-logs { font-family: 'JetBrains Mono', Consolas, monospace; background: #040406; color: #34d399; padding: 8px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.04); margin: 0; font-size: 0.68rem; line-height: 1.35; max-height: 140px; overflow: auto; }
+    .test-result-block { border-bottom: 1px solid rgba(255,255,255,0.04); padding-bottom: 6px; margin-bottom: 6px; }
+    .test-result-block:last-child { border-bottom: 0; }
+
+    /* Action Grouping */
+    .action-grouping { display: flex; flex-direction: column; gap: 8px; margin-bottom: 4px; }
+    .control-row { display: flex; gap: 8px; }
+    .control-row button { flex: 1; min-height: 38px; border-radius: 12px; background: rgba(20,20,31,.6); border: 1px solid var(--line); color: var(--text); box-shadow: none; font-size: 0.8rem; font-weight: 700; cursor: pointer; }
+    .control-row button:hover { border-color: rgba(167, 139, 250, 0.35); background: rgba(167, 139, 250, 0.04); }
+    .approve-button { width: 100%; background: #f59e0b; color: #0c0c0e; font-weight: 850; box-shadow: 0 12px 26px rgba(245,158,11,.18); cursor: pointer; }
+    
+    .messages { display: flex; flex-direction: column; gap: 12px; max-height: 320px; overflow-y: auto; padding-right: 4px; }
+    .message { max-width: 92%; padding: 12px 13px; border: 1px solid rgba(255,255,255,.05); border-radius: 17px; line-height: 1.48; white-space: pre-wrap; word-break: break-word; background: rgba(20,20,31,.4); box-shadow: 0 12px 30px rgba(0,0,0,.12); font-size: 0.8rem; }
+    .message.user { align-self: flex-end; border-color: rgba(167,139,250,.28); background: linear-gradient(135deg, rgba(139,92,246,.15), rgba(37,34,58,.82)); }
+    .message.assistant { align-self: flex-start; border-color: rgba(52,211,153,.15); }
+    .message.system { align-self: center; max-width: 100%; color: var(--muted); font-family: 'JetBrains Mono', monospace; font-size: .74rem; background: rgba(12,12,18,.5); }
+    .role { display: block; margin-bottom: 6px; color: #c4b5fd; font-size: .64rem; font-weight: 850; text-transform: uppercase; letter-spacing: .08em; }
+    
+    form { position: fixed; z-index: 8; left: 0; right: 0; bottom: 0; padding: 12px 12px calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid rgba(255,255,255,.06); background: rgba(7,7,10,.9); backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px); }
+    .composer { display: flex; gap: 10px; align-items: flex-end; }
+    textarea { width: 100%; min-height: 54px; max-height: 132px; resize: none; border: 1px solid rgba(167,139,250,.2); border-radius: 15px; padding: 12px 13px; background: rgba(20,20,31,.9); color: var(--text); font: inherit; line-height: 1.35; outline: none; }
+    textarea:focus { border-color: rgba(167,139,250,.5); box-shadow: 0 0 0 3px rgba(167,139,250,.08); }
+    button.send-button { border: 0; border-radius: 14px; background: var(--accent-strong); color: #fff; font-weight: 850; font-size: .9rem; min-height: 48px; padding: 0 15px; box-shadow: 0 12px 26px rgba(139,92,246,.28); cursor: pointer; font-family: inherit; }
+    .send-button { flex: 0 0 auto; min-width: 72px; }
+    
+    .empty { color: var(--muted); text-align: center; padding: 36px 12px; font-size: 0.76rem; }
+    @media (min-width:700px) {
+      .app-shell { max-width: 760px; margin: 0 auto; border-left: 1px solid rgba(255,255,255,.05); border-right: 1px solid rgba(255,255,255,.05); }
+      form { left: 50%; transform: translateX(-50%); max-width: 760px; }
+      .meta { max-width: 520px; }
+    }
   </style>
 </head>
 <body>
   <div class="app-shell">
     <header>
       <div class="topline">
-        <div class="brand"><div class="mark">O</div><div><h1>Orion AI</h1><div class="meta" id="meta">Connecting...</div></div></div>
+        <div class="brand"><div class="mark">O</div><div><h1>Orion Operator Console</h1><div class="meta" id="meta">Connecting...</div></div></div>
         <div class="status-pill" id="status-pill">Offline</div>
+      </div>
+      <div id="global-indicator-banner" class="indicator-banner idle">
+        <span>Agent is currently idle</span>
       </div>
       <div class="context-card">
         <div class="context-row"><span>Model</span><span class="model" id="model">-</span></div>
@@ -432,14 +664,85 @@ function companionHtml(pairingCode) {
       </div>
     </header>
     <main>
-      <section class="plan-panel" id="plan-panel"><div class="plan-title">Plan waiting for approval</div><div class="plan-copy">Review the latest plan in chat. Start it here when the direction looks right.</div><button class="approve-button" id="approve-plan" type="button">Start Implementation</button><div class="control-row"><button id="deny-plan" type="button">Deny</button><button id="revise-plan" type="button">Revise</button></div></section>
-      <section class="conversation-panel"><div class="panel-title">Tasks</div><select id="conversation-select"></select><div class="control-row" style="margin-top:8px"><button id="new-task" type="button">New Task</button><button id="steer-task" type="button">Steer</button></div></section>
-      <div class="control-row"><button id="refresh-state" type="button">Refresh</button><button id="stop-task" type="button">Pause / Stop</button><button id="resume-task" type="button">Resume</button></div>
-      <div class="queue-line" id="queue-line"></div>
-      <div class="output-panel" id="latest-output">Latest output will appear here.</div>
-      <section class="preview-panel"><div class="panel-title">Preview</div><div class="preview-grid" id="preview-panel"></div></section>
-      <div class="task-strip" id="tasks"></div>
-      <div class="messages" id="messages"><div class="empty">Loading conversation...</div></div>
+      <!-- Task console dashboard -->
+      <section class="dashboard-panel">
+        <div class="panel-header-row">
+          <div class="sub-panel-title">Task Console</div>
+          <button id="new-task" type="button" class="btn-sm-primary">+ New Task</button>
+        </div>
+        
+        <div id="active-task-container" class="dashboard-card active-card">
+          <div class="empty">Loading tasks...</div>
+        </div>
+
+        <section class="plan-panel" id="plan-panel">
+          <div class="plan-title">Plan waiting for approval</div>
+          <div class="plan-copy">Review the latest plan in chat. Start it here when the direction looks right.</div>
+          <button class="approve-button" id="approve-plan" type="button">Start Implementation</button>
+          <div class="control-row" style="margin-top: 8px;">
+            <button id="deny-plan" type="button">Deny</button>
+            <button id="revise-plan" type="button">Revise</button>
+          </div>
+        </section>
+
+        <div class="action-grouping">
+          <div class="control-row">
+            <button id="steer-task" type="button">🎯 Steer Work</button>
+          </div>
+          <div class="control-row">
+            <button id="stop-task" type="button">⏸ Pause / Stop</button>
+            <button id="resume-task" type="button">▶ Resume</button>
+            <button id="refresh-state" type="button">🔄 Refresh</button>
+          </div>
+        </div>
+
+        <div id="attention-tasks-container" class="dashboard-cards-grid"></div>
+        <div id="queued-prompts-container" class="dashboard-card" style="display: none;"></div>
+
+        <div class="recent-tasks-section">
+          <div class="sub-panel-title">All Workspace Tasks</div>
+          <div id="recent-tasks-list" class="recent-tasks-list">
+            <div class="empty">Loading...</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Upgraded Activity Panel -->
+      <section class="activity-panel">
+        <div class="sub-panel-title" style="margin-bottom: 8px;">Activity Panel</div>
+        <div class="tab-header">
+          <button class="tab-btn active" data-tab="tab-output">Output</button>
+          <button class="tab-btn" data-tab="tab-walkthrough">Walkthrough</button>
+          <button class="tab-btn" data-tab="tab-files">Files</button>
+          <button class="tab-btn" data-tab="tab-tests">Tests</button>
+          <button class="tab-btn" data-tab="tab-launch">Launch</button>
+        </div>
+        <div class="tab-content">
+          <div id="tab-output" class="tab-pane active">Latest output will appear here.</div>
+          <div id="tab-walkthrough" class="tab-pane">No walkthrough yet.</div>
+          <div id="tab-files" class="tab-pane">No changed files.</div>
+          <div id="tab-tests" class="tab-pane">No test results.</div>
+          <div id="tab-launch" class="tab-pane">
+            <div id="launch-url-container" style="margin-bottom: 8px; font-weight: 600;">No app launch URL recorded.</div>
+            <pre id="launch-logs-container" class="terminal-logs">No launch logs yet.</pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="chat-section">
+        <div class="sub-panel-title" style="margin-bottom: 8px;">Conversation History</div>
+        <div class="messages" id="messages"><div class="empty">Loading conversation...</div></div>
+      </section>
+
+      <!-- Hidden deprecated elements to maintain compatibility/avoid query errors -->
+      <div style="display:none;">
+        <select id="conversation-select"></select>
+        <button id="new-task-dup"></button>
+        <div id="queue-line"></div>
+        <div id="latest-output"></div>
+        <div id="preview-panel"></div>
+        <div id="tasks"></div>
+      </div>
     </main>
   </div>
   <form id="prompt-form"><div class="composer"><textarea id="prompt" placeholder="Ask Orion..." autocomplete="off" rows="2"></textarea><button class="send-button" id="send" type="submit">Send</button></div></form>
@@ -448,12 +751,12 @@ function companionHtml(pairingCode) {
     const sessionKey = 'orionPhoneCompanionSession';
     let deviceSession = null;
     try { deviceSession = JSON.parse(localStorage.getItem(sessionKey) || 'null'); } catch (e) { deviceSession = null; }
+    
     const messagesEl = document.getElementById('messages');
     const metaEl = document.getElementById('meta');
     const modelEl = document.getElementById('model');
     const statusEl = document.getElementById('status');
     const statusPillEl = document.getElementById('status-pill');
-    const installTipEl = document.getElementById('install-tip');
     const planPanelEl = document.getElementById('plan-panel');
     const approvePlanEl = document.getElementById('approve-plan');
     const denyPlanEl = document.getElementById('deny-plan');
@@ -463,50 +766,210 @@ function companionHtml(pairingCode) {
     const resumeTaskEl = document.getElementById('resume-task');
     const newTaskEl = document.getElementById('new-task');
     const steerTaskEl = document.getElementById('steer-task');
-    const conversationSelectEl = document.getElementById('conversation-select');
-    const previewPanelEl = document.getElementById('preview-panel');
-    const tasksEl = document.getElementById('tasks');
-    const queueLineEl = document.getElementById('queue-line');
-    const latestOutputEl = document.getElementById('latest-output');
+    
+    // New Console elements
+    const globalIndicatorBanner = document.getElementById('global-indicator-banner');
+    const activeTaskContainer = document.getElementById('active-task-container');
+    const attentionTasksContainer = document.getElementById('attention-tasks-container');
+    const queuedPromptsContainer = document.getElementById('queued-prompts-container');
+    const recentTasksList = document.getElementById('recent-tasks-list');
+    
+    const installTipEl = document.getElementById('install-tip');
     const form = document.getElementById('prompt-form');
-    const promptEl = document.getElementById('prompt');
-    const sendEl = document.getElementById('send');
+    
     let lastSignature = '';
+    
     function escapeHtml(value) { return String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch])); }
-    function taskClass(status) { return String(status || '').replace(/[^a-z0-9_-]/gi, '-').toLowerCase(); }
+    
+    async function switchTask(taskId) {
+      if (!taskId) return;
+      statusEl.textContent = 'Switching console view...';
+      try {
+        const res = await companionFetch('/api/conversations/switch', { method:'POST', body: JSON.stringify({ conversationId: taskId }) });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Switch failed');
+        await loadState();
+      } catch (error) {
+        statusEl.textContent = error.message;
+      }
+    }
+    window.switchTask = switchTask;
+
     async function loadState() {
       try {
         if (!deviceSession) {
-          statusEl.textContent = 'Pair this phone from Orion desktop approval.';
+          statusEl.textContent = 'Pairing with Orion...';
           statusPillEl.textContent = 'Pairing';
-          return;
+          const pairResult = await pairIfNeeded();
+          if (!pairResult.success) {
+            statusPillEl.textContent = 'Pairing';
+            if (!pairResult.pending) {
+              statusEl.innerHTML = 'Pairing denied. <button class="btn-sm" onclick="location.reload()">Retry Pairing</button>';
+              clearInterval(statePollInterval);
+            }
+            return;
+          }
         }
         const res = await companionFetch('/api/state');
+        if (res.status === 401) {
+          localStorage.removeItem(sessionKey);
+          deviceSession = null;
+          statusEl.textContent = 'Session invalid or revoked. Re-pairing...';
+          setTimeout(() => { location.reload(); }, 1500);
+          return;
+        }
         const state = await res.json();
         if (!state.success) throw new Error(state.error || 'Failed to load state');
+        
         metaEl.textContent = state.title || 'No active conversation';
         modelEl.textContent = state.model || '-';
         statusPillEl.textContent = state.running ? 'Working' : 'Ready';
         statusPillEl.classList.toggle('running', !!state.running);
         statusEl.textContent = state.subStatus || state.workspace || '';
-        queueLineEl.textContent = state.queuedPrompts ? (state.queuedPrompts + ' queued prompt(s): ' + (state.queuedPromptPreview || []).join(' | ')) : '';
-        latestOutputEl.textContent = state.latestOutput || 'Latest output will appear here.';
+        
         planPanelEl.classList.toggle('visible', !!state.awaitingPlanApproval);
-        conversationSelectEl.innerHTML = Array.isArray(state.conversations) && state.conversations.length ? state.conversations.map(conv => '<option value="' + escapeHtml(conv.id) + '"' + (conv.active ? ' selected' : '') + '>' + escapeHtml(conv.title || conv.id) + '</option>').join('') : '<option>No conversations</option>';
+        
+        // 1. Render Globally Running / View Indicator
+        const viewingId = state.conversationId;
+        const runningId = state.runningConversationId;
+        const globalRunning = !!state.globalRunning;
+
+        if (globalRunning) {
+          if (viewingId === runningId) {
+            globalIndicatorBanner.className = 'indicator-banner active-running';
+            globalIndicatorBanner.innerHTML = '<span>⚡ Viewing Globally Running Task</span>';
+          } else {
+            const runningTaskObj = (state.conversations || []).find(c => c.id === runningId);
+            const runningTitle = runningTaskObj ? runningTaskObj.title : 'Another Task';
+            globalIndicatorBanner.className = 'indicator-banner background-running';
+            globalIndicatorBanner.innerHTML = '<span>⚠️ Running: <strong>' + escapeHtml(runningTitle) + '</strong></span><button onclick="switchTask(\\\'' + escapeHtml(runningId) + '\\\')">Switch View</button>';
+          }
+        } else {
+          globalIndicatorBanner.className = 'indicator-banner idle';
+          globalIndicatorBanner.innerHTML = '<span>💤 Agent is currently idle</span>';
+        }
+
+        // 2. Render Active Task Card
+        const activeConv = (state.conversations || []).find(c => c.id === viewingId);
+        if (activeConv) {
+          const isRunning = globalRunning && runningId === viewingId;
+          const statusText = isRunning ? 'Running' : (activeConv.awaitingPlanApproval ? 'Needs Attention' : 'Idle');
+          const badgeClass = isRunning ? 'success' : (activeConv.awaitingPlanApproval ? 'warning' : 'muted');
+          
+          activeTaskContainer.innerHTML = \`
+            <div class="card-header">
+              <span class="sub-panel-title">Current Task View</span>
+              <div style="display:flex; gap:6px;">
+                <span class="badge \${badgeClass} \${isRunning ? 'pulse' : ''}">\${statusText}</span>
+                <span class="badge active-view">Viewing</span>
+              </div>
+            </div>
+            <div class="card-title">\${escapeHtml(activeConv.title)}</div>
+            <div class="substatus-text">\${escapeHtml(state.subStatus || state.workspace || '')}</div>
+          \`;
+        } else {
+          activeTaskContainer.innerHTML = '<div class="empty">No task selected</div>';
+        }
+
+        // 3. Needs Attention / Plan Waiting Tasks
+        const attentionTasks = (state.conversations || []).filter(c => c.awaitingPlanApproval);
+        if (attentionTasks.length > 0) {
+          attentionTasksContainer.innerHTML = attentionTasks.map(c => {
+            const isViewing = c.id === viewingId;
+            return '<div class="dashboard-card attention-card">' +
+              '<div class="card-header">' +
+                '<span class="badge warning">Plan Awaiting Approval</span>' +
+                (isViewing ? '<span class="badge active-view">Viewing</span>' : '') +
+              '</div>' +
+              '<div class="card-title">' + escapeHtml(c.title) + '</div>' +
+              '<div class="card-actions" style="margin-top: 8px;">' +
+                (isViewing ? '' : '<button class="btn-sm" onclick="switchTask(\\\'' + escapeHtml(c.id) + '\\\')">Switch to Approve</button>') +
+              '</div>' +
+            '</div>';
+          }).join('');
+        } else {
+          attentionTasksContainer.innerHTML = '';
+        }
+
+        // 4. Queued Prompts
+        if (state.queuedPrompts > 0) {
+          queuedPromptsContainer.innerHTML = \`
+            <div class="sub-panel-title">Queued Prompts (\${state.queuedPrompts})</div>
+            <div class="queued-list">
+              \${(state.queuedPromptPreview || []).map(p => '<div class="queued-item">⏳ ' + escapeHtml(p) + '</div>').join('')}
+            </div>
+          \`;
+          queuedPromptsContainer.style.display = 'block';
+        } else {
+          queuedPromptsContainer.style.display = 'none';
+        }
+
+        // 5. Recent Tasks List
+        if (state.conversations && state.conversations.length > 0) {
+          recentTasksList.innerHTML = state.conversations.map(c => {
+            const isViewing = c.id === viewingId;
+            const isRunning = globalRunning && c.id === runningId;
+            const isAwaiting = !!c.awaitingPlanApproval;
+            
+            let badgesHtml = '';
+            if (isViewing) badgesHtml += '<span class="badge active-view" style="margin-left:4px;">Viewing</span>';
+            if (isRunning) badgesHtml += '<span class="badge success pulse" style="margin-left:4px;">Running</span>';
+            if (isAwaiting) badgesHtml += '<span class="badge warning" style="margin-left:4px;">Attention</span>';
+            if (!isViewing && !isRunning && !isAwaiting) badgesHtml += '<span class="badge muted" style="margin-left:4px;">Ready</span>';
+
+            const timeText = new Date(c.updatedAt || 0).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+            return '<div class="task-row' + (isViewing ? ' active-row' : '') + '" onclick="switchTask(\\\'' + escapeHtml(c.id) + '\\\')">' +
+              '<div class="task-row-left" style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding-right:8px;">' +
+                '<div class="task-row-title" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + escapeHtml(c.title) + '</div>' +
+                '<div class="task-row-meta">Updated: ' + timeText + ' • ' + c.taskCount + ' items</div>' +
+              '</div>' +
+              '<div class="task-row-right" style="display:flex; align-items:center;">' +
+                badgesHtml +
+              '</div>' +
+            '</div>';
+          }).join('');
+        } else {
+          recentTasksList.innerHTML = '<div class="empty">No tasks in workspace.</div>';
+        }
+
+        // 6. Upgraded Activity Tab Content
         const preview = state.preview || {};
-        previewPanelEl.innerHTML = [
-          ['Latest', preview.latestAssistantOutput || 'No assistant output yet.'],
-          ['Walkthrough', preview.workWalkthrough || 'No walkthrough yet.'],
-          ['Files', Array.isArray(preview.changedFiles) && preview.changedFiles.length ? preview.changedFiles.join('\\n') : 'No changed files recorded.'],
-          ['Tests', Array.isArray(preview.testResults) && preview.testResults.length ? preview.testResults.join('\\n---\\n') : 'No test results recorded.'],
-          ['Launch', preview.appLaunchUrl || 'No app launch URL recorded.']
-        ].map(item => '<div><div class="panel-title">' + escapeHtml(item[0]) + '</div><div class="preview-item">' + escapeHtml(item[1]) + '</div></div>').join('');
-        tasksEl.innerHTML = Array.isArray(state.tasks) && state.tasks.length ? state.tasks.map(task => '<span class="task-chip ' + taskClass(task.status) + '">' + escapeHtml(task.title || 'Task') + '</span>').join('') : '';
-        const signature = JSON.stringify({ running: state.running, subStatus: state.subStatus, plan: state.awaitingPlanApproval, tasks: state.tasks, messages: state.messages });
+        document.getElementById('tab-output').textContent = preview.latestAssistantOutput || 'No assistant output yet.';
+        
+        const walkthroughPane = document.getElementById('tab-walkthrough');
+        walkthroughPane.textContent = preview.workWalkthrough || 'No walkthrough yet.';
+
+        const filesPane = document.getElementById('tab-files');
+        if (Array.isArray(preview.changedFiles) && preview.changedFiles.length) {
+          filesPane.innerHTML = preview.changedFiles.map(f => '<div style="margin-bottom:4px; font-family: monospace; font-size: 0.72rem;">📄 ' + escapeHtml(f) + '</div>').join('');
+        } else {
+          filesPane.textContent = 'No changed files recorded.';
+        }
+
+        const testsPane = document.getElementById('tab-tests');
+        if (Array.isArray(preview.testResults) && preview.testResults.length) {
+          testsPane.innerHTML = preview.testResults.map(r => '<div class="test-result-block" style="font-family: monospace; white-space: pre-wrap;">' + escapeHtml(r) + '</div>').join('');
+        } else {
+          testsPane.textContent = 'No test results recorded.';
+        }
+
+        const launchUrlContainer = document.getElementById('launch-url-container');
+        if (preview.appLaunchUrl) {
+          launchUrlContainer.innerHTML = '🚀 <strong>Launch URL:</strong> <a href="' + escapeHtml(preview.appLaunchUrl) + '" target="_blank" style="color:var(--accent); text-decoration:underline;">' + escapeHtml(preview.appLaunchUrl) + '</a>';
+        } else {
+          launchUrlContainer.textContent = 'No app launch URL recorded.';
+        }
+
+        const launchLogsContainer = document.getElementById('launch-logs-container');
+        launchLogsContainer.textContent = preview.appLaunchLogs || 'No launch logs yet.';
+
+        // 7. Render Messages Feed
+        const signature = JSON.stringify({ running: state.running, subStatus: state.subStatus, plan: state.awaitingPlanApproval, conversations: state.conversations, messages: state.messages });
         if (signature !== lastSignature) {
           lastSignature = signature;
           messagesEl.innerHTML = !state.messages || state.messages.length === 0 ? '<div class="empty">No messages yet.</div>' : state.messages.map(msg => '<div class="message ' + escapeHtml(msg.role) + '"><span class="role">' + escapeHtml(msg.role) + '</span>' + escapeHtml(msg.text) + '</div>').join('');
-          window.scrollTo(0, document.body.scrollHeight);
+          messagesEl.scrollTop = messagesEl.scrollHeight;
         }
       } catch (error) {
         statusEl.textContent = error.message;
@@ -514,6 +977,7 @@ function companionHtml(pairingCode) {
         statusPillEl.classList.remove('running');
       }
     }
+    
     approvePlanEl.addEventListener('click', async () => {
       approvePlanEl.disabled = true;
       statusEl.textContent = 'Starting approved plan...';
@@ -543,15 +1007,9 @@ function companionHtml(pairingCode) {
       await loadState();
     });
     refreshStateEl.addEventListener('click', loadState);
-    conversationSelectEl.addEventListener('change', async () => {
-      if (!conversationSelectEl.value) return;
-      const res = await companionFetch('/api/conversations/switch', { method:'POST', body: JSON.stringify({ conversationId: conversationSelectEl.value }) });
-      const data = await res.json();
-      if (!data.success) statusEl.textContent = data.error || 'Switch failed';
-      await loadState();
-    });
     newTaskEl.addEventListener('click', async () => {
       const prompt = window.prompt('Start a new Orion task:', '');
+      if (prompt === null) return;
       const res = await companionFetch('/api/conversations/new', { method:'POST', body: JSON.stringify({ prompt: prompt || '' }) });
       const data = await res.json();
       if (!data.success) statusEl.textContent = data.error || 'New task failed';
@@ -595,23 +1053,36 @@ function companionHtml(pairingCode) {
     });
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
-      const prompt = promptEl.value.trim();
+      const prompt = document.getElementById('prompt').value.trim();
       if (!prompt) return;
-      sendEl.disabled = true;
+      document.getElementById('send').disabled = true;
       statusEl.textContent = 'Sending...';
       try {
         const res = await companionFetch('/api/prompt', { method: 'POST', body: JSON.stringify({ prompt }) });
         const data = await res.json();
         if (!data.success) throw new Error(data.error || 'Send failed');
-        promptEl.value = '';
+        document.getElementById('prompt').value = '';
         await loadState();
       } catch (error) {
         statusEl.textContent = error.message;
       } finally {
-        sendEl.disabled = false;
+        document.getElementById('send').disabled = false;
       }
     });
-    promptEl.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); form.requestSubmit(); } });
+    document.getElementById('prompt').addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); form.requestSubmit(); } });
+    
+    // Wire tab clicks
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const parent = btn.closest('.activity-panel');
+        parent.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        parent.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+        btn.classList.add('active');
+        const targetId = btn.getAttribute('data-tab');
+        document.getElementById(targetId).classList.add('active');
+      });
+    });
+
     window.addEventListener('beforeinstallprompt', event => { event.preventDefault(); installTipEl.classList.add('visible'); installTipEl.textContent = 'This companion is installable. Open your browser menu and choose Install app or Add to Home Screen.'; });
     async function companionFetch(url, options = {}) {
       const headers = Object.assign({ 'Content-Type': 'application/json' }, options.headers || {});
@@ -621,23 +1092,34 @@ function companionHtml(pairingCode) {
       }
       return fetch(url, Object.assign({}, options, { headers }));
     }
+    let isPairing = false;
     async function pairIfNeeded() {
-      if (deviceSession) return true;
+      if (deviceSession) return { success: true };
+      if (isPairing) return { success: false, pending: true };
+      isPairing = true;
       const code = new URLSearchParams(location.search).get('pair') || pairingCode;
       const name = (navigator.userAgent || 'Phone').slice(0, 64);
-      const res = await fetch('/api/pair', { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ pairingCode: code, deviceName: name }) });
-      const data = await res.json();
-      if (!data.success) {
-        statusEl.textContent = data.error || 'Pairing pending or denied';
-        return false;
+      try {
+        const res = await fetch('/api/pair', { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ pairingCode: code, deviceName: name }) });
+        const data = await res.json();
+        if (!data.success) {
+          statusEl.textContent = data.error || 'Pairing pending or denied';
+          return { success: false, pending: data.pending !== false };
+        }
+        deviceSession = { deviceId: data.device.id, secret: data.sessionSecret };
+        localStorage.setItem(sessionKey, JSON.stringify(deviceSession));
+        statusEl.textContent = 'Connected';
+        return { success: true };
+      } catch (err) {
+        statusEl.textContent = 'Connection error: ' + err.message;
+        return { success: false, pending: true };
+      } finally {
+        isPairing = false;
       }
-      deviceSession = { deviceId: data.device.id, secret: data.sessionSecret };
-      localStorage.setItem(sessionKey, JSON.stringify(deviceSession));
-      return true;
     }
     if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
-    pairIfNeeded().then(loadState);
-    setInterval(loadState, 1500);
+    loadState();
+    const statePollInterval = setInterval(loadState, 1500);
   </script>
 </body>
 </html>`;
@@ -692,14 +1174,44 @@ function runGitCommand(cwd, args, timeoutMs = 30000) {
   });
 }
 
+let lastLaunchLogs = '';
+
+function appendLaunchLog(data) {
+  lastLaunchLogs += data;
+  if (lastLaunchLogs.length > 50000) {
+    lastLaunchLogs = lastLaunchLogs.slice(-20000);
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.executeJavaScript(`window.lastLaunchLogs = ${JSON.stringify(lastLaunchLogs)}`).catch(() => {});
+  }
+}
+
 function spawnInternalCommand(workspacePath, executable, args = []) {
   if (!executable) throw new Error('Missing executable');
+  lastLaunchLogs = '';
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.executeJavaScript(`window.lastLaunchLogs = ''; window.lastLaunchUrl = '';`).catch(() => {});
+  }
   const child = spawn(executable, args, {
     cwd: workspacePath,
     env: { ...process.env, PAGER: 'cat' },
     windowsHide: true,
     detached: true,
-    stdio: 'ignore'
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  child.stdout.on('data', data => {
+    const text = data.toString();
+    appendLaunchLog(text);
+    const match = text.match(/https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0):\d+/i);
+    if (match) {
+      const url = match[0];
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.executeJavaScript(`window.lastLaunchUrl = ${JSON.stringify(url)}`).catch(() => {});
+      }
+    }
+  });
+  child.stderr.on('data', data => {
+    appendLaunchLog(data.toString());
   });
   child.unref();
   return child;
@@ -762,14 +1274,16 @@ function startPhoneCompanionServer() {
         }
         const deviceName = String(body.deviceName || 'Phone').slice(0, 80);
         let approved = false;
+        let pending = false;
         try {
           const approval = await callRendererFunction('approvePhoneCompanionPairing', { deviceName });
           approved = approval && approval.approved !== false;
+          pending = approval && approval.pending === true;
         } catch (e) {
           approved = false;
         }
         if (!approved) {
-          sendJson(res, 403, { success: false, error: 'Desktop approval required' });
+          sendJson(res, 403, { success: false, error: pending ? 'Desktop approval required' : 'Pairing denied', pending });
           return;
         }
         const writableConfig = readAppConfig();
@@ -941,6 +1455,19 @@ ipcMain.handle('get-phone-companion-pairing', async () => {
 
 ipcMain.handle('enable-phone-companion-lan', async () => {
   return await enablePhoneCompanionLanMode();
+});
+
+ipcMain.handle('get-phone-companion-devices', async () => {
+  const config = readAppConfig();
+  return getCompanionDevices(config).map(companionDevicePublic);
+});
+
+ipcMain.handle('revoke-phone-companion-device', async (event, deviceId) => {
+  const config = readAppConfig();
+  const devices = getCompanionDevices(config).map(d => d.id === deviceId ? { ...d, revoked: true } : d);
+  config.phoneCompanionDevices = devices;
+  writeAppConfig(config);
+  return { success: true, revoked: deviceId };
 });
 
 async function getPhoneCompanionPairingPayload() {
@@ -1815,6 +2342,285 @@ ipcMain.handle('kill-commands-for-conversation', (event, conversationId) => {
   return { success: true, killed };
 });
 
+// --- LOCAL SEMANTIC CODEBASE INDEXING (RAG) SYSTEM ---
+function chunkText(text, maxChunkSize = 1200, overlap = 150) {
+  const lines = text.split(/\r?\n/);
+  const chunks = [];
+  let currentChunk = [];
+  let currentLength = 0;
+  let startLine = 1;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    currentChunk.push(line);
+    currentLength += line.length + 1;
+
+    if (currentLength >= maxChunkSize) {
+      chunks.push({
+        text: currentChunk.join('\n'),
+        startLine: startLine,
+        endLine: i + 1
+      });
+      const backtrackLines = Math.min(currentChunk.length - 1, Math.ceil(overlap / 50));
+      currentChunk = currentChunk.slice(-backtrackLines);
+      currentLength = currentChunk.join('\n').length + 1;
+      startLine = i + 1 - backtrackLines + 1;
+    }
+  }
+
+  if (currentChunk.length > 0) {
+    chunks.push({
+      text: currentChunk.join('\n'),
+      startLine: startLine,
+      endLine: lines.length
+    });
+  }
+  return chunks;
+}
+
+function cosineSimilarity(vecA, vecB) {
+  if (!vecA || !vecB || vecA.length !== vecB.length) return 0;
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < vecA.length; i++) {
+    dotProduct += vecA[i] * vecB[i];
+    normA += vecA[i] * vecA[i];
+    normB += vecB[i] * vecB[i];
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+async function getGeminiEmbedding(text, apiKey) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${apiKey}`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: "models/text-embedding-004",
+      content: { parts: [{ text }] }
+    })
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Embedding API returned HTTP ${response.status}: ${errorText}`);
+  }
+  const data = await response.json();
+  if (!data.embedding || !data.embedding.values) {
+    throw new Error('Embedding values missing in API response');
+  }
+  return data.embedding.values;
+}
+
+function listFilesRecursive(dirPath) {
+  const getFiles = (dir, rootDir) => {
+    let results = [];
+    if (!fs.existsSync(dir)) return results;
+    const list = fs.readdirSync(dir);
+    list.forEach((file) => {
+      const filePath = path.join(dir, file);
+      const stat = fs.statSync(filePath);
+      const relPath = path.relative(rootDir, filePath);
+      
+      if (file === 'node_modules' || file === '.git' || file === 'dist' || file === '.gemini' || file === 'build') {
+        return;
+      }
+      
+      if (stat.isDirectory()) {
+        results.push({ name: file, path: relPath, isDir: true });
+        results = results.concat(getFiles(filePath, rootDir));
+      } else {
+        results.push({ name: file, path: relPath, isDir: false, size: stat.size });
+      }
+    });
+    return results;
+  };
+  return getFiles(dirPath, dirPath);
+}
+
+const activeWorkspaceIndices = {};
+async function runBackgroundIndexing(workspacePath, apiKey) {
+  if (activeWorkspaceIndices[workspacePath]?.status === 'indexing') {
+    return;
+  }
+  
+  activeWorkspaceIndices[workspacePath] = { status: 'indexing', progress: 0, total: 0 };
+  updateRagStatusInRenderer(workspacePath, 'Scanning...');
+
+  try {
+    const files = listFilesRecursive(workspacePath);
+    const indexableFiles = files.filter(f => {
+      if (f.isDir) return false;
+      const ext = path.extname(f.name).toLowerCase();
+      const codeExtensions = ['.js', '.jsx', '.ts', '.tsx', '.py', '.html', '.css', '.json', '.md', '.txt', '.java', '.cpp', '.h', '.c', '.go', '.rs', '.sh', '.bat', '.env', '.yml', '.yaml'];
+      return codeExtensions.includes(ext);
+    });
+
+    const indexDir = path.join(app.getPath('userData'), 'orion-embeddings');
+    if (!fs.existsSync(indexDir)) {
+      fs.mkdirSync(indexDir, { recursive: true });
+    }
+    const indexFilename = crypto.createHash('sha256').update(workspacePath).digest('hex') + '.json';
+    const indexPath = path.join(indexDir, indexFilename);
+
+    let indexData = { workspace: workspacePath, files: {}, chunks: [] };
+    if (fs.existsSync(indexPath)) {
+      try {
+        indexData = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+      } catch (e) {
+        indexData = { workspace: workspacePath, files: {}, chunks: [] };
+      }
+    }
+
+    const relativePaths = new Set(indexableFiles.map(f => f.path));
+    let indexChanged = false;
+    for (const relPath of Object.keys(indexData.files)) {
+      if (!relativePaths.has(relPath)) {
+        delete indexData.files[relPath];
+        indexData.chunks = indexData.chunks.filter(c => c.path !== relPath);
+        indexChanged = true;
+      }
+    }
+
+    const filesToEmbed = [];
+    indexableFiles.forEach(f => {
+      const fullPath = path.join(workspacePath, f.path);
+      if (!fs.existsSync(fullPath)) return;
+      const content = fs.readFileSync(fullPath, 'utf8');
+      const hash = crypto.createHash('md5').update(content).digest('hex');
+      const existingFile = indexData.files[f.path];
+
+      if (!existingFile || existingFile.hash !== hash) {
+        filesToEmbed.push({ relPath: f.path, fullPath, content, hash });
+      }
+    });
+
+    if (filesToEmbed.length === 0) {
+      if (indexChanged) {
+        fs.writeFileSync(indexPath, JSON.stringify(indexData, null, 2), 'utf8');
+      }
+      activeWorkspaceIndices[workspacePath] = { status: 'ready', progress: indexableFiles.length, total: indexableFiles.length };
+      updateRagStatusInRenderer(workspacePath, 'Semantic Ready');
+      return;
+    }
+
+    let progress = 0;
+    const total = filesToEmbed.length;
+    activeWorkspaceIndices[workspacePath] = { status: 'indexing', progress, total };
+    updateRagStatusInRenderer(workspacePath, `Indexing (0/${total})`);
+
+    for (const file of filesToEmbed) {
+      indexData.chunks = indexData.chunks.filter(c => c.path !== file.relPath);
+      const chunks = chunkText(file.content);
+      
+      for (let idx = 0; idx < chunks.length; idx++) {
+        const chunk = chunks[idx];
+        try {
+          const vector = await getGeminiEmbedding(chunk.text, apiKey);
+          indexData.chunks.push({
+            path: file.relPath,
+            startLine: chunk.startLine,
+            endLine: chunk.endLine,
+            text: chunk.text,
+            vector
+          });
+          await new Promise(r => setTimeout(r, 100));
+        } catch (err) {
+          console.error(`Failed to embed chunk ${idx} of ${file.relPath}:`, err);
+        }
+      }
+
+      indexData.files[file.relPath] = { hash: file.hash };
+      fs.writeFileSync(indexPath, JSON.stringify(indexData, null, 2), 'utf8');
+
+      progress++;
+      activeWorkspaceIndices[workspacePath] = { status: 'indexing', progress, total };
+      updateRagStatusInRenderer(workspacePath, `Indexing (${progress}/${total})`);
+    }
+
+    activeWorkspaceIndices[workspacePath] = { status: 'ready', progress: indexableFiles.length, total: indexableFiles.length };
+    updateRagStatusInRenderer(workspacePath, 'Semantic Ready');
+
+  } catch (err) {
+    console.error('Error in background indexing:', err);
+    updateRagStatusInRenderer(workspacePath, 'Indexing Failed');
+  }
+}
+
+function updateRagStatusInRenderer(workspacePath, statusText) {
+  const windows = BrowserWindow.getAllWindows();
+  windows.forEach(win => {
+    if (!win.isDestroyed()) {
+      win.webContents.executeJavaScript(`if (window.onRagStatusChange) window.onRagStatusChange(${JSON.stringify(statusText)});`).catch(() => {});
+    }
+  });
+}
+
+ipcMain.handle('index-workspace', async (event, workspacePath) => {
+  if (!workspacePath) return { success: false, error: 'No workspace path' };
+  const config = readAppConfig();
+  const apiKey = config.geminiApiKey;
+  if (!apiKey) {
+    updateRagStatusInRenderer(workspacePath, 'Awaiting API Key');
+    return { success: false, error: 'Awaiting API Key' };
+  }
+  
+  runBackgroundIndexing(workspacePath, apiKey);
+  return { success: true };
+});
+
+ipcMain.handle('search-embeddings', async (event, { query, limit }) => {
+  try {
+    const config = readAppConfig();
+    const apiKey = config.geminiApiKey;
+    if (!apiKey) throw new Error('API key is not configured');
+    
+    const queryVector = await getGeminiEmbedding(query, apiKey);
+    
+    const windows = BrowserWindow.getAllWindows();
+    let currentWorkspacePath = '';
+    if (windows.length > 0) {
+      const activeProj = await windows[0].webContents.executeJavaScript('window.getCurrentProject ? window.getCurrentProject() : null').catch(() => null);
+      currentWorkspacePath = activeProj || '';
+    }
+    if (!currentWorkspacePath) {
+      currentWorkspacePath = config.defaultWorkspacePath || '';
+    }
+    if (!currentWorkspacePath) throw new Error('No active workspace');
+    
+    const indexDir = path.join(app.getPath('userData'), 'orion-embeddings');
+    const indexFilename = crypto.createHash('sha256').update(currentWorkspacePath).digest('hex') + '.json';
+    const indexPath = path.join(indexDir, indexFilename);
+    
+    if (!fs.existsSync(indexPath)) {
+      return { success: true, results: [], message: 'No index built yet for this workspace.' };
+    }
+    
+    const indexData = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+    const chunks = indexData.chunks || [];
+    
+    const scoredChunks = chunks.map(chunk => {
+      const sim = cosineSimilarity(queryVector, chunk.vector);
+      return {
+        path: chunk.path,
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        text: chunk.text,
+        similarity: sim
+      };
+    });
+    
+    scoredChunks.sort((a, b) => b.similarity - a.similarity);
+    const topResults = scoredChunks.slice(0, parseInt(limit, 10) || 5);
+    
+    return { success: true, results: topResults };
+  } catch (err) {
+    console.error('Error searching embeddings:', err);
+    return { success: false, error: err.message };
+  }
+});
+
 if (process.env.NODE_ENV === 'test') {
   module.exports = {
     escapePowerShellSingle,
@@ -1834,7 +2640,10 @@ if (process.env.NODE_ENV === 'test') {
     buildCompanionPairingAnnouncement,
     enablePhoneCompanionLanMode,
     getPhoneCompanionPairingForTest: getPhoneCompanionPairingPayload,
-    getCompanionServer: () => companionServer
+    getCompanionServer: () => companionServer,
+    chunkText,
+    cosineSimilarity,
+    getGeminiEmbedding
   };
 }
 

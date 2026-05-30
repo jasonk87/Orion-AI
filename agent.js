@@ -107,6 +107,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const workspacePath = conversation.workspace || window.getCurrentWorkspace();
   const promptSource = options.source || 'user';
   const isInternalPrompt = !!options.internalPrompt || promptSource === 'followup' || promptSource === 'system' || promptSource === 'plan-approval';
+  
+  if (!isInternalPrompt && !conversation.awaitingPlanApproval) {
+    conversation.planApproved = false;
+  }
+
   const promptForModel = isInternalPrompt
     ? `[ORION INTERNAL FOLLOW-UP - not a user message]\n${userPrompt}\n\nContinue from the saved conversation/task state. Do not quote this as something the user said.`
     : userPrompt;
@@ -193,6 +198,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       conversation.planApproved = true;
       conversation.awaitingPlanApproval = false;
       window.appendSystemMessage("Plan approved. Continuing implementation.");
+      if (window.saveConversationsToStorage) {
+        window.saveConversationsToStorage();
+      }
     }
 
     if (approvalIntent.intent === 'deny') {
@@ -766,6 +774,13 @@ async function executeTool(name, args, workspace, config, conversation) {
     case 'list_files': {
       const files = await window.api.listFiles(workspace);
       return files.map(f => ({ path: f.path, isDir: f.isDir, size: f.size }));
+    }
+
+    case 'search_embeddings': {
+      if (!args.query) throw new Error("Missing 'query' parameter");
+      const result = await window.api.searchEmbeddings(args.query, args.limit);
+      if (!result.success) throw new Error(result.error || 'Semantic search failed');
+      return result;
     }
     
     case 'read_file': {
@@ -2201,7 +2216,18 @@ async function callOllamaAPI(messages, modelName, onWarning) {
                 }
               }
             },
-            required: ["tasks"]
+          }
+        },
+        {
+          name: "search_embeddings",
+          description: "Searches the workspace files semantically using vector embeddings of code chunks. Returns the most relevant code snippets with line numbers and file paths.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              query: { type: "STRING", description: "The semantic search query, e.g. 'how is configuration loaded'" },
+              limit: { type: "NUMBER", description: "Optional maximum number of results to return. Defaults to 5." }
+            },
+            required: ["query"]
           }
         }
       ]
@@ -2597,6 +2623,18 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning) {
                 }
               },
               required: ["tasks"]
+            }
+          },
+          {
+            name: "search_embeddings",
+            description: "Searches the workspace files semantically using vector embeddings of code chunks. Returns the most relevant code snippets with line numbers and file paths.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                query: { type: "STRING", description: "The semantic search query, e.g. 'how is configuration loaded'" },
+                limit: { type: "NUMBER", description: "Optional maximum number of results to return. Defaults to 5." }
+              },
+              required: ["query"]
             }
           }
         ]

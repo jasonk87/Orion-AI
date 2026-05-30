@@ -445,6 +445,10 @@ async function syncWorkspaceFiles() {
   el.fileTree.innerHTML = '<p class="empty-state">Scanning directory...</p>';
   loadWorkspaceEntrypoint();
   
+  if (window.api && typeof window.api.indexWorkspace === 'function') {
+    window.api.indexWorkspace(currentWorkspace).catch(() => {});
+  }
+  
   const files = await window.api.listFiles(currentWorkspace);
   el.fileCountBadge.textContent = files.length;
   
@@ -1400,7 +1404,58 @@ function updatePhoneCompanionPairingPanel(payload = {}) {
       ? `${expiresText}. Desktop approval required.`
       : 'LAN companion mode is disabled by default. No localhost QR is shown for phones.';
   }
+  refreshPairedDevicesList().catch(() => {});
 }
+
+async function refreshPairedDevicesList() {
+  const listContainer = document.getElementById('paired-devices-list');
+  const sectionContainer = document.getElementById('paired-devices-section');
+  if (!listContainer || !sectionContainer || !window.api || typeof window.api.getPhoneCompanionDevices !== 'function') return;
+
+  try {
+    const devices = await window.api.getPhoneCompanionDevices();
+    if (devices && devices.length > 0) {
+      sectionContainer.style.display = 'block';
+      listContainer.innerHTML = devices.map(d => {
+        const lastSeen = d.lastSeenAt ? new Date(d.lastSeenAt).toLocaleTimeString() : 'Never';
+        const statusText = d.revoked ? 'Revoked' : 'Active';
+        const badgeClass = d.revoked ? 'fail' : 'pass';
+        
+        return `
+          <div class="device-item" style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: 6px; font-size: 0.8rem; font-family: var(--font-sans);">
+            <div style="display: flex; flex-direction: column; gap: 2px;">
+              <div style="font-weight: 600; color: var(--text-primary);">${escapeHtml(d.name)}</div>
+              <div style="font-size: 0.72rem; color: var(--text-muted);">Last seen: ${escapeHtml(lastSeen)}</div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span class="status-indicator ${badgeClass}" style="font-size: 0.65rem; padding: 2px 6px; border-radius: 4px; font-weight: 700; text-transform: uppercase;">${statusText}</span>
+              ${!d.revoked ? `<button class="btn-secondary" style="padding: 2px 6px; font-size: 0.7rem; border-color: var(--error-color); color: var(--error-color); cursor: pointer;" onclick="revokeDevice('${escapeHtml(d.id)}')">Revoke</button>` : ''}
+            </div>
+          </div>
+        `;
+      }).join('');
+    } else {
+      sectionContainer.style.display = 'none';
+    }
+  } catch (error) {
+    console.warn('Failed to fetch phone companion devices:', error);
+  }
+}
+
+window.revokeDevice = async (id) => {
+  if (confirm("Are you sure you want to revoke this paired phone's access?")) {
+    if (window.api && typeof window.api.revokePhoneCompanionDevice === 'function') {
+      await window.api.revokePhoneCompanionDevice(id);
+      await refreshPairedDevicesList();
+    }
+  }
+};
+
+setInterval(() => {
+  if (el.phoneCompanionModal && el.phoneCompanionModal.classList.contains('active')) {
+    refreshPairedDevicesList().catch(() => {});
+  }
+}, 4000);
 
 function renderSystemBubble(text) {
   if (isLegacyPhoneCompanionTokenMessage(text)) {
@@ -1747,9 +1802,11 @@ window.updateTestResultsPanel = updateTestResultsPanel;
 window.runRegressionTests = runRegressionTests;
 window.renderAiMessage = renderAiMessage;
 window.appendSystemMessage = appendSystemMessage;
+window.saveConversationsToStorage = saveConversationsToStorage;
 window.showPhoneCompanionPairingCard = showPhoneCompanionPairingCard;
 window.syncWorkspaceFiles = syncWorkspaceFiles;
 window.refreshWorkspaceEntrypoint = loadWorkspaceEntrypoint;
+
 
 window.clearActiveAiBubble = () => {
   activeAiBubble = null;
@@ -1833,19 +1890,36 @@ window.getPhoneCompanionState = (targetConversationId) => {
       workWalkthrough,
       changedFiles,
       testResults,
-      appLaunchUrl: window.lastLaunchUrl || ''
+      appLaunchUrl: window.lastLaunchUrl || '',
+      appLaunchLogs: window.lastLaunchLogs || ''
     }
   };
 };
 
+let isPairingConfirmOpen = false;
+let lastConfirmTime = 0;
 window.approvePhoneCompanionPairing = async (request) => {
+  if (isPairingConfirmOpen) {
+    return { approved: false, pending: true };
+  }
+  const now = Date.now();
+  if (now - lastConfirmTime < 5000) {
+    return { approved: false, pending: true };
+  }
+  isPairingConfirmOpen = true;
+  lastConfirmTime = now;
   const name = request && request.deviceName ? request.deviceName : 'Phone';
   let approved = true;
-  if (window.confirm) {
-    approved = window.confirm(`Allow ${name} to control Orion from Phone Companion?`);
+  try {
+    if (window.confirm) {
+      approved = window.confirm(`Allow ${name} to control Orion from Phone Companion?`);
+    }
+  } finally {
+    isPairingConfirmOpen = false;
   }
-  return { approved };
+  return { approved, pending: false };
 };
+
 
 // No longer switches desktop conversation
 window.switchPhoneCompanionConversation = async (conversationId) => {
@@ -2310,3 +2384,22 @@ function filterProjects(query) {
 
 window.renderConversationList = renderConversationList;
 window.renderProjectsList = renderProjectsList;
+
+window.onRagStatusChange = (statusText) => {
+  const badge = document.getElementById('rag-index-status');
+  if (!badge) return;
+  badge.textContent = statusText;
+  badge.style.display = statusText ? 'inline-block' : 'none';
+  
+  if (statusText.startsWith('Indexing')) {
+    badge.className = 'badge warning pulse';
+  } else if (statusText === 'Semantic Ready') {
+    badge.className = 'badge success';
+  } else if (statusText === 'Awaiting API Key') {
+    badge.className = 'badge danger';
+  } else {
+    badge.className = 'badge muted';
+  }
+};
+
+window.getCurrentProject = () => currentWorkspace;

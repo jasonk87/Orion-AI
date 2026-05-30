@@ -28,6 +28,10 @@ contextBridge.exposeInMainWorld('api', {
   fetchWebPage: (url) => ipcRenderer.invoke('fetch-web-page', { url }),
   getPhoneCompanionPairing: () => ipcRenderer.invoke('get-phone-companion-pairing'),
   enablePhoneCompanionLan: () => ipcRenderer.invoke('enable-phone-companion-lan'),
+  getPhoneCompanionDevices: () => ipcRenderer.invoke('get-phone-companion-devices'),
+  revokePhoneCompanionDevice: (deviceId) => ipcRenderer.invoke('revoke-phone-companion-device', deviceId),
+  indexWorkspace: (workspacePath) => ipcRenderer.invoke('index-workspace', workspacePath),
+  searchEmbeddings: (query, limit) => ipcRenderer.invoke('search-embeddings', { query, limit }),
   
   // Config Controls
   readConfig: () => ipcRenderer.invoke('read-config'),
