@@ -1369,7 +1369,13 @@ function appendSystemMessage(text, options = {}) {
     renderSystemBubble(text);
   }
   if (conv) {
-    conv.messages.push({ role: 'system', text: text });
+    const sysMsg = { role: 'system', text: text };
+    if (options.source === 'plan-approval') {
+      sysMsg.source = 'plan-approval'; // Matches: role: 'system', source: 'plan-approval'
+    } else if (options.source) {
+      sysMsg.source = options.source;
+    }
+    conv.messages.push(sysMsg);
     saveConversationsToStorage();
   }
 }
@@ -2087,18 +2093,7 @@ window.approvePhoneCompanionPlan = async (targetId) => {
   conv.awaitingPlanApproval = false;
 
   const approvalText = "Plan approved via Phone Companion. Continuing implementation.";
-  // Add visible system message to conversation history
-  conv.messages.push({
-    role: 'system',
-    source: 'plan-approval',
-    text: approvalText,
-    createdAt: Date.now()
-  });
-  saveConversationsToStorage();
-
-  if (resolvedId === activeConversationId) {
-    appendSystemMessage(approvalText);
-  }
+  appendSystemMessage(approvalText, { conversationId: resolvedId, source: 'plan-approval' });
 
   const prompt = 'The implementation plan was explicitly approved via Phone Companion. Continue execution from the approved plan, update the checklist only for completed/material milestones, run verification, and provide a Work Walkthrough.';
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
@@ -2187,9 +2182,7 @@ async function approveCurrentPlanAndContinue() {
   conv.awaitingPlanApproval = false;
 
   const approvalText = "Plan approved. Continuing implementation.";
-  conv.messages.push({ role: 'system', source: 'plan-approval', text: approvalText, createdAt: Date.now() });
-  saveConversationsToStorage();
-  appendSystemMessage(approvalText);
+  appendSystemMessage(approvalText, { conversationId: activeConversationId, source: 'plan-approval' });
 
   const prompt = 'The implementation plan was explicitly approved. Continue execution from the approved plan, update the checklist only for completed/material milestones, run verification, and provide a Work Walkthrough.';
 
