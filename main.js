@@ -1662,11 +1662,14 @@ function launchCommandInWorkspace(workspacePath, command) {
 
   if (process.platform === 'win32') {
     const commandText = `Set-Location -LiteralPath '${escapePowerShellSingle(workspacePath)}'; ${command}`;
-    spawn('powershell.exe', [
+    spawn('cmd.exe', [
+      '/c',
+      'start',
+      'powershell.exe',
       '-NoExit',
       '-Command',
       commandText
-    ], { windowsHide: false, detached: true, stdio: 'ignore' });
+    ], { windowsHide: true, detached: true, stdio: 'ignore' });
   } else {
     spawn('bash', ['-lc', command], { cwd: workspacePath, detached: true, stdio: 'ignore' });
   }
