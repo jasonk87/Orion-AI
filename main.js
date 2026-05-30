@@ -1601,20 +1601,20 @@ ipcMain.handle('launch-workspace-app', async (event, workspacePath) => {
     const pythonFiles = ['main.py', 'app.py', 'index.py', 'game.py'];
     const foundPy = pythonFiles.find(f => files.includes(f));
     if (foundPy) {
-      launchInternalCommandInWorkspace(workspacePath, 'python', [foundPy]);
-      return { success: true, message: `Started Python application: "python ${foundPy}"` };
+      launchCommandInWorkspace(workspacePath, `python ${foundPy}`);
+      return { success: true, message: `Started Python application in terminal: "python ${foundPy}"` };
     }
     
     // 4. Check for Cargo.toml (Rust)
     if (files.includes('Cargo.toml')) {
-      launchInternalCommandInWorkspace(workspacePath, 'cargo', ['run']);
-      return { success: true, message: 'Started Cargo application: "cargo run"' };
+      launchCommandInWorkspace(workspacePath, 'cargo run');
+      return { success: true, message: 'Started Cargo application in terminal: "cargo run"' };
     }
     
     // 5. Check for Go files
     if (files.includes('go.mod') || files.some(f => f.endsWith('.go'))) {
-      launchInternalCommandInWorkspace(workspacePath, 'go', ['run', '.']);
-      return { success: true, message: 'Started Go application: "go run ."' };
+      launchCommandInWorkspace(workspacePath, 'go run .');
+      return { success: true, message: 'Started Go application in terminal: "go run ."' };
     }
     
     return { success: false, error: 'Could not auto-detect a runnable entry point (index.html, package.json, main.py, Cargo.toml, etc.).' };
