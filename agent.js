@@ -221,15 +221,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             text: `[SYSTEM: The user attempted to approve the plan, but it is structurally invalid or missing. It must have a '## Testing Plan' section. Please update implementation_plan.md with this section now.]`
           }]
         });
-      }
-
-      conversation.planApproved = true;
-      conversation.awaitingPlanApproval = false;
-      if (window.appendSystemMessage) {
-        window.appendSystemMessage("Plan approved. Continuing implementation.", { conversationId: conversation.id });
-      }
-      if (window.saveConversationsToStorage) {
-        window.saveConversationsToStorage();
+      } else {
+        conversation.planApproved = true;
+        conversation.awaitingPlanApproval = false;
+        if (window.appendSystemMessage) {
+          window.appendSystemMessage("Plan approved. Continuing implementation.", { conversationId: conversation.id });
+        }
+        if (window.saveConversationsToStorage) {
+          window.saveConversationsToStorage();
+        }
       }
     }
 
