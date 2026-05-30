@@ -2086,18 +2086,18 @@ window.approvePhoneCompanionPlan = async (targetId) => {
   conv.planApproved = true;
   conv.awaitingPlanApproval = false;
 
+  const approvalText = "Plan approved via Phone Companion. Continuing implementation.";
   // Add visible system message to conversation history
   conv.messages.push({
     role: 'system',
     source: 'plan-approval',
-    text: '[Plan approval via Phone Companion] Start implementation',
+    text: approvalText,
     createdAt: Date.now()
   });
   saveConversationsToStorage();
 
   if (resolvedId === activeConversationId) {
-    appendSystemMessage("Plan approved via Phone Companion. Continuing implementation.");
-    renderSystemBubble('[Plan approval via Phone Companion] Start implementation');
+    appendSystemMessage(approvalText);
   }
 
   const prompt = 'The implementation plan was explicitly approved via Phone Companion. Continue execution from the approved plan, update the checklist only for completed/material milestones, run verification, and provide a Work Walkthrough.';
@@ -2185,13 +2185,13 @@ async function approveCurrentPlanAndContinue() {
 
   conv.planApproved = true;
   conv.awaitingPlanApproval = false;
+
+  const approvalText = "Plan approved. Continuing implementation.";
+  conv.messages.push({ role: 'system', source: 'plan-approval', text: approvalText, createdAt: Date.now() });
   saveConversationsToStorage();
-  appendSystemMessage("Plan approved. Continuing implementation.");
+  appendSystemMessage(approvalText);
 
   const prompt = 'The implementation plan was explicitly approved. Continue execution from the approved plan, update the checklist only for completed/material milestones, run verification, and provide a Work Walkthrough.';
-  renderSystemBubble('[Plan approval] Start implementation');
-  conv.messages.push({ role: 'system', source: 'plan-approval', text: '[Plan approval] Start implementation', createdAt: Date.now() });
-  saveConversationsToStorage();
 
   if (window.runAgentLoop) {
     if (window.isAgentRunning && window.isAgentRunning()) {
