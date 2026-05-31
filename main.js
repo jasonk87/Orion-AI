@@ -6,6 +6,12 @@ const http = require('http');
 const os = require('os');
 const crypto = require('crypto');
 const QRCode = require('qrcode');
+const {
+  classifyCommandRequest,
+  isDestructiveCommand,
+  isIndexableWorkspaceFile,
+  resolveWorkspacePath
+} = require('./safety');
 
 let mainWindow;
 let companionServer = null;
@@ -21,17 +27,6 @@ function stopPhoneCompanionServer() {
     companionServer = null;
     server.close(() => resolve());
   });
-}
-
-function resolveWorkspacePath(workspacePath, relativePath = '') {
-  if (!workspacePath) throw new Error('Missing workspace path');
-  const workspaceRoot = path.resolve(workspacePath);
-  const fullPath = path.resolve(workspaceRoot, relativePath || '');
-  const relative = path.relative(workspaceRoot, fullPath);
-  if (relative.startsWith('..') || path.isAbsolute(relative)) {
-    throw new Error('Path escapes the active workspace');
-  }
-  return fullPath;
 }
 
 function createFileBackup(fullPath, workspaceRoot) {
@@ -170,9 +165,19 @@ app.on('window-all-closed', function () {
   if (process.platform !== 'darwin') app.quit();
 });
 
+function getConfigPath() {
+  const base = app && app.getPath ? app.getPath('userData') : __dirname;
+  return path.join(base, 'config.json');
+}
+
 function readAppConfig() {
-  const configPath = path.join(__dirname, 'config.json');
+  const configPath = getConfigPath();
+  const legacyConfigPath = path.join(__dirname, 'config.json');
   try {
+    if (!fs.existsSync(configPath) && configPath !== legacyConfigPath && fs.existsSync(legacyConfigPath)) {
+      fs.mkdirSync(path.dirname(configPath), { recursive: true });
+      fs.copyFileSync(legacyConfigPath, configPath);
+    }
     if (fs.existsSync(configPath)) {
       return JSON.parse(fs.readFileSync(configPath, 'utf8'));
     }
@@ -183,9 +188,10 @@ function readAppConfig() {
 }
 
 function writeAppConfig(config) {
-  const configPath = path.join(__dirname, 'config.json');
-  const tempPath = path.join(__dirname, 'config.tmp.json');
+  const configPath = getConfigPath();
+  const tempPath = path.join(path.dirname(configPath), 'config.tmp.json');
   try {
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
     fs.writeFileSync(tempPath, JSON.stringify(config, null, 2), 'utf8');
     fs.renameSync(tempPath, configPath);
   } catch (e) {
@@ -193,6 +199,7 @@ function writeAppConfig(config) {
     if (fs.existsSync(tempPath)) {
       try { fs.unlinkSync(tempPath); } catch(err) {}
     }
+    throw e;
   }
 }
 
@@ -1767,7 +1774,7 @@ ipcMain.handle('list-files', async (event, dirPath) => {
       
       list.forEach((file) => {
         const filePath = path.join(dir, file);
-        const stat = fs.statSync(filePath);
+        const stat = fs.lstatSync(filePath);
         const relPath = path.relative(rootDir, filePath);
         
         // Exclude common build/version control folders
@@ -1775,7 +1782,9 @@ ipcMain.handle('list-files', async (event, dirPath) => {
           return;
         }
         
-        if (stat.isDirectory()) {
+        if (stat.isSymbolicLink()) {
+          return;
+        } else if (stat.isDirectory()) {
           results.push({ name: file, path: relPath, isDir: true });
           results = results.concat(getFiles(filePath, rootDir));
         } else {
@@ -2081,6 +2090,8 @@ ipcMain.handle('fetch-web-page', async (event, { url }) => {
 let activeProcesses = {};
 let commandSessions = {};
 let commandAliases = {};
+const MAX_COMMAND_OUTPUT_CHARS = 200000;
+const MAX_COMMAND_SESSIONS = 100;
 
 function registerCommandSession(processId, session, child) {
   commandSessions[processId] = session;
@@ -2089,6 +2100,19 @@ function registerCommandSession(processId, session, child) {
   const match = processId.match(/^cmd_(conv[_-][a-zA-Z0-9_-]+)_(.+)$/);
   if (match && match[2]) {
     commandAliases[match[2]] = processId;
+  }
+}
+
+function pruneCommandSessions() {
+  const completedIds = Object.keys(commandSessions)
+    .filter(id => !activeProcesses[id])
+    .sort((a, b) => (commandSessions[a].finishedAt || commandSessions[a].startedAt) - (commandSessions[b].finishedAt || commandSessions[b].startedAt));
+  while (completedIds.length > MAX_COMMAND_SESSIONS) {
+    const id = completedIds.shift();
+    delete commandSessions[id];
+    Object.keys(commandAliases).forEach(alias => {
+      if (commandAliases[alias] === id) delete commandAliases[alias];
+    });
   }
 }
 
@@ -2133,31 +2157,6 @@ function killProcessTree(child, callback) {
     } catch (e) {}
     if (callback) callback();
   }, 1000);
-}
-
-const DESTRUCTIVE_PATTERNS = [
-  /\brm\s+-r[fF]?\b/i,          // rm -rf anywhere
-  /\bdel\s+\/s\s+\/q\b/i,       // del /s /q anywhere
-  /\bRemove-Item\s+-Recurse\b/i,// PowerShell Remove-Item -Recurse
-  /\bgit\s+reset\s+--hard\b/i,  // git reset --hard
-  /\bgit\s+clean\s+-fdx\b/i,    // git clean -fdx
-  /\bmkfs\b/i,                  // mkfs
-  /\bformat\b/i                 // format
-];
-
-function isDestructiveCommand(command) {
-  // Split commands by chaining operators to check parts, or check entire string.
-  // Actually, checking the full string is safer to catch chained destructive commands.
-  return DESTRUCTIVE_PATTERNS.some(pattern => pattern.test(command));
-}
-
-function classifyCommandRequest(command, options = {}) {
-  const text = String(command || '');
-  const source = options.source || 'freeform';
-  if (!text.trim()) return { category: source, allowed: false, reason: 'Missing command' };
-  if (source === 'internal') return { category: 'internal', allowed: true, reason: 'Internal executable/args command' };
-  if (isDestructiveCommand(text)) return { category: 'destructive', allowed: false, reason: 'Command matches destructive deny rules' };
-  return { category: 'freeform', allowed: true, reason: 'Allowed freeform terminal command' };
 }
 
 function startCommandSession({ command, cwd, processId, timeoutMs }) {
@@ -2205,6 +2204,8 @@ function startCommandSession({ command, cwd, processId, timeoutMs }) {
     } else {
       session.stdout += text;
     }
+    if (session.stdout.length > MAX_COMMAND_OUTPUT_CHARS) session.stdout = session.stdout.slice(-MAX_COMMAND_OUTPUT_CHARS);
+    if (session.stderr.length > MAX_COMMAND_OUTPUT_CHARS) session.stderr = session.stderr.slice(-MAX_COMMAND_OUTPUT_CHARS);
     mainWindow.webContents.send(`cmd-output-${processId}`, { type, text });
   };
   
@@ -2232,6 +2233,7 @@ function startCommandSession({ command, cwd, processId, timeoutMs }) {
     } else {
       session.status = code === 0 ? 'completed' : 'failed';
     }
+    pruneCommandSessions();
   });
   
   child.on('error', (err) => {
@@ -2240,6 +2242,7 @@ function startCommandSession({ command, cwd, processId, timeoutMs }) {
     session.error = err.message;
     session.finishedAt = Date.now();
     session.status = 'error';
+    pruneCommandSessions();
   });
   
   return session;
@@ -2423,14 +2426,16 @@ function listFilesRecursive(dirPath) {
     const list = fs.readdirSync(dir);
     list.forEach((file) => {
       const filePath = path.join(dir, file);
-      const stat = fs.statSync(filePath);
+      const stat = fs.lstatSync(filePath);
       const relPath = path.relative(rootDir, filePath);
       
       if (file === 'node_modules' || file === '.git' || file === 'dist' || file === '.gemini' || file === 'build') {
         return;
       }
       
-      if (stat.isDirectory()) {
+      if (stat.isSymbolicLink()) {
+        return;
+      } else if (stat.isDirectory()) {
         results.push({ name: file, path: relPath, isDir: true });
         results = results.concat(getFiles(filePath, rootDir));
       } else {
@@ -2455,9 +2460,7 @@ async function runBackgroundIndexing(workspacePath, apiKey) {
     const files = listFilesRecursive(workspacePath);
     const indexableFiles = files.filter(f => {
       if (f.isDir) return false;
-      const ext = path.extname(f.name).toLowerCase();
-      const codeExtensions = ['.js', '.jsx', '.ts', '.tsx', '.py', '.html', '.css', '.json', '.md', '.txt', '.java', '.cpp', '.h', '.c', '.go', '.rs', '.sh', '.bat', '.env', '.yml', '.yaml'];
-      return codeExtensions.includes(ext);
+      return isIndexableWorkspaceFile(f.name);
     });
 
     const indexDir = path.join(app.getPath('userData'), 'orion-embeddings');
@@ -2516,6 +2519,7 @@ async function runBackgroundIndexing(workspacePath, apiKey) {
     for (const file of filesToEmbed) {
       indexData.chunks = indexData.chunks.filter(c => c.path !== file.relPath);
       const chunks = chunkText(file.content);
+      let embeddedAllChunks = true;
       
       for (let idx = 0; idx < chunks.length; idx++) {
         const chunk = chunks[idx];
@@ -2530,11 +2534,16 @@ async function runBackgroundIndexing(workspacePath, apiKey) {
           });
           await new Promise(r => setTimeout(r, 100));
         } catch (err) {
+          embeddedAllChunks = false;
           console.error(`Failed to embed chunk ${idx} of ${file.relPath}:`, err);
         }
       }
 
-      indexData.files[file.relPath] = { hash: file.hash };
+      if (embeddedAllChunks) {
+        indexData.files[file.relPath] = { hash: file.hash };
+      } else {
+        delete indexData.files[file.relPath];
+      }
       fs.writeFileSync(indexPath, JSON.stringify(indexData, null, 2), 'utf8');
 
       progress++;
