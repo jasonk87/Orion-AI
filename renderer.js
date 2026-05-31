@@ -9,6 +9,26 @@ if (typeof marked !== 'undefined') {
   });
 }
 
+function sanitizeRenderedMarkdown(container) {
+  container.querySelectorAll('a[href]').forEach(link => {
+    const href = link.getAttribute('href') || '';
+    if (!/^(https?:|mailto:|orion-file:)/i.test(href)) {
+      link.removeAttribute('href');
+      link.removeAttribute('target');
+      link.removeAttribute('rel');
+      return;
+    }
+    if (/^https?:/i.test(href)) {
+      link.setAttribute('target', '_blank');
+      link.setAttribute('rel', 'noopener noreferrer');
+    }
+  });
+  container.querySelectorAll('img[src]').forEach(image => {
+    const src = image.getAttribute('src') || '';
+    if (!/^https?:/i.test(src)) image.removeAttribute('src');
+  });
+}
+
 // STATE MANAGEMENT
 let appConfig = {
   geminiApiKey: '',
@@ -1356,6 +1376,7 @@ function renderUserMessage(text) {
     <div class="message-header user">🧑 User</div>
     <div class="message-body">${escapeHtml(text).replace(/\n/g, '<br>')}</div>
   `;
+  sanitizeRenderedMarkdown(bubble);
   el.messagesContainer.appendChild(bubble);
   el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
 }
@@ -1649,6 +1670,7 @@ function renderAiMessage(text, logs = [], conversationId = null) {
       ${runningIndicatorHtml}
     </div>
   `;
+  sanitizeRenderedMarkdown(bubble);
   
   // Format code blocks
   if (isNew) {
@@ -1666,7 +1688,7 @@ function renderAiMessage(text, logs = [], conversationId = null) {
   if (approveButton) {
     approveButton.addEventListener('click', approveCurrentPlanAndContinue);
   }
-  Prism.highlightAllUnder(bubble);
+  if (typeof Prism !== 'undefined') Prism.highlightAllUnder(bubble);
   
   // Inject copy & edit buttons into pre blocks
   bubble.querySelectorAll('pre').forEach(pre => {
