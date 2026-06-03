@@ -5,6 +5,7 @@ const { exec, spawn } = require('child_process');
 const http = require('http');
 const os = require('os');
 const crypto = require('crypto');
+const vm = require('vm');
 const QRCode = require('qrcode');
 const {
   classifyCommandRequest,
@@ -61,7 +62,7 @@ function writeRunArtifact(payload = {}) {
   const artifactDir = path.join(getArtifactRoot(), conversationId);
   fs.mkdirSync(artifactDir, { recursive: true });
   const artifactPath = path.join(artifactDir, `${runId}.json`);
-  fs.writeFileSync(artifactPath, JSON.stringify({
+  atomicWriteFileSync(artifactPath, JSON.stringify({
     createdAt: new Date().toISOString(),
     ...payload
   }, null, 2), 'utf8');
@@ -164,6 +165,21 @@ app.on('window-all-closed', function () {
   }
   if (process.platform !== 'darwin') app.quit();
 });
+
+
+function atomicWriteFileSync(filePath, content, encoding = 'utf8') {
+  const tempPath = filePath + '.tmp';
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(tempPath, content, encoding);
+    fs.renameSync(tempPath, filePath);
+  } catch (e) {
+    if (fs.existsSync(tempPath)) {
+      try { fs.unlinkSync(tempPath); } catch(err) {}
+    }
+    throw e;
+  }
+}
 
 function getConfigPath() {
   const base = app && app.getPath ? app.getPath('userData') : __dirname;
@@ -1872,7 +1888,7 @@ ipcMain.handle('write-file', async (event, { workspacePath, relativePath, conten
     const backupPath = createFileBackup(fullPath, workspaceRoot);
     // Create folder structure if it doesn't exist
     fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-    fs.writeFileSync(fullPath, content, 'utf8');
+    atomicWriteFileSync(fullPath, content, 'utf8');
     return { success: true, backupPath };
   } catch (e) {
     console.error('Error writing file:', e);
@@ -1902,12 +1918,38 @@ function applyPatch(original, operation) {
     if (operation.replacement === undefined) throw new Error('replace_regex requires replacement');
     const flags = operation.flags || '';
     const safeFlags = Array.from(new Set(flags.replace(/[^gimsuy]/g, '').split(''))).join('');
-    const regex = new RegExp(operation.pattern, safeFlags.includes('g') ? safeFlags : safeFlags + 'g');
-    const matches = updated.match(regex);
-    const replacements = matches ? matches.length : 0;
-    updated = updated.replace(regex, operation.replacement);
-    if (replacements === 0) throw new Error('Regex pattern did not match');
-    details = { replacements };
+    const context = vm.createContext({
+      updated,
+      pattern: operation.pattern,
+      flags: safeFlags.includes('g') ? safeFlags : safeFlags + 'g',
+      replacement: operation.replacement,
+      result: null,
+      error: null
+    });
+    try {
+      vm.runInContext(`
+        try {
+          const regex = new RegExp(pattern, flags);
+          const matches = updated.match(regex);
+          const replacements = matches ? matches.length : 0;
+          const newUpdated = updated.replace(regex, replacement);
+          result = { replacements, newUpdated };
+        } catch (e) {
+          error = e.message;
+        }
+      `, context, { timeout: 250 });
+      if (context.error) throw new Error(context.error);
+      if (!context.result) throw new Error('Regex evaluation failed');
+      const { replacements, newUpdated } = context.result;
+      if (replacements === 0) throw new Error('Regex pattern did not match');
+      updated = newUpdated;
+      details = { replacements };
+    } catch (e) {
+      if (e.message.includes('timed out')) {
+        throw new Error('Regex execution timed out (possible ReDoS)');
+      }
+      throw e;
+    }
   } else if (operation.type === 'insert') {
     if (!operation.anchor) throw new Error('insert requires anchor');
     if (operation.content === undefined) throw new Error('insert requires content');
@@ -1979,7 +2021,7 @@ ipcMain.handle('patch-file', async (event, { workspacePath, relativePath, operat
     }
 
     const backupPath = createFileBackup(fullPath, workspaceRoot);
-    fs.writeFileSync(fullPath, updated, 'utf8');
+    atomicWriteFileSync(fullPath, updated, 'utf8');
     return { success: true, changed: true, message: `Patched ${relativePath} successfully.`, details, proof: buildPatchProof(original, updated), backupPath };
   } catch (e) {
     console.error('Error patching file:', e);
@@ -2504,7 +2546,7 @@ async function runBackgroundIndexing(workspacePath, apiKey) {
 
     if (filesToEmbed.length === 0) {
       if (indexChanged) {
-        fs.writeFileSync(indexPath, JSON.stringify(indexData, null, 2), 'utf8');
+        atomicWriteFileSync(indexPath, JSON.stringify(indexData, null, 2), 'utf8');
       }
       activeWorkspaceIndices[workspacePath] = { status: 'ready', progress: indexableFiles.length, total: indexableFiles.length };
       updateRagStatusInRenderer(workspacePath, 'Semantic Ready');
@@ -2544,7 +2586,7 @@ async function runBackgroundIndexing(workspacePath, apiKey) {
       } else {
         delete indexData.files[file.relPath];
       }
-      fs.writeFileSync(indexPath, JSON.stringify(indexData, null, 2), 'utf8');
+      atomicWriteFileSync(indexPath, JSON.stringify(indexData, null, 2), 'utf8');
 
       progress++;
       activeWorkspaceIndices[workspacePath] = { status: 'indexing', progress, total };
