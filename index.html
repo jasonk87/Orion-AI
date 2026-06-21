@@ -13,7 +13,7 @@
   <!-- Custom Title Bar for borderless Electron Window -->
   <header id="titlebar">
     <div class="titlebar-left">
-      <span class="app-logo">🌌</span>
+      <span class="app-logo">&#127756;</span>
       <span class="app-title">Orion AI</span>
       <span class="menu-item">File</span>
       <span class="menu-item">View</span>
@@ -36,9 +36,9 @@
     <aside id="left-sidebar">
       <div class="sidebar-top">
         <div class="sidebar-nav-actions">
-          <button id="sidebar-toggle" title="Toggle Sidebar">☰</button>
-          <button id="nav-back" title="Go Back">←</button>
-          <button id="nav-forward" title="Go Forward">→</button>
+          <button id="sidebar-toggle" title="Toggle Sidebar">&#9776;</button>
+          <button id="nav-back" title="Go Back">&#8592;</button>
+          <button id="nav-forward" title="Go Forward">&#8594;</button>
         </div>
         
         <button id="btn-new-chat" class="btn-primary">
@@ -46,8 +46,8 @@
         </button>
 
         <ul class="nav-links">
-          <li class="active" id="nav-history"><span class="icon">🕒</span> Conversation History</li>
-          <li id="nav-tasks"><span class="icon">📅</span> Scheduled Tasks</li>
+          <li class="active" id="nav-history"><span class="icon">&#128338;</span> Conversation History</li>
+          <li id="nav-tasks"><span class="icon">&#128197;</span> Scheduled Tasks</li>
         </ul>
       </div>
 
@@ -56,13 +56,13 @@
         <div class="section-header">
           <span>Projects</span>
           <div class="section-actions">
-            <button id="btn-project-filter" title="Filter Projects">🔍</button>
-            <button id="btn-add-project" title="Add Project Folder">📁</button>
+            <button id="btn-project-filter" title="Filter Projects">&#128269;</button>
+            <button id="btn-add-project" title="Add Project Folder">&#128193;</button>
           </div>
         </div>
         <div class="project-list" id="project-list">
           <div class="project-item active" id="default-proj-item">
-            <span class="folder-icon">📁</span>
+            <span class="folder-icon">&#128193;</span>
             <div class="project-details">
               <span class="project-name" id="project-name-label">Default Workspace</span>
               <span class="project-subtext" id="project-status-label">Select folder to start</span>
@@ -87,7 +87,7 @@
 
       <!-- Sidebar Footer -->
       <div class="sidebar-footer">
-        <button id="btn-settings"><span class="icon">⚙</span> Settings</button>
+        <button id="btn-settings"><span class="icon">&#9881;</span> Settings</button>
       </div>
     </aside>
 
@@ -97,16 +97,16 @@
       <div id="conversation-header">
         <div class="header-title-container">
           <span id="chat-title">New Conversation</span>
-          <span class="dropdown-arrow">▼</span>
+          <span class="dropdown-arrow">&#9660;</span>
         </div>
         
         <!-- Workspace File Bar -->
         <div class="workspace-action-bar">
           <button id="btn-change-workspace" class="btn-secondary">Change Workspace</button>
-          <button id="btn-sync-files" class="btn-secondary" title="Scan file directory">🔄 Sync Files</button>
+          <button id="btn-sync-files" class="btn-secondary" title="Scan file directory">&#128260; Sync Files</button>
           <button id="btn-phone-companion" class="btn-secondary phone-companion-button" title="Pair Phone Companion">Phone</button>
-          <button id="btn-launch-app" class="btn-secondary" title="Launch application for testing">▶ Launch</button>
-          <button id="btn-toggle-right-sidebar" class="btn-secondary" title="Toggle Agent Panel">☰ Panel</button>
+          <button id="btn-launch-app" class="btn-secondary" title="Launch application for testing">&#9654; Launch</button>
+          <button id="btn-toggle-right-sidebar" class="btn-secondary" title="Toggle Agent Panel">&#9776; Panel</button>
         </div>
       </div>
 
@@ -157,12 +157,18 @@
                   <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
                 </select>
               </div>
+              <div class="pro-toggle-container">
+                <label class="pro-toggle-label" title="Enable multi-step critical thinking, planning, and edge-case validation">
+                  <input type="checkbox" id="pro-mode-checkbox">
+                  <span>Pro Mode</span>
+                </label>
+              </div>
             </div>
             <div class="toolbar-right">
-              <button class="btn-steer" id="btn-steer" title="Send steering feedback directly to active task">🎯 Steer</button>
-              <button class="btn-queue" id="btn-queue" title="Queue this prompt to run after the active task finishes">⏳ Queue</button>
-              <button class="tool-btn mic-btn" id="btn-voice" title="Speech to text input">🎙️</button>
-              <button id="btn-submit" class="btn-send" title="Send message">✦</button>
+              <button class="btn-steer" id="btn-steer" title="Send steering feedback directly to active task">&#127919; Steer</button>
+              <button class="btn-queue" id="btn-queue" title="Queue this prompt to run after the active task finishes">&#9203; Queue</button>
+              <button class="tool-btn mic-btn" id="btn-voice" title="Speech to text input">&#127897;&#65039;</button>
+              <button id="btn-submit" class="btn-send" title="Send message">&#10022;</button>
             </div>
           </div>
         </div>
@@ -172,7 +178,7 @@
     <!-- RIGHT SIDEBAR: Task Planner and Workspace Files -->
     <aside id="right-sidebar">
       <div class="sidebar-header">
-        <h3>⚡ Agent Panel</h3>
+        <h3>&#9889; Agent Panel</h3>
       </div>
       
       <!-- Planning & Task Checklist -->

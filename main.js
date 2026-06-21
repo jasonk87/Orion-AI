@@ -331,7 +331,7 @@ function companionManifest() {
     scope: '/',
     display: 'standalone',
     background_color: '#09090d',
-    theme_color: '#8b5cf6',
+    theme_color: '#2563eb',
     orientation: 'portrait',
     icons: [
       { src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any maskable' }
@@ -360,7 +360,7 @@ function companionIconSvg() {
   <defs>
     <radialGradient id="g" cx="30%" cy="20%" r="80%">
       <stop offset="0%" stop-color="#60a5fa"/>
-      <stop offset="42%" stop-color="#8b5cf6"/>
+      <stop offset="42%" stop-color="#2563eb"/>
       <stop offset="100%" stop-color="#111827"/>
     </radialGradient>
     <filter id="s" x="-20%" y="-20%" width="140%" height="140%">
@@ -379,8 +379,8 @@ function companionHtml(pairingCode) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Orion Operator Console</title>
-  <meta name="theme-color" content="#8b5cf6">
+  <title>Orion</title>
+  <meta name="theme-color" content="#f7f7f5">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="manifest" href="/manifest.webmanifest">
@@ -394,11 +394,11 @@ function companionHtml(pairingCode) {
       --bg: #07070a;
       --panel: rgba(20, 20, 31, 0.6);
       --panel-strong: rgba(28, 28, 43, 0.85);
-      --line: rgba(167, 139, 250, 0.15);
+      --line: rgba(96, 165, 250, 0.16);
       --text: #f3f1fe;
       --muted: #9f9aa7;
-      --accent: #a78bfa;
-      --accent-strong: #8b5cf6;
+      --accent: #60a5fa;
+      --accent-strong: #2563eb;
       --success: #10b981;
       --warning: #f59e0b;
       --danger: #ef4444;
@@ -410,7 +410,7 @@ function companionHtml(pairingCode) {
     body {
       margin: 0;
       min-height: 100vh;
-      background: radial-gradient(circle at 16% -8%, rgba(96,165,250,.18), transparent 34%), radial-gradient(circle at 86% 0%, rgba(167,139,250,.16), transparent 36%), linear-gradient(180deg,#0a0a10 0%,#07070a 45%,#050508 100%);
+      background: radial-gradient(circle at 18% -10%, rgba(37,99,235,.22), transparent 34%), radial-gradient(circle at 86% 0%, rgba(14,165,233,.13), transparent 34%), linear-gradient(180deg,#090b12 0%,#07070a 45%,#050508 100%);
       overflow-x: hidden;
     }
     body::before {
@@ -441,8 +441,8 @@ function companionHtml(pairingCode) {
       border-radius: 12px;
       display: grid;
       place-items: center;
-      background: linear-gradient(145deg, #60a5fa, #8b5cf6 55%, #171827);
-      box-shadow: 0 10px 30px rgba(139,92,246,.28);
+      background: linear-gradient(145deg, #60a5fa, #2563eb 58%, #111827);
+      box-shadow: 0 10px 30px rgba(37,99,235,.26);
       font-weight: 900;
       color: #fff;
     }
@@ -515,7 +515,7 @@ function companionHtml(pairingCode) {
     .model { color: var(--text); font-weight: 700; }
     .substatus { margin-top: 8px; color: var(--accent); font-size: .76rem; min-height: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     
-    .install-tip { display: none; margin-top: 10px; padding: 9px 10px; border: 1px dashed rgba(167,139,250,.36); border-radius: 12px; color: #ddd6fe; background: rgba(167,139,250,.09); font-size: .76rem; line-height: 1.35; }
+    .install-tip { display: none; margin-top: 10px; padding: 9px 10px; border: 1px dashed rgba(96,165,250,.36); border-radius: 12px; color: #bfdbfe; background: rgba(37,99,235,.1); font-size: .76rem; line-height: 1.35; }
     .install-tip.visible { display: block; }
     
     main { position: relative; z-index: 1; padding: 14px; display: flex; flex-direction: column; gap: 16px; }
@@ -536,7 +536,7 @@ function companionHtml(pairingCode) {
     /* Dashboard and Cards */
     .dashboard-panel { display: flex; flex-direction: column; gap: 12px; }
     .panel-header-row { display: flex; align-items: center; justify-content: space-between; }
-    .sub-panel-title { font-size: .74rem; color: #c4b5fd; font-weight: 850; text-transform: uppercase; letter-spacing: .08em; }
+    .sub-panel-title { font-size: .74rem; color: #93c5fd; font-weight: 850; text-transform: uppercase; letter-spacing: .08em; }
     
     .btn-sm-primary {
       min-height: 32px;
@@ -547,9 +547,14 @@ function companionHtml(pairingCode) {
       background: var(--accent-strong);
       color: #fff;
       border: 0;
-      box-shadow: 0 4px 12px rgba(139, 92, 246, 0.2);
+      box-shadow: 0 4px 12px rgba(37, 99, 235, 0.22);
       cursor: pointer;
       font-family: inherit;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      white-space: nowrap;
+      transition: transform .16s ease, border-color .16s ease, background .16s ease, opacity .16s ease;
     }
     .btn-sm {
       min-height: 28px;
@@ -561,6 +566,11 @@ function companionHtml(pairingCode) {
       color: var(--text);
       cursor: pointer;
       font-family: inherit;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      white-space: nowrap;
+      transition: transform .16s ease, border-color .16s ease, background .16s ease, opacity .16s ease;
     }
 
     .dashboard-card {
@@ -571,7 +581,7 @@ function companionHtml(pairingCode) {
     }
     .dashboard-card.active-card {
       border-left: 4px solid var(--accent);
-      background: linear-gradient(180deg, rgba(139, 92, 246, 0.04), rgba(20, 20, 31, 0.6));
+      background: linear-gradient(180deg, rgba(37, 99, 235, 0.05), rgba(20, 20, 31, 0.6));
     }
     .dashboard-cards-grid { display: flex; flex-direction: column; gap: 8px; }
     .attention-card {
@@ -587,7 +597,7 @@ function companionHtml(pairingCode) {
     .badge.warning { background: rgba(245, 158, 11, 0.1); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.2); }
     .badge.danger { background: rgba(239, 68, 68, 0.1); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.2); }
     .badge.muted { background: rgba(255, 255, 255, 0.04); color: var(--muted); border: 1px solid rgba(255, 255, 255, 0.06); }
-    .badge.active-view { background: rgba(139, 92, 246, 0.12); color: #c4b5fd; border: 1px solid rgba(139, 92, 246, 0.2); }
+    .badge.active-view { background: rgba(37, 99, 235, 0.12); color: #93c5fd; border: 1px solid rgba(96, 165, 250, 0.22); }
     .badge.pulse { animation: status-pulse 1.8s infinite; }
     @keyframes status-pulse {
       0% { opacity: 0.6; }
@@ -630,9 +640,9 @@ function companionHtml(pairingCode) {
       font-family: inherit;
     }
     .tab-btn.active {
-      background: rgba(139, 92, 246, 0.15);
-      color: #c4b5fd;
-      border: 1px solid rgba(139, 92, 246, 0.2);
+      background: rgba(37, 99, 235, 0.15);
+      color: #93c5fd;
+      border: 1px solid rgba(96, 165, 250, 0.22);
     }
     .tab-content { position: relative; }
     .tab-pane { display: none; font-size: 0.74rem; color: var(--muted); white-space: pre-wrap; word-break: break-all; max-height: 180px; overflow-y: auto; line-height: 1.4; }
@@ -644,25 +654,487 @@ function companionHtml(pairingCode) {
     /* Action Grouping */
     .action-grouping { display: flex; flex-direction: column; gap: 8px; margin-bottom: 4px; }
     .control-row { display: flex; gap: 8px; }
-    .control-row button { flex: 1; min-height: 38px; border-radius: 12px; background: rgba(20,20,31,.6); border: 1px solid var(--line); color: var(--text); box-shadow: none; font-size: 0.8rem; font-weight: 700; cursor: pointer; }
+    .control-row button { flex: 1; min-width: 0; min-height: 38px; border-radius: 12px; background: rgba(20,20,31,.6); border: 1px solid var(--line); color: var(--text); box-shadow: none; font-size: 0.8rem; font-weight: 700; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; text-align: center; white-space: nowrap; transition: transform .16s ease, border-color .16s ease, background .16s ease, opacity .16s ease; }
     .control-row button:hover { border-color: rgba(167, 139, 250, 0.35); background: rgba(167, 139, 250, 0.04); }
     .approve-button { width: 100%; background: #f59e0b; color: #0c0c0e; font-weight: 850; box-shadow: 0 12px 26px rgba(245,158,11,.18); cursor: pointer; }
+    .project-select-panel { display: flex; flex-direction: column; gap: 8px; }
+    select {
+      width: 100%;
+      min-height: 38px;
+      border-radius: 10px;
+      border: 1px solid rgba(96,165,250,.22);
+      background: rgba(20,20,31,.9);
+      color: var(--text);
+      padding: 0 10px;
+      font: inherit;
+      font-size: .78rem;
+      outline: none;
+    }
     
     .messages { display: flex; flex-direction: column; gap: 12px; max-height: 320px; overflow-y: auto; padding-right: 4px; }
     .message { max-width: 92%; padding: 12px 13px; border: 1px solid rgba(255,255,255,.05); border-radius: 17px; line-height: 1.48; white-space: pre-wrap; word-break: break-word; background: rgba(20,20,31,.4); box-shadow: 0 12px 30px rgba(0,0,0,.12); font-size: 0.8rem; }
-    .message.user { align-self: flex-end; border-color: rgba(167,139,250,.28); background: linear-gradient(135deg, rgba(139,92,246,.15), rgba(37,34,58,.82)); }
+    .message.user { align-self: flex-end; border-color: rgba(96,165,250,.28); background: linear-gradient(135deg, rgba(37,99,235,.16), rgba(24,32,54,.84)); }
     .message.assistant { align-self: flex-start; border-color: rgba(52,211,153,.15); }
     .message.system { align-self: center; max-width: 100%; color: var(--muted); font-family: 'JetBrains Mono', monospace; font-size: .74rem; background: rgba(12,12,18,.5); }
-    .role { display: block; margin-bottom: 6px; color: #c4b5fd; font-size: .64rem; font-weight: 850; text-transform: uppercase; letter-spacing: .08em; }
+    .role { display: block; margin-bottom: 6px; color: #93c5fd; font-size: .64rem; font-weight: 850; text-transform: uppercase; letter-spacing: .08em; }
     
     form { position: fixed; z-index: 8; left: 0; right: 0; bottom: 0; padding: 12px 12px calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid rgba(255,255,255,.06); background: rgba(7,7,10,.9); backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px); }
     .composer { display: flex; gap: 10px; align-items: flex-end; }
-    textarea { width: 100%; min-height: 54px; max-height: 132px; resize: none; border: 1px solid rgba(167,139,250,.2); border-radius: 15px; padding: 12px 13px; background: rgba(20,20,31,.9); color: var(--text); font: inherit; line-height: 1.35; outline: none; }
-    textarea:focus { border-color: rgba(167,139,250,.5); box-shadow: 0 0 0 3px rgba(167,139,250,.08); }
-    button.send-button { border: 0; border-radius: 14px; background: var(--accent-strong); color: #fff; font-weight: 850; font-size: .9rem; min-height: 48px; padding: 0 15px; box-shadow: 0 12px 26px rgba(139,92,246,.28); cursor: pointer; font-family: inherit; }
+    textarea { width: 100%; min-height: 54px; max-height: 132px; resize: none; border: 1px solid rgba(96,165,250,.22); border-radius: 15px; padding: 12px 13px; background: rgba(20,20,31,.9); color: var(--text); font: inherit; line-height: 1.35; outline: none; }
+    textarea:focus { border-color: rgba(96,165,250,.52); box-shadow: 0 0 0 3px rgba(37,99,235,.1); }
+    button.send-button { border: 0; border-radius: 14px; background: var(--accent-strong); color: #fff; font-weight: 850; font-size: .9rem; min-height: 48px; padding: 0 15px; box-shadow: 0 12px 26px rgba(37,99,235,.28); cursor: pointer; font-family: inherit; }
     .send-button { flex: 0 0 auto; min-width: 72px; }
+    button:active { transform: translateY(1px); }
+    button:disabled { opacity: .55; cursor: wait; }
     
     .empty { color: var(--muted); text-align: center; padding: 36px 12px; font-size: 0.76rem; }
+    /* Codex-inspired mobile shell, Orion palette */
+    :root {
+      color-scheme: light;
+      --bg: #f7f7f5;
+      --panel: rgba(255,255,255,.82);
+      --panel-strong: #ffffff;
+      --line: rgba(24,24,27,.09);
+      --text: #18181b;
+      --muted: #6f6f76;
+      --accent: #7c3aed;
+      --accent-strong: #5b2a86;
+      --success: #16a34a;
+      --warning: #b45309;
+      --danger: #dc2626;
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    body {
+      background:
+        radial-gradient(circle at 50% -16%, rgba(124,58,237,.12), transparent 34%),
+        linear-gradient(180deg, #fbfbfa 0%, #f7f7f5 60%, #f1f0ee 100%);
+    }
+    body::before { display: none; }
+    .app-shell {
+      min-height: 100vh;
+      padding-bottom: calc(94px + env(safe-area-inset-bottom));
+      background: transparent;
+    }
+    header {
+      border-bottom: 0;
+      background: linear-gradient(180deg, rgba(247,247,245,.98), rgba(247,247,245,.78));
+      padding: calc(14px + env(safe-area-inset-top)) 18px 10px;
+    }
+    .topline {
+      display: grid;
+      grid-template-columns: 44px 1fr 44px;
+      align-items: center;
+      min-height: 48px;
+    }
+    .brand {
+      justify-self: center;
+      justify-content: center;
+      gap: 0;
+      text-align: center;
+    }
+    .brand::before,
+    .status-pill::after {
+      width: 44px;
+      height: 44px;
+      border-radius: 22px;
+      display: grid;
+      place-items: center;
+      background: rgba(255,255,255,.76);
+      box-shadow: 0 10px 28px rgba(24,24,27,.08);
+      color: var(--text);
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    .brand::before {
+      content: "‹";
+      position: absolute;
+      left: 18px;
+      font-size: 2rem;
+      padding-bottom: 4px;
+    }
+    .status-pill::after {
+      content: "⋮";
+      position: absolute;
+      right: 18px;
+      top: calc(14px + env(safe-area-inset-top));
+      font-weight: 800;
+    }
+    .mark { display: none; }
+    h1 {
+      font-size: 1.03rem;
+      font-weight: 800;
+      color: var(--text);
+    }
+    .brand h1 { font-size: 0; }
+    .brand h1::after { content: "Orion"; font-size: 1.08rem; }
+    .meta {
+      max-width: 72vw;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: .72rem;
+    }
+    .status-pill {
+      width: 0;
+      height: 0;
+      padding: 0;
+      border: 0;
+      overflow: hidden;
+      background: transparent;
+      color: transparent;
+    }
+    .context-card {
+      margin-top: 12px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+    }
+    .context-row {
+      justify-content: center;
+      font-size: .8rem;
+      gap: 8px;
+    }
+    .context-row span:first-child { display: none; }
+    .model {
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .substatus {
+      text-align: center;
+      color: var(--muted);
+      font-size: .74rem;
+      margin-top: 3px;
+    }
+    .indicator-banner {
+      margin-top: 12px;
+      padding: 0;
+      border: 0;
+      background: transparent !important;
+      color: var(--text) !important;
+      justify-content: center;
+      font-size: .78rem;
+      gap: 8px;
+    }
+    .indicator-banner::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: #c9c9cf;
+    }
+    .indicator-banner.active-running::before { background: var(--success); }
+    .indicator-banner.background-running::before { background: #f59e0b; }
+    .indicator-banner button {
+      border: 0;
+      border-radius: 999px;
+      background: #ece8f4 !important;
+      color: var(--accent-strong) !important;
+      padding: 5px 9px;
+      font: inherit;
+      font-size: .72rem;
+      font-weight: 800;
+    }
+    main {
+      padding: 18px 20px 22px;
+      gap: 28px;
+    }
+    .dashboard-panel,
+    .recent-tasks-section,
+    .chat-section,
+    .activity-panel {
+      gap: 14px;
+    }
+    .dashboard-panel {
+      display: grid;
+      grid-template-areas:
+        "top"
+        "projects"
+        "active"
+        "plan"
+        "actions"
+        "attention"
+        "queued"
+        "recents";
+    }
+    .dashboard-panel > .panel-header-row { grid-area: top; }
+    .project-select-panel { grid-area: projects; }
+    #active-task-container { grid-area: active; }
+    #plan-panel { grid-area: plan; }
+    .action-grouping { grid-area: actions; }
+    #attention-tasks-container { grid-area: attention; }
+    #queued-prompts-container { grid-area: queued; }
+    .recent-tasks-section { grid-area: recents; }
+    .panel-header-row {
+      align-items: center;
+      gap: 12px;
+    }
+    .sub-panel-title {
+      color: var(--text);
+      font-size: .92rem;
+      text-transform: none;
+      letter-spacing: 0;
+      font-weight: 850;
+    }
+    .dashboard-panel > .panel-header-row .sub-panel-title::before { content: "Projects"; }
+    .dashboard-panel > .panel-header-row .sub-panel-title { font-size: 0; }
+    .dashboard-panel > .panel-header-row .sub-panel-title::before { font-size: 1rem; }
+    .btn-sm-primary {
+      min-height: 48px;
+      padding: 0 18px;
+      border-radius: 999px;
+      background: #151518;
+      box-shadow: 0 12px 30px rgba(24,24,27,.16);
+      font-size: .9rem;
+    }
+    .btn-sm-primary::before { content: "✎ "; }
+    .dashboard-card,
+    .activity-panel,
+    .plan-panel {
+      border: 0;
+      background: transparent;
+      box-shadow: none;
+      padding: 0;
+      border-radius: 0;
+    }
+    .project-select-panel {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
+    .project-select-panel .panel-header-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    select {
+      min-height: 50px;
+      border-radius: 15px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.9);
+      color: var(--text);
+      font-size: .95rem;
+      box-shadow: 0 8px 24px rgba(24,24,27,.05);
+    }
+    .badge {
+      border-radius: 999px;
+      border: 0 !important;
+      background: #eeeeef !important;
+      color: var(--muted) !important;
+      text-transform: none;
+      font-size: .72rem;
+      padding: 4px 8px;
+    }
+    .badge.success { background: rgba(22,163,74,.12) !important; color: #15803d !important; }
+    .badge.warning { background: rgba(245,158,11,.15) !important; color: #92400e !important; }
+    .badge.active-view { background: rgba(124,58,237,.13) !important; color: var(--accent-strong) !important; }
+    .dashboard-card.active-card {
+      background: #ffffff;
+      border: 1px solid var(--line);
+      border-left: 0;
+      border-radius: 18px;
+      padding: 14px;
+      box-shadow: 0 12px 30px rgba(24,24,27,.06);
+    }
+    .card-title {
+      font-size: 1rem;
+      font-weight: 750;
+    }
+    .substatus-text,
+    .task-row-meta {
+      color: var(--muted);
+      font-size: .76rem;
+    }
+    .control-row {
+      gap: 10px;
+    }
+    .control-row button,
+    .btn-sm {
+      min-height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255,255,255,.78);
+      color: var(--text);
+      box-shadow: 0 8px 20px rgba(24,24,27,.04);
+      font-size: .82rem;
+      font-weight: 750;
+    }
+    .plan-panel {
+      padding: 14px;
+      border-radius: 18px;
+      background: #fff7ed;
+      border: 1px solid rgba(245,158,11,.22);
+    }
+    .plan-title { color: #92400e; }
+    .approve-button {
+      min-height: 44px;
+      border: 0;
+      border-radius: 999px;
+      background: #151518;
+      color: #fff;
+    }
+    .recent-tasks-section .sub-panel-title::before { content: "Recents"; }
+    .recent-tasks-section .sub-panel-title { font-size: 0; }
+    .recent-tasks-section .sub-panel-title::before { font-size: 1rem; }
+    .recent-tasks-list {
+      max-height: none;
+      gap: 0;
+      overflow: visible;
+    }
+    .task-row {
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      padding: 13px 0;
+      border-bottom: 1px solid rgba(24,24,27,.06);
+    }
+    .task-row.active-row {
+      background: transparent;
+      border-color: rgba(24,24,27,.08);
+    }
+    .task-row-title {
+      color: var(--text);
+      font-size: .96rem;
+      font-weight: 500;
+    }
+    .task-row-right .badge:not(.success):not(.warning) { display: none; }
+    .activity-panel {
+      display: none;
+      background: #ffffff;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 14px;
+      box-shadow: 0 12px 30px rgba(24,24,27,.05);
+    }
+    .activity-panel:has(.tab-pane.active:not(:empty)) { display: block; }
+    .tab-header {
+      border: 0;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+    .tab-btn {
+      border-radius: 999px;
+      background: #f0f0f1;
+      color: var(--muted);
+    }
+    .tab-btn.active {
+      background: #151518;
+      color: #fff;
+      border: 0;
+    }
+    .tab-pane {
+      color: var(--muted);
+      word-break: break-word;
+    }
+    .terminal-logs {
+      background: #f6f6f7;
+      color: #166534;
+      border: 1px solid var(--line);
+    }
+    .messages {
+      max-height: none;
+      gap: 16px;
+      overflow: visible;
+    }
+    .chat-section .sub-panel-title::before { content: "Chat"; }
+    .chat-section .sub-panel-title { font-size: 0; }
+    .chat-section .sub-panel-title::before { font-size: 1rem; }
+    .message {
+      border: 0;
+      box-shadow: none;
+      max-width: 100%;
+      background: transparent;
+      color: var(--text);
+      padding: 0;
+      font-size: .98rem;
+      line-height: 1.48;
+    }
+    .message.user {
+      max-width: 78%;
+      align-self: flex-end;
+      background: #ececec;
+      border-radius: 22px;
+      padding: 14px 16px;
+    }
+    .message.assistant { align-self: stretch; }
+    .message.system {
+      align-self: stretch;
+      font-family: inherit;
+      color: var(--muted);
+      background: transparent;
+      font-size: .82rem;
+    }
+    .role { display: none; }
+    .queued-item {
+      background: #ffffff;
+      border: 1px solid var(--line);
+      color: var(--text);
+      border-radius: 12px;
+    }
+    .install-tip.visible {
+      background: #fff;
+      color: var(--muted);
+      border: 1px solid var(--line);
+    }
+    form {
+      border-top: 0;
+      background: linear-gradient(180deg, rgba(247,247,245,0), rgba(247,247,245,.96) 24%, rgba(247,247,245,.98));
+      padding: 12px 20px calc(12px + env(safe-area-inset-bottom));
+    }
+    .composer {
+      align-items: center;
+      gap: 10px;
+    }
+    .composer::before {
+      content: "+";
+      flex: 0 0 46px;
+      height: 46px;
+      border-radius: 999px;
+      display: grid;
+      place-items: center;
+      background: #fff;
+      color: #151518;
+      font-size: 1.8rem;
+      line-height: 1;
+      box-shadow: 0 10px 24px rgba(24,24,27,.08);
+    }
+    textarea {
+      min-height: 48px;
+      max-height: 110px;
+      border: 1px solid rgba(24,24,27,.06);
+      border-radius: 999px;
+      background: #ffffff;
+      color: var(--text);
+      padding: 12px 48px 12px 18px;
+      box-shadow: 0 10px 24px rgba(24,24,27,.08);
+      font-size: .95rem;
+    }
+    textarea:focus {
+      border-color: rgba(124,58,237,.22);
+      box-shadow: 0 0 0 4px rgba(124,58,237,.08), 0 10px 24px rgba(24,24,27,.08);
+    }
+    button.send-button {
+      min-width: 46px;
+      width: 46px;
+      min-height: 46px;
+      padding: 0;
+      border-radius: 999px;
+      background: var(--accent-strong);
+      font-size: 0;
+      box-shadow: 0 12px 26px rgba(91,42,134,.22);
+    }
+    button.send-button::before {
+      content: "›";
+      font-size: 2rem;
+      line-height: 1;
+      transform: rotate(-90deg);
+      display: inline-block;
+      margin-top: 2px;
+    }
+    .empty {
+      color: var(--muted);
+      font-size: .86rem;
+    }
     @media (min-width:700px) {
       .app-shell { max-width: 760px; margin: 0 auto; border-left: 1px solid rgba(255,255,255,.05); border-right: 1px solid rgba(255,255,255,.05); }
       form { left: 50%; transform: translateX(-50%); max-width: 760px; }
@@ -674,7 +1146,7 @@ function companionHtml(pairingCode) {
   <div class="app-shell">
     <header>
       <div class="topline">
-        <div class="brand"><div class="mark">O</div><div><h1>Orion Operator Console</h1><div class="meta" id="meta">Connecting...</div></div></div>
+        <div class="brand"><div class="mark">O</div><div><h1>Orion</h1><div class="meta" id="meta">Connecting...</div></div></div>
         <div class="status-pill" id="status-pill">Offline</div>
       </div>
       <div id="global-indicator-banner" class="indicator-banner idle">
@@ -687,11 +1159,20 @@ function companionHtml(pairingCode) {
       </div>
     </header>
     <main>
-      <!-- Task console dashboard -->
+      <!-- Mobile task console -->
       <section class="dashboard-panel">
         <div class="panel-header-row">
-          <div class="sub-panel-title">Task Console</div>
-          <button id="new-task" type="button" class="btn-sm-primary">+ New Task</button>
+          <div class="sub-panel-title">Projects</div>
+          <button id="new-task" type="button" class="btn-sm-primary">Chat</button>
+        </div>
+        <div class="dashboard-card project-select-panel">
+          <div class="panel-header-row">
+            <div class="sub-panel-title">Chats</div>
+            <span class="badge muted" id="project-count-badge">0 Projects</span>
+          </div>
+          <select id="project-select">
+            <option value="">Standalone conversation</option>
+          </select>
         </div>
         
         <div id="active-task-container" class="dashboard-card active-card">
@@ -710,12 +1191,12 @@ function companionHtml(pairingCode) {
 
         <div class="action-grouping">
           <div class="control-row">
-            <button id="steer-task" type="button">🎯 Steer Work</button>
+            <button id="steer-task" type="button">Steer Work</button>
           </div>
           <div class="control-row">
-            <button id="stop-task" type="button">⏸ Pause / Stop</button>
-            <button id="resume-task" type="button">▶ Resume</button>
-            <button id="refresh-state" type="button">🔄 Refresh</button>
+            <button id="stop-task" type="button">Pause / Stop</button>
+            <button id="resume-task" type="button">Resume</button>
+            <button id="refresh-state" type="button">Refresh</button>
           </div>
         </div>
 
@@ -723,7 +1204,7 @@ function companionHtml(pairingCode) {
         <div id="queued-prompts-container" class="dashboard-card" style="display: none;"></div>
 
         <div class="recent-tasks-section">
-          <div class="sub-panel-title">All Workspace Tasks</div>
+          <div class="sub-panel-title">Recents</div>
           <div id="recent-tasks-list" class="recent-tasks-list">
             <div class="empty">Loading...</div>
           </div>
@@ -732,7 +1213,7 @@ function companionHtml(pairingCode) {
 
       <!-- Upgraded Activity Panel -->
       <section class="activity-panel">
-        <div class="sub-panel-title" style="margin-bottom: 8px;">Activity Panel</div>
+        <div class="sub-panel-title" style="margin-bottom: 8px;">Activity</div>
         <div class="tab-header">
           <button class="tab-btn active" data-tab="tab-output">Output</button>
           <button class="tab-btn" data-tab="tab-walkthrough">Walkthrough</button>
@@ -753,7 +1234,7 @@ function companionHtml(pairingCode) {
       </section>
 
       <section class="chat-section">
-        <div class="sub-panel-title" style="margin-bottom: 8px;">Conversation History</div>
+        <div class="sub-panel-title" style="margin-bottom: 8px;">Chat</div>
         <div class="messages" id="messages"><div class="empty">Loading conversation...</div></div>
       </section>
 
@@ -789,6 +1270,8 @@ function companionHtml(pairingCode) {
     const resumeTaskEl = document.getElementById('resume-task');
     const newTaskEl = document.getElementById('new-task');
     const steerTaskEl = document.getElementById('steer-task');
+    const projectSelectEl = document.getElementById('project-select');
+    const projectCountBadgeEl = document.getElementById('project-count-badge');
     
     // New Console elements
     const globalIndicatorBanner = document.getElementById('global-indicator-banner');
@@ -801,6 +1284,9 @@ function companionHtml(pairingCode) {
     const form = document.getElementById('prompt-form');
     
     let lastSignature = '';
+    let projectSelectInitialized = false;
+    let lastProjectOptionsSignature = '';
+    let currentConversationId = '';
     
     function escapeHtml(value) { return String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch])); }
     
@@ -844,6 +1330,7 @@ function companionHtml(pairingCode) {
         const state = await res.json();
         if (!state.success) throw new Error(state.error || 'Failed to load state');
         
+        currentConversationId = state.conversationId || '';
         metaEl.textContent = state.title || 'No active conversation';
         modelEl.textContent = state.model || '-';
         statusPillEl.textContent = state.running ? 'Working' : 'Ready';
@@ -860,16 +1347,16 @@ function companionHtml(pairingCode) {
         if (globalRunning) {
           if (viewingId === runningId) {
             globalIndicatorBanner.className = 'indicator-banner active-running';
-            globalIndicatorBanner.innerHTML = '<span>⚡ Viewing Globally Running Task</span>';
+            globalIndicatorBanner.innerHTML = '<span>Viewing globally running task</span>';
           } else {
             const runningTaskObj = (state.conversations || []).find(c => c.id === runningId);
             const runningTitle = runningTaskObj ? runningTaskObj.title : 'Another Task';
             globalIndicatorBanner.className = 'indicator-banner background-running';
-            globalIndicatorBanner.innerHTML = '<span>⚠️ Running: <strong>' + escapeHtml(runningTitle) + '</strong></span><button onclick="switchTask(\\\'' + escapeHtml(runningId) + '\\\')">Switch View</button>';
+            globalIndicatorBanner.innerHTML = '<span>Running: <strong>' + escapeHtml(runningTitle) + '</strong></span><button onclick="switchTask(\\\'' + escapeHtml(runningId) + '\\\')">Switch View</button>';
           }
         } else {
           globalIndicatorBanner.className = 'indicator-banner idle';
-          globalIndicatorBanner.innerHTML = '<span>💤 Agent is currently idle</span>';
+          globalIndicatorBanner.innerHTML = '<span>Agent is currently idle</span>';
         }
 
         // 2. Render Active Task Card
@@ -919,7 +1406,7 @@ function companionHtml(pairingCode) {
           queuedPromptsContainer.innerHTML = \`
             <div class="sub-panel-title">Queued Prompts (\${state.queuedPrompts})</div>
             <div class="queued-list">
-              \${(state.queuedPromptPreview || []).map(p => '<div class="queued-item">⏳ ' + escapeHtml(p) + '</div>').join('')}
+              \${(state.queuedPromptPreview || []).map(p => '<div class="queued-item">' + escapeHtml(p) + '</div>').join('')}
             </div>
           \`;
           queuedPromptsContainer.style.display = 'block';
@@ -945,7 +1432,7 @@ function companionHtml(pairingCode) {
             return '<div class="task-row' + (isViewing ? ' active-row' : '') + '" onclick="switchTask(\\\'' + escapeHtml(c.id) + '\\\')">' +
               '<div class="task-row-left" style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding-right:8px;">' +
                 '<div class="task-row-title" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + escapeHtml(c.title) + '</div>' +
-                '<div class="task-row-meta">Updated: ' + timeText + ' • ' + c.taskCount + ' items</div>' +
+                '<div class="task-row-meta">Updated: ' + timeText + ' - ' + c.taskCount + ' items</div>' +
               '</div>' +
               '<div class="task-row-right" style="display:flex; align-items:center;">' +
                 badgesHtml +
@@ -965,7 +1452,7 @@ function companionHtml(pairingCode) {
 
         const filesPane = document.getElementById('tab-files');
         if (Array.isArray(preview.changedFiles) && preview.changedFiles.length) {
-          filesPane.innerHTML = preview.changedFiles.map(f => '<div style="margin-bottom:4px; font-family: monospace; font-size: 0.72rem;">📄 ' + escapeHtml(f) + '</div>').join('');
+          filesPane.innerHTML = preview.changedFiles.map(f => '<div style="margin-bottom:4px; font-family: monospace; font-size: 0.72rem;">' + escapeHtml(f) + '</div>').join('');
         } else {
           filesPane.textContent = 'No changed files recorded.';
         }
@@ -979,7 +1466,7 @@ function companionHtml(pairingCode) {
 
         const launchUrlContainer = document.getElementById('launch-url-container');
         if (preview.appLaunchUrl) {
-          launchUrlContainer.innerHTML = '🚀 <strong>Launch URL:</strong> <a href="' + escapeHtml(preview.appLaunchUrl) + '" target="_blank" style="color:var(--accent); text-decoration:underline;">' + escapeHtml(preview.appLaunchUrl) + '</a>';
+          launchUrlContainer.innerHTML = '<strong>Launch URL:</strong> <a href="' + escapeHtml(preview.appLaunchUrl) + '" target="_blank" style="color:var(--accent); text-decoration:underline;">' + escapeHtml(preview.appLaunchUrl) + '</a>';
         } else {
           launchUrlContainer.textContent = 'No app launch URL recorded.';
         }
@@ -987,8 +1474,32 @@ function companionHtml(pairingCode) {
         const launchLogsContainer = document.getElementById('launch-logs-container');
         launchLogsContainer.textContent = preview.appLaunchLogs || 'No launch logs yet.';
 
+        const projects = Array.isArray(state.projects) ? state.projects : [];
+        const projectOptionsSignature = JSON.stringify(projects.map(project => ({
+          path: project.path,
+          name: project.name,
+          conversationCount: project.conversationCount
+        })));
+        if (document.activeElement !== projectSelectEl && projectOptionsSignature !== lastProjectOptionsSignature) {
+          const selectedProject = projectSelectEl.value;
+          projectSelectEl.innerHTML = '<option value="">Standalone conversation</option>' + projects.map(project => {
+            const label = project.name + (project.conversationCount ? ' (' + project.conversationCount + ')' : '');
+            return '<option value="' + escapeHtml(project.path) + '">' + escapeHtml(label) + '</option>';
+          }).join('');
+          if (selectedProject && projects.some(project => project.path === selectedProject)) {
+            projectSelectEl.value = selectedProject;
+          } else if (!projectSelectInitialized && state.workspace && projects.some(project => project.path === state.workspace)) {
+            projectSelectEl.value = state.workspace;
+          }
+          projectSelectInitialized = true;
+          lastProjectOptionsSignature = projectOptionsSignature;
+        } else if (!projectSelectInitialized && document.activeElement !== projectSelectEl) {
+          projectSelectInitialized = true;
+        }
+        projectCountBadgeEl.textContent = projects.length + (projects.length === 1 ? ' Project' : ' Projects');
+
         // 7. Render Messages Feed
-        const signature = JSON.stringify({ running: state.running, subStatus: state.subStatus, plan: state.awaitingPlanApproval, conversations: state.conversations, messages: state.messages });
+        const signature = JSON.stringify({ running: state.running, subStatus: state.subStatus, plan: state.awaitingPlanApproval, conversations: state.conversations, projects: state.projects, messages: state.messages });
         if (signature !== lastSignature) {
           lastSignature = signature;
           messagesEl.innerHTML = !state.messages || state.messages.length === 0 ? '<div class="empty">No messages yet.</div>' : state.messages.map(msg => '<div class="message ' + escapeHtml(msg.role) + '"><span class="role">' + escapeHtml(msg.role) + '</span>' + escapeHtml(msg.text) + '</div>').join('');
@@ -1031,9 +1542,8 @@ function companionHtml(pairingCode) {
     });
     refreshStateEl.addEventListener('click', loadState);
     newTaskEl.addEventListener('click', async () => {
-      const prompt = window.prompt('Start a new Orion task:', '');
-      if (prompt === null) return;
-      const res = await companionFetch('/api/conversations/new', { method:'POST', body: JSON.stringify({ prompt: prompt || '' }) });
+      const projectPath = projectSelectEl.value || '';
+      const res = await companionFetch('/api/conversations/new', { method:'POST', body: JSON.stringify({ prompt: '', projectPath }) });
       const data = await res.json();
       if (!data.success) statusEl.textContent = data.error || 'New task failed';
       await loadState();
@@ -1081,6 +1591,13 @@ function companionHtml(pairingCode) {
       document.getElementById('send').disabled = true;
       statusEl.textContent = 'Sending...';
       try {
+        if (!currentConversationId) {
+          const projectPath = projectSelectEl.value || '';
+          const newTaskRes = await companionFetch('/api/conversations/new', { method: 'POST', body: JSON.stringify({ prompt: '', projectPath }) });
+          const newTask = await newTaskRes.json();
+          if (!newTask.success) throw new Error(newTask.error || 'New task failed');
+          currentConversationId = newTask.conversationId || currentConversationId;
+        }
         const res = await companionFetch('/api/prompt', { method: 'POST', body: JSON.stringify({ prompt }) });
         const data = await res.json();
         if (!data.success) throw new Error(data.error || 'Send failed');
@@ -1142,7 +1659,7 @@ function companionHtml(pairingCode) {
     }
     if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
     loadState();
-    const statePollInterval = setInterval(loadState, 1500);
+    const statePollInterval = setInterval(loadState, 3000);
   </script>
 </body>
 </html>`;
@@ -1253,8 +1770,8 @@ async function callRendererFunction(functionName, arg) {
 function startPhoneCompanionServer() {
   if (companionServer) return;
   const config = readAppConfig();
-  const port = Number(config.phoneCompanionPort || 1122);
-  const enableCompanion = config.enablePhoneCompanion === true;
+  const port = Number(config.phoneCompanionPort || 5000);
+  const enableCompanion = config.enablePhoneCompanion !== false;
   const host = enableCompanion ? '0.0.0.0' : '127.0.0.1';
   companionToken = ensureCompanionToken(config);
   const pairingCode = ensureCompanionPairingCode(config);
@@ -1264,8 +1781,9 @@ function startPhoneCompanionServer() {
       const latestConfig = readAppConfig();
       const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
       if (url.pathname === '/') {
+        const freshPairingCode = ensureCompanionPairingCode(readAppConfig());
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-        res.end(companionHtml(pairingCode));
+        res.end(companionHtml(freshPairingCode));
         return;
       }
 
@@ -1290,20 +1808,33 @@ function startPhoneCompanionServer() {
       if (req.method === 'POST' && url.pathname === '/api/pair') {
         const bodyText = await readRequestBody(req);
         const body = bodyText ? JSON.parse(bodyText) : {};
+        const submittedPairingCode = String(body.pairingCode || '');
+        const configuredPairingCode = String(latestConfig.phoneCompanionPairingCode || pairingCode);
         const pairingExpired = Date.parse(latestConfig.phoneCompanionPairingExpiresAt || '') <= Date.now();
-        if (pairingExpired || String(body.pairingCode || '') !== String(latestConfig.phoneCompanionPairingCode || pairingCode)) {
+        const matchesConfiguredCode = submittedPairingCode === configuredPairingCode;
+        const matchesServedCode = submittedPairingCode === String(pairingCode || '');
+        if ((!matchesConfiguredCode || pairingExpired) && !matchesServedCode) {
           sendJson(res, 401, { success: false, error: 'Invalid pairing code' });
           return;
         }
+        if (pairingExpired || !matchesConfiguredCode) {
+          const writableConfig = readAppConfig();
+          writableConfig.phoneCompanionPairingCode = submittedPairingCode;
+          writableConfig.phoneCompanionPairingExpiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+          writeAppConfig(writableConfig);
+        }
         const deviceName = String(body.deviceName || 'Phone').slice(0, 80);
-        let approved = false;
+        const requireDesktopApproval = latestConfig.phoneCompanionRequireDesktopApproval === true;
+        let approved = !requireDesktopApproval;
         let pending = false;
-        try {
-          const approval = await callRendererFunction('approvePhoneCompanionPairing', { deviceName });
-          approved = approval && approval.approved !== false;
-          pending = approval && approval.pending === true;
-        } catch (e) {
-          approved = false;
+        if (requireDesktopApproval) {
+          try {
+            const approval = await callRendererFunction('approvePhoneCompanionPairing', { deviceName });
+            approved = approval && approval.approved !== false;
+            pending = approval && approval.pending === true;
+          } catch (e) {
+            approved = false;
+          }
         }
         if (!approved) {
           sendJson(res, 403, { success: false, error: pending ? 'Desktop approval required' : 'Pairing denied', pending });
@@ -1495,8 +2026,8 @@ ipcMain.handle('revoke-phone-companion-device', async (event, deviceId) => {
 
 async function getPhoneCompanionPairingPayload() {
   const config = readAppConfig();
-  const port = Number(config.phoneCompanionPort || 1122);
-  const enableCompanion = config.enablePhoneCompanion === true;
+  const port = Number(config.phoneCompanionPort || 5000);
+  const enableCompanion = config.enablePhoneCompanion !== false;
   const address = enableCompanion ? getLocalWifiAddress() : '127.0.0.1';
   const pairingCode = ensureCompanionPairingCode(config);
   const latestConfig = readAppConfig();

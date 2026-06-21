@@ -24,7 +24,7 @@ const INDEXABLE_EXTENSIONS = new Set([
 ]);
 
 function assertNoWorkspaceLinkEscape(workspaceRoot, fullPath) {
-  const rootRealPath = fs.realpathSync(workspaceRoot);
+  const rootRealPath = fs.existsSync(workspaceRoot) ? fs.realpathSync(workspaceRoot) : workspaceRoot;
   const relativeParts = path.relative(workspaceRoot, fullPath).split(path.sep).filter(Boolean);
   let currentPath = workspaceRoot;
   for (const part of relativeParts) {

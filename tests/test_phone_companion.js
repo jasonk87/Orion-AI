@@ -104,7 +104,6 @@ function makeElectronMock(handlers = {}) {
 
 async function startMainWithConfig(port, config, handlers) {
   const fsMock = makeFsMock({
-    enablePhoneCompanion: false,
     phoneCompanionPort: port,
     phoneCompanionPairingCode: 'pair-code-123456',
     phoneCompanionPairingExpiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
@@ -135,6 +134,10 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
   const root = await request('GET', 1131, '/');
   t.equal(root.statusCode, 200, 'root shell is available without token-in-URL auth');
   t.notOk(root.text.includes('phoneCompanionToken'), 'root shell does not expose legacy token');
+  t.ok(root.text.includes('<title>Orion</title>'), 'root shell serves the Orion mobile UI');
+  t.ok(root.text.includes('Recents'), 'root shell includes Codex-style recents');
+  t.ok(root.text.includes('Projects'), 'root shell includes project selection');
+  t.notOk(root.text.includes('Start a new Orion task:'), 'new task no longer requires a prompt/name dialog');
 
   const manifest = await request('GET', 1131, '/manifest.webmanifest');
   t.equal(manifest.statusCode, 200, 'manifest is available without token query string');
@@ -174,8 +177,8 @@ test('Phone Companion pairing payload is available through IPC for top-bar butto
   const { main } = await startMainWithConfig(1136);
   const payload = await main.getPhoneCompanionPairingForTest();
   t.equal(payload.success, true, 'IPC pairing payload succeeds');
-  t.equal(payload.networkEnabled, false, 'initial top-bar payload does not pretend localhost is phone-reachable');
-  t.notOk(payload.pairUrl, 'disabled LAN payload does not expose a localhost QR URL');
+  t.equal(payload.networkEnabled, true, 'initial top-bar payload is phone-reachable on LAN');
+  t.ok(payload.pairUrl.includes('http://192.168.50.25:1136/?pair='), 'enabled payload exposes Wi-Fi pairing URL');
   await closeServer(main.getCompanionServer());
 });
 
@@ -221,6 +224,17 @@ test('Phone Companion v2 pairing creates reusable sessions and revoked sessions 
   await closeServer(main.getCompanionServer());
 });
 
+test('Phone Companion v2 auto-pairs valid LAN pairing links by default', async (t) => {
+  const { main, electron } = await startMainWithConfig(1142);
+
+  const pair = await request('POST', 1142, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'Phone' });
+  t.equal(pair.statusCode, 200, 'valid pairing code creates a session without desktop confirmation');
+  t.ok(pair.json.sessionSecret, 'auto-pair returns a session secret');
+  t.notOk(electron.calls.some(call => call.includes('approvePhoneCompanionPairing')), 'default pairing does not call desktop confirmation bridge');
+
+  await closeServer(main.getCompanionServer());
+});
+
 test('Phone Companion v2 task controls and preview endpoints reach desktop bridge', async (t) => {
   const { main, electron } = await startMainWithConfig(1133);
   const pair = await request('POST', 1133, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
@@ -229,7 +243,7 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
   const switchRes = await request('POST', 1133, '/api/conversations/switch', { conversationId: 'conv2' }, session);
   t.equal(switchRes.statusCode, 200, 'task switching endpoint succeeds');
 
-  const newTask = await request('POST', 1133, '/api/conversations/new', { prompt: 'new task' }, session);
+  const newTask = await request('POST', 1133, '/api/conversations/new', { prompt: 'new task', projectPath: 'C:\\Projects\\OrionTarget' }, session);
   t.equal(newTask.statusCode, 200, 'new task endpoint succeeds');
 
   const prompt = await request('POST', 1133, '/api/prompt', { prompt: 'hello' }, session);
@@ -255,17 +269,18 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
   t.equal(preview.json.preview.appLaunchUrl, 'http://localhost:3000', 'preview exposes app launch URL');
 
   t.ok(!electron.calls.some(call => call.includes('switchPhoneCompanionConversation')), 'desktop bridge no longer switches global active conversation task');
+  t.ok(electron.calls.some(call => call.includes('C:\\\\Projects\\\\OrionTarget')), 'new task endpoint forwards selected project path');
   t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt')), 'desktop bridge submitted prompt');
   t.ok(electron.calls.some(call => call.includes('approvePhoneCompanionPlan')), 'desktop bridge approved plan');
 
   await closeServer(main.getCompanionServer());
 });
 
-test('Phone Companion LAN mode remains disabled by default', async (t) => {
+test('Phone Companion LAN mode can still be explicitly disabled', async (t) => {
   const { main } = await startMainWithConfig(1134, { enablePhoneCompanion: false });
   const server = main.getCompanionServer();
   const address = server.address();
-  t.equal(address.address, '127.0.0.1', 'server binds localhost when companion LAN mode is disabled');
+  t.equal(address.address, '127.0.0.1', 'server binds localhost when companion LAN mode is explicitly disabled');
   await closeServer(server);
 });
 
@@ -350,7 +365,7 @@ test('Phone Companion v2 desktop device list and revoke IPC endpoints', async (t
 
 test('Phone Companion v2 pairing pending and denied states', async (t) => {
   // Test pending (desktop approval required / rate-limited)
-  const { main: mainPending } = await startMainWithConfig(1140, {}, {
+  const { main: mainPending } = await startMainWithConfig(1140, { phoneCompanionRequireDesktopApproval: true }, {
     pairingApproval: { approved: false, pending: true }
   });
   const resPending = await request('POST', 1140, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
@@ -361,7 +376,7 @@ test('Phone Companion v2 pairing pending and denied states', async (t) => {
   await closeServer(mainPending.getCompanionServer());
 
   // Test denied (user rejected pairing request)
-  const { main: mainDenied } = await startMainWithConfig(1141, {}, {
+  const { main: mainDenied } = await startMainWithConfig(1141, { phoneCompanionRequireDesktopApproval: true }, {
     pairingApproval: { approved: false, pending: false }
   });
   const resDenied = await request('POST', 1141, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });

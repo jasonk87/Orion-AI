@@ -281,7 +281,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     messages.push({
       role: 'user',
       parts: [{
-        text: '[SYSTEM: An implementation plan is awaiting approval. The latest user message was classified as plan feedback/revision, not approval. Do not execute destructive tools. Update or replace the plan if needed, then pause again.]'
+        text: '[SYSTEM: An implementation plan is awaiting approval. The user provided feedback or asked a question. Do not execute destructive tools. Address the user\'s message. ONLY update the implementation_plan.md if the user requested changes to the plan. If you update the plan, pause for approval. If you just answer a question, do not write the plan again.]'
       }]
     });
   }
@@ -330,6 +330,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     let planValidationRetries = 0;
     let consecutiveNoToolCalls = 0;
     let malformedCallsCount = 0;
+    let postEditEvidencePrompts = 0;
     const repeatedToolFailures = new Map();
     const maxMalformedToolRetries = 5;
     const canExecuteThisTask = () => !config.planningMode || conversation.planApproved || planningBypassedForTask;
@@ -371,20 +372,123 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           await sleep(modelCallDelayMs);
         }
         
-        if (modelName.startsWith('gemini-')) {
-          response = await callGeminiAPI(messages, modelName, config.geminiApiKey, (warningMsg) => {
-            agentSubStatus = warningMsg;
-            currentAgentLogs.push({ type: 'thought', content: `⚠️ ${warningMsg}` });
-            conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
-            window.renderAiMessage(lastTextResponse, currentAgentLogs);
+        const isProMode = typeof window.isProModeActive === 'function' && window.isProModeActive();
+        
+        if (isProMode) {
+          // 1. Analyst call
+          currentAgentLogs.push({ type: 'thought', content: "🔍 Pro Mode: Analyzing architecture & edge cases..." });
+          window.renderAiMessage(lastTextResponse, currentAgentLogs);
+          
+          let analystMessages = [...messages];
+          analystMessages.push({
+            role: 'user',
+            parts: [{ text: "[PRO MODE: Act as a Senior Systems Architect and Critic. Analyze the user's task or current state. Identify all potential edge cases, hidden assumptions, potential bugs, architectural flaws, and performance bottlenecks. Output your detailed analysis, edge cases, and proposed strategies. Do NOT call any tools yet.]" }]
           });
+          
+          let analystRes;
+          if (modelName.startsWith('gemini-')) {
+            analystRes = await callGeminiAPI(analystMessages, modelName, config.geminiApiKey, null, true);
+          } else {
+            analystRes = await callOllamaAPI(analystMessages, modelName, null, true);
+          }
+          
+          const analystCandidate = analystRes.candidates && analystRes.candidates[0];
+          if (analystCandidate && analystCandidate.finishReason && analystCandidate.finishReason !== "STOP") {
+            throw new Error(`Pro Mode Analyst call stopped by API (Reason: ${analystCandidate.finishReason})`);
+          }
+          
+          const analystText = analystCandidate && analystCandidate.content && analystCandidate.content.parts && analystCandidate.content.parts[0] && analystCandidate.content.parts[0].text || "No analysis generated.";
+          
+          currentAgentLogs.push({ type: 'thought', content: `📐 Architect Analysis:\n${analystText}` });
+          window.renderAiMessage(lastTextResponse, currentAgentLogs);
+          
+          // 2. Critic call
+          currentAgentLogs.push({ type: 'thought', content: "⚖️ Pro Mode: Critic evaluating proposed strategies..." });
+          window.renderAiMessage(lastTextResponse, currentAgentLogs);
+          
+          let criticMessages = [...analystMessages];
+          criticMessages.push({
+            role: 'model',
+            parts: [{ text: analystText }]
+          });
+          criticMessages.push({
+            role: 'user',
+            parts: [{ text: "[PRO MODE: Act as a Critical Code Reviewer. Find weaknesses, gaps, or security flaws in the architect's analysis. What is missing? What will fail under load or with invalid inputs? Output your critique and suggested improvements. Do NOT call any tools yet.]" }]
+          });
+          
+          let criticRes;
+          if (modelName.startsWith('gemini-')) {
+            criticRes = await callGeminiAPI(criticMessages, modelName, config.geminiApiKey, null, true);
+          } else {
+            criticRes = await callOllamaAPI(criticMessages, modelName, null, true);
+          }
+          
+          const criticCandidate = criticRes.candidates && criticRes.candidates[0];
+          if (criticCandidate && criticCandidate.finishReason && criticCandidate.finishReason !== "STOP") {
+            throw new Error(`Pro Mode Critic call stopped by API (Reason: ${criticCandidate.finishReason})`);
+          }
+          
+          const criticText = criticCandidate && criticCandidate.content && criticCandidate.content.parts && criticCandidate.content.parts[0] && criticCandidate.content.parts[0].text || "No critic review generated.";
+          
+          currentAgentLogs.push({ type: 'thought', content: `🛡️ Critic Review:\n${criticText}` });
+          window.renderAiMessage(lastTextResponse, currentAgentLogs);
+          
+          // 3. Execution call
+          currentAgentLogs.push({ type: 'thought', content: "🚀 Pro Mode: Executing tool call / response..." });
+          window.renderAiMessage(lastTextResponse, currentAgentLogs);
+          
+          const needsPlan = config.planningMode && !conversation.planApproved;
+          const executionInstruction = needsPlan 
+            ? "Based on the above deep reasoning, proceed with the PLANNING PHASE. You must first create the 'implementation_plan.md' file containing your refined design (incorporating the critic's suggestions) and call 'set_task_checklist' with your tasks, then wait for user approval. Do NOT write or modify any other source files or run commands yet."
+            : "Based on the above deep reasoning, proceed with the EXECUTION PHASE. Generate the next tool calls or responses with high reliability and precision to complete the tasks.";
+
+          let execMessages = [...messages];
+          execMessages.push({
+            role: 'user',
+            parts: [{
+              text: `[PRO MODE CONTRIBUTE:
+Architect Edge Case Analysis:
+${analystText}
+
+Critic Review & Suggestions:
+${criticText}
+
+${executionInstruction}]`
+            }]
+          });
+          
+          if (modelName.startsWith('gemini-')) {
+            response = await callGeminiAPI(execMessages, modelName, config.geminiApiKey, (warningMsg) => {
+              agentSubStatus = warningMsg;
+              currentAgentLogs.push({ type: 'thought', content: `⚠️ ${warningMsg}` });
+              conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
+              window.renderAiMessage(lastTextResponse, currentAgentLogs);
+            });
+          } else {
+            response = await callOllamaAPI(execMessages, modelName, (warningMsg) => {
+              agentSubStatus = warningMsg;
+              currentAgentLogs.push({ type: 'thought', content: `⚠️ ${warningMsg}` });
+              conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
+              window.renderAiMessage(lastTextResponse, currentAgentLogs);
+            });
+          }
         } else {
-          response = await callOllamaAPI(messages, modelName, (warningMsg) => {
-            agentSubStatus = warningMsg;
-            currentAgentLogs.push({ type: 'thought', content: `⚠️ ${warningMsg}` });
-            conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
-            window.renderAiMessage(lastTextResponse, currentAgentLogs);
-          });
+          // Normal mode (direct call)
+          if (modelName.startsWith('gemini-')) {
+            response = await callGeminiAPI(messages, modelName, config.geminiApiKey, (warningMsg) => {
+              agentSubStatus = warningMsg;
+              currentAgentLogs.push({ type: 'thought', content: `⚠️ ${warningMsg}` });
+              conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
+              window.renderAiMessage(lastTextResponse, currentAgentLogs);
+            });
+          } else {
+            response = await callOllamaAPI(messages, modelName, (warningMsg) => {
+              agentSubStatus = warningMsg;
+              currentAgentLogs.push({ type: 'thought', content: `⚠️ ${warningMsg}` });
+              conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
+              window.renderAiMessage(lastTextResponse, currentAgentLogs);
+            });
+          }
         }
         agentSubStatus = 'Processing model response...';
       } catch (e) {
@@ -513,6 +617,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           const prompt = `[SYSTEM: You returned a response without calling any tools, but there are still pending tasks in the checklist: ${pendingTasks.map(t => `"${t.title}"`).join(', ')}. Continue with the next concrete tool action if one is needed. Do not call set_task_checklist merely to mark in-progress work. If the pending task is already complete, mark it completed; if you are blocked, explain the blocker and the next recovery step. When everything is fully complete and verified, output your final summary.]`;
           
           messages.push({ role: 'user', parts: [{ text: prompt }] });
+          continue;
+        }
+        const evidencePrompt = buildPostEditEvidencePrompt(workWalkthrough, {
+          canExecute: canExecuteThisTask(),
+          promptCount: postEditEvidencePrompts,
+          maxPrompts: 2
+        });
+        if (evidencePrompt && loopCount < maxLoops) {
+          postEditEvidencePrompts++;
+          currentAgentLogs.push({ type: 'thought', content: 'Verification guard: code changed, so Orion must inspect the changed files and run or justify a real check before finishing.' });
+          messages.push({ role: 'user', parts: [{ text: evidencePrompt }] });
           continue;
         }
         break;
@@ -650,7 +765,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         }
 
         if (!planIsValid) {
-          if (planValidationRetries < 1) {
+          if (planValidationRetries < 2) {
             planValidationRetries++;
             console.log(`Plan written, but missing Testing Plan. Requesting auto-revision (attempt ${planValidationRetries}).`);
             forceYield = false;
@@ -1593,12 +1708,76 @@ function withWorkWalkthrough(text, items, final = false) {
   return `${base.trim() || 'Working on it.'}\n\n${heading}\n${lines.join('\n')}${suffix}`;
 }
 
+function isFileMutationItem(item) {
+  return !!(item && item.kind === 'file' && item.path);
+}
+
+function isPlanMutationItem(item) {
+  return !!(item && item.kind === 'plan');
+}
+
+function isRealVerificationCommand(command) {
+  const text = String(command || '').toLowerCase().trim();
+  if (!text) return false;
+  if (/^(mkdir|md|new-item|copy|cp|move|mv|ren|rename|dir|ls|get-childitem)\b/.test(text)) return false;
+  return /\b(pytest|unittest|python\s+-m\s+py_compile|python\s+-m\s+compileall|npm\s+test|npm\s+run\s+(test|build|lint|typecheck)|pnpm\s+(test|build|lint|typecheck)|yarn\s+(test|build|lint|typecheck)|node\s+--check|tsc\b|eslint\b|ruff\b|mypy\b|go\s+test|cargo\s+test|dotnet\s+test|mvn\s+test|gradle\s+test|smoke|--smoke-test|playwright|vitest|jest|tap|tape)\b/.test(text);
+}
+
+function isVerificationItem(item) {
+  if (!item) return false;
+  if (item.toolName === 'run_tests' || item.kind === 'test') return true;
+  if (item.toolName === 'run_command') return isRealVerificationCommand(item.command);
+  if (item.toolName === 'start_command') return isRealVerificationCommand(item.command);
+  return false;
+}
+
+function hasVerificationAfterLastFileEdit(items) {
+  const list = Array.isArray(items) ? items : [];
+  const lastEditIndex = list.findLastIndex(item => isFileMutationItem(item));
+  if (lastEditIndex === -1) return true;
+  return list.slice(lastEditIndex + 1).some(item => isVerificationItem(item));
+}
+
+function hasReadAfterLastFileEdit(items) {
+  const list = Array.isArray(items) ? items : [];
+  const lastEditIndex = list.findLastIndex(item => isFileMutationItem(item));
+  if (lastEditIndex === -1) return true;
+  return list.slice(lastEditIndex + 1).some(item => item && item.toolName === 'read_file');
+}
+
+function buildPostEditEvidencePrompt(items, options = {}) {
+  const list = Array.isArray(items) ? items : [];
+  if (!options.canExecute) return '';
+  if ((options.promptCount || 0) >= (options.maxPrompts || 2)) return '';
+  const filesTouched = [...new Set(list.filter(isFileMutationItem).map(item => item.path))];
+  if (!filesTouched.length) return '';
+  const missingRead = !hasReadAfterLastFileEdit(list);
+  const missingVerification = !hasVerificationAfterLastFileEdit(list);
+  if (!missingRead && !missingVerification) return '';
+
+  const fileList = filesTouched.map(path => `\`${path}\``).join(', ');
+  return `[SYSTEM: Post-edit evidence gate. You changed source files (${fileList}) but have not yet produced enough evidence to finish.
+
+Before giving a final answer:
+- Re-read the touched source files or the relevant changed sections to reconcile the actual code against the task and approved plan.
+- Run at least one real verification check after the edits. Use the project regression command when available. For Python/Pygame/interactive apps, prefer \`python -m py_compile <file>\` plus a bounded smoke check such as a \`--smoke-test\` flag or short timeout. Commands that only create folders, list files, or move assets do not count as verification.
+- If a check cannot run, inspect the blocker and state the exact reason in the final summary.
+- If the evidence reveals a bug or mismatch, fix it and rerun the relevant check.
+
+Call the necessary tools now. Do not finish with a generic summary.]`;
+}
+
 function buildFinalVerificationSummary(items) {
   const filesTouched = [...new Set(items.filter(item => item.kind === 'file' && item.path).map(item => item.path))];
-  const testsRun = items.filter(item => item.kind === 'test' || item.toolName === 'run_tests' || item.toolName === 'run_command').map(item => item.label);
+  const testsRun = items.filter(isVerificationItem).map(item => item.label);
+  const nonVerificationCommands = items
+    .filter(item => item && (item.toolName === 'run_command' || item.toolName === 'start_command') && !isVerificationItem(item))
+    .map(item => item.label);
   const failures = items.filter(item => item.status === 'error');
   const planItems = items.filter(item => item.kind === 'plan');
   const hasPlan = planItems.length > 0;
+  const changedSourceFiles = filesTouched.filter(path => !/implementation_plan\.md$/i.test(path));
+  const verificationGap = changedSourceFiles.length > 0 && !hasVerificationAfterLastFileEdit(items);
 
   const lines = ['\n\n## Final Pre-Submit Summary'];
   lines.push(`- **Files touched:** ${filesTouched.length ? filesTouched.map(path => `\`${path}\``).join(', ') : 'None recorded'}`);
@@ -1608,6 +1787,12 @@ function buildFinalVerificationSummary(items) {
   } else {
     lines.push(`- **Tests/checks run:** ${testsRun.length ? testsRun.join('; ') : 'None recorded'}`);
     lines.push(`- **Failures/skipped checks:** ${failures.length ? failures.map(item => item.label).join('; ') : 'None recorded'}`);
+  }
+  if (verificationGap) {
+    lines.push('- **Verification gap:** Source files changed after the last real verification check. Treat this run as incomplete until a real smoke/regression check is run.');
+  }
+  if (nonVerificationCommands.length && !testsRun.length) {
+    lines.push(`- **Non-verification commands:** ${nonVerificationCommands.join('; ')}. These do not prove the code works.`);
   }
   lines.push('- **How to verify:** Review the files above and rerun the listed tests/checks.');
   return lines.join('\n');
@@ -2040,7 +2225,7 @@ function convertGeminiToOllamaTools(geminiTools) {
   return ollamaTools;
 }
 
-async function callOllamaAPI(messages, modelName, onWarning) {
+async function callOllamaAPI(messages, modelName, onWarning, disableTools = false) {
   const url = `http://localhost:11434/api/chat`;
   
   // Format standard Orion AI system instruction
@@ -2340,11 +2525,14 @@ async function callOllamaAPI(messages, modelName, onWarning) {
     model: modelName,
     messages: ollamaMessages,
     stream: false,
-    tools: ollamaTools,
     options: {
       temperature: 0
     }
   };
+  
+  if (!disableTools) {
+    requestBody.tools = ollamaTools;
+  }
   
   const response = await fetch(url, {
     method: 'POST',
@@ -2395,12 +2583,53 @@ async function callOllamaAPI(messages, modelName, onWarning) {
   };
 }
 
+function sanitizeMessagesForTextOnly(messages) {
+  const cleanMessages = [];
+  messages.forEach(msg => {
+    if (msg.role === 'tool') {
+      return;
+    }
+    const textParts = (msg.parts || []).filter(part => part.text !== undefined && part.text !== null);
+    if (textParts.length > 0) {
+      cleanMessages.push({
+        role: msg.role,
+        parts: textParts.map(p => ({ text: p.text }))
+      });
+    } else {
+      const originalFunctionCalls = (msg.parts || [])
+        .filter(part => part.functionCall !== undefined && part.functionCall !== null)
+        .map(part => part.functionCall.name);
+      if (originalFunctionCalls.length > 0) {
+        cleanMessages.push({
+          role: msg.role,
+          parts: [{ text: `[Orion: Model executed tool call(s): ${originalFunctionCalls.join(', ')}]` }]
+        });
+      }
+    }
+  });
+
+  const merged = [];
+  cleanMessages.forEach(msg => {
+    if (merged.length > 0 && merged[merged.length - 1].role === msg.role) {
+      merged[merged.length - 1].parts.push(...msg.parts);
+    } else {
+      merged.push({
+        role: msg.role,
+        parts: [...msg.parts]
+      });
+    }
+  });
+  return merged;
+}
+
 // GEMINI API UTILITIES
-async function callGeminiAPI(messages, modelName, apiKey, onWarning) {
+async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTools = false) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
   
+  const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
+
   // Format body, translating role: 'tool' to role: 'user' for Gemini REST API compatibility
-  const formattedContents = messages.map(msg => {
+  const formattedContents = processedMessages.map(msg => {
     if (msg.role === 'tool') {
       return {
         role: 'user',
@@ -2426,7 +2655,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning) {
   const requestBody = {
     contents: mergedContents,
     systemInstruction: {
-      parts: [{ text: SYSTEM_INSTRUCTION }]
+      parts: [{ text: disableTools ? (SYSTEM_INSTRUCTION.split('Tools available:')[0] + '\n\nCRITICAL: You are in an analysis phase. DO NOT output any function calls. Provide your analysis in markdown text only.') : SYSTEM_INSTRUCTION }]
     },
     generationConfig: {
       temperature: 0,
@@ -2737,6 +2966,11 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning) {
     ]
   };
 
+  if (disableTools) {
+    delete requestBody.tools;
+    delete requestBody.toolConfig;
+  }
+
   const attempts = MODEL_API_MAX_ATTEMPTS;
   let delay = 1500; // Start with 1.5s
   
@@ -2923,6 +3157,11 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     commandProvidesInput,
     classifyAgentFailure,
     buildFailureRecoveryGuidance,
+    isRealVerificationCommand,
+    isVerificationItem,
+    hasVerificationAfterLastFileEdit,
+    buildPostEditEvidencePrompt,
+    buildFinalVerificationSummary,
     diagnoseModelApiFailure
   };
 }

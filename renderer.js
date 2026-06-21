@@ -87,6 +87,7 @@ const el = {
   btnSubmit: document.getElementById('btn-submit'),
   modelSelect: document.getElementById('model-select'),
   chatTitle: document.getElementById('chat-title'),
+  proModeCheckbox: document.getElementById('pro-mode-checkbox'),
   
   // Settings modal
   settingsModal: document.getElementById('settings-modal'),
@@ -147,6 +148,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupEntrypointControls();
   setupRightSidebarToggle();
   setupChatHandlers();
+  
+  // Load and listen to Pro Mode toggle
+  if (el.proModeCheckbox) {
+    el.proModeCheckbox.checked = localStorage.getItem('ag2_pro_mode') === 'true';
+    el.proModeCheckbox.addEventListener('change', (e) => {
+      localStorage.setItem('ag2_pro_mode', e.target.checked ? 'true' : 'false');
+    });
+  }
   
   // Bind manual task checklist add button
   const btnAddTaskManual = document.getElementById('btn-add-task-manual');
@@ -1088,6 +1097,36 @@ function createNewConversationUnderProject(projectPath) {
   el.chatInput.focus();
 }
 
+function getStandaloneWorkspaceRoot() {
+  const configured = (appConfig.standaloneWorkspaceRoot || '').trim();
+  if (configured) return configured.replace(/[\\\/]+$/, '');
+  return 'C:\\Users\\Owner\\Desktop\\Projects\\OrionAI\\standalone-workspaces';
+}
+
+function getStandaloneWorkspaceForTitle(title) {
+  const slug = slugify(title || 'new-conversation') || 'new-conversation';
+  return getStandaloneWorkspaceRoot() + '\\' + slug;
+}
+
+function createPhoneConversation({ projectPath = '', title = 'New Phone Task' } = {}) {
+  const convId = 'conv-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
+  const normalizedProjectPath = String(projectPath || '').trim();
+  const conv = {
+    id: convId,
+    title,
+    messages: [],
+    createdAt: Date.now(),
+    workspace: normalizedProjectPath || '',
+    projectPath: normalizedProjectPath,
+    tasks: [],
+    awaitingPlanApproval: false,
+    planApproved: false
+  };
+  conversations.unshift(conv);
+  saveConversationsToStorage();
+  return conv;
+}
+
 function loadConversationsFromStorage() {
   const raw = localStorage.getItem('ag2_conversations');
   const backup = localStorage.getItem('ag2_conversations_backup');
@@ -1311,8 +1350,7 @@ async function submitMessage() {
     if (conv.projectPath) {
       conv.workspace = conv.projectPath;
     } else {
-      const slug = slugify(title);
-      conv.workspace = 'C:\\Users\\Owner\\.gemini\\antigravity\\scratch\\standalone' + '\\' + slug;
+      conv.workspace = getStandaloneWorkspaceForTitle(title);
     }
   }
   
@@ -2005,56 +2043,43 @@ function hasRequiredTestingPlanSection(content) {
 }
 
 window.startPhoneCompanionTask = async (options = {}) => {
-  const convId = 'conv-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
-  const conv = {
-    id: convId,
-    title: 'New Phone Task',
-    messages: [],
-    createdAt: Date.now(),
-    workspace: currentWorkspace,
-    projectPath: window.getCurrentProject ? window.getCurrentProject() : '',
-    tasks: [],
-    awaitingPlanApproval: false,
-    planApproved: false
-  };
-  conversations.unshift(conv);
-  saveConversationsToStorage();
+  const conv = createPhoneConversation({
+    projectPath: options.projectPath || '',
+    title: 'New Phone Task'
+  });
 
   const prompt = String(options.prompt || '').trim();
   if (prompt) {
-    await window.submitPhoneCompanionPrompt({ prompt, conversationId: convId });
+    await window.submitPhoneCompanionPrompt({ prompt, conversationId: conv.id });
   }
-  return { success: true, conversationId: convId };
+  return { success: true, conversationId: conv.id, workspace: conv.workspace, projectPath: conv.projectPath };
 };
 
 window.submitPhoneCompanionPrompt = async (options) => {
   // Can be called with either a string or an options object
   const text = typeof options === 'string' ? options.trim() : String(options.prompt || '').trim();
-  const targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
+  let targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
 
   if (!text) return { success: false, error: 'Missing prompt' };
 
   let conv = conversations.find(c => c.id === targetId);
   if (!conv) {
-    conv = {
-      id: targetId,
-      title: 'New Phone Task',
-      messages: [],
-      createdAt: Date.now(),
-      workspace: currentWorkspace,
-      projectPath: window.getCurrentProject ? window.getCurrentProject() : '',
-      tasks: [],
-      awaitingPlanApproval: false,
-      planApproved: false
-    };
-    conversations.unshift(conv);
-    saveConversationsToStorage();
+    conv = createPhoneConversation({
+      projectPath: typeof options === 'object' ? options.projectPath || '' : '',
+      title: 'New Phone Task'
+    });
+    targetId = conv.id;
   }
 
   // Generate a short title if it's new
   if (conv.messages.length === 0 || conv.title === 'New Phone Task' || conv.title === 'Untitled Conversation') {
     conv.title = text.length > 40 ? text.substring(0, 40) + '...' : text;
   }
+  normalizeConversationWorkspace(conv);
+  if (!conv.workspace) {
+    conv.workspace = conv.projectPath || getStandaloneWorkspaceForTitle(conv.title);
+  }
+  saveConversationsToStorage();
 
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
 
@@ -2522,3 +2547,4 @@ window.onRagStatusChange = (statusText) => {
 };
 
 window.getCurrentProject = () => currentWorkspace;
+window.isProModeActive = () => el.proModeCheckbox ? el.proModeCheckbox.checked : false;

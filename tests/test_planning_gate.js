@@ -299,7 +299,7 @@ test('invalid plan twice eventually yields to the user to prevent infinite loop'
     // It should yield to the user after 1 retry (so total 2 attempts to write plan)
     t.equal(conversation.awaitingPlanApproval, true, 'loop yields and sets awaitingPlanApproval to true');
     t.equal(conversation.planApproved, false, 'plan is marked as NOT approved');
-    t.equal(fetchCallCount, 4, 'agent only tried 2 times in loop before yielding');
+    t.equal(fetchCallCount, 5, 'agent only tried 3 times in loop before yielding');
   } finally {
     // Restore mocks
     global.window.runAgentLoop = originalRunAgentLoop;

@@ -177,6 +177,41 @@ test('write_file refuses silent full-file overwrites', (t) => {
   t.end();
 });
 
+test('post-edit evidence gate requires real verification before finalizing', (t) => {
+  t.ok(agentJs.includes('Post-edit evidence gate'), 'agent has a post-edit evidence gate prompt');
+  t.ok(agentJs.includes('Verification guard: code changed'), 'agent logs when the verification guard keeps working');
+  t.equal(agent.isRealVerificationCommand('mkdir assets'), false, 'folder creation is not verification');
+  t.equal(agent.isRealVerificationCommand('python -m py_compile main.py'), true, 'Python compile check counts as verification');
+  t.equal(agent.isRealVerificationCommand('npm test'), true, 'npm test counts as verification');
+
+  const changedOnly = [
+    { kind: 'file', toolName: 'patch_file', path: 'main.py', status: 'done' },
+    { toolName: 'run_command', kind: 'command', command: 'mkdir assets', label: 'Ran `mkdir assets`', status: 'done' }
+  ];
+  t.equal(agent.hasVerificationAfterLastFileEdit(changedOnly), false, 'non-verification command after edit does not satisfy evidence gate');
+  t.ok(agent.buildPostEditEvidencePrompt(changedOnly, { canExecute: true, promptCount: 0 }).includes('Call the necessary tools now'), 'guard asks for concrete tools');
+
+  const verified = [
+    { kind: 'file', toolName: 'patch_file', path: 'main.py', status: 'done' },
+    { toolName: 'read_file', path: 'main.py', status: 'done' },
+    { toolName: 'run_command', kind: 'command', command: 'python -m py_compile main.py', label: 'Ran `python -m py_compile main.py`', status: 'done' }
+  ];
+  t.equal(agent.hasVerificationAfterLastFileEdit(verified), true, 'real verification after edit satisfies evidence gate');
+  t.equal(agent.buildPostEditEvidencePrompt(verified, { canExecute: true, promptCount: 0 }), '', 'guard does not fire after read and verification evidence');
+  t.end();
+});
+
+test('final verification summary calls out fake checks and gaps', (t) => {
+  const summary = agent.buildFinalVerificationSummary([
+    { kind: 'file', toolName: 'write_file', path: 'main.py', status: 'done' },
+    { toolName: 'run_command', kind: 'command', command: 'mkdir assets', label: 'Ran `mkdir assets`', status: 'done' }
+  ]);
+  t.ok(summary.includes('Verification gap'), 'summary exposes missing verification after source edits');
+  t.ok(summary.includes('Non-verification commands'), 'summary labels filesystem chores as non-verification');
+  t.ok(summary.includes('These do not prove the code works'), 'summary explains why non-verification commands are insufficient');
+  t.end();
+});
+
 test('workspace artifacts and file explorer controls are wired', (t) => {
   t.ok(agentJs.includes('buildRunArtifactPayload'), 'agent builds external run artifact payloads');
   t.ok(agentJs.includes('writeRunArtifact'), 'agent writes run artifacts through IPC');
@@ -186,6 +221,15 @@ test('workspace artifacts and file explorer controls are wired', (t) => {
   t.ok(rendererJs.includes('copyWorkspacePath'), 'file explorer copy handler exists');
   t.ok(rendererJs.includes('dragstart'), 'file explorer drag start is wired');
   t.ok(rendererJs.includes('drop'), 'file explorer drop move is wired');
+  t.end();
+});
+
+test('phone standalone conversations get isolated workspaces', (t) => {
+  t.ok(rendererJs.includes('function getStandaloneWorkspaceRoot'), 'standalone workspace root helper exists');
+  t.ok(rendererJs.includes('Desktop\\\\Projects\\\\OrionAI\\\\standalone-workspaces'), 'default standalone root lives under OrionAI project folder');
+  t.ok(rendererJs.includes('function createPhoneConversation'), 'phone conversations use a dedicated constructor');
+  t.ok(rendererJs.includes('projectPath: normalizedProjectPath'), 'phone constructor preserves explicit project linkage only');
+  t.ok(rendererJs.includes('conv.workspace = conv.projectPath || getStandaloneWorkspaceForTitle(conv.title)'), 'standalone phone prompt initializes an isolated workspace');
   t.end();
 });
 

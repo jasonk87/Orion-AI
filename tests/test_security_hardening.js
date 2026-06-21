@@ -16,6 +16,10 @@ test('workspace containment rejects lexical and link escapes', (t) => {
 
   t.throws(() => safety.resolveWorkspacePath(workspace, '../outside.txt'), /escapes/, 'rejects lexical parent escape');
 
+  // Test resolveWorkspacePath with a non-existent workspace folder
+  const nonExistentWorkspace = path.join(os.tmpdir(), 'orion-non-existent-workspace-' + Date.now());
+  t.doesNotThrow(() => safety.resolveWorkspacePath(nonExistentWorkspace, 'somefile.txt'), 'does not throw when workspace does not exist');
+
   const linkPath = path.join(workspace, 'linked-outside');
   try {
     fs.symlinkSync(outside, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
