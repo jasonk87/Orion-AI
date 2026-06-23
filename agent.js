@@ -90,8 +90,12 @@ const OPERATIONAL_CONTEXT_TOOL_DECLARATIONS = [
   },
   {
     name: 'complete_subplan',
-    description: 'Completes the current subplan only with concrete test, inspection, or user-confirmation evidence.',
-    parameters: { type: 'OBJECT', properties: { summary: { type: 'STRING' }, evidence: { type: 'ARRAY', items: { type: 'STRING' } }, nextAction: { type: 'STRING' } }, required: ['evidence'] }
+    description: 'Completes and automatically distills the current subplan. Requires concrete evidence; keep durable lessons and summarize temporary context to discard.',
+    parameters: { type: 'OBJECT', properties: {
+      summary: { type: 'STRING' }, evidence: { type: 'ARRAY', items: { type: 'STRING' } }, nextAction: { type: 'STRING' },
+      keep: { type: 'ARRAY', items: { type: 'OBJECT', properties: { text: { type: 'STRING' }, category: { type: 'STRING' }, evidence: { type: 'STRING' } }, required: ['text'] } },
+      discard: { type: 'ARRAY', items: { type: 'OBJECT', properties: { summary: { type: 'STRING' }, reason: { type: 'STRING' } }, required: ['summary'] } }
+    }, required: ['evidence'] }
   },
   {
     name: 'record_blocker',

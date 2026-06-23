@@ -31,6 +31,7 @@
       blockers: { active: [], resolved: [] },
       discoveries: [],
       discarded: [],
+      lastDistillation: null,
       lastCheckpoint: null,
       createdAt: at,
       updatedAt: at
@@ -97,6 +98,13 @@
       },
       discoveries: Array.isArray(source.discoveries) ? source.discoveries.slice(-MAX_DISCOVERIES) : [],
       discarded: Array.isArray(source.discarded) ? source.discarded.slice(-MAX_DISCARDED) : [],
+      lastDistillation: source.lastDistillation && typeof source.lastDistillation === 'object' ? {
+        subplanId: cleanText(source.lastDistillation.subplanId, 100),
+        subplanTitle: cleanText(source.lastDistillation.subplanTitle, 1000),
+        kept: Array.isArray(source.lastDistillation.kept) ? source.lastDistillation.kept.map(item => cleanText(item, 4000)).filter(Boolean).slice(-20) : [],
+        discarded: Array.isArray(source.lastDistillation.discarded) ? source.lastDistillation.discarded.map(item => cleanText(item, 2000)).filter(Boolean).slice(-20) : [],
+        at: source.lastDistillation.at || null
+      } : null,
       createdAt: source.createdAt || at,
       updatedAt: source.updatedAt || at
     };
@@ -164,7 +172,44 @@
         state.activeSubplan.nextAction = cleanText(args.nextAction, 2000);
         state.activeSubplan.updatedAt = at;
         state.activeSubplan.completedAt = at;
-        event.summary = `Subplan completed: ${state.activeSubplan.title}`;
+        const explicitKeep = Array.isArray(args.keep) ? args.keep.map(item => typeof item === 'string' ? { text: item } : item).filter(Boolean) : [];
+        const kept = explicitKeep.length ? explicitKeep : [{
+          text: `Completed ${state.activeSubplan.title}: ${state.activeSubplan.summary || 'Verified subplan outcome.'}`,
+          category: 'verified_outcome',
+          evidence: evidence.join('; ')
+        }];
+        kept.forEach(item => {
+          const text = cleanText(item.text, 4000);
+          if (!text || state.discoveries.some(existing => existing.text.toLowerCase() === text.toLowerCase())) return;
+          state.discoveries.push({
+            id: makeId('discovery', text, at),
+            text,
+            category: cleanText(item.category, 100) || 'subplan_lesson',
+            evidence: cleanText(item.evidence, 2000) || evidence.join('; ').slice(0, 2000),
+            promotedAt: at
+          });
+        });
+        state.discoveries = state.discoveries.slice(-MAX_DISCOVERIES);
+
+        const explicitDiscard = Array.isArray(args.discard) ? args.discard.map(item => typeof item === 'string' ? { summary: item } : item).filter(Boolean) : [];
+        const tossed = explicitDiscard.length ? explicitDiscard : [{
+          summary: `Temporary working details from completed subplan: ${state.activeSubplan.title}`,
+          reason: 'Subplan is complete; verified outcome and evidence were retained.'
+        }];
+        tossed.forEach(item => {
+          const summary = cleanText(item.summary, 2000);
+          if (!summary) return;
+          state.discarded.push({ id: makeId('discarded', summary, at), summary, reason: cleanText(item.reason, 1000), discardedAt: at });
+        });
+        state.discarded = state.discarded.slice(-MAX_DISCARDED);
+        state.lastDistillation = {
+          subplanId: state.activeSubplan.id,
+          subplanTitle: state.activeSubplan.title,
+          kept: kept.map(item => cleanText(item.text, 4000)).filter(Boolean),
+          discarded: tossed.map(item => cleanText(item.summary, 2000)).filter(Boolean),
+          at
+        };
+        event.summary = `Subplan completed and distilled: ${state.activeSubplan.title} (${state.lastDistillation.kept.length} kept, ${state.lastDistillation.discarded.length} discarded)`;
         break;
       }
       case 'record_blocker': {

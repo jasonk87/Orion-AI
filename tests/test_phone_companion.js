@@ -137,6 +137,8 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
   t.ok(root.text.includes('<title>Orion</title>'), 'root shell serves the Orion mobile UI');
   t.ok(root.text.includes('Recents'), 'root shell includes Codex-style recents');
   t.ok(root.text.includes('Projects'), 'root shell includes project selection');
+  t.ok(root.text.includes('Mission Control'), 'root shell includes mobile mission context');
+  t.ok(root.text.includes('state.operationalContext'), 'mobile shell renders operational context from state');
   t.notOk(root.text.includes('Start a new Orion task:'), 'new task no longer requires a prompt/name dialog');
 
   const manifest = await request('GET', 1131, '/manifest.webmanifest');
@@ -300,6 +302,15 @@ test('Phone Companion v2 task dashboard carries global running, viewed state, qu
     queuedPrompts: 2,
     queuedPromptPreview: ['npm test', 'git status'],
     subStatus: 'Running webpack...',
+    operationalContext: {
+      revision: 4,
+      mission: 'Build a deep colony simulation.',
+      activeObjective: 'Create the playable loop.',
+      activeSubplan: { title: 'Implement economy', status: 'active', nextAction: 'Run balance test.' },
+      winConditions: [{ id: 'economy', title: 'Working economy', status: 'in_progress', evidenceCount: 1 }],
+      blockers: [{ id: 'save', title: 'Save format mismatch', details: 'Old schema.' }],
+      lastDistillation: null
+    },
     preview: {
       latestAssistantOutput: 'latest',
       workWalkthrough: 'Done: test',
@@ -323,6 +334,9 @@ test('Phone Companion v2 task dashboard carries global running, viewed state, qu
   t.equal(state.queuedPrompts, 2, 'carries queuedPrompts count');
   t.deepEqual(state.queuedPromptPreview, ['npm test', 'git status'], 'carries queuedPromptPreview');
   t.equal(state.subStatus, 'Running webpack...', 'carries subStatus');
+  t.equal(state.operationalContext.mission, 'Build a deep colony simulation.', 'carries mission context');
+  t.equal(state.operationalContext.activeSubplan.title, 'Implement economy', 'carries active subplan');
+  t.equal(state.operationalContext.blockers[0].title, 'Save format mismatch', 'carries active blockers');
   
   t.equal(state.preview.appLaunchLogs, 'Server listening on port 3000', 'carries appLaunchLogs in activity panel');
   t.equal(state.preview.appLaunchUrl, 'http://localhost:3000', 'carries appLaunchUrl');

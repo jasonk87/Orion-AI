@@ -2061,7 +2061,7 @@ window.onAgentStatusChange = (running) => {
   }
 };
 window.renderUserMessageInChat = renderUserMessage;
-window.getPhoneCompanionState = (targetConversationId) => {
+window.getPhoneCompanionState = async (targetConversationId) => {
   const resolvedId = targetConversationId || activeConversationId;
   const conv = conversations.find(c => c.id === resolvedId);
   const messages = conv && conv.messages ? conv.messages.slice(-40).map(msg => ({
@@ -2099,12 +2099,32 @@ window.getPhoneCompanionState = (targetConversationId) => {
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
   const globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
   const isActiveTargetRunning = isGlobalRunning && globalRunningId === resolvedId;
+  const companionWorkspace = conv ? (conv.workspace || conv.projectPath || currentWorkspace || '') : currentWorkspace;
+  const operationalResult = companionWorkspace && window.readOperationalContext
+    ? await window.readOperationalContext(companionWorkspace)
+    : null;
+  const operationalState = operationalResult && operationalResult.state
+    ? window.OrionOperationalContext.normalizeContext(operationalResult.state)
+    : window.OrionOperationalContext.createEmptyContext();
+  const operationalContext = {
+    revision: operationalState.revision,
+    mission: operationalState.mission.statement,
+    activeObjective: operationalState.activeObjective ? operationalState.activeObjective.title : '',
+    activeSubplan: operationalState.activeSubplan ? {
+      title: operationalState.activeSubplan.title,
+      status: operationalState.activeSubplan.status,
+      nextAction: operationalState.activeSubplan.nextAction
+    } : null,
+    winConditions: operationalState.winConditions.map(item => ({ id: item.id, title: item.title, status: item.status, evidenceCount: item.evidence.length })),
+    blockers: operationalState.blockers.active.map(item => ({ id: item.id, title: item.title, details: item.details })),
+    lastDistillation: operationalState.lastDistillation
+  };
 
   return {
     conversationId: resolvedId,
     title: conv ? conv.title : '',
     conversations: conversationsSummary,
-    workspace: conv ? (conv.workspace || conv.projectPath || currentWorkspace || '') : currentWorkspace,
+    workspace: companionWorkspace,
     running: isActiveTargetRunning,
     globalRunning: isGlobalRunning,
     runningConversationId: globalRunningId,
@@ -2116,6 +2136,7 @@ window.getPhoneCompanionState = (targetConversationId) => {
     model: window.getSelectedModel(),
     messages,
     latestOutput: latestOutput ? latestOutput.text : '',
+    operationalContext,
     preview: {
       latestAssistantOutput: latestText,
       workWalkthrough,

@@ -54,10 +54,28 @@ test('subplans require evidence before completion', (t) => {
   state = operational.applyAction(state, 'complete_subplan', {
     summary: 'Save data round-trips.',
     evidence: ['npm test: 42 passing'],
-    nextAction: 'Begin autonomous NPC behavior.'
+    nextAction: 'Begin autonomous NPC behavior.',
+    keep: [{ text: 'Save files use ID-based entity relationships.', category: 'architecture' }],
+    discard: [{ summary: 'Early circular-reference stack traces', reason: 'Serializer is fixed.' }]
   }, '2026-06-23T12:02:00.000Z').state;
   t.equal(state.activeSubplan.status, 'completed', 'evidence permits completion');
   t.ok(state.activeSubplan.completedAt, 'records completion time');
+  t.equal(state.lastDistillation.kept[0], 'Save files use ID-based entity relationships.', 'records what was kept');
+  t.equal(state.lastDistillation.discarded[0], 'Early circular-reference stack traces', 'records what was tossed');
+  t.ok(state.discoveries.some(item => item.text === 'Save files use ID-based entity relationships.'), 'promotes durable lesson automatically');
+  t.ok(state.discarded.some(item => item.summary === 'Early circular-reference stack traces'), 'discards temporary context automatically');
+  t.end();
+});
+
+test('subplan completion produces a safe default distillation', (t) => {
+  let state = operational.applyAction(missionState(), 'start_subplan', { title: 'Economy smoke test' }, T0).state;
+  state = operational.applyAction(state, 'complete_subplan', {
+    summary: 'Resource production and consumption balance correctly.',
+    evidence: ['economy.test.js passed']
+  }, '2026-06-23T12:02:30.000Z').state;
+  t.equal(state.lastDistillation.kept.length, 1, 'retains one verified outcome by default');
+  t.ok(state.lastDistillation.kept[0].includes('Resource production'), 'default retained outcome includes the result');
+  t.equal(state.lastDistillation.discarded.length, 1, 'marks temporary working context discarded');
   t.end();
 });
 
@@ -127,6 +145,7 @@ test('agent and renderer wire operational context into both providers and Missio
   t.ok(agent.includes('formatForPrompt(operationalContext.state)'), 'injects canonical context into model input');
   t.ok(agent.includes("'context_compaction'"), 'checkpoints compaction');
   t.ok(renderer.includes("reason: 'user_steering'"), 'checkpoints steering');
+  t.ok(renderer.includes('operationalContext,'), 'exposes sanitized mission context to Phone Companion');
   t.ok(html.includes('id="operational-context-panel"'), 'renders Mission Control panel');
   t.ok(html.includes('id="operational-context-modal"'), 'provides a direct Mission Control editor');
   t.ok(renderer.includes("mutateOperationalContext(currentWorkspace, 'update_mission_context'"), 'editor persists through validated context transitions');

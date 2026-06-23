@@ -1135,6 +1135,15 @@ function companionHtml(pairingCode) {
       color: var(--muted);
       font-size: .86rem;
     }
+    .mission-mobile-card { display: none; }
+    .mission-mobile-card.visible { display: block; }
+    .mission-mobile-title { font-size: .96rem; font-weight: 760; line-height: 1.35; margin: 7px 0; }
+    .mission-mobile-objective { color: var(--muted); font-size: .78rem; margin-bottom: 10px; }
+    .mission-mobile-condition { display: flex; align-items: flex-start; gap: 8px; padding: 5px 0; color: var(--muted); font-size: .78rem; }
+    .mission-mobile-dot { width: 8px; height: 8px; flex: 0 0 auto; margin-top: 3px; border-radius: 50%; background: #a1a1aa; }
+    .mission-mobile-condition.in_progress .mission-mobile-dot { background: #d97706; }
+    .mission-mobile-condition.satisfied .mission-mobile-dot { background: #059669; }
+    .mission-mobile-blocker { margin-top: 7px; padding: 7px 9px; border-left: 2px solid #dc2626; border-radius: 4px; background: rgba(220,38,38,.06); color: #991b1b; font-size: .75rem; }
     @media (min-width:700px) {
       .app-shell { max-width: 760px; margin: 0 auto; border-left: 1px solid rgba(255,255,255,.05); border-right: 1px solid rgba(255,255,255,.05); }
       form { left: 50%; transform: translateX(-50%); max-width: 760px; }
@@ -1177,6 +1186,17 @@ function companionHtml(pairingCode) {
         
         <div id="active-task-container" class="dashboard-card active-card">
           <div class="empty">Loading tasks...</div>
+        </div>
+
+        <div id="mission-context-card" class="dashboard-card mission-mobile-card">
+          <div class="panel-header-row">
+            <div class="sub-panel-title">Mission Control</div>
+            <span class="badge muted" id="mission-context-revision">Not set</span>
+          </div>
+          <div class="mission-mobile-title" id="mission-context-title"></div>
+          <div class="mission-mobile-objective" id="mission-context-objective"></div>
+          <div id="mission-context-conditions"></div>
+          <div id="mission-context-blockers"></div>
         </div>
 
         <section class="plan-panel" id="plan-panel">
@@ -1279,6 +1299,12 @@ function companionHtml(pairingCode) {
     const attentionTasksContainer = document.getElementById('attention-tasks-container');
     const queuedPromptsContainer = document.getElementById('queued-prompts-container');
     const recentTasksList = document.getElementById('recent-tasks-list');
+    const missionContextCard = document.getElementById('mission-context-card');
+    const missionContextRevision = document.getElementById('mission-context-revision');
+    const missionContextTitle = document.getElementById('mission-context-title');
+    const missionContextObjective = document.getElementById('mission-context-objective');
+    const missionContextConditions = document.getElementById('mission-context-conditions');
+    const missionContextBlockers = document.getElementById('mission-context-blockers');
     
     const installTipEl = document.getElementById('install-tip');
     const form = document.getElementById('prompt-form');
@@ -1379,6 +1405,26 @@ function companionHtml(pairingCode) {
           \`;
         } else {
           activeTaskContainer.innerHTML = '<div class="empty">No task selected</div>';
+        }
+
+        // Mission-level context follows the selected conversation without exposing discarded noise.
+        const missionContext = state.operationalContext || {};
+        const hasMissionContext = !!(missionContext.mission || (missionContext.winConditions || []).length);
+        missionContextCard.classList.toggle('visible', hasMissionContext);
+        if (hasMissionContext) {
+          missionContextRevision.textContent = 'r' + (missionContext.revision || 0);
+          missionContextTitle.textContent = missionContext.mission || 'Mission not defined';
+          missionContextObjective.textContent = missionContext.activeSubplan
+            ? 'Now: ' + missionContext.activeSubplan.title + ' (' + missionContext.activeSubplan.status + ')'
+            : (missionContext.activeObjective ? 'Objective: ' + missionContext.activeObjective : 'No active objective');
+          missionContextConditions.innerHTML = (missionContext.winConditions || []).map(condition =>
+            '<div class="mission-mobile-condition ' + escapeHtml(condition.status) + '">' +
+              '<span class="mission-mobile-dot"></span><span>' + escapeHtml(condition.title) + '</span>' +
+            '</div>'
+          ).join('');
+          missionContextBlockers.innerHTML = (missionContext.blockers || []).map(blocker =>
+            '<div class="mission-mobile-blocker">Blocked: ' + escapeHtml(blocker.title) + '</div>'
+          ).join('');
         }
 
         // 3. Needs Attention / Plan Waiting Tasks
