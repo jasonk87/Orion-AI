@@ -33,6 +33,11 @@ test('operational context creates a mission and preserves win-condition progress
 
   t.equal(state.winConditions[0].status, 'in_progress', 'mission edits retain existing progress');
   t.deepEqual(state.winConditions[0].evidence, ['Economy smoke test executes.'], 'mission edits retain evidence');
+  state = operational.applyAction(state, 'update_mission_context', {
+    mission: 'Build a deep colony simulation.',
+    activeObjective: ''
+  }, '2026-06-23T12:00:04.000Z').state;
+  t.equal(state.activeObjective, null, 'explicitly clears the active objective');
   t.end();
 });
 
@@ -123,5 +128,7 @@ test('agent and renderer wire operational context into both providers and Missio
   t.ok(agent.includes("'context_compaction'"), 'checkpoints compaction');
   t.ok(renderer.includes("reason: 'user_steering'"), 'checkpoints steering');
   t.ok(html.includes('id="operational-context-panel"'), 'renders Mission Control panel');
+  t.ok(html.includes('id="operational-context-modal"'), 'provides a direct Mission Control editor');
+  t.ok(renderer.includes("mutateOperationalContext(currentWorkspace, 'update_mission_context'"), 'editor persists through validated context transitions');
   t.end();
 });

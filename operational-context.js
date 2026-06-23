@@ -122,8 +122,11 @@
             .map((item, index) => normalizeWinCondition(item, index, state.winConditions, at))
             .filter(item => item.title);
         }
-        if (cleanText(args.activeObjective)) {
-          state.activeObjective = { title: cleanText(args.activeObjective, 1000), rationale: cleanText(args.rationale, 2000), startedAt: at, updatedAt: at };
+        if (Object.prototype.hasOwnProperty.call(args, 'activeObjective')) {
+          const objectiveTitle = cleanText(args.activeObjective, 1000);
+          state.activeObjective = objectiveTitle
+            ? { title: objectiveTitle, rationale: cleanText(args.rationale, 2000), startedAt: state.activeObjective && state.activeObjective.title === objectiveTitle ? state.activeObjective.startedAt : at, updatedAt: at }
+            : null;
         }
         event.summary = `Mission updated: ${statement}`;
         break;

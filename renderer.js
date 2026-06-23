@@ -110,6 +110,13 @@ const el = {
   taskCompletionBadge: document.getElementById('task-completion-badge'),
   operationalContextPanel: document.getElementById('operational-context-panel'),
   operationalContextRevision: document.getElementById('operational-context-revision'),
+  btnEditOperationalContext: document.getElementById('btn-edit-operational-context'),
+  operationalContextModal: document.getElementById('operational-context-modal'),
+  btnOperationalContextClose: document.getElementById('btn-operational-context-close'),
+  btnOperationalContextSave: document.getElementById('btn-operational-context-save'),
+  operationalMissionInput: document.getElementById('operational-mission-input'),
+  operationalObjectiveInput: document.getElementById('operational-objective-input'),
+  operationalWinConditionsInput: document.getElementById('operational-win-conditions-input'),
   testIndicator: document.getElementById('test-indicator'),
   lblTestCmd: document.getElementById('lbl-test-cmd'),
   testResults: document.getElementById('test-results-container'),
@@ -145,6 +152,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   await loadSettings();
   setupSettingsModal();
   setupFileViewerModal();
+  setupOperationalContextEditor();
   setupWorkspaceHandlers();
   setupStartActions();
   setupEntrypointControls();
@@ -1868,6 +1876,65 @@ async function refreshOperationalContext(workspace = currentWorkspace) {
   }
   const result = await window.readOperationalContext(workspace);
   updateOperationalContext(result && result.state);
+}
+
+function closeOperationalContextEditor() {
+  if (el.operationalContextModal) el.operationalContextModal.classList.remove('active');
+}
+
+async function openOperationalContextEditor() {
+  if (!currentWorkspace) {
+    alert('Choose a workspace or start a conversation before defining a mission.');
+    return;
+  }
+  const result = await window.readOperationalContext(currentWorkspace);
+  const context = result && result.state
+    ? window.OrionOperationalContext.normalizeContext(result.state)
+    : window.OrionOperationalContext.createEmptyContext();
+  el.operationalMissionInput.value = context.mission.statement;
+  el.operationalObjectiveInput.value = context.activeObjective ? context.activeObjective.title : '';
+  el.operationalWinConditionsInput.value = context.winConditions.map(item => item.title).join('\n');
+  el.operationalContextModal.classList.add('active');
+  el.operationalMissionInput.focus();
+}
+
+async function saveOperationalContextEditor() {
+  const mission = el.operationalMissionInput.value.trim();
+  if (!mission) {
+    alert('Mission is required.');
+    el.operationalMissionInput.focus();
+    return;
+  }
+  const winConditions = el.operationalWinConditionsInput.value
+    .split(/\r?\n/)
+    .map(title => title.trim())
+    .filter(Boolean)
+    .filter((title, index, all) => all.findIndex(candidate => candidate.toLowerCase() === title.toLowerCase()) === index)
+    .map(title => ({ title }));
+  el.btnOperationalContextSave.disabled = true;
+  try {
+    await window.mutateOperationalContext(currentWorkspace, 'update_mission_context', {
+      mission,
+      activeObjective: el.operationalObjectiveInput.value.trim(),
+      winConditions
+    });
+    closeOperationalContextEditor();
+    appendSystemMessage(`Mission Control updated with ${winConditions.length} win condition${winConditions.length === 1 ? '' : 's'}.`);
+  } catch (error) {
+    alert(`Could not save mission: ${error.message}`);
+  } finally {
+    el.btnOperationalContextSave.disabled = false;
+  }
+}
+
+function setupOperationalContextEditor() {
+  if (!el.operationalContextModal) return;
+  el.btnEditOperationalContext.addEventListener('click', openOperationalContextEditor);
+  el.btnOperationalContextClose.addEventListener('click', closeOperationalContextEditor);
+  el.btnOperationalContextSave.addEventListener('click', saveOperationalContextEditor);
+  el.operationalContextModal.addEventListener('click', event => {
+    if (event.target === el.operationalContextModal) closeOperationalContextEditor();
+  });
 }
 
 // --- REGRESSION TEST PANEL ---
