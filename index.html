@@ -180,6 +180,16 @@
       <div class="sidebar-header">
         <h3>&#9889; Agent Panel</h3>
       </div>
+
+      <div class="panel-section operational-context-section">
+        <div class="panel-section-title">
+          <span>Mission Control</span>
+          <span class="badge muted" id="operational-context-revision">Not set</span>
+        </div>
+        <div class="panel-content operational-context-panel" id="operational-context-panel">
+          <p class="empty-state">Define a mission to give Orion durable operational direction.</p>
+        </div>
+      </div>
       
       <!-- Planning & Task Checklist -->
       <div class="panel-section">
@@ -343,6 +353,7 @@
   <script src="node_modules/prismjs/components/prism-javascript.min.js"></script>
   <script src="node_modules/prismjs/components/prism-css.min.js"></script>
   <script src="node_modules/prismjs/components/prism-json.min.js"></script>
+  <script src="operational-context.js"></script>
   <script src="renderer.js"></script>
   <script src="agent.js"></script>
 </body>

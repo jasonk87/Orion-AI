@@ -108,6 +108,8 @@ const el = {
   // Right Agent Panel
   taskChecklist: document.getElementById('task-checklist-container'),
   taskCompletionBadge: document.getElementById('task-completion-badge'),
+  operationalContextPanel: document.getElementById('operational-context-panel'),
+  operationalContextRevision: document.getElementById('operational-context-revision'),
   testIndicator: document.getElementById('test-indicator'),
   lblTestCmd: document.getElementById('lbl-test-cmd'),
   testResults: document.getElementById('test-results-container'),
@@ -985,6 +987,13 @@ function triggerSteer() {
   if (window.steeringQueue) {
     window.steeringQueue.push(text);
     appendSteeringMessage(text);
+    if (currentWorkspace && window.mutateOperationalContext) {
+      window.mutateOperationalContext(currentWorkspace, 'checkpoint', {
+        reason: 'user_steering',
+        summary: `User steering received: ${text.slice(0, 800)}`,
+        nextAction: 'Apply the steering instruction before continuing the active subplan.'
+      }).catch(error => console.warn('Could not checkpoint steering:', error));
+    }
   }
   el.chatInput.value = '';
   document.getElementById('btn-steer').style.display = 'none';
@@ -1309,6 +1318,7 @@ function selectConversation(id) {
   // Reload tasks & tests
   updateTasksChecklist(conv.tasks);
   updateTestResultsPanel(conv.testResults);
+  refreshOperationalContext(conv.workspace);
   loadRunArtifacts();
   
   // Scroll to bottom
@@ -1815,6 +1825,51 @@ function updateTasksChecklist(tasks) {
   el.taskCompletionBadge.textContent = `${percentage}%`;
 }
 
+function updateOperationalContext(state) {
+  if (!el.operationalContextPanel || !el.operationalContextRevision) return;
+  const context = state && window.OrionOperationalContext
+    ? window.OrionOperationalContext.normalizeContext(state)
+    : null;
+  if (!context || (!context.mission.statement && context.winConditions.length === 0)) {
+    el.operationalContextRevision.textContent = 'Not set';
+    el.operationalContextPanel.innerHTML = '<p class="empty-state">Define a mission to give Orion durable operational direction.</p>';
+    return;
+  }
+
+  const satisfied = context.winConditions.filter(item => item.status === 'satisfied').length;
+  const winProgress = context.winConditions.length ? `${satisfied}/${context.winConditions.length}` : 'No conditions';
+  const blockers = context.blockers.active;
+  const conditionMarkup = context.winConditions.slice(0, 8).map(item => `
+    <div class="mission-condition ${item.status}">
+      <span class="mission-condition-dot"></span>
+      <span>${escapeHtml(item.title)}</span>
+    </div>
+  `).join('');
+  const blockerMarkup = blockers.slice(0, 4).map(item => `<div class="mission-blocker">${escapeHtml(item.title)}</div>`).join('');
+
+  el.operationalContextRevision.textContent = `r${context.revision}`;
+  el.operationalContextPanel.innerHTML = `
+    <div class="mission-label">Mission</div>
+    <div class="mission-statement">${escapeHtml(context.mission.statement || 'Not defined')}</div>
+    <div class="mission-meta-row">
+      <span>${escapeHtml(context.activeObjective ? context.activeObjective.title : 'No active objective')}</span>
+      <span>${winProgress}</span>
+    </div>
+    ${context.activeSubplan ? `<div class="mission-subplan"><strong>Now:</strong> ${escapeHtml(context.activeSubplan.title)} <span class="mission-status">${escapeHtml(context.activeSubplan.status)}</span></div>` : ''}
+    ${conditionMarkup ? `<div class="mission-conditions">${conditionMarkup}</div>` : ''}
+    ${blockerMarkup ? `<div class="mission-blockers"><div class="mission-label">Blockers</div>${blockerMarkup}</div>` : ''}
+  `;
+}
+
+async function refreshOperationalContext(workspace = currentWorkspace) {
+  if (!workspace || !window.readOperationalContext) {
+    updateOperationalContext(null);
+    return;
+  }
+  const result = await window.readOperationalContext(workspace);
+  updateOperationalContext(result && result.state);
+}
+
 // --- REGRESSION TEST PANEL ---
 function updateTestResultsPanel(results) {
   if (!el.testResults || !el.testIndicator) return;
@@ -1905,6 +1960,8 @@ window.getCurrentWorkspace = () => currentWorkspace;
 window.getSelectedModel = () => el.modelSelect ? el.modelSelect.value : appConfig.defaultModel;
 window.selectConversationById = selectConversation;
 window.updateTasksChecklist = updateTasksChecklist;
+window.updateOperationalContext = updateOperationalContext;
+window.refreshOperationalContext = refreshOperationalContext;
 window.updateTestResultsPanel = updateTestResultsPanel;
 window.runRegressionTests = runRegressionTests;
 window.renderAiMessage = renderAiMessage;

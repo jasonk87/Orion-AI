@@ -10,6 +10,7 @@ CRITICAL RULES:
 3. WEB RESEARCH: If you are unsure about an API, library, framework, command, model parameter, error message, current behavior, or documentation detail, use "google_search" and then "fetch_web_page" on the most relevant official docs or primary source before editing. Do not invent configuration files or API shapes when files are missing or the correct implementation is unclear. Do not say you reviewed, checked, verified, or confirmed documentation unless you actually used these web tools in the current task and can name the source URL. If docs appear to say something surprising, quote or paraphrase the exact relevant rule before changing files.
 4. CONTEXT INTEGRITY: Keep files clean, respect formatting, and preserve comments that are unrelated to your edits.
 5. NOTES AND MEMORY: Use project/standalone notes as durable working memory. Read them when orienting, and update them when you learn durable facts: architecture, important files, commands, decisions, user preferences, gotchas, open tasks, test status, and future repair notes. Project notes are shared across every conversation in the same project; standalone notes belong only to that standalone conversation. Keep notes concise and useful, not a transcript.
+5A. OPERATIONAL CONTEXT: For long-running or multi-subplan goals, maintain mission, measurable win conditions, active objective/subplan, blockers, and retained discoveries with the operational-context tools. Treat operational context as canonical working state, not another chat transcript. Promote durable lessons; discard summaries of fixed errors, dead ends, and temporary output. Never mark a subplan or win condition complete without concrete evidence from tests, inspected output, or explicit user confirmation.
 6. DESIGN QUALITY: When creating apps, games, dashboards, or visual tools, make them visually polished and pleasant by default. Treat beauty, layout, typography, color, spacing, motion, and interaction feedback as part of "working." Avoid bare black boxes, default controls, tiny unstyled text, and placeholder-looking screens unless the user explicitly asks for minimal output. For games, include a cohesive visual theme, clear HUD, start/game-over states, readable controls, animation polish, and a satisfying feel.
 7. FOLLOW-UP TIMERS: If you say you will wait, check back, continue after N seconds/minutes, or inspect long-running training/tests later, you MUST call "schedule_followup". Do not merely say you will wait. Schedule only one active follow-up for the same purpose; when the follow-up runs, actually inspect status/output and either continue work, stop the process, or clearly finish.
 7A. ADAPT INSTEAD OF QUITTING: Do not abandon a task after ordinary errors. If an edit, command, test, or route check fails, inspect fresh state, group repeated failures, look up official/current docs when needed, and try a different strategy. Stop only for hard blockers such as missing credentials, unavailable model access, explicit user stop, or a hard-destructive command block; when stopping, preserve state and explain the exact next recovery step.
@@ -42,6 +43,9 @@ Tools available:
 - schedule_followup: Schedule Orion to continue this conversation after a delay.
 - read_notes: Read durable project or standalone notes for this conversation scope.
 - update_notes: Replace or append durable project/standalone notes for this conversation scope.
+- read_operational_context: Read the canonical mission-level working state.
+- update_mission_context, start_subplan, update_subplan_context, complete_subplan: Manage the mission route and current work segment.
+- record_blocker, resolve_blocker, promote_discovery, discard_noise, evaluate_win_conditions: Distill useful state and remove operational clutter.
 - google_search: Search Google for current docs, API references, examples, and troubleshooting.
 - fetch_web_page: Fetch the text content of a specific web page found via search.
 - sync_workspace_env: Safely write configured API keys/search IDs into .env-style files without exposing the secret values in chat or tool output.
@@ -58,6 +62,63 @@ const GEMINI_THINKING_BUDGET = 24576;
 const MODEL_API_REQUEST_TIMEOUT_MS = 60000;
 const MODEL_API_MAX_RETRY_WAIT_MS = 45000;
 const MODEL_API_MAX_ATTEMPTS = 3;
+const OperationalContext = window.OrionOperationalContext || (typeof require === 'function' ? require('./operational-context') : null);
+
+const OPERATIONAL_CONTEXT_TOOL_DECLARATIONS = [
+  {
+    name: 'read_operational_context',
+    description: 'Reads Orion mission, win conditions, active objective/subplan, blockers, discoveries, discarded noise, and latest checkpoint.',
+    parameters: { type: 'OBJECT', properties: {} }
+  },
+  {
+    name: 'update_mission_context',
+    description: 'Creates or updates the durable mission and measurable win conditions. Use for long-running goals, not ordinary one-step requests.',
+    parameters: { type: 'OBJECT', properties: {
+      mission: { type: 'STRING' }, activeObjective: { type: 'STRING' }, rationale: { type: 'STRING' },
+      winConditions: { type: 'ARRAY', items: { type: 'OBJECT', properties: { id: { type: 'STRING' }, title: { type: 'STRING' }, status: { type: 'STRING' }, evidence: { type: 'ARRAY', items: { type: 'STRING' } }, notes: { type: 'STRING' } }, required: ['title'] } }
+    }, required: ['mission'] }
+  },
+  {
+    name: 'start_subplan',
+    description: 'Starts the next bounded route segment under the current mission.',
+    parameters: { type: 'OBJECT', properties: { title: { type: 'STRING' }, objective: { type: 'STRING' }, rationale: { type: 'STRING' }, steps: { type: 'ARRAY', items: { type: 'STRING' } }, summary: { type: 'STRING' }, nextAction: { type: 'STRING' } }, required: ['title'] }
+  },
+  {
+    name: 'update_subplan_context',
+    description: 'Updates meaningful active-subplan state. Do not call for routine narration or raw tool output.',
+    parameters: { type: 'OBJECT', properties: { title: { type: 'STRING' }, status: { type: 'STRING' }, steps: { type: 'ARRAY', items: { type: 'STRING' } }, summary: { type: 'STRING' }, nextAction: { type: 'STRING' } } }
+  },
+  {
+    name: 'complete_subplan',
+    description: 'Completes the current subplan only with concrete test, inspection, or user-confirmation evidence.',
+    parameters: { type: 'OBJECT', properties: { summary: { type: 'STRING' }, evidence: { type: 'ARRAY', items: { type: 'STRING' } }, nextAction: { type: 'STRING' } }, required: ['evidence'] }
+  },
+  {
+    name: 'record_blocker',
+    description: 'Records a current mission blocker. Prefer this after a repeated or genuinely blocking failure, not every transient error.',
+    parameters: { type: 'OBJECT', properties: { id: { type: 'STRING' }, title: { type: 'STRING' }, details: { type: 'STRING' }, source: { type: 'STRING' } }, required: ['title'] }
+  },
+  {
+    name: 'resolve_blocker',
+    description: 'Moves an active blocker to resolved and retains its useful lesson.',
+    parameters: { type: 'OBJECT', properties: { id: { type: 'STRING', description: 'Blocker id or exact title.' }, resolution: { type: 'STRING' }, lesson: { type: 'STRING' } }, required: ['id', 'resolution'] }
+  },
+  {
+    name: 'promote_discovery',
+    description: 'Retains a durable architecture fact, command, constraint, API, preference, or lesson that will matter later.',
+    parameters: { type: 'OBJECT', properties: { text: { type: 'STRING' }, category: { type: 'STRING' }, evidence: { type: 'STRING' } }, required: ['text'] }
+  },
+  {
+    name: 'discard_noise',
+    description: 'Records that temporary output, a failed guess, dead-end plan, or fixed error should not influence future work. Store only a short summary, never raw noise.',
+    parameters: { type: 'OBJECT', properties: { summary: { type: 'STRING' }, reason: { type: 'STRING' } }, required: ['summary'] }
+  },
+  {
+    name: 'evaluate_win_conditions',
+    description: 'Updates win-condition progress. A condition cannot be satisfied without concrete evidence.',
+    parameters: { type: 'OBJECT', properties: { evaluations: { type: 'ARRAY', items: { type: 'OBJECT', properties: { id: { type: 'STRING' }, title: { type: 'STRING' }, status: { type: 'STRING' }, evidence: { type: 'ARRAY', items: { type: 'STRING' } }, notes: { type: 'STRING' } } } } }, required: ['evaluations'] }
+  }
+];
 
 window.steeringQueue = [];
 window.promptQueue = [];
@@ -177,6 +238,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   }
 
   const scopedNotes = await readScopedNotes(workspacePath, conversation);
+  const operationalContext = await readOperationalContext(workspacePath);
+  const operationalPrompt = OperationalContext.formatForPrompt(operationalContext.state);
+  if (operationalPrompt) {
+    messages.unshift(
+      { role: 'user', parts: [{ text: operationalPrompt }] },
+      { role: 'model', parts: [{ text: 'Understood. I will use this operational state to choose and verify the next useful action.' }] }
+    );
+  }
   if (scopedNotes.content && scopedNotes.content.trim()) {
     messages.unshift(
       {
@@ -289,6 +358,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let lastTextResponse = "Thinking...";
   let aiMessageIndex = conversation.messages.length;
   let workWalkthrough = [];
+  let forceYield = false;
   // Initialize AI message state in conversation list
   conversation.messages.push({ role: 'assistant', text: 'Thinking...', logs: [], turns: [] });
   
@@ -315,6 +385,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         messages = compactResult.messages;
         persistCompactedConversation(conversation, compactResult.summary);
         await appendScopedNotes(workspacePath, conversation, `\n\n## Context Compaction ${new Date().toISOString()}\n${compactResult.summary}\n`);
+        await checkpointOperationalContext(workspacePath, 'context_compaction', 'Conversation context was compacted; canonical mission state was preserved.', 'Continue the active subplan from operational context.');
         aiMessageIndex = conversation.messages.length;
         conversation.messages.push({ role: 'assistant', text: 'Thinking...', logs: [], turns: [] });
         window.saveConversationsToStorage();
@@ -326,7 +397,6 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // Run the agent execution loop (up to 15 steps to prevent runaway bills)
     let loopCount = 0;
     let maxLoops = 20;
-    let forceYield = false;
     let planValidationRetries = 0;
     let consecutiveNoToolCalls = 0;
     let malformedCallsCount = 0;
@@ -711,6 +781,7 @@ ${executionInstruction}]`
           }
           if (failureCount >= 3) {
             const errMsg = `Repeated failure guard paused ${toolName} after ${failureCount} identical failures. ${guidance}`;
+            await checkpointOperationalContext(workspacePath, 'repeated_tool_failure', `${toolName} failed ${failureCount} times: ${String(resultError).slice(0, 500)}`, guidance);
             currentAgentLogs.push({ type: 'thought', content: errMsg });
             toolResponseParts.push({
               functionResponse: {
@@ -722,6 +793,7 @@ ${executionInstruction}]`
             break;
           }
           if (failureCount === 2) {
+            await checkpointOperationalContext(workspacePath, 'tool_failure', `${toolName} repeated a ${baseFailure.category} failure.`, guidance);
             currentAgentLogs.push({ type: 'thought', content: `Repeated ${toolName} failure detected (${baseFailure.category}). ${guidance}` });
             if (typeof result === 'object' && result !== null && !Array.isArray(result)) {
               result.repeatedFailureWarning = guidance;
@@ -840,6 +912,13 @@ ${executionInstruction}]`
         }
       }).catch(() => {});
     }
+    const pendingOperationalTask = (conversation.tasks || []).find(task => task.status !== 'completed' && task.status !== 'x');
+    await checkpointOperationalContext(
+      workspacePath,
+      forceYield ? 'agent_yield' : 'agent_run_complete',
+      String(lastTextResponse || 'Agent run finished.').replace(/\s+/g, ' ').slice(0, 1000),
+      pendingOperationalTask ? pendingOperationalTask.title : ''
+    );
     
     // Clear the active bubble tracking ONLY after the final render has updated it (removing the spinner)
     window.clearActiveAiBubble();
@@ -1160,6 +1239,19 @@ async function executeTool(name, args, workspace, config, conversation) {
       }
       return await writeScopedNotes(workspace, conversation, args.content);
     }
+
+    case 'read_operational_context':
+      return await readOperationalContext(workspace);
+    case 'update_mission_context':
+    case 'start_subplan':
+    case 'update_subplan_context':
+    case 'complete_subplan':
+    case 'record_blocker':
+    case 'resolve_blocker':
+    case 'promote_discovery':
+    case 'discard_noise':
+    case 'evaluate_win_conditions':
+      return await mutateOperationalContext(workspace, name, args);
     
     case 'run_tests': {
       const testRes = await window.runRegressionTests();
@@ -1469,6 +1561,55 @@ async function appendScopedNotes(workspace, conversation, content) {
     : addition;
   return await writeScopedNotes(workspace, conversation, nextContent);
 }
+
+const OPERATIONAL_CONTEXT_PATH = '.orion/context/operational-context.json';
+const OPERATIONAL_CONTEXT_JOURNAL_PATH = '.orion/context/journal.jsonl';
+
+async function readOperationalContext(workspace) {
+  const empty = OperationalContext.createEmptyContext();
+  if (!workspace) return { success: true, state: empty, path: OPERATIONAL_CONTEXT_PATH };
+  const content = await window.api.readFile(workspace, OPERATIONAL_CONTEXT_PATH, { maxChars: 500000 });
+  if (!content || content.error) return { success: true, state: empty, path: OPERATIONAL_CONTEXT_PATH };
+  try {
+    return { success: true, state: OperationalContext.normalizeContext(JSON.parse(content)), path: OPERATIONAL_CONTEXT_PATH };
+  } catch (error) {
+    return { success: false, state: empty, path: OPERATIONAL_CONTEXT_PATH, error: `Operational context is invalid JSON: ${error.message}` };
+  }
+}
+
+async function appendOperationalJournal(workspace, event, revision) {
+  const existing = await window.api.readFile(workspace, OPERATIONAL_CONTEXT_JOURNAL_PATH, { maxChars: 500000 });
+  const lines = typeof existing === 'string' ? existing.trim().split(/\r?\n/).filter(Boolean) : [];
+  lines.push(JSON.stringify({ ...event, revision }));
+  const writeResult = await window.api.writeFile(workspace, OPERATIONAL_CONTEXT_JOURNAL_PATH, `${lines.slice(-500).join('\n')}\n`);
+  if (writeResult && writeResult.error) throw new Error(writeResult.error);
+}
+
+async function mutateOperationalContext(workspace, action, args = {}) {
+  if (!workspace) throw new Error('No active workspace for operational context');
+  const current = await readOperationalContext(workspace);
+  if (!current.success) throw new Error(current.error);
+  const transition = OperationalContext.applyAction(current.state, action, args);
+  const writeResult = await window.api.writeFile(workspace, OPERATIONAL_CONTEXT_PATH, `${JSON.stringify(transition.state, null, 2)}\n`);
+  if (writeResult && writeResult.error) throw new Error(writeResult.error);
+  await appendOperationalJournal(workspace, transition.event, transition.state.revision);
+  if (window.updateOperationalContext) window.updateOperationalContext(transition.state);
+  return { success: true, action, event: transition.event, state: transition.state, path: OPERATIONAL_CONTEXT_PATH };
+}
+
+async function checkpointOperationalContext(workspace, reason, summary, nextAction = '') {
+  try {
+    const current = await readOperationalContext(workspace);
+    if (!current.state.mission.statement && current.state.winConditions.length === 0) return null;
+    return await mutateOperationalContext(workspace, 'checkpoint', { reason, summary, nextAction });
+  } catch (error) {
+    console.warn('Operational context checkpoint failed:', error);
+    return null;
+  }
+}
+
+window.readOperationalContext = readOperationalContext;
+window.mutateOperationalContext = mutateOperationalContext;
 
 function getCompactionThreshold(modelName, config) {
   const budgets = config.modelContextBudgets || {};
@@ -2234,6 +2375,7 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
   const ollamaTools = convertGeminiToOllamaTools([
     {
       functionDeclarations: [
+        ...OPERATIONAL_CONTEXT_TOOL_DECLARATIONS,
         {
           name: "list_files",
           description: "Lists all files recursively in the active workspace directory, excluding build folders like node_modules.",
@@ -2684,6 +2826,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
     tools: [
       {
         functionDeclarations: [
+          ...OPERATIONAL_CONTEXT_TOOL_DECLARATIONS,
           {
             name: "list_files",
             description: "Lists all files recursively in the active workspace directory, excluding build folders like node_modules.",

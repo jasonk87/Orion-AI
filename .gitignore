@@ -1,6 +1,7 @@
 node_modules/
 dist/
 standalone-workspaces/
+.orion/
 
 config.json
 .env
