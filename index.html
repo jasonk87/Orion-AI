@@ -15,17 +15,14 @@
     <div class="titlebar-left">
       <span class="app-logo">&#127756;</span>
       <span class="app-title">Orion AI</span>
-      <span class="menu-item">File</span>
-      <span class="menu-item">View</span>
-      <span class="menu-item">Window</span>
     </div>
     <div class="titlebar-center">
-      <span class="workspace-indicator" id="workspace-label">No Workspace Loaded - Click to Choose</span>
+      <span class="workspace-indicator" id="workspace-label" role="button" tabindex="0">No Workspace Loaded - Click to Choose</span>
     </div>
     <div class="titlebar-right">
-      <button class="win-btn" id="btn-minimize">&#128469;&#xFE0E;</button>
-      <button class="win-btn" id="btn-maximize">&#128470;&#xFE0E;</button>
-      <button class="win-btn btn-close" id="btn-close">&#128473;&#xFE0E;</button>
+      <button class="win-btn" id="btn-minimize" aria-label="Minimize window" title="Minimize">&#128469;&#xFE0E;</button>
+      <button class="win-btn" id="btn-maximize" aria-label="Maximize window" title="Maximize">&#128470;&#xFE0E;</button>
+      <button class="win-btn btn-close" id="btn-close" aria-label="Close window" title="Close">&#128473;&#xFE0E;</button>
     </div>
   </header>
 
@@ -35,20 +32,9 @@
     <!-- LEFT SIDEBAR -->
     <aside id="left-sidebar">
       <div class="sidebar-top">
-        <div class="sidebar-nav-actions">
-          <button id="sidebar-toggle" title="Toggle Sidebar">&#9776;</button>
-          <button id="nav-back" title="Go Back">&#8592;</button>
-          <button id="nav-forward" title="Go Forward">&#8594;</button>
-        </div>
-        
         <button id="btn-new-chat" class="btn-primary">
           <span class="plus-icon">+</span> New Conversation
         </button>
-
-        <ul class="nav-links">
-          <li class="active" id="nav-history"><span class="icon">&#128338;</span> Conversation History</li>
-          <li id="nav-tasks"><span class="icon">&#128197;</span> Scheduled Tasks</li>
-        </ul>
       </div>
 
       <!-- Projects Section -->
@@ -115,25 +101,11 @@
         <!-- Welcoming splash or history messages -->
         <div class="welcome-splash" id="welcome-splash">
           <h1>Orion AI</h1>
-          <p>Start with a repo, a task, or an existing conversation.</p>
+          <p>Describe the outcome. Orion will plan, act, verify, and keep going.</p>
           <div class="start-actions">
             <button id="btn-start-open-repo" class="btn-primary">Open Repo</button>
             <button id="btn-start-new-task" class="btn-secondary">New Task</button>
             <button id="btn-start-resume" class="btn-secondary">Resume Work</button>
-          </div>
-          <div class="quick-tips">
-            <div class="tip-card">
-              <h3>Projects</h3>
-              <p>Choose a workspace folder before asking Orion to change files.</p>
-            </div>
-            <div class="tip-card">
-              <h3>Planning</h3>
-              <p>Risky work pauses for approval before edits or commands run.</p>
-            </div>
-            <div class="tip-card">
-              <h3>Companion</h3>
-              <p>Use your phone link to inspect, steer, approve, pause, and resume.</p>
-            </div>
           </div>
         </div>
         
@@ -145,7 +117,7 @@
       <!-- CHAT INPUT CONTAINER -->
       <div id="chat-input-wrapper">
         <div class="chat-input-container">
-          <textarea id="chat-input" placeholder="Ask anything, @ to mention files, / for actions..." rows="1"></textarea>
+          <textarea id="chat-input" placeholder="Ask Orion to build, fix, or investigate..." rows="1"></textarea>
           
           <div class="chat-input-toolbar">
             <div class="toolbar-left">
@@ -167,7 +139,6 @@
             <div class="toolbar-right">
               <button class="btn-steer" id="btn-steer" title="Send steering feedback directly to active task">&#127919; Steer</button>
               <button class="btn-queue" id="btn-queue" title="Queue this prompt to run after the active task finishes">&#9203; Queue</button>
-              <button class="tool-btn mic-btn" id="btn-voice" title="Speech to text input">&#127897;&#65039;</button>
               <button id="btn-submit" class="btn-send" title="Send message">&#10022;</button>
             </div>
           </div>
@@ -189,7 +160,7 @@
             <span class="badge muted" id="operational-context-revision">Not set</span>
           </div>
         </div>
-        <div class="panel-content operational-context-panel" id="operational-context-panel">
+        <div class="panel-content operational-context-panel" id="operational-context-panel" aria-live="polite">
           <p class="empty-state">Define a mission to give Orion durable operational direction.</p>
         </div>
       </div>

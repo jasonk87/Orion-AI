@@ -748,14 +748,14 @@ function companionHtml(pairingCode) {
       line-height: 1;
     }
     .brand::before {
-      content: "‹";
+      content: "\\2039";
       position: absolute;
       left: 18px;
       font-size: 2rem;
       padding-bottom: 4px;
     }
     .status-pill::after {
-      content: "⋮";
+      content: "\\22ee";
       position: absolute;
       right: 18px;
       top: calc(14px + env(safe-area-inset-top));
@@ -887,7 +887,7 @@ function companionHtml(pairingCode) {
       box-shadow: 0 12px 30px rgba(24,24,27,.16);
       font-size: .9rem;
     }
-    .btn-sm-primary::before { content: "✎ "; }
+    .btn-sm-primary::before { content: "\\270e "; }
     .dashboard-card,
     .activity-panel,
     .plan-panel {
@@ -1124,7 +1124,7 @@ function companionHtml(pairingCode) {
       box-shadow: 0 12px 26px rgba(91,42,134,.22);
     }
     button.send-button::before {
-      content: "›";
+      content: "\\203a";
       font-size: 2rem;
       line-height: 1;
       transform: rotate(-90deg);
@@ -1144,6 +1144,134 @@ function companionHtml(pairingCode) {
     .mission-mobile-condition.in_progress .mission-mobile-dot { background: #d97706; }
     .mission-mobile-condition.satisfied .mission-mobile-dot { background: #059669; }
     .mission-mobile-blocker { margin-top: 7px; padding: 7px 9px; border-left: 2px solid #dc2626; border-radius: 4px; background: rgba(220,38,38,.06); color: #991b1b; font-size: .75rem; }
+    /* Unified Orion dark companion theme */
+    :root {
+      color-scheme: dark;
+      --bg: #090b12;
+      --panel: #111724;
+      --panel-strong: #151c2a;
+      --line: rgba(151,164,196,.15);
+      --text: #f4f6fb;
+      --muted: #8994a9;
+      --accent: #8273f4;
+      --accent-strong: #6f5bea;
+      --success: #46d59b;
+      --warning: #f2b84b;
+      --danger: #f16876;
+      font-family: "Segoe UI Variable", Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    body {
+      background: radial-gradient(circle at 50% -12%, rgba(96,78,210,.16), transparent 30%), var(--bg);
+      color: var(--text);
+    }
+    .app-shell { background: transparent; }
+    header {
+      border-bottom: 1px solid var(--line);
+      background: rgba(9,11,18,.9);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+    }
+    .brand::before,
+    .status-pill::after {
+      background: rgba(21,28,42,.88);
+      color: var(--text);
+      border: 1px solid var(--line);
+      box-shadow: 0 10px 28px rgba(0,0,0,.24);
+    }
+    h1, .sub-panel-title, .card-title { color: var(--text); }
+    .model, .meta, .substatus, .substatus-text, .task-row-meta { color: var(--muted); }
+    .indicator-banner { color: var(--text) !important; }
+    .indicator-banner::before { background: #596378; }
+    .indicator-banner button { background: rgba(130,115,244,.13) !important; color: #c9c2ff !important; }
+    main { gap: 24px; }
+    .dashboard-panel {
+      grid-template-areas:
+        "top"
+        "projects"
+        "active"
+        "mission"
+        "plan"
+        "actions"
+        "attention"
+        "queued"
+        "recents";
+    }
+    #mission-context-card { grid-area: mission; }
+    .dashboard-card.active-card,
+    .mission-mobile-card.visible,
+    .activity-panel,
+    .plan-panel {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: linear-gradient(145deg, rgba(21,28,42,.96), rgba(14,19,30,.96));
+      box-shadow: 0 16px 38px rgba(0,0,0,.2), inset 0 1px rgba(255,255,255,.02);
+      padding: 14px;
+    }
+    .mission-mobile-card.visible { animation: mobile-card-enter .24s cubic-bezier(.2,.8,.2,1) both; }
+    .mission-mobile-title { color: var(--text); }
+    .mission-mobile-objective, .mission-mobile-condition { color: var(--muted); }
+    .mission-mobile-condition.in_progress .mission-mobile-dot { background: var(--warning); box-shadow: 0 0 9px rgba(242,184,75,.28); }
+    .mission-mobile-condition.satisfied .mission-mobile-dot { background: var(--success); box-shadow: 0 0 9px rgba(70,213,155,.24); }
+    .mission-mobile-blocker { background: rgba(241,104,118,.08); color: #ffb5bd; border-color: var(--danger); }
+    select,
+    textarea {
+      border-color: var(--line);
+      background: rgba(17,23,36,.96);
+      color: var(--text);
+      box-shadow: inset 0 1px rgba(255,255,255,.018), 0 10px 26px rgba(0,0,0,.13);
+    }
+    textarea::placeholder { color: #657086; }
+    select:focus,
+    textarea:focus { border-color: rgba(130,115,244,.62); box-shadow: 0 0 0 3px rgba(130,115,244,.1); }
+    .btn-sm-primary,
+    button.send-button {
+      background: linear-gradient(145deg, #8f80ff, #6654e7);
+      color: white;
+      box-shadow: 0 12px 28px rgba(85,67,216,.28);
+    }
+    .control-row button,
+    .btn-sm {
+      border-color: var(--line);
+      background: rgba(17,23,36,.86);
+      color: var(--text);
+      box-shadow: none;
+    }
+    .control-row button:active,
+    .btn-sm:active,
+    .send-button:active { transform: scale(.98); }
+    .badge { background: rgba(137,148,169,.12) !important; color: var(--muted) !important; }
+    .badge.success { background: rgba(70,213,155,.12) !important; color: #7aebbb !important; }
+    .badge.warning { background: rgba(242,184,75,.13) !important; color: #f7ce7d !important; }
+    .badge.active-view { background: rgba(130,115,244,.15) !important; color: #c9c2ff !important; }
+    .task-row { border-color: rgba(151,164,196,.1); }
+    .task-row:hover, .task-row.active-row { background: rgba(130,115,244,.055); }
+    .task-row-title { color: var(--text); }
+    .activity-panel { display: block; }
+    .tab-btn { background: rgba(137,148,169,.1); color: var(--muted); }
+    .tab-btn.active { background: rgba(130,115,244,.18); color: #d8d3ff; border: 1px solid rgba(130,115,244,.28); }
+    .tab-pane { color: var(--muted); }
+    .terminal-logs { background: #080b11; color: #78e7b7; border-color: var(--line); }
+    .message { color: var(--text); }
+    .message.user { background: rgba(130,115,244,.16); border: 1px solid rgba(130,115,244,.22); }
+    .message.system { color: var(--muted); }
+    .queued-item { background: var(--panel); border-color: var(--line); color: var(--text); }
+    .install-tip.visible { background: var(--panel); color: var(--muted); border-color: var(--line); }
+    form {
+      border-top: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(9,11,18,0), rgba(9,11,18,.96) 24%, rgba(9,11,18,.99));
+    }
+    .composer::before { background: var(--panel-strong); color: var(--text); border: 1px solid var(--line); box-shadow: 0 10px 24px rgba(0,0,0,.22); }
+    button.send-button::before { content: "\\2191"; font-size: 1.25rem; transform: none; margin: 0; }
+    .empty { color: var(--muted); }
+    @keyframes mobile-card-enter {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+    }
     @media (min-width:700px) {
       .app-shell { max-width: 760px; margin: 0 auto; border-left: 1px solid rgba(255,255,255,.05); border-right: 1px solid rgba(255,255,255,.05); }
       form { left: 50%; transform: translateX(-50%); max-width: 760px; }

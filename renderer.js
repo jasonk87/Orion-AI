@@ -387,6 +387,12 @@ function setupWorkspaceHandlers() {
   };
   
   el.workspaceLabel.addEventListener('click', triggerWorkspaceSelect);
+  el.workspaceLabel.addEventListener('keydown', event => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      triggerWorkspaceSelect();
+    }
+  });
   el.btnChangeWorkspace.addEventListener('click', triggerWorkspaceSelect);
   
   if (el.btnAddProject) {
@@ -973,6 +979,15 @@ function setupChatHandlers() {
   
   document.getElementById('btn-steer').addEventListener('click', triggerSteer);
   document.getElementById('btn-queue').addEventListener('click', triggerQueue);
+  const addFileButton = document.getElementById('btn-add-file');
+  if (addFileButton) {
+    addFileButton.addEventListener('click', () => {
+      const needsSpace = el.chatInput.value && !/\s$/.test(el.chatInput.value);
+      el.chatInput.value += `${needsSpace ? ' ' : ''}@`;
+      el.chatInput.focus();
+      el.chatInput.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+  }
   
   el.btnNewChat.addEventListener('click', createNewConversation);
   if (el.btnAddConversation) {
