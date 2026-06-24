@@ -5,6 +5,8 @@
   const MAX_RESOLVED_BLOCKERS = 100;
   const MAX_DISCOVERIES = 100;
   const MAX_DISCARDED = 50;
+  const MAX_EVIDENCE = 50;
+  const MAX_CHAT_VIEW_MESSAGES = 6;
 
   function isoNow(now) {
     return typeof now === 'string' ? now : (now instanceof Date ? now.toISOString() : new Date().toISOString());
@@ -31,6 +33,7 @@
       blockers: { active: [], resolved: [] },
       discoveries: [],
       discarded: [],
+      latestEvidence: [],
       lastDistillation: null,
       lastCheckpoint: null,
       createdAt: at,
@@ -98,6 +101,14 @@
       },
       discoveries: Array.isArray(source.discoveries) ? source.discoveries.slice(-MAX_DISCOVERIES) : [],
       discarded: Array.isArray(source.discarded) ? source.discarded.slice(-MAX_DISCARDED) : [],
+      latestEvidence: Array.isArray(source.latestEvidence) ? source.latestEvidence.map(item => ({
+        id: cleanText(item && item.id, 100) || makeId('evidence', item && item.summary, at),
+        toolName: cleanText(item && item.toolName, 100),
+        summary: cleanText(item && item.summary, 1200),
+        outcome: normalizeStatus(item && item.outcome, ['success', 'failure'], 'success'),
+        checkpoint: cleanText(item && item.checkpoint, 500),
+        at: item && item.at || at
+      })).filter(item => item.summary).slice(-MAX_EVIDENCE) : [],
       lastDistillation: source.lastDistillation && typeof source.lastDistillation === 'object' ? {
         subplanId: cleanText(source.lastDistillation.subplanId, 100),
         subplanTitle: cleanText(source.lastDistillation.subplanTitle, 1000),
@@ -249,7 +260,37 @@
         const summary = requireText(args, 'summary', 'discarded context summary');
         state.discarded.push({ id: makeId('discarded', summary, at), summary, reason: cleanText(args.reason, 1000), discardedAt: at });
         state.discarded = state.discarded.slice(-MAX_DISCARDED);
+        const discardedKey = summary.toLowerCase();
+        state.latestEvidence = state.latestEvidence.filter(item => {
+          const evidenceKey = item.summary.toLowerCase();
+          return !evidenceKey.includes(discardedKey) && !discardedKey.includes(evidenceKey);
+        });
+        if (state.lastCheckpoint && cleanText(state.lastCheckpoint.summary, 4000).toLowerCase().includes(discardedKey)) {
+          state.lastCheckpoint = null;
+        }
         event.summary = `Noise discarded: ${summary}`;
+        break;
+      }
+      case 'record_tool_result': {
+        const toolName = requireText(args, 'toolName', 'tool name');
+        const summary = requireText(args, 'summary', 'tool result summary');
+        const outcome = args.success === false ? 'failure' : 'success';
+        state.latestEvidence.push({
+          id: makeId('evidence', `${toolName}-${summary}`, at),
+          toolName,
+          summary,
+          outcome,
+          checkpoint: cleanText(args.checkpoint, 500),
+          at
+        });
+        state.latestEvidence = state.latestEvidence.slice(-MAX_EVIDENCE);
+        state.lastCheckpoint = {
+          reason: 'tool_result',
+          summary: `${toolName} ${outcome}: ${summary}`.slice(0, 4000),
+          nextAction: cleanText(args.nextAction, 2000),
+          at
+        };
+        event.summary = `Tool result recorded: ${toolName} (${outcome})`;
         break;
       }
       case 'evaluate_win_conditions': {
@@ -299,11 +340,50 @@
       lines.push('Retained discoveries:');
       state.discoveries.slice(-12).forEach(item => lines.push(`- ${item.text}`));
     }
+    if (state.latestEvidence.length) {
+      lines.push('Latest evidence/checkpoints:');
+      state.latestEvidence.slice(-8).forEach(item => lines.push(`- [${item.outcome}] ${item.toolName}: ${item.summary}`));
+    }
+    if (state.lastCheckpoint) {
+      lines.push(`Latest checkpoint: ${state.lastCheckpoint.summary || state.lastCheckpoint.reason}`);
+      if (state.lastCheckpoint.nextAction) lines.push(`Checkpoint next action: ${state.lastCheckpoint.nextAction}`);
+    }
     lines.push('Treat this as working memory, not a transcript. Update it when mission-level state changes; do not store raw logs or temporary output. Never satisfy a win condition without concrete evidence.');
     return lines.join('\n');
   }
 
-  const api = { VERSION, createEmptyContext, normalizeContext, applyAction, formatForPrompt };
+  function buildRecentChatView(messages, currentInput = '', limit = MAX_CHAT_VIEW_MESSAGES) {
+    const input = cleanText(currentInput, 12000);
+    const view = (Array.isArray(messages) ? messages : [])
+      .filter(message => message && (message.role === 'user' || message.role === 'assistant'))
+      .map(message => ({ role: message.role, text: cleanText(message.text, 3000) }))
+      .filter(message => message.text && message.text !== 'Thinking...' && !message.text.startsWith('[COMPACTED CONTEXT SUMMARY]'));
+    if (view.length && view[view.length - 1].role === 'user' && view[view.length - 1].text === input) view.pop();
+    return view.slice(-Math.max(0, Number(limit) || MAX_CHAT_VIEW_MESSAGES));
+  }
+
+  function buildReasoningMessages(input, conversationMessages, currentInput) {
+    const state = normalizeContext(input);
+    const statePrompt = formatForPrompt(state) || [
+      '[ORION OPERATIONAL CONTEXT - canonical working state]',
+      'Mission: Not defined',
+      'Win conditions: Not defined',
+      'Establish the mission and evidence-backed win conditions before treating chat as task state.'
+    ].join('\n');
+    const messages = [
+      { role: 'user', parts: [{ text: statePrompt }] },
+      { role: 'model', parts: [{ text: 'Working state loaded. I will reason from it and treat chat as an input/view channel.' }] }
+    ];
+    const chatView = buildRecentChatView(conversationMessages, currentInput);
+    if (chatView.length) {
+      messages.push({ role: 'user', parts: [{ text: `[RECENT CHAT VIEW - non-canonical]\n${chatView.map(item => `${item.role}: ${item.text}`).join('\n\n')}` }] });
+      messages.push({ role: 'model', parts: [{ text: 'Recent chat received as non-canonical context.' }] });
+    }
+    messages.push({ role: 'user', parts: [{ text: cleanText(currentInput, 12000) }] });
+    return messages;
+  }
+
+  const api = { VERSION, createEmptyContext, normalizeContext, applyAction, formatForPrompt, buildRecentChatView, buildReasoningMessages };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   if (globalScope) globalScope.OrionOperationalContext = api;
 })(typeof window !== 'undefined' ? window : globalThis);

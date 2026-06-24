@@ -137,12 +137,71 @@ test('prompt format carries operational signal without discarded noise', (t) => 
   t.end();
 });
 
+test('tool results become latest evidence before the next reasoning turn', (t) => {
+  let state = missionState();
+  state = operational.applyAction(state, 'record_tool_result', {
+    toolName: 'run_tests',
+    success: true,
+    summary: 'npm test: 385 passing',
+    checkpoint: 'Full suite verified.'
+  }, T0).state;
+  const prompt = operational.formatForPrompt(state);
+  t.equal(state.latestEvidence.length, 1, 'stores tool evidence in working state');
+  t.ok(prompt.includes('Latest evidence/checkpoints'), 'prompts include latest evidence');
+  t.ok(prompt.includes('run_tests: npm test: 385 passing'), 'next turn sees the reduced tool result');
+  t.end();
+});
+
+test('discarded noise is pruned from latest evidence and not reintroduced', (t) => {
+  let state = missionState();
+  state = operational.applyAction(state, 'record_tool_result', {
+    toolName: 'run_command',
+    success: false,
+    summary: 'obsolete stack trace XYZ123'
+  }, T0).state;
+  state = operational.applyAction(state, 'discard_noise', {
+    summary: 'obsolete stack trace XYZ123',
+    reason: 'Fixed by later serializer guard.'
+  }, T0).state;
+  const prompt = operational.formatForPrompt(state);
+  t.equal(state.latestEvidence.length, 0, 'discard action removes matching transient evidence');
+  t.notOk(prompt.includes('obsolete stack trace XYZ123'), 'discarded evidence does not return to prompts');
+  t.end();
+});
+
+test('conversation can be compacted without losing mission state', (t) => {
+  const state = missionState();
+  const compactedConversation = [
+    { role: 'user', text: '[COMPACTED CONTEXT SUMMARY]\nOld task summary that is not canonical.' },
+    { role: 'assistant', text: 'Understood. I will use this compacted summary as prior context.' }
+  ];
+  const messages = operational.buildReasoningMessages(state, compactedConversation, 'Continue.');
+  const joined = JSON.stringify(messages);
+  t.ok(joined.includes('Build a deep colony simulation.'), 'mission state is still present');
+  t.ok(joined.includes('Working economy'), 'win conditions are still present');
+  t.notOk(joined.includes('Old task summary that is not canonical'), 'compacted chat summary is not task source of truth');
+  t.end();
+});
+
+test('new model turn receives mission state even when old chat is reduced', (t) => {
+  const state = missionState();
+  const reducedChat = [{ role: 'user', text: 'Tiny follow-up only.' }];
+  const messages = operational.buildReasoningMessages(state, reducedChat, 'Do the next step.');
+  t.equal(messages[0].role, 'user', 'state envelope is first');
+  t.ok(messages[0].parts[0].text.includes('Mission: Build a deep colony simulation.'), 'first provider turn carries mission');
+  t.ok(messages[0].parts[0].text.includes('Win conditions'), 'first provider turn carries win conditions');
+  t.ok(messages.some(message => JSON.stringify(message).includes('[RECENT CHAT VIEW - non-canonical]')), 'chat is present only as view context');
+  t.end();
+});
+
 test('agent and renderer wire operational context into both providers and Mission Control', (t) => {
   const agent = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
   const renderer = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8');
   const html = fs.readFileSync(path.join(__dirname, '../index.html'), 'utf8');
   t.equal((agent.match(/\.\.\.OPERATIONAL_CONTEXT_TOOL_DECLARATIONS/g) || []).length, 2, 'shares tool declarations across Gemini and Ollama');
-  t.ok(agent.includes('formatForPrompt(operationalContext.state)'), 'injects canonical context into model input');
+  t.ok(agent.includes('OperationalContext.buildReasoningMessages(workingState'), 'builds provider input from working state first');
+  t.notOk(agent.includes('conversation.messages.forEach(msg =>'), 'does not reconstruct task state from full chat transcript');
+  t.ok(agent.includes('recordToolOutcomeInWorkingState'), 'reduces tool outcomes into working state');
   t.ok(agent.includes("'context_compaction'"), 'checkpoints compaction');
   t.ok(renderer.includes("reason: 'user_steering'"), 'checkpoints steering');
   t.ok(renderer.includes('operationalContext,'), 'exposes sanitized mission context to Phone Companion');

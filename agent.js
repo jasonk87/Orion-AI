@@ -124,6 +124,10 @@ const OPERATIONAL_CONTEXT_TOOL_DECLARATIONS = [
   }
 ];
 
+const OPERATIONAL_CONTEXT_ACTIONS = new Set(OPERATIONAL_CONTEXT_TOOL_DECLARATIONS
+  .map(tool => tool.name)
+  .filter(name => name !== 'read_operational_context'));
+
 window.steeringQueue = [];
 window.promptQueue = [];
 window.followupTimers = window.followupTimers || {};
@@ -182,76 +186,19 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     ? `[ORION INTERNAL FOLLOW-UP - not a user message]\n${userPrompt}\n\nContinue from the saved conversation/task state. Do not quote this as something the user said.`
     : userPrompt;
   
-  // Format message history for Gemini API
-  let messages = [];
-  
-  // Convert LocalStorage conversation history to Gemini format
-  // We keep user and model turns. System messages are skipped or added as user instructions
-  conversation.messages.forEach(msg => {
-    if (msg.role === 'user') {
-      messages.push({ role: 'user', parts: [{ text: msg.text }] });
-    } else if (msg.role === 'assistant') {
-      if (msg.turns && msg.turns.length > 0) {
-        msg.turns.forEach(turn => {
-          messages.push({ role: 'model', parts: turn.modelParts });
-          if (turn.toolResponseParts) {
-            const sanitizedParts = JSON.parse(JSON.stringify(turn.toolResponseParts));
-            sanitizedParts.forEach(p => {
-              if (p.functionResponse && p.functionResponse.response !== undefined) {
-                const resp = p.functionResponse.response;
-                if (typeof resp !== 'object' || resp === null || Array.isArray(resp)) {
-                  p.functionResponse.response = { output: resp };
-                }
-              }
-            });
-            messages.push({ role: 'tool', parts: sanitizedParts });
-          }
-        });
-      } else {
-        // Fallback for simple text messages or old format
-        if (msg.apiParts) {
-          messages.push({ role: 'model', parts: msg.apiParts });
-        } else {
-          messages.push({ role: 'model', parts: [{ text: msg.text }] });
-        }
-        if (msg.apiToolResponseParts) {
-          const sanitizedParts = JSON.parse(JSON.stringify(msg.apiToolResponseParts));
-          sanitizedParts.forEach(p => {
-            if (p.functionResponse && p.functionResponse.response !== undefined) {
-              const resp = p.functionResponse.response;
-              if (typeof resp !== 'object' || resp === null || Array.isArray(resp)) {
-                p.functionResponse.response = { output: resp };
-              }
-            }
-          });
-          messages.push({ role: 'tool', parts: sanitizedParts });
-        }
-      }
-    }
-  });
-  
-  // If the last message is the real user prompt, it's already in history.
-  // Internal follow-ups are injected as system-like instructions, never as user-authored turns.
-  const lastMessageText = messages.length > 0 && messages[messages.length - 1].role === 'user'
-    ? ((messages[messages.length - 1].parts || []).map(part => part.text || '').join(''))
-    : '';
-  if (isInternalPrompt) {
-    messages.push({ role: 'user', parts: [{ text: promptForModel }] });
-  } else if (messages.length === 0 || messages[messages.length - 1].role !== 'user' || lastMessageText !== userPrompt) {
-    messages.push({ role: 'user', parts: [{ text: userPrompt }] });
-  }
-
   const scopedNotes = await readScopedNotes(workspacePath, conversation);
   const operationalContext = await readOperationalContext(workspacePath);
-  const operationalPrompt = OperationalContext.formatForPrompt(operationalContext.state);
-  if (operationalPrompt) {
-    messages.unshift(
-      { role: 'user', parts: [{ text: operationalPrompt }] },
-      { role: 'model', parts: [{ text: 'Understood. I will use this operational state to choose and verify the next useful action.' }] }
-    );
-  }
+  let workingState = operationalContext.state;
+  // Canonical operational state seeds reasoning. Conversation remains a bounded UI/input view;
+  // old model and tool turns are deliberately not replayed as task truth.
+  let messages = OperationalContext.buildReasoningMessages(workingState, conversation.messages, promptForModel);
+  const refreshWorkingStateMessage = () => {
+    if (messages[0] && messages[0].parts && messages[0].parts[0]) {
+      messages[0].parts[0].text = OperationalContext.formatForPrompt(workingState) || messages[0].parts[0].text;
+    }
+  };
   if (scopedNotes.content && scopedNotes.content.trim()) {
-    messages.unshift(
+    messages.splice(2, 0,
       {
         role: 'user',
         parts: [{
@@ -386,10 +333,23 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       if (config.autoCompact !== false && tokenCount > compactThreshold) {
         window.appendSystemMessage(`Context reached ${tokenCount} tokens; compacting for ${modelName} at threshold ${compactThreshold}.`);
         const compactResult = await compactHistory(messages, modelName, config.geminiApiKey);
-        messages = compactResult.messages;
         persistCompactedConversation(conversation, compactResult.summary);
         await appendScopedNotes(workspacePath, conversation, `\n\n## Context Compaction ${new Date().toISOString()}\n${compactResult.summary}\n`);
-        await checkpointOperationalContext(workspacePath, 'context_compaction', 'Conversation context was compacted; canonical mission state was preserved.', 'Continue the active subplan from operational context.');
+        const checkpoint = await checkpointOperationalContext(workspacePath, 'context_compaction', 'Conversation context was compacted; canonical mission state was preserved.', 'Continue the active subplan from operational context.');
+        if (checkpoint && checkpoint.state) workingState = checkpoint.state;
+        messages = OperationalContext.buildReasoningMessages(workingState, conversation.messages, promptForModel);
+        if (scopedNotes.content && scopedNotes.content.trim()) {
+          messages.splice(2, 0,
+            {
+              role: 'user',
+              parts: [{ text: `[ORION DURABLE NOTES - ${scopedNotes.scopeLabel}]\nThese are persistent notes for this scope. Use them as working memory, but verify against files when needed.\n\n${scopedNotes.content}` }]
+            },
+            {
+              role: 'model',
+              parts: [{ text: 'Understood. I will use these durable notes as context for this task.' }]
+            }
+          );
+        }
         aiMessageIndex = conversation.messages.length;
         conversation.messages.push({ role: 'assistant', text: 'Thinking...', logs: [], turns: [] });
         window.saveConversationsToStorage();
@@ -750,6 +710,11 @@ ${executionInstruction}]`
               response: { error: planningGate.reason, failureCategory: failure.category, recoveryGuidance: guidance }
             }
           });
+          const transition = await recordToolOutcomeInWorkingState(workspacePath, toolName, args, { error: planningGate.reason, failureCategory: failure.category });
+          if (transition && transition.state) {
+            workingState = transition.state;
+            refreshWorkingStateMessage();
+          }
           continue;
         }
         if (planningGate.forceYield) {
@@ -793,6 +758,11 @@ ${executionInstruction}]`
                 response: { error: errMsg, repeatedFailure: true, failureCategory: failure.category, recoveryGuidance: guidance }
               }
             });
+            const transition = await recordToolOutcomeInWorkingState(workspacePath, toolName, args, { error: errMsg, repeatedFailure: true, failureCategory: failure.category });
+            if (transition && transition.state) {
+              workingState = transition.state;
+              refreshWorkingStateMessage();
+            }
             forceYield = true;
             break;
           }
@@ -803,6 +773,16 @@ ${executionInstruction}]`
               result.repeatedFailureWarning = guidance;
             }
           }
+        }
+
+        if (result && result.state && OPERATIONAL_CONTEXT_ACTIONS.has(toolName)) {
+          workingState = result.state;
+          refreshWorkingStateMessage();
+        }
+        const transition = await recordToolOutcomeInWorkingState(workspacePath, toolName, args, result);
+        if (transition && transition.state) {
+          workingState = transition.state;
+          refreshWorkingStateMessage();
         }
         
         toolResponseParts.push({
@@ -1608,6 +1588,45 @@ async function checkpointOperationalContext(workspace, reason, summary, nextActi
     return await mutateOperationalContext(workspace, 'checkpoint', { reason, summary, nextAction });
   } catch (error) {
     console.warn('Operational context checkpoint failed:', error);
+    return null;
+  }
+}
+
+function summarizeToolOutcome(toolName, args, result) {
+  const success = !(result && (result.error || result.success === false));
+  const parts = [];
+  if (result && typeof result === 'object') {
+    if (result.message) parts.push(String(result.message));
+    if (result.summary) parts.push(String(result.summary));
+    if (result.path) parts.push(`path=${result.path}`);
+    if (result.file) parts.push(`file=${result.file}`);
+    if (result.exitCode !== undefined) parts.push(`exitCode=${result.exitCode}`);
+    if (result.error) parts.push(`error=${String(result.error)}`);
+    if (!parts.length && result.output) parts.push(String(result.output));
+  } else if (result !== undefined) {
+    parts.push(String(result));
+  }
+  const argHint = args && typeof args === 'object'
+    ? Object.entries(args).slice(0, 3).map(([key, value]) => `${key}=${String(value).slice(0, 120)}`).join(', ')
+    : '';
+  const summary = String(parts.filter(Boolean).join(' | ') || argHint || 'Tool completed.').trim().slice(0, 1200);
+  return { success, summary };
+}
+
+async function recordToolOutcomeInWorkingState(workspace, toolName, args, result) {
+  try {
+    if (!workspace || toolName === 'read_operational_context') return null;
+    const current = await readOperationalContext(workspace);
+    if (!current.state.mission.statement && current.state.winConditions.length === 0 && !current.state.activeSubplan) return null;
+    const outcome = summarizeToolOutcome(toolName, args, result);
+    return await mutateOperationalContext(workspace, 'record_tool_result', {
+      toolName,
+      success: outcome.success,
+      summary: outcome.summary,
+      checkpoint: 'Tool result reduced into operational working state before next model turn.'
+    });
+  } catch (error) {
+    console.warn('Operational working-state tool reduction failed:', error);
     return null;
   }
 }
