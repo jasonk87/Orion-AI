@@ -41,3 +41,35 @@ test('phone companion finishes with the same dark theme and complete mission hie
   t.ok(main.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
   t.end();
 });
+
+test('progressive disclosure keeps secondary surfaces contextual', (t) => {
+  const renderer = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8');
+  t.ok(html.includes('id="btn-toggle-left-sidebar"'), 'provides a real navigation collapse control');
+  t.ok(html.includes('id="command-palette-modal"'), 'provides a command palette');
+  t.ok(renderer.includes("event.key.toLowerCase() === 'k'"), 'supports Ctrl+K command access');
+  t.ok(renderer.includes("event.key === 'Tab'"), 'traps keyboard focus within the command palette');
+  t.ok(renderer.includes("classList.toggle('contextual-panel-hidden', artifacts.length === 0)"), 'hides empty artifact surface');
+  t.ok(renderer.includes("revealAgentPanel('A plan is ready for review.')"), 'reveals Agent Panel for approval');
+  t.ok(renderer.includes('active blocker was recorded'), 'reveals Agent Panel for blockers');
+  t.end();
+});
+
+test('agent presence communicates meaningful execution phases', (t) => {
+  const renderer = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8');
+  t.ok(html.includes('id="agent-state-pill"'), 'renders agent state beside conversation title');
+  ['Thinking', 'Acting', 'Verifying', 'Review needed', 'Complete'].forEach(label => {
+    t.ok(renderer.includes(`'${label}'`), `supports ${label} state`);
+  });
+  t.ok(styles.includes('.agent-state-pill.verifying'), 'styles verification distinctly');
+  t.ok(styles.includes('.orion-toast.success'), 'provides completion feedback');
+  t.ok(main.includes("? 'Verifying'"), 'phone uses the same verification state language');
+  t.end();
+});
+
+test('responsive app chrome preserves the agent canvas', (t) => {
+  t.ok(styles.includes('@media (max-width: 980px)'), 'has compact laptop behavior');
+  t.ok(styles.includes('@media (max-width: 760px)'), 'has narrow-window behavior');
+  t.ok(styles.includes('#left-sidebar:not(.collapsed)'), 'uses an overlay navigation rail when narrow');
+  t.ok(styles.includes('#right-sidebar:not(.collapsed)'), 'uses an overlay Agent Panel when narrow');
+  t.end();
+});

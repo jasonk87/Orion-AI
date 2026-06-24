@@ -134,6 +134,16 @@ const el = {
   btnSaveEntrypoint: document.getElementById('btn-save-entrypoint'),
   rightSidebar: document.getElementById('right-sidebar'),
   btnToggleRightSidebar: document.getElementById('btn-toggle-right-sidebar'),
+  btnToggleLeftSidebar: document.getElementById('btn-toggle-left-sidebar'),
+  leftSidebar: document.getElementById('left-sidebar'),
+  btnCommandPalette: document.getElementById('btn-command-palette'),
+  commandPaletteModal: document.getElementById('command-palette-modal'),
+  agentStatePill: document.getElementById('agent-state-pill'),
+  agentStateText: document.getElementById('agent-state-text'),
+  agentStateDetail: document.getElementById('agent-state-detail'),
+  workspaceFilesPanel: document.getElementById('workspace-files-panel'),
+  runArtifactsPanel: document.getElementById('run-artifacts-panel'),
+  toastRegion: document.getElementById('toast-region'),
   btnStartOpenRepo: document.getElementById('btn-start-open-repo'),
   btnStartNewTask: document.getElementById('btn-start-new-task'),
   btnStartResume: document.getElementById('btn-start-resume'),
@@ -145,6 +155,8 @@ const el = {
 };
 
 let viewedFilePath = '';
+let agentPresenceTimer = null;
+let agentCompletionTimer = null;
 
 // INITIALIZE APP
 document.addEventListener('DOMContentLoaded', async () => {
@@ -156,6 +168,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupWorkspaceHandlers();
   setupStartActions();
   setupEntrypointControls();
+  setupProgressiveDisclosure();
   setupRightSidebarToggle();
   setupChatHandlers();
   
@@ -501,6 +514,7 @@ function saveProjectsToStorage() {
 
 async function syncWorkspaceFiles() {
   if (!currentWorkspace) return;
+  if (el.workspaceFilesPanel) el.workspaceFilesPanel.classList.remove('contextual-panel-hidden');
   el.fileTree.innerHTML = '<p class="empty-state">Scanning directory...</p>';
   loadWorkspaceEntrypoint();
   
@@ -569,15 +583,95 @@ function setupRightSidebarToggle() {
   const storedCollapsed = localStorage.getItem('rightSidebarCollapsed');
   const isCollapsed = storedCollapsed === null ? true : (storedCollapsed === 'true');
   
-  if (isCollapsed) {
-    el.rightSidebar.classList.add('collapsed');
-  } else {
-    el.rightSidebar.classList.remove('collapsed');
-  }
+  setRightSidebarCollapsed(isCollapsed, false);
   
   el.btnToggleRightSidebar.addEventListener('click', () => {
-    const currentlyCollapsed = el.rightSidebar.classList.toggle('collapsed');
-    localStorage.setItem('rightSidebarCollapsed', currentlyCollapsed.toString());
+    setRightSidebarCollapsed(!el.rightSidebar.classList.contains('collapsed'));
+  });
+}
+
+function setRightSidebarCollapsed(collapsed, persist = true) {
+  if (!el.rightSidebar) return;
+  el.rightSidebar.classList.toggle('collapsed', collapsed);
+  if (el.btnToggleRightSidebar) el.btnToggleRightSidebar.setAttribute('aria-expanded', String(!collapsed));
+  if (persist) localStorage.setItem('rightSidebarCollapsed', String(collapsed));
+}
+
+function revealAgentPanel(reason = '') {
+  const wasCollapsed = el.rightSidebar && el.rightSidebar.classList.contains('collapsed');
+  setRightSidebarCollapsed(false, false);
+  if (reason && wasCollapsed) showToast(reason, 'attention');
+}
+
+function setLeftSidebarCollapsed(collapsed, persist = true) {
+  if (!el.leftSidebar) return;
+  el.leftSidebar.classList.toggle('collapsed', collapsed);
+  if (el.btnToggleLeftSidebar) el.btnToggleLeftSidebar.setAttribute('aria-expanded', String(!collapsed));
+  if (persist) localStorage.setItem('leftSidebarCollapsed', String(collapsed));
+}
+
+function runCommandPaletteAction(command) {
+  const targets = {
+    'new-task': el.btnNewChat,
+    'open-workspace': el.btnChangeWorkspace,
+    'sync-files': el.btnSyncFiles,
+    'agent-panel': el.btnToggleRightSidebar,
+    phone: el.btnPhoneCompanion,
+    launch: document.getElementById('btn-launch-app'),
+    settings: el.btnSettings
+  };
+  const target = targets[command];
+  if (target) target.click();
+}
+
+function setupProgressiveDisclosure() {
+  if (el.leftSidebar && el.btnToggleLeftSidebar) {
+    const stored = localStorage.getItem('leftSidebarCollapsed');
+    const collapsed = stored === null ? window.innerWidth < 980 : stored === 'true';
+    setLeftSidebarCollapsed(collapsed, false);
+    el.btnToggleLeftSidebar.addEventListener('click', () => {
+      setLeftSidebarCollapsed(!el.leftSidebar.classList.contains('collapsed'));
+    });
+  }
+
+  const closePalette = () => el.commandPaletteModal && el.commandPaletteModal.classList.remove('active');
+  const openPalette = () => {
+    if (!el.commandPaletteModal) return;
+    el.commandPaletteModal.classList.add('active');
+    const firstCommand = el.commandPaletteModal.querySelector('.command-item');
+    if (firstCommand) firstCommand.focus();
+  };
+  if (el.btnCommandPalette) el.btnCommandPalette.addEventListener('click', openPalette);
+  if (el.commandPaletteModal) {
+    el.commandPaletteModal.addEventListener('click', event => {
+      if (event.target === el.commandPaletteModal) closePalette();
+      const item = event.target.closest('.command-item');
+      if (!item) return;
+      runCommandPaletteAction(item.dataset.command);
+      closePalette();
+    });
+  }
+  document.addEventListener('keydown', event => {
+    const paletteOpen = el.commandPaletteModal && el.commandPaletteModal.classList.contains('active');
+    if (paletteOpen && event.key === 'Tab') {
+      const items = [...el.commandPaletteModal.querySelectorAll('.command-item')];
+      if (items.length) {
+        const currentIndex = items.indexOf(document.activeElement);
+        const nextIndex = event.shiftKey
+          ? (currentIndex <= 0 ? items.length - 1 : currentIndex - 1)
+          : (currentIndex >= items.length - 1 ? 0 : currentIndex + 1);
+        event.preventDefault();
+        items[nextIndex].focus();
+      }
+    } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+      event.preventDefault();
+      paletteOpen ? closePalette() : openPalette();
+    } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'n') {
+      event.preventDefault();
+      createNewConversation();
+    } else if (event.key === 'Escape' && el.commandPaletteModal && el.commandPaletteModal.classList.contains('active')) {
+      closePalette();
+    }
   });
 }
 
@@ -830,6 +924,7 @@ async function loadRunArtifacts() {
   const result = await window.api.listRunArtifacts(activeConversationId);
   const artifacts = result && result.success ? result.artifacts : [];
   if (el.artifactCountBadge) el.artifactCountBadge.textContent = artifacts.length;
+  if (el.runArtifactsPanel) el.runArtifactsPanel.classList.toggle('contextual-panel-hidden', artifacts.length === 0);
   if (!artifacts.length) {
     el.artifactList.innerHTML = '<p class="empty-state">Artifacts are saved outside the project after runs.</p>';
     return;
@@ -1309,6 +1404,7 @@ function selectConversation(id) {
     el.workspaceLabel.textContent = conv.projectPath ? `${conv.projectPath} > [Pending First Message]` : 'Pending First Message';
     el.fileTree.innerHTML = '<p class="empty-state">Workspace will initialize upon sending your first prompt.</p>';
     el.fileCountBadge.textContent = '0';
+    if (el.workspaceFilesPanel) el.workspaceFilesPanel.classList.add('contextual-panel-hidden');
   }
   
   renderConversationList();
@@ -1343,6 +1439,12 @@ function selectConversation(id) {
   updateTestResultsPanel(conv.testResults);
   refreshOperationalContext(conv.workspace);
   loadRunArtifacts();
+  if (conv.awaitingPlanApproval && !conv.planApproved) {
+    revealAgentPanel('A plan is ready for review.');
+    renderAgentPresence('attention', 'Review needed', 'Implementation plan is waiting for approval');
+  } else if (!(window.isAgentRunning && window.isAgentRunning())) {
+    renderAgentPresence('idle', 'Ready', 'Waiting for a task');
+  }
   
   // Scroll to bottom
   el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
@@ -1862,6 +1964,12 @@ function updateOperationalContext(state) {
   const satisfied = context.winConditions.filter(item => item.status === 'satisfied').length;
   const winProgress = context.winConditions.length ? `${satisfied}/${context.winConditions.length}` : 'No conditions';
   const blockers = context.blockers.active;
+  if (blockers.length > 0) {
+    revealAgentPanel('Orion needs attention: an active blocker was recorded.');
+    if (!(window.isAgentRunning && window.isAgentRunning())) {
+      renderAgentPresence('attention', 'Needs attention', blockers[0].title);
+    }
+  }
   const conditionMarkup = context.winConditions.slice(0, 8).map(item => `
     <div class="mission-condition ${item.status}">
       <span class="mission-condition-dot"></span>
@@ -2058,6 +2166,47 @@ window.clearActiveAiBubble = () => {
   activeAiBubble = null;
 };
 
+function renderAgentPresence(state, label, detail) {
+  if (!el.agentStatePill) return;
+  el.agentStatePill.className = `agent-state-pill ${state}`;
+  el.agentStateText.textContent = label;
+  el.agentStateDetail.textContent = detail || '';
+}
+
+function refreshAgentPresence() {
+  const running = window.isAgentRunning && window.isAgentRunning();
+  const conv = conversations.find(item => item.id === activeConversationId);
+  if (conv && conv.awaitingPlanApproval && !conv.planApproved) {
+    renderAgentPresence('attention', 'Review needed', 'Implementation plan is waiting for approval');
+    return;
+  }
+  if (!running) return;
+  const mode = window.getAgentExecutionMode ? window.getAgentExecutionMode() : 'executing';
+  const subStatus = window.getAgentSubStatus ? window.getAgentSubStatus() : '';
+  if (/run_tests|test|verif/i.test(subStatus)) {
+    renderAgentPresence('verifying', 'Verifying', subStatus);
+  } else if (/running tool/i.test(subStatus) || mode === 'executing' || mode === 'direct') {
+    renderAgentPresence('acting', 'Acting', subStatus || 'Working through the current objective');
+  } else if (/waiting|cooldown|retry/i.test(subStatus)) {
+    renderAgentPresence('waiting', 'Waiting', subStatus);
+  } else {
+    renderAgentPresence('thinking', 'Thinking', subStatus || 'Choosing the next useful action');
+  }
+}
+
+function showToast(message, tone = 'default') {
+  if (!el.toastRegion || !message) return;
+  const toast = document.createElement('div');
+  toast.className = `orion-toast ${tone}`;
+  toast.textContent = message;
+  el.toastRegion.replaceChildren(toast);
+  setTimeout(() => toast.classList.add('visible'), 10);
+  setTimeout(() => {
+    toast.classList.remove('visible');
+    setTimeout(() => toast.remove(), 220);
+  }, 3200);
+}
+
 window.onAgentStatusChange = (running) => {
   const submitBtn = el.btnSubmit;
   const steerBtn = document.getElementById('btn-steer');
@@ -2065,14 +2214,29 @@ window.onAgentStatusChange = (running) => {
   
   if (running) {
     submitBtn.classList.add('btn-stop');
-    submitBtn.innerHTML = '⏹';
+    submitBtn.innerHTML = '&#9209;';
     submitBtn.title = 'Stop agent task execution';
+    clearTimeout(agentCompletionTimer);
+    refreshAgentPresence();
+    clearInterval(agentPresenceTimer);
+    agentPresenceTimer = setInterval(refreshAgentPresence, 250);
   } else {
+    clearInterval(agentPresenceTimer);
+    agentPresenceTimer = null;
     submitBtn.classList.remove('btn-stop');
-    submitBtn.innerHTML = '✦';
+    submitBtn.innerHTML = '&#10022;';
     submitBtn.title = 'Send message';
     steerBtn.style.display = 'none';
     queueBtn.style.display = 'none';
+    const conv = conversations.find(item => item.id === activeConversationId);
+    if (conv && conv.awaitingPlanApproval && !conv.planApproved) {
+      revealAgentPanel('A plan is ready for review.');
+      renderAgentPresence('attention', 'Review needed', 'Implementation plan is waiting for approval');
+    } else {
+      renderAgentPresence('complete', 'Complete', 'Orion finished the current run');
+      showToast('Orion finished the current run.', 'success');
+      agentCompletionTimer = setTimeout(() => renderAgentPresence('idle', 'Ready', 'Waiting for a task'), 2600);
+    }
   }
 };
 window.renderUserMessageInChat = renderUserMessage;
@@ -2146,6 +2310,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     queuedPrompts: window.promptQueue ? window.promptQueue.filter(q => q.conversationId === resolvedId).length : 0,
     queuedPromptPreview: window.promptQueue ? window.promptQueue.filter(q => q.conversationId === resolvedId).map(q => q.prompt).slice(0, 3) : [],
     subStatus: isActiveTargetRunning && window.getAgentSubStatus ? window.getAgentSubStatus() : '',
+    executionMode: isActiveTargetRunning && window.getAgentExecutionMode ? window.getAgentExecutionMode() : 'idle',
     awaitingPlanApproval: !!(conv && conv.awaitingPlanApproval && !conv.planApproved),
     tasks: conv && Array.isArray(conv.tasks) ? conv.tasks : [],
     model: window.getSelectedModel(),

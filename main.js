@@ -1174,6 +1174,24 @@ function companionHtml(pairingCode) {
       -webkit-backdrop-filter: blur(20px);
     }
     .brand::before,
+    .status-pill::after { display: none; }
+    .status-pill {
+      position: absolute;
+      top: calc(18px + env(safe-area-inset-top));
+      right: 18px;
+      width: auto;
+      height: auto;
+      overflow: visible;
+      padding: 5px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(21,28,42,.9);
+      color: var(--muted);
+      font-size: .66rem;
+      font-weight: 750;
+    }
+    .status-pill.running { border-color: rgba(130,115,244,.28); color: #c9c2ff; }
+    .brand::before,
     .status-pill::after {
       background: rgba(21,28,42,.88);
       color: var(--text);
@@ -1487,7 +1505,15 @@ function companionHtml(pairingCode) {
         currentConversationId = state.conversationId || '';
         metaEl.textContent = state.title || 'No active conversation';
         modelEl.textContent = state.model || '-';
-        statusPillEl.textContent = state.running ? 'Working' : 'Ready';
+        const phoneSubStatus = state.subStatus || '';
+        const phoneAgentState = state.awaitingPlanApproval
+          ? 'Review'
+          : (!state.running
+            ? 'Ready'
+            : (/run_tests|test|verif/i.test(phoneSubStatus)
+              ? 'Verifying'
+              : (/running tool/i.test(phoneSubStatus) || state.executionMode === 'executing' || state.executionMode === 'direct' ? 'Acting' : 'Thinking')));
+        statusPillEl.textContent = phoneAgentState;
         statusPillEl.classList.toggle('running', !!state.running);
         statusEl.textContent = state.subStatus || state.workspace || '';
         

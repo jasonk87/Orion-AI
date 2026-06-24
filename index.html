@@ -13,6 +13,7 @@
   <!-- Custom Title Bar for borderless Electron Window -->
   <header id="titlebar">
     <div class="titlebar-left">
+      <button id="btn-toggle-left-sidebar" class="chrome-icon-button" aria-label="Toggle navigation sidebar" title="Toggle sidebar">&#9776;</button>
       <span class="app-logo">&#127756;</span>
       <span class="app-title">Orion AI</span>
     </div>
@@ -82,8 +83,11 @@
       <!-- Conversation Top Bar -->
       <div id="conversation-header">
         <div class="header-title-container">
-          <span id="chat-title">New Conversation</span>
-          <span class="dropdown-arrow">&#9660;</span>
+          <div class="conversation-title-line">
+            <span id="chat-title">New Conversation</span>
+            <span id="agent-state-pill" class="agent-state-pill idle" aria-live="polite"><span class="agent-state-dot"></span><span id="agent-state-text">Ready</span></span>
+          </div>
+          <span id="agent-state-detail" class="agent-state-detail">Waiting for a task</span>
         </div>
         
         <!-- Workspace File Bar -->
@@ -93,6 +97,7 @@
           <button id="btn-phone-companion" class="btn-secondary phone-companion-button" title="Pair Phone Companion">Phone</button>
           <button id="btn-launch-app" class="btn-secondary" title="Launch application for testing">&#9654; Launch</button>
           <button id="btn-toggle-right-sidebar" class="btn-secondary" title="Toggle Agent Panel">&#9776; Panel</button>
+          <button id="btn-command-palette" class="btn-secondary command-palette-trigger" title="Commands (Ctrl+K)" aria-label="Open command palette">&#8943;</button>
         </div>
       </div>
 
@@ -182,7 +187,7 @@
       </div>
 
       <!-- Workspace Files Panel -->
-      <div class="panel-section flex-grow">
+      <div class="panel-section flex-grow" id="workspace-files-panel">
         <div class="panel-section-title" style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
           <span style="display: flex; align-items: center; gap: 6px;">
             Workspace Files
@@ -199,7 +204,7 @@
         </div>
       </div>
 
-      <div class="panel-section">
+      <div class="panel-section contextual-panel-hidden" id="run-artifacts-panel">
         <div class="panel-section-title" style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
           <span>Run Artifacts</span>
           <span class="badge" id="artifact-count-badge">0</span>
@@ -213,6 +218,24 @@
     </aside>
 
   </div>
+
+  <div id="command-palette-modal" class="modal-overlay command-palette-overlay" role="dialog" aria-modal="true" aria-labelledby="command-palette-title">
+    <div class="command-palette-card">
+      <div class="command-palette-heading">
+        <span id="command-palette-title">Orion commands</span>
+        <kbd>Esc</kbd>
+      </div>
+      <button class="command-item" data-command="new-task"><span>New conversation</span><kbd>Ctrl N</kbd></button>
+      <button class="command-item" data-command="open-workspace"><span>Open workspace</span></button>
+      <button class="command-item" data-command="sync-files"><span>Refresh workspace files</span></button>
+      <button class="command-item" data-command="agent-panel"><span>Toggle Agent Panel</span></button>
+      <button class="command-item" data-command="phone"><span>Open Phone Companion</span></button>
+      <button class="command-item" data-command="launch"><span>Launch workspace app</span></button>
+      <button class="command-item" data-command="settings"><span>Settings</span></button>
+    </div>
+  </div>
+
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
 
   <!-- FILE VIEWER MODAL -->
   <div id="file-viewer-modal" class="modal-overlay">

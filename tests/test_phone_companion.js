@@ -302,6 +302,7 @@ test('Phone Companion v2 task dashboard carries global running, viewed state, qu
     queuedPrompts: 2,
     queuedPromptPreview: ['npm test', 'git status'],
     subStatus: 'Running webpack...',
+    executionMode: 'executing',
     operationalContext: {
       revision: 4,
       mission: 'Build a deep colony simulation.',
@@ -334,6 +335,7 @@ test('Phone Companion v2 task dashboard carries global running, viewed state, qu
   t.equal(state.queuedPrompts, 2, 'carries queuedPrompts count');
   t.deepEqual(state.queuedPromptPreview, ['npm test', 'git status'], 'carries queuedPromptPreview');
   t.equal(state.subStatus, 'Running webpack...', 'carries subStatus');
+  t.equal(state.executionMode, 'executing', 'carries agent execution mode');
   t.equal(state.operationalContext.mission, 'Build a deep colony simulation.', 'carries mission context');
   t.equal(state.operationalContext.activeSubplan.title, 'Implement economy', 'carries active subplan');
   t.equal(state.operationalContext.blockers[0].title, 'Save format mismatch', 'carries active blockers');
