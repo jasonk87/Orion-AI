@@ -7,6 +7,7 @@
   const MAX_DISCARDED = 50;
   const MAX_EVIDENCE = 50;
   const MAX_CHAT_VIEW_MESSAGES = 6;
+  const COMPLETION_STATUSES = ['continue_work', 'ask_clarification', 'blocked', 'ready_for_final'];
 
   function isoNow(now) {
     return typeof now === 'string' ? now : (now instanceof Date ? now.toISOString() : new Date().toISOString());
@@ -175,6 +176,7 @@
       }
       case 'complete_subplan': {
         if (!state.activeSubplan) throw new Error('No active subplan exists');
+        if (state.blockers.active.length > 0) throw new Error('Subplan completion requires resolving active blockers first');
         const evidence = Array.isArray(args.evidence) ? args.evidence.map(value => cleanText(value, 1000)).filter(Boolean) : [];
         if (evidence.length === 0) throw new Error('Subplan completion requires concrete evidence');
         state.activeSubplan.status = 'completed';
@@ -383,7 +385,120 @@
     return messages;
   }
 
-  const api = { VERSION, createEmptyContext, normalizeContext, applyAction, formatForPrompt, buildRecentChatView, buildReasoningMessages };
+  function gatherEvidenceText(state) {
+    const parts = [];
+    state.winConditions.forEach(condition => {
+      condition.evidence.forEach(item => parts.push(item));
+      if (condition.notes) parts.push(condition.notes);
+    });
+    if (state.activeSubplan) {
+      state.activeSubplan.evidence.forEach(item => parts.push(item));
+      if (state.activeSubplan.summary) parts.push(state.activeSubplan.summary);
+    }
+    state.latestEvidence.forEach(item => {
+      parts.push(item.summary);
+      if (item.checkpoint) parts.push(item.checkpoint);
+    });
+    if (state.lastCheckpoint) {
+      parts.push(state.lastCheckpoint.summary);
+      parts.push(state.lastCheckpoint.nextAction);
+    }
+    return parts.map(item => cleanText(item, 1200)).filter(Boolean);
+  }
+
+  function normalizeExplicitRequirements(requirements) {
+    return (Array.isArray(requirements) ? requirements : [])
+      .map(item => {
+        if (typeof item === 'string') return { title: cleanText(item, 500), status: 'pending' };
+        return {
+          title: cleanText(item && (item.title || item.text || item.requirement), 500),
+          status: normalizeStatus(item && item.status, ['pending', 'in_progress', 'completed', 'x'], 'pending'),
+          evidence: Array.isArray(item && item.evidence) ? item.evidence.map(value => cleanText(value, 1000)).filter(Boolean) : []
+        };
+      })
+      .filter(item => item.title);
+  }
+
+  function makeGate(status, reasons, details = {}) {
+    return {
+      status: COMPLETION_STATUSES.includes(status) ? status : 'continue_work',
+      reasons: reasons.map(reason => cleanText(reason, 1200)).filter(Boolean),
+      missingEvidence: (details.missingEvidence || []).map(item => cleanText(item, 1200)).filter(Boolean),
+      blockers: details.blockers || [],
+      pendingWinConditions: details.pendingWinConditions || [],
+      pendingRequirements: details.pendingRequirements || []
+    };
+  }
+
+  function evaluateCompletionGate(input, options = {}) {
+    const state = normalizeContext(input);
+    const explicitRequirements = normalizeExplicitRequirements(options.explicitRequirements);
+    const reasons = [];
+    const missingEvidence = [];
+    const evidenceText = gatherEvidenceText(state);
+    const hasEvidence = evidenceText.length > 0;
+    const hasVerificationEvidence = evidenceText.some(text => /\b(test|tests|smoke|manual|verified|verification|passed|inspected|screenshot|build|lint|typecheck|exit\s*code\s*0|exitcode=0|npm test)\b/i.test(text));
+
+    if (!state.mission.statement) {
+      return makeGate('ask_clarification', ['Mission statement is missing; Orion needs a canonical mission before it can judge completion.'], { missingEvidence: ['mission statement'] });
+    }
+
+    if (state.blockers.active.length > 0) {
+      return makeGate('blocked', ['Active blockers remain in operational state.'], {
+        blockers: state.blockers.active.map(item => ({ id: item.id, title: item.title, details: item.details }))
+      });
+    }
+
+    const pendingWinConditions = state.winConditions
+      .filter(condition => condition.status !== 'satisfied')
+      .map(condition => ({ id: condition.id, title: condition.title, status: condition.status }));
+    if (state.winConditions.length === 0) {
+      missingEvidence.push('measurable win conditions');
+      reasons.push('No win conditions are defined.');
+    } else if (pendingWinConditions.length > 0) {
+      reasons.push('One or more win conditions are not satisfied.');
+    }
+
+    const unsupportedSatisfied = state.winConditions
+      .filter(condition => condition.status === 'satisfied' && condition.evidence.length === 0)
+      .map(condition => condition.title);
+    unsupportedSatisfied.forEach(title => missingEvidence.push(`evidence for satisfied win condition: ${title}`));
+
+    if (state.activeSubplan && state.activeSubplan.status === 'blocked') {
+      return makeGate('blocked', ['The active subplan is blocked.'], { blockers: [{ id: state.activeSubplan.id, title: state.activeSubplan.title, details: state.activeSubplan.summary }] });
+    }
+    if (state.activeSubplan && state.activeSubplan.status === 'active') {
+      reasons.push(`Active subplan is still in progress: ${state.activeSubplan.title}`);
+    }
+    if (state.activeSubplan && state.activeSubplan.status === 'completed' && state.activeSubplan.evidence.length === 0) {
+      missingEvidence.push(`evidence for completed subplan: ${state.activeSubplan.title}`);
+    }
+
+    const pendingRequirements = explicitRequirements
+      .filter(requirement => requirement.status !== 'completed' && requirement.status !== 'x')
+      .map(requirement => ({ title: requirement.title, status: requirement.status }));
+    if (pendingRequirements.length > 0) {
+      reasons.push('Explicit user requirements or checklist items are still pending.');
+    }
+
+    if (!hasEvidence) {
+      missingEvidence.push('latest evidence or checkpoint');
+      reasons.push('No latest evidence/checkpoints are available.');
+    }
+
+    if (options.requireVerificationEvidence !== false && !hasVerificationEvidence) {
+      missingEvidence.push('tests, smoke check, manual verification, or inspected evidence');
+      reasons.push('No test/smoke/manual verification evidence is recorded.');
+    }
+
+    if (reasons.length || missingEvidence.length || pendingWinConditions.length || pendingRequirements.length) {
+      return makeGate('continue_work', reasons, { missingEvidence, pendingWinConditions, pendingRequirements });
+    }
+
+    return makeGate('ready_for_final', ['Mission has evidence-backed satisfied win conditions, no active blockers, and verification evidence.']);
+  }
+
+  const api = { VERSION, createEmptyContext, normalizeContext, applyAction, formatForPrompt, buildRecentChatView, buildReasoningMessages, evaluateCompletionGate };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   if (globalScope) globalScope.OrionOperationalContext = api;
 })(typeof window !== 'undefined' ? window : globalThis);

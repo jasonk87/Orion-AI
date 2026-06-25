@@ -407,122 +407,29 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         }
         
         const isProMode = typeof window.isProModeActive === 'function' && window.isProModeActive();
-        
         if (isProMode) {
-          // 1. Analyst call
-          currentAgentLogs.push({ type: 'thought', content: "🔍 Pro Mode: Analyzing architecture & edge cases..." });
-          window.renderAiMessage(lastTextResponse, currentAgentLogs);
-          
-          let analystMessages = [...messages];
-          analystMessages.push({
+          messages.push({
             role: 'user',
-            parts: [{ text: "[PRO MODE: Act as a Senior Systems Architect and Critic. Analyze the user's task or current state. Identify all potential edge cases, hidden assumptions, potential bugs, architectural flaws, and performance bottlenecks. Output your detailed analysis, edge cases, and proposed strategies. Do NOT call any tools yet.]" }]
+            parts: [{ text: '[PRO MODE: Use extra care on architecture, edge cases, tests, and failure recovery inside the same state-driven reasoning loop. Do not create another role; the operational completion gate is the completion authority.]' }]
           });
-          
-          let analystRes;
-          if (modelName.startsWith('gemini-')) {
-            analystRes = await callGeminiAPI(analystMessages, modelName, config.geminiApiKey, null, true);
-          } else {
-            analystRes = await callOllamaAPI(analystMessages, modelName, null, true);
-          }
-          
-          const analystCandidate = analystRes.candidates && analystRes.candidates[0];
-          if (analystCandidate && analystCandidate.finishReason && analystCandidate.finishReason !== "STOP") {
-            throw new Error(`Pro Mode Analyst call stopped by API (Reason: ${analystCandidate.finishReason})`);
-          }
-          
-          const analystText = analystCandidate && analystCandidate.content && analystCandidate.content.parts && analystCandidate.content.parts[0] && analystCandidate.content.parts[0].text || "No analysis generated.";
-          
-          currentAgentLogs.push({ type: 'thought', content: `📐 Architect Analysis:\n${analystText}` });
+          currentAgentLogs.push({ type: 'thought', content: 'Pro Mode: using the single state-driven loop with stricter evidence expectations.' });
           window.renderAiMessage(lastTextResponse, currentAgentLogs);
-          
-          // 2. Critic call
-          currentAgentLogs.push({ type: 'thought', content: "⚖️ Pro Mode: Critic evaluating proposed strategies..." });
-          window.renderAiMessage(lastTextResponse, currentAgentLogs);
-          
-          let criticMessages = [...analystMessages];
-          criticMessages.push({
-            role: 'model',
-            parts: [{ text: analystText }]
-          });
-          criticMessages.push({
-            role: 'user',
-            parts: [{ text: "[PRO MODE: Act as a Critical Code Reviewer. Find weaknesses, gaps, or security flaws in the architect's analysis. What is missing? What will fail under load or with invalid inputs? Output your critique and suggested improvements. Do NOT call any tools yet.]" }]
-          });
-          
-          let criticRes;
-          if (modelName.startsWith('gemini-')) {
-            criticRes = await callGeminiAPI(criticMessages, modelName, config.geminiApiKey, null, true);
-          } else {
-            criticRes = await callOllamaAPI(criticMessages, modelName, null, true);
-          }
-          
-          const criticCandidate = criticRes.candidates && criticRes.candidates[0];
-          if (criticCandidate && criticCandidate.finishReason && criticCandidate.finishReason !== "STOP") {
-            throw new Error(`Pro Mode Critic call stopped by API (Reason: ${criticCandidate.finishReason})`);
-          }
-          
-          const criticText = criticCandidate && criticCandidate.content && criticCandidate.content.parts && criticCandidate.content.parts[0] && criticCandidate.content.parts[0].text || "No critic review generated.";
-          
-          currentAgentLogs.push({ type: 'thought', content: `🛡️ Critic Review:\n${criticText}` });
-          window.renderAiMessage(lastTextResponse, currentAgentLogs);
-          
-          // 3. Execution call
-          currentAgentLogs.push({ type: 'thought', content: "🚀 Pro Mode: Executing tool call / response..." });
-          window.renderAiMessage(lastTextResponse, currentAgentLogs);
-          
-          const needsPlan = config.planningMode && !conversation.planApproved;
-          const executionInstruction = needsPlan 
-            ? "Based on the above deep reasoning, proceed with the PLANNING PHASE. You must first create the 'implementation_plan.md' file containing your refined design (incorporating the critic's suggestions) and call 'set_task_checklist' with your tasks, then wait for user approval. Do NOT write or modify any other source files or run commands yet."
-            : "Based on the above deep reasoning, proceed with the EXECUTION PHASE. Generate the next tool calls or responses with high reliability and precision to complete the tasks.";
+        }
 
-          let execMessages = [...messages];
-          execMessages.push({
-            role: 'user',
-            parts: [{
-              text: `[PRO MODE CONTRIBUTE:
-Architect Edge Case Analysis:
-${analystText}
-
-Critic Review & Suggestions:
-${criticText}
-
-${executionInstruction}]`
-            }]
+        if (modelName.startsWith('gemini-')) {
+          response = await callGeminiAPI(messages, modelName, config.geminiApiKey, (warningMsg) => {
+            agentSubStatus = warningMsg;
+            currentAgentLogs.push({ type: 'thought', content: `Warning: ${warningMsg}` });
+            conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
+            window.renderAiMessage(lastTextResponse, currentAgentLogs);
           });
-          
-          if (modelName.startsWith('gemini-')) {
-            response = await callGeminiAPI(execMessages, modelName, config.geminiApiKey, (warningMsg) => {
-              agentSubStatus = warningMsg;
-              currentAgentLogs.push({ type: 'thought', content: `⚠️ ${warningMsg}` });
-              conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
-              window.renderAiMessage(lastTextResponse, currentAgentLogs);
-            });
-          } else {
-            response = await callOllamaAPI(execMessages, modelName, (warningMsg) => {
-              agentSubStatus = warningMsg;
-              currentAgentLogs.push({ type: 'thought', content: `⚠️ ${warningMsg}` });
-              conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
-              window.renderAiMessage(lastTextResponse, currentAgentLogs);
-            });
-          }
         } else {
-          // Normal mode (direct call)
-          if (modelName.startsWith('gemini-')) {
-            response = await callGeminiAPI(messages, modelName, config.geminiApiKey, (warningMsg) => {
-              agentSubStatus = warningMsg;
-              currentAgentLogs.push({ type: 'thought', content: `⚠️ ${warningMsg}` });
-              conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
-              window.renderAiMessage(lastTextResponse, currentAgentLogs);
-            });
-          } else {
-            response = await callOllamaAPI(messages, modelName, (warningMsg) => {
-              agentSubStatus = warningMsg;
-              currentAgentLogs.push({ type: 'thought', content: `⚠️ ${warningMsg}` });
-              conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
-              window.renderAiMessage(lastTextResponse, currentAgentLogs);
-            });
-          }
+          response = await callOllamaAPI(messages, modelName, (warningMsg) => {
+            agentSubStatus = warningMsg;
+            currentAgentLogs.push({ type: 'thought', content: `Warning: ${warningMsg}` });
+            conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
+            window.renderAiMessage(lastTextResponse, currentAgentLogs);
+          });
         }
         agentSubStatus = 'Processing model response...';
       } catch (e) {
@@ -663,6 +570,28 @@ ${executionInstruction}]`
           currentAgentLogs.push({ type: 'thought', content: 'Verification guard: code changed, so Orion must inspect the changed files and run or justify a real check before finishing.' });
           messages.push({ role: 'user', parts: [{ text: evidencePrompt }] });
           continue;
+        }
+        if (hasOperationalMissionState(workingState)) {
+          const completionGate = evaluateWorkingStateCompletion(workingState, conversation);
+          if (completionGate.status === 'continue_work' && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
+            const gateMessage = buildCompletionGateMessage(completionGate);
+            currentAgentLogs.push({ type: 'thought', content: `Completion gate held final response.\n${gateMessage}` });
+            messages.push({
+              role: 'user',
+              parts: [{
+                text: `[SYSTEM: The operational completion gate says this task is not ready for a final summary yet.\n${gateMessage}\nContinue work by updating operational state, running/recording verification, resolving blockers, or satisfying win conditions with evidence. Do not split this into another role.]`
+              }]
+            });
+            continue;
+          }
+          if (completionGate.status === 'blocked' || completionGate.status === 'ask_clarification') {
+            lastTextResponse = `${completionGate.status === 'blocked' ? 'I cannot honestly mark this complete yet because the operational state is blocked.' : 'I need clarification before I can judge this complete.'}\n\n${buildCompletionGateMessage(completionGate)}`;
+            break;
+          }
+          if (completionGate.status !== 'ready_for_final') {
+            lastTextResponse = `I cannot honestly mark this complete yet.\n\n${buildCompletionGateMessage(completionGate)}`;
+            break;
+          }
         }
         break;
       } else {
@@ -1282,6 +1211,21 @@ async function executeTool(name, args, workspace, config, conversation) {
           message: `Checklist update skipped: ${gate.reason}`
         };
       }
+      if (args.tasks.length > 0 && args.tasks.every(task => task.status === 'completed' || task.status === 'x')) {
+        const currentOperational = await readOperationalContext(workspace);
+        if (currentOperational.success && hasOperationalMissionState(currentOperational.state)) {
+          const completionGate = OperationalContext.evaluateCompletionGate(currentOperational.state, { explicitRequirements: args.tasks });
+          if (completionGate.status !== 'ready_for_final') {
+            return {
+              success: true,
+              skipped: true,
+              reason: 'completion_gate',
+              message: `Checklist completion skipped: ${buildCompletionGateMessage(completionGate)}`,
+              completionGate
+            };
+          }
+        }
+      }
       
       // Update local storage representation in target conversation
       conversation.tasks = args.tasks;
@@ -1574,6 +1518,12 @@ async function mutateOperationalContext(workspace, action, args = {}) {
   const current = await readOperationalContext(workspace);
   if (!current.success) throw new Error(current.error);
   const transition = OperationalContext.applyAction(current.state, action, args);
+  if (action === 'evaluate_win_conditions' && transition.state.winConditions.length > 0 && transition.state.winConditions.every(condition => condition.status === 'satisfied')) {
+    const completionGate = OperationalContext.evaluateCompletionGate(transition.state, { explicitRequirements: [] });
+    if (completionGate.status !== 'ready_for_final') {
+      throw new Error(`Completion gate rejected final win-condition satisfaction: ${buildCompletionGateMessage(completionGate)}`);
+    }
+  }
   const writeResult = await window.api.writeFile(workspace, OPERATIONAL_CONTEXT_PATH, `${JSON.stringify(transition.state, null, 2)}\n`);
   if (writeResult && writeResult.error) throw new Error(writeResult.error);
   await appendOperationalJournal(workspace, transition.event, transition.state.revision);
@@ -1590,6 +1540,26 @@ async function checkpointOperationalContext(workspace, reason, summary, nextActi
     console.warn('Operational context checkpoint failed:', error);
     return null;
   }
+}
+
+function hasOperationalMissionState(state) {
+  return !!(state && (state.mission && state.mission.statement || state.winConditions && state.winConditions.length || state.activeSubplan));
+}
+
+function buildCompletionGateMessage(gate) {
+  const parts = [`Completion gate status: ${gate.status}.`];
+  if (gate.reasons && gate.reasons.length) parts.push(`Reasons: ${gate.reasons.join('; ')}`);
+  if (gate.missingEvidence && gate.missingEvidence.length) parts.push(`Missing proof: ${gate.missingEvidence.join('; ')}`);
+  if (gate.pendingWinConditions && gate.pendingWinConditions.length) parts.push(`Pending win conditions: ${gate.pendingWinConditions.map(item => item.title).join('; ')}`);
+  if (gate.pendingRequirements && gate.pendingRequirements.length) parts.push(`Pending requirements: ${gate.pendingRequirements.map(item => item.title).join('; ')}`);
+  if (gate.blockers && gate.blockers.length) parts.push(`Active blockers: ${gate.blockers.map(item => item.title).join('; ')}`);
+  return parts.join('\n');
+}
+
+function evaluateWorkingStateCompletion(state, conversation) {
+  return OperationalContext.evaluateCompletionGate(state, {
+    explicitRequirements: conversation && conversation.tasks ? conversation.tasks : []
+  });
 }
 
 function summarizeToolOutcome(toolName, args, result) {

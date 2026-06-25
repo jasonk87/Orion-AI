@@ -113,6 +113,85 @@ test('win conditions cannot be satisfied without evidence', (t) => {
   t.end();
 });
 
+test('completion gate rejects unsatisfied win conditions', (t) => {
+  let state = missionState();
+  state = operational.applyAction(state, 'record_tool_result', {
+    toolName: 'run_tests',
+    success: true,
+    summary: 'npm test passed'
+  }, T0).state;
+  const gate = operational.evaluateCompletionGate(state);
+  t.equal(gate.status, 'continue_work', 'not ready while win conditions remain pending');
+  t.equal(gate.pendingWinConditions.length, 2, 'reports pending win conditions');
+  t.end();
+});
+
+test('completion gate rejects active blockers', (t) => {
+  let state = missionState();
+  state = operational.applyAction(state, 'record_blocker', {
+    title: 'Save file crashes',
+    details: 'Cannot verify persistence.'
+  }, T0).state;
+  const gate = operational.evaluateCompletionGate(state);
+  t.equal(gate.status, 'blocked', 'active blockers prevent finalization');
+  t.equal(gate.blockers[0].title, 'Save file crashes', 'reports blocker');
+  t.end();
+});
+
+test('completion gate rejects missing evidence', (t) => {
+  let state = missionState();
+  state.winConditions = state.winConditions.map(condition => ({ ...condition, status: 'satisfied', evidence: [] }));
+  const gate = operational.evaluateCompletionGate(state);
+  t.equal(gate.status, 'continue_work', 'cannot finalize without proof');
+  t.ok(gate.missingEvidence.some(item => item.includes('latest evidence')), 'requires latest evidence');
+  t.ok(gate.missingEvidence.some(item => item.includes('Working economy')), 'requires condition evidence');
+  t.end();
+});
+
+test('completion gate accepts evidence-backed completed mission', (t) => {
+  let state = missionState();
+  state = operational.applyAction(state, 'start_subplan', { title: 'Verify playable loop' }, T0).state;
+  state = operational.applyAction(state, 'complete_subplan', {
+    summary: 'Playable loop verified.',
+    evidence: ['manual smoke verification passed']
+  }, T0).state;
+  state = operational.applyAction(state, 'evaluate_win_conditions', {
+    evaluations: [
+      { id: 'economy', status: 'satisfied', evidence: ['economy.test.js passed'] },
+      { id: 'npcs', status: 'satisfied', evidence: ['npc autonomy smoke test passed'] }
+    ]
+  }, T0).state;
+  state = operational.applyAction(state, 'record_tool_result', {
+    toolName: 'run_tests',
+    success: true,
+    summary: 'npm test: all tests passed'
+  }, T0).state;
+  const gate = operational.evaluateCompletionGate(state);
+  t.equal(gate.status, 'ready_for_final', 'all evidence-backed state can finalize');
+  t.end();
+});
+
+test('completion gate ignores chat trimming and judges operational state', (t) => {
+  let state = missionState();
+  state = operational.applyAction(state, 'evaluate_win_conditions', {
+    evaluations: [
+      { id: 'economy', status: 'satisfied', evidence: ['economy.test.js passed'] },
+      { id: 'npcs', status: 'satisfied', evidence: ['npc autonomy smoke test passed'] }
+    ]
+  }, T0).state;
+  state = operational.applyAction(state, 'record_tool_result', {
+    toolName: 'run_tests',
+    success: true,
+    summary: 'npm test passed after chat history was trimmed'
+  }, T0).state;
+  const fullChat = operational.buildReasoningMessages(state, [{ role: 'user', text: 'old long chat' }], 'Finish.');
+  const trimmedChat = operational.buildReasoningMessages(state, [], 'Finish.');
+  t.equal(operational.evaluateCompletionGate(state).status, 'ready_for_final', 'gate is state-driven');
+  t.ok(JSON.stringify(fullChat).includes('Build a deep colony simulation.'), 'full chat path carries state');
+  t.ok(JSON.stringify(trimmedChat).includes('Build a deep colony simulation.'), 'trimmed chat path carries state');
+  t.end();
+});
+
 test('discoveries deduplicate and discarded noise stays bounded', (t) => {
   let state = missionState();
   state = operational.applyAction(state, 'promote_discovery', { text: 'Tests run with npm test.', category: 'command' }, T0).state;
@@ -201,6 +280,10 @@ test('agent and renderer wire operational context into both providers and Missio
   t.equal((agent.match(/\.\.\.OPERATIONAL_CONTEXT_TOOL_DECLARATIONS/g) || []).length, 2, 'shares tool declarations across Gemini and Ollama');
   t.ok(agent.includes('OperationalContext.buildReasoningMessages(workingState'), 'builds provider input from working state first');
   t.notOk(agent.includes('conversation.messages.forEach(msg =>'), 'does not reconstruct task state from full chat transcript');
+  t.ok(agent.includes('evaluateWorkingStateCompletion'), 'uses a single completion gate before finalizing');
+  t.ok(agent.includes('Completion gate held final response'), 'completion gate can force continued work instead of final summaries');
+  t.notOk(agent.includes('criticMessages'), 'does not keep a separate critic/reviewer agent path');
+  t.notOk(agent.includes('Act as a Critical Code Reviewer'), 'does not prompt a separate reviewer role');
   t.ok(agent.includes('recordToolOutcomeInWorkingState'), 'reduces tool outcomes into working state');
   t.ok(agent.includes("'context_compaction'"), 'checkpoints compaction');
   t.ok(renderer.includes("reason: 'user_steering'"), 'checkpoints steering');
