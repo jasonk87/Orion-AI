@@ -63,6 +63,8 @@ test('renderer and package hardening are wired', (t) => {
   t.notOk(indexHtml.includes('cdnjs.cloudflare.com'), 'desktop renderer no longer loads CDN scripts');
   t.ok(indexHtml.includes('node_modules/prismjs/prism.js'), 'desktop renderer loads local Prism');
   t.ok(packageJson.scripts.package.includes('--ignore="^/config\\.json$"'), 'package excludes local config');
+  t.ok(packageJson.scripts.package.includes('--ignore="^/standalone-workspaces($|/)"'), 'package excludes generated standalone workspace state');
+  t.ok(packageJson.scripts.package.includes('--ignore="^/\\.orion($|/)"'), 'package excludes generated operational context state');
   t.end();
 });
 

@@ -327,7 +327,9 @@
 
   function formatForPrompt(input) {
     const state = normalizeContext(input);
-    if (!state.mission.statement && state.winConditions.length === 0 && !state.activeSubplan && state.blockers.active.length === 0) return '';
+    const hasMissionState = !!(state.mission.statement || state.winConditions.length || state.activeObjective || state.activeSubplan);
+    if (!hasMissionState && state.blockers.active.length > 0) return '';
+    if (!hasMissionState && state.blockers.active.length === 0) return '';
     const lines = ['[ORION OPERATIONAL CONTEXT - canonical working state]'];
     lines.push(`Mission: ${state.mission.statement || 'Not defined'}`);
     lines.push(`Active objective: ${state.activeObjective ? state.activeObjective.title : 'None'}`);

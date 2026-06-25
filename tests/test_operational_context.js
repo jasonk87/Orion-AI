@@ -273,6 +273,21 @@ test('new model turn receives mission state even when old chat is reduced', (t) 
   t.end();
 });
 
+test('orphan blockers are not injected as canonical task state', (t) => {
+  let state = operational.createEmptyContext(T0);
+  state = operational.applyAction(state, 'record_blocker', {
+    title: 'Command Execution Environment Issue',
+    details: 'Old spawn powershell.exe ENOENT failure.'
+  }, T0).state;
+  const prompt = operational.formatForPrompt(state);
+  const messages = operational.buildReasoningMessages(state, [], 'how much system memory do i have?');
+  const joined = JSON.stringify(messages);
+  t.equal(prompt, '', 'blocker-only context is treated as stale/orphaned');
+  t.notOk(joined.includes('Command Execution Environment Issue'), 'stale blocker is not injected into the next direct task');
+  t.ok(joined.includes('Mission: Not defined'), 'model still receives a neutral state envelope');
+  t.end();
+});
+
 test('agent and renderer wire operational context into both providers and Mission Control', (t) => {
   const agent = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
   const renderer = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8');
