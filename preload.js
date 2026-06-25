@@ -44,6 +44,7 @@ contextBridge.exposeInMainWorld('api', {
   browserWaitForPage: (timeoutMs) => ipcRenderer.invoke('browser-wait-for-page', { timeoutMs }),
   takeScreenshot: (workspacePath, destination) => ipcRenderer.invoke('take-screenshot', { workspacePath, destination }),
   inspectScreenshot: (workspacePath, relativePath) => ipcRenderer.invoke('inspect-screenshot', { workspacePath, relativePath }),
+  readWorkspaceFileBase64: (workspacePath, relativePath) => ipcRenderer.invoke('read-workspace-file-base64', { workspacePath, relativePath }),
   compareScreenshotToGoal: (workspacePath, relativePath, goal, observations) => ipcRenderer.invoke('compare-screenshot-to-goal', { workspacePath, relativePath, goal, observations }),
   indexWorkspace: (workspacePath) => ipcRenderer.invoke('index-workspace', workspacePath),
   searchEmbeddings: (query, limit) => ipcRenderer.invoke('search-embeddings', { query, limit }),

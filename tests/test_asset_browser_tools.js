@@ -57,7 +57,8 @@ test('agent exposes general asset, browser, and visual tools without hardcoded w
     'wait_for_page',
     'take_screenshot',
     'inspect_screenshot',
-    'compare_screenshot_to_goal'
+    'compare_screenshot_to_goal',
+    'inspect_screenshot_with_model'
   ].forEach(toolName => {
     t.ok(source.includes(`name: '${toolName}'`) || source.includes(`case '${toolName}'`), `${toolName} is registered as a general tool`);
   });
@@ -144,5 +145,49 @@ test('visual verification tools can represent Three.js preview evidence without 
     ''
   );
   t.equal(uncertain.status, 'needs_more_visual_evidence', 'does not claim visual completion without observations');
+  t.end();
+});
+
+test('Gemini multimodal screenshot inspection sends inline image data and returns visual evidence', async (t) => {
+  const originalFetch = global.fetch;
+  let requestBody = null;
+  global.fetch = async (url, options) => {
+    requestBody = JSON.parse(options.body);
+    return {
+      ok: true,
+      json: async () => ({
+        candidates: [{
+          content: {
+            parts: [{
+              text: JSON.stringify({
+                status: 'appears_satisfied',
+                confidence: 0.82,
+                observations: ['A campfire is visible near the center of the village scene.'],
+                missing: [],
+                recommendation: 'Record visual evidence and continue polishing if needed.'
+              })
+            }]
+          }
+        }]
+      })
+    };
+  };
+
+  const result = await agent.inspectScreenshotWithGemini({
+    imageBase64: Buffer.from('fake-png').toString('base64'),
+    mimeType: 'image/png',
+    path: '.orion/screenshots/preview.png',
+    goal: 'campfire appears in the fantasy village scene',
+    modelName: 'gemini-2.5-flash-lite',
+    apiKey: 'test-key'
+  });
+
+  t.equal(result.status, 'appears_satisfied', 'returns structured Gemini visual status');
+  t.equal(result.confidence, 0.82, 'returns structured confidence');
+  t.ok(result.evidence.includes('campfire is visible'), 'returns visual evidence observations');
+  t.equal(requestBody.contents[0].parts[1].inline_data.mime_type, 'image/png', 'sends screenshot as Gemini inline image data');
+  t.ok(requestBody.contents[0].parts[1].inline_data.data, 'includes base64 image data');
+
+  global.fetch = originalFetch;
   t.end();
 });

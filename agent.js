@@ -51,6 +51,7 @@ Tools available:
 - download_file, inspect_archive, extract_archive, inspect_binary_asset, list_asset_metadata: General asset acquisition/inspection hands. Use when useful; do not follow a hardcoded asset pipeline.
 - open_url, search_web, click_element, fill_input, navigate_back, download_from_page, wait_for_page: Browser worker hands for autonomous web navigation and acquisition when the mission calls for it.
 - take_screenshot, inspect_screenshot, compare_screenshot_to_goal: Visual verification eyes for previews and UI/game scenes. Use evidence honestly; do not claim visual success without screenshot evidence or observations.
+- inspect_screenshot_with_model: Sends a workspace screenshot to Gemini multimodal vision for semantic visual inspection against a goal.
 - sync_workspace_env: Safely write configured API keys/search IDs into .env-style files without exposing the secret values in chat or tool output.
 - set_task_checklist: Set the UI checklist of tasks (array of {title, status}). Status can be 'pending', 'in-progress', 'completed'. Use only for milestone changes, not routine progress churn.`;
 
@@ -206,6 +207,11 @@ const ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS = [
     name: 'compare_screenshot_to_goal',
     description: 'Records a structured screenshot-vs-goal judgment using screenshot metadata and supplied observations. If observations are missing, returns needs_more_visual_evidence.',
     parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' }, goal: { type: 'STRING' }, observations: { type: 'STRING', description: 'Optional visual observations from model/user/inspection.' } }, required: ['path', 'goal'] }
+  },
+  {
+    name: 'inspect_screenshot_with_model',
+    description: 'Uses Gemini multimodal vision to inspect a workspace screenshot against a goal and returns structured visual evidence. Prefer this when Gemini is available before judging visual win conditions.',
+    parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' }, goal: { type: 'STRING' } }, required: ['path', 'goal'] }
   }
 ];
 
@@ -932,7 +938,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       const artifactPayload = buildRunArtifactPayload({
         conversation,
         userPrompt,
-        modelName,
+        modelName: config.modelName || 'gemini-2.5-flash-lite',
         workspacePath,
         workWalkthrough,
         finalText: lastTextResponse
@@ -1418,6 +1424,23 @@ async function executeTool(name, args, workspace, config, conversation) {
       return result;
     }
 
+    case 'inspect_screenshot_with_model': {
+      if (!args.path) throw new Error("Missing 'path' parameter");
+      if (!args.goal) throw new Error("Missing 'goal' parameter");
+      if (!config.geminiApiKey) throw new Error('Gemini API key is required for multimodal screenshot inspection.');
+      const file = await window.api.readWorkspaceFileBase64(workspace, args.path);
+      if (!file.success) throw new Error(file.error || 'Could not read screenshot image');
+      if (!String(file.mimeType || '').startsWith('image/')) throw new Error(`Screenshot inspection requires an image file, got ${file.mimeType}`);
+      return await inspectScreenshotWithGemini({
+        imageBase64: file.data,
+        mimeType: file.mimeType,
+        path: args.path,
+        goal: args.goal,
+        modelName,
+        apiKey: config.geminiApiKey
+      });
+    }
+
     case 'sync_workspace_env': {
       return await syncWorkspaceEnv(workspace, config, args);
     }
@@ -1839,7 +1862,7 @@ function buildDiscoveryFromToolOutcome(toolName, args = {}, result = {}, outcome
   if (!result || result.error || result.success === false) return null;
   const assetTools = new Set(['download_file', 'inspect_archive', 'extract_archive', 'inspect_binary_asset', 'list_asset_metadata']);
   const browserTools = new Set(['open_url', 'search_web', 'click_element', 'download_from_page']);
-  const visualTools = new Set(['take_screenshot', 'inspect_screenshot', 'compare_screenshot_to_goal']);
+  const visualTools = new Set(['take_screenshot', 'inspect_screenshot', 'compare_screenshot_to_goal', 'inspect_screenshot_with_model']);
   if (assetTools.has(toolName)) {
     const source = result.url || args.url || '';
     const path = result.path || result.destination || args.path || '';
@@ -2044,6 +2067,7 @@ function summarizeToolStart(toolName, args = {}) {
   if (toolName === 'take_screenshot') return { toolName, kind: 'visual', status: 'running', label: 'Captured browser screenshot' };
   if (toolName === 'inspect_screenshot') return { toolName, kind: 'visual', status: 'running', label: `Inspected screenshot \`${args.path || 'screenshot'}\`` };
   if (toolName === 'compare_screenshot_to_goal') return { toolName, kind: 'visual', status: 'running', label: `Compared screenshot to goal` };
+  if (toolName === 'inspect_screenshot_with_model') return { toolName, kind: 'visual', status: 'running', label: `Inspected screenshot with Gemini vision` };
   if (toolName === 'write_file') {
     const isPlan = args.path && args.path.split(/[\\/]/).pop().toLowerCase() === 'implementation_plan.md';
     return {
@@ -2108,7 +2132,7 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
   } else if (result && result.summary && (
     toolName === 'download_file' || toolName === 'inspect_archive' || toolName === 'extract_archive' ||
     toolName === 'inspect_binary_asset' || toolName === 'list_asset_metadata' ||
-    toolName === 'take_screenshot' || toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal'
+    toolName === 'take_screenshot' || toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal' || toolName === 'inspect_screenshot_with_model'
   )) {
     item.detail = result.summary;
   } else if (result && result.title && (toolName === 'open_url' || toolName === 'search_web' || toolName === 'click_element' || toolName === 'fill_input' || toolName === 'navigate_back' || toolName === 'wait_for_page')) {
@@ -3161,6 +3185,90 @@ function sanitizeMessagesForTextOnly(messages) {
   return merged;
 }
 
+function parseModelJsonObject(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (match) {
+      try {
+        return JSON.parse(match[0]);
+      } catch (inner) {}
+    }
+  }
+  return {};
+}
+
+async function inspectScreenshotWithGemini({ imageBase64, mimeType, path, goal, modelName, apiKey }) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName || 'gemini-2.5-flash-lite'}:generateContent?key=${apiKey}`;
+  const prompt = `You are Orion's visual verification eye. Inspect this screenshot against the mission goal.
+
+Goal: ${goal}
+
+Return compact JSON only with:
+{
+  "status": "appears_satisfied" | "partially_satisfied" | "not_satisfied" | "uncertain",
+  "confidence": 0.0-1.0,
+  "observations": ["specific visible evidence"],
+  "missing": ["what is missing or unclear"],
+  "recommendation": "next action for the agent"
+}
+
+Be strict. If the screenshot does not clearly show the requested objective, say not_satisfied or uncertain.`;
+
+  const requestBody = {
+    contents: [{
+      role: 'user',
+      parts: [
+        { text: prompt },
+        { inline_data: { mime_type: mimeType, data: imageBase64 } }
+      ]
+    }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json'
+    }
+  };
+
+  const response = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestBody)
+  }, MODEL_API_REQUEST_TIMEOUT_MS, 'Gemini vision screenshot inspection');
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Gemini vision inspection failed HTTP ${response.status}: ${errText}`);
+  }
+
+  const data = await response.json();
+  const text = data.candidates && data.candidates[0] && data.candidates[0].content &&
+    data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
+    data.candidates[0].content.parts[0].text;
+  const parsed = parseModelJsonObject(text);
+  const allowed = ['appears_satisfied', 'partially_satisfied', 'not_satisfied', 'uncertain'];
+  const status = allowed.includes(parsed.status) ? parsed.status : 'uncertain';
+  const confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0));
+  const observations = Array.isArray(parsed.observations) ? parsed.observations.map(item => String(item).slice(0, 500)).filter(Boolean).slice(0, 8) : [];
+  const missing = Array.isArray(parsed.missing) ? parsed.missing.map(item => String(item).slice(0, 500)).filter(Boolean).slice(0, 8) : [];
+  const recommendation = String(parsed.recommendation || '').slice(0, 1000);
+
+  return {
+    success: true,
+    path,
+    goal,
+    status,
+    confidence,
+    observations,
+    missing,
+    recommendation,
+    evidence: observations.join('; ') || text || 'Gemini inspected screenshot but returned no observations.',
+    summary: `Gemini vision judged screenshot ${status} for goal "${goal}" (confidence ${confidence.toFixed(2)}).`
+  };
+}
+
 // GEMINI API UTILITIES
 async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTools = false) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
@@ -3716,6 +3824,8 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     sanitizeFinalAnswerText,
     withWorkWalkthrough,
     buildDiscoveryFromToolOutcome,
+    parseModelJsonObject,
+    inspectScreenshotWithGemini,
     diagnoseModelApiFailure
   };
 }

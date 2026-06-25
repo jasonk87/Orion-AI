@@ -314,6 +314,28 @@ function listAssetMetadataInWorkspace(workspacePath, relativePath) {
   };
 }
 
+function readWorkspaceFileBase64(workspacePath, relativePath) {
+  const fullPath = resolveWorkspacePath(workspacePath, relativePath);
+  if (!fs.existsSync(fullPath)) throw new Error('File does not exist');
+  const stat = fs.statSync(fullPath);
+  if (!stat.isFile()) throw new Error('Path is not a file');
+  const ext = path.extname(fullPath).toLowerCase();
+  const mimeTypes = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp',
+    '.gif': 'image/gif'
+  };
+  return {
+    success: true,
+    path: relativePath,
+    mimeType: mimeTypes[ext] || 'application/octet-stream',
+    size: stat.size,
+    data: fs.readFileSync(fullPath).toString('base64')
+  };
+}
+
 let browserWorker = null;
 
 function ensureBrowserWorker() {
@@ -3060,6 +3082,14 @@ ipcMain.handle('inspect-screenshot', async (event, { workspacePath, relativePath
   }
 });
 
+ipcMain.handle('read-workspace-file-base64', async (event, { workspacePath, relativePath }) => {
+  try {
+    return readWorkspaceFileBase64(workspacePath, relativePath);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
 ipcMain.handle('compare-screenshot-to-goal', async (event, { workspacePath, relativePath, goal, observations }) => {
   try {
     return compareScreenshotToGoalInWorkspace(workspacePath, relativePath, goal, observations);
@@ -3933,6 +3963,7 @@ if (process.env.NODE_ENV === 'test') {
     extractArchiveInWorkspace,
     inspectBinaryAssetInWorkspace,
     listAssetMetadataInWorkspace,
+    readWorkspaceFileBase64,
     compareScreenshotToGoalInWorkspace,
     classifyCommandRequest,
     getCommandShellSpec,
