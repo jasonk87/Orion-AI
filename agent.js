@@ -535,18 +535,25 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           });
           continue;
         }
-        if (shouldHaveUsedToolsButDidNot(textVal, workWalkthrough, userPrompt) && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
+        if (shouldHaveUsedToolsButDidNot(textVal, workWalkthrough, userPrompt) && consecutiveNoToolCalls < 3 && loopCount < maxLoops) {
           const guidance = buildFailureRecoveryGuidance(classifyAgentFailure({
             category: 'model_no_tool_use',
             errorText: textVal
           }));
+          const localInspectionGuidance = requestNeedsLocalInspection(userPrompt)
+            ? ' The user asked about this local computer. Call local inspection commands now, such as `systeminfo`, CPU/RAM/disk/process commands, or another available local route. Do not answer with acknowledgement only.'
+            : '';
           messages.push({
             role: 'user',
             parts: [{
-              text: `[SYSTEM: ${guidance}]`
+              text: `[SYSTEM: ${guidance}${localInspectionGuidance}]`
             }]
           });
           continue;
+        }
+        if (isGenericNonAnswer(textVal) && requestNeedsLocalInspection(userPrompt) && (workWalkthrough || []).length === 0) {
+          lastTextResponse = 'I did not produce a real answer. This question needs local system inspection first, so I should run commands to check CPU/RAM/disk or clearly explain why that evidence cannot be gathered.';
+          break;
         }
         if (pendingTasks.length > 0 && canExecuteThisTask() && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
           console.log(`No tool calls, but there are ${pendingTasks.length} pending tasks. Continuing loop automatically.`);
@@ -1763,7 +1770,7 @@ function normalizeFollowupPurpose(value) {
 }
 
 function buildToolUseContractPrompt() {
-  return `[SYSTEM: Before answering, decide whether the user's request requires interacting with the workspace or runtime. If it requires files, commands, tests, external docs, app state, timers, notes, or code changes, use the relevant tools before giving a final answer. If no tool is needed, answer normally and do not claim that work was performed. Never end with a generic completion message unless the Work Walkthrough shows what actually happened. Remember, for complex tasks, your final summary must explicitly list what planned tests were run, their results, and reasons for any skipped tests.]`;
+  return `[SYSTEM: Before answering, decide whether the user's request requires interacting with the workspace or runtime. If it requires files, commands, tests, external docs, app state, timers, notes, or code changes, use the relevant tools before giving a final answer. Questions about this computer's performance, specs, RAM, CPU, disk, processes, or local environment require local inspection with tools unless fresh evidence is already present. If no tool is needed, answer normally and do not claim that work was performed. Never end with a generic completion message unless the Work Walkthrough shows what actually happened. Remember, for complex tasks, your final summary must explicitly list what planned tests were run, their results, and reasons for any skipped tests.]`;
 }
 
 function getPlanningToolGate(config, canExecute, toolName, args = {}) {
@@ -2142,6 +2149,7 @@ function shouldHaveUsedToolsButDidNot(text, workWalkthrough, userPrompt = '') {
   if ((workWalkthrough || []).length > 0) return false;
   const response = String(text || '').trim();
   if (!response) return true;
+  if (requestNeedsLocalInspection(userPrompt) && isGenericNonAnswer(response)) return true;
   if (response.length < 80) return true;
 
   const promptLower = String(userPrompt || '').toLowerCase();
@@ -2156,6 +2164,16 @@ function shouldHaveUsedToolsButDidNot(text, workWalkthrough, userPrompt = '') {
   }
 
   return false;
+}
+
+function isGenericNonAnswer(text) {
+  const normalized = String(text || '').toLowerCase().replace(/[^\w\s']/g, '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return true;
+  return /^(understood|ok|okay|sure|got it|done|sounds good|working on it|i understand|acknowledged|noted|task finished)( thanks)?$/.test(normalized);
+}
+
+function requestNeedsLocalInspection(prompt) {
+  return isLocalSystemFactRequest(prompt);
 }
 
 async function validateRunCommandForAgentUse(command, workspace) {
@@ -2201,7 +2219,7 @@ function extractPythonScriptPath(command) {
 function isLocalSystemFactRequest(prompt) {
   const text = String(prompt || '').toLowerCase();
   return /\b(my|this|computer|pc|machine|system|windows|local)\b/.test(text)
-    && /\b(memory|ram|disk|storage|cpu|gpu|process|processes|battery|ip address|environment|env var|path|installed|version|free space|space left|usage)\b/.test(text);
+    && /\b(memory|ram|disk|storage|cpu|gpu|processor|graphics|process|processes|battery|ip address|environment|env var|path|installed|version|free space|space left|usage|performance|performing|speed|slow|fast|specs?|hardware|benchmark)\b/.test(text);
 }
 
 function isFailedToolResult(result) {
@@ -3425,6 +3443,9 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     extractPythonScriptPath,
     commandProvidesInput,
     isLocalSystemFactRequest,
+    requestNeedsLocalInspection,
+    isGenericNonAnswer,
+    shouldHaveUsedToolsButDidNot,
     isFailedToolResult,
     getToolFailureSignal,
     buildToolEvidenceEntry,

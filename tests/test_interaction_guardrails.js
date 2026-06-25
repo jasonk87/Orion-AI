@@ -116,7 +116,15 @@ test('failure taxonomy classifies common failure modes', (t) => {
 
 test('local system fact failures do not become fake blockers or web research', (t) => {
   t.equal(agent.isLocalSystemFactRequest('how much memory does my computer have left?'), true, 'recognizes local memory query');
+  t.equal(agent.isLocalSystemFactRequest('what do you think about my computer performance wise?'), true, 'recognizes local performance assessment query');
   t.equal(agent.isLocalSystemFactRequest('look up Gemini API docs'), false, 'does not classify docs research as local system fact');
+  t.equal(agent.isGenericNonAnswer('Understood.'), true, 'recognizes generic acknowledgement as a non-answer');
+  t.equal(agent.requestNeedsLocalInspection('what do you think about my computer performance wise?'), true, 'performance assessment requires local inspection');
+  t.equal(
+    agent.shouldHaveUsedToolsButDidNot('Understood.', [], 'what do you think about my computer performance wise?'),
+    true,
+    'generic acknowledgement cannot satisfy a local performance request without tools'
+  );
 
   const failedCommand = {
     exitCode: -4058,
