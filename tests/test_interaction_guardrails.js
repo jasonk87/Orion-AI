@@ -228,6 +228,26 @@ test('model API calls cannot sit indefinitely without visible cooldown status', 
   t.end();
 });
 
+test('live model status does not leak into final answer transcript logs', (t) => {
+  t.notOk(
+    agentJs.includes("currentAgentLogs.push({ type: 'thought', content: textVal })"),
+    'normal model answer text is rendered as the answer, not duplicated as a Thought log'
+  );
+  t.notOk(
+    agentJs.includes("currentAgentLogs.push({ type: 'thought', content: `Warning: ${warningMsg}` })"),
+    'provider retry/cooldown warnings stay in live status instead of permanent Thought logs'
+  );
+  t.notOk(
+    agentJs.includes("currentAgentLogs.push({ type: 'thought', content: 'Pro Mode: using the single state-driven loop with stricter evidence expectations.' })"),
+    'Pro Mode internal loop note is not persisted into user-facing transcript logs'
+  );
+  t.ok(
+    rendererJs.includes('<strong>Thought:</strong>'),
+    'renderer can still show genuine diagnostic thought logs when explicitly recorded'
+  );
+  t.end();
+});
+
 test('write_file refuses silent full-file overwrites', (t) => {
   t.ok(agentJs.includes('write_file refused to overwrite an existing file'), 'write_file blocks existing file overwrite by default');
   t.ok(agentJs.includes('overwriteReason'), 'explicit overwrite reason is required');

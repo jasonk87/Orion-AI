@@ -413,21 +413,18 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             role: 'user',
             parts: [{ text: '[PRO MODE: Use extra care on architecture, edge cases, tests, and failure recovery inside the same state-driven reasoning loop. Do not create another role; the operational completion gate is the completion authority.]' }]
           });
-          currentAgentLogs.push({ type: 'thought', content: 'Pro Mode: using the single state-driven loop with stricter evidence expectations.' });
           window.renderAiMessage(lastTextResponse, currentAgentLogs);
         }
 
         if (modelName.startsWith('gemini-')) {
           response = await callGeminiAPI(messages, modelName, config.geminiApiKey, (warningMsg) => {
             agentSubStatus = warningMsg;
-            currentAgentLogs.push({ type: 'thought', content: `Warning: ${warningMsg}` });
             conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
             window.renderAiMessage(lastTextResponse, currentAgentLogs);
           });
         } else {
           response = await callOllamaAPI(messages, modelName, (warningMsg) => {
             agentSubStatus = warningMsg;
-            currentAgentLogs.push({ type: 'thought', content: `Warning: ${warningMsg}` });
             conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
             window.renderAiMessage(lastTextResponse, currentAgentLogs);
           });
@@ -517,7 +514,6 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       });
       
       if (textVal) {
-        currentAgentLogs.push({ type: 'thought', content: textVal });
         lastTextResponse = textVal;
       }
       
