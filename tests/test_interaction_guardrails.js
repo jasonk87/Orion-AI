@@ -84,17 +84,30 @@ test('failure taxonomy classifies common failure modes', (t) => {
     toolName: 'run_command',
     errorText: 'npm: command not found'
   }).category, 'missing_dependency', 'classifies missing dependencies');
+  t.equal(agent.classifyAgentFailure({
+    toolName: 'run_command',
+    errorText: 'npm: command not found'
+  }).recommendedNature, 'fixable', 'missing dependencies are recommended as fixable');
 
   t.equal(agent.classifyAgentFailure({
     toolName: 'google_search',
     errorText: 'HTTP 401 invalid API key'
   }).category, 'auth_missing', 'classifies missing auth');
+  t.equal(agent.classifyAgentFailure({
+    toolName: 'google_search',
+    errorText: 'HTTP 401 invalid API key'
+  }).recommendedNature, 'terminal', 'missing auth is recommended as terminal');
 
   t.equal(agent.classifyAgentFailure({
     toolName: 'run_command',
     result: { timedOut: true },
     errorText: 'Command timed out'
   }).category, 'timeout', 'classifies timeouts');
+  t.equal(agent.classifyAgentFailure({
+    toolName: 'run_command',
+    result: { timedOut: true },
+    errorText: 'Command timed out'
+  }).recommendedNature, 'transient', 'timeouts are recommended as transient');
 
   t.equal(agent.classifyAgentFailure({
     toolName: 'run_command',

@@ -103,13 +103,25 @@ const OPERATIONAL_CONTEXT_TOOL_DECLARATIONS = [
   },
   {
     name: 'record_blocker',
-    description: 'Records a current mission blocker. Prefer this after a repeated or genuinely blocking failure, not every transient error.',
-    parameters: { type: 'OBJECT', properties: { id: { type: 'STRING' }, title: { type: 'STRING' }, details: { type: 'STRING' }, source: { type: 'STRING' } }, required: ['title'] }
+    description: 'Records a current mission blocker with triage labels. Prefer this after a repeated or genuinely blocking failure, not every transient error. Severity defaults to major; nature defaults to fixable.',
+    parameters: { type: 'OBJECT', properties: {
+      id: { type: 'STRING' },
+      title: { type: 'STRING' },
+      details: { type: 'STRING' },
+      source: { type: 'STRING' },
+      severity: { type: 'STRING', description: 'critical, major, or minor. critical blocks app launch/tests/core execution/primary mission loop/all progress; major blocks a feature/subplan/win condition; minor is polish/cleanup/technical debt/nice-to-have.' },
+      nature: { type: 'STRING', description: 'transient, fixable, or terminal. transient is temporary external/runtime; fixable is implementation/environment repair; terminal means current approach violates hard constraints.' }
+    }, required: ['title'] }
   },
   {
     name: 'resolve_blocker',
     description: 'Moves an active blocker to resolved and retains its useful lesson.',
     parameters: { type: 'OBJECT', properties: { id: { type: 'STRING', description: 'Blocker id or exact title.' }, resolution: { type: 'STRING' }, lesson: { type: 'STRING' } }, required: ['id', 'resolution'] }
+  },
+  {
+    name: 'convert_blocker_to_backlog',
+    description: 'Converts an active minor blocker into backlog/technical debt so it no longer blocks completion. Retains the lesson as a discovery candidate. Only valid for minor blockers.',
+    parameters: { type: 'OBJECT', properties: { id: { type: 'STRING', description: 'Blocker id or exact title.' }, resolution: { type: 'STRING' }, lesson: { type: 'STRING' }, discovery: { type: 'STRING' } }, required: ['id'] }
   },
   {
     name: 'promote_discovery',
@@ -1286,6 +1298,7 @@ async function executeTool(name, args, workspace, config, conversation) {
     case 'complete_subplan':
     case 'record_blocker':
     case 'resolve_blocker':
+    case 'convert_blocker_to_backlog':
     case 'promote_discovery':
     case 'discard_noise':
     case 'evaluate_win_conditions':
@@ -1799,6 +1812,8 @@ function buildCompletionGateMessage(gate) {
   if (gate.pendingWinConditions && gate.pendingWinConditions.length) parts.push(`Pending win conditions: ${gate.pendingWinConditions.map(item => item.title).join('; ')}`);
   if (gate.pendingRequirements && gate.pendingRequirements.length) parts.push(`Pending requirements: ${gate.pendingRequirements.map(item => item.title).join('; ')}`);
   if (gate.blockers && gate.blockers.length) parts.push(`Active blockers: ${gate.blockers.map(item => item.title).join('; ')}`);
+  if (gate.remainingMinorBlockers && gate.remainingMinorBlockers.length) parts.push(`Remaining minor blockers: ${gate.remainingMinorBlockers.map(item => item.title).join('; ')}`);
+  if (gate.backlogCandidates && gate.backlogCandidates.length) parts.push(`Backlog candidates: ${gate.backlogCandidates.map(item => item.title).join('; ')}`);
   return parts.join('\n');
 }
 
@@ -2577,7 +2592,7 @@ function buildEpistemicCorrectionPrompt({ userPrompt, answerText, toolEvidenceLe
 }
 
 function classifyAgentFailure({ toolName = '', args = {}, result = null, errorText = '', failureCount = 1, category = '' } = {}) {
-  if (category) return { category, toolName, args, errorText: String(errorText || ''), failureCount };
+  if (category) return { category, recommendedNature: recommendedNatureForFailureCategory(category), toolName, args, errorText: String(errorText || ''), failureCount };
 
   const text = String(errorText || '').toLowerCase();
   const command = String((args && args.command) || '');
@@ -2601,7 +2616,23 @@ function classifyAgentFailure({ toolName = '', args = {}, result = null, errorTe
     resolved = 'interactive_command_needs_input';
   }
 
-  return { category: resolved, toolName, args, errorText: String(errorText || ''), failureCount };
+  return { category: resolved, recommendedNature: recommendedNatureForFailureCategory(resolved), toolName, args, errorText: String(errorText || ''), failureCount };
+}
+
+function recommendedNatureForFailureCategory(category) {
+  const map = {
+    timeout: 'transient',
+    auth_missing: 'terminal',
+    command_blocked: 'terminal',
+    missing_dependency: 'fixable',
+    patch_target_missing: 'fixable',
+    test_failure: 'fixable',
+    interactive_command_needs_input: 'fixable',
+    repeated_tool_failure: 'fixable',
+    model_no_tool_use: 'fixable',
+    tool_failure: 'fixable'
+  };
+  return map[category] || 'fixable';
 }
 
 function buildFailureRecoveryGuidance(failure) {
@@ -3814,6 +3845,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     getEpistemicToolGate,
     buildEpistemicCorrectionPrompt,
     classifyAgentFailure,
+    recommendedNatureForFailureCategory,
     buildFailureRecoveryGuidance,
     isRealVerificationCommand,
     isVerificationItem,

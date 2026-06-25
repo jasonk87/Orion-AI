@@ -101,6 +101,129 @@ test('blockers move to resolved state and retain useful lessons', (t) => {
   t.end();
 });
 
+test('blocker severity and nature normalize and sort by engineering priority', (t) => {
+  let state = missionState();
+  state = operational.applyAction(state, 'record_blocker', {
+    id: 'minor-fixable',
+    title: 'Campfire scale looks slightly large',
+    severity: 'minor',
+    nature: 'fixable'
+  }, T0).state;
+  state = operational.applyAction(state, 'record_blocker', {
+    id: 'major-transient',
+    title: 'Asset CDN timed out',
+    severity: 'major',
+    nature: 'transient'
+  }, T0).state;
+  state = operational.applyAction(state, 'record_blocker', {
+    id: 'major-terminal',
+    title: 'Asset license prohibits redistribution',
+    severity: 'major',
+    nature: 'terminal'
+  }, T0).state;
+  state = operational.applyAction(state, 'record_blocker', {
+    id: 'critical-fixable',
+    title: 'App launch crashes',
+    severity: 'critical',
+    nature: 'fixable'
+  }, T0).state;
+  state = operational.applyAction(state, 'record_blocker', {
+    id: 'unknown-labels',
+    title: 'Unknown labels normalize',
+    severity: 'urgent',
+    nature: 'weird'
+  }, T0).state;
+
+  const unknown = state.blockers.active.find(item => item.id === 'unknown-labels');
+  t.equal(unknown.severity, 'major', 'unknown severity normalizes to major');
+  t.equal(unknown.nature, 'fixable', 'unknown nature normalizes to fixable');
+  t.deepEqual(
+    state.blockers.active.map(item => item.id),
+    ['critical-fixable', 'major-terminal', 'unknown-labels', 'major-transient', 'minor-fixable'],
+    'blockers sort critical before major before minor, and terminal before fixable/transient within severity'
+  );
+
+  const prompt = operational.formatForPrompt(state);
+  t.ok(prompt.includes('[CRITICAL / FIXABLE] critical-fixable: App launch crashes'), 'prompt includes critical/fixable label');
+  t.ok(prompt.includes('[MAJOR / TERMINAL] major-terminal: Asset license prohibits redistribution'), 'prompt includes major/terminal label');
+  t.ok(prompt.includes('transient blockers are retry/backoff candidates'), 'prompt includes transient retry/backoff guidance');
+  t.ok(prompt.includes('do not automatically replan yet'), 'prompt forbids automatic replanning');
+  t.end();
+});
+
+test('completion gate triages critical, major, minor, and terminal blockers', (t) => {
+  let base = missionState();
+  base = operational.applyAction(base, 'evaluate_win_conditions', {
+    evaluations: [
+      { id: 'economy', status: 'satisfied', evidence: ['economy.test.js passed'] },
+      { id: 'npcs', status: 'satisfied', evidence: ['npc autonomy smoke test passed'] }
+    ]
+  }, T0).state;
+  base = operational.applyAction(base, 'record_tool_result', {
+    toolName: 'run_tests',
+    success: true,
+    summary: 'npm test passed'
+  }, T0).state;
+
+  let critical = operational.applyAction(base, 'record_blocker', {
+    title: 'App launch crashes',
+    severity: 'critical',
+    nature: 'fixable'
+  }, T0).state;
+  t.equal(operational.evaluateCompletionGate(critical).status, 'blocked', 'critical blockers block completion');
+
+  let major = operational.applyAction(base, 'record_blocker', {
+    title: 'Inventory save test fails',
+    severity: 'major',
+    nature: 'fixable'
+  }, T0).state;
+  t.equal(operational.evaluateCompletionGate(major).status, 'blocked', 'major blockers block completion');
+
+  let minor = operational.applyAction(base, 'record_blocker', {
+    id: 'minor-polish',
+    title: 'Campfire scale looks slightly large',
+    severity: 'minor',
+    nature: 'fixable'
+  }, T0).state;
+  const minorGate = operational.evaluateCompletionGate(minor);
+  t.equal(minorGate.status, 'ready_for_final', 'minor-only blockers do not block completion when win conditions have evidence');
+  t.equal(minorGate.remainingMinorBlockers[0].title, 'Campfire scale looks slightly large', 'minor blockers are returned as remaining minor blockers');
+  t.equal(minorGate.backlogCandidates[0].id, 'minor-polish', 'minor blockers are returned as backlog candidates');
+
+  let terminalMajor = operational.applyAction(base, 'record_blocker', {
+    title: 'Required asset license prohibits redistribution',
+    severity: 'major',
+    nature: 'terminal'
+  }, T0).state;
+  t.equal(operational.evaluateCompletionGate(terminalMajor).status, 'blocked', 'terminal major blockers block completion');
+
+  let terminalCritical = operational.applyAction(base, 'record_blocker', {
+    title: 'Missing required GPU feature',
+    severity: 'critical',
+    nature: 'terminal'
+  }, T0).state;
+  t.equal(operational.evaluateCompletionGate(terminalCritical).status, 'blocked', 'terminal critical blockers block completion');
+
+  let terminalMinor = operational.applyAction(base, 'record_blocker', {
+    id: 'minor-terminal',
+    title: 'Optional icon license cannot be used',
+    severity: 'minor',
+    nature: 'terminal'
+  }, T0).state;
+  t.equal(operational.evaluateCompletionGate(terminalMinor).status, 'blocked', 'terminal blockers block unless converted to backlog/technical debt');
+
+  terminalMinor = operational.applyAction(terminalMinor, 'convert_blocker_to_backlog', {
+    id: 'minor-terminal',
+    lesson: 'Optional icon license cannot be used; pick a different icon later.'
+  }, T0).state;
+  const convertedGate = operational.evaluateCompletionGate(terminalMinor);
+  t.equal(convertedGate.status, 'ready_for_final', 'converted minor terminal blocker no longer blocks completion');
+  t.equal(terminalMinor.blockers.active.length, 0, 'minor blocker is removed from active blockers');
+  t.ok(terminalMinor.blockers.resolved.some(item => item.backlog), 'converted blocker is retained as backlog metadata');
+  t.ok(terminalMinor.discoveries.some(item => item.category === 'backlog_candidate'), 'converted blocker lesson is retained as discovery candidate');
+  t.end();
+});
+
 test('win conditions cannot be satisfied without evidence', (t) => {
   const state = missionState();
   t.throws(() => operational.applyAction(state, 'evaluate_win_conditions', {

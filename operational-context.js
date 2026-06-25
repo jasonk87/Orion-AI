@@ -47,6 +47,51 @@
     return allowed.includes(status) ? status : fallback;
   }
 
+  function normalizeSeverity(value) {
+    return normalizeStatus(value, ['critical', 'major', 'minor'], 'major');
+  }
+
+  function normalizeNature(value) {
+    return normalizeStatus(value, ['transient', 'fixable', 'terminal'], 'fixable');
+  }
+
+  function normalizeBlocker(item, now) {
+    const source = item && typeof item === 'object' ? item : { title: item };
+    const title = cleanText(source.title, 1000);
+    return {
+      ...source,
+      id: cleanText(source.id, 100) || makeId('blocker', title || 'blocker', now),
+      title,
+      details: cleanText(source.details, 3000),
+      source: cleanText(source.source, 500),
+      severity: normalizeSeverity(source.severity),
+      nature: normalizeNature(source.nature),
+      count: Number.isFinite(source.count) ? source.count : 1,
+      createdAt: source.createdAt || now,
+      updatedAt: source.updatedAt || now
+    };
+  }
+
+  function blockerSortKey(item) {
+    const severityRank = { critical: 0, major: 1, minor: 2 };
+    const natureRank = { terminal: 0, fixable: 1, transient: 2 };
+    return [
+      severityRank[normalizeSeverity(item && item.severity)],
+      natureRank[normalizeNature(item && item.nature)],
+      cleanText(item && item.title, 1000).toLowerCase()
+    ];
+  }
+
+  function compareBlockers(a, b) {
+    const left = blockerSortKey(a);
+    const right = blockerSortKey(b);
+    for (let index = 0; index < left.length; index++) {
+      if (left[index] < right[index]) return -1;
+      if (left[index] > right[index]) return 1;
+    }
+    return 0;
+  }
+
   function normalizeWinCondition(item, index, previous, now) {
     const source = typeof item === 'string' ? { title: item } : (item || {});
     const title = cleanText(source.title || source.condition, 500);
@@ -97,8 +142,8 @@
         completedAt: source.activeSubplan.completedAt || null
       } : null,
       blockers: {
-        active: Array.isArray(blockers.active) ? blockers.active.slice(-100) : [],
-        resolved: Array.isArray(blockers.resolved) ? blockers.resolved.slice(-MAX_RESOLVED_BLOCKERS) : []
+        active: Array.isArray(blockers.active) ? blockers.active.slice(-100).map(item => normalizeBlocker(item, at)).filter(item => item.title).sort(compareBlockers) : [],
+        resolved: Array.isArray(blockers.resolved) ? blockers.resolved.map(item => normalizeBlocker(item, at)).filter(item => item.title).slice(-MAX_RESOLVED_BLOCKERS) : []
       },
       discoveries: Array.isArray(source.discoveries) ? source.discoveries.slice(-MAX_DISCOVERIES) : [],
       discarded: Array.isArray(source.discarded) ? source.discarded.slice(-MAX_DISCARDED) : [],
@@ -227,16 +272,31 @@
       }
       case 'record_blocker': {
         const title = requireText(args, 'title', 'blocker title');
+        const severity = normalizeSeverity(args.severity);
+        const nature = normalizeNature(args.nature);
         const existing = state.blockers.active.find(item => item.title.toLowerCase() === title.toLowerCase());
         if (existing) {
           existing.details = cleanText(args.details, 3000) || existing.details;
+          existing.severity = severity;
+          existing.nature = nature;
           existing.updatedAt = at;
           existing.count = (existing.count || 1) + 1;
         } else {
-          state.blockers.active.push({ id: cleanText(args.id, 100) || makeId('blocker', title, at), title, details: cleanText(args.details, 3000), source: cleanText(args.source, 500), count: 1, createdAt: at, updatedAt: at });
+          state.blockers.active.push({
+            id: cleanText(args.id, 100) || makeId('blocker', title, at),
+            title,
+            details: cleanText(args.details, 3000),
+            source: cleanText(args.source, 500),
+            severity,
+            nature,
+            count: 1,
+            createdAt: at,
+            updatedAt: at
+          });
         }
+        state.blockers.active = state.blockers.active.sort(compareBlockers);
         if (state.activeSubplan) state.activeSubplan.status = 'blocked';
-        event.summary = `Blocker recorded: ${title}`;
+        event.summary = `Blocker recorded: [${severity.toUpperCase()} / ${nature.toUpperCase()}] ${title}`;
         break;
       }
       case 'resolve_blocker': {
@@ -244,10 +304,36 @@
         const index = state.blockers.active.findIndex(item => item.id === identity || item.title.toLowerCase() === identity.toLowerCase());
         if (index === -1) throw new Error(`Active blocker not found: ${identity}`);
         const blocker = state.blockers.active.splice(index, 1)[0];
-        state.blockers.resolved.push({ ...blocker, resolution: requireText(args, 'resolution', 'resolution'), lesson: cleanText(args.lesson, 2000), resolvedAt: at });
+        state.blockers.resolved.push({ ...blocker, resolution: requireText(args, 'resolution', 'resolution'), lesson: cleanText(args.lesson, 2000), resolvedAt: at, resolutionType: 'resolved' });
         state.blockers.resolved = state.blockers.resolved.slice(-MAX_RESOLVED_BLOCKERS);
         if (state.activeSubplan && state.blockers.active.length === 0 && state.activeSubplan.status === 'blocked') state.activeSubplan.status = 'active';
         event.summary = `Blocker resolved: ${blocker.title}`;
+        break;
+      }
+      case 'convert_blocker_to_backlog': {
+        const identity = requireText(args, 'id', 'blocker id or title');
+        const index = state.blockers.active.findIndex(item => item.id === identity || item.title.toLowerCase() === identity.toLowerCase());
+        if (index === -1) throw new Error(`Active blocker not found: ${identity}`);
+        const blocker = state.blockers.active[index];
+        if (blocker.severity !== 'minor') throw new Error('Only minor blockers can be converted to backlog/technical debt');
+        const moved = state.blockers.active.splice(index, 1)[0];
+        const resolution = cleanText(args.resolution, 1000) || 'Converted to backlog/technical debt; not required for current evidence-backed completion.';
+        const lesson = cleanText(args.lesson, 2000) || `${moved.title}: ${moved.details || 'Minor blocker deferred as backlog/technical debt.'}`;
+        state.blockers.resolved.push({ ...moved, resolution, lesson, resolvedAt: at, resolutionType: 'backlog', backlog: true });
+        state.blockers.resolved = state.blockers.resolved.slice(-MAX_RESOLVED_BLOCKERS);
+        const discoveryText = cleanText(args.discovery || `Backlog/technical debt candidate: ${lesson}`, 4000);
+        if (discoveryText && !state.discoveries.some(item => item.text.toLowerCase() === discoveryText.toLowerCase())) {
+          state.discoveries.push({
+            id: makeId('discovery', discoveryText, at),
+            text: discoveryText,
+            category: 'backlog_candidate',
+            evidence: `${moved.severity}/${moved.nature}: ${moved.title}`,
+            promotedAt: at
+          });
+          state.discoveries = state.discoveries.slice(-MAX_DISCOVERIES);
+        }
+        if (state.activeSubplan && state.blockers.active.length === 0 && state.activeSubplan.status === 'blocked') state.activeSubplan.status = 'active';
+        event.summary = `Minor blocker converted to backlog: ${moved.title}`;
         break;
       }
       case 'promote_discovery': {
@@ -339,7 +425,11 @@
     state.winConditions.forEach(item => lines.push(`- [${item.status}] ${item.title}${item.evidence.length ? ` | evidence: ${item.evidence.slice(-2).join('; ')}` : ''}`));
     lines.push('Active blockers:');
     if (state.blockers.active.length === 0) lines.push('- None');
-    state.blockers.active.forEach(item => lines.push(`- ${item.id}: ${item.title}${item.details ? ` — ${item.details}` : ''}`));
+    state.blockers.active.slice().sort(compareBlockers).forEach(item => {
+      const label = `[${item.severity.toUpperCase()} / ${item.nature.toUpperCase()}]`;
+      lines.push(`- ${label} ${item.id}: ${item.title}${item.details ? ` — ${item.details}` : ''}`);
+    });
+    lines.push('Blocker triage guidance: resolve critical blockers before major or minor blockers; do not spend loops on minor blockers while critical blockers exist; terminal blockers are plan-invalidating evidence but do not automatically replan yet; transient blockers are retry/backoff candidates; fixable blockers are implementation repair candidates; minor blockers may become backlog/technical debt if all win conditions have evidence.');
     if (state.discoveries.length) {
       lines.push('Retained discoveries:');
       state.discoveries.slice(-12).forEach(item => lines.push(`- ${item.text}`));
@@ -427,6 +517,8 @@
       reasons: reasons.map(reason => cleanText(reason, 1200)).filter(Boolean),
       missingEvidence: (details.missingEvidence || []).map(item => cleanText(item, 1200)).filter(Boolean),
       blockers: details.blockers || [],
+      remainingMinorBlockers: details.remainingMinorBlockers || [],
+      backlogCandidates: details.backlogCandidates || [],
       pendingWinConditions: details.pendingWinConditions || [],
       pendingRequirements: details.pendingRequirements || []
     };
@@ -445,9 +537,16 @@
       return makeGate('ask_clarification', ['Mission statement is missing; Orion needs a canonical mission before it can judge completion.'], { missingEvidence: ['mission statement'] });
     }
 
-    if (state.blockers.active.length > 0) {
-      return makeGate('blocked', ['Active blockers remain in operational state.'], {
-        blockers: state.blockers.active.map(item => ({ id: item.id, title: item.title, details: item.details }))
+    const activeBlockers = state.blockers.active.slice().sort(compareBlockers);
+    const completionBlockingBlockers = activeBlockers.filter(item =>
+      item.severity === 'critical' ||
+      item.severity === 'major' ||
+      item.nature === 'terminal'
+    );
+    const remainingMinorBlockers = activeBlockers.filter(item => item.severity === 'minor' && item.nature !== 'terminal');
+    if (completionBlockingBlockers.length > 0) {
+      return makeGate('blocked', ['Critical, major, or terminal blockers remain in operational state.'], {
+        blockers: completionBlockingBlockers.map(item => ({ id: item.id, title: item.title, details: item.details, severity: item.severity, nature: item.nature }))
       });
     }
 
@@ -497,10 +596,17 @@
       return makeGate('continue_work', reasons, { missingEvidence, pendingWinConditions, pendingRequirements });
     }
 
-    return makeGate('ready_for_final', ['Mission has evidence-backed satisfied win conditions, no active blockers, and verification evidence.']);
+    return makeGate('ready_for_final', [
+      remainingMinorBlockers.length
+        ? 'Mission has evidence-backed satisfied win conditions and only minor non-terminal blockers remain as backlog candidates.'
+        : 'Mission has evidence-backed satisfied win conditions, no active completion-blocking blockers, and verification evidence.'
+    ], {
+      remainingMinorBlockers: remainingMinorBlockers.map(item => ({ id: item.id, title: item.title, details: item.details, severity: item.severity, nature: item.nature })),
+      backlogCandidates: remainingMinorBlockers.map(item => ({ id: item.id, title: item.title, details: item.details, severity: item.severity, nature: item.nature }))
+    });
   }
 
-  const api = { VERSION, createEmptyContext, normalizeContext, applyAction, formatForPrompt, buildRecentChatView, buildReasoningMessages, evaluateCompletionGate };
+  const api = { VERSION, createEmptyContext, normalizeContext, applyAction, formatForPrompt, buildRecentChatView, buildReasoningMessages, evaluateCompletionGate, normalizeSeverity, normalizeNature, compareBlockers };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   if (globalScope) globalScope.OrionOperationalContext = api;
 })(typeof window !== 'undefined' ? window : globalThis);
