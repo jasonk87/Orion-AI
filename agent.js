@@ -48,6 +48,9 @@ Tools available:
 - record_blocker, resolve_blocker, promote_discovery, discard_noise, evaluate_win_conditions: Distill useful state and remove operational clutter.
 - google_search: Search Google for current docs, API references, examples, and troubleshooting.
 - fetch_web_page: Fetch the text content of a specific web page found via search.
+- download_file, inspect_archive, extract_archive, inspect_binary_asset, list_asset_metadata: General asset acquisition/inspection hands. Use when useful; do not follow a hardcoded asset pipeline.
+- open_url, search_web, click_element, fill_input, navigate_back, download_from_page, wait_for_page: Browser worker hands for autonomous web navigation and acquisition when the mission calls for it.
+- take_screenshot, inspect_screenshot, compare_screenshot_to_goal: Visual verification eyes for previews and UI/game scenes. Use evidence honestly; do not claim visual success without screenshot evidence or observations.
 - sync_workspace_env: Safely write configured API keys/search IDs into .env-style files without exposing the secret values in chat or tool output.
 - set_task_checklist: Set the UI checklist of tasks (array of {title, status}). Status can be 'pending', 'in-progress', 'completed'. Use only for milestone changes, not routine progress churn.`;
 
@@ -127,6 +130,84 @@ const OPERATIONAL_CONTEXT_TOOL_DECLARATIONS = [
 const OPERATIONAL_CONTEXT_ACTIONS = new Set(OPERATIONAL_CONTEXT_TOOL_DECLARATIONS
   .map(tool => tool.name)
   .filter(name => name !== 'read_operational_context'));
+
+const ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS = [
+  {
+    name: 'download_file',
+    description: 'Downloads an http(s) file into the workspace. General-purpose asset/research capability; the ReAct loop decides when to use it.',
+    parameters: { type: 'OBJECT', properties: { url: { type: 'STRING' }, destination: { type: 'STRING', description: 'Optional workspace-relative path. Defaults under assets/downloads/.' } }, required: ['url'] }
+  },
+  {
+    name: 'inspect_archive',
+    description: 'Inspects an archive such as zip/tar without extracting it and returns visible entries.',
+    parameters: { type: 'OBJECT', properties: { path: { type: 'STRING', description: 'Workspace-relative archive path.' } }, required: ['path'] }
+  },
+  {
+    name: 'extract_archive',
+    description: 'Extracts an archive into the workspace. Use after inspection when the archive contents are relevant.',
+    parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' }, destination: { type: 'STRING', description: 'Optional workspace-relative extraction folder. Defaults under assets/extracted/.' } }, required: ['path'] }
+  },
+  {
+    name: 'inspect_binary_asset',
+    description: 'Inspects a binary/3D/media asset such as glb, gltf, image, obj, fbx, or zip and returns safe metadata.',
+    parameters: { type: 'OBJECT', properties: { path: { type: 'STRING', description: 'Workspace-relative asset path.' } }, required: ['path'] }
+  },
+  {
+    name: 'list_asset_metadata',
+    description: 'Lists asset-like files and metadata under a workspace folder. Defaults to assets/.',
+    parameters: { type: 'OBJECT', properties: { path: { type: 'STRING', description: 'Optional workspace-relative folder.' } } }
+  },
+  {
+    name: 'open_url',
+    description: 'Opens a URL in Orion’s hidden browser worker and returns page title, text snippet, and links.',
+    parameters: { type: 'OBJECT', properties: { url: { type: 'STRING' } }, required: ['url'] }
+  },
+  {
+    name: 'search_web',
+    description: 'Searches the web in Orion’s browser worker and returns page text/links. Use as a general browsing hand, not a fixed workflow.',
+    parameters: { type: 'OBJECT', properties: { query: { type: 'STRING' } }, required: ['query'] }
+  },
+  {
+    name: 'click_element',
+    description: 'Clicks an element in the current browser page by CSS selector or visible text.',
+    parameters: { type: 'OBJECT', properties: { selector: { type: 'STRING' }, text: { type: 'STRING' } } }
+  },
+  {
+    name: 'fill_input',
+    description: 'Fills an input in the current browser page by CSS selector.',
+    parameters: { type: 'OBJECT', properties: { selector: { type: 'STRING' }, value: { type: 'STRING' } }, required: ['selector'] }
+  },
+  {
+    name: 'navigate_back',
+    description: 'Navigates the browser worker back one page.',
+    parameters: { type: 'OBJECT', properties: {} }
+  },
+  {
+    name: 'download_from_page',
+    description: 'Downloads a URL from the current browser page, either by selector or explicit URL, into the workspace.',
+    parameters: { type: 'OBJECT', properties: { selector: { type: 'STRING' }, url: { type: 'STRING' }, destination: { type: 'STRING' } } }
+  },
+  {
+    name: 'wait_for_page',
+    description: 'Waits briefly for the current browser page to settle and returns an updated page snapshot.',
+    parameters: { type: 'OBJECT', properties: { timeoutMs: { type: 'NUMBER' } } }
+  },
+  {
+    name: 'take_screenshot',
+    description: 'Captures the current browser worker view as a screenshot in the workspace for visual verification.',
+    parameters: { type: 'OBJECT', properties: { destination: { type: 'STRING', description: 'Optional workspace-relative PNG path.' } } }
+  },
+  {
+    name: 'inspect_screenshot',
+    description: 'Inspects screenshot file metadata. Does not invent semantic visual conclusions.',
+    parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' } }, required: ['path'] }
+  },
+  {
+    name: 'compare_screenshot_to_goal',
+    description: 'Records a structured screenshot-vs-goal judgment using screenshot metadata and supplied observations. If observations are missing, returns needs_more_visual_evidence.',
+    parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' }, goal: { type: 'STRING' }, observations: { type: 'STRING', description: 'Optional visual observations from model/user/inspection.' } }, required: ['path', 'goal'] }
+  }
+];
 
 window.steeringQueue = [];
 window.promptQueue = [];
@@ -1233,6 +1314,110 @@ async function executeTool(name, args, workspace, config, conversation) {
       return result;
     }
 
+    case 'download_file': {
+      if (!args.url) throw new Error("Missing 'url' parameter");
+      const result = await window.api.downloadFile(workspace, args.url, args.destination || '');
+      if (!result.success) throw new Error(result.error || 'Download failed');
+      if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
+      return result;
+    }
+
+    case 'inspect_archive': {
+      if (!args.path) throw new Error("Missing 'path' parameter");
+      const result = await window.api.inspectArchive(workspace, args.path);
+      if (!result.success) throw new Error(result.error || 'Archive inspection failed');
+      return result;
+    }
+
+    case 'extract_archive': {
+      if (!args.path) throw new Error("Missing 'path' parameter");
+      const result = await window.api.extractArchive(workspace, args.path, args.destination || '');
+      if (!result.success) throw new Error(result.error || 'Archive extraction failed');
+      if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
+      return result;
+    }
+
+    case 'inspect_binary_asset': {
+      if (!args.path) throw new Error("Missing 'path' parameter");
+      const result = await window.api.inspectBinaryAsset(workspace, args.path);
+      if (!result.success) throw new Error(result.error || 'Asset inspection failed');
+      return result;
+    }
+
+    case 'list_asset_metadata': {
+      const result = await window.api.listAssetMetadata(workspace, args.path || 'assets');
+      if (!result.success) throw new Error(result.error || 'Asset metadata listing failed');
+      return result;
+    }
+
+    case 'open_url': {
+      if (!args.url) throw new Error("Missing 'url' parameter");
+      const result = await window.api.browserOpenUrl(args.url);
+      if (!result.success) throw new Error(result.error || 'Browser open failed');
+      return result;
+    }
+
+    case 'search_web': {
+      if (!args.query) throw new Error("Missing 'query' parameter");
+      const result = await window.api.browserSearchWeb(args.query);
+      if (!result.success) throw new Error(result.error || 'Browser search failed');
+      return result;
+    }
+
+    case 'click_element': {
+      const result = await window.api.browserClickElement(args.selector || '', args.text || '');
+      if (!result.success) throw new Error(result.error || 'Click failed');
+      return result;
+    }
+
+    case 'fill_input': {
+      if (!args.selector) throw new Error("Missing 'selector' parameter");
+      const result = await window.api.browserFillInput(args.selector, args.value || '');
+      if (!result.success) throw new Error(result.error || 'Fill input failed');
+      return result;
+    }
+
+    case 'navigate_back': {
+      const result = await window.api.browserNavigateBack();
+      if (!result.success) throw new Error(result.error || 'Navigate back failed');
+      return result;
+    }
+
+    case 'download_from_page': {
+      const result = await window.api.browserDownloadFromPage(workspace, args.selector || '', args.url || '', args.destination || '');
+      if (!result.success) throw new Error(result.error || 'Page download failed');
+      if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
+      return result;
+    }
+
+    case 'wait_for_page': {
+      const result = await window.api.browserWaitForPage(args.timeoutMs || 1000);
+      if (!result.success) throw new Error(result.error || 'Wait failed');
+      return result;
+    }
+
+    case 'take_screenshot': {
+      const result = await window.api.takeScreenshot(workspace, args.destination || '');
+      if (!result.success) throw new Error(result.error || 'Screenshot failed');
+      if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
+      return result;
+    }
+
+    case 'inspect_screenshot': {
+      if (!args.path) throw new Error("Missing 'path' parameter");
+      const result = await window.api.inspectScreenshot(workspace, args.path);
+      if (!result.success) throw new Error(result.error || 'Screenshot inspection failed');
+      return result;
+    }
+
+    case 'compare_screenshot_to_goal': {
+      if (!args.path) throw new Error("Missing 'path' parameter");
+      if (!args.goal) throw new Error("Missing 'goal' parameter");
+      const result = await window.api.compareScreenshotToGoal(workspace, args.path, args.goal, args.observations || '');
+      if (!result.success) throw new Error(result.error || 'Screenshot comparison failed');
+      return result;
+    }
+
     case 'sync_workspace_env': {
       return await syncWorkspaceEnv(workspace, config, args);
     }
@@ -1606,8 +1791,14 @@ function summarizeToolOutcome(toolName, args, result) {
   if (result && typeof result === 'object') {
     if (result.message) parts.push(String(result.message));
     if (result.summary) parts.push(String(result.summary));
+    if (result.title) parts.push(`title=${result.title}`);
+    if (result.url) parts.push(`url=${result.url}`);
     if (result.path) parts.push(`path=${result.path}`);
+    if (result.destination) parts.push(`destination=${result.destination}`);
     if (result.file) parts.push(`file=${result.file}`);
+    if (result.count !== undefined) parts.push(`count=${result.count}`);
+    if (result.entryCount !== undefined) parts.push(`entryCount=${result.entryCount}`);
+    if (result.status) parts.push(`status=${result.status}`);
     if (result.exitCode !== undefined) parts.push(`exitCode=${result.exitCode}`);
     if (result.error) parts.push(`error=${String(result.error)}`);
     if (!parts.length && result.output) parts.push(String(result.output));
@@ -1627,16 +1818,54 @@ async function recordToolOutcomeInWorkingState(workspace, toolName, args, result
     const current = await readOperationalContext(workspace);
     if (!current.state.mission.statement && current.state.winConditions.length === 0 && !current.state.activeSubplan) return null;
     const outcome = summarizeToolOutcome(toolName, args, result);
-    return await mutateOperationalContext(workspace, 'record_tool_result', {
+    let transition = await mutateOperationalContext(workspace, 'record_tool_result', {
       toolName,
       success: outcome.success,
       summary: outcome.summary,
       checkpoint: 'Tool result reduced into operational working state before next model turn.'
     });
+    const discovery = buildDiscoveryFromToolOutcome(toolName, args, result, outcome);
+    if (discovery && outcome.success) {
+      transition = await mutateOperationalContext(workspace, 'promote_discovery', discovery);
+    }
+    return transition;
   } catch (error) {
     console.warn('Operational working-state tool reduction failed:', error);
     return null;
   }
+}
+
+function buildDiscoveryFromToolOutcome(toolName, args = {}, result = {}, outcome = {}) {
+  if (!result || result.error || result.success === false) return null;
+  const assetTools = new Set(['download_file', 'inspect_archive', 'extract_archive', 'inspect_binary_asset', 'list_asset_metadata']);
+  const browserTools = new Set(['open_url', 'search_web', 'click_element', 'download_from_page']);
+  const visualTools = new Set(['take_screenshot', 'inspect_screenshot', 'compare_screenshot_to_goal']);
+  if (assetTools.has(toolName)) {
+    const source = result.url || args.url || '';
+    const path = result.path || result.destination || args.path || '';
+    const licenseHint = result.license || result.licenseInfo || '';
+    return {
+      text: `Asset capability result: ${outcome.summary}${source ? ` Source: ${source}.` : ''}${path ? ` Path: ${path}.` : ''}${licenseHint ? ` License: ${licenseHint}.` : ''}`,
+      category: 'asset_discovery',
+      evidence: outcome.summary
+    };
+  }
+  if (browserTools.has(toolName)) {
+    const url = result.url || args.url || '';
+    return {
+      text: `Browser research result: ${result.title || outcome.summary}${url ? ` (${url})` : ''}`,
+      category: 'web_discovery',
+      evidence: outcome.summary
+    };
+  }
+  if (visualTools.has(toolName)) {
+    return {
+      text: `Visual verification result: ${outcome.summary}`,
+      category: 'visual_evidence',
+      evidence: result.evidence || outcome.summary
+    };
+  }
+  return null;
 }
 
 window.readOperationalContext = readOperationalContext;
@@ -1777,7 +2006,7 @@ function getPlanningToolGate(config, canExecute, toolName, args = {}) {
   if (!config || !config.planningMode || canExecute) {
     return { allowed: true, forceYield: false, reason: '' };
   }
-  const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'run_command', 'start_command', 'run_tests', 'sync_workspace_env', 'launch_workspace_app', 'git_push'];
+  const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'run_command', 'start_command', 'run_tests', 'sync_workspace_env', 'launch_workspace_app', 'git_push', 'download_file', 'download_from_page', 'extract_archive', 'take_screenshot'];
   if (!destructiveTools.includes(toolName)) {
     return { allowed: true, forceYield: false, reason: '' };
   }
@@ -1800,6 +2029,21 @@ function summarizeToolStart(toolName, args = {}) {
   if (toolName === 'launch_workspace_app') return { toolName, status: 'running', label: 'Launched workspace app' };
   if (toolName === 'set_workspace_entrypoint') return { toolName, status: 'running', label: args.command ? `Set entry point to \`${args.command}\`` : 'Cleared workspace entry point' };
   if (toolName === 'git_push') return { toolName, kind: 'git', status: 'running', label: `Pushed Git branch${args.branch ? ` to \`${args.branch}\`` : ''}` };
+  if (toolName === 'download_file') return { toolName, kind: 'asset', status: 'running', label: `Downloaded asset from \`${args.url || 'URL'}\`` };
+  if (toolName === 'inspect_archive') return { toolName, kind: 'asset', status: 'running', label: `Inspected archive \`${args.path || 'archive'}\`` };
+  if (toolName === 'extract_archive') return { toolName, kind: 'asset', status: 'running', label: `Extracted archive \`${args.path || 'archive'}\`` };
+  if (toolName === 'inspect_binary_asset') return { toolName, kind: 'asset', status: 'running', label: `Inspected asset \`${args.path || 'asset'}\`` };
+  if (toolName === 'list_asset_metadata') return { toolName, kind: 'asset', status: 'running', label: `Listed asset metadata${args.path ? ` under \`${args.path}\`` : ''}` };
+  if (toolName === 'open_url') return { toolName, kind: 'browser', status: 'running', label: `Opened URL \`${args.url || ''}\`` };
+  if (toolName === 'search_web') return { toolName, kind: 'browser', status: 'running', label: `Searched web for \`${args.query || ''}\`` };
+  if (toolName === 'click_element') return { toolName, kind: 'browser', status: 'running', label: `Clicked page element${args.selector ? ` \`${args.selector}\`` : ''}` };
+  if (toolName === 'fill_input') return { toolName, kind: 'browser', status: 'running', label: `Filled input \`${args.selector || 'input'}\`` };
+  if (toolName === 'navigate_back') return { toolName, kind: 'browser', status: 'running', label: 'Navigated browser back' };
+  if (toolName === 'download_from_page') return { toolName, kind: 'asset', status: 'running', label: 'Downloaded asset from current page' };
+  if (toolName === 'wait_for_page') return { toolName, kind: 'browser', status: 'running', label: 'Waited for page' };
+  if (toolName === 'take_screenshot') return { toolName, kind: 'visual', status: 'running', label: 'Captured browser screenshot' };
+  if (toolName === 'inspect_screenshot') return { toolName, kind: 'visual', status: 'running', label: `Inspected screenshot \`${args.path || 'screenshot'}\`` };
+  if (toolName === 'compare_screenshot_to_goal') return { toolName, kind: 'visual', status: 'running', label: `Compared screenshot to goal` };
   if (toolName === 'write_file') {
     const isPlan = args.path && args.path.split(/[\\/]/).pop().toLowerCase() === 'implementation_plan.md';
     return {
@@ -1861,6 +2105,14 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
     item.detail = result && result.success ? 'Passed' : 'Failed or unavailable';
   } else if (toolName === 'schedule_followup') {
     item.detail = result && result.replacedExisting ? 'Replaced an existing related timer' : '';
+  } else if (result && result.summary && (
+    toolName === 'download_file' || toolName === 'inspect_archive' || toolName === 'extract_archive' ||
+    toolName === 'inspect_binary_asset' || toolName === 'list_asset_metadata' ||
+    toolName === 'take_screenshot' || toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal'
+  )) {
+    item.detail = result.summary;
+  } else if (result && result.title && (toolName === 'open_url' || toolName === 'search_web' || toolName === 'click_element' || toolName === 'fill_input' || toolName === 'navigate_back' || toolName === 'wait_for_page')) {
+    item.detail = `Page: ${result.title}`;
   }
 }
 
@@ -2520,6 +2772,7 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
     {
       functionDeclarations: [
         ...OPERATIONAL_CONTEXT_TOOL_DECLARATIONS,
+        ...ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS,
         {
           name: "list_files",
           description: "Lists all files recursively in the active workspace directory, excluding build folders like node_modules.",
@@ -2971,6 +3224,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
       {
         functionDeclarations: [
           ...OPERATIONAL_CONTEXT_TOOL_DECLARATIONS,
+          ...ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS,
           {
             name: "list_files",
             description: "Lists all files recursively in the active workspace directory, excluding build folders like node_modules.",
@@ -3461,6 +3715,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     stripEchoedSystemScaffold,
     sanitizeFinalAnswerText,
     withWorkWalkthrough,
+    buildDiscoveryFromToolOutcome,
     diagnoseModelApiFailure
   };
 }

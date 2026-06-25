@@ -128,6 +128,337 @@ function copyWorkspacePath(workspacePath, fromPath, toPath) {
   return { success: true };
 }
 
+function safeRelativeAssetPath(value, fallback) {
+  const raw = String(value || fallback || '').trim().replace(/^[/\\]+/, '');
+  const safe = raw.replace(/[:<>|"?*]/g, '_');
+  return safe || fallback;
+}
+
+function inferFilenameFromUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const base = path.basename(decodeURIComponent(parsed.pathname || ''));
+    return base && base !== '/' ? base : `download-${Date.now()}`;
+  } catch (e) {
+    return `download-${Date.now()}`;
+  }
+}
+
+function listWorkspaceTree(workspacePath, relativePath, limit = 200) {
+  const root = resolveWorkspacePath(workspacePath, relativePath || '.');
+  if (!fs.existsSync(root)) throw new Error('Path does not exist');
+  const workspaceRoot = path.resolve(workspacePath);
+  const entries = [];
+  const visit = (fullPath) => {
+    if (entries.length >= limit) return;
+    const stat = fs.statSync(fullPath);
+    const rel = path.relative(workspaceRoot, fullPath);
+    entries.push({
+      path: rel,
+      isDir: stat.isDirectory(),
+      size: stat.isDirectory() ? 0 : stat.size,
+      modifiedAt: stat.mtime.toISOString()
+    });
+    if (stat.isDirectory()) {
+      fs.readdirSync(fullPath).slice(0, 200).forEach(name => {
+        if (entries.length < limit) visit(path.join(fullPath, name));
+      });
+    }
+  };
+  visit(root);
+  return entries;
+}
+
+async function downloadFileToWorkspace(workspacePath, url, destination) {
+  if (!url || !/^https?:\/\//i.test(String(url))) throw new Error('download_file requires an http(s) URL');
+  const filename = inferFilenameFromUrl(url);
+  const relativePath = safeRelativeAssetPath(destination, path.join('assets', 'downloads', filename));
+  const fullPath = resolveWorkspacePath(workspacePath, relativePath);
+  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Download failed with HTTP ${response.status}`);
+  const buffer = Buffer.from(await response.arrayBuffer());
+  fs.writeFileSync(fullPath, buffer);
+  return {
+    success: true,
+    url,
+    path: path.relative(path.resolve(workspacePath), fullPath),
+    size: buffer.length,
+    contentType: response.headers.get('content-type') || '',
+    summary: `Downloaded ${filename} (${buffer.length} bytes)`
+  };
+}
+
+function runUtilityCommand(executable, args, cwd, timeoutMs = 30000) {
+  return new Promise(resolve => {
+    const child = spawn(executable, args, { cwd, windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    const timeout = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch (e) {}
+    }, timeoutMs);
+    child.stdout.on('data', data => { stdout += data.toString(); });
+    child.stderr.on('data', data => { stderr += data.toString(); });
+    child.on('error', error => {
+      clearTimeout(timeout);
+      resolve({ success: false, code: null, stdout, stderr, error: error.message });
+    });
+    child.on('close', code => {
+      clearTimeout(timeout);
+      resolve({ success: code === 0, code, stdout, stderr, error: code === 0 ? '' : stderr || stdout });
+    });
+  });
+}
+
+async function inspectArchiveInWorkspace(workspacePath, relativePath) {
+  const fullPath = resolveWorkspacePath(workspacePath, relativePath);
+  if (!fs.existsSync(fullPath)) throw new Error('Archive does not exist');
+  const stat = fs.statSync(fullPath);
+  const ext = path.extname(fullPath).toLowerCase();
+  const tarResult = await runUtilityCommand('tar', ['-tf', fullPath], workspacePath, 30000);
+  const entries = tarResult.success
+    ? tarResult.stdout.split(/\r?\n/).map(line => line.trim()).filter(Boolean).slice(0, 500)
+    : [];
+  return {
+    success: tarResult.success,
+    path: relativePath,
+    extension: ext,
+    size: stat.size,
+    entries,
+    entryCount: entries.length,
+    error: tarResult.success ? '' : tarResult.error,
+    summary: tarResult.success ? `Archive contains ${entries.length} visible entries.` : `Archive inspection failed: ${tarResult.error}`
+  };
+}
+
+async function extractArchiveInWorkspace(workspacePath, relativePath, destination) {
+  const sourceFullPath = resolveWorkspacePath(workspacePath, relativePath);
+  if (!fs.existsSync(sourceFullPath)) throw new Error('Archive does not exist');
+  const fallbackDest = path.join('assets', 'extracted', path.basename(relativePath, path.extname(relativePath)));
+  const destRel = safeRelativeAssetPath(destination, fallbackDest);
+  const destFullPath = resolveWorkspacePath(workspacePath, destRel);
+  fs.mkdirSync(destFullPath, { recursive: true });
+  const result = await runUtilityCommand('tar', ['-xf', sourceFullPath, '-C', destFullPath], workspacePath, 60000);
+  if (!result.success) throw new Error(result.error || 'Archive extraction failed');
+  const files = listWorkspaceTree(workspacePath, destRel, 250);
+  return {
+    success: true,
+    path: relativePath,
+    destination: destRel,
+    files,
+    summary: `Extracted archive to ${destRel} (${files.length} listed entries).`
+  };
+}
+
+function detectBinaryAssetKind(buffer, ext) {
+  const first = buffer.slice(0, 16).toString('hex');
+  if (buffer.slice(0, 4).toString('utf8') === 'glTF') return 'glb';
+  if (first.startsWith('89504e47')) return 'png';
+  if (first.startsWith('ffd8ff')) return 'jpeg';
+  if (first.startsWith('504b0304')) return 'zip';
+  if (ext === '.gltf') return 'gltf';
+  if (ext === '.glb') return 'glb';
+  if (ext === '.obj') return 'obj';
+  if (ext === '.fbx') return 'fbx';
+  return ext.replace(/^\./, '') || 'binary';
+}
+
+function inspectBinaryAssetInWorkspace(workspacePath, relativePath) {
+  const fullPath = resolveWorkspacePath(workspacePath, relativePath);
+  if (!fs.existsSync(fullPath)) throw new Error('Asset does not exist');
+  const stat = fs.statSync(fullPath);
+  const ext = path.extname(fullPath).toLowerCase();
+  const buffer = fs.readFileSync(fullPath);
+  const kind = detectBinaryAssetKind(buffer, ext);
+  const details = {};
+  if (kind === 'glb' && buffer.length >= 12) {
+    details.magic = buffer.slice(0, 4).toString('utf8');
+    details.version = buffer.readUInt32LE(4);
+    details.declaredLength = buffer.readUInt32LE(8);
+  }
+  if (kind === 'gltf') {
+    try {
+      const parsed = JSON.parse(buffer.toString('utf8'));
+      details.asset = parsed.asset || {};
+      details.meshes = Array.isArray(parsed.meshes) ? parsed.meshes.length : 0;
+      details.materials = Array.isArray(parsed.materials) ? parsed.materials.length : 0;
+      details.images = Array.isArray(parsed.images) ? parsed.images.length : 0;
+    } catch (e) {
+      details.parseError = e.message;
+    }
+  }
+  return {
+    success: true,
+    path: relativePath,
+    extension: ext,
+    kind,
+    size: stat.size,
+    modifiedAt: stat.mtime.toISOString(),
+    details,
+    summary: `Inspected ${kind} asset ${relativePath} (${stat.size} bytes).`
+  };
+}
+
+function listAssetMetadataInWorkspace(workspacePath, relativePath) {
+  const entries = listWorkspaceTree(workspacePath, relativePath || 'assets', 300);
+  const assetExts = new Set(['.glb', '.gltf', '.obj', '.fbx', '.png', '.jpg', '.jpeg', '.webp', '.svg', '.mtl', '.bin', '.zip']);
+  const assets = entries
+    .filter(entry => !entry.isDir && assetExts.has(path.extname(entry.path).toLowerCase()))
+    .map(entry => ({ ...entry, extension: path.extname(entry.path).toLowerCase() }));
+  return {
+    success: true,
+    path: relativePath || 'assets',
+    assets,
+    count: assets.length,
+    summary: `Found ${assets.length} asset-like files under ${relativePath || 'assets'}.`
+  };
+}
+
+let browserWorker = null;
+
+function ensureBrowserWorker() {
+  if (browserWorker && !browserWorker.isDestroyed()) return browserWorker;
+  browserWorker = new BrowserWindow({
+    show: false,
+    width: 1280,
+    height: 800,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true
+    }
+  });
+  return browserWorker;
+}
+
+async function getBrowserSnapshot(win) {
+  const data = await win.webContents.executeJavaScript(`(() => {
+    const links = Array.from(document.querySelectorAll('a')).slice(0, 80).map((a, index) => ({
+      index,
+      text: (a.innerText || a.textContent || '').trim().slice(0, 160),
+      href: a.href || ''
+    }));
+    return {
+      url: location.href,
+      title: document.title || '',
+      text: (document.body && document.body.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 4000),
+      links
+    };
+  })()`);
+  return { success: true, ...data };
+}
+
+async function browserOpenUrl(url) {
+  if (!/^https?:\/\//i.test(String(url || '')) && !/^file:\/\//i.test(String(url || ''))) throw new Error('open_url requires http(s) or file URL');
+  const win = ensureBrowserWorker();
+  await win.loadURL(url);
+  return await getBrowserSnapshot(win);
+}
+
+async function browserSearchWeb(query) {
+  if (!String(query || '').trim()) throw new Error('search_web requires query');
+  return await browserOpenUrl(`https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`);
+}
+
+async function browserClickElement(selector, text) {
+  const win = ensureBrowserWorker();
+  const result = await win.webContents.executeJavaScript(`(() => {
+    const selector = ${JSON.stringify(selector || '')};
+    const text = ${JSON.stringify(text || '')}.toLowerCase();
+    let el = selector ? document.querySelector(selector) : null;
+    if (!el && text) {
+      el = Array.from(document.querySelectorAll('a,button,[role="button"],input[type="submit"]')).find(node => (node.innerText || node.textContent || node.value || '').toLowerCase().includes(text));
+    }
+    if (!el) return { clicked: false, error: 'Element not found' };
+    el.click();
+    return { clicked: true };
+  })()`);
+  if (!result.clicked) return { success: false, error: result.error };
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  return await getBrowserSnapshot(win);
+}
+
+async function browserFillInput(selector, value) {
+  const win = ensureBrowserWorker();
+  const result = await win.webContents.executeJavaScript(`(() => {
+    const el = document.querySelector(${JSON.stringify(selector || '')});
+    if (!el) return { filled: false, error: 'Input not found' };
+    el.focus();
+    el.value = ${JSON.stringify(String(value || ''))};
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return { filled: true };
+  })()`);
+  return result.filled ? await getBrowserSnapshot(win) : { success: false, error: result.error };
+}
+
+async function browserNavigateBack() {
+  const win = ensureBrowserWorker();
+  if (win.webContents.canGoBack()) {
+    win.webContents.goBack();
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  return await getBrowserSnapshot(win);
+}
+
+async function browserDownloadFromPage(workspacePath, selector, url, destination) {
+  let targetUrl = url;
+  if (!targetUrl) {
+    const win = ensureBrowserWorker();
+    targetUrl = await win.webContents.executeJavaScript(`(() => {
+      const selector = ${JSON.stringify(selector || '')};
+      const el = selector ? document.querySelector(selector) : document.querySelector('a[href]');
+      return el && (el.href || el.src) || '';
+    })()`);
+  }
+  return await downloadFileToWorkspace(workspacePath, targetUrl, destination);
+}
+
+async function browserWaitForPage(timeoutMs) {
+  const win = ensureBrowserWorker();
+  await new Promise(resolve => setTimeout(resolve, Math.min(Math.max(Number(timeoutMs) || 1000, 100), 30000)));
+  return await getBrowserSnapshot(win);
+}
+
+async function takeBrowserScreenshot(workspacePath, destination) {
+  const win = ensureBrowserWorker();
+  const image = await win.webContents.capturePage();
+  const fallback = path.join('.orion', 'screenshots', `screenshot-${Date.now()}.png`);
+  const rel = safeRelativeAssetPath(destination, fallback);
+  const fullPath = resolveWorkspacePath(workspacePath, rel);
+  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+  const png = image.toPNG();
+  fs.writeFileSync(fullPath, png);
+  const size = image.getSize();
+  return { success: true, path: rel, width: size.width, height: size.height, size: png.length, summary: `Captured screenshot ${rel} (${size.width}x${size.height}).` };
+}
+
+function inspectScreenshotInWorkspace(workspacePath, relativePath) {
+  const asset = inspectBinaryAssetInWorkspace(workspacePath, relativePath);
+  return {
+    ...asset,
+    screenshot: true,
+    summary: `Screenshot ${relativePath}: ${asset.kind}, ${asset.size} bytes.`
+  };
+}
+
+function compareScreenshotToGoalInWorkspace(workspacePath, relativePath, goal, observations) {
+  const screenshot = inspectScreenshotInWorkspace(workspacePath, relativePath);
+  const obs = String(observations || '').trim();
+  const goalText = String(goal || '').trim();
+  const satisfied = obs && /appears|visible|present|matches|satisfied|fits|shown|contains/i.test(obs) && !/not visible|missing|absent|does not|failed/i.test(obs);
+  return {
+    success: true,
+    path: relativePath,
+    goal: goalText,
+    status: satisfied ? 'appears_satisfied' : 'needs_more_visual_evidence',
+    confidence: satisfied ? 0.65 : 0.2,
+    evidence: obs || `Local screenshot metadata is available (${screenshot.kind}, ${screenshot.size} bytes), but no visual observation text was provided.`,
+    limitation: obs ? '' : 'This local tool does not perform semantic computer vision by itself; use the screenshot evidence with model/user visual inspection before marking visual win conditions complete.',
+    summary: satisfied ? `Screenshot appears to satisfy goal based on supplied observations: ${goalText}` : `Screenshot comparison needs more visual evidence for: ${goalText}`
+  };
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1200,
@@ -2612,6 +2943,131 @@ ipcMain.handle('copy-path', async (event, { workspacePath, fromPath, toPath }) =
   }
 });
 
+ipcMain.handle('download-file', async (event, { workspacePath, url, destination }) => {
+  try {
+    return await downloadFileToWorkspace(workspacePath, url, destination);
+  } catch (e) {
+    console.error('Error downloading file:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('inspect-archive', async (event, { workspacePath, relativePath }) => {
+  try {
+    return await inspectArchiveInWorkspace(workspacePath, relativePath);
+  } catch (e) {
+    console.error('Error inspecting archive:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('extract-archive', async (event, { workspacePath, relativePath, destination }) => {
+  try {
+    return await extractArchiveInWorkspace(workspacePath, relativePath, destination);
+  } catch (e) {
+    console.error('Error extracting archive:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('inspect-binary-asset', async (event, { workspacePath, relativePath }) => {
+  try {
+    return inspectBinaryAssetInWorkspace(workspacePath, relativePath);
+  } catch (e) {
+    console.error('Error inspecting binary asset:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('list-asset-metadata', async (event, { workspacePath, relativePath }) => {
+  try {
+    return listAssetMetadataInWorkspace(workspacePath, relativePath);
+  } catch (e) {
+    console.error('Error listing asset metadata:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('browser-open-url', async (event, { url }) => {
+  try {
+    return await browserOpenUrl(url);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('browser-search-web', async (event, { query }) => {
+  try {
+    return await browserSearchWeb(query);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('browser-click-element', async (event, { selector, text }) => {
+  try {
+    return await browserClickElement(selector, text);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('browser-fill-input', async (event, { selector, value }) => {
+  try {
+    return await browserFillInput(selector, value);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('browser-navigate-back', async () => {
+  try {
+    return await browserNavigateBack();
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('browser-download-from-page', async (event, { workspacePath, selector, url, destination }) => {
+  try {
+    return await browserDownloadFromPage(workspacePath, selector, url, destination);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('browser-wait-for-page', async (event, { timeoutMs }) => {
+  try {
+    return await browserWaitForPage(timeoutMs);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('take-screenshot', async (event, { workspacePath, destination }) => {
+  try {
+    return await takeBrowserScreenshot(workspacePath, destination);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('inspect-screenshot', async (event, { workspacePath, relativePath }) => {
+  try {
+    return inspectScreenshotInWorkspace(workspacePath, relativePath);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('compare-screenshot-to-goal', async (event, { workspacePath, relativePath, goal, observations }) => {
+  try {
+    return compareScreenshotToGoalInWorkspace(workspacePath, relativePath, goal, observations);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
 ipcMain.handle('write-file', async (event, { workspacePath, relativePath, content }) => {
   try {
     const workspaceRoot = path.resolve(workspacePath);
@@ -3472,6 +3928,12 @@ if (process.env.NODE_ENV === 'test') {
     moveWorkspacePath,
     copyWorkspacePath,
     listRunArtifacts,
+    downloadFileToWorkspace,
+    inspectArchiveInWorkspace,
+    extractArchiveInWorkspace,
+    inspectBinaryAssetInWorkspace,
+    listAssetMetadataInWorkspace,
+    compareScreenshotToGoalInWorkspace,
     classifyCommandRequest,
     getCommandShellSpec,
     commandLooksPowerShellSpecific,
