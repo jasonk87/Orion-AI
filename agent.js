@@ -1860,7 +1860,7 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
 function withWorkWalkthrough(text, items, final = false) {
   const meaningfulItems = (items || []).filter(Boolean);
   if (meaningfulItems.length === 0) return text;
-  const base = stripWorkWalkthrough(String(text || ''));
+  const base = sanitizeFinalAnswerText(text);
   const heading = final ? '## Work Walkthrough' : '## Work Walkthrough';
   const lines = meaningfulItems.slice(-12).map(item => {
     const marker = item.status === 'error' ? 'Failed' : (item.status === 'running' ? 'Working' : 'Done');
@@ -1943,6 +1943,8 @@ function buildFinalVerificationSummary(items) {
   const hasPlan = planItems.length > 0;
   const changedSourceFiles = filesTouched.filter(path => !/implementation_plan\.md$/i.test(path));
   const verificationGap = changedSourceFiles.length > 0 && !hasVerificationAfterLastFileEdit(items);
+  const needsPreSubmitSummary = filesTouched.length > 0 || testsRun.length > 0 || failures.length > 0 || hasPlan || verificationGap;
+  if (!needsPreSubmitSummary) return '';
 
   const lines = ['\n\n## Final Pre-Submit Summary'];
   lines.push(`- **Files touched:** ${filesTouched.length ? filesTouched.map(path => `\`${path}\``).join(', ') : 'None recorded'}`);
@@ -1985,9 +1987,25 @@ function buildRunArtifactPayload({ conversation, userPrompt, modelName, workspac
 }
 
 function stripWorkWalkthrough(text) {
-  const marker = '\n\n## Work Walkthrough';
-  const index = text.indexOf(marker);
-  return index === -1 ? text : text.slice(0, index);
+  let cleaned = String(text || '');
+  for (const marker of ['\n\n## Work Walkthrough', '\n\n## Final Pre-Submit Summary']) {
+    const index = cleaned.indexOf(marker);
+    if (index !== -1) cleaned = cleaned.slice(0, index);
+  }
+  return cleaned;
+}
+
+function stripEchoedSystemScaffold(text) {
+  let cleaned = String(text || '');
+  cleaned = cleaned.replace(/^\s*\[SYSTEM:\s*(?:Work Walkthrough|Final Pre-Submit Summary|Before answering|Planning Mode|Post-edit evidence gate|The operational completion gate)[\s\S]*?\]\s*/i, '');
+  cleaned = cleaned.replace(/\n\s*\[SYSTEM:\s*(?:Work Walkthrough|Final Pre-Submit Summary|Before answering|Planning Mode|Post-edit evidence gate|The operational completion gate)[\s\S]*?\]\s*/gi, '\n');
+  return cleaned;
+}
+
+function sanitizeFinalAnswerText(text) {
+  return stripEchoedSystemScaffold(stripWorkWalkthrough(String(text || '')))
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 function buildPlanApprovalMessage(planItem, fallbackText) {
@@ -3419,6 +3437,9 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     hasVerificationAfterLastFileEdit,
     buildPostEditEvidencePrompt,
     buildFinalVerificationSummary,
+    stripEchoedSystemScaffold,
+    sanitizeFinalAnswerText,
+    withWorkWalkthrough,
     diagnoseModelApiFailure
   };
 }

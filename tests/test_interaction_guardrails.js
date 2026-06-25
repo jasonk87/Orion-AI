@@ -289,6 +289,28 @@ test('final verification summary calls out fake checks and gaps', (t) => {
   t.end();
 });
 
+test('final answer leads with answer and strips echoed system walkthrough scaffolding', (t) => {
+  const leaked = `[SYSTEM: Work Walkthrough:
+
+Ran wmic ComputerSystem get TotalPhysicalMemory to get system memory.
+Parsed the output to extract the memory value: 12817575936 bytes.
+Converted bytes to GB: 12817575936 / (1024^3) ≈ 11.94 GB.
+Responded to the user with the system memory information.] Your computer has approximately 11.94 GB of system memory.`;
+
+  const cleaned = agent.sanitizeFinalAnswerText(leaked);
+  t.equal(cleaned, 'Your computer has approximately 11.94 GB of system memory.', 'echoed system walkthrough is stripped and answer remains first');
+
+  const final = agent.withWorkWalkthrough(leaked, [
+    { toolName: 'run_command', kind: 'command', command: 'wmic ComputerSystem get TotalPhysicalMemory', label: 'Ran `wmic ComputerSystem get TotalPhysicalMemory`', status: 'done', detail: 'Exit: 0, timeout: 120000ms' }
+  ], true);
+
+  t.ok(final.startsWith('Your computer has approximately 11.94 GB of system memory.'), 'final response starts with the direct answer');
+  t.equal((final.match(/## Work Walkthrough/g) || []).length, 1, 'only one Work Walkthrough is appended');
+  t.notOk(final.includes('[SYSTEM:'), 'system scaffold is not shown to the user');
+  t.notOk(final.includes('## Final Pre-Submit Summary'), 'read-only command answers skip heavy pre-submit summary');
+  t.end();
+});
+
 test('blocked planning writes are not reported as touched files', (t) => {
   const summary = agent.buildFinalVerificationSummary([
     { kind: 'file', toolName: 'write_file', path: 'tic_tac_toe.py', status: 'error', label: 'Write `tic_tac_toe.py`', detail: 'Planning Mode Active' },
