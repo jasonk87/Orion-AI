@@ -281,6 +281,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     conversation.planApproved = false;
   }
 
+  if (!isInternalPrompt && !conversation.awaitingPlanApproval && config.planningMode !== false) {
+    const simpleRoute = classifySimpleTask(userPrompt);
+    if (simpleRoute && simpleRoute.route === 'local_memory') {
+      await answerLocalMemoryQuestionFastPath({ userPrompt, workspacePath, conversation, config, route: simpleRoute });
+      return;
+    }
+  }
+
   const promptForModel = isInternalPrompt
     ? `[ORION INTERNAL FOLLOW-UP - not a user message]\n${userPrompt}\n\nContinue from the saved conversation/task state. Do not quote this as something the user said.`
     : userPrompt;
@@ -2708,6 +2716,118 @@ ${JSON.stringify(String(userPrompt || ''))}`;
   }
 }
 
+function tokenizeIntentText(value) {
+  const tokens = [];
+  let current = '';
+  const input = String(value || '').toLowerCase();
+  for (const char of input) {
+    const code = char.charCodeAt(0);
+    const isDigit = code >= 48 && code <= 57;
+    const isLetter = code >= 97 && code <= 122;
+    if (isDigit || isLetter) {
+      current += char;
+    } else if (current) {
+      tokens.push(current);
+      current = '';
+    }
+  }
+  if (current) tokens.push(current);
+  return tokens;
+}
+
+function hasAnyToken(tokenSet, values) {
+  return values.some(value => tokenSet.has(value));
+}
+
+function classifySimpleTask(userPrompt) {
+  const tokens = tokenizeIntentText(userPrompt);
+  const tokenSet = new Set(tokens);
+  if (tokens.length === 0) return null;
+
+  const localSubject = hasAnyToken(tokenSet, ['my', 'this', 'computer', 'pc', 'machine', 'system', 'laptop', 'windows']);
+  const memorySubject = hasAnyToken(tokenSet, ['ram', 'memory']);
+  const askingAmount = hasAnyToken(tokenSet, ['how', 'much', 'many', 'total', 'have', 'left', 'free', 'available']);
+
+  if (localSubject && memorySubject && askingAmount) {
+    return {
+      route: 'local_memory',
+      mode: 'direct',
+      reason: 'Simple local system memory question; answer from local command evidence without model planning.'
+    };
+  }
+
+  return null;
+}
+
+function parseKeyValueOutput(output) {
+  const result = {};
+  for (const rawLine of String(output || '').split(/\r?\n/)) {
+    const index = rawLine.indexOf('=');
+    if (index === -1) continue;
+    const key = rawLine.slice(0, index).trim();
+    const value = rawLine.slice(index + 1).trim();
+    if (key) result[key] = value;
+  }
+  return result;
+}
+
+function formatGibFromKb(kb) {
+  const value = Number(kb);
+  if (!Number.isFinite(value) || value <= 0) return '';
+  return (value / 1024 / 1024).toFixed(2);
+}
+
+function buildLocalMemoryAnswer(stdout) {
+  const values = parseKeyValueOutput(stdout);
+  const totalGb = formatGibFromKb(values.TotalVisibleMemorySize);
+  const freeGb = formatGibFromKb(values.FreePhysicalMemory);
+  if (!totalGb && !freeGb) return '';
+  const parts = [];
+  if (totalGb) parts.push(`Your computer has about ${totalGb} GB of usable system RAM`);
+  if (freeGb) parts.push(`${freeGb} GB is currently free/available`);
+  return `${parts.join(', ')}.`;
+}
+
+async function answerLocalMemoryQuestionFastPath({ userPrompt, workspacePath, conversation, config, route }) {
+  agentExecutionMode = 'direct';
+  agentSubStatus = 'Checking system memory locally...';
+  const aiMessageIndex = conversation.messages.length;
+  const command = 'wmic OS get FreePhysicalMemory,TotalVisibleMemorySize /value';
+  const processId = `cmd_${conversation.id}_${Date.now()}`;
+  const timeoutMs = config.commandTimeoutMs || 120000;
+  const workWalkthrough = [{ toolName: 'run_command', kind: 'command', status: 'running', command, label: `Ran \`${command}\`` }];
+  conversation.messages.push({ role: 'assistant', text: 'Checking your system memory...', logs: [], turns: [] });
+  if (window.renderAiMessage) window.renderAiMessage(conversation.messages[aiMessageIndex].text, currentAgentLogs);
+
+  try {
+    const result = await window.api.runCommand(command, workspacePath, processId, timeoutMs);
+    const stdout = result && result.stdout ? result.stdout : '';
+    const stderr = result && (result.stderr || result.error) ? (result.stderr || result.error) : '';
+    const answer = result && Number(result.code) === 0 ? buildLocalMemoryAnswer(stdout) : '';
+    workWalkthrough[0].status = answer ? 'done' : 'error';
+    workWalkthrough[0].detail = `Exit: ${result && result.code !== undefined ? result.code : 'unknown'}, timeout: ${result && result.timeoutMs ? result.timeoutMs : timeoutMs}ms`;
+    const finalText = answer || `I could not read your RAM from the local command output.\n\nCommand attempted: \`${command}\`${stderr ? `\n\nError: ${String(stderr).slice(0, 500)}` : ''}`;
+    conversation.messages[aiMessageIndex].text = withWorkWalkthrough(finalText, workWalkthrough, true);
+    conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
+    if (window.renderAiMessage) window.renderAiMessage(conversation.messages[aiMessageIndex].text, currentAgentLogs);
+  } catch (error) {
+    workWalkthrough[0].status = 'error';
+    workWalkthrough[0].detail = error.message;
+    conversation.messages[aiMessageIndex].text = withWorkWalkthrough(`I could not read your RAM because the local command runner failed: ${error.message}`, workWalkthrough, true);
+    conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
+    if (window.renderAiMessage) window.renderAiMessage(conversation.messages[aiMessageIndex].text, currentAgentLogs);
+  } finally {
+    isAgentRunning = false;
+    runningConversationId = null;
+    agentExecutionMode = 'idle';
+    agentSubStatus = '';
+    if (window.onAgentStatusChange) window.onAgentStatusChange(false);
+    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    if (window.renderConversationList) window.renderConversationList();
+    if (window.renderProjectsList) window.renderProjectsList();
+  }
+}
+
 function shouldHaveUsedToolsButDidNot(text, workWalkthrough, userPrompt = '') {
   if ((workWalkthrough || []).length > 0) return false;
   const response = String(text || '').trim();
@@ -2780,9 +2900,16 @@ function extractPythonScriptPath(command) {
 }
 
 function isLocalSystemFactRequest(prompt) {
-  const text = String(prompt || '').toLowerCase();
-  return /\b(my|this|computer|pc|machine|system|windows|local)\b/.test(text)
-    && /\b(memory|ram|disk|storage|cpu|gpu|processor|graphics|process|processes|battery|ip address|environment|env var|path|installed|version|free space|space left|usage|performance|performing|speed|slow|fast|specs?|hardware|benchmark)\b/.test(text);
+  const tokenSet = new Set(tokenizeIntentText(prompt));
+  const localSubject = hasAnyToken(tokenSet, ['my', 'this', 'computer', 'pc', 'machine', 'system', 'windows', 'local', 'laptop']);
+  const systemTopic = hasAnyToken(tokenSet, [
+    'memory', 'ram', 'disk', 'storage', 'cpu', 'gpu', 'processor', 'graphics',
+    'process', 'processes', 'battery', 'ip', 'address', 'environment', 'env',
+    'path', 'installed', 'version', 'free', 'space', 'left', 'usage',
+    'performance', 'performing', 'speed', 'slow', 'fast', 'spec', 'specs',
+    'hardware', 'benchmark'
+  ]);
+  return localSubject && systemTopic;
 }
 
 function isFailedToolResult(result) {
@@ -4100,6 +4227,9 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
   module.exports = {
     classifyPlanApprovalIntent,
     classifyPlanningNeed,
+    tokenizeIntentText,
+    classifySimpleTask,
+    buildLocalMemoryAnswer,
     getPlanningToolGate,
     normalizeChecklistTasks,
     shouldApplyChecklistUpdate,

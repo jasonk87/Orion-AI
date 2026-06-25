@@ -182,6 +182,17 @@ test('local system fact failures do not become fake blockers or web research', (
   t.end();
 });
 
+test('simple task router handles local RAM questions without model planning', (t) => {
+  const route = agent.classifySimpleTask('how much ram do i have on my computer?');
+  t.equal(route.route, 'local_memory', 'routes RAM question to local memory fast path');
+  t.equal(route.mode, 'direct', 'simple RAM question is direct');
+  t.notOk(agent.classifySimpleTask('refactor the agent loop'), 'complex refactor is not swallowed by simple router');
+  const answer = agent.buildLocalMemoryAnswer('FreePhysicalMemory=4194304\r\nTotalVisibleMemorySize=12582912\r\n');
+  t.ok(answer.startsWith('Your computer has about 12.00 GB'), 'memory answer leads with direct answer');
+  t.ok(answer.includes('4.00 GB is currently free'), 'memory answer includes available RAM when present');
+  t.end();
+});
+
 test('failure taxonomy produces specific recovery guidance', (t) => {
   const patchGuidance = agent.buildFailureRecoveryGuidance({ category: 'patch_target_missing' });
   t.ok(patchGuidance.includes('Re-read the surrounding file lines'), 'patch guidance asks to inspect current file context');
