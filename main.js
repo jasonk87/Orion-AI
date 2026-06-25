@@ -2942,8 +2942,9 @@ function startCommandSession({ command, cwd, processId, timeoutMs }) {
 
   if (!processId) processId = 'cmd_' + Date.now();
   
-  const shell = process.platform === 'win32' ? resolveWindowsShellExecutable('powershell.exe') : 'bash';
-  const shellArgs = process.platform === 'win32' ? ['-NoProfile', '-Command'] : ['-c'];
+  const shellSpec = getCommandShellSpec(command);
+  const shell = shellSpec.executable;
+  const shellArgs = shellSpec.args;
   const resolvedTimeoutMs = Math.min(Math.max(parseInt(timeoutMs, 10) || 120000, 1000), 30 * 60 * 1000);
   
   const session = {
@@ -2979,7 +2980,9 @@ function startCommandSession({ command, cwd, processId, timeoutMs }) {
     }
     if (session.stdout.length > MAX_COMMAND_OUTPUT_CHARS) session.stdout = session.stdout.slice(-MAX_COMMAND_OUTPUT_CHARS);
     if (session.stderr.length > MAX_COMMAND_OUTPUT_CHARS) session.stderr = session.stderr.slice(-MAX_COMMAND_OUTPUT_CHARS);
-    mainWindow.webContents.send(`cmd-output-${processId}`, { type, text });
+    if (mainWindow && mainWindow.webContents && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(`cmd-output-${processId}`, { type, text });
+    }
   };
   
   const timeout = setTimeout(() => {
@@ -3019,6 +3022,30 @@ function startCommandSession({ command, cwd, processId, timeoutMs }) {
   });
   
   return session;
+}
+
+function getCommandShellSpec(command) {
+  if (process.platform !== 'win32') {
+    return { executable: 'bash', args: ['-c'] };
+  }
+  if (commandLooksPowerShellSpecific(command)) {
+    return {
+      executable: resolveWindowsShellExecutable('powershell.exe'),
+      args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command']
+    };
+  }
+  return {
+    executable: resolveWindowsShellExecutable('cmd.exe'),
+    args: ['/d', '/s', '/c']
+  };
+}
+
+function commandLooksPowerShellSpecific(command) {
+  const text = String(command || '');
+  return /\b(Get|Set|New|Remove|Select|Where|ForEach|Start|Stop|Test|Resolve|Copy|Move|Clear|Write|Read|Invoke|Import|Export|ConvertTo|Out)-[A-Za-z]/.test(text)
+    || /\b\$\w+/.test(text)
+    || /\|\s*(Select-Object|Where-Object|ForEach-Object|Sort-Object|Format-Table|Format-List)\b/i.test(text)
+    || /\b-NoProfile\b|\b-ExecutionPolicy\b/i.test(text);
 }
 
 function resolveWindowsShellExecutable(preferred = 'powershell.exe') {
@@ -3073,6 +3100,8 @@ ipcMain.handle('run-command', (event, { command, cwd, processId, timeoutMs }) =>
           clearInterval(poll);
           resolve({
             code: session.exitCode,
+            stdout: session.stdout,
+            stderr: session.stderr,
             error: session.error,
             timedOut: session.timedOut,
             killed: session.killed,
@@ -3444,6 +3473,8 @@ if (process.env.NODE_ENV === 'test') {
     copyWorkspacePath,
     listRunArtifacts,
     classifyCommandRequest,
+    getCommandShellSpec,
+    commandLooksPowerShellSpecific,
     spawnInternalCommand,
     buildCompanionPairingAnnouncement,
     enablePhoneCompanionLanMode,

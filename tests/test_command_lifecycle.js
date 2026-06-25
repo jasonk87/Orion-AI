@@ -67,3 +67,44 @@ test('startCommandSession runs and killProcessTree kills', (t) => {
     }, 200);
   });
 });
+
+test('Windows command shell selection does not require PowerShell for plain commands', (t) => {
+  if (process.platform !== 'win32') {
+    t.pass('Windows-only shell selection skipped on non-Windows');
+    t.end();
+    return;
+  }
+
+  const plain = main.getCommandShellSpec('systeminfo');
+  t.ok(plain.executable.toLowerCase().endsWith('cmd.exe'), 'plain Windows commands use cmd.exe');
+  t.deepEqual(plain.args, ['/d', '/s', '/c'], 'cmd shell uses non-interactive args');
+
+  const powershell = main.getCommandShellSpec('Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty TotalPhysicalMemory');
+  t.ok(powershell.executable.toLowerCase().endsWith('powershell.exe'), 'PowerShell-specific commands still use PowerShell');
+  t.ok(powershell.args.includes('-NoProfile'), 'PowerShell shell remains non-profiled');
+
+  t.equal(main.commandLooksPowerShellSpecific('systeminfo'), false, 'systeminfo is not treated as PowerShell-specific');
+  t.equal(main.commandLooksPowerShellSpecific('Get-ChildItem | Select-Object Name'), true, 'PowerShell pipelines are detected');
+  t.end();
+});
+
+test('run-command sessions retain captured stdout in main process', (t) => {
+  const command = process.platform === 'win32' ? 'echo orion-shell-smoke' : 'printf orion-shell-smoke';
+  const session = main.startCommandSession({
+    command,
+    cwd: __dirname,
+    processId: `stdout_smoke_${Date.now()}`,
+    timeoutMs: 10000
+  });
+
+  const started = Date.now();
+  const poll = setInterval(() => {
+    if (session.status !== 'running' || Date.now() - started > 5000) {
+      clearInterval(poll);
+      t.equal(session.status, 'completed', 'command completed');
+      t.equal(session.exitCode, 0, 'command exited successfully');
+      t.ok(session.stdout.includes('orion-shell-smoke'), 'stdout is captured on the session');
+      t.end();
+    }
+  }, 100);
+});

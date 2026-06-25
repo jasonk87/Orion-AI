@@ -1128,8 +1128,8 @@ async function executeTool(name, args, workspace, config, conversation) {
       
       return {
         exitCode: result.code,
-        stdout: stdoutOutput,
-        stderr: stderrOutput || result.error || '',
+        stdout: stdoutOutput || result.stdout || '',
+        stderr: stderrOutput || result.stderr || result.error || '',
         timedOut: !!result.timedOut,
         killed: !!result.killed,
         timeoutMs: result.timeoutMs || timeoutMs
