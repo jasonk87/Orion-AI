@@ -72,5 +72,7 @@ test('config failures and command retention safeguards are wired', (t) => {
   t.ok(mainJs.includes('const MAX_COMMAND_OUTPUT_CHARS = 200000;'), 'command output has a memory cap');
   t.ok(mainJs.includes('const MAX_COMMAND_SESSIONS = 100;'), 'completed command sessions have a retention cap');
   t.ok(mainJs.includes('pruneCommandSessions();'), 'completed sessions are pruned');
+  t.ok(mainJs.includes('resolveWindowsShellExecutable'), 'packaged command runner resolves Windows shell by absolute path');
+  t.ok(mainJs.includes("'System32', 'WindowsPowerShell'"), 'PowerShell resolver checks the Windows system path');
   t.end();
 });

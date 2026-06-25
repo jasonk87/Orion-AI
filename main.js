@@ -2942,7 +2942,7 @@ function startCommandSession({ command, cwd, processId, timeoutMs }) {
 
   if (!processId) processId = 'cmd_' + Date.now();
   
-  const shell = process.platform === 'win32' ? 'powershell.exe' : 'bash';
+  const shell = process.platform === 'win32' ? resolveWindowsShellExecutable('powershell.exe') : 'bash';
   const shellArgs = process.platform === 'win32' ? ['-NoProfile', '-Command'] : ['-c'];
   const resolvedTimeoutMs = Math.min(Math.max(parseInt(timeoutMs, 10) || 120000, 1000), 30 * 60 * 1000);
   
@@ -3019,6 +3019,29 @@ function startCommandSession({ command, cwd, processId, timeoutMs }) {
   });
   
   return session;
+}
+
+function resolveWindowsShellExecutable(preferred = 'powershell.exe') {
+  if (process.platform !== 'win32') return preferred;
+  const windir = process.env.WINDIR || process.env.SystemRoot || 'C:\\Windows';
+  const candidates = preferred.toLowerCase().includes('cmd')
+    ? [
+        path.join(windir, 'System32', 'cmd.exe'),
+        path.join(windir, 'Sysnative', 'cmd.exe'),
+        'cmd.exe'
+      ]
+    : [
+        path.join(windir, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+        path.join(windir, 'Sysnative', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+        'powershell.exe'
+      ];
+  return candidates.find(candidate => {
+    try {
+      return candidate.includes(path.sep) ? fs.existsSync(candidate) : true;
+    } catch (e) {
+      return false;
+    }
+  }) || preferred;
 }
 
 function commandSessionSummary(session, maxChars = 8000) {
