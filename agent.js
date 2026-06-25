@@ -5,7 +5,7 @@ const SYSTEM_INSTRUCTION = `You are Orion AI, the ultimate pair programmer agent
 Your goal is to solve the task given by the user with high quality, precision, and trust.
 
 CRITICAL RULES:
-1. PLANNING MODE DECISION: Match the process to the size of the request. Use an implementation plan only when the task is genuinely complex: new projects, multi-file builds, architecture changes, risky migrations, broad bug hunts, security-sensitive work, or requests where the user should review direction before code changes. For small fixes, running/opening a program, running tests, setting an entry point, showing paths, pushing when explicitly asked, or narrow follow-ups, act directly without creating implementation_plan.md. If a plan is needed, create "implementation_plan.md", set the checklist, show the plan in chat, and pause for explicit user approval or requested revisions before modifying source files or running commands. Every implementation plan MUST include a "## Testing Plan" section that details exact commands/tests to run, expected behaviors, edge cases, success conditions, and manual checks if automated tests are unavailable.
+1. PLANNING MODE DECISION: Match the process to the size of the request. Use an implementation plan only when the task is genuinely complex: new projects, multi-file builds, architecture changes, risky migrations, broad bug hunts, security-sensitive work, or requests where the user should review direction before code changes. For small fixes, running/opening a program, running tests, setting an entry point, showing paths, pushing when explicitly asked, or narrow follow-ups, act directly without creating implementation_plan.md. If a plan is needed, first complete a Mission Refinement / Strategy Pass and write "STRATEGY.md"; only then create "implementation_plan.md", set the checklist, show the plan in chat, and pause for explicit user approval or requested revisions before modifying source files or running commands. Every implementation plan MUST include a "## Testing Plan" section that details exact commands/tests to run, expected behaviors, edge cases, success conditions, and manual checks if automated tests are unavailable.
 2. TESTING AND REGRESSION DISCIPLINE: When you create or change code, you are responsible for producing run-ready code. Before meaningful edits, inspect existing tests and the detected regression command when relevant. After edits, run the appropriate tests or smoke checks using "run_tests", "run_command", or the long-running command tools. If tests fail, read the output, fix the issue, and rerun tests until they pass or you can clearly explain a blocker. For long tests, training, games, and servers, use "start_command" with a sensible timeout, check status/output, and stop processes with "kill_command" when finished. Do not start multiple copies of the same long-running program unless the previous one is stopped. Do not use an interactive command as a test unless you pipe/provide input or intentionally kill it after a short smoke check. For graphical/Pygame/interactive applications, write a non-interactive test script or design the program to accept a '--smoke-test' command-line flag that exits after a few frames/seconds, and use this flag (or run with a short timeoutMs) when validating. Do not claim code works unless you ran a relevant check or state exactly why you could not.
 3. WEB RESEARCH: If you are unsure about an API, library, framework, command, model parameter, error message, current behavior, or documentation detail, use "google_search" and then "fetch_web_page" on the most relevant official docs or primary source before editing. Do not use web search to answer facts about the user's local machine, workspace state, installed tools, paths, memory, disk, processes, environment variables, or runtime output; inspect local state instead. Do not invent configuration files or API shapes when files are missing or the correct implementation is unclear. Do not say you reviewed, checked, verified, or confirmed documentation unless you actually used these web tools in the current task and can name the source URL. If docs appear to say something surprising, quote or paraphrase the exact relevant rule before changing files.
 4. CONTEXT INTEGRITY: Keep files clean, respect formatting, and preserve comments that are unrelated to your edits.
@@ -31,7 +31,7 @@ Tools available:
 - set_workspace_entrypoint: Set or clear the launch entry point command for this workspace.
 - git_push: Push the current Git branch, or the current branch to a requested remote branch, when the user asks.
 - read_file: Read a file's content. Use startLine/endLine or maxChars for large files.
-- write_file: Write a new file. Existing non-plan files require allowOverwrite=true and overwriteReason; prefer patch_file for edits.
+- write_file: Write a new file. Existing non-governance files require allowOverwrite=true and overwriteReason; prefer patch_file for source edits. STRATEGY.md and implementation_plan.md are governance files.
 - modify_file: Edit a specific section of a file (search and replace).
 - patch_file: Targeted file update using line ranges, anchors, exact replacement, or regex. Prefer this over rewriting large files.
 - run_command: Run a command line in Powershell.
@@ -361,6 +361,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
   let planningDecision = { mode: 'plan', reason: 'Planning mode is active.' };
   let planningBypassedForTask = false;
+  let strategyStatus = { exists: false, valid: false, missingSections: STRATEGY_REQUIRED_SECTIONS, needsClarification: false };
   if (!isInternalPrompt && config.planningMode !== false && !conversation.planApproved && !conversation.awaitingPlanApproval && !(approvalIntent && approvalIntent.intent === 'approve')) {
     planningDecision = await classifyPlanningNeed(userPrompt, modelName, config.geminiApiKey);
     if (planningDecision.mode === 'direct') {
@@ -379,6 +380,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     };
     agentExecutionMode = 'executing';
   }
+  if (!planningBypassedForTask && planningDecision.mode === 'plan' && config.planningMode !== false && !conversation.planApproved && !isInternalPrompt) {
+    strategyStatus = await readStrategyStatus(workspacePath);
+  }
 
   messages.push({
     role: 'user',
@@ -391,9 +395,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     messages.push({
       role: 'user',
       parts: [{
-        text: `[SYSTEM: Planning decision for this user request: ${planningDecision.mode}. Reason: ${planningDecision.reason || 'No reason provided.'} ${planningBypassedForTask ? 'This is a direct task, so do not create implementation_plan.md unless new complexity appears during inspection.' : 'If this requires workspace changes and no plan is approved, create a real implementation plan and pause.'}]`
+        text: `[SYSTEM: Planning decision for this user request: ${planningDecision.mode}. Reason: ${planningDecision.reason || 'No reason provided.'} ${planningBypassedForTask ? 'This is a direct task, so do not create STRATEGY.md or implementation_plan.md unless new complexity appears during inspection.' : 'If this requires workspace changes and no plan is approved, complete Mission Refinement first, create a valid STRATEGY.md, then create a real implementation plan and pause.'}]`
       }]
     });
+    if (!planningBypassedForTask && planningDecision.mode === 'plan' && !conversation.planApproved && !isInternalPrompt) {
+      messages.push({
+        role: 'user',
+        parts: [{ text: buildRefinementPrompt(strategyStatus) }]
+      });
+    }
   }
 
   if (conversation.awaitingPlanApproval && !conversation.planApproved && approvalIntent && approvalIntent.intent === 'revise') {
@@ -735,7 +745,16 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         window.renderAiMessage(conversation.messages[aiMessageIndex].text || lastTextResponse, currentAgentLogs);
         
         // Safety gate for planning mode
-        const planningGate = getPlanningToolGate(config, canExecuteThisTask(), toolName, args);
+        if (!canExecuteThisTask() && config.planningMode && planningDecision.mode === 'plan' && (
+          (toolName === 'write_file' && (isImplementationPlanPath(args.path) || isStrategyPath(args.path))) ||
+          toolName === 'modify_file' || toolName === 'patch_file' || toolName === 'run_command' || toolName === 'start_command' || toolName === 'run_tests'
+        )) {
+          strategyStatus = await readStrategyStatus(workspacePath);
+        }
+        const planningGate = getPlanningToolGate(config, canExecuteThisTask(), toolName, args, {
+          strategyRequired: !planningBypassedForTask && planningDecision.mode === 'plan',
+          strategyStatus
+        });
         if (!planningGate.allowed) {
           const failure = classifyAgentFailure({
             toolName,
@@ -801,6 +820,24 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
         const evidenceEntry = buildToolEvidenceEntry(toolName, args, result);
         toolEvidenceLedger.push(evidenceEntry);
+
+        if (toolName === 'write_file' && isStrategyPath(args.path) && !isFailedToolResult(result)) {
+          try {
+            const strategyTransition = await applyStrategyToOperationalContext(workspacePath, String(args.content || ''));
+            result.strategyValidation = strategyTransition.validation;
+            if (strategyTransition.transition && strategyTransition.transition.state) {
+              workingState = strategyTransition.transition.state;
+              refreshWorkingStateMessage();
+            }
+            if (strategyTransition.validation && strategyTransition.validation.needsClarification) {
+              result.requiresClarification = true;
+              result.message = `${result.message || 'STRATEGY.md written.'} Mission-critical ambiguity was identified; ask the user before creating implementation_plan.md.`;
+            }
+          } catch (strategyError) {
+            result.strategyContextUpdateError = strategyError.message;
+            currentAgentLogs.push({ type: 'thought', content: `Strategy context update warning: ${strategyError.message}` });
+          }
+        }
 
         const resultError = getToolFailureSignal(result);
         if (resultError) {
@@ -1094,9 +1131,10 @@ async function executeTool(name, args, workspace, config, conversation) {
     case 'write_file': {
       if (!args.path) throw new Error("Missing 'path' parameter");
       if (args.content === undefined) throw new Error("Missing 'content' parameter");
-      const isPlanFile = args.path.split(/[\\/]/).pop().toLowerCase() === 'implementation_plan.md';
+      const isPlanFile = isImplementationPlanPath(args.path);
+      const isStrategyFile = isStrategyPath(args.path);
       const existingContent = await window.api.readFile(workspace, args.path, { maxChars: 200000 });
-      if (!isPlanFile && existingContent && !existingContent.error && args.allowOverwrite !== true) {
+      if (!isPlanFile && !isStrategyFile && existingContent && !existingContent.error && args.allowOverwrite !== true) {
         throw new Error("write_file refused to overwrite an existing file. Use patch_file for surgical edits, or set allowOverwrite=true with overwriteReason when a full rewrite is explicitly required.");
       }
       if (args.allowOverwrite === true && !String(args.overwriteReason || '').trim()) {
@@ -1823,6 +1861,80 @@ function evaluateWorkingStateCompletion(state, conversation) {
   });
 }
 
+function firstMeaningfulLine(text, fallback = '') {
+  const lines = String(text || '').split(/\r?\n/)
+    .map(line => line.replace(/^\s*[-*]\s*(\[[ xX]\]\s*)?/, '').trim())
+    .filter(Boolean);
+  return (lines[0] || fallback).slice(0, 1000);
+}
+
+function bulletLines(text, max = 8) {
+  return String(text || '').split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => /^[-*]\s+/.test(line))
+    .map(line => line.replace(/^[-*]\s+/, '').replace(/^\[[ xX]\]\s*/, '').trim())
+    .filter(Boolean)
+    .slice(0, max);
+}
+
+function summarizeSectionForDiscovery(title, content) {
+  const lines = bulletLines(content, 4);
+  const text = lines.length ? lines.join('; ') : firstMeaningfulLine(content);
+  return text ? `${title}: ${text}`.slice(0, 4000) : '';
+}
+
+function buildOperationalContextFromStrategy(content) {
+  const trueObjective = extractMarkdownSection(content, 'True Objective');
+  const evidenceRequired = extractMarkdownSection(content, 'Evidence Required for Success');
+  const recommendedDirection = extractMarkdownSection(content, 'Recommended Direction');
+  const currentReality = extractMarkdownSection(content, 'Current Repo Reality');
+  const relevantFiles = extractMarkdownSection(content, 'Relevant Files / Subsystems');
+  const assumptions = extractMarkdownSection(content, 'Assumptions');
+  const risks = extractMarkdownSection(content, 'Risks / Failure Modes');
+  const whatNotToTouch = extractMarkdownSection(content, 'What Not To Touch');
+  const mission = firstMeaningfulLine(trueObjective, 'Execute the strategy in STRATEGY.md.');
+  const evidenceLines = bulletLines(evidenceRequired, 12);
+  const winConditions = evidenceLines.length
+    ? evidenceLines.map(line => ({ title: line, status: 'pending', evidence: [] }))
+    : [{ title: `Evidence satisfies strategy objective: ${mission}`, status: 'pending', evidence: [] }];
+  const discoveries = [
+    summarizeSectionForDiscovery('Current repo reality', currentReality),
+    summarizeSectionForDiscovery('Relevant files/subsystems', relevantFiles),
+    summarizeSectionForDiscovery('Strategy assumptions', assumptions),
+    summarizeSectionForDiscovery('Risks/failure modes', risks),
+    summarizeSectionForDiscovery('What not to touch', whatNotToTouch)
+  ].filter(Boolean);
+  return {
+    mission,
+    winConditions,
+    activeObjective: firstMeaningfulLine(recommendedDirection, mission),
+    discoveries
+  };
+}
+
+async function applyStrategyToOperationalContext(workspace, content) {
+  const validation = validateStrategyContent(content);
+  if (!validation.valid || !workspace) return { validation, transition: null };
+  const derived = buildOperationalContextFromStrategy(content);
+  let transition = await mutateOperationalContext(workspace, 'update_mission_context', {
+    mission: derived.mission,
+    winConditions: derived.winConditions,
+    activeObjective: derived.activeObjective,
+    rationale: 'Derived from STRATEGY.md during mission refinement.'
+  });
+  for (const text of derived.discoveries) {
+    transition = await mutateOperationalContext(workspace, 'promote_discovery', {
+      text,
+      category: 'strategy_discovery',
+      evidence: 'STRATEGY.md'
+    });
+  }
+  transition = await mutateOperationalContext(workspace, 'discard_noise', {
+    summary: 'Temporary repository scan details were distilled into STRATEGY.md and operational context.'
+  });
+  return { validation, transition };
+}
+
 function summarizeToolOutcome(toolName, args, result) {
   const success = !(result && (result.error || result.success === false));
   const parts = [];
@@ -2040,22 +2152,181 @@ function buildToolUseContractPrompt() {
   return `[SYSTEM: Before answering, decide whether the user's request requires interacting with the workspace or runtime. If it requires files, commands, tests, external docs, app state, timers, notes, or code changes, use the relevant tools before giving a final answer. Questions about this computer's performance, specs, RAM, CPU, disk, processes, or local environment require local inspection with tools unless fresh evidence is already present. If no tool is needed, answer normally and do not claim that work was performed. Never end with a generic completion message unless the Work Walkthrough shows what actually happened. Remember, for complex tasks, your final summary must explicitly list what planned tests were run, their results, and reasons for any skipped tests.]`;
 }
 
-function getPlanningToolGate(config, canExecute, toolName, args = {}) {
+const STRATEGY_FILE_NAME = 'strategy.md';
+const IMPLEMENTATION_PLAN_FILE_NAME = 'implementation_plan.md';
+const STRATEGY_REQUIRED_SECTIONS = [
+  'True Objective',
+  'Current Repo Reality',
+  'Relevant Files / Subsystems',
+  'Assumptions',
+  'Ambiguities',
+  'Risks / Failure Modes',
+  'Evidence Required for Success',
+  'Clarifying Questions, if needed',
+  'Recommended Direction',
+  'What Not To Touch'
+];
+
+function basenameLower(pathValue) {
+  return String(pathValue || '').split(/[\\/]/).pop().toLowerCase();
+}
+
+function isImplementationPlanPath(pathValue) {
+  return basenameLower(pathValue) === IMPLEMENTATION_PLAN_FILE_NAME;
+}
+
+function isStrategyPath(pathValue) {
+  return basenameLower(pathValue) === STRATEGY_FILE_NAME;
+}
+
+function normalizeHeadingText(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function hasRequiredStrategySections(content) {
+  const text = String(content || '');
+  if (!text.trim()) return false;
+  const headings = new Set();
+  const headingRegex = /^#{1,4}\s+(.+)$/gm;
+  let match;
+  while ((match = headingRegex.exec(text))) {
+    headings.add(normalizeHeadingText(match[1]));
+  }
+  return STRATEGY_REQUIRED_SECTIONS.every(section => headings.has(normalizeHeadingText(section)));
+}
+
+function extractMarkdownSection(content, heading) {
+  const text = String(content || '');
+  const normalizedHeading = normalizeHeadingText(heading);
+  const headingRegex = /^(#{1,4})\s+(.+)$/gm;
+  let match;
+  while ((match = headingRegex.exec(text))) {
+    if (normalizeHeadingText(match[2]) !== normalizedHeading) continue;
+    const start = headingRegex.lastIndex;
+    const currentDepth = match[1].length;
+    let end = text.length;
+    let next;
+    while ((next = headingRegex.exec(text))) {
+      if (next[1].length <= currentDepth) {
+        end = next.index;
+        break;
+      }
+    }
+    return text.slice(start, end).trim();
+  }
+  return '';
+}
+
+function strategyRequiresClarification(content) {
+  const section = extractMarkdownSection(content, 'Clarifying Questions, if needed');
+  if (!section) return false;
+  const normalized = section.toLowerCase();
+  if (/^\s*(none|n\/a|no critical questions|no mission-critical ambiguity)\s*[\.\-]*\s*$/i.test(section)) return false;
+  return /\b(mission[-\s]?critical|critical ambiguity|must ask|cannot proceed|blocked until|requires user|needs user clarification)\b/i.test(normalized) ||
+    /^\s*[-*]\s*\[(critical|blocker|mission-critical)\]/im.test(section);
+}
+
+function validateStrategyContent(content) {
+  const missingSections = STRATEGY_REQUIRED_SECTIONS.filter(section => {
+    const headings = [];
+    const headingRegex = /^#{1,4}\s+(.+)$/gm;
+    let match;
+    while ((match = headingRegex.exec(String(content || '')))) headings.push(normalizeHeadingText(match[1]));
+    return !headings.includes(normalizeHeadingText(section));
+  });
+  const valid = missingSections.length === 0;
+  return {
+    valid,
+    missingSections,
+    needsClarification: valid && strategyRequiresClarification(content)
+  };
+}
+
+async function readStrategyStatus(workspacePath) {
+  try {
+    if (!window.api || typeof window.api.readFile !== 'function') {
+      return { exists: false, valid: false, missingSections: STRATEGY_REQUIRED_SECTIONS, needsClarification: false, content: '' };
+    }
+    const result = await window.api.readFile(workspacePath, 'STRATEGY.md', { maxChars: 120000 });
+    const content = typeof result === 'string'
+      ? result
+      : (result && !result.error && typeof result.content === 'string' ? result.content : '');
+    if (!content) return { exists: false, valid: false, missingSections: STRATEGY_REQUIRED_SECTIONS, needsClarification: false, content: '' };
+    return { exists: true, content, ...validateStrategyContent(content) };
+  } catch (err) {
+    return { exists: false, valid: false, missingSections: STRATEGY_REQUIRED_SECTIONS, needsClarification: false, content: '', error: err.message };
+  }
+}
+
+function buildRefinementPrompt(strategyStatus = {}) {
+  const statusLine = strategyStatus.exists
+    ? (strategyStatus.valid ? 'A STRATEGY.md exists and has the required sections.' : `A STRATEGY.md exists but is invalid or incomplete. Missing sections: ${(strategyStatus.missingSections || []).join(', ') || 'unknown'}.`)
+    : 'No valid STRATEGY.md exists yet.';
+  return `[SYSTEM: Mission Refinement / Strategy Pass is mandatory before implementation planning for this complex task.
+${statusLine}
+
+Architecture: Refine → Plan → Act → Verify → Update State.
+
+During refinement, you may inspect/read/search and update operational context, but you must not edit source files, run destructive commands, create implementation_plan.md, mark tasks complete, or claim completion.
+
+Required first inspections for project/workspace tasks:
+1. get_workspace_info
+2. read_operational_context
+3. read_notes
+4. list_files
+
+Then inspect obvious grounding files when present: README, package.json, pyproject.toml, requirements.txt, main entry files, test config/test folders, and existing implementation_plan.md.
+
+Before writing implementation_plan.md, write STRATEGY.md with these exact sections:
+${STRATEGY_REQUIRED_SECTIONS.map(section => `- ${section}`).join('\n')}
+
+If STRATEGY.md finds mission-critical ambiguity, ask the user before planning. If ambiguity is minor, record the assumption in STRATEGY.md and operational context, then proceed. Base implementation_plan.md on STRATEGY.md, not just the raw user prompt. Do not add agent roles, automatic replanning, or domain-specific workflows.]`;
+}
+
+function getPlanningToolGate(config, canExecute, toolName, args = {}, options = {}) {
   if (!config || !config.planningMode || canExecute) {
     return { allowed: true, forceYield: false, reason: '' };
   }
   const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'run_command', 'start_command', 'run_tests', 'sync_workspace_env', 'launch_workspace_app', 'git_push', 'download_file', 'download_from_page', 'extract_archive', 'take_screenshot'];
+  const completionTools = ['complete_subplan', 'evaluate_win_conditions'];
+  const strategyRequired = options.strategyRequired !== false;
+  const strategyStatus = options.strategyStatus || {};
+  if (completionTools.includes(toolName)) {
+    return {
+      allowed: false,
+      forceYield: false,
+      reason: 'Refinement/Planning Mode Active: do not mark tasks, subplans, or win conditions complete before strategy, plan approval, execution, and evidence.'
+    };
+  }
   if (!destructiveTools.includes(toolName)) {
     return { allowed: true, forceYield: false, reason: '' };
   }
-  const isPlanWrite = toolName === 'write_file' && args.path && args.path.split(/[\\/]/).pop().toLowerCase() === 'implementation_plan.md';
+  const isStrategyWrite = toolName === 'write_file' && isStrategyPath(args.path);
+  if (strategyRequired && isStrategyWrite) {
+    return { allowed: true, forceYield: false, reason: 'Writing STRATEGY.md is allowed during refinement.' };
+  }
+  const isPlanWrite = toolName === 'write_file' && isImplementationPlanPath(args.path);
   if (isPlanWrite) {
+    if (strategyRequired && !strategyStatus.valid) {
+      return {
+        allowed: false,
+        forceYield: false,
+        reason: `Refinement required: create a valid STRATEGY.md before implementation_plan.md. STRATEGY.md must include: ${STRATEGY_REQUIRED_SECTIONS.join(', ')}.`
+      };
+    }
+    if (strategyRequired && strategyStatus.needsClarification) {
+      return {
+        allowed: false,
+        forceYield: false,
+        reason: 'Clarification required: STRATEGY.md identifies mission-critical ambiguity. Ask the user before creating implementation_plan.md.'
+      };
+    }
     return { allowed: true, forceYield: true, reason: 'Writing implementation_plan.md is allowed before approval.' };
   }
   return {
     allowed: false,
     forceYield: false,
-    reason: "Planning Mode Active: this request needs an implementation plan before file edits or command execution. Create implementation_plan.md, show the plan in chat, set the checklist, then pause for explicit approval or requested revisions."
+    reason: "Refinement/Planning Mode Active: this request needs a grounded STRATEGY.md before implementation_plan.md, and an approved implementation plan before file edits or command execution. Inspect the workspace first, write STRATEGY.md, then create implementation_plan.md and pause for approval."
   };
 }
 
@@ -2084,14 +2355,15 @@ function summarizeToolStart(toolName, args = {}) {
   if (toolName === 'compare_screenshot_to_goal') return { toolName, kind: 'visual', status: 'running', label: `Compared screenshot to goal` };
   if (toolName === 'inspect_screenshot_with_model') return { toolName, kind: 'visual', status: 'running', label: `Inspected screenshot with Gemini vision` };
   if (toolName === 'write_file') {
-    const isPlan = args.path && args.path.split(/[\\/]/).pop().toLowerCase() === 'implementation_plan.md';
+    const isPlan = args.path && isImplementationPlanPath(args.path);
+    const isStrategy = args.path && isStrategyPath(args.path);
     return {
       toolName,
-      kind: isPlan ? 'plan' : 'file',
+      kind: isPlan ? 'plan' : (isStrategy ? 'strategy' : 'file'),
       status: 'running',
       path: args.path,
       content: isPlan ? String(args.content || '') : '',
-      label: isPlan ? 'Created implementation plan' : `Write \`${args.path || 'file'}\``
+      label: isPlan ? 'Created implementation plan' : (isStrategy ? 'Created mission strategy' : `Write \`${args.path || 'file'}\``)
     };
   }
   if (toolName === 'modify_file' || toolName === 'patch_file') {
@@ -2295,8 +2567,8 @@ function stripWorkWalkthrough(text) {
 
 function stripEchoedSystemScaffold(text) {
   let cleaned = String(text || '');
-  cleaned = cleaned.replace(/^\s*\[SYSTEM:\s*(?:Work Walkthrough|Final Pre-Submit Summary|Before answering|Planning Mode|Post-edit evidence gate|The operational completion gate)[\s\S]*?\]\s*/i, '');
-  cleaned = cleaned.replace(/\n\s*\[SYSTEM:\s*(?:Work Walkthrough|Final Pre-Submit Summary|Before answering|Planning Mode|Post-edit evidence gate|The operational completion gate)[\s\S]*?\]\s*/gi, '\n');
+  cleaned = cleaned.replace(/^\s*\[SYSTEM:\s*(?:Work Walkthrough|Final Pre-Submit Summary|Before answering|Planning Mode|Mission Refinement|Refinement\/Planning Mode|Post-edit evidence gate|The operational completion gate)[\s\S]*?\]\s*/i, '');
+  cleaned = cleaned.replace(/\n\s*\[SYSTEM:\s*(?:Work Walkthrough|Final Pre-Submit Summary|Before answering|Planning Mode|Mission Refinement|Refinement\/Planning Mode|Post-edit evidence gate|The operational completion gate)[\s\S]*?\]\s*/gi, '\n');
   return cleaned;
 }
 
@@ -2887,7 +3159,7 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
         },
         {
           name: "write_file",
-          description: "Creates a new file. Existing non-plan files require allowOverwrite=true and overwriteReason; prefer patch_file for edits.",
+          description: "Creates a new file. Existing non-governance files require allowOverwrite=true and overwriteReason; prefer patch_file for source edits. STRATEGY.md and implementation_plan.md are governance files.",
           parameters: {
             type: "OBJECT",
             properties: {
@@ -3423,7 +3695,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
           },
           {
             name: "write_file",
-            description: "Creates a new file. Existing non-plan files require allowOverwrite=true and overwriteReason; prefer patch_file for edits.",
+            description: "Creates a new file. Existing non-governance files require allowOverwrite=true and overwriteReason; prefer patch_file for source edits. STRATEGY.md and implementation_plan.md are governance files.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -3832,6 +4104,12 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     normalizeChecklistTasks,
     shouldApplyChecklistUpdate,
     hasRequiredTestingPlanSection,
+    STRATEGY_REQUIRED_SECTIONS,
+    hasRequiredStrategySections,
+    validateStrategyContent,
+    strategyRequiresClarification,
+    buildRefinementPrompt,
+    buildOperationalContextFromStrategy,
     validateRunCommandForAgentUse,
     extractPythonScriptPath,
     commandProvidesInput,

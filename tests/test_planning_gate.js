@@ -37,6 +37,24 @@ global.fetch = async (url, options) => {
 
 const agent = require('../agent.js');
 
+function validStrategy(overrides = {}) {
+  const sections = {
+    'True Objective': 'Build the requested feature safely against the current repository reality.',
+    'Current Repo Reality': '- Existing app code is present and must be inspected before edits.',
+    'Relevant Files / Subsystems': '- agent.js\n- tests/',
+    'Assumptions': '- Minor ambiguity can be handled with conservative defaults.',
+    'Ambiguities': '- None mission-critical.',
+    'Risks / Failure Modes': '- Tests may reveal integration breakage.',
+    'Evidence Required for Success': '- npm test passes\n- Changed files are reread after edits',
+    'Clarifying Questions, if needed': 'None',
+    'Recommended Direction': 'Inspect first, plan second, edit only after approval.',
+    'What Not To Touch': '- Do not rewrite unrelated systems.'
+  };
+  return Object.entries({ ...sections, ...overrides })
+    .map(([heading, body]) => `## ${heading}\n\n${body}`)
+    .join('\n\n');
+}
+
 test('classifyPlanApprovalIntent returns correct intents', async (t) => {
   const approveRes = await agent.classifyPlanApprovalIntent('good to go', 'gemini-1', 'key');
   t.equal(approveRes.intent, 'approve', 'Recognizes approve intent');
@@ -69,18 +87,34 @@ test('classifyPlanningNeed returns correct modes', async (t) => {
   t.end();
 });
 
-test('Planning Gate behavior blocks destructive tools except implementation_plan.md', (t) => {
+test('Planning Gate behavior requires STRATEGY.md before implementation_plan.md', (t) => {
   const config = { planningMode: true };
 
   const readGate = agent.getPlanningToolGate(config, false, 'read_file', { path: 'app.js' });
-  t.equal(readGate.allowed, true, 'allows non-destructive read before approval');
+  t.equal(readGate.allowed, true, 'allows non-destructive read during refinement');
 
-  const planGate = agent.getPlanningToolGate(config, false, 'write_file', { path: 'plans/implementation_plan.md' });
-  t.equal(planGate.allowed, true, 'allows exact implementation_plan.md write before approval');
+  const strategyGate = agent.getPlanningToolGate(config, false, 'write_file', { path: 'STRATEGY.md' });
+  t.equal(strategyGate.allowed, true, 'allows STRATEGY.md write during refinement');
+  t.equal(strategyGate.forceYield, false, 'strategy write does not request implementation approval yet');
+
+  const missingStrategyGate = agent.getPlanningToolGate(config, false, 'write_file', { path: 'plans/implementation_plan.md' }, {
+    strategyStatus: { exists: false, valid: false }
+  });
+  t.equal(missingStrategyGate.allowed, false, 'blocks implementation_plan.md until STRATEGY.md exists');
+
+  const planGate = agent.getPlanningToolGate(config, false, 'write_file', { path: 'plans/implementation_plan.md' }, {
+    strategyStatus: { exists: true, valid: true, needsClarification: false }
+  });
+  t.equal(planGate.allowed, true, 'allows exact implementation_plan.md write after valid strategy');
   t.equal(planGate.forceYield, true, 'plan write forces pause/yield');
 
   const bypassGate = agent.getPlanningToolGate(config, false, 'write_file', { path: 'implementation_plan.md.bak' });
   t.equal(bypassGate.allowed, false, 'blocks filename suffix bypass');
+
+  const sourceEditGate = agent.getPlanningToolGate(config, false, 'patch_file', { path: 'src/app.js' }, {
+    strategyStatus: { exists: true, valid: true, needsClarification: false }
+  });
+  t.equal(sourceEditGate.allowed, false, 'blocks source edits during refinement/planning');
 
   const commandGate = agent.getPlanningToolGate(config, false, 'run_command', { command: 'npm test' });
   t.equal(commandGate.allowed, false, 'blocks command execution before approval');
@@ -88,6 +122,60 @@ test('Planning Gate behavior blocks destructive tools except implementation_plan
   const approvedGate = agent.getPlanningToolGate(config, true, 'run_command', { command: 'npm test' });
   t.equal(approvedGate.allowed, true, 'allows destructive tools after approval/direct classification');
 
+  const directGate = agent.getPlanningToolGate(config, true, 'write_file', { path: 'small.txt', content: 'ok' });
+  t.equal(directGate.allowed, true, 'direct/simple tasks can bypass refinement through canExecute');
+
+  t.end();
+});
+
+test('STRATEGY.md validation requires all refinement sections', (t) => {
+  const content = validStrategy();
+  t.equal(agent.hasRequiredStrategySections(content), true, 'valid strategy contains all required sections');
+  const missing = content.replace(/## What Not To Touch[\s\S]*$/, '');
+  t.equal(agent.hasRequiredStrategySections(missing), false, 'missing required section is invalid');
+  const validation = agent.validateStrategyContent(missing);
+  t.equal(validation.valid, false, 'validation rejects incomplete strategy');
+  t.ok(validation.missingSections.includes('What Not To Touch'), 'validation reports missing section');
+  t.end();
+});
+
+test('strategy critical ambiguity triggers clarification gate before planning', (t) => {
+  const content = validStrategy({
+    'Clarifying Questions, if needed': '- [critical] Which repository should be modified? This is mission-critical.'
+  });
+  const validation = agent.validateStrategyContent(content);
+  t.equal(validation.valid, true, 'critical-ambiguity strategy can still be structurally valid');
+  t.equal(validation.needsClarification, true, 'critical ambiguity requires clarification');
+
+  const gate = agent.getPlanningToolGate({ planningMode: true }, false, 'write_file', { path: 'implementation_plan.md' }, {
+    strategyStatus: validation
+  });
+  t.equal(gate.allowed, false, 'implementation plan is blocked until clarification');
+  t.ok(gate.reason.includes('Clarification required'), 'gate explains ask-clarification behavior');
+  t.end();
+});
+
+test('refinement prompt requires first inspections and no new roles or replanning', (t) => {
+  const prompt = agent.buildRefinementPrompt({ exists: false, valid: false, missingSections: agent.STRATEGY_REQUIRED_SECTIONS });
+  t.ok(prompt.includes('get_workspace_info'), 'requires workspace info first');
+  t.ok(prompt.includes('read_operational_context'), 'requires operational context read first');
+  t.ok(prompt.includes('read_notes'), 'requires notes read first');
+  t.ok(prompt.includes('list_files'), 'requires file listing first');
+  t.ok(prompt.includes('README'), 'requires obvious grounding files');
+  t.ok(prompt.includes('Do not add agent roles'), 'forbids new roles');
+  t.ok(prompt.includes('automatic replanning'), 'mentions replanning only as forbidden');
+  t.end();
+});
+
+test('strategy derives operational context mission and win conditions', (t) => {
+  const derived = agent.buildOperationalContextFromStrategy(validStrategy({
+    'True Objective': 'Make Orion slower before hard decisions and more reliable on large repos.',
+    'Evidence Required for Success': '- STRATEGY.md exists before implementation_plan.md\n- Source edits are blocked during refinement'
+  }));
+  t.equal(derived.mission, 'Make Orion slower before hard decisions and more reliable on large repos.', 'derives mission from True Objective');
+  t.equal(derived.winConditions.length, 2, 'derives measurable win conditions from evidence section');
+  t.equal(derived.winConditions[0].title, 'STRATEGY.md exists before implementation_plan.md', 'keeps evidence requirement as win condition');
+  t.ok(derived.discoveries.some(text => text.includes('Relevant files/subsystems')), 'promotes durable strategy discoveries');
   t.end();
 });
 
@@ -120,6 +208,9 @@ test('invalid plan does not present approval UI and requests internal revision',
   global.window.saveConversationsToStorage = () => {};
   global.window.api = {
     readFile: async (workspacePath, filePath) => {
+      if (filePath === 'STRATEGY.md') {
+        return validStrategy();
+      }
       if (filePath === 'implementation_plan.md') {
         return '# Plan\n\n## Implementation\n\nDo the work.'; // Invalid, missing Testing Plan
       }
@@ -182,7 +273,10 @@ test('invalid plan does not present approval UI and requests internal revision',
       };
     } else {
       // Third call: The model gets the rejection and writes a valid plan
-      global.window.api.readFile = async () => '# Plan\n\n## Testing Plan\n\nTest it.'; // Now it's valid
+      global.window.api.readFile = async (workspacePath, filePath) => {
+        if (filePath === 'STRATEGY.md') return validStrategy();
+        return '# Plan\n\n## Testing Plan\n\nTest it.'; // Now it's valid
+      };
       return {
         ok: true,
         json: async () => ({
@@ -249,6 +343,9 @@ test('invalid plan twice eventually yields to the user to prevent infinite loop'
   global.window.saveConversationsToStorage = () => {};
   global.window.api = {
     readFile: async (workspacePath, filePath) => {
+      if (filePath === 'STRATEGY.md') {
+        return validStrategy();
+      }
       return '# Plan\n\n## Implementation\n\nStill invalid plan.';
     },
     writeFile: async () => ({ success: true }),

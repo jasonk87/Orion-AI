@@ -341,7 +341,7 @@ test('blocked planning writes are not reported as touched files', (t) => {
   t.ok(filesTouchedLine.includes('None recorded'), 'blocked source writes do not count as touched files');
   t.notOk(filesTouchedLine.includes('`tic_tac_toe.py`'), 'blocked source path is not listed as touched');
   t.ok(agentJs.includes('updateWalkthroughItem(walkthroughItem, toolName, args, { error: planningGate.reason'), 'planning gate marks blocked tool attempts in walkthrough');
-  t.ok(agentJs.includes("label: isPlan ? 'Created implementation plan' : `Write \\`"), 'write label is neutral until execution succeeds');
+  t.ok(agentJs.includes("isStrategy ? 'Created mission strategy' : `Write \\`"), 'source write label is neutral until execution succeeds');
   t.end();
 });
 
