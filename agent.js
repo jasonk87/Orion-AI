@@ -655,6 +655,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             workingState = transition.state;
             refreshWorkingStateMessage();
           }
+          updateWalkthroughItem(walkthroughItem, toolName, args, { error: planningGate.reason, failureCategory: failure.category }, new Error(planningGate.reason));
           continue;
         }
         if (planningGate.forceYield) {
@@ -1804,7 +1805,7 @@ function summarizeToolStart(toolName, args = {}) {
       status: 'running',
       path: args.path,
       content: isPlan ? String(args.content || '') : '',
-      label: isPlan ? 'Created implementation plan' : `Wrote \`${args.path || 'file'}\``
+      label: isPlan ? 'Created implementation plan' : `Write \`${args.path || 'file'}\``
     };
   }
   if (toolName === 'modify_file' || toolName === 'patch_file') {
@@ -1877,7 +1878,7 @@ function withWorkWalkthrough(text, items, final = false) {
 }
 
 function isFileMutationItem(item) {
-  return !!(item && item.kind === 'file' && item.path);
+  return !!(item && item.kind === 'file' && item.path && item.status === 'done');
 }
 
 function isPlanMutationItem(item) {
@@ -1936,7 +1937,7 @@ Call the necessary tools now. Do not finish with a generic summary.]`;
 }
 
 function buildFinalVerificationSummary(items) {
-  const filesTouched = [...new Set(items.filter(item => item.kind === 'file' && item.path).map(item => item.path))];
+  const filesTouched = [...new Set(items.filter(isFileMutationItem).map(item => item.path))];
   const testsRun = items.filter(isVerificationItem).map(item => item.label);
   const nonVerificationCommands = items
     .filter(item => item && (item.toolName === 'run_command' || item.toolName === 'start_command') && !isVerificationItem(item))
@@ -1967,7 +1968,7 @@ function buildFinalVerificationSummary(items) {
 }
 
 function buildRunArtifactPayload({ conversation, userPrompt, modelName, workspacePath, workWalkthrough, finalText }) {
-  const filesTouched = [...new Set((workWalkthrough || []).filter(item => item.kind === 'file' && item.path).map(item => item.path))];
+  const filesTouched = [...new Set((workWalkthrough || []).filter(isFileMutationItem).map(item => item.path))];
   return {
     conversationId: conversation.id,
     runId: `run-${Date.now()}`,

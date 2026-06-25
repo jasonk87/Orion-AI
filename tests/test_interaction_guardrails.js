@@ -269,6 +269,19 @@ test('final verification summary calls out fake checks and gaps', (t) => {
   t.end();
 });
 
+test('blocked planning writes are not reported as touched files', (t) => {
+  const summary = agent.buildFinalVerificationSummary([
+    { kind: 'file', toolName: 'write_file', path: 'tic_tac_toe.py', status: 'error', label: 'Write `tic_tac_toe.py`', detail: 'Planning Mode Active' },
+    { kind: 'plan', toolName: 'write_file', path: 'implementation_plan.md', status: 'done', label: 'Created implementation plan' }
+  ]);
+  const filesTouchedLine = summary.split('\n').find(line => line.includes('Files touched')) || '';
+  t.ok(filesTouchedLine.includes('None recorded'), 'blocked source writes do not count as touched files');
+  t.notOk(filesTouchedLine.includes('`tic_tac_toe.py`'), 'blocked source path is not listed as touched');
+  t.ok(agentJs.includes('updateWalkthroughItem(walkthroughItem, toolName, args, { error: planningGate.reason'), 'planning gate marks blocked tool attempts in walkthrough');
+  t.ok(agentJs.includes("label: isPlan ? 'Created implementation plan' : `Write \\`"), 'write label is neutral until execution succeeds');
+  t.end();
+});
+
 test('workspace artifacts and file explorer controls are wired', (t) => {
   t.ok(agentJs.includes('buildRunArtifactPayload'), 'agent builds external run artifact payloads');
   t.ok(agentJs.includes('writeRunArtifact'), 'agent writes run artifacts through IPC');
