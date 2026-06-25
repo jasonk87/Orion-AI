@@ -52,6 +52,16 @@ test('repeated failure guard warns on second failure and pauses on third', (t) =
   t.end();
 });
 
+test('tool contract separates failed tools from task truth', (t) => {
+  t.ok(agentJs.includes('A failed tool path is evidence about that tool attempt, not proof'), 'system prompt separates tool failure from task truth');
+  t.ok(agentJs.includes("Do not use web search to answer facts about the user's local machine"), 'system prompt blocks local-machine web fallback');
+  t.ok(agentJs.includes('For local machine facts, a non-zero exit proves only that this command attempt failed'), 'run_command schema warns against overclaiming failed commands');
+  t.ok(agentJs.includes('Do not use for facts about this local machine'), 'google_search schema blocks local-state usage');
+  t.ok(agentJs.includes('buildEpistemicCorrectionPrompt'), 'loop has an epistemic self-correction guard');
+  t.ok(agentJs.includes('getEpistemicToolGate'), 'loop gates invalid tool escalation');
+  t.end();
+});
+
 test('failure taxonomy classifies common failure modes', (t) => {
   t.equal(agent.classifyAgentFailure({
     toolName: 'patch_file',
@@ -101,6 +111,53 @@ test('failure taxonomy classifies common failure modes', (t) => {
     category: 'model_no_tool_use'
   }).category, 'model_no_tool_use', 'classifies model no-tool-use follow-up');
 
+  t.end();
+});
+
+test('local system fact failures do not become fake blockers or web research', (t) => {
+  t.equal(agent.isLocalSystemFactRequest('how much memory does my computer have left?'), true, 'recognizes local memory query');
+  t.equal(agent.isLocalSystemFactRequest('look up Gemini API docs'), false, 'does not classify docs research as local system fact');
+
+  const failedCommand = {
+    exitCode: -4058,
+    stdout: '',
+    stderr: '',
+    timeoutMs: 120000
+  };
+  t.equal(agent.isFailedToolResult(failedCommand), true, 'non-zero command exit is failed evidence');
+  t.ok(agent.getToolFailureSignal(failedCommand).includes('-4058'), 'failure signal preserves exit code');
+
+  const ledger = [
+    agent.buildToolEvidenceEntry('run_command', { command: 'wmic ComputerSystem get TotalPhysicalMemory /value' }, failedCommand),
+    agent.buildToolEvidenceEntry('run_command', { command: 'systeminfo' }, failedCommand)
+  ];
+
+  const webGate = agent.getEpistemicToolGate(
+    'how much memory does my computer have left?',
+    ledger,
+    'google_search',
+    { query: 'how to get system memory information without powershell or wmic' }
+  );
+  t.equal(webGate.allowed, false, 'blocks web search for local machine facts');
+  t.ok(webGate.reason.includes('local machine'), 'web gate explains local-state boundary');
+
+  const blockerGate = agent.getEpistemicToolGate(
+    'how much memory does my computer have left?',
+    ledger,
+    'record_blocker',
+    { title: 'Cannot check memory' }
+  );
+  t.equal(blockerGate.allowed, false, 'blocks blocker recording from failed local commands alone');
+  t.ok(blockerGate.reason.includes('failed local-inspection commands alone'), 'blocker gate explains evidence problem');
+
+  const correction = agent.buildEpistemicCorrectionPrompt({
+    userPrompt: 'how much memory does my computer have left?',
+    answerText: 'I cannot proceed without a configured Google Search API key.',
+    toolEvidenceLedger: ledger
+  });
+  t.ok(correction.includes('failed tool attempts'), 'self-correction prompt names failed tool attempts');
+  t.ok(correction.includes('not proof'), 'self-correction prompt rejects unsupported inference');
+  t.ok(correction.includes('Do not use web search'), 'self-correction prompt blocks web fallback');
   t.end();
 });
 

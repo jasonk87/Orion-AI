@@ -7,13 +7,13 @@ Your goal is to solve the task given by the user with high quality, precision, a
 CRITICAL RULES:
 1. PLANNING MODE DECISION: Match the process to the size of the request. Use an implementation plan only when the task is genuinely complex: new projects, multi-file builds, architecture changes, risky migrations, broad bug hunts, security-sensitive work, or requests where the user should review direction before code changes. For small fixes, running/opening a program, running tests, setting an entry point, showing paths, pushing when explicitly asked, or narrow follow-ups, act directly without creating implementation_plan.md. If a plan is needed, create "implementation_plan.md", set the checklist, show the plan in chat, and pause for explicit user approval or requested revisions before modifying source files or running commands. Every implementation plan MUST include a "## Testing Plan" section that details exact commands/tests to run, expected behaviors, edge cases, success conditions, and manual checks if automated tests are unavailable.
 2. TESTING AND REGRESSION DISCIPLINE: When you create or change code, you are responsible for producing run-ready code. Before meaningful edits, inspect existing tests and the detected regression command when relevant. After edits, run the appropriate tests or smoke checks using "run_tests", "run_command", or the long-running command tools. If tests fail, read the output, fix the issue, and rerun tests until they pass or you can clearly explain a blocker. For long tests, training, games, and servers, use "start_command" with a sensible timeout, check status/output, and stop processes with "kill_command" when finished. Do not start multiple copies of the same long-running program unless the previous one is stopped. Do not use an interactive command as a test unless you pipe/provide input or intentionally kill it after a short smoke check. For graphical/Pygame/interactive applications, write a non-interactive test script or design the program to accept a '--smoke-test' command-line flag that exits after a few frames/seconds, and use this flag (or run with a short timeoutMs) when validating. Do not claim code works unless you ran a relevant check or state exactly why you could not.
-3. WEB RESEARCH: If you are unsure about an API, library, framework, command, model parameter, error message, current behavior, or documentation detail, use "google_search" and then "fetch_web_page" on the most relevant official docs or primary source before editing. Do not invent configuration files or API shapes when files are missing or the correct implementation is unclear. Do not say you reviewed, checked, verified, or confirmed documentation unless you actually used these web tools in the current task and can name the source URL. If docs appear to say something surprising, quote or paraphrase the exact relevant rule before changing files.
+3. WEB RESEARCH: If you are unsure about an API, library, framework, command, model parameter, error message, current behavior, or documentation detail, use "google_search" and then "fetch_web_page" on the most relevant official docs or primary source before editing. Do not use web search to answer facts about the user's local machine, workspace state, installed tools, paths, memory, disk, processes, environment variables, or runtime output; inspect local state instead. Do not invent configuration files or API shapes when files are missing or the correct implementation is unclear. Do not say you reviewed, checked, verified, or confirmed documentation unless you actually used these web tools in the current task and can name the source URL. If docs appear to say something surprising, quote or paraphrase the exact relevant rule before changing files.
 4. CONTEXT INTEGRITY: Keep files clean, respect formatting, and preserve comments that are unrelated to your edits.
 5. NOTES AND MEMORY: Use project/standalone notes as durable working memory. Read them when orienting, and update them when you learn durable facts: architecture, important files, commands, decisions, user preferences, gotchas, open tasks, test status, and future repair notes. Project notes are shared across every conversation in the same project; standalone notes belong only to that standalone conversation. Keep notes concise and useful, not a transcript.
 5A. OPERATIONAL CONTEXT: For long-running or multi-subplan goals, maintain mission, measurable win conditions, active objective/subplan, blockers, and retained discoveries with the operational-context tools. Treat operational context as canonical working state, not another chat transcript. Promote durable lessons; discard summaries of fixed errors, dead ends, and temporary output. Never mark a subplan or win condition complete without concrete evidence from tests, inspected output, or explicit user confirmation.
 6. DESIGN QUALITY: When creating apps, games, dashboards, or visual tools, make them visually polished and pleasant by default. Treat beauty, layout, typography, color, spacing, motion, and interaction feedback as part of "working." Avoid bare black boxes, default controls, tiny unstyled text, and placeholder-looking screens unless the user explicitly asks for minimal output. For games, include a cohesive visual theme, clear HUD, start/game-over states, readable controls, animation polish, and a satisfying feel.
 7. FOLLOW-UP TIMERS: If you say you will wait, check back, continue after N seconds/minutes, or inspect long-running training/tests later, you MUST call "schedule_followup". Do not merely say you will wait. Schedule only one active follow-up for the same purpose; when the follow-up runs, actually inspect status/output and either continue work, stop the process, or clearly finish.
-7A. ADAPT INSTEAD OF QUITTING: Do not abandon a task after ordinary errors. If an edit, command, test, or route check fails, inspect fresh state, group repeated failures, look up official/current docs when needed, and try a different strategy. Stop only for hard blockers such as missing credentials, unavailable model access, explicit user stop, or a hard-destructive command block; when stopping, preserve state and explain the exact next recovery step.
+7A. ADAPT INSTEAD OF QUITTING: Do not abandon a task after ordinary errors. If an edit, command, test, or route check fails, inspect fresh state, group repeated failures, look up official/current docs when needed, and try a different strategy. A failed tool path is evidence about that tool attempt, not proof that the user's objective is impossible. Stop only for hard blockers such as missing credentials, unavailable model access, explicit user stop, or a hard-destructive command block; when stopping, preserve state and explain the exact next recovery step.
 8. BE CONCISE: Explain your technical decisions briefly. The user can see your tools running and thoughts.
 9. AUTONOMOUS WORKFLOW: Once the user approves your plan, execute all required file creations, edits, and test runs consecutively in a single session without yielding or waiting for further conversational input. For direct tasks that do not need a plan, execute them immediately and report the result. Keep calling tools until the entire task is fully complete.
 10. TASK COMPLETION: Create a checklist during planning when a task has meaningful milestones. During execution, use "set_task_checklist" sparingly: update it only when a milestone is completed, blocked, added, removed, or materially revised. Do not call it just to mark an item "in-progress" after reading/searching files or to refresh the same state. If exploration gives enough evidence, move to the next action instead of repeating checklist updates. Once all tasks are complete, update the checklist to show all tasks are 'completed', and then present your final summary.
@@ -366,6 +366,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     let malformedCallsCount = 0;
     let postEditEvidencePrompts = 0;
     const repeatedToolFailures = new Map();
+    const toolEvidenceLedger = [];
     const maxMalformedToolRetries = 5;
     const canExecuteThisTask = () => !config.planningMode || conversation.planApproved || planningBypassedForTask;
     
@@ -571,6 +572,16 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           messages.push({ role: 'user', parts: [{ text: evidencePrompt }] });
           continue;
         }
+        const epistemicCorrection = buildEpistemicCorrectionPrompt({
+          userPrompt,
+          answerText: textVal,
+          toolEvidenceLedger
+        });
+        if (epistemicCorrection && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
+          currentAgentLogs.push({ type: 'thought', content: 'Self-correction guard: failed tool attempts do not prove the requested fact is unknowable or blocked.' });
+          messages.push({ role: 'user', parts: [{ text: epistemicCorrection }] });
+          continue;
+        }
         if (hasOperationalMissionState(workingState)) {
           const completionGate = evaluateWorkingStateCompletion(workingState, conversation);
           if (completionGate.status === 'continue_work' && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
@@ -649,12 +660,32 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         if (planningGate.forceYield) {
           forceYield = true;
         }
+
+        const epistemicToolGate = getEpistemicToolGate(userPrompt, toolEvidenceLedger, toolName, args);
+        if (!epistemicToolGate.allowed) {
+          currentAgentLogs[logIndex].status = 'error';
+          currentAgentLogs[logIndex].result = epistemicToolGate.reason;
+          const gatedResult = {
+            error: epistemicToolGate.reason,
+            failureCategory: 'unsupported_inference',
+            recoveryGuidance: epistemicToolGate.guidance
+          };
+          toolEvidenceLedger.push(buildToolEvidenceEntry(toolName, args, gatedResult));
+          updateWalkthroughItem(walkthroughItem, toolName, args, gatedResult, new Error(epistemicToolGate.reason));
+          toolResponseParts.push({
+            functionResponse: {
+              name: toolName,
+              response: gatedResult
+            }
+          });
+          continue;
+        }
         
         // Execute the tool
         let result;
         try {
           result = await executeTool(toolName, args, workspacePath, config, conversation);
-          currentAgentLogs[logIndex].status = 'success';
+          currentAgentLogs[logIndex].status = isFailedToolResult(result) ? 'error' : 'success';
           currentAgentLogs[logIndex].result = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
           updateWalkthroughItem(walkthroughItem, toolName, args, result, null);
         } catch (err) {
@@ -665,7 +696,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           updateWalkthroughItem(walkthroughItem, toolName, args, result, err);
         }
 
-        const resultError = result && (result.error || (result.success === false && result.message));
+        const evidenceEntry = buildToolEvidenceEntry(toolName, args, result);
+        toolEvidenceLedger.push(evidenceEntry);
+
+        const resultError = getToolFailureSignal(result);
         if (resultError) {
           const baseFailure = classifyAgentFailure({ toolName, args, result, errorText: resultError });
           const failureKey = `${toolName}:${stableStringify(args)}:${String(resultError).slice(0, 240)}`;
@@ -1793,7 +1827,7 @@ function summarizeToolStart(toolName, args = {}) {
 
 function updateWalkthroughItem(item, toolName, args, result, error) {
   if (!item) return;
-  item.status = error ? 'error' : 'done';
+  item.status = (error || isFailedToolResult(result)) ? 'error' : 'done';
   if (error) {
     item.detail = error.message;
     return;
@@ -2149,6 +2183,90 @@ function extractPythonScriptPath(command) {
   return match ? (match[1] || match[2] || match[3]) : '';
 }
 
+function isLocalSystemFactRequest(prompt) {
+  const text = String(prompt || '').toLowerCase();
+  return /\b(my|this|computer|pc|machine|system|windows|local)\b/.test(text)
+    && /\b(memory|ram|disk|storage|cpu|gpu|process|processes|battery|ip address|environment|env var|path|installed|version|free space|space left|usage)\b/.test(text);
+}
+
+function isFailedToolResult(result) {
+  if (!result || typeof result !== 'object') return false;
+  if (result.error || result.success === false) return true;
+  if (result.exitCode !== undefined && Number(result.exitCode) !== 0) return true;
+  if (result.code !== undefined && Number(result.code) !== 0) return true;
+  if (result.timedOut || result.killed) return true;
+  return false;
+}
+
+function getToolFailureSignal(result) {
+  if (!result || typeof result !== 'object') return '';
+  if (result.error) return String(result.error);
+  if (result.success === false && result.message) return String(result.message);
+  if (result.exitCode !== undefined && Number(result.exitCode) !== 0) {
+    const stderr = result.stderr ? ` stderr: ${String(result.stderr).slice(0, 500)}` : '';
+    return `Command exited with code ${result.exitCode}.${stderr}`;
+  }
+  if (result.code !== undefined && Number(result.code) !== 0) return `Command exited with code ${result.code}.`;
+  if (result.timedOut) return 'Command timed out.';
+  if (result.killed) return 'Command was stopped.';
+  return '';
+}
+
+function buildToolEvidenceEntry(toolName, args = {}, result = {}) {
+  const failure = getToolFailureSignal(result);
+  const command = args && args.command ? String(args.command) : '';
+  return {
+    toolName,
+    command,
+    failed: !!failure,
+    failure,
+    category: failure ? classifyAgentFailure({ toolName, args, result, errorText: failure }).category : 'success',
+    summary: summarizeToolOutcome(toolName, args, result).summary
+  };
+}
+
+function hasLocalInspectionAttempt(ledger) {
+  return (ledger || []).some(item => item && (item.toolName === 'run_command' || item.toolName === 'start_command' || item.toolName === 'get_command_status' || item.toolName === 'read_command_output'));
+}
+
+function hasOnlyFailedLocalInspection(ledger) {
+  const local = (ledger || []).filter(item => item && (item.toolName === 'run_command' || item.toolName === 'start_command'));
+  return local.length > 0 && local.every(item => item.failed);
+}
+
+function getEpistemicToolGate(userPrompt, ledger, toolName, args = {}) {
+  if (!isLocalSystemFactRequest(userPrompt)) return { allowed: true };
+  if (toolName === 'google_search' || toolName === 'fetch_web_page') {
+    return {
+      allowed: false,
+      reason: 'Web research cannot answer facts about this local machine. A failed local command is not evidence that the local fact is unknowable.',
+      guidance: 'Use local inspection. If local command execution itself is failing, say that the command runner failed and do not ask for Google Search credentials.'
+    };
+  }
+  if (toolName === 'record_blocker' && hasOnlyFailedLocalInspection(ledger)) {
+    return {
+      allowed: false,
+      reason: 'Do not record a mission blocker from failed local-inspection commands alone. The failures prove only that those tool attempts failed, not that the requested local fact cannot be answered.',
+      guidance: 'Try a different local route, or honestly report that local command execution failed and name the failed attempts.'
+    };
+  }
+  return { allowed: true };
+}
+
+function buildEpistemicCorrectionPrompt({ userPrompt, answerText, toolEvidenceLedger }) {
+  if (!isLocalSystemFactRequest(userPrompt)) return '';
+  if (!hasLocalInspectionAttempt(toolEvidenceLedger)) return '';
+  const text = String(answerText || '').toLowerCase();
+  const claimsBlocked = /\b(blocked|cannot proceed|can't proceed|unable to proceed|need .*google|google search api key|configured google|cannot answer|impossible)\b/.test(text);
+  if (!claimsBlocked || !hasOnlyFailedLocalInspection(toolEvidenceLedger)) return '';
+  const failures = toolEvidenceLedger
+    .filter(item => item.failed)
+    .slice(-5)
+    .map(item => `- ${item.toolName}${item.command ? ` (${item.command})` : ''}: ${item.failure || item.summary}`)
+    .join('\n');
+  return `[SYSTEM: Self-correction required. The user asked for a local machine fact. Your previous answer appears to turn failed tool attempts into a world-state conclusion.\n\nFailed tool attempts are evidence about the tool path, not proof that the user's objective is blocked or that Google is needed.\n\nRecent failed evidence:\n${failures}\n\nCorrect your reasoning. Do not use web search for local machine facts. Do not record a blocker unless there is evidence the objective itself is impossible. Try another local inspection route if available; otherwise answer honestly that the local command runner/attempts failed and name what proof is missing.]`;
+}
+
 function classifyAgentFailure({ toolName = '', args = {}, result = null, errorText = '', failureCount = 1, category = '' } = {}) {
   if (category) return { category, toolName, args, errorText: String(errorText || ''), failureCount };
 
@@ -2483,7 +2601,7 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
         },
         {
           name: "run_command",
-          description: "Runs a command in powershell in the workspace directory, waits for completion, and returns code, stdout, stderr, and timeout status.",
+          description: "Runs a command in powershell in the workspace directory, waits for completion, and returns code, stdout, stderr, and timeout status. For local machine facts, a non-zero exit proves only that this command attempt failed; try a different local route before concluding the task is blocked.",
           parameters: {
             type: "OBJECT",
             properties: {
@@ -2577,7 +2695,7 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
         },
         {
           name: "google_search",
-          description: "Searches Google for current documentation, API references, examples, and troubleshooting. Use this before guessing about unfamiliar or current technical details.",
+          description: "Searches Google for current documentation, API references, examples, and troubleshooting. Do not use for facts about this local machine, workspace state, installed tools, paths, memory, disk, processes, or environment variables; inspect local state instead.",
           parameters: {
             type: "OBJECT",
             properties: {
@@ -2934,7 +3052,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
           },
           {
             name: "run_command",
-            description: "Runs a command in powershell in the workspace directory, waits for completion, and returns code, stdout, stderr, and timeout status.",
+            description: "Runs a command in powershell in the workspace directory, waits for completion, and returns code, stdout, stderr, and timeout status. For local machine facts, a non-zero exit proves only that this command attempt failed; try a different local route before concluding the task is blocked.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -3028,7 +3146,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
           },
           {
             name: "google_search",
-            description: "Searches Google for current documentation, API references, examples, and troubleshooting. Use this before guessing about unfamiliar or current technical details.",
+            description: "Searches Google for current documentation, API references, examples, and troubleshooting. Do not use for facts about this local machine, workspace state, installed tools, paths, memory, disk, processes, or environment variables; inspect local state instead.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -3291,6 +3409,12 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     validateRunCommandForAgentUse,
     extractPythonScriptPath,
     commandProvidesInput,
+    isLocalSystemFactRequest,
+    isFailedToolResult,
+    getToolFailureSignal,
+    buildToolEvidenceEntry,
+    getEpistemicToolGate,
+    buildEpistemicCorrectionPrompt,
     classifyAgentFailure,
     buildFailureRecoveryGuidance,
     isRealVerificationCommand,
