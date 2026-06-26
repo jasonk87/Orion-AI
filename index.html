@@ -5,11 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Orion AI</title>
   <!-- Google Fonts for premium typography -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,100..800;1,100..800&family=Outfit:wght@100..900&display=swap" rel="stylesheet">
-  <!-- PrismJS for high-quality code syntax highlighting -->
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+  <link rel="stylesheet" href="node_modules/prismjs/themes/prism-tomorrow.min.css">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -17,19 +13,17 @@
   <!-- Custom Title Bar for borderless Electron Window -->
   <header id="titlebar">
     <div class="titlebar-left">
-      <span class="app-logo">🌌</span>
+      <button id="btn-toggle-left-sidebar" class="chrome-icon-button" aria-label="Toggle navigation sidebar" title="Toggle sidebar">&#9776;</button>
+      <span class="app-logo">&#127756;</span>
       <span class="app-title">Orion AI</span>
-      <span class="menu-item">File</span>
-      <span class="menu-item">View</span>
-      <span class="menu-item">Window</span>
     </div>
     <div class="titlebar-center">
-      <span class="workspace-indicator" id="workspace-label">No Workspace Loaded - Click to Choose</span>
+      <span class="workspace-indicator" id="workspace-label" role="button" tabindex="0">No Workspace Loaded - Click to Choose</span>
     </div>
     <div class="titlebar-right">
-      <button class="win-btn" id="btn-minimize">&#128469;&#xFE0E;</button>
-      <button class="win-btn" id="btn-maximize">&#128470;&#xFE0E;</button>
-      <button class="win-btn btn-close" id="btn-close">&#128473;&#xFE0E;</button>
+      <button class="win-btn" id="btn-minimize" aria-label="Minimize window" title="Minimize">&#128469;&#xFE0E;</button>
+      <button class="win-btn" id="btn-maximize" aria-label="Maximize window" title="Maximize">&#128470;&#xFE0E;</button>
+      <button class="win-btn btn-close" id="btn-close" aria-label="Close window" title="Close">&#128473;&#xFE0E;</button>
     </div>
   </header>
 
@@ -39,20 +33,9 @@
     <!-- LEFT SIDEBAR -->
     <aside id="left-sidebar">
       <div class="sidebar-top">
-        <div class="sidebar-nav-actions">
-          <button id="sidebar-toggle" title="Toggle Sidebar">☰</button>
-          <button id="nav-back" title="Go Back">←</button>
-          <button id="nav-forward" title="Go Forward">→</button>
-        </div>
-        
         <button id="btn-new-chat" class="btn-primary">
           <span class="plus-icon">+</span> New Conversation
         </button>
-
-        <ul class="nav-links">
-          <li class="active" id="nav-history"><span class="icon">🕒</span> Conversation History</li>
-          <li id="nav-tasks"><span class="icon">📅</span> Scheduled Tasks</li>
-        </ul>
       </div>
 
       <!-- Projects Section -->
@@ -60,13 +43,13 @@
         <div class="section-header">
           <span>Projects</span>
           <div class="section-actions">
-            <button id="btn-project-filter" title="Filter Projects">🔍</button>
-            <button id="btn-add-project" title="Add Project Folder">📁</button>
+            <button id="btn-project-filter" title="Filter Projects">&#128269;</button>
+            <button id="btn-add-project" title="Add Project Folder">&#128193;</button>
           </div>
         </div>
         <div class="project-list" id="project-list">
           <div class="project-item active" id="default-proj-item">
-            <span class="folder-icon">📁</span>
+            <span class="folder-icon">&#128193;</span>
             <div class="project-details">
               <span class="project-name" id="project-name-label">Default Workspace</span>
               <span class="project-subtext" id="project-status-label">Select folder to start</span>
@@ -91,7 +74,7 @@
 
       <!-- Sidebar Footer -->
       <div class="sidebar-footer">
-        <button id="btn-settings"><span class="icon">⚙</span> Settings</button>
+        <button id="btn-settings"><span class="icon">&#9881;</span> Settings</button>
       </div>
     </aside>
 
@@ -100,14 +83,21 @@
       <!-- Conversation Top Bar -->
       <div id="conversation-header">
         <div class="header-title-container">
-          <span id="chat-title">New Conversation</span>
-          <span class="dropdown-arrow">▼</span>
+          <div class="conversation-title-line">
+            <span id="chat-title">New Conversation</span>
+            <span id="agent-state-pill" class="agent-state-pill idle" aria-live="polite"><span class="agent-state-dot"></span><span id="agent-state-text">Ready</span></span>
+          </div>
+          <span id="agent-state-detail" class="agent-state-detail">Waiting for a task</span>
         </div>
         
         <!-- Workspace File Bar -->
         <div class="workspace-action-bar">
           <button id="btn-change-workspace" class="btn-secondary">Change Workspace</button>
-          <button id="btn-sync-files" class="btn-secondary" title="Scan file directory">🔄 Sync Files</button>
+          <button id="btn-sync-files" class="btn-secondary" title="Scan file directory">&#128260; Sync Files</button>
+          <button id="btn-phone-companion" class="btn-secondary phone-companion-button" title="Pair Phone Companion">Phone</button>
+          <button id="btn-launch-app" class="btn-secondary" title="Launch application for testing">&#9654; Launch</button>
+          <button id="btn-toggle-right-sidebar" class="btn-secondary" title="Toggle Agent Panel">&#9776; Panel</button>
+          <button id="btn-command-palette" class="btn-secondary command-palette-trigger" title="Commands (Ctrl+K)" aria-label="Open command palette">&#8943;</button>
         </div>
       </div>
 
@@ -115,21 +105,12 @@
       <div id="chat-feed">
         <!-- Welcoming splash or history messages -->
         <div class="welcome-splash" id="welcome-splash">
-          <h1>✦ Orion AI</h1>
-          <p>Your Ultimate Pair Programmer. Let's build something exceptional.</p>
-          <div class="quick-tips">
-            <div class="tip-card">
-              <h3>⚡ Full Context</h3>
-              <p>Understands your entire folder structure automatically, compacting context to optimize costs.</p>
-            </div>
-            <div class="tip-card">
-              <h3>🛡️ Regression Tests</h3>
-              <p>Automatically runs your test suite after code edits to ensure nothing breaks.</p>
-            </div>
-            <div class="tip-card">
-              <h3>📝 Planning Mode</h3>
-              <p>Drafts detailed blueprints and task checklists for approval before touching code.</p>
-            </div>
+          <h1>Orion AI</h1>
+          <p>Describe the outcome. Orion will plan, act, verify, and keep going.</p>
+          <div class="start-actions">
+            <button id="btn-start-open-repo" class="btn-primary">Open Repo</button>
+            <button id="btn-start-new-task" class="btn-secondary">New Task</button>
+            <button id="btn-start-resume" class="btn-secondary">Resume Work</button>
           </div>
         </div>
         
@@ -141,7 +122,7 @@
       <!-- CHAT INPUT CONTAINER -->
       <div id="chat-input-wrapper">
         <div class="chat-input-container">
-          <textarea id="chat-input" placeholder="Ask anything, @ to mention files, / for actions..." rows="1"></textarea>
+          <textarea id="chat-input" placeholder="Ask Orion to build, fix, or investigate..." rows="1"></textarea>
           
           <div class="chat-input-toolbar">
             <div class="toolbar-left">
@@ -153,12 +134,17 @@
                   <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
                 </select>
               </div>
+              <div class="pro-toggle-container">
+                <label class="pro-toggle-label" title="Enable multi-step critical thinking, planning, and edge-case validation">
+                  <input type="checkbox" id="pro-mode-checkbox">
+                  <span>Pro Mode</span>
+                </label>
+              </div>
             </div>
             <div class="toolbar-right">
-              <button class="btn-steer" id="btn-steer" title="Send steering feedback directly to active task">🎯 Steer</button>
-              <button class="btn-queue" id="btn-queue" title="Queue this prompt to run after the active task finishes">⏳ Queue</button>
-              <button class="tool-btn mic-btn" id="btn-voice" title="Speech to text input">🎙️</button>
-              <button id="btn-submit" class="btn-send" title="Send message">✦</button>
+              <button class="btn-steer" id="btn-steer" title="Send steering feedback directly to active task">&#127919; Steer</button>
+              <button class="btn-queue" id="btn-queue" title="Queue this prompt to run after the active task finishes">&#9203; Queue</button>
+              <button id="btn-submit" class="btn-send" title="Send message">&#10022;</button>
             </div>
           </div>
         </div>
@@ -168,7 +154,20 @@
     <!-- RIGHT SIDEBAR: Task Planner and Workspace Files -->
     <aside id="right-sidebar">
       <div class="sidebar-header">
-        <h3>⚡ Agent Panel</h3>
+        <h3>&#9889; Agent Panel</h3>
+      </div>
+
+      <div class="panel-section operational-context-section">
+        <div class="panel-section-title">
+          <span>Mission Control</span>
+          <div class="mission-title-actions">
+            <button id="btn-edit-operational-context" class="mission-edit-button" title="Edit mission and win conditions">Edit</button>
+            <span class="badge muted" id="operational-context-revision">Not set</span>
+          </div>
+        </div>
+        <div class="panel-content operational-context-panel" id="operational-context-panel" aria-live="polite">
+          <p class="empty-state">Define a mission to give Orion durable operational direction.</p>
+        </div>
       </div>
       
       <!-- Planning & Task Checklist -->
@@ -180,10 +179,6 @@
             <span class="badge" id="task-completion-badge">0%</span>
           </div>
         </div>
-        <div class="entrypoint-row">
-          <input id="workspace-entrypoint-input" type="text" placeholder="Entry point command, e.g. python app.py">
-          <button id="btn-save-entrypoint" title="Save entry point for this workspace">Set</button>
-        </div>
         <div class="panel-content scrollable">
           <div id="task-checklist-container">
             <p class="empty-state">No tasks active. Start a conversation with a plan to see items here.</p>
@@ -192,11 +187,13 @@
       </div>
 
       <!-- Workspace Files Panel -->
-      <div class="panel-section flex-grow">
+      <div class="panel-section flex-grow" id="workspace-files-panel">
         <div class="panel-section-title" style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
-          <span>Workspace Files</span>
+          <span style="display: flex; align-items: center; gap: 6px;">
+            Workspace Files
+            <span class="badge muted" id="rag-index-status" style="display: none; font-size: 0.62rem; padding: 1px 4px; font-weight: normal; text-transform: uppercase;"></span>
+          </span>
           <div style="display: flex; align-items: center; gap: 6px;">
-            <button id="btn-launch-app" title="Launch application for testing" style="background: var(--success-glow); border: 1px solid var(--success-color); border-radius: 4px; color: var(--success-color); cursor: pointer; font-size: 0.7rem; padding: 2px 6px; font-weight: 600; display: flex; align-items: center; gap: 3px; border-style: solid;">▶ Launch</button>
             <span class="badge" id="file-count-badge">0</span>
           </div>
         </div>
@@ -206,9 +203,39 @@
           </div>
         </div>
       </div>
+
+      <div class="panel-section contextual-panel-hidden" id="run-artifacts-panel">
+        <div class="panel-section-title" style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
+          <span>Run Artifacts</span>
+          <span class="badge" id="artifact-count-badge">0</span>
+        </div>
+        <div class="panel-content scrollable artifact-panel">
+          <div id="artifact-list-container">
+            <p class="empty-state">Artifacts are saved outside the project after runs.</p>
+          </div>
+        </div>
+      </div>
     </aside>
 
   </div>
+
+  <div id="command-palette-modal" class="modal-overlay command-palette-overlay" role="dialog" aria-modal="true" aria-labelledby="command-palette-title">
+    <div class="command-palette-card">
+      <div class="command-palette-heading">
+        <span id="command-palette-title">Orion commands</span>
+        <kbd>Esc</kbd>
+      </div>
+      <button class="command-item" data-command="new-task"><span>New conversation</span><kbd>Ctrl N</kbd></button>
+      <button class="command-item" data-command="open-workspace"><span>Open workspace</span></button>
+      <button class="command-item" data-command="sync-files"><span>Refresh workspace files</span></button>
+      <button class="command-item" data-command="agent-panel"><span>Toggle Agent Panel</span></button>
+      <button class="command-item" data-command="phone"><span>Open Phone Companion</span></button>
+      <button class="command-item" data-command="launch"><span>Launch workspace app</span></button>
+      <button class="command-item" data-command="settings"><span>Settings</span></button>
+    </div>
+  </div>
+
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
 
   <!-- FILE VIEWER MODAL -->
   <div id="file-viewer-modal" class="modal-overlay">
@@ -222,6 +249,54 @@
       </div>
       <div class="modal-footer">
         <button id="btn-file-viewer-mention" class="btn-secondary">Mention in Chat</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="phone-companion-modal" class="modal-overlay">
+    <div class="modal-card phone-companion-card">
+      <div class="modal-header">
+        <h2>Phone Companion Pairing</h2>
+        <button class="modal-close" id="btn-phone-companion-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="phone-companion-qr" class="phone-companion-qr"></div>
+        <div id="phone-companion-pair-url" class="phone-companion-url"></div>
+        <div id="phone-companion-meta" class="phone-companion-meta"></div>
+        
+        <!-- Desktop paired-device management UI -->
+        <div id="paired-devices-section" style="margin-top: 24px; border-top: 1px solid var(--border-color); padding-top: 16px; display: none;">
+          <h3 style="font-size: 0.95rem; margin-bottom: 12px; color: var(--accent-color); font-family: var(--font-sans);">Paired Devices</h3>
+          <div id="paired-devices-list" style="display: flex; flex-direction: column; gap: 8px;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="operational-context-modal" class="modal-overlay">
+    <div class="modal-card operational-context-editor-card">
+      <div class="modal-header">
+        <h2>Mission Control</h2>
+        <button class="modal-close" id="btn-operational-context-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="operational-mission-input">Mission</label>
+          <textarea id="operational-mission-input" rows="4" placeholder="Describe the durable destination Orion should work toward."></textarea>
+          <small class="form-help">The destination should remain stable while subplans change.</small>
+        </div>
+        <div class="form-group">
+          <label for="operational-objective-input">Active objective</label>
+          <input id="operational-objective-input" type="text" placeholder="What matters most right now?">
+        </div>
+        <div class="form-group">
+          <label for="operational-win-conditions-input">Win conditions</label>
+          <textarea id="operational-win-conditions-input" rows="7" placeholder="One measurable condition per line"></textarea>
+          <small class="form-help">Unchanged lines retain their status and evidence. New or renamed lines begin pending.</small>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-operational-context-save" class="btn-primary">Save Mission</button>
       </div>
     </div>
   </div>
@@ -273,6 +348,12 @@
         </div>
 
         <div class="form-group">
+          <label for="setting-model-call-delay">Delay Between Model Calls (ms):</label>
+          <input type="number" id="setting-model-call-delay" value="0" min="0" max="60000">
+          <small class="form-help">Adds breathing room between API calls to reduce rate-limit loops.</small>
+        </div>
+
+        <div class="form-group">
           <label for="setting-compact-threshold">Context Compaction Threshold (Tokens):</label>
           <input type="number" id="setting-compact-threshold" value="100000">
           <small class="form-help">Triggers conversation history summarizing when the conversation exceeds this size.</small>
@@ -293,10 +374,11 @@
 
   <!-- SCRIPTS -->
   <script src="node_modules/marked/marked.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-css.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+  <script src="node_modules/prismjs/prism.js"></script>
+  <script src="node_modules/prismjs/components/prism-javascript.min.js"></script>
+  <script src="node_modules/prismjs/components/prism-css.min.js"></script>
+  <script src="node_modules/prismjs/components/prism-json.min.js"></script>
+  <script src="operational-context.js"></script>
   <script src="renderer.js"></script>
   <script src="agent.js"></script>
 </body>
