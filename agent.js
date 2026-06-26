@@ -444,6 +444,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let aiMessageIndex = conversation.messages.length;
   let workWalkthrough = [];
   let forceYield = false;
+  let finalAnswerQualityPrompts = 0;
+  let finalAnswerQualityLoopExtensions = 0;
   // Initialize AI message state in conversation list
   conversation.messages.push({ role: 'assistant', text: 'Thinking...', logs: [], turns: [] });
   
@@ -748,6 +750,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         if (epistemicCorrection && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
           currentAgentLogs.push({ type: 'thought', content: 'Self-correction guard: failed tool attempts do not prove the requested fact is unknowable or blocked.' });
           messages.push({ role: 'user', parts: [{ text: epistemicCorrection }] });
+          continue;
+        }
+        const finalAnswerQualityPrompt = buildFinalAnswerQualityGatePrompt(userPrompt, textVal, workWalkthrough);
+        if (finalAnswerQualityPrompt && loopCount >= maxLoops && finalAnswerQualityLoopExtensions < 2) {
+          finalAnswerQualityLoopExtensions++;
+          maxLoops++;
+        }
+        if (finalAnswerQualityPrompt && finalAnswerQualityPrompts < 2 && loopCount < maxLoops) {
+          finalAnswerQualityPrompts++;
+          currentAgentLogs.push({ type: 'thought', content: 'Final-answer quality gate: the draft inspected context but did not answer with recommendations, a plan, changes, or a next action.' });
+          messages.push({ role: 'user', parts: [{ text: finalAnswerQualityPrompt }] });
           continue;
         }
         if (hasOperationalMissionState(workingState)) {
@@ -2707,6 +2720,44 @@ function sanitizeFinalAnswerText(text) {
     .trim();
 }
 
+function requestNeedsActionableFinalAnswer(prompt) {
+  const text = String(prompt || '').toLowerCase();
+  if (!text.trim()) return false;
+  const actionPatterns = [
+    /\bhow\s+(?:do|can|would|should)\s+(?:we|you|i)\s+(?:improve|fix|build|make|add|repair|change|handle|solve)\b/,
+    /\bwhat\s+(?:can|should|would)\s+(?:we|you|i)\s+(?:improve|fix|build|make|add|change|do)\b/,
+    /\b(?:recommend|recommendation|recommendations|next\s+patch|next\s+action|next\s+step|plan|roadmap)\b/,
+    /\b(?:why\s+did\s+it\s+stop|how\s+do\s+we\s+fix|what\s+was\s+wrong|what\s+went\s+wrong)\b/,
+    /\b(?:bugs?|errors?|issues?)\b.*\b(?:fix|improve|recommend|look\s+through|find|what)\b/
+  ];
+  return actionPatterns.some(pattern => pattern.test(text));
+}
+
+function answerHasActionableFinalContent(answerText) {
+  const text = sanitizeFinalAnswerText(answerText);
+  const lower = text.toLowerCase();
+  if (isGenericNonAnswer(text)) return false;
+  if (lower.length < 80) return false;
+  const actionLine = /^\s*(?:[-*]|\d+\.)\s+(?:make|add|fix|improve|build|change|update|remove|run|test|verify|use|create|implement|patch|prioritize|separate|preserve|launch|rebuild|retry)\b/im;
+  const actionHeading = /^#{1,4}\s*(?:findings|recommendations|plan|changes|next steps|fixes|what i found|what to fix)\b/im;
+  const actionSentence = /\b(?:the best improvements are|i recommend|i would fix|we should|next patch should|the fix is|i changed|i fixed|i added|i updated|next action is)\b/i;
+  const concreteCodeReference = /\b(?:file|function|test|setting|model|ui|api|state|server|launch|verification)\b/i;
+  if (actionLine.test(text) || actionHeading.test(text) || actionSentence.test(text)) return true;
+  return /\b(?:fix|improve|add|update|change|implement|test|verify|recommend|prioritize)\b/i.test(text) && concreteCodeReference.test(text);
+}
+
+function buildFinalAnswerQualityGatePrompt(userPrompt, answerText, workWalkthrough = []) {
+  if (!requestNeedsActionableFinalAnswer(userPrompt)) return '';
+  if (answerHasActionableFinalContent(answerText)) return '';
+  const inspected = (workWalkthrough || []).some(item => item && item.status !== 'error');
+  const inspectionNote = inspected
+    ? 'You inspected context, but inspection alone is not completion.'
+    : 'You have not produced the actual answer yet.';
+  return `[SYSTEM: Final-response quality gate. The user asked for improvements, fixes, recommendations, a plan, or a next action. ${inspectionNote}
+
+Before final response, answer the user's actual question with at least one concrete recommendation, fix plan, implemented change summary, or next action. Do not stop at phrases like "Ah, the path is..." or a file-inspection summary. If more evidence is needed, call the necessary tools now; otherwise produce a direct, actionable answer now.]`;
+}
+
 function buildPlanApprovalMessage(planItem, fallbackText) {
   const planContent = planItem && planItem.content ? formatPlanContentForChat(planItem.content) : '';
   const intro = 'I created [`implementation_plan.md`](orion-file:implementation_plan.md) and paused for review. The plan is shown below; approve it when you want me to start, or tell me what to change.';
@@ -4421,6 +4472,9 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     requestNeedsLocalInspection,
     isTaskContinuationPrompt,
     isGenericNonAnswer,
+    requestNeedsActionableFinalAnswer,
+    answerHasActionableFinalContent,
+    buildFinalAnswerQualityGatePrompt,
     shouldHaveUsedToolsButDidNot,
     isFailedToolResult,
     getToolFailureSignal,

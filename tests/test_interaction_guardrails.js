@@ -141,6 +141,21 @@ test('local system fact failures do not become fake blockers or web research', (
     true,
     'generic acknowledgement cannot satisfy a local performance request without tools'
   );
+  t.equal(agent.requestNeedsActionableFinalAnswer('how do we improve Orion after this run?'), true, 'improvement questions require actionable final answers');
+  t.equal(agent.answerHasActionableFinalContent('Ah! The path is C:\\Projects\\OrionAI.'), false, 'half-thought path discovery is not an actionable answer');
+  t.ok(
+    agent.buildFinalAnswerQualityGatePrompt(
+      'how do we improve Orion after this run?',
+      'Ah! The path is C:\\Projects\\OrionAI.',
+      [{ toolName: 'read_file', label: 'Read agent.js', status: 'done' }]
+    ).includes('inspection alone is not completion'),
+    'final quality gate rejects inspection-only non-answers'
+  );
+  t.equal(
+    agent.answerHasActionableFinalContent('I reviewed the project. The best improvements are:\n1. Fix task-state resume.\n2. Add regression tests around agent failures.'),
+    true,
+    'concrete recommendations satisfy the final quality gate'
+  );
 
   const failedCommand = {
     exitCode: -4058,
