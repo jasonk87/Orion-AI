@@ -2147,6 +2147,26 @@ function escapeHtml(text) {
 window.getAppConfig = () => appConfig;
 window.getActiveConversationId = () => activeConversationId;
 window.getCurrentWorkspace = () => currentWorkspace;
+window.changeActiveWorkspace = function(folderPath) {
+  if (activeConversationId) {
+    const conv = conversations.find(c => c.id === activeConversationId);
+    if (conv) {
+      conv.workspace = folderPath;
+      conv.projectPath = folderPath;
+      saveConversationsToStorage();
+    }
+  }
+  if (!projects.includes(folderPath)) {
+    projects.push(folderPath);
+    saveProjectsToStorage();
+    renderProjectsList();
+  }
+  currentWorkspace = folderPath;
+  expandedFileFolders = new Set();
+  el.workspaceLabel.textContent = folderPath;
+  syncWorkspaceFiles();
+  refreshOperationalContext();
+};
 window.getSelectedModel = () => el.modelSelect ? el.modelSelect.value : appConfig.defaultModel;
 window.selectConversationById = selectConversation;
 window.updateTasksChecklist = updateTasksChecklist;

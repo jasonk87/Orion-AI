@@ -251,7 +251,7 @@ test('run_command guard blocks interactive Python scripts without stdin', async 
 
 test('model API calls cannot sit indefinitely without visible cooldown status', (t) => {
   t.ok(agentJs.includes('MODEL_API_REQUEST_TIMEOUT_MS = 60000'), 'model API requests have a hard timeout');
-  t.ok(agentJs.includes('MODEL_API_MAX_ATTEMPTS = 3'), 'Gemini retry attempts are bounded');
+  t.ok(agentJs.includes('MODEL_API_MAX_ATTEMPTS = 15'), 'Gemini retry attempts support long-running tasks');
   t.ok(agentJs.includes('fetchWithTimeout(url'), 'Gemini generateContent uses timeout-aware fetch');
   t.ok(agentJs.includes('sleepWithModelApiStatus'), 'retry backoff is routed through status-aware sleep');
   t.ok(agentJs.includes('isStopRequested'), 'retry wait can react to user stop');

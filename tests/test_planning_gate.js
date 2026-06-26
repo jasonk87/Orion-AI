@@ -39,6 +39,8 @@ const agent = require('../agent.js');
 
 function validStrategy(overrides = {}) {
   const sections = {
+    'Objective': 'Build the requested feature safely against the current repository reality.',
+    'Relevant Files': '- agent.js\n- tests/',
     'True Objective': 'Build the requested feature safely against the current repository reality.',
     'Current Repo Reality': '- Existing app code is present and must be inspected before edits.',
     'Relevant Files / Subsystems': '- agent.js\n- tests/',
@@ -117,7 +119,7 @@ test('Planning Gate behavior requires STRATEGY.md before implementation_plan.md'
   t.equal(sourceEditGate.allowed, false, 'blocks source edits during refinement/planning');
 
   const commandGate = agent.getPlanningToolGate(config, false, 'run_command', { command: 'npm test' });
-  t.equal(commandGate.allowed, false, 'blocks command execution before approval');
+  t.equal(commandGate.allowed, true, 'allows command execution for inspection before approval');
 
   const approvedGate = agent.getPlanningToolGate(config, true, 'run_command', { command: 'npm test' });
   t.equal(approvedGate.allowed, true, 'allows destructive tools after approval/direct classification');
@@ -131,11 +133,11 @@ test('Planning Gate behavior requires STRATEGY.md before implementation_plan.md'
 test('STRATEGY.md validation requires all refinement sections', (t) => {
   const content = validStrategy();
   t.equal(agent.hasRequiredStrategySections(content), true, 'valid strategy contains all required sections');
-  const missing = content.replace(/## What Not To Touch[\s\S]*$/, '');
+  const missing = content.replace(/## Relevant Files[\s\S]*?(?=\n\n## )/, '');
   t.equal(agent.hasRequiredStrategySections(missing), false, 'missing required section is invalid');
   const validation = agent.validateStrategyContent(missing);
   t.equal(validation.valid, false, 'validation rejects incomplete strategy');
-  t.ok(validation.missingSections.includes('What Not To Touch'), 'validation reports missing section');
+  t.ok(validation.missingSections.includes('Relevant Files'), 'validation reports missing section');
   t.end();
 });
 

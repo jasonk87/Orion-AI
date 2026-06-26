@@ -2897,7 +2897,7 @@ ipcMain.handle('list-files', async (event, dirPath) => {
     return getFiles(dirPath, dirPath);
   } catch (e) {
     console.error('Error listing files:', e);
-    return [];
+    return { error: e.message };
   }
 });
 
@@ -3449,6 +3449,14 @@ function startCommandSession({ command, cwd, processId, timeoutMs }) {
     stderr: '',
     commandCategory: classification.category
   };
+  if (cwd && !fs.existsSync(cwd)) {
+    try {
+      fs.mkdirSync(cwd, { recursive: true });
+    } catch (e) {
+      console.error('Failed to create command cwd directory:', e);
+    }
+  }
+
   const child = spawn(shell, [...shellArgs, command], {
     cwd: cwd,
     env: { ...process.env, PAGER: 'cat' },
@@ -3740,7 +3748,7 @@ function listFilesRecursive(dirPath) {
       const stat = fs.lstatSync(filePath);
       const relPath = path.relative(rootDir, filePath);
       
-      if (file === 'node_modules' || file === '.git' || file === 'dist' || file === '.gemini' || file === 'build') {
+      if (file === 'node_modules' || file === '.git' || file === 'dist' || file === '.gemini' || file === 'build' || file === '.ruff_cache' || file === '.pytest_cache' || file === '__pycache__' || file === '.venv' || file === 'venv' || file === 'env' || file === '.tox' || file === '.next' || file === '.codex-remote-attachments' || file === '.idea' || file === '.vscode' || file === 'coverage') {
         return;
       }
       

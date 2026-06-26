@@ -21,11 +21,13 @@ CRITICAL RULES:
 12. SECRETS AND ENVIRONMENT: When a project needs the user's Gemini API key, Google API key, or Google Search Engine ID, use "sync_workspace_env" to create or update workspace environment files. Do not hardcode secrets into source files, do not print secret values, and do not ask the user to paste keys you can sync from settings. Make code read secrets from environment variables such as GEMINI_API_KEY, GOOGLE_API_KEY, GOOGLE_SEARCH_API_KEY, GOOGLE_SEARCH_ENGINE_ID, and GOOGLE_CSE_ID. For browser-only/static apps, do not expose private API keys in client-side code; add a small local/server API layer instead.
 13. GEMINI APP DEFAULTS: For new Gemini Python projects, prefer the current "google-genai" package and "from google import genai" unless local files already use a different SDK. The model "gemini-2.5-flash-lite" is valid; do not downgrade it to older model names unless official docs or an API error proves it is unavailable.
 14. USER-REQUESTED LOCAL/GIT OPERATIONS: When the user asks for the active directory, to open the folder, to launch/run the program, or to push to GitHub/Git, use the dedicated tools for those actions. Do not push to Git or launch apps unless the user asked for it. If the user explicitly asks you to run a command, run it directly unless it matches Orion's hard destructive block list; do not interrupt with extra approval prompts for ordinary user-requested commands. If the user asks to push without specifying a branch, push the current branch to the default remote.
-15. WORKSPACE AND SYSTEM-WIDE QUERIES: Prefer and prioritize files/code within the active workspace. However, if the user asks system-wide questions (such as locating python pip files, environment variables, or global configuration directories), you are fully authorized to run system commands using "run_command" to query, search, and identify paths outside the workspace folder in order to answer their questions.
+15. WORKSPACE AND SYSTEM-WIDE QUERIES: Prefer and prioritize files/code within the active workspace. If the user mentions a specific local folder, program, or path outside the workspace (like "on my desktop" or "in my projects folder"), ALWAYS investigate the local filesystem using your local tools (e.g., run_command, list_files, grep_search) BEFORE attempting a web search. You are fully authorized to run system commands using "run_command" to query, search, and identify paths outside the workspace folder in order to answer their questions.
+16. OPERATING SYSTEM AWARENESS: You are currently running on a Windows system. When guessing or constructing file paths outside the current workspace, ALWAYS use Windows path conventions (e.g., C:\\, or PowerShell variables like $env:USERPROFILE\\Desktop) instead of Mac/Linux conventions (like /Users/user). Use "run_command" to search for the correct path before assuming.
 
 Tools available:
 - list_files: List all files in the workspace (excluding node_modules).
 - get_workspace_info: Return the active workspace directory and conversation scope.
+- change_workspace: Changes the active workspace directory of this conversation to a new absolute directory path on your computer. Use this when the user asks you to inspect or work on a project located outside the active standalone workspace folder.
 - open_workspace_folder: Open the active workspace folder in the OS file explorer.
 - launch_workspace_app: Launch the active workspace app using Orion's app detection.
 - set_workspace_entrypoint: Set or clear the launch entry point command for this workspace.
@@ -63,9 +65,9 @@ let agentExecutionMode = 'idle';
 let currentAgentLogs = [];
 let isStopRequested = false;
 const GEMINI_THINKING_BUDGET = 24576;
-const MODEL_API_REQUEST_TIMEOUT_MS = 60000;
+const MODEL_API_REQUEST_TIMEOUT_MS = 600000;
 const MODEL_API_MAX_RETRY_WAIT_MS = 45000;
-const MODEL_API_MAX_ATTEMPTS = 3;
+const MODEL_API_MAX_ATTEMPTS = 15;
 const OperationalContext = window.OrionOperationalContext || (typeof require === 'function' ? require('./operational-context') : null);
 
 const OPERATIONAL_CONTEXT_TOOL_DECLARATIONS = [
@@ -273,7 +275,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   if (window.onAgentStatusChange) window.onAgentStatusChange(true);
   
   const config = window.getAppConfig();
-  const workspacePath = conversation.workspace || window.getCurrentWorkspace();
+  let workspacePath = conversation.workspace || window.getCurrentWorkspace();
   const promptSource = options.source || 'user';
   const isInternalPrompt = !!options.internalPrompt || promptSource === 'followup' || promptSource === 'system' || promptSource === 'plan-approval';
   
@@ -285,6 +287,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const simpleRoute = classifySimpleTask(userPrompt);
     if (simpleRoute && simpleRoute.route === 'local_memory') {
       await answerLocalMemoryQuestionFastPath({ userPrompt, workspacePath, conversation, config, route: simpleRoute });
+      return;
+    }
+    if (simpleRoute && simpleRoute.route === 'local_project_summary') {
+      await answerLocalProjectSummaryFastPath({ userPrompt, workspacePath, conversation, config, route: simpleRoute });
       return;
     }
   }
@@ -815,6 +821,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         let result;
         try {
           result = await executeTool(toolName, args, workspacePath, config, conversation);
+          if (toolName === 'change_workspace' && result && result.success) {
+            workspacePath = conversation.workspace;
+          }
           currentAgentLogs[logIndex].status = isFailedToolResult(result) ? 'error' : 'success';
           currentAgentLogs[logIndex].result = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
           updateWalkthroughItem(walkthroughItem, toolName, args, result, null);
@@ -1115,7 +1124,14 @@ async function executeTool(name, args, workspace, config, conversation) {
 
     case 'list_files': {
       const files = await window.api.listFiles(workspace);
-      return files.map(f => ({ path: f.path, isDir: f.isDir, size: f.size }));
+      const mappedFiles = files.map(f => ({ path: f.path, isDir: f.isDir, size: f.size }));
+      if (mappedFiles.length > 800) {
+        return {
+          files: mappedFiles.slice(0, 800),
+          warning: `Truncated output. Found ${mappedFiles.length} items, showing first 800. Be more specific or use search/grep tools.`
+        };
+      }
+      return mappedFiles;
     }
 
     case 'search_embeddings': {
@@ -1248,6 +1264,28 @@ async function executeTool(name, args, workspace, config, conversation) {
       return { ...patchRes, message: `${patchRes.message || 'File patched successfully.'}${testFeedback}` };
     }
     
+    case 'change_workspace': {
+      if (!args.path) throw new Error("Missing 'path' parameter");
+      const targetPath = args.path;
+      try {
+        const files = await window.api.listFiles(targetPath);
+        if (files && files.error) {
+          throw new Error(files.error);
+        }
+      } catch (err) {
+        throw new Error(`Workspace path "${targetPath}" is invalid or does not exist: ${err.message}`);
+      }
+      conversation.workspace = targetPath;
+      conversation.projectPath = targetPath;
+      if (typeof window.changeActiveWorkspace === 'function') {
+        window.changeActiveWorkspace(targetPath);
+      }
+      return {
+        success: true,
+        message: `Workspace directory changed to: ${targetPath}`
+      };
+    }
+
     case 'run_command': {
       if (!args.command) throw new Error("Missing 'command' parameter");
       const timeoutMs = args.timeoutMs || config.commandTimeoutMs || 120000;
@@ -2163,16 +2201,8 @@ function buildToolUseContractPrompt() {
 const STRATEGY_FILE_NAME = 'strategy.md';
 const IMPLEMENTATION_PLAN_FILE_NAME = 'implementation_plan.md';
 const STRATEGY_REQUIRED_SECTIONS = [
-  'True Objective',
-  'Current Repo Reality',
-  'Relevant Files / Subsystems',
-  'Assumptions',
-  'Ambiguities',
-  'Risks / Failure Modes',
-  'Evidence Required for Success',
-  'Clarifying Questions, if needed',
-  'Recommended Direction',
-  'What Not To Touch'
+  'Objective',
+  'Relevant Files'
 ];
 
 function basenameLower(pathValue) {
@@ -2295,7 +2325,7 @@ function getPlanningToolGate(config, canExecute, toolName, args = {}, options = 
   if (!config || !config.planningMode || canExecute) {
     return { allowed: true, forceYield: false, reason: '' };
   }
-  const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'run_command', 'start_command', 'run_tests', 'sync_workspace_env', 'launch_workspace_app', 'git_push', 'download_file', 'download_from_page', 'extract_archive', 'take_screenshot'];
+  const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'start_command', 'run_tests', 'sync_workspace_env', 'launch_workspace_app', 'git_push', 'download_file', 'download_from_page', 'extract_archive', 'take_screenshot'];
   const completionTools = ['complete_subplan', 'evaluate_win_conditions'];
   const strategyRequired = options.strategyRequired !== false;
   const strategyStatus = options.strategyStatus || {};
@@ -3133,6 +3163,18 @@ function describeModelApiError(status, errorText) {
   return { status, message, retryDelayMs };
 }
 
+function isGeminiHighDemandError(status, message) {
+  return status === 503 && /currently experiencing high demand|spikes in demand|high demand/i.test(String(message || ''));
+}
+
+function getNextGeminiModelForHighDemand(modelName) {
+  const fallbackChain = {
+    'gemini-2.5-flash-lite': 'gemini-2.5-flash',
+    'gemini-2.5-flash': 'gemini-2.5-pro'
+  };
+  return fallbackChain[modelName] || null;
+}
+
 // OLLAMA API UTILITIES & TRANSLATION HELPERS
 function convertGeminiToOllamaMessages(geminiMessages) {
   const ollamaMessages = [];
@@ -3236,6 +3278,17 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
           name: "get_workspace_info",
           description: "Returns the active workspace directory, conversation scope, and project metadata. Use when the user asks where the project/program is or asks for the directory.",
           parameters: { type: "OBJECT", properties: {} }
+        },
+        {
+          name: "change_workspace",
+          description: "Changes the active workspace directory of this conversation to a new absolute directory path on your computer. Use this when you discover that the user wants to work on or inspect a project located outside the active standalone workspace folder.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              path: { type: "STRING", description: "The absolute path to the directory you want to set as the active workspace." }
+            },
+            required: ["path"]
+          }
         },
         {
           name: "open_workspace_folder",
@@ -3701,7 +3754,7 @@ Be strict. If the screenshot does not clearly show the requested objective, say 
 
 // GEMINI API UTILITIES
 async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTools = false) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+  let activeModelName = modelName;
   
   const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
 
@@ -3735,10 +3788,13 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
       parts: [{ text: disableTools ? (SYSTEM_INSTRUCTION.split('Tools available:')[0] + '\n\nCRITICAL: You are in an analysis phase. DO NOT output any function calls. Provide your analysis in markdown text only.') : SYSTEM_INSTRUCTION }]
     },
     generationConfig: {
-      temperature: 0,
-      thinkingConfig: {
-        thinkingBudget: GEMINI_THINKING_BUDGET
-      }
+      ...(modelName.includes('thinking') || modelName.includes('2.5') ? {
+        thinkingConfig: {
+          thinkingBudget: GEMINI_THINKING_BUDGET
+        }
+      } : {
+        temperature: 0
+      })
     },
     safetySettings: [
       {
@@ -3772,6 +3828,17 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
             name: "get_workspace_info",
             description: "Returns the active workspace directory, conversation scope, and project metadata. Use when the user asks where the project/program is or asks for the directory.",
             parameters: { type: "OBJECT", properties: {} }
+          },
+          {
+            name: "change_workspace",
+            description: "Changes the active workspace directory of this conversation to a new absolute directory path on your computer. Use this when you discover that the user wants to work on or inspect a project located outside the active standalone workspace folder.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                path: { type: "STRING", description: "The absolute path to the directory you want to set as the active workspace." }
+              },
+              required: ["path"]
+            }
           },
           {
             name: "open_workspace_folder",
@@ -4055,6 +4122,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
   
   for (let i = 1; i <= attempts; i++) {
     try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${activeModelName}:generateContent?key=${apiKey}`;
       const response = await fetchWithTimeout(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -4069,6 +4137,19 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
       const status = response.status;
       const apiError = describeModelApiError(status, errorText);
       const retryDelayMs = Math.min(apiError.retryDelayMs || delay, MODEL_API_MAX_RETRY_WAIT_MS);
+
+      if (isGeminiHighDemandError(status, apiError.message)) {
+        const fallbackModelName = getNextGeminiModelForHighDemand(activeModelName);
+        if (fallbackModelName) {
+          if (onWarning) {
+            onWarning(`Gemini API returned HTTP ${status} (High Demand) for ${activeModelName}. Temporarily switching this request to ${fallbackModelName}; your selected default model is unchanged.`);
+          }
+          activeModelName = fallbackModelName;
+          delay = 1500;
+          i -= 1;
+          continue;
+        }
+      }
       
       const isTransient = [429, 500, 502, 503, 504].includes(status);
       if (!isTransient || i === attempts) {
