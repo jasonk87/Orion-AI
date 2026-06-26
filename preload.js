@@ -27,6 +27,8 @@ contextBridge.exposeInMainWorld('api', {
   listAssetMetadata: (workspacePath, relativePath) => ipcRenderer.invoke('list-asset-metadata', { workspacePath, relativePath }),
   writeFile: (workspacePath, relativePath, content) => ipcRenderer.invoke('write-file', { workspacePath, relativePath, content }),
   patchFile: (workspacePath, relativePath, operation) => ipcRenderer.invoke('patch-file', { workspacePath, relativePath, operation }),
+  getHomeDir: () => ipcRenderer.invoke('get-home-dir'),
+  getUserDataPath: () => ipcRenderer.invoke('get-user-data-path'),
   writeRunArtifact: (payload) => ipcRenderer.invoke('write-run-artifact', payload),
   listRunArtifacts: (conversationId) => ipcRenderer.invoke('list-run-artifacts', conversationId),
   googleSearch: (query, apiKey, searchEngineId, numResults) => ipcRenderer.invoke('google-search', { query, apiKey, searchEngineId, numResults }),

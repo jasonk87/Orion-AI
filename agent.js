@@ -20,9 +20,12 @@ CRITICAL RULES:
 11. RESPONSE FORMAT: Use clean GitHub-flavored Markdown. Prefer short sections with level-2 headings like "Summary", "Findings", "Plan", "Changes", "Tests", and "Next Steps". Use bullets for scan-friendly details, numbered lists only for ordered steps, and fenced code blocks for code. Do not write giant unbroken paragraphs. For code reviews or "look through the code" requests, lead with a brief summary, then specific findings with file/function references, then prioritized recommendations. When creating an implementation plan, put the detailed plan in implementation_plan.md and also show a readable approval summary in chat. At the end of any task that used tools, include a "Work Walkthrough" explaining what you actually did: files touched, commands/tests run, results, and remaining follow-up.
 12. SECRETS AND ENVIRONMENT: When a project needs the user's Gemini API key, Google API key, or Google Search Engine ID, use "sync_workspace_env" to create or update workspace environment files. Do not hardcode secrets into source files, do not print secret values, and do not ask the user to paste keys you can sync from settings. Make code read secrets from environment variables such as GEMINI_API_KEY, GOOGLE_API_KEY, GOOGLE_SEARCH_API_KEY, GOOGLE_SEARCH_ENGINE_ID, and GOOGLE_CSE_ID. For browser-only/static apps, do not expose private API keys in client-side code; add a small local/server API layer instead.
 13. GEMINI APP DEFAULTS: For new Gemini Python projects, prefer the current "google-genai" package and "from google import genai" unless local files already use a different SDK. The model "gemini-2.5-flash-lite" is valid; do not downgrade it to older model names unless official docs or an API error proves it is unavailable.
+13A. PYTHON PACKAGE VERSIONS: Before pinning a specific package version in requirements.txt, check the active Python version with "python --version". Avoid pinning old versions (e.g., pygame==2.5.2, tensorflow==2.x) that require building from source and may lack pre-built wheels for the installed Python version. When in doubt, specify only a minimum version (e.g., pygame>=2.6.0) or no version at all. Always try "pip install <package>" (no version) first; only add a version constraint if the project explicitly requires one.
 14. USER-REQUESTED LOCAL/GIT OPERATIONS: When the user asks for the active directory, to open the folder, to launch/run the program, or to push to GitHub/Git, use the dedicated tools for those actions. Do not push to Git or launch apps unless the user asked for it. If the user explicitly asks you to run a command, run it directly unless it matches Orion's hard destructive block list; do not interrupt with extra approval prompts for ordinary user-requested commands. If the user asks to push without specifying a branch, push the current branch to the default remote.
-15. WORKSPACE AND SYSTEM-WIDE QUERIES: Prefer and prioritize files/code within the active workspace. If the user mentions a specific local folder, program, or path outside the workspace (like "on my desktop" or "in my projects folder"), ALWAYS investigate the local filesystem using your local tools (e.g., run_command, list_files, grep_search) BEFORE attempting a web search. You are fully authorized to run system commands using "run_command" to query, search, and identify paths outside the workspace folder in order to answer their questions.
-16. OPERATING SYSTEM AWARENESS: You are currently running on a Windows system. When guessing or constructing file paths outside the current workspace, ALWAYS use Windows path conventions (e.g., C:\\, or PowerShell variables like $env:USERPROFILE\\Desktop) instead of Mac/Linux conventions (like /Users/user). Use "run_command" to search for the correct path before assuming.
+15. WORKSPACE AND SYSTEM-WIDE QUERIES: Prefer and prioritize files/code within the active workspace. If the user mentions a specific local folder, program, or path outside the workspace (like "on my desktop" or "in my projects folder"), ALWAYS investigate the local filesystem using your local tools (e.g., run_command, list_files, grep_search) BEFORE attempting a web search. You are fully authorized to run system commands using "run_command" to query, search, and identify paths outside the workspace folder in order to answer their questions. When the user names a specific program or project (e.g., "a program called X" or "my project named Y"), immediately use "change_workspace" directly to that project's path (e.g., C:\\Users\\Owner\\Desktop\\Projects\\X) and then read its key files — do NOT call "list_files" on the parent folder first, as parent folders may have hundreds of entries and the target may be truncated. If the path does not exist, try common spelling/casing variants, then use "run_command" with Get-ChildItem filtered by name.
+17. SIMPLE READ-ONLY QUESTIONS: For questions like "what is this program about", "tell me what X does", "describe this project" — do NOT call "update_mission_context", "start_subplan", or "evaluate_win_conditions". These operational planning tools are for long-running multi-step tasks only. For read-only questions: navigate to the project, read the key files (README, main entry, package.json / requirements.txt), and answer directly. Never set win conditions for a question that just needs file reading.
+18. FIND VS FIX: When the user asks you to "find", "look for", "check for", "review", "audit", or "identify" bugs/typos/issues/faults — your job is ONLY to read files and report what you found. Do NOT modify files, do NOT propose a fix implementation plan, and do NOT start fixing things. Present your findings clearly and ask the user which issues they want you to address. Only make changes when the user explicitly asks you to fix, patch, implement, or update something.
+16. OPERATING SYSTEM AWARENESS: You are currently running on a Windows system. When guessing or constructing file paths outside the current workspace, ALWAYS use Windows path conventions (e.g., C:\\Users\\owner\\Desktop) with the literal resolved path — do NOT pass unexpanded PowerShell variables like $env:USERPROFILE as a path argument to any tool; resolve the path to a literal string first (e.g., C:\\Users\\owner). If you are unsure of the username, run 'echo $env:USERPROFILE' first. When searching for files on the Desktop or broad directories, ALWAYS limit recursive searches with '-Depth 2' or '-Depth 3' and add '-ErrorAction SilentlyContinue' to avoid timeouts from permission-denied folders. Never run an unbounded 'Get-ChildItem -Recurse' on C:\\ or the Desktop without a depth limit.
 
 Tools available:
 - list_files: List all files in the workspace (excluding node_modules).
@@ -62,6 +65,7 @@ let isAgentRunning = false;
 let runningConversationId = null;
 let agentSubStatus = '';
 let agentExecutionMode = 'idle';
+let resolvedHomeDir = 'C:\\Users\\Owner';
 let currentAgentLogs = [];
 let isStopRequested = false;
 const GEMINI_THINKING_BUDGET = 24576;
@@ -279,8 +283,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const promptSource = options.source || 'user';
   const isInternalPrompt = !!options.internalPrompt || promptSource === 'followup' || promptSource === 'system' || promptSource === 'plan-approval';
 
+  let simpleRoute = null;
   if (!isInternalPrompt && !conversation.awaitingPlanApproval && config.planningMode !== false) {
-    const simpleRoute = classifySimpleTask(userPrompt);
+    simpleRoute = classifySimpleTask(userPrompt);
     if (simpleRoute && simpleRoute.route === 'local_memory') {
       await answerLocalMemoryQuestionFastPath({ userPrompt, workspacePath, conversation, config, route: simpleRoute });
       return;
@@ -295,6 +300,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     ? `[ORION INTERNAL FOLLOW-UP - not a user message]\n${userPrompt}\n\nContinue from the saved conversation/task state. Do not quote this as something the user said.`
     : userPrompt;
   
+  // Resolve the user's home directory once so the model never needs to discover it
+  resolvedHomeDir = 'C:\\Users\\Owner';
+  try {
+    if (window.api && window.api.getHomeDir) resolvedHomeDir = await window.api.getHomeDir();
+  } catch (_) {}
+
   const scopedNotes = await readScopedNotes(workspacePath, conversation);
   const operationalContext = await readOperationalContext(workspacePath);
   let workingState = operationalContext.state;
@@ -302,6 +313,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
   if (!isInternalPrompt && !conversation.awaitingPlanApproval && !isContinuationRequest) {
     conversation.planApproved = false;
+    // Clear stale operational context (blockers, win conditions, mission) from previous runs
+    if (workspacePath && hasOperationalMissionState(workingState)) {
+      try {
+        const emptyState = OperationalContext.createEmptyContext();
+        await window.api.writeFile(workspacePath, OPERATIONAL_CONTEXT_PATH, `${JSON.stringify(emptyState, null, 2)}\n`);
+        workingState = emptyState;
+      } catch (_) {}
+    }
   }
   // Canonical operational state seeds reasoning. Conversation remains a bounded UI/input view;
   // old model and tool turns are deliberately not replayed as task truth.
@@ -325,6 +344,18 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       }
     );
   }
+
+  // Inject resolved system facts so the model never needs to probe for the home directory
+  messages.splice(2, 0,
+    {
+      role: 'user',
+      parts: [{ text: `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nDo NOT run echo or whoami to discover these paths — use the values above directly.` }]
+    },
+    {
+      role: 'model',
+      parts: [{ text: `Understood. Home directory is ${resolvedHomeDir}. I will use this directly without probing.` }]
+    }
+  );
 
   let approvalIntent = null;
   if (!isInternalPrompt && conversation.awaitingPlanApproval && !conversation.planApproved) {
@@ -388,7 +419,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       window.appendSystemMessage('Planning mode: direct task, no implementation plan required. Continuing or fixing the current in-progress task.');
     }
   } else if (!isInternalPrompt && config.planningMode !== false && !conversation.planApproved && !conversation.awaitingPlanApproval && !(approvalIntent && approvalIntent.intent === 'approve')) {
-    planningDecision = await classifyPlanningNeed(userPrompt, modelName, config.geminiApiKey);
+    // Fast-path routes (local_project_describe, local_project_review, etc.) bypass the Gemini classifier
+    if (simpleRoute && (simpleRoute.mode === 'direct' || simpleRoute.mode === 'answer')) {
+      planningDecision = { mode: simpleRoute.mode, reason: simpleRoute.reason };
+    } else {
+      planningDecision = await classifyPlanningNeed(userPrompt, modelName, config.geminiApiKey);
+    }
     if (planningDecision.mode === 'direct') {
       planningBypassedForTask = true;
       agentExecutionMode = 'direct';
@@ -416,11 +452,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     }]
   });
 
+  const reviewOnlyMode = simpleRoute && simpleRoute.route === 'local_project_review';
   if (config.planningMode !== false) {
+    const reviewOnlyConstraint = reviewOnlyMode
+      ? ' CRITICAL: The user asked you to FIND issues, not fix them. Read files, identify bugs/typos/structural faults, and present your findings as a clear report. Do NOT modify any files, do NOT propose implementation steps, and do NOT ask to approve a fix plan. End by summarizing what you found and asking the user which issues they want you to address.'
+      : '';
     messages.push({
       role: 'user',
       parts: [{
-        text: `[SYSTEM: Planning decision for this user request: ${planningDecision.mode}. Reason: ${planningDecision.reason || 'No reason provided.'} ${planningBypassedForTask ? 'This is a direct task, so do not create STRATEGY.md or implementation_plan.md unless new complexity appears during inspection.' : 'If this requires workspace changes and no plan is approved, complete Mission Refinement first, create a valid STRATEGY.md, then create a real implementation plan and pause.'}]`
+        text: `[SYSTEM: Planning decision for this user request: ${planningDecision.mode}. Reason: ${planningDecision.reason || 'No reason provided.'} ${planningBypassedForTask ? 'This is a direct task, so do not create STRATEGY.md or implementation_plan.md unless new complexity appears during inspection.' : 'If this requires workspace changes and no plan is approved, complete Mission Refinement first, create a valid STRATEGY.md, then create a real implementation plan and pause.'}${reviewOnlyConstraint}]`
       }]
     });
     if (!planningBypassedForTask && planningDecision.mode === 'plan' && !conversation.planApproved && !isInternalPrompt) {
@@ -494,9 +534,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       console.error("Token count/compacting error:", e);
     }
     
-    // Run the agent execution loop (up to 15 steps to prevent runaway bills)
+    // Run the agent execution loop
     let loopCount = 0;
-    let maxLoops = 20;
+    let maxLoops = reviewOnlyMode ? 40 : 20;
     let planValidationRetries = 0;
     let consecutiveNoToolCalls = 0;
     let malformedCallsCount = 0;
@@ -680,11 +720,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         lastTextResponse = textVal;
       }
       
-      // Update live chat bubbles
+      // Update live chat bubbles — skip render when there are no tool calls so the
+      // final answer isn't shown with the "Working..." spinner still attached; the
+      // finally block will render once isAgentRunning is already false.
       conversation.messages[aiMessageIndex].text = withWorkWalkthrough(lastTextResponse, workWalkthrough, false);
       conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
-      window.renderAiMessage(conversation.messages[aiMessageIndex].text, currentAgentLogs);
-      
+      if (functionCalls.length > 0) {
+        window.renderAiMessage(conversation.messages[aiMessageIndex].text, currentAgentLogs);
+      }
+
       // If no tool calls, the agent is done, unless there are pending tasks in the checklist
       if (functionCalls.length === 0) {
         consecutiveNoToolCalls++;
@@ -752,6 +796,24 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           messages.push({ role: 'user', parts: [{ text: epistemicCorrection }] });
           continue;
         }
+        // In review-only mode, always nudge the model to keep reading files until it explicitly signals completion
+        if (reviewOnlyMode && consecutiveNoToolCalls === 1 && workWalkthrough.length > 0 && loopCount < maxLoops) {
+          const signalsDone = /\b(that'?s all|in conclusion|to summarize|summary of findings|final(?:ly)?|this concludes|completed (?:my )?(?:review|analysis|scan)|finished reviewing|done reviewing)\b/i.test(String(textVal || ''));
+          if (!signalsDone) {
+            currentAgentLogs.push({ type: 'thought', content: 'Review mode: model paused mid-review. Nudging to continue reading files.' });
+            messages.push({ role: 'user', parts: [{ text: '[SYSTEM: You paused mid-review without finishing. Continue reading the remaining project files. Do not stop until you have covered all major source files, then present your complete findings.]' }] });
+            continue;
+          }
+        }
+        // If model described a next action but didn't call the tool, give it one nudge to follow through
+        if (consecutiveNoToolCalls === 1 && workWalkthrough.length > 0 && loopCount < maxLoops) {
+          const describesThenStops = /\b(let'?s|i'?ll|i will|i'm going to|next i'?ll|now i'?ll|i'll now|let me now)\b.{0,120}(search|read|look|check|list|run|scan|find|navigate|inspect|analyze|review)/i.test(String(textVal || ''));
+          if (describesThenStops) {
+            currentAgentLogs.push({ type: 'thought', content: 'Model described a next tool action but did not call it. Nudging to execute.' });
+            messages.push({ role: 'user', parts: [{ text: '[SYSTEM: You described what you were going to do next but did not call any tool. Execute that action now with the appropriate tool call. Do not describe it again.]' }] });
+            continue;
+          }
+        }
         const finalAnswerQualityPrompt = buildFinalAnswerQualityGatePrompt(userPrompt, textVal, workWalkthrough);
         if (finalAnswerQualityPrompt && loopCount >= maxLoops && finalAnswerQualityLoopExtensions < 2) {
           finalAnswerQualityLoopExtensions++;
@@ -763,7 +825,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           messages.push({ role: 'user', parts: [{ text: finalAnswerQualityPrompt }] });
           continue;
         }
-        if (hasOperationalMissionState(workingState)) {
+        if (hasOperationalMissionState(workingState) && agentExecutionMode === 'executing') {
           const completionGate = evaluateWorkingStateCompletion(workingState, conversation);
           if (completionGate.status === 'continue_work' && loopCount >= maxLoops && completionGateLoopExtensions < 3) {
             completionGateLoopExtensions++;
@@ -827,7 +889,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         }
         const planningGate = getPlanningToolGate(config, canExecuteThisTask(), toolName, args, {
           strategyRequired: !planningBypassedForTask && planningDecision.mode === 'plan',
-          strategyStatus
+          strategyStatus,
+          agentExecutionMode
         });
         if (!planningGate.allowed) {
           const failure = classifyAgentFailure({
@@ -1055,7 +1118,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       lastTextResponse = "Task finished.";
     }
     lastTextResponse = withWorkWalkthrough(lastTextResponse, workWalkthrough, true);
-    
+
+    // Save walkthrough to file so the chat bubble stays clean
+    if (workWalkthrough.length > 0 && workspacePath) {
+      try {
+        const walkthroughMd = buildWorkWalkthroughMarkdown(workWalkthrough, lastTextResponse);
+        await window.api.writeFile(workspacePath, 'work_walkthrough.md', walkthroughMd);
+      } catch (_) {}
+    }
+
     // Ensure the final text and logs are written and rendered
     conversation.messages[aiMessageIndex].text = lastTextResponse;
     conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
@@ -1202,7 +1273,7 @@ async function executeTool(name, args, workspace, config, conversation) {
     case 'search_embeddings': {
       if (!args.query) throw new Error("Missing 'query' parameter");
       const result = await window.api.searchEmbeddings(args.query, args.limit);
-      if (!result.success) throw new Error(result.error || 'Semantic search failed');
+      if (!result.success) return { success: false, results: [], message: 'Semantic search is not available for this workspace. Use read_file or run_command to find what you need instead.' };
       return result;
     }
     
@@ -1335,7 +1406,12 @@ async function executeTool(name, args, workspace, config, conversation) {
     
     case 'change_workspace': {
       if (!args.path) throw new Error("Missing 'path' parameter");
-      const targetPath = args.path;
+      // Expand common Windows env var patterns the model tends to emit literally
+      let targetPath = args.path
+        .replace(/\$env:USERPROFILE/gi, resolvedHomeDir)
+        .replace(/\$env:HOMEDRIVE/gi, resolvedHomeDir.slice(0, 2) || 'C:')
+        .replace(/\$env:HOMEPATH/gi, resolvedHomeDir.slice(2) || '\\Users\\Owner')
+        .replace(/^~[/\\]?/, resolvedHomeDir + '\\');
       try {
         const files = await window.api.listFiles(targetPath);
         if (files && files.error) {
@@ -1930,7 +2006,7 @@ async function mutateOperationalContext(workspace, action, args = {}) {
   const current = await readOperationalContext(workspace);
   if (!current.success) throw new Error(current.error);
   const transition = OperationalContext.applyAction(current.state, action, args);
-  if (action === 'evaluate_win_conditions' && transition.state.winConditions.length > 0 && transition.state.winConditions.every(condition => condition.status === 'satisfied')) {
+  if (action === 'evaluate_win_conditions' && transition.state.winConditions.length > 0 && transition.state.winConditions.every(condition => condition.status === 'satisfied') && agentExecutionMode !== 'direct' && agentExecutionMode !== 'answer') {
     const completionGate = OperationalContext.evaluateCompletionGate(transition.state, { explicitRequirements: [] });
     if (completionGate.status !== 'ready_for_final') {
       throw new Error(`Completion gate rejected final win-condition satisfaction: ${buildCompletionGateMessage(completionGate)}`);
@@ -2270,7 +2346,9 @@ function normalizeFollowupPurpose(value) {
 }
 
 function buildToolUseContractPrompt() {
-  return `[SYSTEM: Before answering, decide whether the user's request requires interacting with the workspace or runtime. If it requires files, commands, tests, external docs, app state, timers, notes, or code changes, use the relevant tools before giving a final answer. Questions about this computer's performance, specs, RAM, CPU, disk, processes, or local environment require local inspection with tools unless fresh evidence is already present. If no tool is needed, answer normally and do not claim that work was performed. Never end with a generic completion message unless the Work Walkthrough shows what actually happened. Remember, for complex tasks, your final summary must explicitly list what planned tests were run, their results, and reasons for any skipped tests.]`;
+  return `[SYSTEM: Before answering, decide whether the user's request requires interacting with the workspace or runtime. If it requires files, commands, tests, external docs, app state, timers, notes, or code changes, use the relevant tools before giving a final answer. Questions about this computer's performance, specs, RAM, CPU, disk, processes, or local environment require local inspection with tools unless fresh evidence is already present. If no tool is needed, answer normally and do not claim that work was performed. Never end with a generic completion message unless the Work Walkthrough shows what actually happened. Remember, for complex tasks, your final summary must explicitly list what planned tests were run, their results, and reasons for any skipped tests.
+
+CRITICAL: If a planning gate blocks a tool call, do NOT paste planning documents (STRATEGY.md content, implementation plan phases, testing plan sections) into your chat response. Instead write one short sentence explaining what is blocking you and ask the user to clarify or rephrase. Planning document prose must only ever go into files — never into the chat bubble.]`;
 }
 
 const STRATEGY_FILE_NAME = 'strategy.md';
@@ -2404,12 +2482,17 @@ function getPlanningToolGate(config, canExecute, toolName, args = {}, options = 
   const completionTools = ['complete_subplan', 'evaluate_win_conditions'];
   const strategyRequired = options.strategyRequired !== false;
   const strategyStatus = options.strategyStatus || {};
-  if (completionTools.includes(toolName)) {
+  const executionMode = options.agentExecutionMode || '';
+  // Allow completion tools for read-only/answer tasks — no plan approval needed to close them
+  if (completionTools.includes(toolName) && executionMode !== 'answer' && executionMode !== 'direct') {
     return {
       allowed: false,
       forceYield: false,
       reason: 'Refinement/Planning Mode Active: do not mark tasks, subplans, or win conditions complete before strategy, plan approval, execution, and evidence.'
     };
+  }
+  if (completionTools.includes(toolName)) {
+    return { allowed: true, forceYield: false, reason: '' };
   }
   if (!destructiveTools.includes(toolName)) {
     return { allowed: true, forceYield: false, reason: '' };
@@ -2544,16 +2627,26 @@ function withWorkWalkthrough(text, items, final = false) {
   const meaningfulItems = (items || []).filter(Boolean);
   if (meaningfulItems.length === 0) return text;
   const base = sanitizeFinalAnswerText(text);
-  const heading = final ? '## Work Walkthrough' : '## Work Walkthrough';
+  if (final) {
+    // Walkthrough is saved to work_walkthrough.md — keep the chat bubble clean
+    return base.trim() || 'Task finished.';
+  }
   const lines = meaningfulItems.slice(-12).map(item => {
     const marker = item.status === 'error' ? 'Failed' : (item.status === 'running' ? 'Working' : 'Done');
     const detail = item.detail ? ` - ${item.detail}` : '';
     return `- **${marker}:** ${item.label}${detail}`;
   });
-  const suffix = final
-    ? buildFinalVerificationSummary(meaningfulItems)
-    : '\n\n_I will keep this updated as I work._';
-  return `${base.trim() || 'Working on it.'}\n\n${heading}\n${lines.join('\n')}${suffix}`;
+  return `${base.trim() || 'Working on it.'}\n\n## Work Walkthrough\n${lines.join('\n')}\n\n_I will keep this updated as I work._`;
+}
+
+function buildWorkWalkthroughMarkdown(items, finalText) {
+  const lines = (items || []).filter(Boolean).map(item => {
+    const marker = item.status === 'error' ? '❌ Failed' : (item.status === 'running' ? '⏳ Working' : '✅ Done');
+    const detail = item.detail ? ` — ${item.detail}` : '';
+    return `- **${marker}:** ${item.label}${detail}`;
+  });
+  const summary = buildFinalVerificationSummary((items || []).filter(Boolean));
+  return `# Work Walkthrough\n\n${lines.join('\n')}${summary || ''}`;
 }
 
 function isFileMutationItem(item) {
@@ -2836,19 +2929,30 @@ Return only compact JSON with:
 
 Definitions:
 - plan: broad or complex work where the user should review direction first, such as creating a substantial new project, major redesign/refactor, large bug hunt, architecture change, risky migration, security-sensitive change, or ambiguous multi-step coding task.
-- direct: concrete low-risk work that should be executed immediately, such as running/opening a program, running tests, showing a directory, setting an entry point, pushing to Git when explicitly requested, viewing a file, making a narrow edit, fixing a small bug, or continuing an already-approved task.
+- direct: concrete low-risk work that should be executed immediately, such as running/opening a program, running tests, showing a directory, setting an entry point, pushing to Git when explicitly requested, viewing a file, making a narrow edit, fixing a small bug, continuing an already-approved task, OR reading/inspecting local files to answer a question about them.
 - answer: a question or explanation that can be answered in chat without workspace changes or command execution.
 
 Decision guidance:
 - Prefer direct for read-only local inspection or inventory tasks, including listing installed runtimes, checking versions, checking PATH, finding executables, showing files, or running safe diagnostic commands.
+- Prefer direct for any request to describe, explain, summarize, or understand a local program, project, or file — even if multiple files must be read. Reading files is not risky.
 - Prefer direct for a small number of safe commands that gather facts, even if the answer has several sections.
 - Prefer plan only when the task requires a coordinated implementation, risky changes, many file edits, architecture/design choices, migrations, security-sensitive changes, or user review before modifying the workspace.
-- Prefer answer when no local tools or workspace actions are needed.
+- Prefer answer when no local tools or workspace actions are needed at all.
+- NEVER return plan for a read-only question about what a local program/project/file does or contains.
+- NEVER return plan for a code review, bug hunt, typo check, or analysis of a local project — these are read-only inspection tasks.
 
 Examples:
 - "what python environments do i have installed on this computer" -> direct
 - "where is python installed and which one is first on PATH" -> direct
 - "run the tests" -> direct
+- "what is this program about" -> direct
+- "can you tell me what llm-call does" -> direct
+- "tell me about the project in my Desktop/projects folder" -> direct
+- "what does this file do" -> direct
+- "look through my program and find any bugs" -> direct
+- "can you find typos and structural faults in my project" -> direct
+- "review my code for issues" -> direct
+- "audit this codebase for security problems" -> direct
 - "explain how PATH works on Windows" -> answer
 - "build me a Python desktop app" -> plan
 - "refactor the authentication flow" -> plan
@@ -2925,6 +3029,29 @@ function classifySimpleTask(userPrompt) {
       route: 'local_memory',
       mode: 'direct',
       reason: 'Simple local system memory question; answer from local command evidence without model planning.'
+    };
+  }
+
+  // Read-only "what is X about / what does X do" questions targeting local projects
+  const describeVerbs = hasAnyToken(tokenSet, ['what', 'tell', 'describe', 'explain', 'summarize', 'show', 'about']);
+  const describeNouns = hasAnyToken(tokenSet, ['program', 'project', 'app', 'application', 'file', 'folder', 'code', 'script', 'tool', 'repo', 'repository']);
+  const localRef = hasAnyToken(tokenSet, ['my', 'this', 'the', 'desktop', 'projects', 'folder']);
+  if (describeVerbs && (describeNouns || localRef)) {
+    return {
+      route: 'local_project_describe',
+      mode: 'direct',
+      reason: 'Read-only question about a local program or project; read files and answer without planning gates.'
+    };
+  }
+
+  // Code review / bug hunt on a local project — read-only analysis, no plan approval needed
+  const reviewVerbs = hasAnyToken(tokenSet, ['find', 'look', 'check', 'review', 'audit', 'scan', 'analyze', 'analyse', 'search', 'identify', 'spot', 'detect']);
+  const reviewTargets = hasAnyToken(tokenSet, ['bug', 'bugs', 'typo', 'typos', 'error', 'errors', 'issue', 'issues', 'fault', 'faults', 'problem', 'problems', 'smell', 'smells', 'vulnerability', 'vulnerabilities']);
+  if (reviewVerbs && reviewTargets && (describeNouns || localRef)) {
+    return {
+      route: 'local_project_review',
+      mode: 'direct',
+      reason: 'Read-only code review or bug hunt on a local project; inspect files and report findings without planning gates.'
     };
   }
 

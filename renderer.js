@@ -55,6 +55,7 @@ let appConfig = {
 };
 
 let currentWorkspace = '';
+let cachedUserDataPath = '';
 let activeConversationId = null;
 let conversations = []; // { id, title, messages, tasks, testResults }
 let activeProcessId = null;
@@ -166,6 +167,7 @@ let agentCompletionTimer = null;
 document.addEventListener('DOMContentLoaded', async () => {
   setupWindowControls();
   await loadSettings();
+  try { cachedUserDataPath = await window.api.getUserDataPath(); } catch (_) {}
   setupSettingsModal();
   setupFileViewerModal();
   setupOperationalContextEditor();
@@ -1235,7 +1237,8 @@ function createNewConversationUnderProject(projectPath) {
 function getStandaloneWorkspaceRoot() {
   const configured = (appConfig.standaloneWorkspaceRoot || '').trim();
   if (configured) return configured.replace(/[\\\/]+$/, '');
-  return 'C:\\Users\\Owner\\Desktop\\Projects\\OrionAI\\standalone-workspaces';
+  const base = cachedUserDataPath || 'C:\\Users\\Owner\\AppData\\Roaming\\OrionAI';
+  return base + '\\standalone-workspaces';
 }
 
 function getStandaloneWorkspaceForTitle(title) {
@@ -1486,10 +1489,11 @@ async function submitMessage() {
   
   // Initialize title & folder path if first prompt
   if (!conv.workspace) {
-    const title = prompt.length > 25 ? prompt.substring(0, 25) + '...' : prompt;
+    const title = generateConversationTitle(prompt);
     conv.title = title;
     el.chatTitle.textContent = title;
-    
+    renderConversationList();
+
     if (conv.projectPath) {
       conv.workspace = conv.projectPath;
     } else {
@@ -1524,7 +1528,22 @@ async function submitMessage() {
       loadRunArtifacts();
     }
   } else {
-    appendSystemMessage("Agent engine is loading... please try again in a moment.");
+    appendSystemMessage("Agent engine is loading... your message will run automatically when ready.");
+    const pendingPrompt = prompt;
+    const pendingConv = conv;
+    const waitForEngine = setInterval(async () => {
+      if (window.runAgentLoop) {
+        clearInterval(waitForEngine);
+        const selectedModel = el.modelSelect.value;
+        if (window.isAgentRunning && window.isAgentRunning()) {
+          window.promptQueue.push({ prompt: pendingPrompt, modelSelectValue: selectedModel, conversationId: pendingConv.id, alreadyRendered: true });
+        } else {
+          await window.runAgentLoop(pendingPrompt, selectedModel, pendingConv);
+          loadRunArtifacts();
+        }
+      }
+    }, 500);
+    setTimeout(() => clearInterval(waitForEngine), 30000);
   }
 }
 
@@ -1533,6 +1552,59 @@ function slugify(text) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/(^-|-$)+/g, '');
+}
+
+function toTitleCase(str) {
+  const minors = new Set(['a', 'an', 'the', 'and', 'but', 'or', 'for', 'nor', 'on', 'at', 'to', 'by', 'in', 'of', 'up', 'as', 'is', 'it', 'vs']);
+  const upperAbbrevs = new Set(['ai', 'llm', 'gpt', 'api', 'url', 'ui', 'ux', 'css', 'html', 'json', 'sql', 'db', 'cli', 'sdk', 'aws', 'ide', 'gpu', 'cpu', 'ram', 'os', 'ci', 'cd', 'qa', 'jwt', 'ssh', 'ftp', 'http', 'https', 'xml', 'csv', 'pdf', 'id', 'io']);
+  return String(str || '')
+    .toLowerCase()
+    .trim()
+    .replace(/\b\w+/g, (word, offset) => {
+      if (upperAbbrevs.has(word)) return word.toUpperCase();
+      if (offset === 0 || !minors.has(word)) return word.charAt(0).toUpperCase() + word.slice(1);
+      return word;
+    });
+}
+
+function generateConversationTitle(prompt) {
+  let text = String(prompt || '').trim();
+
+  // Strip common leading filler patterns
+  const leadingFillers = [
+    /^i have a (?:program|project|app|application|file|script|tool|repo|repository) called\s+/i,
+    /^(?:can|could) you (?:please\s+)?/i,
+    /^please\s+/i,
+    /^i (?:need|want|would like) (?:you to\s+)?/i,
+    /^help me (?:with\s+)?/i,
+    /^orion[,\s]+/i,
+  ];
+  for (const pat of leadingFillers) {
+    text = text.replace(pat, '').trim();
+  }
+
+  // If the text contains multiple sentences, take only the first meaningful one
+  const sentenceBreak = text.search(/[.!?]\s+[A-Za-z]/);
+  if (sentenceBreak > 8) text = text.substring(0, sentenceBreak).trim();
+
+  // Strip location context ("in my projects folder on my desktop", etc.)
+  text = text
+    .replace(/\s+in my (?:projects?\s+folder(?:\s+on my desktop)?|desktop(?:\s+projects?\s+folder)?|projects?)\s*$/i, '')
+    .replace(/\s+on my desktop\s*$/i, '')
+    .replace(/\s+located (?:at|in)\s+\S+\s*$/i, '')
+    .trim();
+
+  // Collapse whitespace
+  text = text.replace(/\s+/g, ' ').trim();
+
+  // Truncate at word boundary to ~45 chars
+  if (text.length > 45) {
+    const cut = text.substring(0, 45);
+    const lastSpace = cut.lastIndexOf(' ');
+    text = (lastSpace > 15 ? cut.substring(0, lastSpace) : cut) + '...';
+  }
+
+  return toTitleCase(text) || 'New Conversation';
 }
 
 function normalizeConversationWorkspace(conv) {
@@ -2668,7 +2740,8 @@ function renderProjectsList() {
   
   projects.forEach(path => {
     const isCurrent = path === currentWorkspace || (activeConv && activeConv.projectPath === path);
-    const name = path.substring(path.lastIndexOf('\\') + 1) || path;
+    const rawName = path.substring(path.lastIndexOf('\\') + 1) || path;
+    const name = toTitleCase(rawName);
     
     const projectContainer = document.createElement('div');
     projectContainer.className = 'project-container';
@@ -2782,7 +2855,8 @@ function filterProjects(query) {
   el.projectList.innerHTML = '';
   
   projects.forEach(path => {
-    const name = path.substring(path.lastIndexOf('\\') + 1) || path;
+    const rawName = path.substring(path.lastIndexOf('\\') + 1) || path;
+    const name = toTitleCase(rawName);
     if (!name.toLowerCase().includes(query.toLowerCase())) return;
     
     const activeConv = conversations.find(c => c.id === activeConversationId);

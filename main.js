@@ -3303,6 +3303,9 @@ ipcMain.handle('patch-file', async (event, { workspacePath, relativePath, operat
   }
 });
 
+ipcMain.handle('get-home-dir', () => os.homedir());
+ipcMain.handle('get-user-data-path', () => app.getPath('userData'));
+
 ipcMain.handle('write-run-artifact', async (event, payload) => {
   try {
     const artifactPath = writeRunArtifact(payload || {});
