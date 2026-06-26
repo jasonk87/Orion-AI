@@ -11,7 +11,7 @@ CRITICAL RULES:
 4. CONTEXT INTEGRITY: Keep files clean, respect formatting, and preserve comments that are unrelated to your edits.
 5. NOTES AND MEMORY: Use project/standalone notes as durable working memory. Read them when orienting, and update them when you learn durable facts: architecture, important files, commands, decisions, user preferences, gotchas, open tasks, test status, and future repair notes. Project notes are shared across every conversation in the same project; standalone notes belong only to that standalone conversation. Keep notes concise and useful, not a transcript.
 5A. OPERATIONAL CONTEXT: For long-running or multi-subplan goals, maintain mission, measurable win conditions, active objective/subplan, blockers, and retained discoveries with the operational-context tools. Treat operational context as canonical working state, not another chat transcript. Promote durable lessons; discard summaries of fixed errors, dead ends, and temporary output. Never mark a subplan or win condition complete without concrete evidence from tests, inspected output, or explicit user confirmation.
-6. DESIGN QUALITY: When creating apps, games, dashboards, or visual tools, make them visually polished and pleasant by default. Treat beauty, layout, typography, color, spacing, motion, and interaction feedback as part of "working." Avoid bare black boxes, default controls, tiny unstyled text, and placeholder-looking screens unless the user explicitly asks for minimal output. For games, include a cohesive visual theme, clear HUD, start/game-over states, readable controls, animation polish, and a satisfying feel.
+6. DESIGN QUALITY: When creating apps, games, dashboards, or visual tools, make them visually polished and pleasant by default. Treat beauty, layout, typography, color, spacing, motion, and interaction feedback as part of "working." Avoid bare black boxes, default controls, tiny unstyled text, and placeholder-looking screens unless the user explicitly asks for minimal output. For games, include a cohesive visual theme, clear HUD, start/game-over states, readable controls, animation polish, and a satisfying feel. Do not rely on CDN-only frontend dependencies (such as Tailwind CDN, Chart.js CDN, icon CDNs, or remote fonts) for local production-style apps unless the user explicitly asks for CDN usage; prefer local CSS/JS or installed packages so browser console checks stay clean.
 7. FOLLOW-UP TIMERS: If you say you will wait, check back, continue after N seconds/minutes, or inspect long-running training/tests later, you MUST call "schedule_followup". Do not merely say you will wait. Schedule only one active follow-up for the same purpose; when the follow-up runs, actually inspect status/output and either continue work, stop the process, or clearly finish.
 7A. ADAPT INSTEAD OF QUITTING: Do not abandon a task after ordinary errors. If an edit, command, test, or route check fails, inspect fresh state, group repeated failures, look up official/current docs when needed, and try a different strategy. A failed tool path is evidence about that tool attempt, not proof that the user's objective is impossible. Stop only for hard blockers such as missing credentials, unavailable model access, explicit user stop, or a hard-destructive command block; when stopping, preserve state and explain the exact next recovery step.
 8. BE CONCISE: Explain your technical decisions briefly. The user can see your tools running and thoughts.
@@ -278,10 +278,6 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let workspacePath = conversation.workspace || window.getCurrentWorkspace();
   const promptSource = options.source || 'user';
   const isInternalPrompt = !!options.internalPrompt || promptSource === 'followup' || promptSource === 'system' || promptSource === 'plan-approval';
-  
-  if (!isInternalPrompt && !conversation.awaitingPlanApproval) {
-    conversation.planApproved = false;
-  }
 
   if (!isInternalPrompt && !conversation.awaitingPlanApproval && config.planningMode !== false) {
     const simpleRoute = classifySimpleTask(userPrompt);
@@ -302,6 +298,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const scopedNotes = await readScopedNotes(workspacePath, conversation);
   const operationalContext = await readOperationalContext(workspacePath);
   let workingState = operationalContext.state;
+  const isContinuationRequest = isTaskContinuationPrompt(userPrompt) && hasOperationalMissionState(workingState);
+
+  if (!isInternalPrompt && !conversation.awaitingPlanApproval && !isContinuationRequest) {
+    conversation.planApproved = false;
+  }
   // Canonical operational state seeds reasoning. Conversation remains a bounded UI/input view;
   // old model and tool turns are deliberately not replayed as task truth.
   let messages = OperationalContext.buildReasoningMessages(workingState, conversation.messages, promptForModel);
@@ -376,7 +377,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let planningDecision = { mode: 'plan', reason: 'Planning mode is active.' };
   let planningBypassedForTask = false;
   let strategyStatus = { exists: false, valid: false, missingSections: STRATEGY_REQUIRED_SECTIONS, needsClarification: false };
-  if (!isInternalPrompt && config.planningMode !== false && !conversation.planApproved && !conversation.awaitingPlanApproval && !(approvalIntent && approvalIntent.intent === 'approve')) {
+  if (isContinuationRequest && !conversation.awaitingPlanApproval) {
+    planningDecision = {
+      mode: 'direct',
+      reason: 'Continuing or fixing an existing in-progress approved task.'
+    };
+    planningBypassedForTask = true;
+    agentExecutionMode = 'executing';
+    if (window.appendSystemMessage) {
+      window.appendSystemMessage('Planning mode: direct task, no implementation plan required. Continuing or fixing the current in-progress task.');
+    }
+  } else if (!isInternalPrompt && config.planningMode !== false && !conversation.planApproved && !conversation.awaitingPlanApproval && !(approvalIntent && approvalIntent.intent === 'approve')) {
     planningDecision = await classifyPlanningNeed(userPrompt, modelName, config.geminiApiKey);
     if (planningDecision.mode === 'direct') {
       planningBypassedForTask = true;
@@ -487,7 +498,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     let planValidationRetries = 0;
     let consecutiveNoToolCalls = 0;
     let malformedCallsCount = 0;
+    let maxTokensContinuations = 0;
     let postEditEvidencePrompts = 0;
+    let postEditEvidenceLoopExtensions = 0;
+    let completionGatePrompts = 0;
+    let completionGateLoopExtensions = 0;
     const repeatedToolFailures = new Map();
     const toolEvidenceLedger = [];
     const maxMalformedToolRetries = 5;
@@ -584,6 +599,29 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       }
       
       if (candidate.finishReason && candidate.finishReason !== "STOP") {
+        if (candidate.finishReason === "MAX_TOKENS" && maxTokensContinuations < 3 && loopCount < maxLoops) {
+          maxTokensContinuations++;
+          const modelParts = (candidate.content && candidate.content.parts) || [];
+          const partialText = modelParts.map(part => part.text || '').join('').trim();
+          if (partialText) {
+            lastTextResponse = partialText;
+            conversation.messages[aiMessageIndex].text = withWorkWalkthrough(lastTextResponse, workWalkthrough, false);
+            window.renderAiMessage(conversation.messages[aiMessageIndex].text, currentAgentLogs);
+          }
+          messages.push({
+            role: 'model',
+            parts: modelParts.length ? modelParts : [{ text: '[Model response stopped because it reached the token limit before finishing.]' }]
+          });
+          conversation.messages[aiMessageIndex].turns.push({ modelParts, toolResponseParts: null });
+          currentAgentLogs.push({ type: 'thought', content: `Model hit MAX_TOKENS. Continuing from partial response (Attempt ${maxTokensContinuations}/3).` });
+          messages.push({
+            role: 'user',
+            parts: [{
+              text: '[SYSTEM: Your previous response hit MAX_TOKENS before the task was complete. Continue from the exact current state. Do not restart, do not repeat completed work, and use tools if needed to finish the active investigation. If you were about to summarize findings, continue the findings concisely.]'
+            }]
+          });
+          continue;
+        }
         if (candidate.finishReason === "MALFORMED_FUNCTION_CALL" && malformedCallsCount < maxMalformedToolRetries) {
           malformedCallsCount++;
           const errorMsg = `⚠️ Tool call was malformed (Attempt ${malformedCallsCount}/${maxMalformedToolRetries}). Requesting regeneration...`;
@@ -692,6 +730,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           promptCount: postEditEvidencePrompts,
           maxPrompts: 2
         });
+        if (evidencePrompt && loopCount >= maxLoops && postEditEvidenceLoopExtensions < 3) {
+          postEditEvidenceLoopExtensions++;
+          maxLoops++;
+        }
         if (evidencePrompt && loopCount < maxLoops) {
           postEditEvidencePrompts++;
           currentAgentLogs.push({ type: 'thought', content: 'Verification guard: code changed, so Orion must inspect the changed files and run or justify a real check before finishing.' });
@@ -710,13 +752,18 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         }
         if (hasOperationalMissionState(workingState)) {
           const completionGate = evaluateWorkingStateCompletion(workingState, conversation);
-          if (completionGate.status === 'continue_work' && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
+          if (completionGate.status === 'continue_work' && loopCount >= maxLoops && completionGateLoopExtensions < 3) {
+            completionGateLoopExtensions++;
+            maxLoops++;
+          }
+          if (completionGate.status === 'continue_work' && completionGatePrompts < 3 && loopCount < maxLoops) {
+            completionGatePrompts++;
             const gateMessage = buildCompletionGateMessage(completionGate);
             currentAgentLogs.push({ type: 'thought', content: `Completion gate held final response.\n${gateMessage}` });
             messages.push({
               role: 'user',
               parts: [{
-                text: `[SYSTEM: The operational completion gate says this task is not ready for a final summary yet.\n${gateMessage}\nContinue work by updating operational state, running/recording verification, resolving blockers, or satisfying win conditions with evidence. Do not split this into another role.]`
+                text: `[SYSTEM: The operational completion gate says this task is not ready for a final summary yet.\n${gateMessage}\nContinue work with the next concrete tool action now: implement missing files, run/record verification, launch or visually inspect the UI, resolve blockers, or satisfy win conditions with evidence. Do not answer with another status-only summary. Do not split this into another role.]`
               }]
             });
             continue;
@@ -1124,7 +1171,12 @@ async function executeTool(name, args, workspace, config, conversation) {
 
     case 'list_files': {
       const files = await window.api.listFiles(workspace);
-      const mappedFiles = files.map(f => ({ path: f.path, isDir: f.isDir, size: f.size }));
+      if (files && files.error) throw new Error(files.error);
+      const fileList = Array.isArray(files) ? files : (Array.isArray(files && files.files) ? files.files : []);
+      if (!Array.isArray(files) && !Array.isArray(files && files.files)) {
+        throw new Error('list_files returned an unexpected result shape.');
+      }
+      const mappedFiles = fileList.map(f => ({ path: f.path, isDir: f.isDir, size: f.size }));
       if (mappedFiles.length > 800) {
         return {
           files: mappedFiles.slice(0, 800),
@@ -1184,6 +1236,10 @@ async function executeTool(name, args, workspace, config, conversation) {
         if (beforePass && !testRes.success) {
           testFeedback = "\n[WARNING] REGRESSION DETECTED: Regression tests failed after this write. Please review your modifications.";
         }
+      }
+      const missingHtmlRefs = await findMissingHtmlLocalReferences(workspace, args.path, args.content);
+      if (missingHtmlRefs.length) {
+        testFeedback += `\n[WARNING] Missing local HTML references from ${args.path}: ${missingHtmlRefs.map(ref => `\`${ref}\``).join(', ')}. Create these files or remove the references before considering the UI verified.`;
       }
       
       return {
@@ -1889,6 +1945,12 @@ function hasOperationalMissionState(state) {
   return !!(state && (state.mission && state.mission.statement || state.winConditions && state.winConditions.length || state.activeSubplan));
 }
 
+function isTaskContinuationPrompt(prompt) {
+  const text = String(prompt || '').toLowerCase().trim();
+  if (!text) return false;
+  return /\b(continue|keep going|finish|finish this|lets finish|let's finish|resume|carry on|complete it|fix this|fix these|why didn't you catch|why did you not catch|catch and fix|not done|still broken|missing|error|console|failed to load|err_file_not_found)\b/.test(text);
+}
+
 function buildCompletionGateMessage(gate) {
   const parts = [`Completion gate status: ${gate.status}.`];
   if (gate.reasons && gate.reasons.length) parts.push(`Reasons: ${gate.reasons.join('; ')}`);
@@ -2493,7 +2555,36 @@ function isRealVerificationCommand(command) {
   const text = String(command || '').toLowerCase().trim();
   if (!text) return false;
   if (/^(mkdir|md|new-item|copy|cp|move|mv|ren|rename|dir|ls|get-childitem)\b/.test(text)) return false;
-  return /\b(pytest|unittest|python\s+-m\s+py_compile|python\s+-m\s+compileall|npm\s+test|npm\s+run\s+(test|build|lint|typecheck)|pnpm\s+(test|build|lint|typecheck)|yarn\s+(test|build|lint|typecheck)|node\s+--check|tsc\b|eslint\b|ruff\b|mypy\b|go\s+test|cargo\s+test|dotnet\s+test|mvn\s+test|gradle\s+test|smoke|--smoke-test|playwright|vitest|jest|tap|tape)\b/.test(text);
+  return /\b(pytest|unittest|python\s+-m\s+py_compile|python\s+-m\s+compileall|npm\s+test|npm\s+run\s+(test|build|lint|typecheck)|pnpm\s+(test|build|lint|typecheck)|yarn\s+(test|build|lint|typecheck)|node\s+--check|node\s+[\w./\\-]*test[\w./\\-]*\.js|tsc\b|eslint\b|ruff\b|mypy\b|go\s+test|cargo\s+test|dotnet\s+test|mvn\s+test|gradle\s+test|smoke|--smoke-test|playwright|vitest|jest|tap|tape)\b/.test(text);
+}
+
+async function findMissingHtmlLocalReferences(workspace, htmlPath, htmlContent) {
+  if (!/\.html?$/i.test(String(htmlPath || ''))) return [];
+  const text = String(htmlContent || '');
+  const refs = [];
+  const attrRegex = /\b(?:src|href)\s*=\s*["']([^"']+)["']/gi;
+  let match;
+  while ((match = attrRegex.exec(text))) {
+    const ref = String(match[1] || '').trim();
+    if (!ref || ref.startsWith('#') || /^[a-z][a-z0-9+.-]*:/i.test(ref) || ref.startsWith('//')) continue;
+    if (/^(data:|mailto:|tel:|javascript:)/i.test(ref)) continue;
+    const cleanRef = ref.split(/[?#]/)[0].replace(/^[\\/]+/, '');
+    if (!cleanRef) continue;
+    refs.push(cleanRef);
+  }
+
+  const baseDir = String(htmlPath || '').split(/[\\/]/).slice(0, -1).join('/');
+  const missing = [];
+  for (const ref of [...new Set(refs)]) {
+    const candidate = baseDir ? `${baseDir}/${ref}` : ref;
+    try {
+      const result = await window.api.readFile(workspace, candidate, { maxChars: 1 });
+      if (!result || result.error) missing.push(ref);
+    } catch (err) {
+      missing.push(ref);
+    }
+  }
+  return missing;
 }
 
 function isVerificationItem(item) {
@@ -3169,6 +3260,8 @@ function isGeminiHighDemandError(status, message) {
 
 function getNextGeminiModelForHighDemand(modelName) {
   const fallbackChain = {
+    'gemini-3.1-flash-lite': 'gemini-3.5-flash',
+    'gemini-3.5-flash': 'gemini-3.1-pro-preview',
     'gemini-2.5-flash-lite': 'gemini-2.5-flash',
     'gemini-2.5-flash': 'gemini-2.5-pro'
   };
@@ -4326,6 +4419,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     commandProvidesInput,
     isLocalSystemFactRequest,
     requestNeedsLocalInspection,
+    isTaskContinuationPrompt,
     isGenericNonAnswer,
     shouldHaveUsedToolsButDidNot,
     isFailedToolResult,

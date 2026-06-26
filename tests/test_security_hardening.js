@@ -65,6 +65,8 @@ test('renderer and package hardening are wired', (t) => {
   t.ok(packageJson.scripts.package.includes('--ignore="^/config\\.json$"'), 'package excludes local config');
   t.ok(packageJson.scripts.package.includes('--ignore="^/standalone-workspaces($|/)"'), 'package excludes generated standalone workspace state');
   t.ok(packageJson.scripts.package.includes('--ignore="^/\\.orion($|/)"'), 'package excludes generated operational context state');
+  t.ok(mainJs.includes('startStaticWorkspaceServer'), 'static HTML apps launch through a local server');
+  t.ok(mainJs.includes('shell.openExternal(url)'), 'static HTML launch uses http URL instead of file origin');
   t.end();
 });
 

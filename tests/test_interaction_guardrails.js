@@ -33,6 +33,8 @@ test('plan approval continuation is not stored as a fake user message', (t) => {
   t.ok(rendererJs.includes("internalPrompt: true"), 'plan approval run is passed as internal prompt');
   t.notOk(rendererJs.includes("conv.messages.push({ role: 'user', text: '[Start implementation]' })"), 'synthetic start implementation is not persisted as user');
   t.notOk(rendererJs.includes("renderUserMessage('[Start implementation]')"), 'synthetic start implementation is not rendered as user');
+  t.equal(agent.isTaskContinuationPrompt('lets finish this'), true, 'finish prompts preserve continuation mode');
+  t.equal(agent.isTaskContinuationPrompt("why didn't you catch and fix these console errors"), true, 'bug follow-up prompts preserve continuation mode');
   t.end();
 });
 
@@ -57,6 +59,7 @@ test('tool contract separates failed tools from task truth', (t) => {
   t.ok(agentJs.includes("Do not use web search to answer facts about the user's local machine"), 'system prompt blocks local-machine web fallback');
   t.ok(agentJs.includes('For local machine facts, a non-zero exit proves only that this command attempt failed'), 'run_command schema warns against overclaiming failed commands');
   t.ok(agentJs.includes('Do not use for facts about this local machine'), 'google_search schema blocks local-state usage');
+  t.ok(agentJs.includes('Do not rely on CDN-only frontend dependencies'), 'generated local apps should avoid CDN-only dependencies');
   t.ok(agentJs.includes('buildEpistemicCorrectionPrompt'), 'loop has an epistemic self-correction guard');
   t.ok(agentJs.includes('getEpistemicToolGate'), 'loop gates invalid tool escalation');
   t.end();
@@ -257,6 +260,8 @@ test('model API calls cannot sit indefinitely without visible cooldown status', 
   t.ok(agentJs.includes('isStopRequested'), 'retry wait can react to user stop');
   t.ok(agentJs.includes('agentSubStatus = warningMsg'), 'provider cooldown warnings update visible substatus');
   t.ok(agentJs.includes('Provider wait/cooldown active'), 'rate-limit retry state is explicit');
+  t.ok(agentJs.includes('candidate.finishReason === "MAX_TOKENS"'), 'MAX_TOKENS responses trigger continuation recovery');
+  t.ok(agentJs.includes('Continue from the exact current state'), 'MAX_TOKENS recovery avoids restarting work');
   t.end();
 });
 
@@ -292,6 +297,10 @@ test('post-edit evidence gate requires real verification before finalizing', (t)
   t.equal(agent.isRealVerificationCommand('mkdir assets'), false, 'folder creation is not verification');
   t.equal(agent.isRealVerificationCommand('python -m py_compile main.py'), true, 'Python compile check counts as verification');
   t.equal(agent.isRealVerificationCommand('npm test'), true, 'npm test counts as verification');
+  t.equal(agent.isRealVerificationCommand('node test.js'), true, 'node test.js counts as verification');
+  t.ok(agentJs.includes('postEditEvidenceLoopExtensions'), 'post-edit verification can extend loop budget before finalizing');
+  t.ok(agentJs.includes('completionGateLoopExtensions'), 'completion gate can extend loop budget before surfacing continue_work');
+  t.ok(agentJs.includes('Do not answer with another status-only summary'), 'completion gate pushes concrete work instead of status-only summaries');
 
   const changedOnly = [
     { kind: 'file', toolName: 'patch_file', path: 'main.py', status: 'done' },

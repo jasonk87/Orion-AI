@@ -17,6 +17,63 @@ const {
 let mainWindow;
 let companionServer = null;
 let companionToken = '';
+const staticWorkspaceServers = new Map();
+
+function getStaticMimeType(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  const map = {
+    '.html': 'text/html; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.js': 'application/javascript; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.svg': 'image/svg+xml',
+    '.ico': 'image/x-icon'
+  };
+  return map[ext] || 'application/octet-stream';
+}
+
+function startStaticWorkspaceServer(workspacePath) {
+  const key = path.resolve(workspacePath);
+  const existing = staticWorkspaceServers.get(key);
+  if (existing && existing.server && existing.url) return Promise.resolve(existing.url);
+
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      try {
+        const requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
+        const decodedPath = decodeURIComponent(requestUrl.pathname === '/' ? '/index.html' : requestUrl.pathname);
+        const requestedPath = path.resolve(key, `.${decodedPath}`);
+        if (requestedPath !== key && !requestedPath.startsWith(`${key}${path.sep}`)) {
+          res.writeHead(403);
+          res.end('Forbidden');
+          return;
+        }
+        fs.readFile(requestedPath, (err, data) => {
+          if (err) {
+            res.writeHead(404);
+            res.end('Not found');
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': getStaticMimeType(requestedPath) });
+          res.end(data);
+        });
+      } catch (err) {
+        res.writeHead(500);
+        res.end('Server error');
+      }
+    });
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      const url = `http://127.0.0.1:${address.port}/index.html`;
+      staticWorkspaceServers.set(key, { server, url });
+      resolve(url);
+    });
+  });
+}
 
 function stopPhoneCompanionServer() {
   return new Promise(resolve => {
@@ -2675,10 +2732,10 @@ ipcMain.handle('launch-workspace-app', async (event, workspacePath) => {
     
     // 1. Check for index.html (standard web games/apps)
     if (files.includes('index.html')) {
-      const fullPath = path.join(workspacePath, 'index.html');
       const { shell } = require('electron');
-      await shell.openPath(fullPath);
-      return { success: true, message: 'Opened index.html in default browser.' };
+      const url = await startStaticWorkspaceServer(workspacePath);
+      await shell.openExternal(url);
+      return { success: true, message: `Opened index.html at ${url}.`, url };
     }
     
     // 2. Check for package.json
