@@ -1458,9 +1458,40 @@ async function executeTool(name, args, workspace, config, conversation) {
         }
       });
       
-      const result = await window.api.runCommand(args.command, workspace, processId, timeoutMs);
+      let result = await window.api.runCommand(args.command, workspace, processId, timeoutMs);
       cleanOutput();
-      
+
+      // Auto-recovery: if pip install X==version failed with a source-build error, retry without version pin
+      const cmdStderr = stderrOutput || result.stderr || result.error || '';
+      const isPipBuildFailure = result.code !== 0
+        && /pip\s+install/i.test(args.command)
+        && /==\d/.test(args.command)
+        && /(Failed to build|Getting requirements to build wheel|error: subprocess-exited-with-error|No module named 'distutils)/i.test(cmdStderr);
+      if (isPipBuildFailure) {
+        const retryCmd = args.command.replace(/([a-zA-Z0-9_\-\.]+)==[\d][^\s]*/g, '$1');
+        currentAgentLogs.push({ type: 'thought', content: `pip build failure detected — retrying without version pin: ${retryCmd}` });
+        const retryId = `cmd_${conversation.id}_retry_${Date.now()}`;
+        let retryStdout = '', retryStderr = '';
+        const cleanRetry = window.api.onCommandOutput(retryId, (data) => {
+          if (data.type === 'stderr') retryStderr += data.text;
+          else retryStdout += data.text;
+        });
+        const retryResult = await window.api.runCommand(retryCmd, workspace, retryId, timeoutMs);
+        cleanRetry();
+        return {
+          exitCode: retryResult.code,
+          stdout: retryStdout || retryResult.stdout || '',
+          stderr: retryStderr || retryResult.stderr || retryResult.error || '',
+          timedOut: !!retryResult.timedOut,
+          killed: !!retryResult.killed,
+          timeoutMs: retryResult.timeoutMs || timeoutMs,
+          autoRetried: true,
+          originalCommand: args.command,
+          retryCommand: retryCmd,
+          retryReason: 'pip source-build failure — retried without version pin'
+        };
+      }
+
       return {
         exitCode: result.code,
         stdout: stdoutOutput || result.stdout || '',
