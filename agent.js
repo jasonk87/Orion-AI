@@ -2984,6 +2984,10 @@ Examples:
 - "can you find typos and structural faults in my project" -> direct
 - "review my code for issues" -> direct
 - "audit this codebase for security problems" -> direct
+- "how could we make this program better?" -> direct
+- "what improvements could we make to this app?" -> direct
+- "can you suggest ways to improve this project?" -> direct
+- "what would you recommend to enhance this?" -> direct
 - "explain how PATH works on Windows" -> answer
 - "build me a Python desktop app" -> plan
 - "refactor the authentication flow" -> plan
@@ -3083,6 +3087,16 @@ function classifySimpleTask(userPrompt) {
       route: 'local_project_review',
       mode: 'direct',
       reason: 'Read-only code review or bug hunt on a local project; inspect files and report findings without planning gates.'
+    };
+  }
+
+  // Improvement / suggestion questions about a local project — conversational, no plan approval needed
+  const improveIndicators = hasAnyToken(tokenSet, ['better', 'improvement', 'improvements', 'improve', 'enhance', 'enhancements', 'suggestion', 'suggestions', 'recommend', 'recommendations', 'optimize', 'optimise', 'refine', 'upgrade', 'strengthen', 'boost']);
+  if (improveIndicators && (describeNouns || localRef)) {
+    return {
+      route: 'local_project_improve',
+      mode: 'direct',
+      reason: 'Improvement or suggestion question about a local project; answer directly without planning gates.'
     };
   }
 
