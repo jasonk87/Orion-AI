@@ -1429,7 +1429,7 @@ function selectConversation(id) {
       if (msg.role === 'user') {
         renderUserMessage(msg.text);
       } else if (msg.role === 'assistant') {
-        renderAiMessage(msg.text, msg.logs);
+        renderAiMessage(msg.text, msg.logs, activeConversationId, msg);
       } else if (msg.role === 'system') {
         renderSystemBubble(msg.text);
       }
@@ -1805,7 +1805,7 @@ function renderPhoneCompanionPairingCard(payload) {
 }
 
 // Generates structural AI Response with step thought details
-function renderAiMessage(text, logs = [], conversationId = null) {
+function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null) {
   const targetId = conversationId || activeConversationId;
   if (targetId !== activeConversationId) {
     return;
@@ -1867,16 +1867,37 @@ function renderAiMessage(text, logs = [], conversationId = null) {
   const activeConv = typeof conversations !== 'undefined'
     ? conversations.find(c => c.id === activeConversationId)
     : null;
-  if (activeConv && activeConv.awaitingPlanApproval && !activeConv.planApproved && !(window.isAgentRunning && window.isAgentRunning())) {
-    planApprovalHtml = `
-      <div class="plan-approval-actions">
-        <div class="plan-approval-copy">
-          <span class="plan-approval-title">Plan ready for review</span>
-          <span class="plan-approval-subtitle">Start when the direction looks right.</span>
+  // Decide whether THIS bubble is the plan-approval card. On a fresh live render the message
+  // object is not threaded in, so fall back to conversation state (the active bubble during a
+  // planning yield is the plan bubble). On reloads the persisted msgMeta.isPlanApprovalCard
+  // identifies the exact bubble so the card does not bleed onto execution bubbles.
+  const isPlanBubble = msgMeta
+    ? !!msgMeta.isPlanApprovalCard
+    : !!(activeConv && activeConv.awaitingPlanApproval && !activeConv.planApproved);
+  if (isPlanBubble) {
+    if (activeConv && activeConv.planApproved) {
+      // The plan was approved — show a persistent "started" state instead of removing the card,
+      // so the chat clearly reflects that the button was pressed.
+      planApprovalHtml = `
+        <div class="plan-approval-actions approved">
+          <div class="plan-approval-copy">
+            <span class="plan-approval-title">Implementation started</span>
+            <span class="plan-approval-subtitle">Orion is building from this approved plan.</span>
+          </div>
+          <button class="btn-approve-plan approved" type="button" disabled>✓ Implementation Started</button>
         </div>
-        <button class="btn-approve-plan" type="button">Start Implementation</button>
-      </div>
-    `;
+      `;
+    } else if (activeConv && activeConv.awaitingPlanApproval && !(window.isAgentRunning && window.isAgentRunning())) {
+      planApprovalHtml = `
+        <div class="plan-approval-actions">
+          <div class="plan-approval-copy">
+            <span class="plan-approval-title">Plan ready for review</span>
+            <span class="plan-approval-subtitle">Start when the direction looks right.</span>
+          </div>
+          <button class="btn-approve-plan" type="button">Start Implementation</button>
+        </div>
+      `;
+    }
   }
   if (window.isAgentRunning && window.isAgentRunning() && runningConversationId === activeConversationId) {
     const stepNum = window.currentLoopCount || 1;
@@ -2684,7 +2705,16 @@ async function approveCurrentPlanAndContinue(options = {}) {
 
   if (button) {
     button.classList.add('approved');
+    button.disabled = true;
     button.textContent = '✓ Implementation Started';
+    // Update the surrounding card immediately so it matches the persistent "started" state
+    // rendered on reload — no flicker, and it clearly reflects that the button was pressed.
+    const card = button.closest('.plan-approval-actions');
+    if (card) card.classList.add('approved');
+    const title = card && card.querySelector('.plan-approval-title');
+    if (title) title.textContent = 'Implementation started';
+    const subtitle = card && card.querySelector('.plan-approval-subtitle');
+    if (subtitle) subtitle.textContent = 'Orion is building from this approved plan.';
   }
 
   conv.planApproved = true;

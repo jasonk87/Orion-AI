@@ -62,6 +62,24 @@ test('execution prompt after plan approval forbids restating or rewriting the pl
   t.end();
 });
 
+// Regression: the "Start Implementation" button used to revert to its unpressed state on any
+// re-render because the plan card only existed while awaitingPlanApproval. The plan bubble is
+// now marked persistently and re-renders into an "Implementation started" state after approval.
+test('plan approval button shows a persistent started state after it is pressed', (t) => {
+  // The plan bubble is marked so a reload can identify it without text guessing.
+  t.ok(agentJs.includes('isPlanApprovalCard = true'), 'the plan-approval bubble is marked on the stored message');
+  t.ok(rendererJs.includes('msgMeta'), 'renderAiMessage accepts the message object to identify the plan bubble');
+  t.ok(rendererJs.includes('renderAiMessage(msg.text, msg.logs, activeConversationId, msg)'), 'bulk reload threads the message object so the card persists');
+  // After approval the card renders a started state instead of disappearing.
+  t.ok(rendererJs.includes('✓ Implementation Started'), 'approved plan renders a persistent "Implementation Started" control');
+  t.ok(rendererJs.includes("plan-approval-actions approved"), 'approved card carries the started styling hook');
+  t.ok(rendererJs.includes('Implementation started'), 'approved card copy reflects that work has started');
+  // The approved/started styling exists in CSS.
+  const cssJs = fs.readFileSync(path.join(__dirname, '../styles.css'), 'utf8');
+  t.ok(cssJs.includes('.plan-approval-actions.approved'), 'CSS defines the approved card treatment');
+  t.end();
+});
+
 test('model call delay and repeated failure guardrails exist', (t) => {
   t.ok(rendererJs.includes('settingModelCallDelay'), 'model-call delay setting is wired in renderer');
   t.ok(agentJs.includes('config.modelCallDelayMs'), 'agent reads model-call delay config');

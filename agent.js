@@ -1233,7 +1233,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // Ensure the final text and logs are written and rendered
     conversation.messages[aiMessageIndex].text = lastTextResponse;
     conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
-    window.renderAiMessage(lastTextResponse, currentAgentLogs);
+    // Permanently mark the bubble that carries the plan-approval card so it can be re-rendered
+    // with a persistent "Implementation started" state after approval, instead of vanishing on
+    // the next reload and looking like the button was never pressed.
+    if (conversation.awaitingPlanApproval) {
+      conversation.messages[aiMessageIndex].isPlanApprovalCard = true;
+    }
+    window.renderAiMessage(lastTextResponse, currentAgentLogs, conversation.id, conversation.messages[aiMessageIndex]);
     if (window.api && window.api.writeRunArtifact && workWalkthrough.length > 0) {
       const artifactPayload = buildRunArtifactPayload({
         conversation,

@@ -1604,6 +1604,15 @@ code {
   border: 1px solid rgba(167, 139, 250, 0.22);
   border-radius: 8px;
   box-shadow: 0 14px 30px rgba(0, 0, 0, 0.18);
+  transition: var(--transition-fast);
+}
+
+/* Once the plan is approved the card shifts to a calmer "started" treatment so the chat
+   clearly shows the button was pressed, rather than the card disappearing. */
+.plan-approval-actions.approved {
+  background: rgba(16, 185, 129, 0.08);
+  border-color: rgba(16, 185, 129, 0.32);
+  box-shadow: none;
 }
 
 .plan-approval-copy {
