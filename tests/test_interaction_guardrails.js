@@ -401,7 +401,7 @@ test('phone standalone conversations get isolated workspaces', (t) => {
   t.ok(rendererJs.includes('Desktop\\\\Projects\\\\OrionAI\\\\standalone-workspaces'), 'default standalone root lives under OrionAI project folder');
   t.ok(rendererJs.includes('function createPhoneConversation'), 'phone conversations use a dedicated constructor');
   t.ok(rendererJs.includes('projectPath: normalizedProjectPath'), 'phone constructor preserves explicit project linkage only');
-  t.ok(rendererJs.includes('conv.workspace = conv.projectPath || getStandaloneWorkspaceForTitle(conv.title)'), 'standalone phone prompt initializes an isolated workspace');
+  t.ok(rendererJs.includes('conv.workspace = conv.projectPath || getStandaloneWorkspaceForTitle(conv.title, conv.id)'), 'standalone phone prompt initializes an isolated workspace');
   t.end();
 });
 

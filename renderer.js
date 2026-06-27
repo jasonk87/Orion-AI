@@ -1230,9 +1230,12 @@ function getStandaloneWorkspaceRoot() {
   return appConfig.standaloneWorkspaceDefault || 'C:\\Users\\Owner\\Desktop\\Projects\\OrionAI\\standalone-workspaces';
 }
 
-function getStandaloneWorkspaceForTitle(title) {
+function getStandaloneWorkspaceForTitle(title, convId) {
   const slug = slugify(title || 'new-conversation') || 'new-conversation';
-  return getStandaloneWorkspaceRoot() + '\\' + slug;
+  // Append a short unique suffix derived from the conversation ID so two
+  // conversations with identical titles never share the same workspace folder.
+  const suffix = convId ? '-' + String(convId).replace(/[^a-z0-9]/gi, '').slice(-8) : '';
+  return getStandaloneWorkspaceRoot() + '\\' + slug + suffix;
 }
 
 function createPhoneConversation({ projectPath = '', title = 'New Phone Task' } = {}) {
@@ -1487,10 +1490,10 @@ async function submitMessage() {
     if (conv.projectPath) {
       conv.workspace = conv.projectPath;
     } else {
-      conv.workspace = getStandaloneWorkspaceForTitle(title);
+      conv.workspace = getStandaloneWorkspaceForTitle(title, conv.id);
     }
   }
-  
+
   // Ensure currentWorkspace is locked onto this isolated folder
   currentWorkspace = conv.workspace;
   expandedFileFolders = new Set();
@@ -2495,7 +2498,7 @@ window.submitPhoneCompanionPrompt = async (options) => {
   }
   normalizeConversationWorkspace(conv);
   if (!conv.workspace) {
-    conv.workspace = conv.projectPath || getStandaloneWorkspaceForTitle(conv.title);
+    conv.workspace = conv.projectPath || getStandaloneWorkspaceForTitle(conv.title, conv.id);
   }
   saveConversationsToStorage();
 
