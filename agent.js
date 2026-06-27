@@ -357,10 +357,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     }
   );
 
-  // Recovery: if the flag wasn't set but user is clearly approving, check disk for a valid plan
-  if (!isInternalPrompt && !conversation.awaitingPlanApproval && !conversation.planApproved && workspacePath) {
+  // Recovery: if the flag wasn't set but user is clearly approving or trying to continue,
+  // check disk for a valid plan and restore the approval gate.
+  // Only trigger when there's no operational mission state — if work has already started
+  // (operational context populated), "continue" means actual continuation, not plan approval.
+  if (!isInternalPrompt && !conversation.awaitingPlanApproval && !conversation.planApproved && workspacePath && !hasOperationalMissionState(workingState)) {
     const fastIntent = classifyPlanApprovalIntentFast(userPrompt);
-    if (fastIntent === 'approve') {
+    const isContinuationApproval = /\b(continue|keep going|proceed|go ahead|let'?s? go|move on|start it|build it)\b/i.test(String(userPrompt || ''));
+    if (fastIntent === 'approve' || isContinuationApproval) {
       try {
         const planContent = await window.api.readFile(workspacePath, 'implementation_plan.md', { maxChars: 100000 });
         const planText = typeof planContent === 'string' ? planContent : (planContent && !planContent.error ? planContent.content || '' : '');
@@ -2919,7 +2923,7 @@ function hasAnyChecklist(conversation) {
 
 function classifyPlanApprovalIntentFast(prompt) {
   const text = String(prompt || '').toLowerCase().trim().replace(/[!.,]+$/, '');
-  const approveWords = /^(approved?|yes|yep|yeah|yup|ok|okay|go|start|proceed|confirm|looks? good|go ahead|let'?s? go|do it|sounds? good|great|perfect|good|correct|right|alright|ship it|execute|begin|run it|build it)$/;
+  const approveWords = /^(approved?|yes|yep|yeah|yup|ok|okay|go|start|proceed|continue|keep going|confirm|looks? good|go ahead|let'?s? go|do it|sounds? good|great|perfect|good|correct|right|alright|ship it|execute|begin|run it|build it|move on)$/;
   const denyWords = /^(no|nope|cancel|stop|abort|deny|reject|don'?t)$/;
   const reviseWords = /^(change|update|revise|modify|edit|adjust|fix|add|remove|rethink|reconsider|wait|hold on|actually|instead)\b/;
   if (approveWords.test(text)) return 'approve';
