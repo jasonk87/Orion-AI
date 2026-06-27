@@ -310,8 +310,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const operationalContext = await readOperationalContext(workspacePath);
   let workingState = operationalContext.state;
   const isContinuationRequest = isTaskContinuationPrompt(userPrompt) && hasOperationalMissionState(workingState);
+  // A "continue"/"approved"/"go" style message is never a brand-new task, so it must not
+  // wipe an already-approved plan — even when the operational context JSON was never populated
+  // (the model may have only written STRATEGY.md/implementation_plan.md as markdown).
+  const isProgressionMessage = isTaskContinuationPrompt(userPrompt) || classifyPlanApprovalIntentFast(userPrompt) === 'approve';
 
-  if (!isInternalPrompt && !conversation.awaitingPlanApproval && !isContinuationRequest) {
+  if (!isInternalPrompt && !conversation.awaitingPlanApproval && !isContinuationRequest && !(conversation.planApproved && isProgressionMessage)) {
     conversation.planApproved = false;
     // Clear stale operational context (blockers, win conditions, mission) from previous runs
     if (workspacePath && hasOperationalMissionState(workingState)) {
