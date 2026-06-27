@@ -1705,6 +1705,67 @@ function companionHtml(pairingCode) {
       form { left: 50%; transform: translateX(-50%); max-width: 760px; }
       .meta { max-width: 520px; }
     }
+    /* ── NEW TASK BOTTOM SHEET ──────────────────── */
+    .sheet-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.52); z-index:40; backdrop-filter:blur(3px); -webkit-backdrop-filter:blur(3px); }
+    .sheet-overlay.open { display:block; }
+    .new-task-sheet {
+      position:fixed; bottom:0; left:0; right:0; z-index:41;
+      background:var(--panel-strong); border-radius:24px 24px 0 0;
+      border-top:1px solid var(--line);
+      box-shadow:0 -24px 60px rgba(0,0,0,.48);
+      padding-bottom:calc(24px + env(safe-area-inset-bottom));
+      transform:translateY(100%);
+      transition:transform .32s cubic-bezier(.2,.8,.2,1);
+      max-height:86vh; overflow-y:auto;
+    }
+    .new-task-sheet.open { transform:translateY(0); }
+    .sheet-handle { width:36px; height:4px; background:rgba(255,255,255,.18); border-radius:2px; margin:10px auto 18px; }
+    .sheet-header { padding:0 20px 14px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); }
+    .sheet-title { font-size:1rem; font-weight:700; color:var(--text); }
+    .sheet-close-btn { width:30px; height:30px; border-radius:50%; background:rgba(255,255,255,.07); border:1px solid var(--line); color:var(--muted); font-size:1.1rem; cursor:pointer; display:grid; place-items:center; line-height:1; }
+    .sheet-section { padding:14px 20px 0; }
+    .sheet-label { font-size:.68rem; font-weight:700; letter-spacing:.08em; color:var(--muted); text-transform:uppercase; margin-bottom:9px; }
+    .proj-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .proj-tile {
+      padding:11px 13px; border-radius:14px;
+      border:1px solid var(--line); background:rgba(17,23,36,.7);
+      cursor:pointer; transition:border-color .15s,background .15s,transform .12s;
+      text-align:left;
+    }
+    .proj-tile:active { transform:scale(.97); }
+    .proj-tile.selected { border-color:rgba(130,115,244,.55); background:rgba(130,115,244,.12); box-shadow:0 0 0 2px rgba(130,115,244,.12); }
+    .proj-tile.standalone { grid-column:1/-1; border-color:rgba(70,213,155,.22); background:rgba(70,213,155,.05); }
+    .proj-tile.standalone.selected { border-color:rgba(70,213,155,.55); background:rgba(70,213,155,.1); }
+    .proj-tile-name { font-size:.86rem; font-weight:650; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .proj-tile.standalone .proj-tile-name { color:var(--success); }
+    .proj-tile-meta { font-size:.71rem; color:var(--muted); margin-top:3px; }
+    .sheet-textarea { width:100%; min-height:78px; background:rgba(9,11,18,.7); border:1px solid var(--line); border-radius:14px; color:var(--text); font-size:.95rem; font-family:inherit; padding:12px 14px; resize:none; outline:none; box-sizing:border-box; margin-top:12px; }
+    .sheet-textarea:focus { border-color:rgba(130,115,244,.62); box-shadow:0 0 0 3px rgba(130,115,244,.09); }
+    .sheet-textarea::placeholder { color:#657086; }
+    .sheet-start-btn { margin-top:10px; width:100%; min-height:48px; border-radius:14px; background:linear-gradient(145deg,#8f80ff,#6654e7); color:white; font-size:.95rem; font-weight:700; border:0; cursor:pointer; box-shadow:0 12px 28px rgba(85,67,216,.28); transition:opacity .15s,transform .12s; }
+    .sheet-start-btn:active { transform:scale(.98); opacity:.9; }
+    .sheet-start-btn:disabled { opacity:.45; cursor:not-allowed; }
+    /* ── FORM MODE BAR (steer / revise) ─────────── */
+    .form-mode-bar { display:none; align-items:center; gap:8px; padding:8px 20px 0; font-size:.78rem; font-weight:650; }
+    .form-mode-bar.visible { display:flex; }
+    .form-mode-bar .mode-icon { font-size:.85rem; }
+    .form-mode-bar .mode-label { color:var(--warning); }
+    .form-mode-bar.revise-mode .mode-label { color:var(--accent); }
+    .form-mode-bar .mode-cancel { margin-left:auto; padding:3px 10px; border-radius:999px; background:rgba(255,255,255,.06); border:1px solid var(--line); color:var(--muted); font-size:.73rem; cursor:pointer; }
+    /* ── TOP ROW ─────────────────────────────────── */
+    .workspace-header-row { display:flex; align-items:center; gap:8px; padding-bottom:4px; }
+    .workspace-header-row .sub-panel-title { flex:1; }
+    .btn-new-task { padding:6px 14px; border-radius:999px; background:rgba(130,115,244,.15); border:1px solid rgba(130,115,244,.28); color:#c9c2ff; font-size:.8rem; font-weight:700; cursor:pointer; white-space:nowrap; transition:background .15s; }
+    .btn-new-task:active { background:rgba(130,115,244,.26); }
+    /* ── CONTEXTUAL CONTROLS ─────────────────────── */
+    .ctx-controls-running, .ctx-controls-idle { display:none; }
+    .ctx-controls-running.visible, .ctx-controls-idle.visible { display:block; }
+    /* ── MESSAGE MARKDOWN ────────────────────────── */
+    .message code { font-family:'JetBrains Mono',monospace; font-size:.82em; background:rgba(130,115,244,.14); border:1px solid rgba(130,115,244,.18); border-radius:5px; padding:1px 5px; }
+    .message pre { background:rgba(9,11,18,.8); border:1px solid var(--line); border-radius:10px; padding:12px 14px; overflow-x:auto; margin:8px 0; }
+    .message pre code { background:none; border:none; padding:0; font-size:.82rem; color:#78e7b7; }
+    .message strong { color:var(--text); font-weight:700; }
+    .message em { font-style:italic; color:var(--muted); }
   </style>
 </head>
 <body>
@@ -1726,19 +1787,12 @@ function companionHtml(pairingCode) {
     <main>
       <!-- Mobile task console -->
       <section class="dashboard-panel">
-        <div class="panel-header-row">
-          <div class="sub-panel-title">Projects</div>
-          <button id="new-task" type="button" class="btn-sm-primary">Chat</button>
+        <div class="workspace-header-row">
+          <div class="sub-panel-title">Tasks</div>
+          <span class="badge muted" id="project-count-badge">0 Projects</span>
+          <button id="new-task" type="button" class="btn-new-task">+ New Task</button>
         </div>
-        <div class="dashboard-card project-select-panel">
-          <div class="panel-header-row">
-            <div class="sub-panel-title">Chats</div>
-            <span class="badge muted" id="project-count-badge">0 Projects</span>
-          </div>
-          <select id="project-select">
-            <option value="">Standalone conversation</option>
-          </select>
-        </div>
+        <select id="project-select" style="display:none;"><option value="">Standalone conversation</option></select>
         
         <div id="active-task-container" class="dashboard-card active-card">
           <div class="empty">Loading tasks...</div>
@@ -1766,13 +1820,17 @@ function companionHtml(pairingCode) {
         </section>
 
         <div class="action-grouping">
-          <div class="control-row">
-            <button id="steer-task" type="button">Steer Work</button>
+          <div class="ctx-controls-running" id="ctx-controls-running">
+            <div class="control-row">
+              <button id="steer-task" type="button">Steer</button>
+              <button id="stop-task" type="button">Pause</button>
+            </div>
           </div>
-          <div class="control-row">
-            <button id="stop-task" type="button">Pause / Stop</button>
-            <button id="resume-task" type="button">Resume</button>
-            <button id="refresh-state" type="button">Refresh</button>
+          <div class="ctx-controls-idle" id="ctx-controls-idle">
+            <div class="control-row">
+              <button id="resume-task" type="button">Resume</button>
+              <button id="refresh-state" type="button">Refresh</button>
+            </div>
           </div>
         </div>
 
@@ -1825,6 +1883,34 @@ function companionHtml(pairingCode) {
       </div>
     </main>
   </div>
+  <!-- New Task Bottom Sheet -->
+  <div class="sheet-overlay" id="sheet-overlay"></div>
+  <div class="new-task-sheet" id="new-task-sheet">
+    <div class="sheet-handle"></div>
+    <div class="sheet-header">
+      <div class="sheet-title">New Task</div>
+      <button class="sheet-close-btn" id="sheet-close" type="button">&#x2715;</button>
+    </div>
+    <div class="sheet-section">
+      <div class="sheet-label">Select a project</div>
+      <div class="proj-grid" id="proj-grid">
+        <div class="proj-tile standalone selected" data-path="">
+          <div class="proj-tile-name">&#x2726; Standalone</div>
+          <div class="proj-tile-meta">No project workspace</div>
+        </div>
+      </div>
+    </div>
+    <div class="sheet-section">
+      <div class="sheet-label">Initial prompt <span style="font-weight:400;text-transform:none;letter-spacing:0;color:#657086;">(optional)</span></div>
+      <textarea class="sheet-textarea" id="sheet-prompt" placeholder="What should Orion build or work on?" rows="3"></textarea>
+      <button class="sheet-start-btn" id="sheet-start" type="button">Start Task</button>
+    </div>
+  </div>
+  <div class="form-mode-bar" id="form-mode-bar">
+    <span class="mode-icon">&#x25B6;</span>
+    <span class="mode-label" id="form-mode-label">Steering</span>
+    <button class="mode-cancel" id="form-mode-cancel" type="button">Cancel</button>
+  </div>
   <form id="prompt-form"><div class="composer"><textarea id="prompt" placeholder="Ask Orion..." autocomplete="off" rows="2"></textarea><button class="send-button" id="send" type="submit">Send</button></div></form>
   <script>
     const pairingCode = ${JSON.stringify(pairingCode)};
@@ -1848,7 +1934,7 @@ function companionHtml(pairingCode) {
     const steerTaskEl = document.getElementById('steer-task');
     const projectSelectEl = document.getElementById('project-select');
     const projectCountBadgeEl = document.getElementById('project-count-badge');
-    
+
     // New Console elements
     const globalIndicatorBanner = document.getElementById('global-indicator-banner');
     const activeTaskContainer = document.getElementById('active-task-container');
@@ -1861,14 +1947,120 @@ function companionHtml(pairingCode) {
     const missionContextObjective = document.getElementById('mission-context-objective');
     const missionContextConditions = document.getElementById('mission-context-conditions');
     const missionContextBlockers = document.getElementById('mission-context-blockers');
-    
+
     const installTipEl = document.getElementById('install-tip');
     const form = document.getElementById('prompt-form');
-    
+    const promptEl = document.getElementById('prompt');
+    const formModeBar = document.getElementById('form-mode-bar');
+    const formModeLabel = document.getElementById('form-mode-label');
+    const formModeCancel = document.getElementById('form-mode-cancel');
+    const sheetOverlay = document.getElementById('sheet-overlay');
+    const newTaskSheet = document.getElementById('new-task-sheet');
+    const sheetClose = document.getElementById('sheet-close');
+    const projGrid = document.getElementById('proj-grid');
+    const sheetPrompt = document.getElementById('sheet-prompt');
+    const sheetStart = document.getElementById('sheet-start');
+    const ctxRunning = document.getElementById('ctx-controls-running');
+    const ctxIdle = document.getElementById('ctx-controls-idle');
+
     let lastSignature = '';
     let projectSelectInitialized = false;
     let lastProjectOptionsSignature = '';
     let currentConversationId = '';
+    let formMode = 'prompt'; // 'prompt' | 'steer' | 'revise'
+    let availableProjects = [];
+    let selectedSheetProject = '';
+
+    // ── Simple markdown renderer ──────────────────────────────
+    function renderMarkdown(text) {
+      if (!text) return '';
+      let s = String(text);
+      const blocks = [];
+      s = s.replace(/\`\`\`([\w]*)\n?([\s\S]*?)\`\`\`/g, (_, lang, code) => {
+        const idx = blocks.length;
+        blocks.push('<pre><code>' + escapeHtml(code.replace(/^\n|\n$/g, '')) + '</code></pre>');
+        return '\x00BLOCK' + idx + '\x00';
+      });
+      s = escapeHtml(s);
+      s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+      s = s.replace(/\*(.+?)\*/g, '<em>$1</em>');
+      s = s.replace(/\`([^\`]+?)\`/g, '<code>$1</code>');
+      s = s.replace(/\n/g, '<br>');
+      s = s.replace(/\x00BLOCK(\d+)\x00/g, (_, i) => blocks[parseInt(i)]);
+      return s;
+    }
+
+    // ── Form mode (steer / revise / prompt) ──────────────────
+    function setFormMode(mode) {
+      formMode = mode;
+      if (mode === 'steer') {
+        formModeBar.className = 'form-mode-bar visible';
+        formModeLabel.textContent = 'Steering active work';
+        promptEl.placeholder = 'How should Orion adjust its approach?';
+        promptEl.focus();
+      } else if (mode === 'revise') {
+        formModeBar.className = 'form-mode-bar revise-mode visible';
+        formModeLabel.textContent = 'Revising plan';
+        promptEl.placeholder = 'What should change in the plan?';
+        promptEl.focus();
+      } else {
+        formMode = 'prompt';
+        formModeBar.className = 'form-mode-bar';
+        promptEl.placeholder = 'Ask Orion...';
+      }
+    }
+    formModeCancel.addEventListener('click', () => setFormMode('prompt'));
+
+    // ── New Task Sheet ────────────────────────────────────────
+    function openSheet() {
+      sheetOverlay.classList.add('open');
+      newTaskSheet.classList.add('open');
+      rebuildProjGrid();
+      sheetPrompt.value = '';
+      setTimeout(() => sheetPrompt.focus(), 320);
+    }
+    function closeSheet() {
+      sheetOverlay.classList.remove('open');
+      newTaskSheet.classList.remove('open');
+    }
+    function selectSheetProject(path) {
+      selectedSheetProject = path;
+      projGrid.querySelectorAll('.proj-tile').forEach(t => t.classList.toggle('selected', t.dataset.path === path));
+    }
+    function rebuildProjGrid() {
+      let html = '<div class="proj-tile standalone' + (selectedSheetProject === '' ? ' selected' : '') + '" data-path=""><div class="proj-tile-name">&#x2726; Standalone</div><div class="proj-tile-meta">No project workspace</div></div>';
+      availableProjects.forEach(p => {
+        const meta = p.conversationCount ? p.conversationCount + ' conversation' + (p.conversationCount === 1 ? '' : 's') : 'No conversations yet';
+        html += '<div class="proj-tile' + (selectedSheetProject === p.path ? ' selected' : '') + '" data-path="' + escapeHtml(p.path) + '"><div class="proj-tile-name">' + escapeHtml(p.name) + '</div><div class="proj-tile-meta">' + escapeHtml(meta) + '</div></div>';
+      });
+      projGrid.innerHTML = html;
+      projGrid.querySelectorAll('.proj-tile').forEach(t => t.addEventListener('click', () => selectSheetProject(t.dataset.path)));
+    }
+    sheetOverlay.addEventListener('click', closeSheet);
+    sheetClose.addEventListener('click', closeSheet);
+    newTaskEl.addEventListener('click', openSheet);
+    sheetStart.addEventListener('click', async () => {
+      sheetStart.disabled = true;
+      const projectPath = selectedSheetProject;
+      const initialPrompt = sheetPrompt.value.trim();
+      try {
+        const res = await companionFetch('/api/conversations/new', { method: 'POST', body: JSON.stringify({ prompt: '', projectPath }) });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'New task failed');
+        currentConversationId = data.conversationId || currentConversationId;
+        closeSheet();
+        if (initialPrompt) {
+          const pRes = await companionFetch('/api/prompt', { method: 'POST', body: JSON.stringify({ prompt: initialPrompt }) });
+          const pData = await pRes.json();
+          if (!pData.success) statusEl.textContent = pData.error || 'Send failed';
+        }
+        await loadState();
+      } catch (err) {
+        statusEl.textContent = err.message;
+      } finally {
+        sheetStart.disabled = false;
+      }
+    });
     
     function escapeHtml(value) { return String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch])); }
     
@@ -2085,34 +2277,26 @@ function companionHtml(pairingCode) {
         launchLogsContainer.textContent = preview.appLaunchLogs || 'No launch logs yet.';
 
         const projects = Array.isArray(state.projects) ? state.projects : [];
-        const projectOptionsSignature = JSON.stringify(projects.map(project => ({
-          path: project.path,
-          name: project.name,
-          conversationCount: project.conversationCount
-        })));
-        if (document.activeElement !== projectSelectEl && projectOptionsSignature !== lastProjectOptionsSignature) {
-          const selectedProject = projectSelectEl.value;
-          projectSelectEl.innerHTML = '<option value="">Standalone conversation</option>' + projects.map(project => {
-            const label = project.name + (project.conversationCount ? ' (' + project.conversationCount + ')' : '');
-            return '<option value="' + escapeHtml(project.path) + '">' + escapeHtml(label) + '</option>';
-          }).join('');
-          if (selectedProject && projects.some(project => project.path === selectedProject)) {
-            projectSelectEl.value = selectedProject;
-          } else if (!projectSelectInitialized && state.workspace && projects.some(project => project.path === state.workspace)) {
-            projectSelectEl.value = state.workspace;
-          }
-          projectSelectInitialized = true;
-          lastProjectOptionsSignature = projectOptionsSignature;
-        } else if (!projectSelectInitialized && document.activeElement !== projectSelectEl) {
-          projectSelectInitialized = true;
-        }
+        availableProjects = projects;
         projectCountBadgeEl.textContent = projects.length + (projects.length === 1 ? ' Project' : ' Projects');
+
+        // Keep hidden select in sync for compatibility
+        const projectOptionsSignature = JSON.stringify(projects.map(p => p.path));
+        if (projectOptionsSignature !== lastProjectOptionsSignature) {
+          projectSelectEl.innerHTML = '<option value="">Standalone conversation</option>' + projects.map(p => '<option value="' + escapeHtml(p.path) + '">' + escapeHtml(p.name) + '</option>').join('');
+          lastProjectOptionsSignature = projectOptionsSignature;
+        }
+
+        // Update contextual controls visibility
+        const isRunning = !!state.running;
+        ctxRunning.classList.toggle('visible', isRunning);
+        ctxIdle.classList.toggle('visible', !isRunning);
 
         // 7. Render Messages Feed
         const signature = JSON.stringify({ running: state.running, subStatus: state.subStatus, plan: state.awaitingPlanApproval, conversations: state.conversations, projects: state.projects, messages: state.messages });
         if (signature !== lastSignature) {
           lastSignature = signature;
-          messagesEl.innerHTML = !state.messages || state.messages.length === 0 ? '<div class="empty">No messages yet.</div>' : state.messages.map(msg => '<div class="message ' + escapeHtml(msg.role) + '"><span class="role">' + escapeHtml(msg.role) + '</span>' + escapeHtml(msg.text) + '</div>').join('');
+          messagesEl.innerHTML = !state.messages || state.messages.length === 0 ? '<div class="empty">No messages yet.</div>' : state.messages.map(msg => '<div class="message ' + escapeHtml(msg.role) + '"><span class="role">' + escapeHtml(msg.role) + '</span>' + (msg.role === 'system' ? escapeHtml(msg.text) : renderMarkdown(msg.text)) + '</div>').join('');
           messagesEl.scrollTop = messagesEl.scrollHeight;
         }
       } catch (error) {
@@ -2142,30 +2326,9 @@ function companionHtml(pairingCode) {
       if (!data.success) statusEl.textContent = data.error || 'Deny failed';
       await loadState();
     });
-    revisePlanEl.addEventListener('click', async () => {
-      const feedback = prompt('Revision note for Orion:', 'Revise the plan before implementing.');
-      if (!feedback) return;
-      const res = await companionFetch('/api/revise-plan', { method: 'POST', body: JSON.stringify({ feedback }) });
-      const data = await res.json();
-      if (!data.success) statusEl.textContent = data.error || 'Revision failed';
-      await loadState();
-    });
+    revisePlanEl.addEventListener('click', () => setFormMode('revise'));
     refreshStateEl.addEventListener('click', loadState);
-    newTaskEl.addEventListener('click', async () => {
-      const projectPath = projectSelectEl.value || '';
-      const res = await companionFetch('/api/conversations/new', { method:'POST', body: JSON.stringify({ prompt: '', projectPath }) });
-      const data = await res.json();
-      if (!data.success) statusEl.textContent = data.error || 'New task failed';
-      await loadState();
-    });
-    steerTaskEl.addEventListener('click', async () => {
-      const prompt = window.prompt('Steer active work:', '');
-      if (!prompt) return;
-      const res = await companionFetch('/api/steer', { method:'POST', body: JSON.stringify({ prompt }) });
-      const data = await res.json();
-      if (!data.success) statusEl.textContent = data.error || 'Steer failed';
-      await loadState();
-    });
+    steerTaskEl.addEventListener('click', () => setFormMode('steer'));
     stopTaskEl.addEventListener('click', async () => {
       stopTaskEl.disabled = true;
       statusEl.textContent = 'Stopping active work...';
@@ -2196,22 +2359,33 @@ function companionHtml(pairingCode) {
     });
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
-      const prompt = document.getElementById('prompt').value.trim();
-      if (!prompt) return;
+      const text = promptEl.value.trim();
+      if (!text) return;
       document.getElementById('send').disabled = true;
       statusEl.textContent = 'Sending...';
       try {
-        if (!currentConversationId) {
-          const projectPath = projectSelectEl.value || '';
-          const newTaskRes = await companionFetch('/api/conversations/new', { method: 'POST', body: JSON.stringify({ prompt: '', projectPath }) });
-          const newTask = await newTaskRes.json();
-          if (!newTask.success) throw new Error(newTask.error || 'New task failed');
-          currentConversationId = newTask.conversationId || currentConversationId;
+        if (formMode === 'steer') {
+          const res = await companionFetch('/api/steer', { method: 'POST', body: JSON.stringify({ prompt: text }) });
+          const data = await res.json();
+          if (!data.success) throw new Error(data.error || 'Steer failed');
+          setFormMode('prompt');
+        } else if (formMode === 'revise') {
+          const res = await companionFetch('/api/revise-plan', { method: 'POST', body: JSON.stringify({ feedback: text }) });
+          const data = await res.json();
+          if (!data.success) throw new Error(data.error || 'Revision failed');
+          setFormMode('prompt');
+        } else {
+          if (!currentConversationId) {
+            const newTaskRes = await companionFetch('/api/conversations/new', { method: 'POST', body: JSON.stringify({ prompt: '', projectPath: '' }) });
+            const newTask = await newTaskRes.json();
+            if (!newTask.success) throw new Error(newTask.error || 'New task failed');
+            currentConversationId = newTask.conversationId || currentConversationId;
+          }
+          const res = await companionFetch('/api/prompt', { method: 'POST', body: JSON.stringify({ prompt: text }) });
+          const data = await res.json();
+          if (!data.success) throw new Error(data.error || 'Send failed');
         }
-        const res = await companionFetch('/api/prompt', { method: 'POST', body: JSON.stringify({ prompt }) });
-        const data = await res.json();
-        if (!data.success) throw new Error(data.error || 'Send failed');
-        document.getElementById('prompt').value = '';
+        promptEl.value = '';
         await loadState();
       } catch (error) {
         statusEl.textContent = error.message;
@@ -2219,7 +2393,7 @@ function companionHtml(pairingCode) {
         document.getElementById('send').disabled = false;
       }
     });
-    document.getElementById('prompt').addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); form.requestSubmit(); } });
+    promptEl.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); form.requestSubmit(); } });
     
     // Wire tab clicks
     document.querySelectorAll('.tab-btn').forEach(btn => {
