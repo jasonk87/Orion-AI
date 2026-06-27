@@ -649,8 +649,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           const partialText = modelParts.map(part => part.text || '').join('').trim();
           if (partialText) {
             lastTextResponse = partialText;
-            conversation.messages[aiMessageIndex].text = withWorkWalkthrough(lastTextResponse, workWalkthrough, false);
-            window.renderAiMessage(conversation.messages[aiMessageIndex].text, currentAgentLogs);
+            conversation.messages[aiMessageIndex].text = lastTextResponse;
+            window.renderAiMessage(lastTextResponse, currentAgentLogs);
           }
           messages.push({
             role: 'model',
@@ -725,10 +725,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // Update live chat bubbles — skip render when there are no tool calls so the
       // final answer isn't shown with the "Working..." spinner still attached; the
       // finally block will render once isAgentRunning is already false.
-      conversation.messages[aiMessageIndex].text = withWorkWalkthrough(lastTextResponse, workWalkthrough, false);
+      conversation.messages[aiMessageIndex].text = lastTextResponse;
       conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
       if (functionCalls.length > 0) {
-        window.renderAiMessage(conversation.messages[aiMessageIndex].text, currentAgentLogs);
+        window.renderAiMessage(lastTextResponse, currentAgentLogs);
       }
 
       // If no tool calls, the agent is done, unless there are pending tasks in the checklist
@@ -878,9 +878,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         const walkthroughItem = summarizeToolStart(toolName, args);
         if (walkthroughItem) {
           workWalkthrough.push(walkthroughItem);
-          conversation.messages[aiMessageIndex].text = withWorkWalkthrough(lastTextResponse, workWalkthrough, false);
         }
-        window.renderAiMessage(conversation.messages[aiMessageIndex].text || lastTextResponse, currentAgentLogs);
+        window.renderAiMessage(lastTextResponse, currentAgentLogs);
         
         // Safety gate for planning mode
         if (!canExecuteThisTask() && config.planningMode && planningDecision.mode === 'plan' && (
@@ -1038,8 +1037,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         });
         
         // Re-render UI with logs
-        conversation.messages[aiMessageIndex].text = withWorkWalkthrough(lastTextResponse, workWalkthrough, false);
-        window.renderAiMessage(conversation.messages[aiMessageIndex].text, currentAgentLogs);
+        conversation.messages[aiMessageIndex].text = lastTextResponse;
+        window.renderAiMessage(lastTextResponse, currentAgentLogs);
       }
       
       // Append tool response parts to message history
@@ -1048,7 +1047,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // Save api response details to current turn
       currentTurn.toolResponseParts = toolResponseParts;
       
-      conversation.messages[aiMessageIndex].text = withWorkWalkthrough(lastTextResponse, workWalkthrough, false);
+      conversation.messages[aiMessageIndex].text = lastTextResponse;
       conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
       window.saveConversationsToStorage();
       
