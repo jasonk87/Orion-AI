@@ -359,9 +359,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
   // Recovery: if the flag wasn't set but user is clearly approving or trying to continue,
   // check disk for a valid plan and restore the approval gate.
-  // Only trigger when there's no operational mission state — if work has already started
-  // (operational context populated), "continue" means actual continuation, not plan approval.
-  if (!isInternalPrompt && !conversation.awaitingPlanApproval && !conversation.planApproved && workspacePath && !hasOperationalMissionState(workingState)) {
+  // planApproved=false means the plan was never approved, so no implementation work could
+  // have started. "continue" in this state can only mean "start the plan", not resume work.
+  if (!isInternalPrompt && !conversation.awaitingPlanApproval && !conversation.planApproved && workspacePath) {
     const fastIntent = classifyPlanApprovalIntentFast(userPrompt);
     const isContinuationApproval = /\b(continue|keep going|proceed|go ahead|let'?s? go|move on|start it|build it)\b/i.test(String(userPrompt || ''));
     if (fastIntent === 'approve' || isContinuationApproval) {
