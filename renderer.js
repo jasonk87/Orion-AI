@@ -469,7 +469,7 @@ async function setWorkspace(folderPath) {
   // Set current parent project
   currentWorkspace = folderPath;
   expandedFileFolders = new Set();
-  el.workspaceLabel.textContent = folderPath;
+  el.workspaceLabel.textContent = folderPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || folderPath;
   
   renderProjectsList();
   
@@ -1397,12 +1397,13 @@ function selectConversation(id) {
   if (conv.workspace) {
     currentWorkspace = conv.workspace;
     expandedFileFolders = new Set();
-    el.workspaceLabel.textContent = conv.workspace;
+    const wsName = conv.workspace.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || conv.workspace;
+    el.workspaceLabel.textContent = wsName;
     syncWorkspaceFiles();
   } else {
     // Brand new conversation
     currentWorkspace = '';
-    el.workspaceLabel.textContent = conv.projectPath ? `${conv.projectPath} > [Pending First Message]` : 'Pending First Message';
+    el.workspaceLabel.textContent = conv.projectPath ? conv.projectPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || conv.projectPath : '';
     el.fileTree.innerHTML = '<p class="empty-state">Workspace will initialize upon sending your first prompt.</p>';
     el.fileCountBadge.textContent = '0';
     if (el.workspaceFilesPanel) el.workspaceFilesPanel.classList.add('contextual-panel-hidden');
@@ -1444,7 +1445,7 @@ function selectConversation(id) {
     revealAgentPanel('A plan is ready for review.');
     renderAgentPresence('attention', 'Review needed', 'Implementation plan is waiting for approval');
   } else if (!(window.isAgentRunning && window.isAgentRunning())) {
-    renderAgentPresence('idle', 'Ready', 'Waiting for a task');
+    renderAgentPresence('idle', 'Ready', '');
   }
   
   // Scroll to bottom
@@ -1494,7 +1495,7 @@ async function submitMessage() {
   // Ensure currentWorkspace is locked onto this isolated folder
   currentWorkspace = conv.workspace;
   expandedFileFolders = new Set();
-  el.workspaceLabel.textContent = currentWorkspace;
+  el.workspaceLabel.textContent = currentWorkspace.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || currentWorkspace;
   syncWorkspaceFiles();
   
   // Update messages history
@@ -1993,7 +1994,7 @@ window.toggleLogs = function(headerElement) {
 function updateTasksChecklist(tasks) {
   if (!tasks || tasks.length === 0) {
     el.taskChecklist.innerHTML = '<p class="empty-state">No tasks active. Start a conversation with a plan to see items here.</p>';
-    el.taskCompletionBadge.textContent = '0%';
+    el.taskCompletionBadge.style.display = 'none';
     return;
   }
   
@@ -2018,6 +2019,7 @@ function updateTasksChecklist(tasks) {
   
   const percentage = Math.round((completedCount / tasks.length) * 100);
   el.taskCompletionBadge.textContent = `${percentage}%`;
+  el.taskCompletionBadge.style.display = '';
 }
 
 function updateOperationalContext(state) {
@@ -2026,7 +2028,8 @@ function updateOperationalContext(state) {
     ? window.OrionOperationalContext.normalizeContext(state)
     : null;
   if (!context || (!context.mission.statement && context.winConditions.length === 0)) {
-    el.operationalContextRevision.textContent = 'Not set';
+    el.operationalContextRevision.style.display = 'none';
+    el.operationalContextRevision.textContent = '';
     el.operationalContextPanel.innerHTML = '<p class="empty-state">Define a mission to give Orion durable operational direction.</p>';
     return;
   }
@@ -2049,6 +2052,7 @@ function updateOperationalContext(state) {
   const blockerMarkup = blockers.slice(0, 4).map(item => `<div class="mission-blocker">${escapeHtml(item.title)}</div>`).join('');
 
   el.operationalContextRevision.textContent = `r${context.revision}`;
+  el.operationalContextRevision.style.display = '';
   el.operationalContextPanel.innerHTML = `
     <div class="mission-label">Mission</div>
     <div class="mission-statement">${escapeHtml(context.mission.statement || 'Not defined')}</div>
@@ -2233,7 +2237,7 @@ window.changeActiveWorkspace = function(folderPath) {
   }
   currentWorkspace = folderPath;
   expandedFileFolders = new Set();
-  el.workspaceLabel.textContent = folderPath;
+  el.workspaceLabel.textContent = folderPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || folderPath;
   syncWorkspaceFiles();
   refreshOperationalContext();
 };
@@ -2325,7 +2329,7 @@ window.onAgentStatusChange = (running) => {
     } else {
       renderAgentPresence('complete', 'Complete', 'Orion finished the current run');
       showToast('Orion finished the current run.', 'success');
-      agentCompletionTimer = setTimeout(() => renderAgentPresence('idle', 'Ready', 'Waiting for a task'), 2600);
+      agentCompletionTimer = setTimeout(() => renderAgentPresence('idle', 'Ready', ''), 2600);
     }
   }
 };
@@ -2953,8 +2957,10 @@ window.onRagStatusChange = (statusText) => {
   badge.style.display = statusText ? 'inline-block' : 'none';
   
   if (statusText.startsWith('Indexing')) {
+    badge.textContent = 'Indexing…';
     badge.className = 'badge warning pulse';
   } else if (statusText === 'Semantic Ready') {
+    badge.textContent = 'Indexed';
     badge.className = 'badge success';
   } else if (statusText === 'Awaiting API Key') {
     badge.className = 'badge danger';
