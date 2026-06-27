@@ -1720,6 +1720,210 @@ code {
   cursor: default;
 }
 
+/* ─── Clarification question card ─────────────────────────────────────────── */
+.clarification-card {
+  margin-top: 14px;
+  padding: 16px;
+  background: rgba(25, 25, 34, 0.78);
+  border: 1px solid rgba(167, 139, 250, 0.22);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: min(100%, 640px);
+}
+
+.clarification-intro {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.clarification-question-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.clarification-question-header {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.clarification-chip {
+  display: inline-block;
+  padding: 2px 8px;
+  background: rgba(167, 139, 250, 0.16);
+  border: 1px solid rgba(167, 139, 250, 0.35);
+  border-radius: 100px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: rgba(167, 139, 250, 0.95);
+  text-transform: uppercase;
+}
+
+.clarification-question-text {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.4;
+}
+
+.clarification-options {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.clarification-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 8px 11px;
+  border-radius: 7px;
+  border: 1px solid rgba(255,255,255,0.07);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  user-select: none;
+}
+
+.clarification-option:hover {
+  background: rgba(167, 139, 250, 0.08);
+  border-color: rgba(167, 139, 250, 0.28);
+}
+
+.clarification-option.selected {
+  background: rgba(167, 139, 250, 0.14);
+  border-color: rgba(167, 139, 250, 0.5);
+}
+
+.clarification-option input[type="radio"] {
+  margin-top: 2px;
+  accent-color: rgb(167, 139, 250);
+  flex-shrink: 0;
+}
+
+.clarification-option-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.clarification-option-label-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.clarification-option-label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.clarification-recommended-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  background: rgba(16, 185, 129, 0.18);
+  border: 1px solid rgba(16, 185, 129, 0.4);
+  border-radius: 100px;
+  font-size: 0.63rem;
+  font-weight: 700;
+  color: rgb(52, 211, 153);
+  letter-spacing: 0.03em;
+}
+
+.clarification-option-desc {
+  font-size: 0.73rem;
+  color: var(--text-secondary);
+  line-height: 1.35;
+}
+
+.clarification-other-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 8px 11px;
+  border-radius: 7px;
+  border: 1px solid rgba(255,255,255,0.07);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.clarification-other-row:hover,
+.clarification-other-row.selected {
+  background: rgba(167, 139, 250, 0.08);
+  border-color: rgba(167, 139, 250, 0.28);
+}
+
+.clarification-other-row.selected {
+  background: rgba(167, 139, 250, 0.14);
+  border-color: rgba(167, 139, 250, 0.5);
+}
+
+.clarification-other-row input[type="radio"] {
+  margin-top: 6px;
+  accent-color: rgb(167, 139, 250);
+  flex-shrink: 0;
+}
+
+.clarification-other-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  font-family: var(--font-sans);
+  font-size: 0.8rem;
+  color: var(--text-primary);
+  min-width: 0;
+  padding: 2px 0;
+}
+
+.clarification-other-input::placeholder {
+  color: var(--text-secondary);
+  opacity: 0.7;
+}
+
+.clarification-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 2px;
+}
+
+.btn-clarification-submit {
+  border: 1px solid rgba(167, 139, 250, 0.5);
+  background: rgba(167, 139, 250, 0.16);
+  color: var(--text-primary);
+  border-radius: 7px;
+  padding: 8px 18px;
+  font-family: var(--font-sans);
+  font-size: 0.78rem;
+  font-weight: 650;
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.btn-clarification-submit:hover {
+  background: rgba(167, 139, 250, 0.26);
+  border-color: var(--accent-hover);
+  box-shadow: 0 0 16px rgba(167, 139, 250, 0.18);
+}
+
+.btn-clarification-submit:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.clarification-card.answered {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
 .agent-running-indicator {
   display: flex;
   align-items: center;

@@ -386,7 +386,12 @@
         args.evaluations.forEach(evaluation => {
           const identity = cleanText(evaluation.id || evaluation.title, 500);
           const condition = state.winConditions.find(item => item.id === identity || item.title.toLowerCase() === identity.toLowerCase());
-          if (!condition) throw new Error(`Win condition not found: ${identity}`);
+          if (!condition) {
+            const available = state.winConditions.length
+              ? state.winConditions.map(c => `"${c.title}"`).join(', ')
+              : 'none — call update_mission_context first to define win conditions';
+            throw new Error(`Win condition not found: "${identity}". Available win conditions: ${available}`);
+          }
           const status = normalizeStatus(evaluation.status, ['pending', 'in_progress', 'satisfied'], condition.status);
           const evidence = Array.isArray(evaluation.evidence) ? evaluation.evidence.map(value => cleanText(value, 1000)).filter(Boolean) : [];
           if (status === 'satisfied' && evidence.length === 0 && condition.evidence.length === 0) throw new Error(`Win condition '${condition.title}' requires evidence before it can be satisfied`);

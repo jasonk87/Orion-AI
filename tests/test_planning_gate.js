@@ -36,11 +36,16 @@ global.fetch = async (url, options) => {
 };
 
 const agent = require('../agent.js');
+// When tests run in a full suite, earlier test files reset global.window, wiping the runAgentLoop
+// assignment that agent.js makes on first load (module cache prevents re-execution). Re-attach here.
+if (!global.window.runAgentLoop && agent.runAgentLoop) global.window.runAgentLoop = agent.runAgentLoop;
 
 function validStrategy(overrides = {}) {
   const sections = {
     'Objective': 'Build the requested feature safely against the current repository reality.',
     'Relevant Files': '- agent.js\n- tests/',
+    'Design & Polish': '- Styled with CSS; animations on all state transitions; responsive layout.',
+    'Ambiguity Resolution': '- Visual style: isometric pixel art (user confirmed). Core mechanic: RTS god-game orders. NPC scale: batch ECS simulation.',
     'True Objective': 'Build the requested feature safely against the current repository reality.',
     'Current Repo Reality': '- Existing app code is present and must be inspected before edits.',
     'Relevant Files / Subsystems': '- agent.js\n- tests/',

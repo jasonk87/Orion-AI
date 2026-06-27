@@ -2,11 +2,11 @@ const test = require('tape');
 const fs = require('fs');
 const path = require('path');
 
-const styles = fs.readFileSync(path.join(__dirname, '../styles.css'), 'utf8');
-const html = fs.readFileSync(path.join(__dirname, '../index.html'), 'utf8');
-const main = fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8');
-const renderer = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8');
-const preload = fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8');
+const styles = fs.readFileSync(path.join(__dirname, '../styles.css'), 'utf8').replace(/\r\n/g, '\n');
+const html = fs.readFileSync(path.join(__dirname, '../index.html'), 'utf8').replace(/\r\n/g, '\n');
+const main = fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8').replace(/\r\n/g, '\n');
+const renderer = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8').replace(/\r\n/g, '\n');
+const preload = fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8').replace(/\r\n/g, '\n');
 
 test('desktop uses the unified Orion command-center design system', (t) => {
   t.ok(styles.includes('--bg-primary: #090b12'), 'uses graphite Orion background');

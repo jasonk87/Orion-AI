@@ -6,12 +6,23 @@ Your goal is to solve the task given by the user with high quality, precision, a
 
 CRITICAL RULES:
 1. PLANNING MODE DECISION: Match the process to the size of the request. Use an implementation plan only when the task is genuinely complex: new projects, multi-file builds, architecture changes, risky migrations, broad bug hunts, security-sensitive work, or requests where the user should review direction before code changes. For small fixes, running/opening a program, running tests, setting an entry point, showing paths, pushing when explicitly asked, or narrow follow-ups, act directly without creating implementation_plan.md. If a plan is needed, first complete a Mission Refinement / Strategy Pass and write "STRATEGY.md"; only then create "implementation_plan.md", set the checklist, show the plan in chat, and pause for explicit user approval or requested revisions before modifying source files or running commands. Every implementation plan MUST include a "## Testing Plan" section that details exact commands/tests to run, expected behaviors, edge cases, success conditions, and manual checks if automated tests are unavailable.
-2. TESTING AND REGRESSION DISCIPLINE: When you create or change code, you are responsible for producing run-ready code. Before meaningful edits, inspect existing tests and the detected regression command when relevant. After edits, run the appropriate tests or smoke checks using "run_tests", "run_command", or the long-running command tools. If tests fail, read the output, fix the issue, and rerun tests until they pass or you can clearly explain a blocker. For long tests, training, games, and servers, use "start_command" with a sensible timeout, check status/output, and stop processes with "kill_command" when finished. Do not start multiple copies of the same long-running program unless the previous one is stopped. Do not use an interactive command as a test unless you pipe/provide input or intentionally kill it after a short smoke check. For graphical/Pygame/interactive applications, write a non-interactive test script or design the program to accept a '--smoke-test' command-line flag that exits after a few frames/seconds, and use this flag (or run with a short timeoutMs) when validating. Do not claim code works unless you ran a relevant check or state exactly why you could not.
+   CLARIFICATION GATE FOR AMBIGUOUS CREATIVE TASKS: For games, simulations, apps, or creative tools where the user's request leaves KEY DESIGN DECISIONS unspecified, you MUST call the "ask_clarifying_questions" tool BEFORE writing STRATEGY.md. Do NOT write questions as text — use the tool. Do NOT say "Task finished" or any completion summary when calling this tool — the task is paused, not done. The tool pauses the agent loop and shows the user an interactive card with radio options, recommended badges, and an "Other" free-text fallback. Key design decisions that require clarification when unspecified: (a) visual style/genre (e.g., 2D pixel art vs isometric vs 3D vs top-down); (b) core gameplay mechanic/loop (what does the player actually DO?); (c) scale and performance strategy (e.g., "thousands of entities" requires a specific approach — batch rendering, spatial partitioning, ECS, etc.); (d) framework/platform when multiple are reasonable. Supply 2-3 questions with 2-4 options each; mark the recommended option with recommended: true. Only after the user answers (their answers come back as your next prompt) should you proceed to STRATEGY.md. Exception: if the user explicitly says "surprise me," "you decide," or "figure it out," skip clarification and document your bold choices in STRATEGY.md under "Design Choices."
+2. TESTING AND REGRESSION DISCIPLINE: When you create or change code, you are responsible for producing run-ready code. Before meaningful edits, inspect existing tests and the detected regression command when relevant. After edits, run the appropriate tests or smoke checks using "run_tests", "run_command", or the long-running command tools. If tests fail, read the output, fix the issue, and rerun tests until they pass or you can clearly explain a blocker. For long tests, training, games, and servers, use "start_command" with a sensible timeout, check status/output, and stop processes with "kill_command" when finished. Do not use an interactive command as a test unless you pipe/provide input or intentionally kill it after a short smoke check. For graphical/Pygame/interactive applications, write a non-interactive test script or design the program to accept a '--smoke-test' command-line flag that exits after a few frames/seconds, and use this flag (or run with a short timeoutMs) when validating. Do not claim code works unless you ran a relevant check or state exactly why you could not.
+   PREVIEW_APP RULES: (a) Orion auto-kills the previous preview window before launching a new one — you never need to manage this manually, and you must NOT open multiple game windows yourself. (b) When preview_app fails or the screenshot shows a crash/black screen: DO NOT STOP. Run "python -m py_compile <file>" to catch syntax errors, then read the crash output with read_command_output or run_command, fix the root cause, and retry preview_app. A single failed launch is NOT a reason to end the task. (c) Always call kill_command on the processId returned by preview_app when you are finished verifying, so the window is closed.
+   FILE EDIT DISCIPLINE: If you have edited the same file more than twice in a row, STOP and read_file the complete current version before making any further changes. Identify ALL remaining issues in one pass, then fix them in a single edit. Incremental micro-patches on the same file create cascading bugs and waste loops. Write complete, correct implementations the first time rather than patching incrementally.
 3. WEB RESEARCH: If you are unsure about an API, library, framework, command, model parameter, error message, current behavior, or documentation detail, use "google_search" and then "fetch_web_page" on the most relevant official docs or primary source before editing. Do not use web search to answer facts about the user's local machine, workspace state, installed tools, paths, memory, disk, processes, environment variables, or runtime output; inspect local state instead. Do not invent configuration files or API shapes when files are missing or the correct implementation is unclear. Do not say you reviewed, checked, verified, or confirmed documentation unless you actually used these web tools in the current task and can name the source URL. If docs appear to say something surprising, quote or paraphrase the exact relevant rule before changing files.
 4. CONTEXT INTEGRITY: Keep files clean, respect formatting, and preserve comments that are unrelated to your edits.
 5. NOTES AND MEMORY: Use project/standalone notes as durable working memory. Read them when orienting, and update them when you learn durable facts: architecture, important files, commands, decisions, user preferences, gotchas, open tasks, test status, and future repair notes. Project notes are shared across every conversation in the same project; standalone notes belong only to that standalone conversation. Keep notes concise and useful, not a transcript.
 5A. OPERATIONAL CONTEXT: For long-running or multi-subplan goals, maintain mission, measurable win conditions, active objective/subplan, blockers, and retained discoveries with the operational-context tools. Treat operational context as canonical working state, not another chat transcript. Promote durable lessons; discard summaries of fixed errors, dead ends, and temporary output. Never mark a subplan or win condition complete without concrete evidence from tests, inspected output, or explicit user confirmation.
-6. DESIGN QUALITY: When creating apps, games, dashboards, or visual tools, make them visually polished and pleasant by default. Treat beauty, layout, typography, color, spacing, motion, and interaction feedback as part of "working." Avoid bare black boxes, default controls, tiny unstyled text, and placeholder-looking screens unless the user explicitly asks for minimal output. For games, include a cohesive visual theme, clear HUD, start/game-over states, readable controls, animation polish, and a satisfying feel. Do not rely on CDN-only frontend dependencies (such as Tailwind CDN, Chart.js CDN, icon CDNs, or remote fonts) for local production-style apps unless the user explicitly asks for CDN usage; prefer local CSS/JS or installed packages so browser console checks stay clean.
+6. DESIGN QUALITY — NON-NEGOTIABLE: Visual polish is a hard requirement, not a nice-to-have. For ANY app, game, dashboard, or UI-facing tool, you MUST meet the following minimum bar before considering the task complete — even if the user did not explicitly ask for it:
+   (a) STYLING: Use a proper CSS framework (Tailwind, MUI, Chakra, etc.) or write thorough custom CSS. Zero bare/unstyled HTML is acceptable in a delivered product. Every element must have intentional color, spacing, typography, and layout.
+   (b) ANIMATIONS & TRANSITIONS: All state changes (answers revealing, score updates, screen transitions, hover/click feedback, loading states) must have smooth CSS transitions or animations. Static instant-swap UI is not polished.
+   (c) RESPONSIVE: Layout must work on both mobile and desktop screen widths.
+   (d) THEME COHERENCE: Use a consistent color palette, font pairing, and visual language throughout. No mismatched default browser styles.
+   (e) INTERACTION FEEDBACK: Buttons must show hover/active states, inputs must have focus rings, loading must show spinners or skeletons.
+   For games specifically: cohesive visual theme, animated game board, smooth reveal mechanics, clear HUD/scoreboard, satisfying start/end states, sound-readiness hooks (even if silent).
+   COMPLETION GATE: A win condition for "Visual polish and animations meet professional standard" must be added to operational context for any UI project, and it must be satisfied with screenshot evidence before the task is marked complete.
+   Do not rely on CDN-only frontend dependencies (such as Tailwind CDN, Chart.js CDN, icon CDNs, or remote fonts) for local production-style apps unless the user explicitly asks for CDN usage; prefer local CSS/JS or installed packages so browser console checks stay clean.
 7. FOLLOW-UP TIMERS: If you say you will wait, check back, continue after N seconds/minutes, or inspect long-running training/tests later, you MUST call "schedule_followup". Do not merely say you will wait. Schedule only one active follow-up for the same purpose; when the follow-up runs, actually inspect status/output and either continue work, stop the process, or clearly finish.
 7A. ADAPT INSTEAD OF QUITTING: Do not abandon a task after ordinary errors. If an edit, command, test, or route check fails, inspect fresh state, group repeated failures, look up official/current docs when needed, and try a different strategy. A failed tool path is evidence about that tool attempt, not proof that the user's objective is impossible. Stop only for hard blockers such as missing credentials, unavailable model access, explicit user stop, or a hard-destructive command block; when stopping, preserve state and explain the exact next recovery step.
 8. BE CONCISE: Explain your technical decisions briefly. The user can see your tools running and thoughts.
@@ -24,6 +35,7 @@ CRITICAL RULES:
 14. USER-REQUESTED LOCAL/GIT OPERATIONS: When the user asks for the active directory, to open the folder, to launch/run the program, or to push to GitHub/Git, use the dedicated tools for those actions. Do not push to Git or launch apps unless the user asked for it. If the user explicitly asks you to run a command, run it directly unless it matches Orion's hard destructive block list; do not interrupt with extra approval prompts for ordinary user-requested commands. If the user asks to push without specifying a branch, push the current branch to the default remote.
 15. WORKSPACE AND SYSTEM-WIDE QUERIES: Prefer and prioritize files/code within the active workspace. If the user mentions a specific local folder, program, or path outside the workspace (like "on my desktop" or "in my projects folder"), ALWAYS investigate the local filesystem using your local tools (e.g., run_command, list_files, grep_search) BEFORE attempting a web search. You are fully authorized to run system commands using "run_command" to query, search, and identify paths outside the workspace folder in order to answer their questions. When the user names a specific program or project (e.g., "a program called X" or "my project named Y"), immediately use "change_workspace" directly to that project's path (e.g., C:\\Users\\Owner\\Desktop\\Projects\\X) and then read its key files — do NOT call "list_files" on the parent folder first, as parent folders may have hundreds of entries and the target may be truncated. If the path does not exist, try common spelling/casing variants, then use "run_command" with Get-ChildItem filtered by name.
 17. SIMPLE READ-ONLY QUESTIONS: For questions like "what is this program about", "tell me what X does", "describe this project" — do NOT call "update_mission_context", "start_subplan", or "evaluate_win_conditions". These operational planning tools are for long-running multi-step tasks only. For read-only questions: navigate to the project, read the key files (README, main entry, package.json / requirements.txt), and answer directly. Never set win conditions for a question that just needs file reading.
+   WORKSPACE SELF-REFERENCE: When the user says "this code", "the code", "this program", "this project", "these files", "my code", "the app", "the whole program", or any similar self-referential phrase, they ALWAYS mean the code already in the active workspace. NEVER ask the user to provide or paste code. NEVER ask "which file?" or "which program?" when a workspace is active — read the workspace and figure it out. Call list_files immediately, then read ALL non-boilerplate source files you find (.py, .js, .ts, .html, .css, etc.) in one pass. If the root contains only cache/config files (.env, .gitignore, __pycache__, .ruff_cache, .orion, etc.), look one level deeper into subdirectories. Read first, ask never.
 18. FIND VS FIX: When the user asks you to "find", "look for", "check for", "review", "audit", or "identify" bugs/typos/issues/faults — your job is ONLY to read files and report what you found. Do NOT modify files, do NOT propose a fix implementation plan, and do NOT start fixing things. Present your findings clearly and ask the user which issues they want you to address. Only make changes when the user explicitly asks you to fix, patch, implement, or update something.
 16. OPERATING SYSTEM AWARENESS: You are currently running on a Windows system. When guessing or constructing file paths outside the current workspace, ALWAYS use Windows path conventions (e.g., C:\\Users\\owner\\Desktop) with the literal resolved path — do NOT pass unexpanded PowerShell variables like $env:USERPROFILE as a path argument to any tool; resolve the path to a literal string first (e.g., C:\\Users\\owner). If you are unsure of the username, run 'echo $env:USERPROFILE' first. When searching for files on the Desktop or broad directories, ALWAYS limit recursive searches with '-Depth 2' or '-Depth 3' and add '-ErrorAction SilentlyContinue' to avoid timeouts from permission-denied folders. Never run an unbounded 'Get-ChildItem -Recurse' on C:\\ or the Desktop without a depth limit.
 
@@ -55,9 +67,10 @@ Tools available:
 - fetch_web_page: Fetch the text content of a specific web page found via search.
 - download_file, inspect_archive, extract_archive, inspect_binary_asset, list_asset_metadata: General asset acquisition/inspection hands. Use when useful; do not follow a hardcoded asset pipeline.
 - open_url, search_web, click_element, fill_input, navigate_back, download_from_page, wait_for_page: Browser worker hands for autonomous web navigation and acquisition when the mission calls for it.
-- take_screenshot, inspect_screenshot, compare_screenshot_to_goal: Visual verification eyes for previews and UI/game scenes. Use evidence honestly; do not claim visual success without screenshot evidence or observations.
-- preview_app: Launches a desktop/GUI app (pygame, tkinter, etc.) as a persistent process, captures a real desktop screenshot, and LEAVES IT RUNNING (no auto-close — you stay in control). ALWAYS use this — never run_command — to run or visually check a GUI program with an event loop, so you never hang and never work blindly. Returns a processId. Then decide: capture_screen again later, read_command_output to watch progress, or kill_command when done. Follow up with inspect_screenshot_with_model to judge a captured frame.
-- capture_screen: Take another desktop screenshot of a still-running app on your own schedule (optional delayMs to let it advance first). Use this to re-check an app launched with preview_app instead of closing it prematurely.
+- take_screenshot: Captures the BROWSER WORKER view — use this after open_url to visually verify a web app (React, HTML, localhost dev servers). Do NOT use capture_screen for web verification; it captures the OS desktop and will show whatever app happens to be on screen, which may not be the correct page.
+- inspect_screenshot, compare_screenshot_to_goal: Visual verification helpers. Use evidence honestly; do not claim visual success without screenshot evidence or observations.
+- preview_app: Launches a NATIVE DESKTOP app (pygame, tkinter game window, etc.) as a persistent process, captures a desktop screenshot, and LEAVES IT RUNNING (no auto-close). ALWAYS use this — never run_command — to run or visually check a GUI program with an event loop. NOT for web apps (use start_command to run the dev server, open_url to navigate, and take_screenshot to capture the page). Returns a processId. Then decide: capture_screen again later, read_command_output to watch progress, or kill_command when done. Follow up with inspect_screenshot_with_model to judge a captured frame.
+- capture_screen: Takes another OS-level desktop screenshot — for NATIVE apps (pygame, tkinter) previously launched with preview_app. Do NOT use for web apps; use open_url + take_screenshot instead.
 - inspect_screenshot_with_model: Sends a workspace screenshot to the active chat LLM's multimodal vision for semantic visual inspection against a goal.
 - sync_workspace_env: Safely write configured API keys/search IDs into .env-style files without exposing the secret values in chat or tool output.
 - set_task_checklist: Set the UI checklist of tasks (array of {title, status}). Status can be 'pending', 'in-progress', 'completed'. Use only for milestone changes, not routine progress churn.`;
@@ -215,12 +228,12 @@ const ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS = [
   },
   {
     name: 'take_screenshot',
-    description: 'Captures the current browser worker view as a screenshot in the workspace for visual verification.',
+    description: 'Captures the current browser worker view as a screenshot. USE THIS to verify web apps — after open_url navigates to a local dev server (e.g. http://localhost:3000), call take_screenshot to capture what that page looks like. This is the correct tool for web/React/HTML verification. Do NOT use capture_screen for web pages — that captures the full OS desktop, which may show a completely different browser window.',
     parameters: { type: 'OBJECT', properties: { destination: { type: 'STRING', description: 'Optional workspace-relative PNG path.' } } }
   },
   {
     name: 'preview_app',
-    description: 'Launches a desktop/GUI app (e.g. a Python/pygame game) as a persistent process, lets it warm up, captures a real desktop screenshot so you can SEE it rendered, and LEAVES IT RUNNING. It does NOT auto-close — you stay in control. ALWAYS use this instead of run_command for GUI programs with an event loop (run_command would hang until timeout). Returns a screenshot path (inspect with inspect_screenshot_with_model) and a processId. After it, decide: wait and capture_screen again to see a later state, read_command_output(processId) to watch progress (e.g. ML training improving), or kill_command(processId) when finished. Reports a crash if the app exited before rendering.',
+    description: 'Launches a NATIVE DESKTOP app (e.g. a Python/pygame game, tkinter window) as a persistent process, lets it warm up, captures a desktop screenshot, and LEAVES IT RUNNING. ALWAYS use this instead of run_command for GUI programs with an event loop. Returns a screenshot path (inspect with inspect_screenshot_with_model) and a processId. After it, decide: wait and capture_screen again, read_command_output(processId) to watch progress (e.g. ML training), or kill_command(processId) when done. NOT for web apps — for web, use start_command to run the dev server then open_url + take_screenshot.',
     parameters: { type: 'OBJECT', properties: {
       command: { type: 'STRING', description: 'Optional command to run (defaults to the workspace entrypoint or an auto-detected python main file).' },
       warmupMs: { type: 'NUMBER', description: 'Optional ms to let the window render before the first capture (default 4000, max 60000).' },
@@ -230,7 +243,7 @@ const ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS = [
   },
   {
     name: 'capture_screen',
-    description: 'Captures a fresh desktop screenshot of whatever is currently on screen — typically an app you previously launched with preview_app, now further along. Optionally waits first (delayMs) so you can let the app reach a more interesting state (game started, ML score improved, debug finished) before capturing. Use this to re-check a running app on your own schedule instead of closing it. Inspect the result with inspect_screenshot_with_model.',
+    description: 'Captures a fresh OS-level desktop screenshot — for NATIVE apps (pygame, tkinter, etc.) previously launched with preview_app. NOT for web apps: use open_url + take_screenshot instead, which captures the browser worker view of the page rather than whatever happens to be on screen. Optionally waits first (delayMs) to let the native app advance.',
     parameters: { type: 'OBJECT', properties: {
       delayMs: { type: 'NUMBER', description: 'Optional ms to wait before capturing (max 120000), to let the running app advance.' },
       destination: { type: 'STRING', description: 'Optional workspace-relative PNG path for the screenshot.' }
@@ -540,6 +553,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   // When a multi-phase approved plan runs out of loop budget with real work still pending,
   // the run auto-continues in a fresh internal pass instead of falsely reporting "Task finished".
   let autoContinueExecution = false;
+  let userRequestedStop = false;
   let finalAnswerQualityPrompts = 0;
   let finalAnswerQualityLoopExtensions = 0;
   // Initialize AI message state in conversation list
@@ -608,6 +622,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     let completionGatePrompts = 0;
     let completionGateLoopExtensions = 0;
     const repeatedToolFailures = new Map();
+    const fileEditCounts = new Map();
+    const fileNeedsReadBeforeEdit = new Set(); // files that must be read before the next edit
     const toolEvidenceLedger = [];
     const maxMalformedToolRetries = 5;
     const canExecuteThisTask = () => !config.planningMode || conversation.planApproved || planningBypassedForTask;
@@ -622,6 +638,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       
       // Check if Stop was requested
       if (isStopRequested) {
+        userRequestedStop = true;
         isStopRequested = false;
         lastTextResponse = "Task aborted by user.";
         currentAgentLogs.push({ type: 'thought', content: "🛑 Task execution stopped by user." });
@@ -721,29 +738,37 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           });
           continue;
         }
-        if (candidate.finishReason === "MALFORMED_FUNCTION_CALL" && malformedCallsCount < maxMalformedToolRetries) {
+        if (candidate.finishReason === "MALFORMED_FUNCTION_CALL") {
           malformedCallsCount++;
           const errorMsg = `⚠️ Tool call was malformed (Attempt ${malformedCallsCount}/${maxMalformedToolRetries}). Requesting regeneration...`;
           currentAgentLogs.push({ type: 'thought', content: errorMsg });
-          
+
           const modelParts = (candidate.content && candidate.content.parts) || [];
           if (modelParts.length === 0) {
             modelParts.push({ text: "[Malformed tool call attempted]" });
           }
           messages.push({ role: 'model', parts: modelParts });
-          
+
           let currentTurn = { modelParts: modelParts, toolResponseParts: null };
           conversation.messages[aiMessageIndex].turns.push(currentTurn);
-          
-          messages.push({
-            role: 'user',
-            parts: [{
-              text: `[SYSTEM: The previous function call was malformed. Please generate a valid JSON function call that adheres strictly to the schema properties and required fields. Avoid adding namespace prefixes (like 'default_api.') or markdown blocks.]`
-            }]
-          });
-          continue;
+
+          if (malformedCallsCount < maxMalformedToolRetries) {
+            messages.push({
+              role: 'user',
+              parts: [{
+                text: `[SYSTEM: The previous function call was malformed and was NOT executed — no process was started, no file was written. Please generate a valid JSON function call. Use simple, minimal arguments. Avoid namespace prefixes (like 'default_api.') and markdown code blocks around the call.]`
+              }]
+            });
+            continue;
+          }
+
+          // All retries exhausted — inject recovery context and break cleanly.
+          lastTextResponse = 'Tool calls failed repeatedly due to a malformed response. The last attempted operation was not executed. Resuming from saved state on next continuation.';
+          conversation.messages[aiMessageIndex].text = lastTextResponse;
+          currentAgentLogs.push({ type: 'thought', content: '⚠️ MALFORMED_FUNCTION_CALL retries exhausted — breaking cleanly for auto-continue recovery.' });
+          break;
         }
-        
+
         lastTextResponse = `Generation stopped by API (Reason: ${candidate.finishReason}).`;
         conversation.messages[aiMessageIndex].text = lastTextResponse;
         currentAgentLogs.push({ type: 'thought', content: `⚠️ Model finish reason: ${candidate.finishReason}` });
@@ -1000,10 +1025,27 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           continue;
         }
         
+        // Hard thrash guard: block repeated edits to the same file without an intervening read
+        if ((toolName === 'write_file' || toolName === 'modify_file' || toolName === 'patch_file') && args.path) {
+          const editKey = String(args.path).toLowerCase();
+          if (fileNeedsReadBeforeEdit.has(editKey)) {
+            const blockMsg = `EDIT BLOCKED: You have already edited ${args.path} multiple times without reading it. Call read_file on this file first to see the actual current state before making further changes. Incremental patches without reading create cascading bugs.`;
+            currentAgentLogs[logIndex].status = 'error';
+            currentAgentLogs[logIndex].result = blockMsg;
+            updateWalkthroughItem(walkthroughItem, toolName, args, { error: blockMsg }, new Error(blockMsg));
+            toolResponseParts.push({ functionResponse: { name: toolName, response: { error: blockMsg, blocked: 'read_required' } } });
+            continue;
+          }
+        }
+
         // Execute the tool
         let result;
         try {
           result = await executeTool(toolName, args, workspacePath, config, conversation);
+          if (result && result._forceYield) {
+            forceYield = true;
+            delete result._forceYield;
+          }
           if (toolName === 'change_workspace' && result && result.success) {
             workspacePath = conversation.workspace;
           }
@@ -1097,7 +1139,30 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           workingState = transition.state;
           refreshWorkingStateMessage();
         }
-        
+
+        // File thrash tracking: after a successful edit, require a read before the next edit.
+        // The pre-execution block above enforces this — here we update the tracking state.
+        if ((toolName === 'write_file' || toolName === 'modify_file' || toolName === 'patch_file') && args.path && !isFailedToolResult(result)) {
+          const editKey = String(args.path).toLowerCase();
+          const editCount = (fileEditCounts.get(editKey) || 0) + 1;
+          fileEditCounts.set(editKey, editCount);
+          if (editCount >= 2) {
+            // Mark this file as requiring a read before the next edit
+            fileNeedsReadBeforeEdit.add(editKey);
+          }
+          // A successful code edit resets app-launch failure counters so the repeated-failure
+          // guard doesn't block the next launch attempt after a legitimate code fix.
+          for (const key of [...repeatedToolFailures.keys()]) {
+            if (key.startsWith('preview_app:') || key.startsWith('run_command:')) {
+              repeatedToolFailures.delete(key);
+            }
+          }
+        }
+        // A successful read_file clears the read-required gate for that file
+        if (toolName === 'read_file' && args.path && !isFailedToolResult(result)) {
+          fileNeedsReadBeforeEdit.delete(String(args.path).toLowerCase());
+        }
+
         toolResponseParts.push({
           functionResponse: {
             name: toolName,
@@ -1121,6 +1186,16 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       window.saveConversationsToStorage();
       
       if (forceYield) {
+        // Clarification questions were presented — just yield, the UI will render the question cards.
+        if (conversation.awaitingClarification) {
+          // Replace any stale AI text (e.g. "Task finished.") with a neutral hold message
+          // so the bubble reads correctly while the question card is visible.
+          const clarIntro = conversation.awaitingClarification.intro || '';
+          if (!lastTextResponse || /task finished/i.test(lastTextResponse)) {
+            lastTextResponse = clarIntro || 'A few quick design questions before I proceed:';
+          }
+          break;
+        }
         // forceYield can be set by the planning gate (model wrote implementation_plan.md before
         // approval) OR by repeated tool failures during execution. Only present the plan
         // approval card for the planning-gate case — execution failures should just break out.
@@ -1242,7 +1317,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // Continue when there is a real mission in flight OR an outstanding checklist — the checklist
     // fallback keeps long work going even if operational mission state is unexpectedly absent.
     const hasResumableWork = hasOperationalMissionState(workingState) || pendingChecklist.length > 0;
-    if (!forceYield && canExecuteAtExit && hasPendingWork && madeProgressThisRun && !blockersActive && !stalled
+    if (!forceYield && !userRequestedStop && canExecuteAtExit && hasPendingWork && madeProgressThisRun && !blockersActive && !stalled
         && hasResumableWork && conversation._planExecAutoContinues < AUTO_CONTINUE_BUDGET) {
       autoContinueExecution = true;
       conversation._planExecAutoContinues++;
@@ -1276,6 +1351,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // the next reload and looking like the button was never pressed.
     if (conversation.awaitingPlanApproval) {
       conversation.messages[aiMessageIndex].isPlanApprovalCard = true;
+    }
+    if (conversation.awaitingClarification) {
+      conversation.messages[aiMessageIndex].isClarificationCard = true;
     }
     window.renderAiMessage(lastTextResponse, currentAgentLogs, conversation.id, conversation.messages[aiMessageIndex]);
     if (window.api && window.api.writeRunArtifact && workWalkthrough.length > 0) {
@@ -1672,9 +1750,14 @@ async function executeTool(name, args, workspace, config, conversation) {
     case 'start_command': {
       if (!args.command) throw new Error("Missing 'command' parameter");
       const requestedId = args.processId ? String(args.processId).replace(/[^a-zA-Z0-9_.-]/g, '_') : '';
-      const processId = requestedId && requestedId.includes(conversation.id)
+      // Normalize the conversation ID to underscores so the session ID is consistent regardless of
+      // whether dashes or underscores appear in conversation.id. Without this, the model would see
+      // e.g. "cmd_conv-123-abc_server" in the result but then sanitize it to "cmd_conv_123_abc_server"
+      // for a subsequent call, causing a lookup miss on the same session.
+      const convIdNorm = conversation.id.replace(/[^a-zA-Z0-9]/g, '_');
+      const processId = requestedId && (requestedId.includes(convIdNorm) || requestedId.includes(conversation.id))
         ? requestedId
-        : `cmd_${conversation.id}_${requestedId || Date.now()}`;
+        : `cmd_${convIdNorm}_${requestedId || Date.now()}`;
       const timeoutMs = args.timeoutMs || config.commandTimeoutMs || 120000;
       const result = await window.api.startCommand(args.command, workspace, processId, timeoutMs);
       if (!result.success) throw new Error(result.error || 'Failed to start command');
@@ -1697,7 +1780,12 @@ async function executeTool(name, args, workspace, config, conversation) {
 
     case 'kill_command': {
       if (!args.processId) throw new Error("Missing 'processId' parameter");
-      return await window.api.killCommand(args.processId);
+      const killResult = await window.api.killCommand(args.processId);
+      // Remove from the active preview tracking list so auto-kill doesn't double-attempt it
+      if (Array.isArray(conversation.activePreviewProcesses)) {
+        conversation.activePreviewProcesses = conversation.activePreviewProcesses.filter(pid => pid !== args.processId);
+      }
+      return killResult;
     }
 
     case 'schedule_followup': {
@@ -1853,12 +1941,22 @@ async function executeTool(name, args, workspace, config, conversation) {
     }
 
     case 'preview_app': {
+      // Kill any preview processes from this conversation that are still open, so the
+      // user never ends up with multiple game windows piling up on their desktop.
+      if (Array.isArray(conversation.activePreviewProcesses) && conversation.activePreviewProcesses.length > 0) {
+        for (const pid of conversation.activePreviewProcesses) {
+          try { await window.api.killCommand(pid); } catch (_) {}
+        }
+        conversation.activePreviewProcesses = [];
+      }
+
       // Generate a managed processId (scoped to this conversation) unless the model supplied one,
       // mirroring start_command, so the app can be tracked/killed afterward.
       const requestedId = args.processId ? String(args.processId).replace(/[^a-zA-Z0-9_.-]/g, '_') : '';
-      const processId = requestedId && requestedId.includes(conversation.id)
+      const convIdNorm = conversation.id.replace(/[^a-zA-Z0-9]/g, '_');
+      const processId = requestedId && (requestedId.includes(convIdNorm) || requestedId.includes(conversation.id))
         ? requestedId
-        : `preview_${conversation.id}_${requestedId || Date.now()}`;
+        : `preview_${convIdNorm}_${requestedId || Date.now()}`;
       const result = await window.api.previewApp(workspace, {
         command: args.command || '',
         warmupMs: args.warmupMs,
@@ -1866,6 +1964,12 @@ async function executeTool(name, args, workspace, config, conversation) {
         processId,
         destination: args.destination || ''
       });
+      // Track the processId so we can auto-kill it next time
+      if (result && result.success) {
+        conversation.activePreviewProcesses = conversation.activePreviewProcesses || [];
+        conversation.activePreviewProcesses.push(processId);
+        if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+      }
       // A crash before render is a real, reportable failure the model must act on — surface it as
       // a failed result (not a thrown error) so the recovery guidance and stderr reach the model.
       if (!result.success && !result.crashed) throw new Error(result.error || 'App preview failed');
@@ -1963,6 +2067,18 @@ async function executeTool(name, args, workspace, config, conversation) {
       return { success: true, message: `Checklist updated with ${args.tasks.length} items.` };
     }
     
+    case 'ask_clarifying_questions': {
+      if (!args.questions || !Array.isArray(args.questions) || args.questions.length === 0) {
+        throw new Error("ask_clarifying_questions requires a non-empty 'questions' array.");
+      }
+      conversation.awaitingClarification = {
+        intro: args.intro || 'A few quick design questions before I proceed:',
+        questions: args.questions
+      };
+      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+      return { success: true, status: 'questions_presented', _forceYield: true };
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -2606,7 +2722,9 @@ const STRATEGY_FILE_NAME = 'strategy.md';
 const IMPLEMENTATION_PLAN_FILE_NAME = 'implementation_plan.md';
 const STRATEGY_REQUIRED_SECTIONS = [
   'Objective',
-  'Relevant Files'
+  'Relevant Files',
+  'Design & Polish',
+  'Ambiguity Resolution'
 ];
 
 function basenameLower(pathValue) {
@@ -2721,6 +2839,8 @@ Then inspect obvious grounding files when present: README, package.json, pyproje
 
 Before writing implementation_plan.md, write STRATEGY.md with these exact sections:
 ${STRATEGY_REQUIRED_SECTIONS.map(section => `- ${section}`).join('\n')}
+
+CLARIFICATION BEFORE STRATEGY: For games, simulations, apps, or creative tools — if the user's request leaves key design decisions open (visual style/genre, core mechanic, scale/performance strategy, framework choice) — call the "ask_clarifying_questions" tool with 2-3 questions BEFORE writing STRATEGY.md. Do NOT write questions as prose — use the tool so the user gets an interactive card UI with selectable options. Do not proceed to STRATEGY.md until you have the user's answers. Only skip this if the user said "surprise me" or "you decide."
 
 If STRATEGY.md finds mission-critical ambiguity, ask the user before planning. If ambiguity is minor, record the assumption in STRATEGY.md and operational context, then proceed. Base implementation_plan.md on STRATEGY.md, not just the raw user prompt. Do not add agent roles, automatic replanning, or domain-specific workflows.]`;
 }
@@ -4136,6 +4256,42 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
             },
             required: ["query"]
           }
+        },
+        {
+          name: "ask_clarifying_questions",
+          description: "Pauses and presents 2-3 structured clarifying questions to the user when key design decisions are unspecified. Use BEFORE writing STRATEGY.md when the request leaves critical choices open (visual style, core mechanic, scale/performance strategy, framework). IMPORTANT: Do NOT say 'Task finished' or any completion text when calling this tool — the task is paused awaiting answers, not done. The user sees an interactive card with radio options, recommended badges, and a free-text 'Other' fallback. Their answers resume the agent automatically.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              intro: { type: "STRING", description: "Brief intro sentence shown above the questions, e.g. 'Before I write the strategy, a few quick design questions:'" },
+              questions: {
+                type: "ARRAY",
+                description: "2-3 clarifying questions to present.",
+                items: {
+                  type: "OBJECT",
+                  properties: {
+                    header: { type: "STRING", description: "Short chip label for the question, max 12 chars, e.g. 'Visual Style'" },
+                    question: { type: "STRING", description: "The full question text to display." },
+                    options: {
+                      type: "ARRAY",
+                      description: "2-4 multiple-choice options.",
+                      items: {
+                        type: "OBJECT",
+                        properties: {
+                          label: { type: "STRING", description: "Option label shown to user." },
+                          description: { type: "STRING", description: "Optional one-line explanation of this choice." },
+                          recommended: { type: "BOOLEAN", description: "If true, badges this option as recommended." }
+                        },
+                        required: ["label"]
+                      }
+                    }
+                  },
+                  required: ["header", "question", "options"]
+                }
+              }
+            },
+            required: ["intro", "questions"]
+          }
         }
       ]
     }
@@ -4733,6 +4889,42 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
               },
               required: ["query"]
             }
+          },
+          {
+            name: "ask_clarifying_questions",
+            description: "Pauses and presents 2-3 structured clarifying questions to the user when key design decisions are unspecified. Use BEFORE writing STRATEGY.md when the request leaves critical choices open (visual style, core mechanic, scale/performance strategy, framework). IMPORTANT: Do NOT say 'Task finished' or any completion text when calling this tool — the task is paused awaiting answers, not done. The user sees an interactive card with radio options, recommended badges, and a free-text 'Other' fallback. Their answers resume the agent automatically.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                intro: { type: "STRING", description: "Brief intro sentence shown above the questions, e.g. 'Before I write the strategy, a few quick design questions:'" },
+                questions: {
+                  type: "ARRAY",
+                  description: "2-3 clarifying questions to present.",
+                  items: {
+                    type: "OBJECT",
+                    properties: {
+                      header: { type: "STRING", description: "Short chip label for the question, max 12 chars, e.g. 'Visual Style'" },
+                      question: { type: "STRING", description: "The full question text to display." },
+                      options: {
+                        type: "ARRAY",
+                        description: "2-4 multiple-choice options.",
+                        items: {
+                          type: "OBJECT",
+                          properties: {
+                            label: { type: "STRING", description: "Option label shown to user." },
+                            description: { type: "STRING", description: "Optional one-line explanation of this choice." },
+                            recommended: { type: "BOOLEAN", description: "If true, badges this option as recommended." }
+                          },
+                          required: ["label"]
+                        }
+                      }
+                    },
+                    required: ["header", "question", "options"]
+                  }
+                }
+              },
+              required: ["intro", "questions"]
+            }
           }
         ]
       }
@@ -5016,4 +5208,5 @@ function diagnoseModelApiFailure(errorText) {
 
 if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
   module.exports.executeTool = executeTool; // So we can test it specifically
+  module.exports.runAgentLoop = window.runAgentLoop;
 }

@@ -533,27 +533,39 @@ async function takeBrowserScreenshot(workspacePath, destination) {
 
 // Captures the actual desktop screen (where a launched native/Python GUI window appears) and
 // saves it into the workspace. Unlike takeBrowserScreenshot, this sees real OS windows.
-async function captureDesktopScreenshot(workspacePath, destination, prefix = 'preview') {
+async function captureDesktopScreenshot(workspacePath, destination, prefix = 'preview', { hideOrion = false } = {}) {
   const { desktopCapturer, screen } = require('electron');
-  const primary = screen.getPrimaryDisplay();
-  const scale = primary.scaleFactor || 1;
-  const thumbnailSize = {
-    width: Math.round(primary.size.width * scale),
-    height: Math.round(primary.size.height * scale)
-  };
-  const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize });
-  if (!sources.length) throw new Error('No screen sources available for capture.');
-  const primarySource = sources.find(s => String(s.display_id) === String(primary.id)) || sources[0];
-  const image = primarySource.thumbnail;
-  if (!image || image.isEmpty()) throw new Error('Captured screen image was empty.');
-  const fallback = path.join('.orion', 'screenshots', `${prefix}-${Date.now()}.png`);
-  const rel = safeRelativeAssetPath(destination, fallback);
-  const fullPath = resolveWorkspacePath(workspacePath, rel);
-  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-  const png = image.toPNG();
-  fs.writeFileSync(fullPath, png);
-  const size = image.getSize();
-  return { rel, png, size };
+
+  // Optionally hide the Orion window so it doesn't obscure the target app in the screenshot.
+  const shouldHide = hideOrion && mainWindow && !mainWindow.isDestroyed();
+  if (shouldHide) {
+    mainWindow.hide();
+    await new Promise(r => setTimeout(r, 300));
+  }
+
+  try {
+    const primary = screen.getPrimaryDisplay();
+    const scale = primary.scaleFactor || 1;
+    const thumbnailSize = {
+      width: Math.round(primary.size.width * scale),
+      height: Math.round(primary.size.height * scale)
+    };
+    const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize });
+    if (!sources.length) throw new Error('No screen sources available for capture.');
+    const primarySource = sources.find(s => String(s.display_id) === String(primary.id)) || sources[0];
+    const image = primarySource.thumbnail;
+    if (!image || image.isEmpty()) throw new Error('Captured screen image was empty.');
+    const fallback = path.join('.orion', 'screenshots', `${prefix}-${Date.now()}.png`);
+    const rel = safeRelativeAssetPath(destination, fallback);
+    const fullPath = resolveWorkspacePath(workspacePath, rel);
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    const png = image.toPNG();
+    fs.writeFileSync(fullPath, png);
+    const size = image.getSize();
+    return { rel, png, size };
+  } finally {
+    if (shouldHide) mainWindow.show();
+  }
 }
 
 // Launches a workspace app (e.g. a Python/pygame game) as a persistent, tracked session, lets it
@@ -581,6 +593,15 @@ async function previewWorkspaceApp(workspacePath, { command, warmupMs, destinati
   if (!resolvedCommand) {
     return { success: false, error: 'Could not determine what to preview. Set a workspace entrypoint or pass an explicit command.' };
   }
+
+  // Snapshot known window IDs before launch so we can identify the new app window after warmup.
+  // Using 1×1 thumbnails for efficiency — we only need the IDs at this point.
+  let knownWindowIds = new Set();
+  try {
+    const { desktopCapturer: dc } = require('electron');
+    const pre = await dc.getSources({ types: ['window'], thumbnailSize: { width: 1, height: 1 } });
+    knownWindowIds = new Set(pre.map(s => s.id));
+  } catch (e) { /* non-fatal — window-diff will miss and fall back to full-screen capture */ }
 
   // Start as a persistent tracked session. startCommandSession validates the command and throws
   // if it is denied. The default backstop is generous (10 min) so long warm-ups / training runs
@@ -619,7 +640,32 @@ async function previewWorkspaceApp(workspacePath, { command, warmupMs, destinati
   let shot = null;
   let captureError = null;
   try {
-    shot = await captureDesktopScreenshot(workspacePath, destination, 'preview');
+    const { desktopCapturer: dc, screen } = require('electron');
+    const primary = screen.getPrimaryDisplay();
+    const scale = primary.scaleFactor || 1;
+    const thumbSize = { width: Math.round(primary.size.width * scale), height: Math.round(primary.size.height * scale) };
+
+    // Find any windows that appeared after we launched — those belong to the new app.
+    // Exclude Orion's own window so it never ends up in the screenshot.
+    const post = await dc.getSources({ types: ['window'], thumbnailSize: thumbSize });
+    const newWins = post.filter(s => !knownWindowIds.has(s.id) && !s.name.toLowerCase().includes('orion'));
+
+    if (newWins.length > 0) {
+      const appSource = newWins[0];
+      const image = appSource.thumbnail;
+      if (!image || image.isEmpty()) throw new Error('App window capture was empty.');
+      const fallback = path.join('.orion', 'screenshots', `preview-${Date.now()}.png`);
+      const rel = safeRelativeAssetPath(destination, fallback);
+      const fullPath = resolveWorkspacePath(workspacePath, rel);
+      fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+      const png = image.toPNG();
+      fs.writeFileSync(fullPath, png);
+      shot = { rel, png, size: image.getSize() };
+    } else {
+      // No new window detected (headless app, slow-starting window, etc.) —
+      // fall back to a full-screen capture with Orion hidden so it stays out of frame.
+      shot = await captureDesktopScreenshot(workspacePath, destination, 'preview', { hideOrion: true });
+    }
   } catch (err) {
     captureError = err.message;
   }
@@ -658,7 +704,7 @@ async function captureScreenForAgent(workspacePath, { destination, delayMs } = {
   const wait = Math.min(Math.max(parseInt(delayMs, 10) || 0, 0), 120000);
   if (wait > 0) await new Promise(resolve => setTimeout(resolve, wait));
   try {
-    const shot = await captureDesktopScreenshot(workspacePath, destination, 'capture');
+    const shot = await captureDesktopScreenshot(workspacePath, destination, 'capture', { hideOrion: true });
     return {
       success: true,
       path: shot.rel,
@@ -715,6 +761,14 @@ function createWindow() {
   });
 
   mainWindow.loadFile('index.html');
+  
+  // Clean up hidden background processes when main UI is closed
+  if (typeof mainWindow.on === 'function') {
+    mainWindow.on('closed', () => {
+      mainWindow = null;
+      app.quit();
+    });
+  }
   
   // Open DevTools in development if needed
   // mainWindow.webContents.openDevTools();
@@ -1032,7 +1086,18 @@ async function checkForSourceUpdatesAndRelaunch() {
   }
 }
 
-app.whenReady().then(async () => {
+const gotTheLock = typeof app.requestSingleInstanceLock === 'function' ? app.requestSingleInstanceLock() : true;
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on('second-instance', (event, commandLine, workingDirectory) => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+
+  app.whenReady().then(async () => {
   // If a newer source tree is found, this copies it in and relaunches; bail so we don't briefly
   // run stale code. Content comparison makes the next launch a no-op, so there is no relaunch loop.
   if (await checkForSourceUpdatesAndRelaunch()) return;
@@ -1044,6 +1109,7 @@ app.whenReady().then(async () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
+}
 
 app.on('window-all-closed', function () {
   if (companionServer) {
@@ -4379,14 +4445,14 @@ ipcMain.handle('start-command', (event, { command, cwd, processId, timeoutMs }) 
 ipcMain.handle('get-command-status', (event, processId) => {
   const resolvedId = resolveCommandSessionId(processId);
   const session = commandSessions[resolvedId];
-  if (!session) return { success: false, error: 'Unknown command session' };
+  if (!session) return { success: false, error: `Unknown command session "${resolvedId}". The command was never started or the session ID is wrong — use start_command to launch it first.` };
   return { success: true, ...commandSessionSummary(session, 2000) };
 });
 
 ipcMain.handle('read-command-output', (event, { processId, maxChars }) => {
   const resolvedId = resolveCommandSessionId(processId);
   const session = commandSessions[resolvedId];
-  if (!session) return { success: false, error: 'Unknown command session' };
+  if (!session) return { success: false, error: `Unknown command session "${resolvedId}". The command was never started or the session ID is wrong — use start_command to launch it first.` };
   return { success: true, ...commandSessionSummary(session, parseInt(maxChars, 10) || 12000) };
 });
 

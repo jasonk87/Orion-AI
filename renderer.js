@@ -1618,7 +1618,8 @@ function createPhoneConversation({ projectPath = '', title = 'New Phone Task' } 
     projectPath: normalizedProjectPath,
     tasks: [],
     awaitingPlanApproval: false,
-    planApproved: false
+    planApproved: false,
+    awaitingClarification: null
   };
   conversations.unshift(conv);
   saveConversationsToStorage();
@@ -1644,6 +1645,23 @@ function loadConversationsFromStorage() {
 }
 
 function migrateConversations() {
+  let projectsUpdated = false;
+  
+  // 1. Recover missing projects from orphaned conversations
+  conversations.forEach(c => {
+    if (c.projectPath) {
+      const exists = projects.find(p => p.toLowerCase() === c.projectPath.toLowerCase());
+      if (!exists) {
+        projects.push(c.projectPath);
+        projectsUpdated = true;
+      }
+    }
+  });
+  
+  if (projectsUpdated) {
+    saveProjectsToStorage();
+  }
+
   let updated = false;
   conversations.forEach(c => {
     if (!c.projectPath && c.workspace) {
@@ -2278,6 +2296,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   
   let runningIndicatorHtml = '';
   let planApprovalHtml = '';
+  let clarificationHtml = '';
   const runningConversationId = window.getRunningConversationId ? window.getRunningConversationId() : null;
   const activeConv = typeof conversations !== 'undefined'
     ? conversations.find(c => c.id === activeConversationId)
@@ -2314,6 +2333,13 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
       `;
     }
   }
+  // Clarification question card — same live/reload dual-detection pattern as plan approval.
+  const isClarificationBubble = msgMeta
+    ? !!msgMeta.isClarificationCard
+    : !!(activeConv && activeConv.awaitingClarification);
+  if (isClarificationBubble && activeConv && activeConv.awaitingClarification) {
+    clarificationHtml = buildClarificationCardHtml(activeConv.awaitingClarification);
+  }
   if (window.isAgentRunning && window.isAgentRunning() && runningConversationId === activeConversationId) {
     const stepNum = window.currentLoopCount || 1;
     
@@ -2348,12 +2374,13 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     ${logsHtml}
     <div class="message-body">
       ${renderedMarkdown}
+      ${clarificationHtml}
       ${planApprovalHtml}
       ${runningIndicatorHtml}
     </div>
   `;
   sanitizeRenderedMarkdown(bubble);
-  
+
   // Format code blocks
   if (isNew) {
     el.messagesContainer.appendChild(bubble);
@@ -2369,6 +2396,31 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   const approveButton = bubble.querySelector('.btn-approve-plan');
   if (approveButton) {
     approveButton.addEventListener('click', () => approveCurrentPlanAndContinue({ button: approveButton }));
+  }
+  // Wire clarification option rows for selection highlight
+  bubble.querySelectorAll('.clarification-option, .clarification-other-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const radio = row.querySelector('input[type="radio"]');
+      if (radio) radio.checked = true;
+      const block = row.closest('.clarification-question-block');
+      if (block) {
+        block.querySelectorAll('.clarification-option, .clarification-other-row').forEach(r => r.classList.remove('selected'));
+      }
+      row.classList.add('selected');
+    });
+  });
+  // Auto-select "Other" row when user types in the text input
+  bubble.querySelectorAll('.clarification-other-input').forEach(input => {
+    input.addEventListener('focus', () => {
+      const row = input.closest('.clarification-other-row');
+      if (row) {
+        row.click();
+      }
+    });
+  });
+  const clarSubmitBtn = bubble.querySelector('.btn-clarification-submit');
+  if (clarSubmitBtn) {
+    clarSubmitBtn.addEventListener('click', () => submitClarificationAnswers({ button: clarSubmitBtn, bubble }));
   }
   if (typeof Prism !== 'undefined') Prism.highlightAllUnder(bubble);
   
@@ -3076,6 +3128,131 @@ window.resumePhoneCompanionTask = async (targetId) => {
   const prompt = 'Continue the previous task. First inspect current state and recent output, then continue only if it is still safe and useful.';
   return await window.submitPhoneCompanionPrompt({ prompt, conversationId: resolvedId });
 };
+
+function buildClarificationCardHtml(clarData) {
+  const { intro, questions } = clarData;
+  const escapedIntro = (intro || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  const questionsHtml = (questions || []).map((q, qi) => {
+    const escapedHeader = (q.header || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const escapedQuestion = (q.question || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    const optionsHtml = (q.options || []).map((opt, oi) => {
+      const escapedLabel = (opt.label || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const escapedDesc = (opt.description || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const recommendedBadge = opt.recommended
+        ? `<span class="clarification-recommended-badge">Recommended</span>`
+        : '';
+      const descHtml = escapedDesc
+        ? `<span class="clarification-option-desc">${escapedDesc}</span>`
+        : '';
+      return `
+        <label class="clarification-option">
+          <input type="radio" name="clarq_${qi}" value="${oi}" />
+          <span class="clarification-option-body">
+            <span class="clarification-option-label-row">
+              <span class="clarification-option-label">${escapedLabel}</span>
+              ${recommendedBadge}
+            </span>
+            ${descHtml}
+          </span>
+        </label>`;
+    }).join('');
+
+    return `
+      <div class="clarification-question-block" data-qi="${qi}">
+        <div class="clarification-question-header">
+          <span class="clarification-chip">${escapedHeader}</span>
+          <span class="clarification-question-text">${escapedQuestion}</span>
+        </div>
+        <div class="clarification-options">
+          ${optionsHtml}
+          <label class="clarification-other-row">
+            <input type="radio" name="clarq_${qi}" value="__other__" />
+            <input class="clarification-other-input" type="text" placeholder="Other — type your answer…" data-qi="${qi}" />
+          </label>
+        </div>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="clarification-card">
+      ${escapedIntro ? `<div class="clarification-intro">${escapedIntro}</div>` : ''}
+      ${questionsHtml}
+      <div class="clarification-actions">
+        <button class="btn-clarification-submit" type="button">Submit</button>
+      </div>
+    </div>`;
+}
+
+async function submitClarificationAnswers({ button, bubble } = {}) {
+  const conv = conversations.find(c => c.id === activeConversationId);
+  if (!conv || !conv.awaitingClarification) return;
+
+  const clarData = conv.awaitingClarification;
+  const questions = clarData.questions || [];
+
+  // Collect answers from the bubble's form controls
+  const answers = [];
+  let allAnswered = true;
+  questions.forEach((q, qi) => {
+    const block = bubble ? bubble.querySelector(`.clarification-question-block[data-qi="${qi}"]`) : null;
+    let answer = null;
+    if (block) {
+      const checked = block.querySelector(`input[type="radio"][name="clarq_${qi}"]:checked`);
+      if (checked) {
+        if (checked.value === '__other__') {
+          const otherInput = block.querySelector(`.clarification-other-input[data-qi="${qi}"]`);
+          answer = otherInput ? otherInput.value.trim() : '';
+        } else {
+          const optIdx = parseInt(checked.value, 10);
+          answer = (q.options[optIdx] && q.options[optIdx].label) || '';
+        }
+      }
+    }
+    if (!answer) allAnswered = false;
+    answers.push({ header: q.header, question: q.question, answer: answer || '(no answer)' });
+  });
+
+  if (!allAnswered) {
+    // Briefly flash the submit button to signal something is missing
+    if (button) {
+      button.textContent = 'Answer all questions first';
+      setTimeout(() => { button.textContent = 'Submit'; }, 1800);
+    }
+    return;
+  }
+
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Submitting…';
+  }
+  if (bubble) {
+    const card = bubble.querySelector('.clarification-card');
+    if (card) card.classList.add('answered');
+  }
+
+  // Format answers as a readable user message
+  const formattedAnswers = answers.map(a => `${a.header}: ${a.answer}`).join('\n');
+  const userMessage = `Here are my answers:\n${formattedAnswers}`;
+
+  // Clear the awaiting state
+  conv.awaitingClarification = null;
+
+  // Render answers as a visible user message and persist to history
+  renderUserMessage(userMessage);
+  conv.messages.push({ role: 'user', text: userMessage, source: 'clarification-answers' });
+  saveConversationsToStorage();
+
+  if (!appConfig.geminiApiKey) {
+    el.settingsModal.classList.add('active');
+    appendSystemMessage("Please enter and save your Gemini API Key first.");
+    return;
+  }
+
+  window.runAgentLoop(userMessage, el.modelSelect.value, conv, { source: 'clarification-answers' })
+    .catch(err => console.error('Clarification resume failed:', err));
+}
 
 async function approveCurrentPlanAndContinue(options = {}) {
   const button = options.button || null;
