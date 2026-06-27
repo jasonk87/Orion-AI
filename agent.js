@@ -385,6 +385,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     }
   }
 
+  // A genuinely new task resets the auto-continue budget so prior runs cannot starve it.
+  if (resetMissionState) {
+    conversation._planExecAutoContinues = 0;
+  }
+
   // Surface a direct-task decision once, in one consistent place.
   if (!isInternalPrompt && !conversation.planApproved && window.appendSystemMessage && planningBypassedForTask && planningDecision.mode === 'direct' && agentExecutionMode === 'direct') {
     window.appendSystemMessage(`Planning mode: direct task, no implementation plan required. ${planningDecision.reason || ''}`.trim());
@@ -495,6 +500,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let aiMessageIndex = conversation.messages.length;
   let workWalkthrough = [];
   let forceYield = false;
+  // When a multi-phase approved plan runs out of loop budget with real work still pending,
+  // the run auto-continues in a fresh internal pass instead of falsely reporting "Task finished".
+  let autoContinueExecution = false;
   let finalAnswerQualityPrompts = 0;
   let finalAnswerQualityLoopExtensions = 0;
   // Initialize AI message state in conversation list
@@ -548,6 +556,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // Run the agent execution loop
     let loopCount = 0;
     let maxLoops = reviewOnly ? 40 : 20;
+    // An approved multi-phase plan (mission state present and execution allowed) needs far more
+    // model turns than a one-shot task. Give it substantially more room so it does not stop
+    // mid-build and falsely report completion. The completion gate still governs when it ends.
+    const executingApprovedPlan = (!config.planningMode || conversation.planApproved || planningBypassedForTask)
+      && hasOperationalMissionState(workingState);
+    if (executingApprovedPlan && !reviewOnly) maxLoops = 60;
     let planValidationRetries = 0;
     let consecutiveNoToolCalls = 0;
     let malformedCallsCount = 0;
@@ -827,7 +841,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           messages.push({ role: 'user', parts: [{ text: finalAnswerQualityPrompt }] });
           continue;
         }
-        if (hasOperationalMissionState(workingState) && agentExecutionMode === 'executing') {
+        // The completion gate must hold back a premature final answer whenever there is a real
+        // mission/subplan in flight and we are allowed to execute — regardless of whether routing
+        // labeled this turn 'executing' or 'direct'. Gating on 'executing' alone let a resumed
+        // approved plan slip straight to "Task finished" with most of the work still pending.
+        if (hasOperationalMissionState(workingState) && canExecuteThisTask() && agentExecutionMode !== 'answer') {
           const completionGate = evaluateWorkingStateCompletion(workingState, conversation);
           if (completionGate.status === 'continue_work' && loopCount >= maxLoops && completionGateLoopExtensions < 3) {
             completionGateLoopExtensions++;
@@ -1134,9 +1152,37 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     agentExecutionMode = 'idle';
     agentSubStatus = '';
     if (window.onAgentStatusChange) window.onAgentStatusChange(false);
-    
+
+    // Determine whether the run stopped with genuine work still pending. This drives both the
+    // auto-continue decision and an honest terminal message instead of a blanket "Task finished".
+    const canExecuteAtExit = (!config.planningMode || conversation.planApproved || planningBypassedForTask);
+    const pendingChecklist = (conversation.tasks || []).filter(task => task.status !== 'completed' && task.status !== 'x');
+    const subplanActive = !!(workingState && workingState.activeSubplan && workingState.activeSubplan.status === 'active');
+    const winPending = !!(workingState && Array.isArray(workingState.winConditions) && workingState.winConditions.length
+      && workingState.winConditions.some(condition => condition.status !== 'satisfied'));
+    const blockersActive = !!(workingState && workingState.blockers && Array.isArray(workingState.blockers.active) && workingState.blockers.active.length);
+    const madeProgressThisRun = (workWalkthrough || []).some(item => item && item.status === 'done');
+    const hasPendingWork = pendingChecklist.length > 0 || subplanActive || winPending;
+
+    // Auto-continue only when we are mid-execution of a real plan, made progress this pass, are
+    // not paused for approval or blocked, and still have budget. This prevents the "it just quits"
+    // failure without risking a runaway loop (no progress in a pass stops the chain).
+    conversation._planExecAutoContinues = conversation._planExecAutoContinues || 0;
+    const AUTO_CONTINUE_BUDGET = 12;
+    if (!forceYield && canExecuteAtExit && hasPendingWork && madeProgressThisRun && !blockersActive
+        && hasOperationalMissionState(workingState) && conversation._planExecAutoContinues < AUTO_CONTINUE_BUDGET) {
+      autoContinueExecution = true;
+      conversation._planExecAutoContinues++;
+    }
+
     if (lastTextResponse === "Thinking...") {
-      lastTextResponse = "Task finished.";
+      if (autoContinueExecution) {
+        lastTextResponse = 'Completed the next batch of implementation steps. Continuing automatically with the remaining plan…';
+      } else if (hasPendingWork && canExecuteAtExit && !forceYield) {
+        lastTextResponse = buildRemainingWorkSummary(pendingChecklist, workingState, conversation._planExecAutoContinues >= AUTO_CONTINUE_BUDGET);
+      } else {
+        lastTextResponse = "Task finished.";
+      }
     }
     lastTextResponse = withWorkWalkthrough(lastTextResponse, workWalkthrough, true);
 
@@ -1184,6 +1230,19 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     if (window.renderProjectsList) window.renderProjectsList();
   }
   
+  // If the run stopped mid-plan with real progress and pending work, queue an internal
+  // continuation so a multi-phase build keeps going instead of falsely ending. Real user
+  // queue items take priority, so only enqueue when nothing else is waiting.
+  if (autoContinueExecution && window.promptQueue && window.promptQueue.length === 0) {
+    window.promptQueue.push({
+      prompt: '[ORION INTERNAL CONTINUATION - not a user message] The approved plan is still in progress. Continue executing the remaining checklist items and subplan steps now: write and edit the actual source files for the next pending tasks, then verify. Do not restate the plan or stop until the work is genuinely complete or you hit a real blocker. Do not quote this as something the user said.',
+      modelSelectValue: modelName,
+      conversationId: conversation.id,
+      alreadyRendered: true,
+      source: 'system'
+    });
+  }
+
   // Check for queued prompts
   setTimeout(async () => {
     if (window.promptQueue && window.promptQueue.length > 0) {
@@ -2105,6 +2164,30 @@ function evaluateWorkingStateCompletion(state, conversation) {
   return OperationalContext.evaluateCompletionGate(state, {
     explicitRequirements: conversation && conversation.tasks ? conversation.tasks : []
   });
+}
+
+// Builds an honest "here is what is done and what remains" message for when an execution run
+// stops with work still pending — instead of a misleading bare "Task finished.".
+function buildRemainingWorkSummary(pendingChecklist, state, budgetExhausted) {
+  const lines = [];
+  if (budgetExhausted) {
+    lines.push('I paused after several automatic continuation passes so this does not run unbounded. The plan is partially implemented — send "continue" to resume.');
+  } else {
+    lines.push('I made progress but the plan is not finished yet.');
+  }
+
+  const remaining = (pendingChecklist || []).map(task => task.title).filter(Boolean).slice(0, 12);
+  if (remaining.length) {
+    lines.push('\n**Still pending:**');
+    remaining.forEach(title => lines.push(`- ${title}`));
+  }
+
+  const subplan = state && state.activeSubplan;
+  if (subplan && subplan.status === 'active' && subplan.nextAction) {
+    lines.push(`\n**Next action:** ${subplan.nextAction}`);
+  }
+
+  return lines.join('\n');
 }
 
 function firstMeaningfulLine(text, fallback = '') {
@@ -4608,6 +4691,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     tokenizeIntentText,
     buildLocalMemoryAnswer,
     getPlanningToolGate,
+    buildRemainingWorkSummary,
     normalizeChecklistTasks,
     shouldApplyChecklistUpdate,
     hasRequiredTestingPlanSection,

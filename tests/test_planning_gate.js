@@ -496,3 +496,43 @@ test('repeated tool failures during execution do not re-trigger plan approval UI
   t.end();
 });
 
+test('buildRemainingWorkSummary lists pending tasks and next action honestly', (t) => {
+  const pending = [
+    { title: 'Implement food spawning', status: 'pending' },
+    { title: 'Develop collision detection', status: 'pending' },
+  ];
+  const state = { activeSubplan: { status: 'active', nextAction: 'Implement food spawning logic' } };
+
+  const msg = agent.buildRemainingWorkSummary(pending, state, false);
+  t.ok(/not finished/i.test(msg), 'message states the work is not finished (not a false "Task finished")');
+  t.ok(msg.includes('Implement food spawning'), 'lists the first pending task');
+  t.ok(msg.includes('Develop collision detection'), 'lists the second pending task');
+  t.ok(msg.includes('Implement food spawning logic'), 'surfaces the subplan next action');
+
+  const exhausted = agent.buildRemainingWorkSummary(pending, state, true);
+  t.ok(/continue/i.test(exhausted), 'budget-exhausted message tells the user how to resume');
+  t.end();
+});
+
+// Regression for the "it just quits mid-plan with no answer" failure. When an approved plan
+// continues but routing labels the turn 'direct' (not 'executing'), the completion gate must
+// still hold the run back. Previously the gate was bypassed and the loop fell straight to
+// "Task finished" with most of the work pending.
+test('completion gate fires for any execution mode with mission state, not only executing', (t) => {
+  const fs = require('fs');
+  const path = require('path');
+  const agentSource = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
+  t.notOk(
+    agentSource.includes("hasOperationalMissionState(workingState) && agentExecutionMode === 'executing'"),
+    'completion gate no longer keys solely off agentExecutionMode === executing'
+  );
+  t.ok(
+    agentSource.includes("hasOperationalMissionState(workingState) && canExecuteThisTask() && agentExecutionMode !== 'answer'"),
+    'completion gate fires whenever execution is allowed and there is mission state'
+  );
+  t.ok(agentSource.includes('if (executingApprovedPlan && !reviewOnly) maxLoops = 60'), 'approved plan execution gets a larger loop budget');
+  t.ok(agentSource.includes('autoContinueExecution = true'), 'auto-continue path exists for unfinished plan execution');
+  t.ok(agentSource.includes('AUTO_CONTINUE_BUDGET'), 'auto-continue is bounded by a budget to prevent runaway loops');
+  t.end();
+});
+
