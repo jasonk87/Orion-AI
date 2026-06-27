@@ -687,7 +687,7 @@ function createWindow() {
     fullscreen: true, // Launch in fullscreen mode
     frame: false, // Borderless window to enable custom title bar matching screenshot
     backgroundColor: '#0c0c0e',
-    icon: path.join(__dirname, 'assets', 'icon.png'),
+    icon: path.join(__dirname, 'assets', process.platform === 'win32' ? 'icon.ico' : 'icon.png'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -701,7 +701,80 @@ function createWindow() {
   // mainWindow.webContents.openDevTools();
 }
 
+// ── PACKAGED-APP AUTO-UPDATE ───────────────────────────────────────────────────────────────
+// The packaged .exe loads its code from resources/app. When the developer updates the source
+// tree, the running app would otherwise stay frozen at build time. On startup the packaged app
+// checks the source tree for newer runtime files, copies any that differ, and relaunches so the
+// new code takes effect — no manual copying or repackaging for JS/CSS/HTML changes.
+const AUTO_UPDATE_FILES = ['main.js', 'preload.js', 'agent.js', 'renderer.js', 'styles.css', 'index.html', 'operational-context.js', 'safety.js'];
+
+function isLikelySourceDir(dir) {
+  try {
+    return !!dir
+      && fs.existsSync(path.join(dir, 'agent.js'))
+      && fs.existsSync(path.join(dir, 'renderer.js'))
+      && fs.existsSync(path.join(dir, 'package.json'));
+  } catch (_) {
+    return false;
+  }
+}
+
+// Where to pull updates from: an explicit config override wins; otherwise infer the project root
+// from the standard packaged layout (<root>/dist/<name>/resources/app -> four levels up).
+function resolveUpdateSourceDir() {
+  try {
+    const cfg = readAppConfig();
+    const configured = (cfg.updateSourceDir || '').trim();
+    if (configured && isLikelySourceDir(configured)) return configured;
+    const inferred = path.resolve(__dirname, '..', '..', '..', '..');
+    if (isLikelySourceDir(inferred)) return inferred;
+  } catch (_) {}
+  return '';
+}
+
+// Pure, testable core: returns the list of files whose source bytes differ from the running copy.
+function computeSourceUpdates(srcDir, destDir, files = AUTO_UPDATE_FILES) {
+  const changed = [];
+  if (!srcDir || !destDir || path.resolve(srcDir) === path.resolve(destDir)) return changed;
+  for (const f of files) {
+    try {
+      const srcPath = path.join(srcDir, f);
+      if (!fs.existsSync(srcPath)) continue;
+      const srcBuf = fs.readFileSync(srcPath);
+      let destBuf = null;
+      try { destBuf = fs.readFileSync(path.join(destDir, f)); } catch (_) {}
+      if (!destBuf || !srcBuf.equals(destBuf)) changed.push(f);
+    } catch (_) {}
+  }
+  return changed;
+}
+
+function checkForSourceUpdatesAndRelaunch() {
+  try {
+    if (!app.isPackaged) return false; // running from source (npm start) — already current
+    const srcDir = resolveUpdateSourceDir();
+    if (!srcDir) return false;
+    const changed = computeSourceUpdates(srcDir, __dirname);
+    if (!changed.length) return false;
+    for (const f of changed) {
+      fs.writeFileSync(path.join(__dirname, f), fs.readFileSync(path.join(srcDir, f)));
+    }
+    console.log('Auto-update: synced newer files and relaunching ->', changed.join(', '));
+    app.relaunch();
+    app.exit(0);
+    return true;
+  } catch (e) {
+    // Any failure must not block launch — fall through and run with whatever is on disk.
+    console.error('Auto-update check failed:', e);
+    return false;
+  }
+}
+
 app.whenReady().then(() => {
+  // If a newer source tree is found, this copies it in and relaunches; bail so we don't briefly
+  // run stale code. Content comparison makes the next launch a no-op, so there is no relaunch loop.
+  if (checkForSourceUpdatesAndRelaunch()) return;
+
   createWindow();
   startPhoneCompanionServer();
 
@@ -4410,6 +4483,8 @@ if (process.env.NODE_ENV === 'test') {
 if (process.env.NODE_ENV === 'test') {
   module.exports.applyPatch = applyPatch;
   module.exports.buildPatchProof = buildPatchProof;
+  module.exports.computeSourceUpdates = computeSourceUpdates;
+  module.exports.isLikelySourceDir = isLikelySourceDir;
 }
 
 if (process.env.NODE_ENV === 'test') {

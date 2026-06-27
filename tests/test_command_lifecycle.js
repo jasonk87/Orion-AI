@@ -110,6 +110,31 @@ test('previewWorkspaceApp guards: missing workspace, no entrypoint, and destruct
   t.end();
 });
 
+test('computeSourceUpdates flags only files whose bytes differ', (t) => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-src-'));
+  const dest = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-dest-'));
+
+  fs.writeFileSync(path.join(src, 'agent.js'), 'IDENTICAL');
+  fs.writeFileSync(path.join(dest, 'agent.js'), 'IDENTICAL');     // unchanged
+  fs.writeFileSync(path.join(src, 'renderer.js'), 'NEW CODE');
+  fs.writeFileSync(path.join(dest, 'renderer.js'), 'OLD CODE');   // differs
+  fs.writeFileSync(path.join(src, 'main.js'), 'ONLY IN SOURCE');  // missing in dest
+
+  const changed = main.computeSourceUpdates(src, dest, ['agent.js', 'renderer.js', 'main.js', 'preload.js']);
+  t.notOk(changed.includes('agent.js'), 'identical file is not flagged for update');
+  t.ok(changed.includes('renderer.js'), 'differing file is flagged for update');
+  t.ok(changed.includes('main.js'), 'file missing from the running app is flagged');
+  t.notOk(changed.includes('preload.js'), 'file absent from the source is skipped');
+
+  // Guard against self-copy / relaunch loops: identical src and dest yields nothing.
+  t.deepEqual(main.computeSourceUpdates(src, src, ['agent.js']), [], 'same source and dest yields no updates');
+  t.end();
+});
+
 test('preview_app launches a persistent session and does NOT auto-close', async (t) => {
   const fs = require('fs');
   const os = require('os');
