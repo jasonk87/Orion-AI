@@ -415,7 +415,7 @@ test('agent and renderer wire operational context into both providers and Missio
   const agent = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
   const renderer = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8');
   const html = fs.readFileSync(path.join(__dirname, '../index.html'), 'utf8');
-  t.equal((agent.match(/\.\.\.OPERATIONAL_CONTEXT_TOOL_DECLARATIONS/g) || []).length, 2, 'shares tool declarations across Gemini and Ollama');
+  t.equal((agent.match(/\? OPERATIONAL_CONTEXT_TOOL_DECLARATIONS :/g) || []).length, 2, 'shares tool declarations across Gemini and Ollama');
   t.ok(agent.includes('OperationalContext.buildReasoningMessages(workingState'), 'builds provider input from working state first');
   t.notOk(agent.includes('conversation.messages.forEach(msg =>'), 'does not reconstruct task state from full chat transcript');
   t.ok(agent.includes('evaluateWorkingStateCompletion'), 'uses a single completion gate before finalizing');

@@ -547,7 +547,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     
     // Run the agent execution loop
     let loopCount = 0;
-    let maxLoops = reviewOnlyMode ? 40 : 20;
+    let maxLoops = reviewOnly ? 40 : 20;
     let planValidationRetries = 0;
     let consecutiveNoToolCalls = 0;
     let malformedCallsCount = 0;
@@ -799,7 +799,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           continue;
         }
         // In review-only mode, always nudge the model to keep reading files until it explicitly signals completion
-        if (reviewOnlyMode && consecutiveNoToolCalls === 1 && workWalkthrough.length > 0 && loopCount < maxLoops) {
+        if (reviewOnly && consecutiveNoToolCalls === 1 && workWalkthrough.length > 0 && loopCount < maxLoops) {
           const signalsDone = /\b(that'?s all|in conclusion|to summarize|summary of findings|final(?:ly)?|this concludes|completed (?:my )?(?:review|analysis|scan)|finished reviewing|done reviewing)\b/i.test(String(textVal || ''));
           if (!signalsDone) {
             currentAgentLogs.push({ type: 'thought', content: 'Review mode: model paused mid-review. Nudging to continue reading files.' });
