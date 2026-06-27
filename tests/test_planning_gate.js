@@ -535,6 +535,27 @@ test('completion gate fires for any execution mode with mission state, not only 
   t.ok(agentSource.includes('AUTO_CONTINUE_BUDGET'), 'auto-continue is bounded by an absolute ceiling to prevent runaway loops');
   t.ok(agentSource.includes('STALL_LIMIT'), 'auto-continue stops when no goal-level progress is made across passes');
   t.ok(agentSource.includes('progressScore'), 'stall detection is based on completed-work progress, not just activity');
+  t.ok(agentSource.includes('const hasResumableWork = hasOperationalMissionState(workingState) || pendingChecklist.length > 0'), 'auto-continue falls back to the checklist when mission state is absent');
+  t.end();
+});
+
+// Regression for the mid-build stop: a continuation of an approved plan whose later phase merely
+// SOUNDS plan-worthy (e.g. "ML training") was re-classified as a new plan, which cleared
+// planApproved and wiped operational mission state — disabling the completion gate and
+// auto-continue so the run stopped mid-build. The fix keeps the mission while it is in progress.
+test('approved-plan continuation does not wipe an in-progress mission when re-classified as plan', (t) => {
+  const fs = require('fs');
+  const path = require('path');
+  const agentSource = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
+
+  t.ok(agentSource.includes('const missionInProgress = hasOperationalMissionState(workingState)'),
+    'routing computes whether a mission is genuinely in progress');
+  t.ok(agentSource.includes("workingState.activeSubplan && workingState.activeSubplan.status === 'active'"),
+    'mission-in-progress considers an active subplan');
+  t.ok(agentSource.includes("workingState.winConditions.some(condition => condition.status !== 'satisfied')"),
+    'mission-in-progress considers unsatisfied win conditions');
+  t.ok(agentSource.includes('if (decision.mode === \'plan\' && !missionInProgress)'),
+    'a re-plan only triggers when no mission is in progress — never tears down an executing plan');
   t.end();
 });
 

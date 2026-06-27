@@ -358,12 +358,22 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const decision = config.planningMode === false
       ? { mode: 'direct', reason: 'Planning mode disabled.' }
       : await classifyPlanningNeed(userPrompt, modelName, config.geminiApiKey);
-    if (decision.mode === 'plan') {
+    // A mission is genuinely in progress when an active subplan still has work or any win
+    // condition is unsatisfied. While that is true we must NEVER downgrade to a re-plan: doing
+    // so clears planApproved and wipes the operational context (mission/subplan/win conditions),
+    // which in turn disables the completion gate and auto-continue and makes the run stop
+    // mid-build. A later phase that merely *sounds* plan-worthy (e.g. "ML training") must not
+    // tear down the approved plan that is already executing it.
+    const missionInProgress = hasOperationalMissionState(workingState) && (
+      (workingState.activeSubplan && workingState.activeSubplan.status === 'active') ||
+      (Array.isArray(workingState.winConditions) && workingState.winConditions.some(condition => condition.status !== 'satisfied'))
+    );
+    if (decision.mode === 'plan' && !missionInProgress) {
       resetMissionState = true;
       conversation.planApproved = false;
       planningDecision = decision;
     } else {
-      planningDecision = { mode: 'direct', reason: 'Continuing approved task.' };
+      planningDecision = { mode: 'direct', reason: missionInProgress ? 'Continuing approved plan that is still in progress.' : 'Continuing approved task.' };
       planningBypassedForTask = true;
       agentExecutionMode = 'executing';
     }
@@ -1191,8 +1201,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const AUTO_CONTINUE_BUDGET = 100;  // absolute ceiling so a runaway can never loop forever
     const STALL_LIMIT = 8;             // consecutive passes with no completed-work progress before stopping
     const stalled = (conversation._stallPasses || 0) >= STALL_LIMIT;
+    // Continue when there is a real mission in flight OR an outstanding checklist — the checklist
+    // fallback keeps long work going even if operational mission state is unexpectedly absent.
+    const hasResumableWork = hasOperationalMissionState(workingState) || pendingChecklist.length > 0;
     if (!forceYield && canExecuteAtExit && hasPendingWork && madeProgressThisRun && !blockersActive && !stalled
-        && hasOperationalMissionState(workingState) && conversation._planExecAutoContinues < AUTO_CONTINUE_BUDGET) {
+        && hasResumableWork && conversation._planExecAutoContinues < AUTO_CONTINUE_BUDGET) {
       autoContinueExecution = true;
       conversation._planExecAutoContinues++;
     }
