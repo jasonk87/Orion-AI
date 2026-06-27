@@ -357,9 +357,27 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     }
   );
 
+  // Recovery: if the flag wasn't set but user is clearly approving, check disk for a valid plan
+  if (!isInternalPrompt && !conversation.awaitingPlanApproval && !conversation.planApproved && workspacePath) {
+    const fastIntent = classifyPlanApprovalIntentFast(userPrompt);
+    if (fastIntent === 'approve') {
+      try {
+        const planContent = await window.api.readFile(workspacePath, 'implementation_plan.md', { maxChars: 100000 });
+        const planText = typeof planContent === 'string' ? planContent : (planContent && !planContent.error ? planContent.content || '' : '');
+        if (planText && planText.trim().length > 100) {
+          conversation.awaitingPlanApproval = true;
+          if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+        }
+      } catch (_) {}
+    }
+  }
+
   let approvalIntent = null;
   if (!isInternalPrompt && conversation.awaitingPlanApproval && !conversation.planApproved) {
-    approvalIntent = await classifyPlanApprovalIntent(userPrompt, modelName, config.geminiApiKey);
+    const fastIntent = classifyPlanApprovalIntentFast(userPrompt);
+    approvalIntent = fastIntent
+      ? { intent: fastIntent, reason: 'Fast-path keyword match.' }
+      : await classifyPlanApprovalIntent(userPrompt, modelName, config.geminiApiKey);
     if (approvalIntent.intent === 'approve') {
       let planIsValid = false;
       try {
@@ -2899,6 +2917,17 @@ function hasAnyChecklist(conversation) {
   return !!(conversation && Array.isArray(conversation.tasks) && conversation.tasks.length > 0);
 }
 
+function classifyPlanApprovalIntentFast(prompt) {
+  const text = String(prompt || '').toLowerCase().trim().replace(/[!.,]+$/, '');
+  const approveWords = /^(approved?|yes|yep|yeah|yup|ok|okay|go|start|proceed|confirm|looks? good|go ahead|let'?s? go|do it|sounds? good|great|perfect|good|correct|right|alright|ship it|execute|begin|run it|build it)$/;
+  const denyWords = /^(no|nope|cancel|stop|abort|deny|reject|don'?t)$/;
+  const reviseWords = /^(change|update|revise|modify|edit|adjust|fix|add|remove|rethink|reconsider|wait|hold on|actually|instead)\b/;
+  if (approveWords.test(text)) return 'approve';
+  if (denyWords.test(text)) return 'deny';
+  if (reviseWords.test(text)) return 'revise';
+  return null;
+}
+
 async function classifyPlanApprovalIntent(userPrompt, modelName, apiKey) {
   const fallback = { intent: 'unclear', reason: 'Could not classify plan approval intent.' };
   const prompt = `Classify the user's latest message about a pending implementation plan.
@@ -4632,6 +4661,7 @@ ${conversationLogsText}`;
 if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
   module.exports = {
     classifyPlanApprovalIntent,
+    classifyPlanApprovalIntentFast,
     classifyPlanningNeed,
     tokenizeIntentText,
     classifySimpleTask,
