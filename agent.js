@@ -425,6 +425,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       conversation.awaitingPlanApproval = false;
       window.saveConversationsToStorage();
     }
+
+    if (approvalIntent.intent === 'unclear') {
+      // Don't silently pass — tell the user the plan is still waiting
+      if (window.appendSystemMessage) {
+        window.appendSystemMessage("A plan is waiting for approval. Type 'approved' or 'yes' to start implementation, or describe what you'd like to change.", { conversationId: conversation.id });
+      }
+      messages.push({
+        role: 'user',
+        parts: [{ text: '[SYSTEM: A plan is awaiting approval and the user sent an ambiguous message. Remind them clearly that the implementation plan is ready and they need to explicitly approve or revise it. Show a brief summary of what will be built.]' }]
+      });
+    }
   }
 
   let planningDecision = { mode: 'plan', reason: 'Planning mode is active.' };
@@ -2922,8 +2933,11 @@ function hasAnyChecklist(conversation) {
 }
 
 function classifyPlanApprovalIntentFast(prompt) {
-  const text = String(prompt || '').toLowerCase().trim().replace(/[!.,]+$/, '');
-  const approveWords = /^(approved?|yes|yep|yeah|yup|ok|okay|go|start|proceed|continue|keep going|confirm|looks? good|go ahead|let'?s? go|do it|sounds? good|great|perfect|good|correct|right|alright|ship it|execute|begin|run it|build it|move on)$/;
+  // Strip trailing punctuation then strip common filler prefixes so "now continue",
+  // "please go ahead", "ok just start it" etc. all resolve to their core intent.
+  const prefixRe = /^(now|please|just|ok,?|okay,?|alright,?|go ahead and|finally,?|let'?s?|let us|yes,?|yeah,?|yep,?|yup,?|sure,?|fine,?)\s+/;
+  const text = String(prompt || '').toLowerCase().trim().replace(/[!.,]+$/, '').replace(prefixRe, '').replace(/[!.,]+$/, '');
+  const approveWords = /^(approved?|yes|yep|yeah|yup|ok|okay|go|start|proceed|continue|keep going|confirm|looks? good|go ahead|do it|sounds? good|great|perfect|good|correct|right|alright|ship it|execute|begin|run it|build it|move on|do this|start it|build this|lets? go|do that)$/;
   const denyWords = /^(no|nope|cancel|stop|abort|deny|reject|don'?t)$/;
   const reviseWords = /^(change|update|revise|modify|edit|adjust|fix|add|remove|rethink|reconsider|wait|hold on|actually|instead)\b/;
   if (approveWords.test(text)) return 'approve';
