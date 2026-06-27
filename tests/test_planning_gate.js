@@ -530,9 +530,11 @@ test('completion gate fires for any execution mode with mission state, not only 
     agentSource.includes("hasOperationalMissionState(workingState) && canExecuteThisTask() && agentExecutionMode !== 'answer'"),
     'completion gate fires whenever execution is allowed and there is mission state'
   );
-  t.ok(agentSource.includes('if (executingApprovedPlan && !reviewOnly) maxLoops = 60'), 'approved plan execution gets a larger loop budget');
+  t.ok(agentSource.includes('if (executingApprovedPlan && !reviewOnly) maxLoops = 100'), 'approved plan execution gets a large loop budget for long tasks');
   t.ok(agentSource.includes('autoContinueExecution = true'), 'auto-continue path exists for unfinished plan execution');
-  t.ok(agentSource.includes('AUTO_CONTINUE_BUDGET'), 'auto-continue is bounded by a budget to prevent runaway loops');
+  t.ok(agentSource.includes('AUTO_CONTINUE_BUDGET'), 'auto-continue is bounded by an absolute ceiling to prevent runaway loops');
+  t.ok(agentSource.includes('STALL_LIMIT'), 'auto-continue stops when no goal-level progress is made across passes');
+  t.ok(agentSource.includes('progressScore'), 'stall detection is based on completed-work progress, not just activity');
   t.end();
 });
 

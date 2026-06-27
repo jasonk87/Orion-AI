@@ -3415,7 +3415,24 @@ function applyPatch(original, operation) {
     const index = updated.indexOf(operation.anchor);
     if (index === -1) throw new Error('Anchor content not found');
     const insertAt = position === 'before' ? index : index + operation.anchor.length;
-    updated = updated.slice(0, insertAt) + operation.content + updated.slice(insertAt);
+    let content = operation.content;
+    // Prevent token fusion at line boundaries. When inserting AFTER an anchor that ends its
+    // line (next char is a newline), content that does not already begin on a new line would
+    // otherwise fuse onto the anchor's line (e.g. "import sys" + "import random" =>
+    // "import sysimport random"). Symmetrically for BEFORE an anchor that starts its line.
+    // Inline inserts (anchor not at a line edge) are untouched, preserving existing behavior.
+    if (position === 'after') {
+      const anchorEndsLine = insertAt >= updated.length || updated[insertAt] === '\n';
+      if (anchorEndsLine && content.length && !content.startsWith('\n')) {
+        content = '\n' + content;
+      }
+    } else {
+      const anchorStartsLine = insertAt === 0 || updated[insertAt - 1] === '\n';
+      if (anchorStartsLine && content.length && !content.endsWith('\n')) {
+        content = content + '\n';
+      }
+    }
+    updated = updated.slice(0, insertAt) + content + updated.slice(insertAt);
     details = { position };
   } else if (operation.type === 'replace_range') {
     const startLine = parseInt(operation.startLine, 10);

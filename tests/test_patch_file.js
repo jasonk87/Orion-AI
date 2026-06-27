@@ -47,6 +47,44 @@ test('patch file - insert before and after', (t) => {
   t.end();
 });
 
+test('patch file - insert after a full line does not fuse tokens', (t) => {
+  // Regression: "import sys" + insert-after "import random" must not become "import sysimport random".
+  const original = 'import pygame\nimport sys\n\n# Initialize';
+  const op = { type: 'insert', anchor: 'import sys', position: 'after', content: 'import random' };
+  const { updated } = main.applyPatch(original, op);
+  t.equal(updated, 'import pygame\nimport sys\nimport random\n\n# Initialize', 'inserted content lands on its own line');
+  t.notOk(updated.includes('sysimport'), 'anchor and inserted token are not fused');
+  t.end();
+});
+
+test('patch file - insert before a line-starting anchor does not fuse tokens', (t) => {
+  const original = 'import pygame\nimport sys\n';
+  const op = { type: 'insert', anchor: 'import sys', position: 'before', content: 'import random' };
+  const { updated } = main.applyPatch(original, op);
+  t.equal(updated, 'import pygame\nimport random\nimport sys\n', 'inserted content forms its own line above the anchor');
+  t.end();
+});
+
+test('patch file - insert preserves content that already starts with a newline', (t) => {
+  // Content that already starts with \n (common model usage) must be inserted verbatim — the
+  // normalization only adds a newline when the content would otherwise fuse onto the anchor line.
+  const original = '# Anchor\nrest';
+  const op = { type: 'insert', anchor: '# Anchor', position: 'after', content: '\nclass Foo:\n    pass\n' };
+  const { updated } = main.applyPatch(original, op);
+  t.equal(updated, '# Anchor\nclass Foo:\n    pass\n\nrest', 'leading-newline content is inserted verbatim, no fusion');
+  t.notOk(updated.includes('Anchor\nclass') === false, 'class starts on its own line after the anchor');
+  t.end();
+});
+
+test('patch file - inline insert mid-line is unchanged', (t) => {
+  // The anchor is not at a line edge, so no newline normalization should occur.
+  const original = 'value = foo + bar';
+  const op = { type: 'insert', anchor: 'foo', position: 'after', content: ' * 2' };
+  const { updated } = main.applyPatch(original, op);
+  t.equal(updated, 'value = foo * 2 + bar', 'mid-line insert stays inline');
+  t.end();
+});
+
 test('patch file - replace_range', (t) => {
   const original = 'line1\nline2\nline3\nline4\n';
   const op = { type: 'replace_range', startLine: 2, endLine: 3, content: 'new2\nnew3' };

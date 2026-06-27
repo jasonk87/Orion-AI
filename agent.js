@@ -385,9 +385,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     }
   }
 
-  // A genuinely new task resets the auto-continue budget so prior runs cannot starve it.
+  // A genuinely new task resets the auto-continue budget and stall tracking so prior runs
+  // cannot starve it.
   if (resetMissionState) {
     conversation._planExecAutoContinues = 0;
+    conversation._stallPasses = 0;
+    conversation._lastProgressScore = -1;
   }
 
   // Surface a direct-task decision once, in one consistent place.
@@ -561,7 +564,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // mid-build and falsely report completion. The completion gate still governs when it ends.
     const executingApprovedPlan = (!config.planningMode || conversation.planApproved || planningBypassedForTask)
       && hasOperationalMissionState(workingState);
-    if (executingApprovedPlan && !reviewOnly) maxLoops = 60;
+    if (executingApprovedPlan && !reviewOnly) maxLoops = 100;
     let planValidationRetries = 0;
     let consecutiveNoToolCalls = 0;
     let malformedCallsCount = 0;
@@ -1164,22 +1167,42 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const madeProgressThisRun = (workWalkthrough || []).some(item => item && item.status === 'done');
     const hasPendingWork = pendingChecklist.length > 0 || subplanActive || winPending;
 
-    // Auto-continue only when we are mid-execution of a real plan, made progress this pass, are
-    // not paused for approval or blocked, and still have budget. This prevents the "it just quits"
-    // failure without risking a runaway loop (no progress in a pass stops the chain).
+    // Progress score = work that is actually finished (completed checklist items + satisfied win
+    // conditions). It is the goal-level signal used to detect a stall: a long task legitimately
+    // takes many passes, but if this score never moves across several consecutive auto-continue
+    // passes, the agent is busy-working without advancing and we should stop rather than spin.
+    const completedChecklist = (conversation.tasks || []).filter(task => task.status === 'completed' || task.status === 'x').length;
+    const satisfiedWins = (workingState && Array.isArray(workingState.winConditions))
+      ? workingState.winConditions.filter(condition => condition.status === 'satisfied').length : 0;
+    const progressScore = completedChecklist + satisfiedWins;
+
     conversation._planExecAutoContinues = conversation._planExecAutoContinues || 0;
-    const AUTO_CONTINUE_BUDGET = 12;
-    if (!forceYield && canExecuteAtExit && hasPendingWork && madeProgressThisRun && !blockersActive
+    if (typeof conversation._lastProgressScore !== 'number') conversation._lastProgressScore = -1;
+    if (progressScore > conversation._lastProgressScore) {
+      conversation._stallPasses = 0;
+      conversation._lastProgressScore = progressScore;
+    } else {
+      conversation._stallPasses = (conversation._stallPasses || 0) + 1;
+    }
+
+    // The goal is to run very long tasks to completion unattended. Continue as long as the plan
+    // is mid-execution, this pass did real work, nothing is blocked, and we are neither stalled
+    // (no goal-level progress for STALL_LIMIT passes) nor past the absolute ceiling.
+    const AUTO_CONTINUE_BUDGET = 100;  // absolute ceiling so a runaway can never loop forever
+    const STALL_LIMIT = 8;             // consecutive passes with no completed-work progress before stopping
+    const stalled = (conversation._stallPasses || 0) >= STALL_LIMIT;
+    if (!forceYield && canExecuteAtExit && hasPendingWork && madeProgressThisRun && !blockersActive && !stalled
         && hasOperationalMissionState(workingState) && conversation._planExecAutoContinues < AUTO_CONTINUE_BUDGET) {
       autoContinueExecution = true;
       conversation._planExecAutoContinues++;
     }
 
+    const stoppedShort = conversation._planExecAutoContinues >= AUTO_CONTINUE_BUDGET || stalled;
     if (lastTextResponse === "Thinking...") {
       if (autoContinueExecution) {
         lastTextResponse = 'Completed the next batch of implementation steps. Continuing automatically with the remaining plan…';
       } else if (hasPendingWork && canExecuteAtExit && !forceYield) {
-        lastTextResponse = buildRemainingWorkSummary(pendingChecklist, workingState, conversation._planExecAutoContinues >= AUTO_CONTINUE_BUDGET);
+        lastTextResponse = buildRemainingWorkSummary(pendingChecklist, workingState, stoppedShort);
       } else {
         lastTextResponse = "Task finished.";
       }
