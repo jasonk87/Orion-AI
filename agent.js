@@ -2,7 +2,7 @@
 
 // System Instruction for the Pair Programmer
 const SYSTEM_INSTRUCTION = `You are Orion AI, the ultimate pair programmer agent running locally on the user's workspace.
-Your goal is to solve the task given by the user with high quality, precision, and trust.
+Your goal is to solve the task given by the user with high quality, precision, and trust. Apply extra care on architecture, edge cases, tests, and failure recovery at every step. The operational completion gate is the sole completion authority — do not self-terminate before it clears.
 
 CRITICAL RULES:
 1. PLANNING MODE DECISION: Match the process to the size of the request. Use an implementation plan only when the task is genuinely complex: new projects, multi-file builds, architecture changes, risky migrations, broad bug hunts, security-sensitive work, or requests where the user should review direction before code changes. For small fixes, running/opening a program, running tests, setting an entry point, showing paths, pushing when explicitly asked, or narrow follow-ups, act directly without creating implementation_plan.md. If a plan is needed, first complete a Mission Refinement / Strategy Pass and write "STRATEGY.md"; only then create "implementation_plan.md", set the checklist, show the plan in chat, and pause for explicit user approval or requested revisions before modifying source files or running commands. Every implementation plan MUST include a "## Testing Plan" section that details exact commands/tests to run, expected behaviors, edge cases, success conditions, and manual checks if automated tests are unavailable.
@@ -587,15 +587,6 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           await sleep(modelCallDelayMs);
         }
         
-        const isProMode = typeof window.isProModeActive === 'function' && window.isProModeActive();
-        if (isProMode) {
-          messages.push({
-            role: 'user',
-            parts: [{ text: '[PRO MODE: Use extra care on architecture, edge cases, tests, and failure recovery inside the same state-driven reasoning loop. Do not create another role; the operational completion gate is the completion authority.]' }]
-          });
-          window.renderAiMessage(lastTextResponse, currentAgentLogs);
-        }
-
         if (modelName.startsWith('gemini-')) {
           response = await callGeminiAPI(messages, modelName, config.geminiApiKey, (warningMsg) => {
             agentSubStatus = warningMsg;
@@ -3601,7 +3592,7 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
   const ollamaTools = convertGeminiToOllamaTools([
     {
       functionDeclarations: [
-        ...OPERATIONAL_CONTEXT_TOOL_DECLARATIONS,
+        ...(agentExecutionMode === 'executing' ? OPERATIONAL_CONTEXT_TOOL_DECLARATIONS : []),
         ...ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS,
         {
           name: "list_files",
@@ -4151,7 +4142,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
     tools: [
       {
         functionDeclarations: [
-          ...OPERATIONAL_CONTEXT_TOOL_DECLARATIONS,
+          ...(agentExecutionMode === 'executing' ? OPERATIONAL_CONTEXT_TOOL_DECLARATIONS : []),
           ...ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS,
           {
             name: "list_files",

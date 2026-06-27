@@ -92,8 +92,6 @@ const el = {
   btnSubmit: document.getElementById('btn-submit'),
   modelSelect: document.getElementById('model-select'),
   chatTitle: document.getElementById('chat-title'),
-  proModeCheckbox: document.getElementById('pro-mode-checkbox'),
-  
   // Settings modal
   settingsModal: document.getElementById('settings-modal'),
   btnSettingsClose: document.getElementById('btn-settings-close'),
@@ -177,14 +175,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupProgressiveDisclosure();
   setupRightSidebarToggle();
   setupChatHandlers();
-  
-  // Load and listen to Pro Mode toggle
-  if (el.proModeCheckbox) {
-    el.proModeCheckbox.checked = localStorage.getItem('ag2_pro_mode') === 'true';
-    el.proModeCheckbox.addEventListener('change', (e) => {
-      localStorage.setItem('ag2_pro_mode', e.target.checked ? 'true' : 'false');
-    });
-  }
   
   // Bind manual task checklist add button
   const btnAddTaskManual = document.getElementById('btn-add-task-manual');
@@ -2974,4 +2964,3 @@ window.onRagStatusChange = (statusText) => {
 };
 
 window.getCurrentProject = () => currentWorkspace;
-window.isProModeActive = () => el.proModeCheckbox ? el.proModeCheckbox.checked : false;
