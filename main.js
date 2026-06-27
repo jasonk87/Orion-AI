@@ -1383,6 +1383,12 @@ function companionHtml(pairingCode) {
       background: #151518;
       color: #fff;
     }
+    .approve-button.approved {
+      background: linear-gradient(145deg, #2fb37e, #1f9d6a);
+      color: #fff;
+      cursor: default;
+      box-shadow: 0 10px 24px rgba(47,179,126,.22);
+    }
     .recent-tasks-section .sub-panel-title::before { content: "Recents"; }
     .recent-tasks-section .sub-panel-title { font-size: 0; }
     .recent-tasks-section .sub-panel-title::before { font-size: 1rem; }
@@ -2307,17 +2313,21 @@ function companionHtml(pairingCode) {
     }
     
     approvePlanEl.addEventListener('click', async () => {
+      const originalLabel = approvePlanEl.textContent;
       approvePlanEl.disabled = true;
+      approvePlanEl.textContent = 'Starting…';
       statusEl.textContent = 'Starting approved plan...';
       try {
         const res = await companionFetch('/api/approve-plan', { method: 'POST' });
         const data = await res.json();
         if (!data.success) throw new Error(data.error || 'Approval failed');
+        approvePlanEl.classList.add('approved');
+        approvePlanEl.textContent = '✓ Implementation Started';
         await loadState();
       } catch (error) {
         statusEl.textContent = error.message;
-      } finally {
         approvePlanEl.disabled = false;
+        approvePlanEl.textContent = originalLabel;
       }
     });
     denyPlanEl.addEventListener('click', async () => {

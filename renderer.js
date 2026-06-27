@@ -1930,7 +1930,7 @@ function renderAiMessage(text, logs = [], conversationId = null) {
   });
   const approveButton = bubble.querySelector('.btn-approve-plan');
   if (approveButton) {
-    approveButton.addEventListener('click', approveCurrentPlanAndContinue);
+    approveButton.addEventListener('click', () => approveCurrentPlanAndContinue({ button: approveButton }));
   }
   if (typeof Prism !== 'undefined') Prism.highlightAllUnder(bubble);
   
@@ -2637,13 +2637,27 @@ window.resumePhoneCompanionTask = async (targetId) => {
   return await window.submitPhoneCompanionPrompt({ prompt, conversationId: resolvedId });
 };
 
-async function approveCurrentPlanAndContinue() {
+async function approveCurrentPlanAndContinue(options = {}) {
+  const button = options.button || null;
+  const originalLabel = button ? button.textContent : '';
+  const restoreButton = () => {
+    if (!button) return;
+    button.disabled = false;
+    button.classList.remove('approved');
+    button.textContent = originalLabel || 'Start Implementation';
+  };
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Starting…';
+  }
+
   const conv = conversations.find(c => c.id === activeConversationId);
-  if (!conv) return { success: false, error: 'No active conversation' };
-  if (!conv.awaitingPlanApproval) return { success: false, error: 'No plan is awaiting approval' };
+  if (!conv) { restoreButton(); return { success: false, error: 'No active conversation' }; }
+  if (!conv.awaitingPlanApproval) { restoreButton(); return { success: false, error: 'No plan is awaiting approval' }; }
   if (!appConfig.geminiApiKey) {
     el.settingsModal.classList.add('active');
     appendSystemMessage("Please enter and save your Gemini API Key first.");
+    restoreButton();
     return { success: false, error: 'Missing Gemini API key' };
   }
 
@@ -2662,7 +2676,13 @@ async function approveCurrentPlanAndContinue() {
 
   if (!planIsValid) {
     appendSystemMessage("Approval rejected: The implementation plan is missing a valid '## Testing Plan' section. Please ask the agent to revise the plan.");
+    restoreButton();
     return { success: false, error: "Missing or invalid '## Testing Plan' section in implementation_plan.md" };
+  }
+
+  if (button) {
+    button.classList.add('approved');
+    button.textContent = '✓ Implementation Started';
   }
 
   conv.planApproved = true;

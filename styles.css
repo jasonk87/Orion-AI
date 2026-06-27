@@ -1644,6 +1644,25 @@ code {
   box-shadow: 0 0 16px rgba(167, 139, 250, 0.18);
 }
 
+.btn-approve-plan.approved {
+  background: rgba(16, 185, 129, 0.14);
+  border-color: rgba(16, 185, 129, 0.5);
+  color: var(--text-primary);
+  cursor: default;
+  box-shadow: none;
+}
+
+.btn-approve-plan.approved:hover {
+  background: rgba(16, 185, 129, 0.14);
+  border-color: rgba(16, 185, 129, 0.5);
+  box-shadow: none;
+}
+
+.btn-approve-plan:disabled {
+  opacity: 0.85;
+  cursor: default;
+}
+
 .agent-running-indicator {
   display: flex;
   align-items: center;
