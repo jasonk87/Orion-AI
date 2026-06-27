@@ -1227,8 +1227,7 @@ function createNewConversationUnderProject(projectPath) {
 function getStandaloneWorkspaceRoot() {
   const configured = (appConfig.standaloneWorkspaceRoot || '').trim();
   if (configured) return configured.replace(/[\\\/]+$/, '');
-  const base = cachedUserDataPath || 'C:\\Users\\Owner\\AppData\\Roaming\\OrionAI';
-  return base + '\\standalone-workspaces';
+  return appConfig.standaloneWorkspaceDefault || 'C:\\Users\\Owner\\Desktop\\Projects\\OrionAI\\standalone-workspaces';
 }
 
 function getStandaloneWorkspaceForTitle(title) {

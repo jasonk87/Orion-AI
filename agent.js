@@ -2657,15 +2657,14 @@ function withWorkWalkthrough(text, items, final = false) {
   const meaningfulItems = (items || []).filter(Boolean);
   if (meaningfulItems.length === 0) return text;
   const base = sanitizeFinalAnswerText(text);
-  if (final) {
-    // Walkthrough is saved to work_walkthrough.md — keep the chat bubble clean
-    return base.trim() || 'Task finished.';
-  }
   const lines = meaningfulItems.slice(-12).map(item => {
     const marker = item.status === 'error' ? 'Failed' : (item.status === 'running' ? 'Working' : 'Done');
     const detail = item.detail ? ` - ${item.detail}` : '';
     return `- **${marker}:** ${item.label}${detail}`;
   });
+  if (final) {
+    return `${base.trim() || 'Task finished.'}\n\n## Work Walkthrough\n${lines.join('\n')}`;
+  }
   return `${base.trim() || 'Working on it.'}\n\n## Work Walkthrough\n${lines.join('\n')}\n\n_I will keep this updated as I work._`;
 }
 
