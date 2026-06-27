@@ -41,6 +41,27 @@ test('plan approval continuation is not stored as a fake user message', (t) => {
   t.end();
 });
 
+// Regression: the "Planning mode: direct task" system message was firing after clicking
+// "Start Implementation" when a second non-internal loop ran while planApproved=true.
+// Guard: the message must only appear for genuinely fresh tasks with no approved plan.
+test('direct-task system message is suppressed when a plan is already approved', (t) => {
+  t.ok(
+    agentJs.includes('!conversation.planApproved && window.appendSystemMessage && planningBypassedForTask'),
+    '"Planning mode: direct task" message is guarded by !conversation.planApproved'
+  );
+  t.end();
+});
+
+// Regression: after clicking "Start Implementation", the model was responding by
+// summarizing/restating the plan instead of writing code. The execution prompt must
+// explicitly forbid restating the plan and rewriting planning artifacts.
+test('execution prompt after plan approval forbids restating or rewriting the plan', (t) => {
+  t.ok(rendererJs.includes('Do not summarize, describe, or restate the plan'), 'execution prompt forbids restating the plan');
+  t.ok(rendererJs.includes('Do not rewrite STRATEGY.md or implementation_plan.md'), 'execution prompt forbids rewriting planning artifacts');
+  t.ok(rendererJs.includes('immediately start creating and editing the actual source code files'), 'execution prompt demands immediate code writing');
+  t.end();
+});
+
 test('model call delay and repeated failure guardrails exist', (t) => {
   t.ok(rendererJs.includes('settingModelCallDelay'), 'model-call delay setting is wired in renderer');
   t.ok(agentJs.includes('config.modelCallDelayMs'), 'agent reads model-call delay config');

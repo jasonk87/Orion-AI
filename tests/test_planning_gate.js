@@ -127,6 +127,16 @@ test('Planning Gate behavior requires STRATEGY.md before implementation_plan.md'
   const directGate = agent.getPlanningToolGate(config, true, 'write_file', { path: 'small.txt', content: 'ok' });
   t.equal(directGate.allowed, true, 'direct/simple tasks can bypass refinement through canExecute');
 
+  // Regression: writing implementation_plan.md during execution (canExecute=true) must never
+  // return forceYield=true — forceYield is what triggers the plan-approval card, so a true
+  // value here would re-show the card and double-present the plan after the user clicks
+  // "Start Implementation".
+  const approvedPlanGate = agent.getPlanningToolGate(config, true, 'write_file', { path: 'implementation_plan.md' }, {
+    strategyStatus: { exists: true, valid: true, needsClarification: false }
+  });
+  t.equal(approvedPlanGate.allowed, true, 'allows implementation_plan.md write during execution');
+  t.equal(approvedPlanGate.forceYield, false, 'forceYield is false when canExecute=true — plan card must not re-appear during execution');
+
   t.end();
 });
 
@@ -401,6 +411,83 @@ test('invalid plan twice eventually yields to the user to prevent infinite loop'
     t.equal(fetchCallCount, 5, 'agent only tried 3 times in loop before yielding');
   } finally {
     // Restore mocks
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+
+  t.end();
+});
+
+// Regression: when the agent is in execution mode (planApproved=true) and encounters repeated
+// tool failures that set forceYield=true, the forceYield block must NOT set awaitingPlanApproval
+// back to true or revoke planApproved. Previously the forceYield block always ran the plan
+// validation path, causing the plan approval card to re-appear after execution errors.
+test('repeated tool failures during execution do not re-trigger plan approval UI', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0 });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    readFile: async (workspacePath, filePath) => {
+      if (filePath === 'STRATEGY.md') return validStrategy();
+      if (filePath === 'implementation_plan.md') return '# Plan\n\n## Testing Plan\n\nRun npm test.';
+      return '';
+    },
+    writeFile: async () => ({ success: true }),
+    runCommand: async () => { throw new Error('Command failed'); },
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+    listFiles: async () => ([{ path: 'test.txt', isDir: false, size: 100 }]),
+  };
+
+  // Conversation is already in execution mode (plan was approved)
+  const conversation = {
+    id: 'test-exec-failures',
+    messages: [],
+    awaitingPlanApproval: false,
+    planApproved: true,
+  };
+
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const text = (body.contents || [])[0]?.parts?.[0]?.text || '';
+
+    // Routing classifier: classify as 'direct' so the planApproved branch continues execution
+    if (text.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    }
+
+    // All model calls during execution: try to run a command (which will always fail via the mock)
+    return {
+      ok: true,
+      json: async () => ({
+        candidates: [{
+          finishReason: 'STOP',
+          content: { parts: [{ functionCall: { name: 'run_command', args: { command: 'npm test' } } }] }
+        }]
+      })
+    };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => {
+      if (delay !== 500) return originalSetTimeout(fn, delay);
+      return null;
+    };
+
+    await window.runAgentLoop('continue implementation', 'gemini-1', conversation);
+
+    // The loop should hit the repeated-failure guard and break via forceYield.
+    // The fix ensures it does NOT set awaitingPlanApproval or revoke planApproved.
+    t.equal(conversation.awaitingPlanApproval, false, 'execution-mode tool failures do not re-show plan approval card');
+    t.equal(conversation.planApproved, true, 'planApproved is not revoked by execution-mode tool failures');
+  } finally {
     global.window.runAgentLoop = originalRunAgentLoop;
     global.fetch = originalFetch;
     global.setTimeout = originalSetTimeout;

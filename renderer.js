@@ -2584,7 +2584,7 @@ window.approvePhoneCompanionPlan = async (targetId) => {
   const approvalText = "Plan approved via Phone Companion. Continuing implementation.";
   appendSystemMessage(approvalText, { conversationId: resolvedId, source: 'plan-approval' });
 
-  const prompt = 'The implementation plan was explicitly approved via Phone Companion. Begin execution now: read implementation_plan.md, then start with the first task and work through the plan by creating and editing the actual project files. Do not just summarize or report status — write real code. Update the checklist only for completed/material milestones, run verification, and provide a Work Walkthrough.';
+  const prompt = 'PLAN APPROVED — EXECUTE NOW. Do not summarize, describe, or restate the plan. Do not rewrite STRATEGY.md or implementation_plan.md — they are already approved. Read implementation_plan.md once to understand the tasks, then immediately start creating and editing the actual source code files. Work through every task. Update the checklist only for completed milestones. Run the test suite when done. Provide a Work Walkthrough.';
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
   if (isGlobalRunning) {
     window.promptQueue.push({ prompt, modelSelectValue: window.getSelectedModel(), conversationId: resolvedId, source: 'plan-approval' });
@@ -2693,7 +2693,7 @@ async function approveCurrentPlanAndContinue(options = {}) {
   const approvalText = "Plan approved. Continuing implementation.";
   appendSystemMessage(approvalText, { conversationId: activeConversationId, source: 'plan-approval' });
 
-  const prompt = 'The implementation plan was explicitly approved. Begin execution now: read implementation_plan.md, then start with the first task and work through the plan by creating and editing the actual project files. Do not just summarize or report status — write real code. Update the checklist only for completed/material milestones, run verification, and provide a Work Walkthrough.';
+  const prompt = 'PLAN APPROVED — EXECUTE NOW. Do not summarize, describe, or restate the plan. Do not rewrite STRATEGY.md or implementation_plan.md — they are already approved. Read implementation_plan.md once to understand the tasks, then immediately start creating and editing the actual source code files. Work through every task. Update the checklist only for completed milestones. Run the test suite when done. Provide a Work Walkthrough.';
 
   if (window.runAgentLoop) {
     if (window.isAgentRunning && window.isAgentRunning()) {

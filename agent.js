@@ -386,7 +386,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   }
 
   // Surface a direct-task decision once, in one consistent place.
-  if (!isInternalPrompt && window.appendSystemMessage && planningBypassedForTask && planningDecision.mode === 'direct' && agentExecutionMode === 'direct') {
+  if (!isInternalPrompt && !conversation.planApproved && window.appendSystemMessage && planningBypassedForTask && planningDecision.mode === 'direct' && agentExecutionMode === 'direct') {
     window.appendSystemMessage(`Planning mode: direct task, no implementation plan required. ${planningDecision.reason || ''}`.trim());
   }
 
@@ -1053,6 +1053,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       window.saveConversationsToStorage();
       
       if (forceYield) {
+        // forceYield can be set by the planning gate (model wrote implementation_plan.md before
+        // approval) OR by repeated tool failures during execution. Only present the plan
+        // approval card for the planning-gate case — execution failures should just break out.
+        if (canExecuteThisTask()) {
+          break;
+        }
+
         // Structural Validation: Check for Testing Plan section before presenting plan for approval
         let planIsValid = false;
         try {
