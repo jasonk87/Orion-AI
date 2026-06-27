@@ -283,23 +283,20 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const promptSource = options.source || 'user';
   const isInternalPrompt = !!options.internalPrompt || promptSource === 'followup' || promptSource === 'system' || promptSource === 'plan-approval';
 
-  let simpleRoute = null;
-  if (!isInternalPrompt && !conversation.awaitingPlanApproval && config.planningMode !== false) {
-    simpleRoute = classifySimpleTask(userPrompt);
-    if (simpleRoute && simpleRoute.route === 'local_memory') {
-      await answerLocalMemoryQuestionFastPath({ userPrompt, workspacePath, conversation, config, route: simpleRoute });
-      return;
-    }
-    if (simpleRoute && simpleRoute.route === 'local_project_summary') {
-      await answerLocalProjectSummaryFastPath({ userPrompt, workspacePath, conversation, config, route: simpleRoute });
-      return;
-    }
-  }
-
+  // ── INTENT ROUTING — driven by structural state, never by parsing the user's words ──
+  // The dangerous flows (approval, continuation, execution) are decided entirely from
+  // explicit flags:
+  //   isInternalPrompt     — caller-set: a system-driven continuation (button approval,
+  //                          queued follow-up). Always executes; never re-classified.
+  //   awaitingPlanApproval — a plan is on screen waiting for the user's verdict.
+  //   planApproved         — the user already approved; we are building/executing.
+  // A small AI classifier is used ONLY where intent is genuinely ambiguous:
+  //   classifyPlanApprovalIntent — a plan is pending and the user typed a free-form reply.
+  //   classifyPlanningNeed       — a fresh task needs a plan/direct/answer decision.
   const promptForModel = isInternalPrompt
     ? `[ORION INTERNAL FOLLOW-UP - not a user message]\n${userPrompt}\n\nContinue from the saved conversation/task state. Do not quote this as something the user said.`
     : userPrompt;
-  
+
   // Resolve the user's home directory once so the model never needs to discover it
   resolvedHomeDir = 'C:\\Users\\Owner';
   try {
@@ -309,27 +306,99 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const scopedNotes = await readScopedNotes(workspacePath, conversation);
   const operationalContext = await readOperationalContext(workspacePath);
   let workingState = operationalContext.state;
-  // Internal prompts (plan-approval, followup, system) are NOT user continuation requests,
-  // even though their text may contain words like "Continue". Only real user messages count,
-  // otherwise the plan-approval prompt ("Continue execution from the approved plan") gets
-  // misrouted into the in-progress-fix branch and the model reports "Task finished."
-  const isContinuationRequest = !isInternalPrompt && isTaskContinuationPrompt(userPrompt) && hasOperationalMissionState(workingState);
-  // A "continue"/"approved"/"go" style message is never a brand-new task, so it must not
-  // wipe an already-approved plan — even when the operational context JSON was never populated
-  // (the model may have only written STRATEGY.md/implementation_plan.md as markdown).
-  const isProgressionMessage = isTaskContinuationPrompt(userPrompt) || classifyPlanApprovalIntentFast(userPrompt) === 'approve';
 
-  if (!isInternalPrompt && !conversation.awaitingPlanApproval && !isContinuationRequest && !(conversation.planApproved && isProgressionMessage)) {
-    conversation.planApproved = false;
-    // Clear stale operational context (blockers, win conditions, mission) from previous runs
-    if (workspacePath && hasOperationalMissionState(workingState)) {
-      try {
-        const emptyState = OperationalContext.createEmptyContext();
-        await window.api.writeFile(workspacePath, OPERATIONAL_CONTEXT_PATH, `${JSON.stringify(emptyState, null, 2)}\n`);
-        workingState = emptyState;
-      } catch (_) {}
+  // Resolve the whole routing decision up front so message construction and the loop
+  // share one consistent verdict.
+  let approvalIntent = null;
+  let planningDecision = { mode: 'plan', reason: 'Planning mode is active.' };
+  let planningBypassedForTask = false;
+  let reviewOnly = false;
+  let planNeedsTestingSection = false;
+  let strategyStatus = { exists: false, valid: false, missingSections: STRATEGY_REQUIRED_SECTIONS, needsClarification: false };
+  let resetMissionState = false;
+
+  if (isInternalPrompt) {
+    // System-driven continuation (approved-plan execution, queued follow-up): just build.
+    // planningBypassedForTask unblocks the executor and keeps the system note execution-focused.
+    planningDecision = { mode: 'direct', reason: 'Internal follow-up continuing existing work.' };
+    planningBypassedForTask = true;
+    agentExecutionMode = 'executing';
+  } else if (conversation.awaitingPlanApproval && !conversation.planApproved) {
+    // The user is replying to a pending plan. The model classifies their reply.
+    approvalIntent = await classifyPlanApprovalIntent(userPrompt, modelName, config.geminiApiKey);
+    if (approvalIntent.intent === 'approve') {
+      const planText = await readImplementationPlanText(workspacePath);
+      if (hasRequiredTestingPlanSection(planText)) {
+        conversation.planApproved = true;
+        conversation.awaitingPlanApproval = false;
+        if (window.appendSystemMessage) window.appendSystemMessage("Plan approved. Continuing implementation.", { conversationId: conversation.id });
+        planningDecision = { mode: 'direct', reason: 'Implementation plan approved.' };
+        planningBypassedForTask = true;
+        agentExecutionMode = 'executing';
+      } else {
+        planNeedsTestingSection = true;
+        if (window.appendSystemMessage) window.appendSystemMessage("Approval rejected: The implementation plan is missing a valid '## Testing Plan' section. Please revise the plan first.", { conversationId: conversation.id });
+        planningDecision = { mode: 'plan', reason: 'Plan missing Testing Plan section; revision required.' };
+      }
+      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    } else if (approvalIntent.intent === 'deny') {
+      conversation.awaitingPlanApproval = false;
+      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+      planningDecision = { mode: 'answer', reason: 'User declined the pending plan.' };
+      agentExecutionMode = 'answer';
+    } else {
+      // revise or unclear: address the user without executing destructive tools
+      planningDecision = { mode: 'direct', reason: approvalIntent.intent === 'revise' ? 'User asked to revise the pending plan.' : 'Ambiguous reply to a pending plan.' };
+      planningBypassedForTask = true;
+      agentExecutionMode = 'answer';
+    }
+  } else if (conversation.planApproved) {
+    // Already approved and building. A new user message continues/steers the same work,
+    // unless the model judges it a genuinely new plan-worthy task.
+    const decision = config.planningMode === false
+      ? { mode: 'direct', reason: 'Planning mode disabled.' }
+      : await classifyPlanningNeed(userPrompt, modelName, config.geminiApiKey);
+    if (decision.mode === 'plan') {
+      resetMissionState = true;
+      conversation.planApproved = false;
+      planningDecision = decision;
+    } else {
+      planningDecision = { mode: 'direct', reason: 'Continuing approved task.' };
+      planningBypassedForTask = true;
+      agentExecutionMode = 'executing';
+    }
+  } else if (config.planningMode === false) {
+    planningDecision = { mode: 'direct', reason: 'Planning mode disabled.' };
+    planningBypassedForTask = true;
+    agentExecutionMode = 'direct';
+  } else {
+    // Fresh task, nothing pending or approved. The model decides plan / direct / answer.
+    const decision = await classifyPlanningNeed(userPrompt, modelName, config.geminiApiKey);
+    planningDecision = decision;
+    reviewOnly = !!decision.reviewOnly;
+    resetMissionState = true; // a fresh task should not inherit a previous mission's state
+    if (decision.mode === 'direct') {
+      planningBypassedForTask = true;
+      agentExecutionMode = 'direct';
+    } else if (decision.mode === 'answer') {
+      agentExecutionMode = 'answer';
     }
   }
+
+  // Surface a direct-task decision once, in one consistent place.
+  if (!isInternalPrompt && window.appendSystemMessage && planningBypassedForTask && planningDecision.mode === 'direct' && agentExecutionMode === 'direct') {
+    window.appendSystemMessage(`Planning mode: direct task, no implementation plan required. ${planningDecision.reason || ''}`.trim());
+  }
+
+  // Structural reset of stale mission state for genuinely new work.
+  if (resetMissionState && workspacePath && hasOperationalMissionState(workingState)) {
+    try {
+      const emptyState = OperationalContext.createEmptyContext();
+      await window.api.writeFile(workspacePath, OPERATIONAL_CONTEXT_PATH, `${JSON.stringify(emptyState, null, 2)}\n`);
+      workingState = emptyState;
+    } catch (_) {}
+  }
+
   // Canonical operational state seeds reasoning. Conversation remains a bounded UI/input view;
   // old model and tool turns are deliberately not replayed as task truth.
   let messages = OperationalContext.buildReasoningMessages(workingState, conversation.messages, promptForModel);
@@ -365,125 +434,27 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     }
   );
 
-  // Recovery: if the flag wasn't set but user is clearly approving or trying to continue,
-  // check disk for a valid plan and restore the approval gate.
-  // planApproved=false means the plan was never approved, so no implementation work could
-  // have started. "continue" in this state can only mean "start the plan", not resume work.
-  if (!isInternalPrompt && !conversation.awaitingPlanApproval && !conversation.planApproved && workspacePath) {
-    const fastIntent = classifyPlanApprovalIntentFast(userPrompt);
-    const isContinuationApproval = /\b(continue|keep going|proceed|go ahead|let'?s? go|move on|start it|build it)\b/i.test(String(userPrompt || ''));
-    if (fastIntent === 'approve' || isContinuationApproval) {
-      try {
-        const planContent = await window.api.readFile(workspacePath, 'implementation_plan.md', { maxChars: 100000 });
-        const planText = typeof planContent === 'string' ? planContent : (planContent && !planContent.error ? planContent.content || '' : '');
-        if (planText && planText.trim().length > 100) {
-          conversation.awaitingPlanApproval = true;
-          if (window.saveConversationsToStorage) window.saveConversationsToStorage();
-        }
-      } catch (_) {}
-    }
-  }
-
-  let approvalIntent = null;
-  if (!isInternalPrompt && conversation.awaitingPlanApproval && !conversation.planApproved) {
-    const fastIntent = classifyPlanApprovalIntentFast(userPrompt);
-    approvalIntent = fastIntent
-      ? { intent: fastIntent, reason: 'Fast-path keyword match.' }
-      : await classifyPlanApprovalIntent(userPrompt, modelName, config.geminiApiKey);
-    if (approvalIntent.intent === 'approve') {
-      let planIsValid = false;
-      try {
-        const planContent = await window.api.readFile(workspacePath, 'implementation_plan.md', { maxChars: 100000 });
-        const planText = typeof planContent === 'string'
-          ? planContent
-          : (planContent && !planContent.error && typeof planContent.content === 'string' ? planContent.content : '');
-        planIsValid = hasRequiredTestingPlanSection(planText);
-      } catch (err) {
-        console.error('Error validating implementation_plan.md during chat approval:', err);
-      }
-
-      if (!planIsValid) {
-        if (window.appendSystemMessage) {
-          window.appendSystemMessage("Approval rejected: The implementation plan is missing a valid '## Testing Plan' section. Please revise the plan first.", { conversationId: conversation.id });
-        }
-        conversation.awaitingPlanApproval = true;
-        conversation.planApproved = false;
-        if (window.saveConversationsToStorage) {
-          window.saveConversationsToStorage();
-        }
-        messages.push({
-          role: 'user',
-          parts: [{
-            text: `[SYSTEM: The user attempted to approve the plan, but it is structurally invalid or missing. It must have a '## Testing Plan' section. Please update implementation_plan.md with this section now.]`
-          }]
-        });
-      } else {
-        conversation.planApproved = true;
-        conversation.awaitingPlanApproval = false;
-        if (window.appendSystemMessage) {
-          window.appendSystemMessage("Plan approved. Continuing implementation.", { conversationId: conversation.id });
-        }
-        if (window.saveConversationsToStorage) {
-          window.saveConversationsToStorage();
-        }
-      }
-    }
-
-    if (approvalIntent.intent === 'deny') {
-      conversation.awaitingPlanApproval = false;
-      window.saveConversationsToStorage();
-    }
-
-    if (approvalIntent.intent === 'unclear') {
-      // Don't silently pass — tell the user the plan is still waiting
-      if (window.appendSystemMessage) {
-        window.appendSystemMessage("A plan is waiting for approval. Type 'approved' or 'yes' to start implementation, or describe what you'd like to change.", { conversationId: conversation.id });
-      }
-      messages.push({
-        role: 'user',
-        parts: [{ text: '[SYSTEM: A plan is awaiting approval and the user sent an ambiguous message. Remind them clearly that the implementation plan is ready and they need to explicitly approve or revise it. Show a brief summary of what will be built.]' }]
-      });
-    }
-  }
-
-  let planningDecision = { mode: 'plan', reason: 'Planning mode is active.' };
-  let planningBypassedForTask = false;
-  let strategyStatus = { exists: false, valid: false, missingSections: STRATEGY_REQUIRED_SECTIONS, needsClarification: false };
-  if (!isInternalPrompt && isContinuationRequest && !conversation.awaitingPlanApproval && !conversation.planApproved) {
-    planningDecision = {
-      mode: 'direct',
-      reason: 'Continuing or fixing an existing in-progress approved task.'
-    };
-    planningBypassedForTask = true;
-    agentExecutionMode = 'executing';
-    if (window.appendSystemMessage) {
-      window.appendSystemMessage('Planning mode: direct task, no implementation plan required. Continuing or fixing the current in-progress task.');
-    }
-  } else if (!isInternalPrompt && config.planningMode !== false && !conversation.planApproved && !conversation.awaitingPlanApproval && !(approvalIntent && approvalIntent.intent === 'approve')) {
-    // Fast-path routes (local_project_describe, local_project_review, etc.) bypass the Gemini classifier
-    if (simpleRoute && (simpleRoute.mode === 'direct' || simpleRoute.mode === 'answer')) {
-      planningDecision = { mode: simpleRoute.mode, reason: simpleRoute.reason };
-    } else {
-      planningDecision = await classifyPlanningNeed(userPrompt, modelName, config.geminiApiKey);
-    }
-    if (planningDecision.mode === 'direct') {
-      planningBypassedForTask = true;
-      agentExecutionMode = 'direct';
-      window.appendSystemMessage(`Planning mode: direct task, no implementation plan required. ${planningDecision.reason || ''}`.trim());
-    } else if (planningDecision.mode === 'answer') {
-      agentExecutionMode = 'answer';
-    }
-  } else if (conversation.planApproved || isInternalPrompt) {
-    planningDecision = {
-      mode: 'direct',
-      reason: isInternalPrompt
-        ? 'This is an internal follow-up to continue existing work, not a new user request.'
-        : 'An implementation plan has already been approved.'
-    };
-    agentExecutionMode = 'executing';
-  }
+  // Strategy gate prep: only a fresh plan-worthy task that has not been approved needs it.
   if (!planningBypassedForTask && planningDecision.mode === 'plan' && config.planningMode !== false && !conversation.planApproved && !isInternalPrompt) {
     strategyStatus = await readStrategyStatus(workspacePath);
+  }
+
+  // Approval-reply system notes (revise / unclear / approved-but-invalid).
+  if (planNeedsTestingSection) {
+    messages.push({
+      role: 'user',
+      parts: [{
+        text: `[SYSTEM: The user approved the plan, but it is missing the mandatory '## Testing Plan' section. Update implementation_plan.md to add it now, then pause for approval again.]`
+      }]
+    });
+  } else if (approvalIntent && approvalIntent.intent === 'unclear') {
+    if (window.appendSystemMessage) {
+      window.appendSystemMessage("A plan is waiting for approval. Approve it to start, or tell me what to change.", { conversationId: conversation.id });
+    }
+    messages.push({
+      role: 'user',
+      parts: [{ text: '[SYSTEM: A plan is awaiting approval and the user sent an ambiguous reply. Briefly summarize what the plan will build and ask them to approve or describe changes. Do not modify files.]' }]
+    });
   }
 
   messages.push({
@@ -493,9 +464,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     }]
   });
 
-  const reviewOnlyMode = simpleRoute && simpleRoute.route === 'local_project_review';
   if (config.planningMode !== false) {
-    const reviewOnlyConstraint = reviewOnlyMode
+    const reviewOnlyConstraint = reviewOnly
       ? ' CRITICAL: The user asked you to FIND issues, not fix them. Read files, identify bugs/typos/structural faults, and present your findings as a clear report. Do NOT modify any files, do NOT propose implementation steps, and do NOT ask to approve a fix plan. End by summarizing what you found and asking the user which issues they want you to address.'
       : '';
     messages.push({
@@ -2100,12 +2070,6 @@ function hasOperationalMissionState(state) {
   return !!(state && (state.mission && state.mission.statement || state.winConditions && state.winConditions.length || state.activeSubplan));
 }
 
-function isTaskContinuationPrompt(prompt) {
-  const text = String(prompt || '').toLowerCase().trim();
-  if (!text) return false;
-  return /\b(continue|keep going|finish|finish this|lets finish|let's finish|resume|carry on|complete it|fix this|fix these|why didn't you catch|why did you not catch|catch and fix|not done|still broken|missing|error|console|failed to load|err_file_not_found)\b/.test(text);
-}
-
 function buildCompletionGateMessage(gate) {
   const parts = [`Completion gate status: ${gate.status}.`];
   if (gate.reasons && gate.reasons.length) parts.push(`Reasons: ${gate.reasons.join('; ')}`);
@@ -2936,22 +2900,20 @@ function hasRequiredTestingPlanSection(content) {
   return /^#{2,3}\s+.*?(testing plan|test plan|validation plan)\b/im.test(String(content || ''));
 }
 
-function hasAnyChecklist(conversation) {
-  return !!(conversation && Array.isArray(conversation.tasks) && conversation.tasks.length > 0);
+async function readImplementationPlanText(workspacePath) {
+  if (!workspacePath) return '';
+  try {
+    const planContent = await window.api.readFile(workspacePath, 'implementation_plan.md', { maxChars: 100000 });
+    if (typeof planContent === 'string') return planContent;
+    if (planContent && !planContent.error && typeof planContent.content === 'string') return planContent.content;
+  } catch (err) {
+    console.error('Error reading implementation_plan.md:', err);
+  }
+  return '';
 }
 
-function classifyPlanApprovalIntentFast(prompt) {
-  // Strip trailing punctuation then strip common filler prefixes so "now continue",
-  // "please go ahead", "ok just start it" etc. all resolve to their core intent.
-  const prefixRe = /^(now|please|just|ok,?|okay,?|alright,?|go ahead and|finally,?|let'?s?|let us|yes,?|yeah,?|yep,?|yup,?|sure,?|fine,?)\s+/;
-  const text = String(prompt || '').toLowerCase().trim().replace(/[!.,]+$/, '').replace(prefixRe, '').replace(/[!.,]+$/, '');
-  const approveWords = /^(approved?|yes|yep|yeah|yup|ok|okay|go|start|proceed|continue|keep going|confirm|looks? good|go ahead|do it|sounds? good|great|perfect|good|correct|right|alright|ship it|execute|begin|run it|build it|move on|do this|start it|build this|lets? go|do that)$/;
-  const denyWords = /^(no|nope|cancel|stop|abort|deny|reject|don'?t)$/;
-  const reviseWords = /^(change|update|revise|modify|edit|adjust|fix|add|remove|rethink|reconsider|wait|hold on|actually|instead)\b/;
-  if (approveWords.test(text)) return 'approve';
-  if (denyWords.test(text)) return 'deny';
-  if (reviseWords.test(text)) return 'revise';
-  return null;
+function hasAnyChecklist(conversation) {
+  return !!(conversation && Array.isArray(conversation.tasks) && conversation.tasks.length > 0);
 }
 
 async function classifyPlanApprovalIntent(userPrompt, modelName, apiKey) {
@@ -3005,12 +2967,13 @@ async function classifyPlanningNeed(userPrompt, modelName, apiKey) {
   const prompt = `Classify whether this Orion AI request should require an implementation plan before acting.
 
 Return only compact JSON with:
-{"mode":"plan"|"direct"|"answer","reason":"short reason"}
+{"mode":"plan"|"direct"|"answer","reviewOnly":true|false,"reason":"short reason"}
 
 Definitions:
 - plan: broad or complex work where the user should review direction first, such as creating a substantial new project, major redesign/refactor, large bug hunt, architecture change, risky migration, security-sensitive change, or ambiguous multi-step coding task.
 - direct: concrete low-risk work that should be executed immediately, such as running/opening a program, running tests, showing a directory, setting an entry point, pushing to Git when explicitly requested, viewing a file, making a narrow edit, fixing a small bug, continuing an already-approved task, OR reading/inspecting local files to answer a question about them.
 - answer: a question or explanation that can be answered in chat without workspace changes or command execution.
+- reviewOnly: true ONLY when the user asked you to FIND/review/audit issues, bugs, typos, or faults WITHOUT being asked to fix them. In that case present findings as a report and do not modify files. Otherwise false.
 
 Decision guidance:
 - Prefer direct for read-only local inspection or inventory tasks, including listing installed runtimes, checking versions, checking PATH, finding executables, showing files, or running safe diagnostic commands.
@@ -3073,7 +3036,7 @@ ${JSON.stringify(String(userPrompt || ''))}`;
       data.candidates[0].content.parts[0].text;
     const parsed = JSON.parse(text || '{}');
     const mode = ['plan', 'direct', 'answer'].includes(parsed.mode) ? parsed.mode : 'plan';
-    return { mode, reason: String(parsed.reason || '') };
+    return { mode, reviewOnly: !!parsed.reviewOnly, reason: String(parsed.reason || '') };
   } catch (e) {
     console.error('Planning need classifier failed:', e);
     return fallback;
@@ -3101,70 +3064,6 @@ function tokenizeIntentText(value) {
 
 function hasAnyToken(tokenSet, values) {
   return values.some(value => tokenSet.has(value));
-}
-
-function classifySimpleTask(userPrompt) {
-  const tokens = tokenizeIntentText(userPrompt);
-  const tokenSet = new Set(tokens);
-  if (tokens.length === 0) return null;
-
-  const localSubject = hasAnyToken(tokenSet, ['my', 'this', 'computer', 'pc', 'machine', 'system', 'laptop', 'windows']);
-  const memorySubject = hasAnyToken(tokenSet, ['ram', 'memory']);
-  const askingAmount = hasAnyToken(tokenSet, ['how', 'much', 'many', 'total', 'have', 'left', 'free', 'available']);
-
-  if (localSubject && memorySubject && askingAmount) {
-    return {
-      route: 'local_memory',
-      mode: 'direct',
-      reason: 'Simple local system memory question; answer from local command evidence without model planning.'
-    };
-  }
-
-  // Read-only "what is X about / what does X do" questions targeting local projects
-  const describeVerbs = hasAnyToken(tokenSet, ['what', 'tell', 'describe', 'explain', 'summarize', 'show', 'about']);
-  const describeNouns = hasAnyToken(tokenSet, ['program', 'project', 'app', 'application', 'file', 'folder', 'code', 'script', 'tool', 'repo', 'repository']);
-  const localRef = hasAnyToken(tokenSet, ['my', 'this', 'the', 'desktop', 'projects', 'folder']);
-  if (describeVerbs && (describeNouns || localRef)) {
-    return {
-      route: 'local_project_describe',
-      mode: 'direct',
-      reason: 'Read-only question about a local program or project; read files and answer without planning gates.'
-    };
-  }
-
-  // Code review / bug hunt on a local project — read-only analysis, no plan approval needed
-  const reviewVerbs = hasAnyToken(tokenSet, ['find', 'look', 'check', 'review', 'audit', 'scan', 'analyze', 'analyse', 'search', 'identify', 'spot', 'detect']);
-  const reviewTargets = hasAnyToken(tokenSet, ['bug', 'bugs', 'typo', 'typos', 'error', 'errors', 'issue', 'issues', 'fault', 'faults', 'problem', 'problems', 'smell', 'smells', 'vulnerability', 'vulnerabilities']);
-  if (reviewVerbs && reviewTargets && (describeNouns || localRef)) {
-    return {
-      route: 'local_project_review',
-      mode: 'direct',
-      reason: 'Read-only code review or bug hunt on a local project; inspect files and report findings without planning gates.'
-    };
-  }
-
-  // Improvement / suggestion questions about a local project — conversational, no plan approval needed
-  const improveIndicators = hasAnyToken(tokenSet, ['better', 'improvement', 'improvements', 'improve', 'enhance', 'enhancements', 'suggestion', 'suggestions', 'recommend', 'recommendations', 'optimize', 'optimise', 'refine', 'upgrade', 'strengthen', 'boost']);
-  if (improveIndicators && (describeNouns || localRef)) {
-    return {
-      route: 'local_project_improve',
-      mode: 'direct',
-      reason: 'Improvement or suggestion question about a local project; answer directly without planning gates.'
-    };
-  }
-
-  // Conversational follow-up questions referencing prior context — no plan approval needed
-  const conversationVerbs = hasAnyToken(tokenSet, ['walk', 'compare', 'elaborate', 'clarify', 'expand', 'detail', 'continue', 'explain', 'more']);
-  const pronounRef = hasAnyToken(tokenSet, ['this', 'it', 'that', 'these', 'those']);
-  if (conversationVerbs && pronounRef) {
-    return {
-      route: 'conversational_followup',
-      mode: 'direct',
-      reason: 'Conversational follow-up referencing prior context; answer directly without planning gates.'
-    };
-  }
-
-  return null;
 }
 
 function parseKeyValueOutput(output) {
@@ -4687,10 +4586,8 @@ ${conversationLogsText}`;
 if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
   module.exports = {
     classifyPlanApprovalIntent,
-    classifyPlanApprovalIntentFast,
     classifyPlanningNeed,
     tokenizeIntentText,
-    classifySimpleTask,
     buildLocalMemoryAnswer,
     getPlanningToolGate,
     normalizeChecklistTasks,
@@ -4707,7 +4604,6 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     commandProvidesInput,
     isLocalSystemFactRequest,
     requestNeedsLocalInspection,
-    isTaskContinuationPrompt,
     isGenericNonAnswer,
     requestNeedsActionableFinalAnswer,
     answerHasActionableFinalContent,

@@ -33,8 +33,11 @@ test('plan approval continuation is not stored as a fake user message', (t) => {
   t.ok(rendererJs.includes("internalPrompt: true"), 'plan approval run is passed as internal prompt');
   t.notOk(rendererJs.includes("conv.messages.push({ role: 'user', text: '[Start implementation]' })"), 'synthetic start implementation is not persisted as user');
   t.notOk(rendererJs.includes("renderUserMessage('[Start implementation]')"), 'synthetic start implementation is not rendered as user');
-  t.equal(agent.isTaskContinuationPrompt('lets finish this'), true, 'finish prompts preserve continuation mode');
-  t.equal(agent.isTaskContinuationPrompt("why didn't you catch and fix these console errors"), true, 'bug follow-up prompts preserve continuation mode');
+  // Routing is structural, not text-guessing: internal prompts always execute and the old
+  // regex-based continuation detector is gone.
+  t.ok(agentJs.includes('if (isInternalPrompt)'), 'internal prompts are routed structurally');
+  t.notOk(agentJs.includes('isTaskContinuationPrompt'), 'regex continuation detector is removed');
+  t.notOk(agentJs.includes('classifyPlanApprovalIntentFast'), 'regex approval fast-path is removed');
   t.end();
 });
 
@@ -200,11 +203,12 @@ test('local system fact failures do not become fake blockers or web research', (
   t.end();
 });
 
-test('simple task router handles local RAM questions without model planning', (t) => {
-  const route = agent.classifySimpleTask('how much ram do i have on my computer?');
-  t.equal(route.route, 'local_memory', 'routes RAM question to local memory fast path');
-  t.equal(route.mode, 'direct', 'simple RAM question is direct');
-  t.notOk(agent.classifySimpleTask('refactor the agent loop'), 'complex refactor is not swallowed by simple router');
+test('task routing is decided by the model classifier, not keyword regex', (t) => {
+  // The brittle keyword router was removed; classifyPlanningNeed (model) makes the call
+  // and carries a structured reviewOnly flag instead of a regex route.
+  t.notOk(agentJs.includes('function classifySimpleTask'), 'keyword simple-task router is removed');
+  t.notOk(agentJs.includes("route: 'local_project_review'"), 'keyword review route is removed');
+  t.ok(agentJs.includes('reviewOnly'), 'review-only intent is carried by the model classifier');
   const answer = agent.buildLocalMemoryAnswer('FreePhysicalMemory=4194304\r\nTotalVisibleMemorySize=12582912\r\n');
   t.ok(answer.startsWith('Your computer has about 12.00 GB'), 'memory answer leads with direct answer');
   t.ok(answer.includes('4.00 GB is currently free'), 'memory answer includes available RAM when present');
