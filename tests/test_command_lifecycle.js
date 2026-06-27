@@ -135,6 +135,37 @@ test('computeSourceUpdates flags only files whose bytes differ', (t) => {
   t.end();
 });
 
+test('packaged updater includes metadata and preserves source file dates', (t) => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-update-src-'));
+  const dest = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-update-dest-'));
+  const sourceDate = new Date('2026-06-27T15:30:00Z');
+
+  fs.writeFileSync(path.join(src, 'package.json'), JSON.stringify({ version: '2.1.0' }));
+  fs.writeFileSync(path.join(dest, 'package.json'), JSON.stringify({ version: '2.0.0' }));
+  fs.writeFileSync(path.join(src, 'renderer.js'), 'new renderer');
+  fs.writeFileSync(path.join(dest, 'renderer.js'), 'old renderer');
+  fs.utimesSync(path.join(src, 'renderer.js'), sourceDate, sourceDate);
+
+  const changed = main.computeSourceUpdates(src, dest, ['package.json', 'renderer.js']);
+  t.ok(changed.includes('package.json'), 'package metadata participates in packaged-app update checks');
+  t.ok(changed.includes('renderer.js'), 'runtime source file is flagged for update');
+
+  main.syncSourceUpdateFiles(src, dest, ['renderer.js']);
+  const copiedStat = fs.statSync(path.join(dest, 'renderer.js'));
+  t.equal(fs.readFileSync(path.join(dest, 'renderer.js'), 'utf8'), 'new renderer', 'copies updated runtime file');
+  t.equal(Math.round(copiedStat.mtimeMs), Math.round(sourceDate.getTime()), 'preserves source mtime for runtime date display');
+
+  const splashHtml = main.buildUpdateSplashHtml({ changed: ['renderer.js', 'styles.css'] });
+  t.ok(splashHtml.includes('Updating local build'), 'update splash explains the blocking maintenance state');
+  t.ok(splashHtml.includes('Relaunching Orion'), 'update splash has relaunching state text');
+  t.ok(splashHtml.includes('rgba(130,115,244'), 'update splash uses Orion accent styling');
+  t.end();
+});
+
 test('preview_app launches a persistent session and does NOT auto-close', async (t) => {
   const fs = require('fs');
   const os = require('os');

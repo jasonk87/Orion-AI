@@ -150,10 +150,12 @@ test('visual verification tools can represent Three.js preview evidence without 
   t.end();
 });
 
-test('Gemini multimodal screenshot inspection sends inline image data and returns visual evidence', async (t) => {
+test('active Gemini screenshot inspection sends inline image data and returns visual evidence', async (t) => {
   const originalFetch = global.fetch;
+  let requestUrl = null;
   let requestBody = null;
   global.fetch = async (url, options) => {
+    requestUrl = url;
     requestBody = JSON.parse(options.body);
     return {
       ok: true,
@@ -175,21 +177,202 @@ test('Gemini multimodal screenshot inspection sends inline image data and return
     };
   };
 
-  const result = await agent.inspectScreenshotWithGemini({
+  const result = await agent.inspectScreenshotWithModel({
     imageBase64: Buffer.from('fake-png').toString('base64'),
     mimeType: 'image/png',
     path: '.orion/screenshots/preview.png',
     goal: 'campfire appears in the fantasy village scene',
-    modelName: 'gemini-2.5-flash-lite',
+    modelName: 'gemini-2.5-flash',
     apiKey: 'test-key'
   });
 
   t.equal(result.status, 'appears_satisfied', 'returns structured Gemini visual status');
   t.equal(result.confidence, 0.82, 'returns structured confidence');
   t.ok(result.evidence.includes('campfire is visible'), 'returns visual evidence observations');
+  t.ok(requestUrl.includes('/models/gemini-2.5-flash:generateContent'), 'uses the active chat model in the Gemini request URL');
   t.equal(requestBody.contents[0].parts[1].inline_data.mime_type, 'image/png', 'sends screenshot as Gemini inline image data');
   t.ok(requestBody.contents[0].parts[1].inline_data.data, 'includes base64 image data');
 
   global.fetch = originalFetch;
+  t.end();
+});
+
+test('active Ollama screenshot inspection sends screenshot to the chat model', async (t) => {
+  const originalFetch = global.fetch;
+  let requestUrl = null;
+  let requestBody = null;
+  global.fetch = async (url, options) => {
+    requestUrl = url;
+    requestBody = JSON.parse(options.body);
+    return {
+      ok: true,
+      json: async () => ({
+        message: {
+          content: JSON.stringify({
+            status: 'appears_satisfied',
+            confidence: 0.74,
+            observations: ['The app window is visible in the desktop screenshot.'],
+            missing: [],
+            recommendation: 'Use this screenshot as visual evidence.'
+          })
+        }
+      })
+    };
+  };
+
+  const imageBase64 = Buffer.from('fake-png').toString('base64');
+  const result = await agent.inspectScreenshotWithModel({
+    imageBase64,
+    mimeType: 'image/png',
+    path: '.orion/screenshots/preview.png',
+    goal: 'desktop app is visible',
+    modelName: 'llava:latest'
+  });
+
+  t.equal(result.status, 'appears_satisfied', 'returns structured Ollama visual status');
+  t.equal(requestUrl, 'http://localhost:11434/api/chat', 'uses Ollama chat endpoint for local chat models');
+  t.equal(requestBody.model, 'llava:latest', 'uses the active Ollama chat model');
+  t.equal(requestBody.messages[0].images[0], imageBase64, 'sends screenshot as Ollama image data');
+  t.notOk(Object.prototype.hasOwnProperty.call(requestBody, 'modelName'), 'does not send a separate modelName argument');
+
+  global.fetch = originalFetch;
+  t.end();
+});
+
+test('Gemini fallback records the model actually used for the current response', async (t) => {
+  const originalFetch = global.fetch;
+  const requestUrls = [];
+  const warnings = [];
+  global.fetch = async (url, options) => {
+    requestUrls.push(url);
+    if (requestUrls.length === 1) {
+      return {
+        ok: false,
+        status: 503,
+        text: async () => JSON.stringify({
+          error: {
+            message: 'The model is currently experiencing high demand. Please try again later.'
+          }
+        })
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        candidates: [{
+          content: {
+            parts: [{ text: 'fallback response' }]
+          }
+        }]
+      })
+    };
+  };
+
+  const result = await agent.callGeminiAPI(
+    [{ role: 'user', parts: [{ text: 'hello' }] }],
+    'gemini-2.5-flash-lite',
+    'test-key',
+    warning => warnings.push(warning),
+    true
+  );
+
+  t.ok(requestUrls[0].includes('/models/gemini-2.5-flash-lite:generateContent'), 'first request uses the selected model');
+  t.ok(requestUrls[1].includes('/models/gemini-2.5-flash:generateContent'), 'fallback request uses the escalated model');
+  t.equal(result._orionActiveModelName, 'gemini-2.5-flash', 'records the model that produced the response');
+  t.ok(warnings.some(warning => warning.includes('Temporarily switching this request to gemini-2.5-flash')), 'emits fallback warning');
+
+  global.fetch = originalFetch;
+  t.end();
+});
+
+test('Gemini monthly spend cap fails fast instead of retrying', async (t) => {
+  const originalFetch = global.fetch;
+  const requestUrls = [];
+  const warnings = [];
+  global.fetch = async (url, options) => {
+    requestUrls.push(url);
+    return {
+      ok: false,
+      status: 429,
+      text: async () => JSON.stringify({
+        error: {
+          code: 429,
+          status: 'RESOURCE_EXHAUSTED',
+          message: 'Your project has exceeded its monthly spending cap. Please go to AI Studio at https://ai.studio/spend to manage your project spend cap.'
+        }
+      })
+    };
+  };
+
+  try {
+    await agent.callGeminiAPI(
+      [{ role: 'user', parts: [{ text: 'hello' }] }],
+      'gemini-2.5-flash',
+      'test-key',
+      warning => warnings.push(warning),
+      true
+    );
+    t.fail('monthly spend cap should throw');
+  } catch (error) {
+    t.ok(error.message.includes('monthly spending cap'), 'throws the real spend-cap message');
+  }
+
+  t.equal(requestUrls.length, 1, 'does not retry a hard spend-cap 429');
+  t.ok(warnings.some(warning => warning.includes('stopping retries')), 'warns that retries are stopped');
+
+  global.fetch = originalFetch;
+  t.end();
+});
+
+test('screenshot tool prefers the active run model over the selected default', async (t) => {
+  const originalFetch = global.fetch;
+  const originalApi = global.window.api;
+  let requestUrl = null;
+  global.window.api = {
+    readWorkspaceFileBase64: async () => ({
+      success: true,
+      data: Buffer.from('fake-png').toString('base64'),
+      mimeType: 'image/png'
+    })
+  };
+  global.fetch = async (url, options) => {
+    requestUrl = url;
+    return {
+      ok: true,
+      json: async () => ({
+        candidates: [{
+          content: {
+            parts: [{
+              text: JSON.stringify({
+                status: 'appears_satisfied',
+                confidence: 0.8,
+                observations: ['The screenshot is readable.'],
+                missing: [],
+                recommendation: 'Continue.'
+              })
+            }]
+          }
+        }]
+      })
+    };
+  };
+
+  const result = await agent.executeTool(
+    'inspect_screenshot_with_model',
+    { path: '.orion/screenshots/preview.png', goal: 'desktop app is visible' },
+    makeWorkspace(),
+    {
+      modelName: 'gemini-2.5-flash-lite',
+      activeRunModelName: 'gemini-2.5-flash',
+      geminiApiKey: 'test-key'
+    },
+    { id: 'conversation-1' }
+  );
+
+  t.equal(result.status, 'appears_satisfied', 'tool returns screenshot inspection result');
+  t.ok(requestUrl.includes('/models/gemini-2.5-flash:generateContent'), 'uses the active run model instead of the selected default');
+
+  global.fetch = originalFetch;
+  global.window.api = originalApi;
   t.end();
 });

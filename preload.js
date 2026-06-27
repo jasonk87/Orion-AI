@@ -55,6 +55,7 @@ contextBridge.exposeInMainWorld('api', {
   
   // Config Controls
   readConfig: () => ipcRenderer.invoke('read-config'),
+  getAppRuntimeInfo: () => ipcRenderer.invoke('get-app-runtime-info'),
   writeConfig: (config) => ipcRenderer.invoke('write-config', config),
   
   // Shell Runner

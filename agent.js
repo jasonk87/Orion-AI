@@ -58,7 +58,7 @@ Tools available:
 - take_screenshot, inspect_screenshot, compare_screenshot_to_goal: Visual verification eyes for previews and UI/game scenes. Use evidence honestly; do not claim visual success without screenshot evidence or observations.
 - preview_app: Launches a desktop/GUI app (pygame, tkinter, etc.) as a persistent process, captures a real desktop screenshot, and LEAVES IT RUNNING (no auto-close — you stay in control). ALWAYS use this — never run_command — to run or visually check a GUI program with an event loop, so you never hang and never work blindly. Returns a processId. Then decide: capture_screen again later, read_command_output to watch progress, or kill_command when done. Follow up with inspect_screenshot_with_model to judge a captured frame.
 - capture_screen: Take another desktop screenshot of a still-running app on your own schedule (optional delayMs to let it advance first). Use this to re-check an app launched with preview_app instead of closing it prematurely.
-- inspect_screenshot_with_model: Sends a workspace screenshot to Gemini multimodal vision for semantic visual inspection against a goal.
+- inspect_screenshot_with_model: Sends a workspace screenshot to the active chat LLM's multimodal vision for semantic visual inspection against a goal.
 - sync_workspace_env: Safely write configured API keys/search IDs into .env-style files without exposing the secret values in chat or tool output.
 - set_task_checklist: Set the UI checklist of tasks (array of {title, status}). Status can be 'pending', 'in-progress', 'completed'. Use only for milestone changes, not routine progress churn.`;
 
@@ -248,12 +248,12 @@ const ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS = [
   },
   {
     name: 'inspect_screenshot_with_model',
-    description: 'Uses Gemini multimodal vision to inspect a workspace screenshot against a goal and returns structured visual evidence. Prefer this when Gemini is available before judging visual win conditions.',
+    description: 'Uses the active chat LLM multimodal vision to inspect a workspace screenshot against a goal and returns structured visual evidence.',
     parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' }, goal: { type: 'STRING' } }, required: ['path', 'goal'] }
   }
 ];
 
-window.steeringQueue = [];
+window.steeringQueue = {};
 window.promptQueue = [];
 window.followupTimers = window.followupTimers || {};
 window.followupTimerMeta = window.followupTimerMeta || {};
@@ -299,6 +299,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   if (window.onAgentStatusChange) window.onAgentStatusChange(true);
   
   const config = window.getAppConfig();
+  config.modelName = modelName || config.modelName || 'gemini-2.5-flash-lite';
+  let activeRunModelName = config.modelName;
+  config.activeRunModelName = activeRunModelName;
   let workspacePath = conversation.workspace || window.getCurrentWorkspace();
   const promptSource = options.source || 'user';
   const isInternalPrompt = !!options.internalPrompt || promptSource === 'followup' || promptSource === 'system' || promptSource === 'plan-approval';
@@ -532,6 +535,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let lastTextResponse = "Thinking...";
   let aiMessageIndex = conversation.messages.length;
   let workWalkthrough = [];
+  const persistedVisualArtifactKeys = new Set();
   let forceYield = false;
   // When a multi-phase approved plan runs out of loop budget with real work still pending,
   // the run auto-continues in a fresh internal pass instead of falsely reporting "Task finished".
@@ -636,7 +640,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // Call API (Gemini or Ollama) with automatic transient error retry and warnings
       let response;
       try {
-        agentSubStatus = `Calling ${modelName.startsWith('gemini-') ? 'Gemini' : 'Ollama (' + modelName + ')'} API...`;
+        agentSubStatus = `Calling ${activeRunModelName.startsWith('gemini-') ? 'Gemini' : 'Ollama (' + activeRunModelName + ')'} API...`;
         window.renderAiMessage(lastTextResponse, currentAgentLogs);
         const modelCallDelayMs = Math.min(Math.max(parseInt(config.modelCallDelayMs, 10) || 0, 0), 60000);
         if (modelCallDelayMs > 0) {
@@ -645,18 +649,22 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           await sleep(modelCallDelayMs);
         }
         
-        if (modelName.startsWith('gemini-')) {
-          response = await callGeminiAPI(messages, modelName, config.geminiApiKey, (warningMsg) => {
+        if (activeRunModelName.startsWith('gemini-')) {
+          response = await callGeminiAPI(messages, activeRunModelName, config.geminiApiKey, (warningMsg) => {
             agentSubStatus = warningMsg;
             conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
             window.renderAiMessage(lastTextResponse, currentAgentLogs);
           });
         } else {
-          response = await callOllamaAPI(messages, modelName, (warningMsg) => {
+          response = await callOllamaAPI(messages, activeRunModelName, (warningMsg) => {
             agentSubStatus = warningMsg;
             conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
             window.renderAiMessage(lastTextResponse, currentAgentLogs);
           });
+        }
+        if (response && response._orionActiveModelName) {
+          activeRunModelName = response._orionActiveModelName;
+          config.activeRunModelName = activeRunModelName;
         }
         agentSubStatus = 'Processing model response...';
       } catch (e) {
@@ -1002,6 +1010,16 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           currentAgentLogs[logIndex].status = isFailedToolResult(result) ? 'error' : 'success';
           currentAgentLogs[logIndex].result = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
           updateWalkthroughItem(walkthroughItem, toolName, args, result, null);
+          persistVisualArtifactForTool({
+            conversation,
+            userPrompt,
+            modelName: config.modelName || 'gemini-2.5-flash-lite',
+            workspacePath,
+            toolName,
+            args,
+            result,
+            persistedVisualArtifactKeys
+          });
         } catch (err) {
           console.error(err);
           currentAgentLogs[logIndex].status = 'error';
@@ -1323,6 +1341,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           if (window.appendSystemMessage) {
             window.appendSystemMessage(queueLabel, { conversationId: targetId });
           }
+          if (nextTask.id && window.markQueuedPromptRunning) {
+            window.markQueuedPromptRunning(nextTask.id, targetId);
+          }
           
           const isActive = window.getActiveConversationId && targetId === window.getActiveConversationId();
           if (!isInternalQueueItem && !nextTask.alreadyRendered && isActive && window.renderUserMessageInChat) {
@@ -1592,13 +1613,15 @@ async function executeTool(name, args, workspace, config, conversation) {
       let stderrOutput = '';
       
       // Setup output streamer listener
-      const cleanOutput = window.api.onCommandOutput(processId, (data) => {
-        if (data.type === 'stderr') {
-          stderrOutput += data.text;
-        } else {
-          stdoutOutput += data.text;
-        }
-      });
+      const cleanOutput = typeof window.api.onCommandOutput === 'function'
+        ? window.api.onCommandOutput(processId, (data) => {
+            if (data.type === 'stderr') {
+              stderrOutput += data.text;
+            } else {
+              stdoutOutput += data.text;
+            }
+          })
+        : () => {};
       
       let result = await window.api.runCommand(args.command, workspace, processId, timeoutMs);
       cleanOutput();
@@ -1614,10 +1637,12 @@ async function executeTool(name, args, workspace, config, conversation) {
         currentAgentLogs.push({ type: 'thought', content: `pip build failure detected — retrying without version pin: ${retryCmd}` });
         const retryId = `cmd_${conversation.id}_retry_${Date.now()}`;
         let retryStdout = '', retryStderr = '';
-        const cleanRetry = window.api.onCommandOutput(retryId, (data) => {
-          if (data.type === 'stderr') retryStderr += data.text;
-          else retryStdout += data.text;
-        });
+        const cleanRetry = typeof window.api.onCommandOutput === 'function'
+          ? window.api.onCommandOutput(retryId, (data) => {
+              if (data.type === 'stderr') retryStderr += data.text;
+              else retryStdout += data.text;
+            })
+          : () => {};
         const retryResult = await window.api.runCommand(retryCmd, workspace, retryId, timeoutMs);
         cleanRetry();
         return {
@@ -1876,16 +1901,17 @@ async function executeTool(name, args, workspace, config, conversation) {
     case 'inspect_screenshot_with_model': {
       if (!args.path) throw new Error("Missing 'path' parameter");
       if (!args.goal) throw new Error("Missing 'goal' parameter");
-      if (!config.geminiApiKey) throw new Error('Gemini API key is required for multimodal screenshot inspection.');
+      const activeModelName = config.activeRunModelName || config.modelName || 'gemini-2.5-flash-lite';
+      if (String(activeModelName || '').startsWith('gemini-') && !config.geminiApiKey) throw new Error('Gemini API key is required for Gemini multimodal screenshot inspection.');
       const file = await window.api.readWorkspaceFileBase64(workspace, args.path);
       if (!file.success) throw new Error(file.error || 'Could not read screenshot image');
       if (!String(file.mimeType || '').startsWith('image/')) throw new Error(`Screenshot inspection requires an image file, got ${file.mimeType}`);
-      return await inspectScreenshotWithGemini({
+      return await inspectScreenshotWithModel({
         imageBase64: file.data,
         mimeType: file.mimeType,
         path: args.path,
         goal: args.goal,
-        modelName,
+        modelName: activeModelName,
         apiKey: config.geminiApiKey
       });
     }
@@ -2776,7 +2802,7 @@ function summarizeToolStart(toolName, args = {}) {
   if (toolName === 'capture_screen') return { toolName, kind: 'visual', status: 'running', label: 'Captured a fresh screen screenshot' };
   if (toolName === 'inspect_screenshot') return { toolName, kind: 'visual', status: 'running', label: `Inspected screenshot \`${args.path || 'screenshot'}\`` };
   if (toolName === 'compare_screenshot_to_goal') return { toolName, kind: 'visual', status: 'running', label: `Compared screenshot to goal` };
-  if (toolName === 'inspect_screenshot_with_model') return { toolName, kind: 'visual', status: 'running', label: `Inspected screenshot with Gemini vision` };
+  if (toolName === 'inspect_screenshot_with_model') return { toolName, kind: 'visual', status: 'running', label: `Inspected screenshot with active model vision` };
   if (toolName === 'write_file') {
     const isPlan = args.path && isImplementationPlanPath(args.path);
     const isStrategy = args.path && isStrategyPath(args.path);
@@ -2845,6 +2871,12 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
     toolName === 'take_screenshot' || toolName === 'preview_app' || toolName === 'capture_screen' || toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal' || toolName === 'inspect_screenshot_with_model'
   )) {
     item.detail = result.summary;
+    if (result.path && (toolName === 'take_screenshot' || toolName === 'preview_app' || toolName === 'capture_screen' || toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal' || toolName === 'inspect_screenshot_with_model')) {
+      item.path = result.path;
+      item.width = result.width || item.width || 0;
+      item.height = result.height || item.height || 0;
+      item.size = result.size || item.size || 0;
+    }
   } else if (result && result.title && (toolName === 'open_url' || toolName === 'search_web' || toolName === 'click_element' || toolName === 'fill_input' || toolName === 'navigate_back' || toolName === 'wait_for_page')) {
     item.detail = `Page: ${result.title}`;
   }
@@ -3000,6 +3032,7 @@ function buildFinalVerificationSummary(items) {
 
 function buildRunArtifactPayload({ conversation, userPrompt, modelName, workspacePath, workWalkthrough, finalText }) {
   const filesTouched = [...new Set((workWalkthrough || []).filter(isFileMutationItem).map(item => item.path))];
+  const visualArtifacts = collectVisualArtifacts(workWalkthrough, workspacePath);
   return {
     conversationId: conversation.id,
     runId: `run-${Date.now()}`,
@@ -3011,12 +3044,72 @@ function buildRunArtifactPayload({ conversation, userPrompt, modelName, workspac
     },
     implementation: {
       filesTouched,
+      visualArtifacts,
       walkthrough: workWalkthrough
     },
     walkthrough: {
       finalText
     }
   };
+}
+
+function isScreenshotProducingTool(toolName) {
+  return toolName === 'take_screenshot' || toolName === 'preview_app' || toolName === 'capture_screen';
+}
+
+function collectVisualArtifacts(items = [], workspacePath = '') {
+  const seen = new Set();
+  return (items || [])
+    .filter(item => item && item.kind === 'visual' && item.path && item.status !== 'error')
+    .map(item => ({
+      path: item.path,
+      workspacePath,
+      toolName: item.toolName,
+      width: item.width || 0,
+      height: item.height || 0,
+      size: item.size || 0,
+      summary: item.detail || item.label || ''
+    }))
+    .filter(item => {
+      const key = `${item.workspacePath}|${item.path}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function persistVisualArtifactForTool({ conversation, userPrompt, modelName, workspacePath, toolName, result, persistedVisualArtifactKeys }) {
+  if (!window.api || !window.api.writeRunArtifact || !isScreenshotProducingTool(toolName)) return;
+  if (!result || result.success === false || !result.path) return;
+  const key = `${workspacePath}|${result.path}`;
+  if (persistedVisualArtifactKeys && persistedVisualArtifactKeys.has(key)) return;
+  if (persistedVisualArtifactKeys) persistedVisualArtifactKeys.add(key);
+  const runId = `visual-${Date.now()}-${String(toolName || 'screenshot').replace(/[^a-z0-9._-]+/gi, '-')}`;
+  const payload = {
+    conversationId: conversation.id,
+    runId,
+    type: 'orion-visual-artifact',
+    toolName,
+    workspacePath,
+    task: {
+      prompt: userPrompt,
+      model: modelName,
+      workspace: workspacePath
+    },
+    visualArtifact: {
+      path: result.path,
+      width: result.width || 0,
+      height: result.height || 0,
+      size: result.size || 0,
+      summary: result.summary || '',
+      capturedAt: new Date().toISOString()
+    }
+  };
+  window.api.writeRunArtifact(payload).then((artifactResult) => {
+    if (artifactResult && artifactResult.success && window.loadRunArtifacts) {
+      window.loadRunArtifacts();
+    }
+  }).catch(() => {});
 }
 
 function stripWorkWalkthrough(text) {
@@ -3642,6 +3735,17 @@ function isGeminiHighDemandError(status, message) {
   return status === 503 && /currently experiencing high demand|spikes in demand|high demand/i.test(String(message || ''));
 }
 
+function isGeminiHardQuotaError(status, message) {
+  if (status !== 429) return false;
+  return /monthly spending cap|project spend cap|ai\.studio\/spend|billing/i.test(String(message || ''));
+}
+
+function createNonRetryableModelError(message) {
+  const error = new Error(message);
+  error.nonRetryable = true;
+  return error;
+}
+
 function getNextGeminiModelForHighDemand(modelName) {
   const fallbackChain = {
     'gemini-3.1-flash-lite': 'gemini-3.5-flash',
@@ -4096,6 +4200,7 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
   }
   
   return {
+    _orionActiveModelName: modelName,
     candidates: [
       {
         content: {
@@ -4161,9 +4266,8 @@ function parseModelJsonObject(text) {
   return {};
 }
 
-async function inspectScreenshotWithGemini({ imageBase64, mimeType, path, goal, modelName, apiKey }) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName || 'gemini-2.5-flash-lite'}:generateContent?key=${apiKey}`;
-  const prompt = `You are Orion's visual verification eye. Inspect this screenshot against the mission goal.
+function buildScreenshotInspectionPrompt(goal) {
+  return `You are Orion's visual verification eye. Inspect this screenshot against the mission goal.
 
 Goal: ${goal}
 
@@ -4177,6 +4281,42 @@ Return compact JSON only with:
 }
 
 Be strict. If the screenshot does not clearly show the requested objective, say not_satisfied or uncertain.`;
+}
+
+function normalizeScreenshotInspectionResult({ text, path, goal, providerName }) {
+  const parsed = parseModelJsonObject(text);
+  const allowed = ['appears_satisfied', 'partially_satisfied', 'not_satisfied', 'uncertain'];
+  const status = allowed.includes(parsed.status) ? parsed.status : 'uncertain';
+  const confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0));
+  const observations = Array.isArray(parsed.observations) ? parsed.observations.map(item => String(item).slice(0, 500)).filter(Boolean).slice(0, 8) : [];
+  const missing = Array.isArray(parsed.missing) ? parsed.missing.map(item => String(item).slice(0, 500)).filter(Boolean).slice(0, 8) : [];
+  const recommendation = String(parsed.recommendation || '').slice(0, 1000);
+
+  return {
+    success: true,
+    path,
+    goal,
+    status,
+    confidence,
+    observations,
+    missing,
+    recommendation,
+    evidence: observations.join('; ') || text || `${providerName} inspected screenshot but returned no observations.`,
+    summary: `${providerName} judged screenshot ${status} for goal "${goal}" (confidence ${confidence.toFixed(2)}).`
+  };
+}
+
+async function inspectScreenshotWithModel({ imageBase64, mimeType, path, goal, modelName, apiKey }) {
+  if (!modelName) throw new Error('Active chat model is required for multimodal screenshot inspection.');
+  if (modelName.startsWith('gemini-')) {
+    return await inspectScreenshotWithGemini({ imageBase64, mimeType, path, goal, modelName, apiKey });
+  }
+  return await inspectScreenshotWithOllama({ imageBase64, path, goal, modelName });
+}
+
+async function inspectScreenshotWithGemini({ imageBase64, mimeType, path, goal, modelName, apiKey }) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+  const prompt = buildScreenshotInspectionPrompt(goal);
 
   const requestBody = {
     contents: [{
@@ -4207,26 +4347,36 @@ Be strict. If the screenshot does not clearly show the requested objective, say 
   const text = data.candidates && data.candidates[0] && data.candidates[0].content &&
     data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
     data.candidates[0].content.parts[0].text;
-  const parsed = parseModelJsonObject(text);
-  const allowed = ['appears_satisfied', 'partially_satisfied', 'not_satisfied', 'uncertain'];
-  const status = allowed.includes(parsed.status) ? parsed.status : 'uncertain';
-  const confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0));
-  const observations = Array.isArray(parsed.observations) ? parsed.observations.map(item => String(item).slice(0, 500)).filter(Boolean).slice(0, 8) : [];
-  const missing = Array.isArray(parsed.missing) ? parsed.missing.map(item => String(item).slice(0, 500)).filter(Boolean).slice(0, 8) : [];
-  const recommendation = String(parsed.recommendation || '').slice(0, 1000);
+  return normalizeScreenshotInspectionResult({ text, path, goal, providerName: modelName });
+}
 
-  return {
-    success: true,
-    path,
-    goal,
-    status,
-    confidence,
-    observations,
-    missing,
-    recommendation,
-    evidence: observations.join('; ') || text || 'Gemini inspected screenshot but returned no observations.',
-    summary: `Gemini vision judged screenshot ${status} for goal "${goal}" (confidence ${confidence.toFixed(2)}).`
-  };
+async function inspectScreenshotWithOllama({ imageBase64, path, goal, modelName }) {
+  const response = await fetchWithTimeout('http://localhost:11434/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: modelName,
+      messages: [{
+        role: 'user',
+        content: buildScreenshotInspectionPrompt(goal),
+        images: [imageBase64]
+      }],
+      stream: false,
+      format: 'json',
+      options: {
+        temperature: 0
+      }
+    })
+  }, MODEL_API_REQUEST_TIMEOUT_MS, 'Ollama vision screenshot inspection');
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Ollama vision inspection failed HTTP ${response.status}: ${errText}`);
+  }
+
+  const data = await response.json();
+  const text = data && data.message && data.message.content;
+  return normalizeScreenshotInspectionResult({ text, path, goal, providerName: modelName });
 }
 
 // GEMINI API UTILITIES
@@ -4607,13 +4757,22 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
       }, MODEL_API_REQUEST_TIMEOUT_MS, 'Gemini generateContent request');
       
       if (response.ok) {
-        return await response.json();
+        const responseData = await response.json();
+        responseData._orionActiveModelName = activeModelName;
+        return responseData;
       }
       
       const errorText = await response.text();
       const status = response.status;
       const apiError = describeModelApiError(status, errorText);
       const retryDelayMs = Math.min(apiError.retryDelayMs || delay, MODEL_API_MAX_RETRY_WAIT_MS);
+
+      if (isGeminiHardQuotaError(status, apiError.message)) {
+        if (onWarning) {
+          onWarning(`Gemini API returned HTTP ${status} (monthly spend cap). This is a billing limit, not a temporary model rate limit, so Orion is stopping retries.`);
+        }
+        throw createNonRetryableModelError(`HTTP ${status}: ${apiError.message}`);
+      }
 
       if (isGeminiHighDemandError(status, apiError.message)) {
         const fallbackModelName = getNextGeminiModelForHighDemand(activeModelName);
@@ -4631,7 +4790,9 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
       const isTransient = [429, 500, 502, 503, 504].includes(status);
       if (!isTransient || i === attempts) {
         const retryText = apiError.retryDelayMs ? ` Retry after about ${Math.ceil(apiError.retryDelayMs / 1000)} seconds.` : '';
-        throw new Error(`HTTP ${status}: ${apiError.message}${retryText}`);
+        const errorMessage = `HTTP ${status}: ${apiError.message}${retryText}`;
+        if (!isTransient) throw createNonRetryableModelError(errorMessage);
+        throw new Error(errorMessage);
       }
       
       if (onWarning) {
@@ -4643,6 +4804,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
       delay = Math.max(delay * 2 + Math.random() * 500, retryDelayMs); // Exponential backoff + API retry hint
       
     } catch (e) {
+      if (e && e.nonRetryable) throw e;
       if (i === attempts) throw e;
       if (onWarning) {
         onWarning(`Connection error: ${e.message}. Provider wait/cooldown active (Attempt ${i}/${attempts}).`);
@@ -4826,7 +4988,10 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     withWorkWalkthrough,
     buildDiscoveryFromToolOutcome,
     parseModelJsonObject,
+    callGeminiAPI,
+    inspectScreenshotWithModel,
     inspectScreenshotWithGemini,
+    inspectScreenshotWithOllama,
     diagnoseModelApiFailure
   };
 }
@@ -4834,6 +4999,9 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
 function diagnoseModelApiFailure(errorText) {
   const text = String(errorText || '').toLowerCase();
   if (!text) return '';
+  if (text.includes('monthly spending cap') || text.includes('project spend cap') || text.includes('ai.studio/spend')) {
+    return 'Diagnosis: the Gemini project has hit a monthly spend cap. This is a hard billing limit, not a temporary model rate limit; retries or model escalation will not continue until the AI Studio spend cap or billing configuration is changed.';
+  }
   if (text.includes('429') || text.includes('quota') || text.includes('resource has been exhausted')) {
     return 'Diagnosis: the model provider is rate-limiting or quota-limiting requests. Orion should pause the request loop, preserve state, and resume after cooldown.';
   }

@@ -16,6 +16,38 @@ test('prompt box queues with Enter and steers with Ctrl+Enter while running', (t
   t.end();
 });
 
+test('queued prompt cards can steer or run next after submission', (t) => {
+  t.ok(rendererJs.includes('function createQueuedPromptId'), 'queued prompts get stable ids');
+  t.ok(rendererJs.includes("source: 'queued-prompt'"), 'queued prompt cards persist with a distinct source');
+  t.ok(rendererJs.includes('data-action="steer"'), 'queued card exposes a steer action');
+  t.ok(rendererJs.includes('data-action="send-now"'), 'queued card exposes a send-now action');
+  t.ok(rendererJs.includes('function promoteQueuedPromptToSteering'), 'queued prompt can be converted to steering');
+  t.ok(rendererJs.includes('function sendQueuedPromptNow'), 'queued prompt can be promoted to immediate/next execution');
+  t.ok(rendererJs.includes('window.promptQueue.unshift(item)'), 'send-now moves a busy queue item to the front');
+  t.ok(rendererJs.includes('window.steeringQueue[conversationId].push(text)'), 'desktop steering is routed per conversation');
+  t.notOk(rendererJs.includes('window.steeringQueue.push(text)'), 'desktop steering no longer writes to the unused global array path');
+  t.ok(rendererJs.includes('window.markQueuedPromptRunning = markQueuedPromptRunning'), 'renderer exposes queued-card state updates to the agent');
+  t.ok(agentJs.includes('window.markQueuedPromptRunning(nextTask.id, targetId)'), 'agent marks queued cards handled when they start running');
+  t.end();
+});
+
+test('chat scrolling only sticks when the user is already near the bottom', (t) => {
+  const directScrollAssignments = rendererJs.match(/el\.chatFeed\.scrollTop = el\.chatFeed\.scrollHeight/g) || [];
+  t.equal(directScrollAssignments.length, 1, 'direct chat scroll assignment is isolated to the helper');
+  t.ok(rendererJs.includes('function shouldAutoScrollChat'), 'renderer can detect whether the chat is near the bottom');
+  t.ok(rendererJs.includes('CHAT_BOTTOM_THRESHOLD_PX'), 'auto-scroll has a small bottom threshold');
+  t.ok(rendererJs.includes('scrollChatToBottomIfNeeded(stickToBottom)'), 'message renderers respect the sticky-bottom gate');
+  t.end();
+});
+
+test('empty Thinking placeholders are not rendered as extra chat bubbles', (t) => {
+  t.ok(rendererJs.includes('function isEmptyThinkingPlaceholder'), 'history replay can identify empty Thinking placeholders');
+  t.ok(rendererJs.includes('if (isEmptyThinkingPlaceholder(msg.text, msg.logs)) return;'), 'history replay skips empty Thinking placeholders');
+  t.ok(rendererJs.includes('if (!activeAiBubble && isThinkingPlaceholder && !hasLogs)'), 'live rendering suppresses empty Thinking bubbles');
+  t.ok(rendererJs.includes("const displayText = isThinkingPlaceholder ? ''"), 'Thinking placeholder text is hidden when logs/status are rendered');
+  t.end();
+});
+
 test('steering and scheduled follow-ups are not persisted as fake user messages', (t) => {
   t.ok(rendererJs.includes("role: 'steering'"), 'steering is stored as a steering event');
   t.notOk(/role:\s*'user'[^}]+Steering/.test(rendererJs), 'steering is not stored as a user message');
@@ -426,6 +458,12 @@ test('blocked planning writes are not reported as touched files', (t) => {
 test('workspace artifacts and file explorer controls are wired', (t) => {
   t.ok(agentJs.includes('buildRunArtifactPayload'), 'agent builds external run artifact payloads');
   t.ok(agentJs.includes('writeRunArtifact'), 'agent writes run artifacts through IPC');
+  t.ok(agentJs.includes('persistVisualArtifactForTool'), 'agent writes screenshot artifacts as soon as they are captured');
+  t.ok(agentJs.includes("type: 'orion-visual-artifact'"), 'screenshot artifacts have a dedicated artifact type');
+  t.ok(agentJs.includes('collectVisualArtifacts'), 'final run artifacts retain visual artifact metadata');
+  t.ok(rendererJs.includes('mergeRunAndWorkspaceScreenshotArtifacts'), 'renderer merges run artifacts with workspace screenshots');
+  t.ok(rendererJs.includes('openImageArtifact'), 'renderer can open screenshot artifacts');
+  t.ok(rendererJs.includes('window.loadRunArtifacts = loadRunArtifacts'), 'agent can refresh the artifact panel after saving screenshot artifacts');
   t.ok(rendererJs.includes('deleteWorkspacePath'), 'file explorer delete handler exists');
   t.ok(rendererJs.includes('moveWorkspacePath'), 'file explorer move handler exists');
   t.ok(rendererJs.includes('renameWorkspacePath'), 'file explorer rename handler exists');
@@ -448,6 +486,10 @@ test('stuck diagnosis prefers adapting or preserving state over quitting', (t) =
   const quotaAdvice = agent.diagnoseModelApiFailure('HTTP 429 Resource has been exhausted');
   t.ok(quotaAdvice.includes('resume after cooldown'), 'quota advice schedules recovery posture');
   t.notOk(quotaAdvice.toLowerCase().includes('quit'), 'quota advice does not tell Orion to quit');
+
+  const spendCapAdvice = agent.diagnoseModelApiFailure('HTTP 429 Your project has exceeded its monthly spending cap. Please go to AI Studio at https://ai.studio/spend');
+  t.ok(spendCapAdvice.includes('monthly spend cap'), 'monthly spend caps get a specific diagnosis');
+  t.ok(spendCapAdvice.includes('retries or model escalation will not continue'), 'monthly spend caps do not encourage retry loops');
 
   const authAdvice = agent.diagnoseModelApiFailure('HTTP 401 invalid api key');
   t.ok(authAdvice.includes('hard blocker'), 'credential errors are treated as real blockers');

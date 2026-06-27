@@ -16,6 +16,7 @@
       <button id="btn-toggle-left-sidebar" class="chrome-icon-button" aria-label="Toggle navigation sidebar" title="Toggle sidebar">&#9776;</button>
       <span class="app-logo">&#127756;</span>
       <span class="app-title">Orion AI</span>
+      <span id="app-version-meta" class="app-version-meta" aria-label="App version and build date"></span>
     </div>
     <div class="titlebar-center">
       <span class="workspace-indicator" id="workspace-label" role="button" tabindex="0">No Workspace Loaded - Click to Choose</span>
@@ -244,6 +245,10 @@
       </div>
       <div class="modal-body file-viewer-body">
         <pre id="file-viewer-content" class="file-viewer-content"></pre>
+        <div id="file-viewer-image-shell" class="file-viewer-image-shell" hidden>
+          <img id="file-viewer-image" class="file-viewer-image" alt="Screenshot artifact preview">
+          <div id="file-viewer-image-meta" class="file-viewer-image-meta"></div>
+        </div>
       </div>
       <div class="modal-footer">
         <button id="btn-file-viewer-mention" class="btn-secondary">Mention in Chat</button>

@@ -5,6 +5,8 @@ const path = require('path');
 const styles = fs.readFileSync(path.join(__dirname, '../styles.css'), 'utf8');
 const html = fs.readFileSync(path.join(__dirname, '../index.html'), 'utf8');
 const main = fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8');
+const renderer = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8');
+const preload = fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8');
 
 test('desktop uses the unified Orion command-center design system', (t) => {
   t.ok(styles.includes('--bg-primary: #090b12'), 'uses graphite Orion background');
@@ -55,7 +57,6 @@ test('progressive disclosure keeps secondary surfaces contextual', (t) => {
 });
 
 test('agent presence communicates meaningful execution phases', (t) => {
-  const renderer = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8');
   t.ok(html.includes('id="agent-state-pill"'), 'renders agent state beside conversation title');
   ['Thinking', 'Acting', 'Verifying', 'Review needed', 'Complete'].forEach(label => {
     t.ok(renderer.includes(`'${label}'`), `supports ${label} state`);
@@ -63,6 +64,45 @@ test('agent presence communicates meaningful execution phases', (t) => {
   t.ok(styles.includes('.agent-state-pill.verifying'), 'styles verification distinctly');
   t.ok(styles.includes('.orion-toast.success'), 'provides completion feedback');
   t.ok(main.includes("? 'Verifying'"), 'phone uses the same verification state language');
+  t.end();
+});
+
+test('window maximize control uses the correct Electron fullscreen API', (t) => {
+  t.ok(main.includes('mainWindow.isFullScreen()'), 'main process uses BrowserWindow.isFullScreen()');
+  t.notOk(main.includes('mainWindow.isFullscreen()'), 'main process does not call the non-existent isFullscreen() API');
+  t.end();
+});
+
+test('desktop exposes quiet runtime version and update state UI', (t) => {
+  t.ok(html.includes('id="app-version-meta"'), 'titlebar includes a quiet version/date metadata slot');
+  t.ok(styles.includes('.app-version-meta'), 'version/date metadata has restrained titlebar styling');
+  t.ok(styles.includes('font-family: var(--font-mono);'), 'metadata uses compact code-style numerals');
+  t.ok(renderer.includes('refreshAppRuntimeInfo'), 'renderer populates runtime metadata on startup');
+  t.ok(preload.includes('getAppRuntimeInfo'), 'preload exposes runtime metadata IPC');
+  t.ok(main.includes('buildUpdateSplashHtml'), 'main process owns the pre-render update splash');
+  t.ok(main.includes('Updating local build'), 'update splash has user-facing maintenance copy');
+  t.ok(main.includes('syncSourceUpdateFiles'), 'source updater copies files through a named sync helper');
+  t.end();
+});
+
+test('queued prompts have quiet in-chat action controls', (t) => {
+  t.ok(renderer.includes('queued-prompt-bubble'), 'renderer uses a dedicated queued prompt card');
+  t.ok(renderer.includes('Send now'), 'queued prompt card exposes send-now copy');
+  t.ok(renderer.includes('Steer'), 'queued prompt card exposes steer copy');
+  t.ok(styles.includes('.queued-prompt-bubble'), 'queued prompt card has theme styling');
+  t.ok(styles.includes('.queued-prompt-action.primary'), 'primary queued action has distinct styling');
+  t.ok(styles.includes('.queued-prompt-footer'), 'queued prompt actions have a stable footer layout');
+  t.end();
+});
+
+test('screenshot artifacts are previewable from the artifact panel', (t) => {
+  t.ok(html.includes('id="file-viewer-image-shell"'), 'file viewer includes an image preview shell');
+  t.ok(html.includes('id="file-viewer-image"'), 'file viewer includes an image element');
+  t.ok(renderer.includes('data-artifact-index'), 'artifact items use click-safe index routing');
+  t.ok(renderer.includes("artifactType === 'screenshot'"), 'renderer identifies screenshot artifacts');
+  t.ok(renderer.includes('readWorkspaceFileBase64'), 'renderer loads screenshot bytes through IPC');
+  t.ok(styles.includes('.artifact-item.previewable'), 'previewable artifacts have interaction styling');
+  t.ok(styles.includes('.file-viewer-image'), 'screenshot preview image is styled');
   t.end();
 });
 

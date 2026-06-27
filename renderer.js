@@ -62,6 +62,7 @@ let activeProcessId = null;
 let projects = []; // Array of workspace folder paths
 let activeAiBubble = null; // Currently rendering AI message bubble
 let currentFileTreeItems = [];
+let currentRunArtifacts = [];
 let expandedFileFolders = new Set();
 
 // DOM ELEMENTS
@@ -70,6 +71,7 @@ const el = {
   btnMinimize: document.getElementById('btn-minimize'),
   btnMaximize: document.getElementById('btn-maximize'),
   btnClose: document.getElementById('btn-close'),
+  appVersionMeta: document.getElementById('app-version-meta'),
   workspaceLabel: document.getElementById('workspace-label'),
   
   // Sidebar items
@@ -153,6 +155,9 @@ const el = {
   fileViewerModal: document.getElementById('file-viewer-modal'),
   fileViewerTitle: document.getElementById('file-viewer-title'),
   fileViewerContent: document.getElementById('file-viewer-content'),
+  fileViewerImageShell: document.getElementById('file-viewer-image-shell'),
+  fileViewerImage: document.getElementById('file-viewer-image'),
+  fileViewerImageMeta: document.getElementById('file-viewer-image-meta'),
   btnFileViewerClose: document.getElementById('btn-file-viewer-close'),
   btnFileViewerMention: document.getElementById('btn-file-viewer-mention')
 };
@@ -165,6 +170,7 @@ let agentCompletionTimer = null;
 document.addEventListener('DOMContentLoaded', async () => {
   setupWindowControls();
   await loadSettings();
+  await refreshAppRuntimeInfo();
   try { cachedUserDataPath = await window.api.getUserDataPath(); } catch (_) {}
   setupSettingsModal();
   setupFileViewerModal();
@@ -241,6 +247,27 @@ function setupWindowControls() {
   el.btnMinimize.addEventListener('click', () => window.api.minimizeWindow());
   el.btnMaximize.addEventListener('click', () => window.api.maximizeWindow());
   el.btnClose.addEventListener('click', () => window.api.closeWindow());
+}
+
+async function refreshAppRuntimeInfo() {
+  if (!el.appVersionMeta || !window.api || !window.api.getAppRuntimeInfo) return;
+  try {
+    const info = await window.api.getAppRuntimeInfo();
+    const parts = [];
+    if (info && info.version) parts.push(`v${info.version}`);
+    if (info && info.runtimeDateLabel) parts.push(info.runtimeDateLabel);
+    if (!parts.length) {
+      el.appVersionMeta.textContent = '';
+      el.appVersionMeta.style.display = 'none';
+      return;
+    }
+    el.appVersionMeta.textContent = parts.join(' · ');
+    el.appVersionMeta.title = `Orion AI ${parts.join(' · ')}`;
+    el.appVersionMeta.style.display = 'inline-flex';
+  } catch (e) {
+    el.appVersionMeta.textContent = '';
+    el.appVersionMeta.style.display = 'none';
+  }
 }
 
 // --- SETTINGS CONFIGURATION ---
@@ -526,14 +553,17 @@ async function syncWorkspaceFiles() {
   el.fileCountBadge.textContent = files.length;
   
   if (files.length === 0) {
+    currentFileTreeItems = [];
     el.fileTree.innerHTML = '<p class="empty-state">No files found.</p>';
     autoDetectTestCommand(files);
+    loadRunArtifacts();
     return;
   }
 
   currentFileTreeItems = files;
   renderFileTree(files);
   autoDetectTestCommand(files);
+  loadRunArtifacts();
   return;
   
   el.fileTree.innerHTML = '';
@@ -922,19 +952,75 @@ async function copyWorkspacePath(relativePath) {
 async function loadRunArtifacts() {
   if (!el.artifactList || !window.api.listRunArtifacts) return;
   const result = await window.api.listRunArtifacts(activeConversationId);
-  const artifacts = result && result.success ? result.artifacts : [];
+  const runArtifacts = result && result.success ? result.artifacts : [];
+  const artifacts = mergeRunAndWorkspaceScreenshotArtifacts(runArtifacts);
+  currentRunArtifacts = artifacts;
   if (el.artifactCountBadge) el.artifactCountBadge.textContent = artifacts.length;
   if (el.runArtifactsPanel) el.runArtifactsPanel.classList.toggle('contextual-panel-hidden', artifacts.length === 0);
   if (!artifacts.length) {
     el.artifactList.innerHTML = '<p class="empty-state">Artifacts are saved outside the project after runs.</p>';
     return;
   }
-  el.artifactList.innerHTML = artifacts.slice(0, 8).map(item => `
-    <div class="artifact-item" title="${escapeHtml(item.artifactPath)}">
-      <span class="artifact-name">${escapeHtml(item.fileName)}</span>
-      <span class="artifact-meta">${escapeHtml(new Date(item.createdAt).toLocaleString())}</span>
-    </div>
-  `).join('');
+  el.artifactList.innerHTML = artifacts.slice(0, 12).map(renderArtifactListItem).join('');
+  el.artifactList.querySelectorAll('[data-artifact-index]').forEach(button => {
+    button.addEventListener('click', () => openRunArtifactByIndex(Number(button.dataset.artifactIndex)));
+  });
+}
+
+function mergeRunAndWorkspaceScreenshotArtifacts(runArtifacts = []) {
+  const merged = Array.isArray(runArtifacts) ? [...runArtifacts] : [];
+  const existingScreenshots = new Set(merged
+    .filter(item => item && item.artifactType === 'screenshot')
+    .map(item => `${item.workspacePath || currentWorkspace}|${item.screenshotPath}`));
+  getWorkspaceScreenshotArtifacts().forEach(item => {
+    const key = `${item.workspacePath}|${item.screenshotPath}`;
+    if (!existingScreenshots.has(key)) {
+      existingScreenshots.add(key);
+      merged.push(item);
+    }
+  });
+  return merged.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+}
+
+function getWorkspaceScreenshotArtifacts() {
+  if (!currentWorkspace || !Array.isArray(currentFileTreeItems)) return [];
+  return currentFileTreeItems
+    .filter(file => file && !file.isDir && /^\.orion[\\/]+screenshots[\\/]+.+\.(png|jpe?g|webp)$/i.test(file.path))
+    .map(file => ({
+      artifactType: 'screenshot',
+      displayName: file.path.split(/[\\/]/).pop(),
+      fileName: file.path.split(/[\\/]/).pop(),
+      artifactPath: file.path,
+      workspacePath: currentWorkspace,
+      screenshotPath: file.path,
+      createdAt: new Date().toISOString(),
+      size: file.size || 0,
+      summary: 'Workspace screenshot'
+    }));
+}
+
+function renderArtifactListItem(item, index) {
+  const isScreenshot = item.artifactType === 'screenshot' && item.screenshotPath;
+  const displayName = item.displayName || item.fileName || 'artifact';
+  const metaParts = [];
+  if (item.artifactType === 'screenshot') metaParts.push('Screenshot');
+  else metaParts.push('Run summary');
+  if (item.width && item.height) metaParts.push(`${item.width}x${item.height}`);
+  if (item.createdAt) metaParts.push(new Date(item.createdAt).toLocaleString());
+  const tag = isScreenshot ? 'button' : 'div';
+  const actionAttrs = isScreenshot ? ` type="button" data-artifact-index="${index}" aria-label="View screenshot artifact ${escapeHtml(displayName)}"` : '';
+  return `
+    <${tag} class="artifact-item ${isScreenshot ? 'previewable' : ''}" title="${escapeHtml(item.summary || item.artifactPath || item.screenshotPath || '')}"${actionAttrs}>
+      <span class="artifact-name">${escapeHtml(displayName)}</span>
+      <span class="artifact-meta">${escapeHtml(metaParts.join(' / '))}</span>
+    </${tag}>
+  `;
+}
+
+async function openRunArtifactByIndex(index) {
+  const item = currentRunArtifacts[index];
+  if (!item || item.artifactType !== 'screenshot') return;
+  await openImageArtifact(item);
 }
 
 async function autoDetectTestCommand(files) {
@@ -1015,6 +1101,7 @@ async function openFileViewer(relPath) {
   if (!currentWorkspace || !relPath) return;
   viewedFilePath = relPath;
   el.fileViewerTitle.textContent = relPath;
+  setFileViewerMode('text');
   el.fileViewerContent.textContent = 'Loading...';
   el.fileViewerModal.classList.add('active');
   
@@ -1026,8 +1113,48 @@ async function openFileViewer(relPath) {
   el.fileViewerContent.textContent = content || '';
 }
 
+async function openImageArtifact(item) {
+  const workspacePath = item.workspacePath || currentWorkspace;
+  const relPath = item.screenshotPath || item.path;
+  if (!workspacePath || !relPath || !window.api.readWorkspaceFileBase64) {
+    showToast('Screenshot artifact is missing its workspace path.', 'attention');
+    return;
+  }
+  viewedFilePath = relPath;
+  el.fileViewerTitle.textContent = relPath;
+  setFileViewerMode('image');
+  if (el.fileViewerImageMeta) el.fileViewerImageMeta.textContent = 'Loading screenshot...';
+  el.fileViewerModal.classList.add('active');
+
+  const file = await window.api.readWorkspaceFileBase64(workspacePath, relPath);
+  if (!file || file.success === false) {
+    if (el.fileViewerImageMeta) el.fileViewerImageMeta.textContent = `Error loading screenshot: ${file && file.error ? file.error : 'unknown error'}`;
+    if (el.fileViewerImage) el.fileViewerImage.removeAttribute('src');
+    return;
+  }
+  const mimeType = file.mimeType || 'image/png';
+  if (el.fileViewerImage) el.fileViewerImage.src = `data:${mimeType};base64,${file.data}`;
+  const dimensions = item.width && item.height ? `${item.width}x${item.height}` : '';
+  const size = item.size ? `${Math.round(item.size / 1024)} KB` : '';
+  if (el.fileViewerImageMeta) {
+    el.fileViewerImageMeta.textContent = [dimensions, size, item.toolName || 'screenshot'].filter(Boolean).join(' / ');
+  }
+}
+
+function setFileViewerMode(mode) {
+  const imageMode = mode === 'image';
+  if (el.fileViewerContent) {
+    el.fileViewerContent.hidden = imageMode;
+    if (!imageMode) el.fileViewerContent.textContent = '';
+  }
+  if (el.fileViewerImageShell) el.fileViewerImageShell.hidden = !imageMode;
+  if (!imageMode && el.fileViewerImage) el.fileViewerImage.removeAttribute('src');
+  if (!imageMode && el.fileViewerImageMeta) el.fileViewerImageMeta.textContent = '';
+}
+
 function closeFileViewer() {
   viewedFilePath = '';
+  setFileViewerMode('text');
   if (el.fileViewerModal) el.fileViewerModal.classList.remove('active');
 }
 
@@ -1074,6 +1201,7 @@ function setupChatHandlers() {
   
   document.getElementById('btn-steer').addEventListener('click', triggerSteer);
   document.getElementById('btn-queue').addEventListener('click', triggerQueue);
+  el.messagesContainer.addEventListener('click', handleQueuedPromptActionClick);
   const addFileButton = document.getElementById('btn-add-file');
   if (addFileButton) {
     addFileButton.addEventListener('click', () => {
@@ -1102,16 +1230,9 @@ function triggerSteer() {
   const text = el.chatInput.value.trim();
   if (!text) return;
   
-  if (window.steeringQueue) {
-    window.steeringQueue.push(text);
-    appendSteeringMessage(text);
-    if (currentWorkspace && window.mutateOperationalContext) {
-      window.mutateOperationalContext(currentWorkspace, 'checkpoint', {
-        reason: 'user_steering',
-        summary: `User steering received: ${text.slice(0, 800)}`,
-        nextAction: 'Apply the steering instruction before continuing the active subplan.'
-      }).catch(error => console.warn('Could not checkpoint steering:', error));
-    }
+  if (enqueueSteeringForConversation(text, activeConversationId)) {
+    appendSteeringMessage(text, activeConversationId);
+    checkpointSteeringInstruction(text, activeConversationId);
   }
   el.chatInput.value = '';
   document.getElementById('btn-steer').style.display = 'none';
@@ -1123,17 +1244,49 @@ function triggerQueue() {
   if (!text) return;
   
   if (window.promptQueue) {
-    window.promptQueue.push({ prompt: text, modelSelectValue: el.modelSelect.value, conversationId: activeConversationId, source: 'user-queue' });
-    appendQueuedMessage(text);
+    const queueItem = {
+      id: createQueuedPromptId(),
+      prompt: text,
+      modelSelectValue: el.modelSelect.value,
+      conversationId: activeConversationId,
+      source: 'user-queue',
+      createdAt: Date.now()
+    };
+    window.promptQueue.push(queueItem);
+    appendQueuedMessage(text, queueItem);
   }
   el.chatInput.value = '';
   document.getElementById('btn-steer').style.display = 'none';
   document.getElementById('btn-queue').style.display = 'none';
 }
 
-function appendSteeringMessage(text) {
-  renderSystemBubble(`[Steering] ${text}`);
-  const conv = conversations.find(c => c.id === activeConversationId);
+function enqueueSteeringForConversation(text, conversationId = activeConversationId) {
+  if (!text || !conversationId) return false;
+  if (!window.steeringQueue || Array.isArray(window.steeringQueue)) {
+    window.steeringQueue = {};
+  }
+  window.steeringQueue[conversationId] = window.steeringQueue[conversationId] || [];
+  window.steeringQueue[conversationId].push(text);
+  return true;
+}
+
+function checkpointSteeringInstruction(text, conversationId = activeConversationId) {
+  const conv = conversations.find(c => c.id === conversationId);
+  const workspace = (conv && (conv.workspace || conv.projectPath)) || currentWorkspace;
+  if (workspace && window.mutateOperationalContext) {
+    window.mutateOperationalContext(workspace, 'checkpoint', {
+      reason: 'user_steering',
+      summary: `User steering received: ${text.slice(0, 800)}`,
+      nextAction: 'Apply the steering instruction before continuing the active subplan.'
+    }).catch(error => console.warn('Could not checkpoint steering:', error));
+  }
+}
+
+function appendSteeringMessage(text, conversationId = activeConversationId) {
+  if (conversationId === activeConversationId) {
+    renderSystemBubble(`[Steering] ${text}`);
+  }
+  const conv = conversations.find(c => c.id === conversationId);
   if (conv) {
     conv.messages.push({ role: 'steering', source: 'steering', text: `[Steering] ${text}`, createdAt: Date.now() });
     saveConversationsToStorage();
@@ -1161,13 +1314,228 @@ function setupStartActions() {
   }
 }
 
-function appendQueuedMessage(text) {
-  renderSystemBubble(`⏳ Prompt Queued: "${text}"`);
-  const conv = conversations.find(c => c.id === activeConversationId);
+function createQueuedPromptId() {
+  return 'queue_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+}
+
+function appendQueuedMessage(text, queueItem = {}) {
+  const item = {
+    id: queueItem.id || createQueuedPromptId(),
+    prompt: text,
+    modelSelectValue: queueItem.modelSelectValue || (el.modelSelect && el.modelSelect.value),
+    conversationId: queueItem.conversationId || activeConversationId,
+    source: queueItem.source || 'user-queue',
+    createdAt: queueItem.createdAt || Date.now()
+  };
+  if (item.conversationId === activeConversationId) {
+    el.welcomeSplash.style.display = 'none';
+    el.messagesContainer.style.display = 'flex';
+    renderQueuedPromptBubble(item);
+  }
+  const conv = conversations.find(c => c.id === item.conversationId);
   if (conv) {
-    conv.messages.push({ role: 'system', text: `⏳ Prompt Queued: "${text}"` });
+    conv.messages.push({
+      role: 'system',
+      source: 'queued-prompt',
+      text: `Prompt queued: "${text}"`,
+      queueId: item.id,
+      queuedPrompt: text,
+      queueState: 'queued',
+      modelSelectValue: item.modelSelectValue,
+      createdAt: item.createdAt
+    });
     saveConversationsToStorage();
   }
+}
+
+function getPromptQueueIndex(queueId, conversationId) {
+  if (!queueId || !Array.isArray(window.promptQueue)) return -1;
+  return window.promptQueue.findIndex(item =>
+    item && item.id === queueId && (!conversationId || item.conversationId === conversationId)
+  );
+}
+
+function removePromptQueueItem(queueId, conversationId) {
+  const index = getPromptQueueIndex(queueId, conversationId);
+  if (index === -1) return null;
+  const [item] = window.promptQueue.splice(index, 1);
+  return item || null;
+}
+
+function findQueuedPromptMessage(queueId, conversationId) {
+  const conv = conversations.find(c => c.id === conversationId);
+  if (!conv || !Array.isArray(conv.messages)) return { conv: null, message: null };
+  const message = conv.messages.find(msg => msg && msg.queueId === queueId);
+  return { conv, message };
+}
+
+function getQueuedPromptStatus(item) {
+  const queueId = item.id || item.queueId;
+  const conversationId = item.conversationId || activeConversationId;
+  const queueIndex = getPromptQueueIndex(queueId, conversationId);
+  const queueState = item.queueState || 'queued';
+  if (queueState === 'steered') return 'Converted to steering';
+  if (queueState === 'sent') return 'Sent to Orion';
+  if (queueIndex === 0) return 'Runs next';
+  if (queueIndex > 0) return `Queued #${queueIndex + 1}`;
+  return 'No longer queued';
+}
+
+function buildQueuedPromptBubble(item) {
+  const queueId = String(item.id || item.queueId || '');
+  const conversationId = String(item.conversationId || activeConversationId || '');
+  const prompt = String(item.prompt || item.queuedPrompt || '');
+  const queueIndex = getPromptQueueIndex(queueId, conversationId);
+  const isPending = queueIndex !== -1;
+  const runningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+  const isThisConversationRunning = !!(window.isAgentRunning && window.isAgentRunning() && runningId === conversationId);
+  const canSteer = isPending && isThisConversationRunning;
+  const canSendNow = isPending;
+  const statusText = getQueuedPromptStatus(item);
+  const resolvedClass = isPending ? '' : ' is-resolved';
+  const steerTitle = canSteer
+    ? 'Turn this queued prompt into steering for the current run'
+    : 'Steer is available only while this conversation is the running task';
+  const sendTitle = canSendNow
+    ? 'Move this prompt to the front of the queue, or start it if Orion is idle'
+    : 'This queued prompt has already been handled';
+
+  const bubble = document.createElement('div');
+  bubble.className = `message-bubble queued-prompt-bubble${resolvedClass}`;
+  bubble.dataset.queueId = queueId;
+  bubble.dataset.conversationId = conversationId;
+  bubble.innerHTML = `
+    <div class="message-header queued">Queued Prompt</div>
+    <div class="message-body queued-prompt-body">
+      <div class="queued-prompt-copy">${escapeHtml(prompt).replace(/\n/g, '<br>')}</div>
+      <div class="queued-prompt-footer">
+        <span class="queued-prompt-status">${escapeHtml(statusText)}</span>
+        <div class="queued-prompt-actions">
+          <button class="queued-prompt-action" type="button" data-action="steer" data-queue-id="${escapeHtml(queueId)}" data-conversation-id="${escapeHtml(conversationId)}" title="${escapeHtml(steerTitle)}"${canSteer ? '' : ' disabled'}>Steer</button>
+          <button class="queued-prompt-action primary" type="button" data-action="send-now" data-queue-id="${escapeHtml(queueId)}" data-conversation-id="${escapeHtml(conversationId)}" title="${escapeHtml(sendTitle)}"${canSendNow ? '' : ' disabled'}>Send now</button>
+        </div>
+      </div>
+    </div>
+  `;
+  return bubble;
+}
+
+function renderQueuedPromptBubble(item) {
+  const stickToBottom = shouldAutoScrollChat();
+  el.messagesContainer.appendChild(buildQueuedPromptBubble(item));
+  scrollChatToBottomIfNeeded(stickToBottom);
+}
+
+function refreshQueuedPromptBubble(queueId, conversationId) {
+  if (conversationId !== activeConversationId || !el.messagesContainer) return;
+  const bubble = el.messagesContainer.querySelector(`[data-queue-id="${queueId}"]`);
+  if (!bubble) return;
+  const { message } = findQueuedPromptMessage(queueId, conversationId);
+  const item = message
+    ? {
+        ...message,
+        id: message.queueId,
+        prompt: message.queuedPrompt,
+        conversationId
+      }
+    : { id: queueId, conversationId };
+  const stickToBottom = shouldAutoScrollChat();
+  bubble.replaceWith(buildQueuedPromptBubble(item));
+  scrollChatToBottomIfNeeded(stickToBottom);
+}
+
+function setQueuedPromptMessageState(queueId, conversationId, queueState) {
+  const { conv, message } = findQueuedPromptMessage(queueId, conversationId);
+  if (message) {
+    message.queueState = queueState;
+    message.updatedAt = Date.now();
+    if (queueState === 'steered') {
+      message.text = `Queued prompt converted to steering: "${message.queuedPrompt || ''}"`;
+    } else if (queueState === 'sent') {
+      message.text = `Queued prompt sent: "${message.queuedPrompt || ''}"`;
+    }
+  }
+  if (conv) saveConversationsToStorage();
+  refreshQueuedPromptBubble(queueId, conversationId);
+}
+
+function handleQueuedPromptActionClick(event) {
+  const button = event.target.closest('.queued-prompt-action');
+  if (!button || button.disabled) return;
+  event.preventDefault();
+  const queueId = button.dataset.queueId;
+  const conversationId = button.dataset.conversationId || activeConversationId;
+  if (button.dataset.action === 'steer') {
+    promoteQueuedPromptToSteering(queueId, conversationId);
+  } else if (button.dataset.action === 'send-now') {
+    sendQueuedPromptNow(queueId, conversationId);
+  }
+}
+
+function promoteQueuedPromptToSteering(queueId, conversationId) {
+  const runningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+  const isThisConversationRunning = !!(window.isAgentRunning && window.isAgentRunning() && runningId === conversationId);
+  if (!isThisConversationRunning) {
+    showToast('Steer is available only for the task currently running.', 'attention');
+    refreshQueuedPromptBubble(queueId, conversationId);
+    return;
+  }
+  const item = removePromptQueueItem(queueId, conversationId);
+  if (!item) {
+    showToast('That queued prompt is no longer waiting.', 'attention');
+    setQueuedPromptMessageState(queueId, conversationId, 'sent');
+    return;
+  }
+  if (enqueueSteeringForConversation(item.prompt, conversationId)) {
+    setQueuedPromptMessageState(queueId, conversationId, 'steered');
+    checkpointSteeringInstruction(item.prompt, conversationId);
+    showToast('Queued prompt changed to steering.', 'success');
+  }
+}
+
+function sendQueuedPromptNow(queueId, conversationId) {
+  const item = removePromptQueueItem(queueId, conversationId);
+  if (!item) {
+    showToast('That queued prompt is no longer waiting.', 'attention');
+    setQueuedPromptMessageState(queueId, conversationId, 'sent');
+    return;
+  }
+  const conv = conversations.find(c => c.id === conversationId);
+  if (!conv) return;
+
+  if (window.isAgentRunning && window.isAgentRunning()) {
+    window.promptQueue.unshift(item);
+    setQueuedPromptMessageState(queueId, conversationId, 'queued');
+    refreshQueuedPromptBubble(queueId, conversationId);
+    showToast('Queued prompt moved to the front.', 'success');
+    return;
+  }
+
+  if (!window.runAgentLoop) {
+    window.promptQueue.unshift(item);
+    showToast('Agent engine is still loading. The prompt is first in queue.', 'attention');
+    refreshQueuedPromptBubble(queueId, conversationId);
+    return;
+  }
+
+  setQueuedPromptMessageState(queueId, conversationId, 'sent');
+  if (!item.alreadyRendered && conv.messages) {
+    conv.messages.push({ role: 'user', source: item.source || 'queue', text: item.prompt, createdAt: Date.now() });
+    saveConversationsToStorage();
+  }
+  if (conversationId === activeConversationId && !item.alreadyRendered) {
+    renderUserMessage(item.prompt);
+  }
+  window.runAgentLoop(item.prompt, item.modelSelectValue || (el.modelSelect && el.modelSelect.value), conv, {
+    source: item.source || 'queue'
+  }).catch(error => {
+    console.error('Queued prompt send-now run failed:', error);
+    appendSystemMessage(`Queued prompt failed to start: ${error.message}`, { conversationId });
+  });
+}
+
+function markQueuedPromptRunning(queueId, conversationId) {
+  setQueuedPromptMessageState(queueId, conversationId, 'sent');
 }
 
 function createNewConversation() {
@@ -1314,6 +1682,29 @@ function removeLegacyPhoneCompanionTokenBubbles() {
   });
 }
 
+const CHAT_BOTTOM_THRESHOLD_PX = 96;
+
+function shouldAutoScrollChat() {
+  if (!el.chatFeed) return false;
+  const distanceFromBottom = el.chatFeed.scrollHeight - el.chatFeed.scrollTop - el.chatFeed.clientHeight;
+  return distanceFromBottom <= CHAT_BOTTOM_THRESHOLD_PX;
+}
+
+function scrollChatToBottom() {
+  if (el.chatFeed) {
+    el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+  }
+}
+
+function scrollChatToBottomIfNeeded(shouldScroll) {
+  if (shouldScroll) scrollChatToBottom();
+}
+
+function isEmptyThinkingPlaceholder(text, logs = []) {
+  const hasLogs = Array.isArray(logs) && logs.length > 0;
+  return String(text || '').trim() === 'Thinking...' && !hasLogs;
+}
+
 function scrubLegacyPhoneCompanionTokenMessages() {
   let updated = false;
   conversations.forEach(c => {
@@ -1429,9 +1820,21 @@ function selectConversation(id) {
       if (msg.role === 'user') {
         renderUserMessage(msg.text);
       } else if (msg.role === 'assistant') {
+        if (isEmptyThinkingPlaceholder(msg.text, msg.logs)) return;
         renderAiMessage(msg.text, msg.logs, activeConversationId, msg);
-      } else if (msg.role === 'system') {
+      } else if (msg.role === 'steering') {
         renderSystemBubble(msg.text);
+      } else if (msg.role === 'system') {
+        if (msg.source === 'queued-prompt') {
+          renderQueuedPromptBubble({
+            ...msg,
+            id: msg.queueId,
+            prompt: msg.queuedPrompt,
+            conversationId: activeConversationId
+          });
+        } else {
+          renderSystemBubble(msg.text);
+        }
       }
     });
     window.clearActiveAiBubble();
@@ -1451,7 +1854,7 @@ function selectConversation(id) {
   }
   
   // Scroll to bottom
-  el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+  scrollChatToBottom();
   
   // Focus the input box so the user can immediately type
   el.chatInput.focus();
@@ -1507,8 +1910,8 @@ async function submitMessage() {
   renderConversationList();
   renderProjectsList();
   
-  // Scroll to bottom
-  el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+  // Scroll to bottom for the local send action.
+  scrollChatToBottom();
   
   // Trigger local Agent loop
   if (window.runAgentLoop) {
@@ -1616,6 +2019,7 @@ function normalizeConversationWorkspace(conv) {
 
 // RENDER HELPER FUNCTIONS
 function renderUserMessage(text) {
+  const stickToBottom = shouldAutoScrollChat();
   const bubble = document.createElement('div');
   bubble.className = 'message-bubble';
   bubble.innerHTML = `
@@ -1624,7 +2028,7 @@ function renderUserMessage(text) {
   `;
   sanitizeRenderedMarkdown(bubble);
   el.messagesContainer.appendChild(bubble);
-  el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+  scrollChatToBottomIfNeeded(stickToBottom);
 }
 
 function appendSystemMessage(text, options = {}) {
@@ -1770,6 +2174,7 @@ function renderSystemBubble(text) {
   if (isLegacyPhoneCompanionTokenMessage(text)) {
     return;
   }
+  const stickToBottom = shouldAutoScrollChat();
   const bubble = document.createElement('div');
   bubble.className = 'message-bubble';
   bubble.innerHTML = `
@@ -1777,10 +2182,11 @@ function renderSystemBubble(text) {
     <div class="message-body" style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-muted);">${escapeHtml(text)}</div>
   `;
   el.messagesContainer.appendChild(bubble);
-  el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+  scrollChatToBottomIfNeeded(stickToBottom);
 }
 
 function renderPhoneCompanionPairingCard(payload) {
+  const stickToBottom = shouldAutoScrollChat();
   const bubble = document.createElement('div');
   bubble.className = 'message-bubble companion-pairing-card';
   const qrSvg = String(payload.qrSvg || '');
@@ -1801,7 +2207,7 @@ function renderPhoneCompanionPairingCard(payload) {
     </div>
   `;
   el.messagesContainer.appendChild(bubble);
-  el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+  scrollChatToBottomIfNeeded(stickToBottom);
 }
 
 // Generates structural AI Response with step thought details
@@ -1810,6 +2216,12 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   if (targetId !== activeConversationId) {
     return;
   }
+  const hasLogs = Array.isArray(logs) && logs.length > 0;
+  const isThinkingPlaceholder = String(text || '').trim() === 'Thinking...';
+  if (!activeAiBubble && isThinkingPlaceholder && !hasLogs) {
+    return;
+  }
+  const stickToBottom = shouldAutoScrollChat();
   let bubble;
   const isNew = !activeAiBubble;
   
@@ -1822,7 +2234,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   }
   
   let logsHtml = '';
-  if (logs && logs.length > 0) {
+  if (hasLogs) {
     const isRunning = window.isAgentRunning && window.isAgentRunning();
     const displayStyle = isRunning ? 'flex' : 'none';
     const arrowSymbol = isRunning ? '▲' : '▼';
@@ -1859,7 +2271,10 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   }
   
   // Render markdown text
-  const renderedMarkdown = typeof marked !== 'undefined' ? marked.parse(text) : escapeHtml(text);
+  const displayText = isThinkingPlaceholder ? '' : String(text || '');
+  const renderedMarkdown = displayText
+    ? (typeof marked !== 'undefined' ? marked.parse(displayText) : escapeHtml(displayText))
+    : '';
   
   let runningIndicatorHtml = '';
   let planApprovalHtml = '';
@@ -1997,7 +2412,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     });
   });
   
-  el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+  scrollChatToBottomIfNeeded(stickToBottom);
 }
 
 // LOG TOGGLING HELPER
@@ -2271,8 +2686,10 @@ window.updateOperationalContext = updateOperationalContext;
 window.refreshOperationalContext = refreshOperationalContext;
 window.updateTestResultsPanel = updateTestResultsPanel;
 window.runRegressionTests = runRegressionTests;
+window.loadRunArtifacts = loadRunArtifacts;
 window.renderAiMessage = renderAiMessage;
 window.appendSystemMessage = appendSystemMessage;
+window.markQueuedPromptRunning = markQueuedPromptRunning;
 window.saveConversationsToStorage = saveConversationsToStorage;
 window.showPhoneCompanionPairingCard = showPhoneCompanionPairingCard;
 window.syncWorkspaceFiles = syncWorkspaceFiles;
