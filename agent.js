@@ -309,7 +309,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const scopedNotes = await readScopedNotes(workspacePath, conversation);
   const operationalContext = await readOperationalContext(workspacePath);
   let workingState = operationalContext.state;
-  const isContinuationRequest = isTaskContinuationPrompt(userPrompt) && hasOperationalMissionState(workingState);
+  // Internal prompts (plan-approval, followup, system) are NOT user continuation requests,
+  // even though their text may contain words like "Continue". Only real user messages count,
+  // otherwise the plan-approval prompt ("Continue execution from the approved plan") gets
+  // misrouted into the in-progress-fix branch and the model reports "Task finished."
+  const isContinuationRequest = !isInternalPrompt && isTaskContinuationPrompt(userPrompt) && hasOperationalMissionState(workingState);
   // A "continue"/"approved"/"go" style message is never a brand-new task, so it must not
   // wipe an already-approved plan — even when the operational context JSON was never populated
   // (the model may have only written STRATEGY.md/implementation_plan.md as markdown).
@@ -445,7 +449,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let planningDecision = { mode: 'plan', reason: 'Planning mode is active.' };
   let planningBypassedForTask = false;
   let strategyStatus = { exists: false, valid: false, missingSections: STRATEGY_REQUIRED_SECTIONS, needsClarification: false };
-  if (isContinuationRequest && !conversation.awaitingPlanApproval && !conversation.planApproved) {
+  if (!isInternalPrompt && isContinuationRequest && !conversation.awaitingPlanApproval && !conversation.planApproved) {
     planningDecision = {
       mode: 'direct',
       reason: 'Continuing or fixing an existing in-progress approved task.'
