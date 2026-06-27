@@ -82,7 +82,7 @@ const OPERATIONAL_CONTEXT_TOOL_DECLARATIONS = [
   },
   {
     name: 'update_mission_context',
-    description: 'Creates or updates the durable mission and measurable win conditions. Use for long-running goals, not ordinary one-step requests.',
+    description: 'Creates or updates the durable mission and measurable win conditions. Use ONLY for long-running multi-step tasks that need a plan. NEVER call for read-only questions, project descriptions, code reviews, improvement suggestions, or conversational follow-ups — answer those directly.',
     parameters: { type: 'OBJECT', properties: {
       mission: { type: 'STRING' }, activeObjective: { type: 'STRING' }, rationale: { type: 'STRING' },
       winConditions: { type: 'ARRAY', items: { type: 'OBJECT', properties: { id: { type: 'STRING' }, title: { type: 'STRING' }, status: { type: 'STRING' }, evidence: { type: 'ARRAY', items: { type: 'STRING' } }, notes: { type: 'STRING' } }, required: ['title'] } }
@@ -1562,6 +1562,9 @@ async function executeTool(name, args, workspace, config, conversation) {
     case 'promote_discovery':
     case 'discard_noise':
     case 'evaluate_win_conditions':
+      if (agentExecutionMode === 'direct' || agentExecutionMode === 'answer') {
+        return { blocked: true, reason: `${name} is not available in ${agentExecutionMode} mode. Operational planning tools are for long-running multi-step tasks only. Answer the user directly using read tools.` };
+      }
       return await mutateOperationalContext(workspace, name, args);
     
     case 'run_tests': {
@@ -2988,6 +2991,10 @@ Examples:
 - "what improvements could we make to this app?" -> direct
 - "can you suggest ways to improve this project?" -> direct
 - "what would you recommend to enhance this?" -> direct
+- "can you walk me through this?" -> direct
+- "what are the next steps?" -> direct
+- "how does this compare to other approaches?" -> direct
+- "elaborate on how that works" -> direct
 - "explain how PATH works on Windows" -> answer
 - "build me a Python desktop app" -> plan
 - "refactor the authentication flow" -> plan
@@ -3097,6 +3104,17 @@ function classifySimpleTask(userPrompt) {
       route: 'local_project_improve',
       mode: 'direct',
       reason: 'Improvement or suggestion question about a local project; answer directly without planning gates.'
+    };
+  }
+
+  // Conversational follow-up questions referencing prior context — no plan approval needed
+  const conversationVerbs = hasAnyToken(tokenSet, ['walk', 'compare', 'elaborate', 'clarify', 'expand', 'detail', 'continue', 'explain', 'more']);
+  const pronounRef = hasAnyToken(tokenSet, ['this', 'it', 'that', 'these', 'those']);
+  if (conversationVerbs && pronounRef) {
+    return {
+      route: 'conversational_followup',
+      mode: 'direct',
+      reason: 'Conversational follow-up referencing prior context; answer directly without planning gates.'
     };
   }
 
