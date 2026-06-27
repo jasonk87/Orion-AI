@@ -537,11 +537,13 @@ async function captureDesktopScreenshot(workspacePath, destination, prefix = 'pr
   return { rel, png, size };
 }
 
-// Launches a workspace app (e.g. a Python/pygame game) for a bounded warm-up window, captures a
-// desktop screenshot so the agent can visually verify it, then force-closes it. This prevents the
-// agent from hanging on a GUI event loop that never exits, and lets it confirm the app actually
-// rendered instead of working blindly.
-async function previewWorkspaceApp(workspacePath, { command, warmupMs, destination } = {}) {
+// Launches a workspace app (e.g. a Python/pygame game) as a persistent, tracked session, lets it
+// warm up, captures a desktop screenshot so the agent can SEE it, and then LEAVES IT RUNNING. The
+// agent decides what happens next — wait longer and capture_screen again, read_command_output to
+// watch progress (e.g. ML training improving over time), or kill_command when done. It never
+// force-closes the app, so a slow-starting or long-running program is not cut off prematurely.
+// A generous session timeout is the only backstop so nothing leaks forever.
+async function previewWorkspaceApp(workspacePath, { command, warmupMs, destination, processId, timeoutMs } = {}) {
   if (!workspacePath || !fs.existsSync(workspacePath)) {
     return { success: false, error: 'No active workspace directory found.' };
   }
@@ -561,41 +563,37 @@ async function previewWorkspaceApp(workspacePath, { command, warmupMs, destinati
     return { success: false, error: 'Could not determine what to preview. Set a workspace entrypoint or pass an explicit command.' };
   }
 
-  const classification = classifyCommandRequest(resolvedCommand, { source: 'freeform' });
-  if (!classification.allowed) {
-    return { success: false, error: classification.reason };
+  // Start as a persistent tracked session. startCommandSession validates the command and throws
+  // if it is denied. The default backstop is generous (10 min) so long warm-ups / training runs
+  // are not killed; the agent should kill_command explicitly when finished.
+  let session;
+  try {
+    session = startCommandSession({
+      command: resolvedCommand,
+      cwd: workspacePath,
+      processId: processId || `preview_${Date.now()}`,
+      timeoutMs: timeoutMs || 10 * 60 * 1000
+    });
+  } catch (e) {
+    return { success: false, error: e.message };
   }
 
-  const resolvedWarmup = Math.min(Math.max(parseInt(warmupMs, 10) || 4000, 1000), 20000);
-  const shellSpec = getCommandShellSpec(resolvedCommand);
-  const child = spawn(shellSpec.executable, [...shellSpec.args, resolvedCommand], {
-    cwd: workspacePath,
-    env: { ...process.env, PAGER: 'cat' },
-    windowsHide: true,
-    detached: process.platform !== 'win32'
-  });
-
-  let stderr = '';
-  let exited = false;
-  let exitCode = null;
-  if (child.stderr) child.stderr.on('data', d => { stderr += d.toString(); if (stderr.length > 8000) stderr = stderr.slice(-8000); });
-  if (child.stdout) child.stdout.on('data', () => {});
-  child.on('exit', (code) => { exited = true; exitCode = code; });
-  child.on('error', (err) => { exited = true; stderr += `\n[spawn error] ${err.message}`; });
-
-  // Let the window render.
+  const resolvedWarmup = Math.min(Math.max(parseInt(warmupMs, 10) || 4000, 1000), 60000);
   await new Promise(resolve => setTimeout(resolve, resolvedWarmup));
 
-  // If it died before the warm-up finished with a non-zero code, it crashed on startup — report
-  // that instead of screenshotting an empty desktop.
-  if (exited && exitCode !== 0) {
+  const stillRunning = !!activeProcesses[session.id];
+
+  // If it already exited non-zero during warm-up, it likely crashed on startup. Report that with
+  // its output instead of screenshotting an empty desktop. (Nothing to manage — already exited.)
+  if (!stillRunning && session.exitCode !== 0 && session.status !== 'completed') {
     return {
       success: false,
       crashed: true,
+      processId: session.id,
       command: resolvedCommand,
-      exitCode,
-      stderr: stderr.slice(-2000),
-      error: `The app exited with code ${exitCode} before a window could be captured — it likely crashed on startup. Inspect the error output and fix it.`
+      exitCode: session.exitCode,
+      stderr: (session.stderr || '').slice(-2000),
+      error: `The app exited (code ${session.exitCode}) before a window could be captured — it likely crashed on startup. Inspect the error output and fix it.`
     };
   }
 
@@ -607,26 +605,53 @@ async function previewWorkspaceApp(workspacePath, { command, warmupMs, destinati
     captureError = err.message;
   }
 
-  // Auto-close: always force-kill so a GUI event loop can never leave the agent hanging.
-  await new Promise(resolve => killProcessTree(child, () => resolve()));
-
-  if (!shot) {
-    return { success: false, command: resolvedCommand, autoClosed: true, stderr: stderr.slice(-2000), error: `Launched and auto-closed the app, but screen capture failed: ${captureError || 'unknown error'}.` };
-  }
-
+  // IMPORTANT: do not kill. The app is left running and managed by its session id so the agent can
+  // wait, re-screenshot, watch output, or kill it on its own terms.
+  const manageHint = `Process id "${session.id}" is left running — wait and capture_screen again to see later state, read_command_output to watch progress, or kill_command when done.`;
   return {
     success: true,
+    processId: session.id,
     command: resolvedCommand,
-    path: shot.rel,
-    width: shot.size.width,
-    height: shot.size.height,
-    size: shot.png.length,
+    running: stillRunning,
+    exitedDuringWarmup: !stillRunning,
+    exitCode: stillRunning ? null : session.exitCode,
+    path: shot ? shot.rel : '',
+    width: shot ? shot.size.width : 0,
+    height: shot ? shot.size.height : 0,
+    size: shot ? shot.png.length : 0,
     warmupMs: resolvedWarmup,
-    autoClosed: true,
-    exitedDuringWarmup: exited,
-    stderr: stderr.slice(-2000),
-    summary: `Previewed "${resolvedCommand}" for ${resolvedWarmup}ms, captured ${shot.rel} (${shot.size.width}x${shot.size.height}), then auto-closed it.`
+    backstopTimeoutMs: session.timeoutMs,
+    stderr: (session.stderr || '').slice(-2000),
+    captureError: captureError || undefined,
+    summary: shot
+      ? `Previewed "${resolvedCommand}" (${stillRunning ? 'still running' : 'exited during warm-up'}); captured ${shot.rel} (${shot.size.width}x${shot.size.height}). ${manageHint}`
+      : `Launched "${resolvedCommand}" but screen capture failed: ${captureError || 'unknown error'}. ${manageHint}`
   };
+}
+
+// On-demand desktop screenshot of whatever is currently on screen (e.g. an app previously launched
+// with preview_app, now further along). Optionally waits first so the agent can let an app reach a
+// more interesting state before capturing — the agent controls the timing, nothing is auto-closed.
+async function captureScreenForAgent(workspacePath, { destination, delayMs } = {}) {
+  if (!workspacePath || !fs.existsSync(workspacePath)) {
+    return { success: false, error: 'No active workspace directory found.' };
+  }
+  const wait = Math.min(Math.max(parseInt(delayMs, 10) || 0, 0), 120000);
+  if (wait > 0) await new Promise(resolve => setTimeout(resolve, wait));
+  try {
+    const shot = await captureDesktopScreenshot(workspacePath, destination, 'capture');
+    return {
+      success: true,
+      path: shot.rel,
+      width: shot.size.width,
+      height: shot.size.height,
+      size: shot.png.length,
+      waitedMs: wait,
+      summary: `Captured the current screen to ${shot.rel} (${shot.size.width}x${shot.size.height})${wait ? ` after waiting ${wait}ms` : ''}.`
+    };
+  } catch (err) {
+    return { success: false, error: `Screen capture failed: ${err.message}` };
+  }
 }
 
 function inspectScreenshotInWorkspace(workspacePath, relativePath) {
@@ -3432,9 +3457,17 @@ ipcMain.handle('take-screenshot', async (event, { workspacePath, destination }) 
   }
 });
 
-ipcMain.handle('preview-workspace-app', async (event, { workspacePath, command, warmupMs, destination }) => {
+ipcMain.handle('preview-workspace-app', async (event, { workspacePath, command, warmupMs, destination, processId, timeoutMs }) => {
   try {
-    return await previewWorkspaceApp(workspacePath, { command, warmupMs, destination });
+    return await previewWorkspaceApp(workspacePath, { command, warmupMs, destination, processId, timeoutMs });
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('capture-screen', async (event, { workspacePath, destination, delayMs }) => {
+  try {
+    return await captureScreenForAgent(workspacePath, { destination, delayMs });
   } catch (e) {
     return { success: false, error: e.message };
   }

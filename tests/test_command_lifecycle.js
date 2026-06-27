@@ -110,6 +110,30 @@ test('previewWorkspaceApp guards: missing workspace, no entrypoint, and destruct
   t.end();
 });
 
+test('preview_app launches a persistent session and does NOT auto-close', async (t) => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-preview-run-'));
+  // A long-lived, harmless command stands in for a GUI app that keeps running.
+  const longCmd = process.platform === 'win32' ? 'ping 127.0.0.1 -n 30' : 'sleep 30';
+
+  // Screen capture needs Electron's desktopCapturer (unavailable under the test mock), so capture
+  // will fail — but the contract we care about holds regardless: the process is started, tracked,
+  // and LEFT RUNNING with a processId so the agent can manage it.
+  const result = await main.previewWorkspaceApp(ws, { command: longCmd, warmupMs: 1000, processId: 'preview_test_persist' });
+
+  t.ok(result.processId, 'returns a processId for the launched app');
+  t.ok(main.activeProcesses[result.processId], 'the app is still running (NOT auto-closed) after preview returns');
+
+  // The agent stays in control: it can kill the process when done.
+  const child = main.activeProcesses[result.processId];
+  await new Promise(resolve => main.killProcessTree(child, () => resolve()));
+  t.pass('agent can kill the previewed app on its own terms');
+  t.end();
+});
+
 test('run-command sessions retain captured stdout in main process', (t) => {
   const command = process.platform === 'win32' ? 'echo orion-shell-smoke' : 'printf orion-shell-smoke';
   const session = main.startCommandSession({
