@@ -408,7 +408,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let planningDecision = { mode: 'plan', reason: 'Planning mode is active.' };
   let planningBypassedForTask = false;
   let strategyStatus = { exists: false, valid: false, missingSections: STRATEGY_REQUIRED_SECTIONS, needsClarification: false };
-  if (isContinuationRequest && !conversation.awaitingPlanApproval) {
+  if (isContinuationRequest && !conversation.awaitingPlanApproval && !conversation.planApproved) {
     planningDecision = {
       mode: 'direct',
       reason: 'Continuing or fixing an existing in-progress approved task.'
