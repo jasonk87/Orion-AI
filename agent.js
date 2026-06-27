@@ -1104,6 +1104,19 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         break;
       }
     }
+
+    // Fallback: if the agent ran in planning mode but never wrote a new plan (e.g. reviewed
+    // an existing one and summarized it), check whether implementation_plan.md exists on disk.
+    // If it does, gate on approval now so the next user message is properly routed.
+    if (!forceYield && planningDecision.mode === 'plan' && !conversation.awaitingPlanApproval && !conversation.planApproved) {
+      try {
+        const existingPlanText = await readImplementationPlanText(workspacePath);
+        if (existingPlanText && existingPlanText.trim()) {
+          conversation.awaitingPlanApproval = true;
+          console.log('Planning turn ended without forceYield; existing implementation_plan.md found — gating on approval.');
+        }
+      } catch (_) {}
+    }
   } catch (error) {
     console.error("Critical error in agent loop:", error);
     window.appendSystemMessage(`Critical error in agent: ${error.message}`);
