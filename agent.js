@@ -32,7 +32,7 @@ Tools available:
 - get_workspace_info: Return the active workspace directory and conversation scope.
 - change_workspace: Changes the active workspace directory of this conversation to a new absolute directory path on your computer. Use this when the user asks you to inspect or work on a project located outside the active standalone workspace folder.
 - open_workspace_folder: Open the active workspace folder in the OS file explorer.
-- launch_workspace_app: Launch the active workspace app using Orion's app detection.
+- launch_workspace_app: Launch the active workspace app using Orion's app detection. For a GUI program with an event loop (pygame, tkinter, a game window), do NOT verify it with run_command — that blocks until timeout. Use preview_app, which runs it briefly, screenshots it, and auto-closes it.
 - set_workspace_entrypoint: Set or clear the launch entry point command for this workspace.
 - git_push: Push the current Git branch, or the current branch to a requested remote branch, when the user asks.
 - read_file: Read a file's content. Use startLine/endLine or maxChars for large files.
@@ -56,6 +56,7 @@ Tools available:
 - download_file, inspect_archive, extract_archive, inspect_binary_asset, list_asset_metadata: General asset acquisition/inspection hands. Use when useful; do not follow a hardcoded asset pipeline.
 - open_url, search_web, click_element, fill_input, navigate_back, download_from_page, wait_for_page: Browser worker hands for autonomous web navigation and acquisition when the mission calls for it.
 - take_screenshot, inspect_screenshot, compare_screenshot_to_goal: Visual verification eyes for previews and UI/game scenes. Use evidence honestly; do not claim visual success without screenshot evidence or observations.
+- preview_app: Launches a desktop/GUI app (pygame, tkinter, etc.) for a few seconds, captures a real desktop screenshot, then auto-closes it. ALWAYS use this — never run_command — to run or visually check a GUI program with an event loop, so you never hang waiting on a window and never work blindly. Follow it with inspect_screenshot_with_model to judge the captured frame.
 - inspect_screenshot_with_model: Sends a workspace screenshot to Gemini multimodal vision for semantic visual inspection against a goal.
 - sync_workspace_env: Safely write configured API keys/search IDs into .env-style files without exposing the secret values in chat or tool output.
 - set_task_checklist: Set the UI checklist of tasks (array of {title, status}). Status can be 'pending', 'in-progress', 'completed'. Use only for milestone changes, not routine progress churn.`;
@@ -215,6 +216,15 @@ const ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS = [
     name: 'take_screenshot',
     description: 'Captures the current browser worker view as a screenshot in the workspace for visual verification.',
     parameters: { type: 'OBJECT', properties: { destination: { type: 'STRING', description: 'Optional workspace-relative PNG path.' } } }
+  },
+  {
+    name: 'preview_app',
+    description: 'Launches a desktop/GUI app (e.g. a Python/pygame game) for a few seconds, captures a real desktop screenshot so you can SEE it rendered, then auto-closes it. ALWAYS use this instead of run_command for GUI programs with an event loop — run_command would hang until timeout waiting for the window to close. Returns a screenshot path to inspect with inspect_screenshot_with_model, or reports a crash if the app exited before rendering.',
+    parameters: { type: 'OBJECT', properties: {
+      command: { type: 'STRING', description: 'Optional command to run (defaults to the workspace entrypoint or an auto-detected python main file).' },
+      warmupMs: { type: 'NUMBER', description: 'Optional ms to let the window render before capture (default 4000, max 20000).' },
+      destination: { type: 'STRING', description: 'Optional workspace-relative PNG path for the screenshot.' }
+    } }
   },
   {
     name: 'inspect_screenshot',
@@ -1807,6 +1817,19 @@ async function executeTool(name, args, workspace, config, conversation) {
       return result;
     }
 
+    case 'preview_app': {
+      const result = await window.api.previewApp(workspace, {
+        command: args.command || '',
+        warmupMs: args.warmupMs,
+        destination: args.destination || ''
+      });
+      // A crash before render is a real, reportable failure the model must act on — surface it as
+      // a failed result (not a thrown error) so the recovery guidance and stderr reach the model.
+      if (!result.success && !result.crashed) throw new Error(result.error || 'App preview failed');
+      if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
+      return result;
+    }
+
     case 'inspect_screenshot': {
       if (!args.path) throw new Error("Missing 'path' parameter");
       const result = await window.api.inspectScreenshot(workspace, args.path);
@@ -2360,7 +2383,7 @@ function buildDiscoveryFromToolOutcome(toolName, args = {}, result = {}, outcome
   if (!result || result.error || result.success === false) return null;
   const assetTools = new Set(['download_file', 'inspect_archive', 'extract_archive', 'inspect_binary_asset', 'list_asset_metadata']);
   const browserTools = new Set(['open_url', 'search_web', 'click_element', 'download_from_page']);
-  const visualTools = new Set(['take_screenshot', 'inspect_screenshot', 'compare_screenshot_to_goal', 'inspect_screenshot_with_model']);
+  const visualTools = new Set(['take_screenshot', 'preview_app', 'inspect_screenshot', 'compare_screenshot_to_goal', 'inspect_screenshot_with_model']);
   if (assetTools.has(toolName)) {
     const source = result.url || args.url || '';
     const path = result.path || result.destination || args.path || '';
@@ -2652,7 +2675,7 @@ function getPlanningToolGate(config, canExecute, toolName, args = {}, options = 
   if (!config || !config.planningMode || canExecute) {
     return { allowed: true, forceYield: false, reason: '' };
   }
-  const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'start_command', 'run_tests', 'sync_workspace_env', 'launch_workspace_app', 'git_push', 'download_file', 'download_from_page', 'extract_archive', 'take_screenshot'];
+  const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'start_command', 'run_tests', 'sync_workspace_env', 'launch_workspace_app', 'preview_app', 'git_push', 'download_file', 'download_from_page', 'extract_archive', 'take_screenshot'];
   const completionTools = ['complete_subplan', 'evaluate_win_conditions'];
   const strategyRequired = options.strategyRequired !== false;
   const strategyStatus = options.strategyStatus || {};
@@ -2721,6 +2744,7 @@ function summarizeToolStart(toolName, args = {}) {
   if (toolName === 'download_from_page') return { toolName, kind: 'asset', status: 'running', label: 'Downloaded asset from current page' };
   if (toolName === 'wait_for_page') return { toolName, kind: 'browser', status: 'running', label: 'Waited for page' };
   if (toolName === 'take_screenshot') return { toolName, kind: 'visual', status: 'running', label: 'Captured browser screenshot' };
+  if (toolName === 'preview_app') return { toolName, kind: 'visual', status: 'running', label: `Previewed app${args.command ? ` \`${args.command}\`` : ''} and captured a screenshot` };
   if (toolName === 'inspect_screenshot') return { toolName, kind: 'visual', status: 'running', label: `Inspected screenshot \`${args.path || 'screenshot'}\`` };
   if (toolName === 'compare_screenshot_to_goal') return { toolName, kind: 'visual', status: 'running', label: `Compared screenshot to goal` };
   if (toolName === 'inspect_screenshot_with_model') return { toolName, kind: 'visual', status: 'running', label: `Inspected screenshot with Gemini vision` };
@@ -2789,7 +2813,7 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
   } else if (result && result.summary && (
     toolName === 'download_file' || toolName === 'inspect_archive' || toolName === 'extract_archive' ||
     toolName === 'inspect_binary_asset' || toolName === 'list_asset_metadata' ||
-    toolName === 'take_screenshot' || toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal' || toolName === 'inspect_screenshot_with_model'
+    toolName === 'take_screenshot' || toolName === 'preview_app' || toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal' || toolName === 'inspect_screenshot_with_model'
   )) {
     item.detail = result.summary;
   } else if (result && result.title && (toolName === 'open_url' || toolName === 'search_web' || toolName === 'click_element' || toolName === 'fill_input' || toolName === 'navigate_back' || toolName === 'wait_for_page')) {
@@ -2871,6 +2895,8 @@ function isVerificationItem(item) {
   if (item.toolName === 'run_tests' || item.kind === 'test') return true;
   if (item.toolName === 'run_command') return isRealVerificationCommand(item.command);
   if (item.toolName === 'start_command') return isRealVerificationCommand(item.command);
+  // A bounded GUI preview that actually captured a screenshot is real evidence the app rendered.
+  if (item.toolName === 'preview_app') return item.status !== 'error';
   return false;
 }
 
@@ -2903,7 +2929,7 @@ function buildPostEditEvidencePrompt(items, options = {}) {
 
 Before giving a final answer:
 - Re-read the touched source files or the relevant changed sections to reconcile the actual code against the task and approved plan.
-- Run at least one real verification check after the edits. Use the project regression command when available. For Python/Pygame/interactive apps, prefer \`python -m py_compile <file>\` plus a bounded smoke check such as a \`--smoke-test\` flag or short timeout. Commands that only create folders, list files, or move assets do not count as verification.
+- Run at least one real verification check after the edits. Use the project regression command when available. For Python/Pygame/interactive GUI apps, prefer \`python -m py_compile <file>\` plus \`preview_app\` (it runs the window briefly, screenshots it, and auto-closes it so you never hang) — then inspect_screenshot_with_model to confirm it looks right. Commands that only create folders, list files, or move assets do not count as verification.
 - If a check cannot run, inspect the blocker and state the exact reason in the final summary.
 - If the evidence reveals a bug or mismatch, fix it and rerun the relevant check.
 

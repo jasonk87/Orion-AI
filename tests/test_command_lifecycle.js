@@ -88,6 +88,28 @@ test('Windows command shell selection does not require PowerShell for plain comm
   t.end();
 });
 
+test('previewWorkspaceApp guards: missing workspace, no entrypoint, and destructive command', async (t) => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+
+  // 1. Missing workspace is rejected before any spawn/capture.
+  const missing = await main.previewWorkspaceApp(path.join(os.tmpdir(), 'orion-does-not-exist-' + Date.now()), {});
+  t.equal(missing.success, false, 'missing workspace is rejected');
+
+  // 2. An empty workspace with no entrypoint and no python file cannot be previewed.
+  const emptyWs = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-preview-empty-'));
+  const undetermined = await main.previewWorkspaceApp(emptyWs, {});
+  t.equal(undetermined.success, false, 'no resolvable command is rejected');
+  t.ok(/determine what to preview/i.test(undetermined.error), 'explains that nothing could be resolved');
+
+  // 3. A destructive explicit command is blocked by the command safety classifier before launch.
+  const denied = await main.previewWorkspaceApp(emptyWs, { command: 'rm -rf ./build' });
+  t.equal(denied.success, false, 'destructive preview command is blocked');
+
+  t.end();
+});
+
 test('run-command sessions retain captured stdout in main process', (t) => {
   const command = process.platform === 'win32' ? 'echo orion-shell-smoke' : 'printf orion-shell-smoke';
   const session = main.startCommandSession({

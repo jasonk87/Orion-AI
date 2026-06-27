@@ -512,6 +512,123 @@ async function takeBrowserScreenshot(workspacePath, destination) {
   return { success: true, path: rel, width: size.width, height: size.height, size: png.length, summary: `Captured screenshot ${rel} (${size.width}x${size.height}).` };
 }
 
+// Captures the actual desktop screen (where a launched native/Python GUI window appears) and
+// saves it into the workspace. Unlike takeBrowserScreenshot, this sees real OS windows.
+async function captureDesktopScreenshot(workspacePath, destination, prefix = 'preview') {
+  const { desktopCapturer, screen } = require('electron');
+  const primary = screen.getPrimaryDisplay();
+  const scale = primary.scaleFactor || 1;
+  const thumbnailSize = {
+    width: Math.round(primary.size.width * scale),
+    height: Math.round(primary.size.height * scale)
+  };
+  const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize });
+  if (!sources.length) throw new Error('No screen sources available for capture.');
+  const primarySource = sources.find(s => String(s.display_id) === String(primary.id)) || sources[0];
+  const image = primarySource.thumbnail;
+  if (!image || image.isEmpty()) throw new Error('Captured screen image was empty.');
+  const fallback = path.join('.orion', 'screenshots', `${prefix}-${Date.now()}.png`);
+  const rel = safeRelativeAssetPath(destination, fallback);
+  const fullPath = resolveWorkspacePath(workspacePath, rel);
+  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+  const png = image.toPNG();
+  fs.writeFileSync(fullPath, png);
+  const size = image.getSize();
+  return { rel, png, size };
+}
+
+// Launches a workspace app (e.g. a Python/pygame game) for a bounded warm-up window, captures a
+// desktop screenshot so the agent can visually verify it, then force-closes it. This prevents the
+// agent from hanging on a GUI event loop that never exits, and lets it confirm the app actually
+// rendered instead of working blindly.
+async function previewWorkspaceApp(workspacePath, { command, warmupMs, destination } = {}) {
+  if (!workspacePath || !fs.existsSync(workspacePath)) {
+    return { success: false, error: 'No active workspace directory found.' };
+  }
+
+  let resolvedCommand = String(command || '').trim();
+  if (!resolvedCommand) {
+    const configuredEntry = getWorkspaceEntrypoint(readAppConfig(), workspacePath);
+    if (configuredEntry && configuredEntry.command) {
+      resolvedCommand = configuredEntry.command;
+    } else {
+      const files = fs.readdirSync(workspacePath);
+      const foundPy = ['main.py', 'app.py', 'index.py', 'game.py'].find(f => files.includes(f));
+      if (foundPy) resolvedCommand = `python ${foundPy}`;
+    }
+  }
+  if (!resolvedCommand) {
+    return { success: false, error: 'Could not determine what to preview. Set a workspace entrypoint or pass an explicit command.' };
+  }
+
+  const classification = classifyCommandRequest(resolvedCommand, { source: 'freeform' });
+  if (!classification.allowed) {
+    return { success: false, error: classification.reason };
+  }
+
+  const resolvedWarmup = Math.min(Math.max(parseInt(warmupMs, 10) || 4000, 1000), 20000);
+  const shellSpec = getCommandShellSpec(resolvedCommand);
+  const child = spawn(shellSpec.executable, [...shellSpec.args, resolvedCommand], {
+    cwd: workspacePath,
+    env: { ...process.env, PAGER: 'cat' },
+    windowsHide: true,
+    detached: process.platform !== 'win32'
+  });
+
+  let stderr = '';
+  let exited = false;
+  let exitCode = null;
+  if (child.stderr) child.stderr.on('data', d => { stderr += d.toString(); if (stderr.length > 8000) stderr = stderr.slice(-8000); });
+  if (child.stdout) child.stdout.on('data', () => {});
+  child.on('exit', (code) => { exited = true; exitCode = code; });
+  child.on('error', (err) => { exited = true; stderr += `\n[spawn error] ${err.message}`; });
+
+  // Let the window render.
+  await new Promise(resolve => setTimeout(resolve, resolvedWarmup));
+
+  // If it died before the warm-up finished with a non-zero code, it crashed on startup — report
+  // that instead of screenshotting an empty desktop.
+  if (exited && exitCode !== 0) {
+    return {
+      success: false,
+      crashed: true,
+      command: resolvedCommand,
+      exitCode,
+      stderr: stderr.slice(-2000),
+      error: `The app exited with code ${exitCode} before a window could be captured — it likely crashed on startup. Inspect the error output and fix it.`
+    };
+  }
+
+  let shot = null;
+  let captureError = null;
+  try {
+    shot = await captureDesktopScreenshot(workspacePath, destination, 'preview');
+  } catch (err) {
+    captureError = err.message;
+  }
+
+  // Auto-close: always force-kill so a GUI event loop can never leave the agent hanging.
+  await new Promise(resolve => killProcessTree(child, () => resolve()));
+
+  if (!shot) {
+    return { success: false, command: resolvedCommand, autoClosed: true, stderr: stderr.slice(-2000), error: `Launched and auto-closed the app, but screen capture failed: ${captureError || 'unknown error'}.` };
+  }
+
+  return {
+    success: true,
+    command: resolvedCommand,
+    path: shot.rel,
+    width: shot.size.width,
+    height: shot.size.height,
+    size: shot.png.length,
+    warmupMs: resolvedWarmup,
+    autoClosed: true,
+    exitedDuringWarmup: exited,
+    stderr: stderr.slice(-2000),
+    summary: `Previewed "${resolvedCommand}" for ${resolvedWarmup}ms, captured ${shot.rel} (${shot.size.width}x${shot.size.height}), then auto-closed it.`
+  };
+}
+
 function inspectScreenshotInWorkspace(workspacePath, relativePath) {
   const asset = inspectBinaryAssetInWorkspace(workspacePath, relativePath);
   return {
@@ -3315,6 +3432,14 @@ ipcMain.handle('take-screenshot', async (event, { workspacePath, destination }) 
   }
 });
 
+ipcMain.handle('preview-workspace-app', async (event, { workspacePath, command, warmupMs, destination }) => {
+  try {
+    return await previewWorkspaceApp(workspacePath, { command, warmupMs, destination });
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
 ipcMain.handle('inspect-screenshot', async (event, { workspacePath, relativePath }) => {
   try {
     return inspectScreenshotInWorkspace(workspacePath, relativePath);
@@ -4237,6 +4362,7 @@ if (process.env.NODE_ENV === 'test') {
     classifyCommandRequest,
     getCommandShellSpec,
     commandLooksPowerShellSpecific,
+    previewWorkspaceApp,
     spawnInternalCommand,
     buildCompanionPairingAnnouncement,
     enablePhoneCompanionLanMode,

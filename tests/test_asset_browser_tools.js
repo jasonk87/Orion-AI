@@ -56,6 +56,7 @@ test('agent exposes general asset, browser, and visual tools without hardcoded w
     'download_from_page',
     'wait_for_page',
     'take_screenshot',
+    'preview_app',
     'inspect_screenshot',
     'compare_screenshot_to_goal',
     'inspect_screenshot_with_model'
