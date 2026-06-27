@@ -6,14 +6,20 @@
   "compactThresholdTokens": 100000,
   "autoCompact": true,
   "modelContextBudgets": {
+    "gemini-3.5-flash": 1000000,
+    "gemini-3.1-pro-preview": 1000000,
+    "gemini-3.1-flash-lite": 1000000,
+    "gemini-3-flash-preview": 1000000,
     "gemini-2.5-flash-lite": 1000000,
     "gemini-2.5-flash": 1000000,
     "gemini-2.5-pro": 1000000,
     "default": 128000
   },
   "commandTimeoutMs": 120000,
+  "modelCallDelayMs": 0,
   "workspaceEntrypoints": {},
-  "phoneCompanionPort": 5000,
+  "phoneCompanionPort": 1122,
   "phoneCompanionToken": "",
+  "enablePhoneCompanion": false,
   "regressionTestCommand": "npm test"
 }

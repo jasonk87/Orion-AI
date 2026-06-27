@@ -5,20 +5,86 @@ const { exec, spawn } = require('child_process');
 const http = require('http');
 const os = require('os');
 const crypto = require('crypto');
+const vm = require('vm');
+const QRCode = require('qrcode');
+const {
+  classifyCommandRequest,
+  isDestructiveCommand,
+  isIndexableWorkspaceFile,
+  resolveWorkspacePath
+} = require('./safety');
 
 let mainWindow;
 let companionServer = null;
 let companionToken = '';
+const staticWorkspaceServers = new Map();
 
-function resolveWorkspacePath(workspacePath, relativePath = '') {
-  if (!workspacePath) throw new Error('Missing workspace path');
-  const workspaceRoot = path.resolve(workspacePath);
-  const fullPath = path.resolve(workspaceRoot, relativePath || '');
-  const relative = path.relative(workspaceRoot, fullPath);
-  if (relative.startsWith('..') || path.isAbsolute(relative)) {
-    throw new Error('Path escapes the active workspace');
-  }
-  return fullPath;
+function getStaticMimeType(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  const map = {
+    '.html': 'text/html; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.js': 'application/javascript; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.svg': 'image/svg+xml',
+    '.ico': 'image/x-icon'
+  };
+  return map[ext] || 'application/octet-stream';
+}
+
+function startStaticWorkspaceServer(workspacePath) {
+  const key = path.resolve(workspacePath);
+  const existing = staticWorkspaceServers.get(key);
+  if (existing && existing.server && existing.url) return Promise.resolve(existing.url);
+
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      try {
+        const requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
+        const decodedPath = decodeURIComponent(requestUrl.pathname === '/' ? '/index.html' : requestUrl.pathname);
+        const requestedPath = path.resolve(key, `.${decodedPath}`);
+        if (requestedPath !== key && !requestedPath.startsWith(`${key}${path.sep}`)) {
+          res.writeHead(403);
+          res.end('Forbidden');
+          return;
+        }
+        fs.readFile(requestedPath, (err, data) => {
+          if (err) {
+            res.writeHead(404);
+            res.end('Not found');
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': getStaticMimeType(requestedPath) });
+          res.end(data);
+        });
+      } catch (err) {
+        res.writeHead(500);
+        res.end('Server error');
+      }
+    });
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      const url = `http://127.0.0.1:${address.port}/index.html`;
+      staticWorkspaceServers.set(key, { server, url });
+      resolve(url);
+    });
+  });
+}
+
+function stopPhoneCompanionServer() {
+  return new Promise(resolve => {
+    if (!companionServer) {
+      resolve();
+      return;
+    }
+    const server = companionServer;
+    companionServer = null;
+    server.close(() => resolve());
+  });
 }
 
 function createFileBackup(fullPath, workspaceRoot) {
@@ -29,8 +95,608 @@ function createFileBackup(fullPath, workspaceRoot) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   const backupPath = path.join(backupRoot, `${safeRelative}.${timestamp}.bak`);
   fs.mkdirSync(path.dirname(backupPath), { recursive: true });
-  fs.copyFileSync(fullPath, backupPath);
+  const stat = fs.statSync(fullPath);
+  if (stat.isDirectory()) {
+    fs.cpSync(fullPath, backupPath, { recursive: true });
+  } else {
+    fs.copyFileSync(fullPath, backupPath);
+  }
   return path.relative(workspaceRoot, backupPath);
+}
+
+function getArtifactRoot() {
+  const base = app && app.getPath ? app.getPath('userData') : __dirname;
+  return path.join(base, 'artifacts');
+}
+
+function sanitizeArtifactSegment(value) {
+  return String(value || 'unknown').replace(/[^a-z0-9._-]+/gi, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'unknown';
+}
+
+function writeRunArtifact(payload = {}) {
+  const conversationId = sanitizeArtifactSegment(payload.conversationId);
+  const runId = sanitizeArtifactSegment(payload.runId || new Date().toISOString());
+  const artifactDir = path.join(getArtifactRoot(), conversationId);
+  fs.mkdirSync(artifactDir, { recursive: true });
+  const artifactPath = path.join(artifactDir, `${runId}.json`);
+  atomicWriteFileSync(artifactPath, JSON.stringify({
+    createdAt: new Date().toISOString(),
+    ...payload
+  }, null, 2), 'utf8');
+  return artifactPath;
+}
+
+function listRunArtifacts(conversationId) {
+  const root = getArtifactRoot();
+  const entries = [];
+  if (!fs.existsSync(root)) return entries;
+  const conversationDirs = conversationId
+    ? [sanitizeArtifactSegment(conversationId)]
+    : fs.readdirSync(root).filter(name => fs.statSync(path.join(root, name)).isDirectory());
+  conversationDirs.forEach(dirName => {
+    const dirPath = path.join(root, dirName);
+    if (!fs.existsSync(dirPath)) return;
+    fs.readdirSync(dirPath).filter(name => name.endsWith('.json')).forEach(fileName => {
+      const fullPath = path.join(dirPath, fileName);
+      const stat = fs.statSync(fullPath);
+      let payload = {};
+      try {
+        payload = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
+      } catch (e) {
+        payload = {};
+      }
+      const visual = payload.visualArtifact || {};
+      const workspacePath = payload.workspacePath || (payload.task && payload.task.workspace) || '';
+      const artifactType = payload.type === 'orion-visual-artifact' ? 'screenshot' : 'run';
+      entries.push({
+        conversationId: dirName,
+        fileName,
+        displayName: artifactType === 'screenshot'
+          ? path.basename(visual.path || fileName)
+          : fileName,
+        artifactType,
+        artifactPath: fullPath,
+        workspacePath,
+        screenshotPath: visual.path || '',
+        width: visual.width || 0,
+        height: visual.height || 0,
+        toolName: payload.toolName || '',
+        summary: visual.summary || '',
+        createdAt: stat.mtime.toISOString(),
+        size: stat.size
+      });
+    });
+  });
+  return entries.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, 50);
+}
+
+function deleteWorkspacePath(workspacePath, relativePath) {
+  const workspaceRoot = path.resolve(workspacePath);
+  const fullPath = resolveWorkspacePath(workspacePath, relativePath);
+  if (!fs.existsSync(fullPath)) throw new Error('Path does not exist');
+  const backupPath = createFileBackup(fullPath, workspaceRoot);
+  fs.rmSync(fullPath, { recursive: true, force: false });
+  return { success: true, backupPath };
+}
+
+function moveWorkspacePath(workspacePath, fromPath, toPath) {
+  const fromFullPath = resolveWorkspacePath(workspacePath, fromPath);
+  const toFullPath = resolveWorkspacePath(workspacePath, toPath);
+  if (!fs.existsSync(fromFullPath)) throw new Error('Source path does not exist');
+  if (fs.existsSync(toFullPath)) throw new Error('Destination already exists');
+  fs.mkdirSync(path.dirname(toFullPath), { recursive: true });
+  fs.renameSync(fromFullPath, toFullPath);
+  return { success: true };
+}
+
+function copyWorkspacePath(workspacePath, fromPath, toPath) {
+  const fromFullPath = resolveWorkspacePath(workspacePath, fromPath);
+  const toFullPath = resolveWorkspacePath(workspacePath, toPath);
+  if (!fs.existsSync(fromFullPath)) throw new Error('Source path does not exist');
+  if (fs.existsSync(toFullPath)) throw new Error('Destination already exists');
+  fs.mkdirSync(path.dirname(toFullPath), { recursive: true });
+  const stat = fs.statSync(fromFullPath);
+  if (stat.isDirectory()) {
+    fs.cpSync(fromFullPath, toFullPath, { recursive: true });
+  } else {
+    fs.copyFileSync(fromFullPath, toFullPath);
+  }
+  return { success: true };
+}
+
+function safeRelativeAssetPath(value, fallback) {
+  const raw = String(value || fallback || '').trim().replace(/^[/\\]+/, '');
+  const safe = raw.replace(/[:<>|"?*]/g, '_');
+  return safe || fallback;
+}
+
+function inferFilenameFromUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const base = path.basename(decodeURIComponent(parsed.pathname || ''));
+    return base && base !== '/' ? base : `download-${Date.now()}`;
+  } catch (e) {
+    return `download-${Date.now()}`;
+  }
+}
+
+function listWorkspaceTree(workspacePath, relativePath, limit = 200) {
+  const root = resolveWorkspacePath(workspacePath, relativePath || '.');
+  if (!fs.existsSync(root)) throw new Error('Path does not exist');
+  const workspaceRoot = path.resolve(workspacePath);
+  const entries = [];
+  const visit = (fullPath) => {
+    if (entries.length >= limit) return;
+    const stat = fs.statSync(fullPath);
+    const rel = path.relative(workspaceRoot, fullPath);
+    entries.push({
+      path: rel,
+      isDir: stat.isDirectory(),
+      size: stat.isDirectory() ? 0 : stat.size,
+      modifiedAt: stat.mtime.toISOString()
+    });
+    if (stat.isDirectory()) {
+      fs.readdirSync(fullPath).slice(0, 200).forEach(name => {
+        if (entries.length < limit) visit(path.join(fullPath, name));
+      });
+    }
+  };
+  visit(root);
+  return entries;
+}
+
+async function downloadFileToWorkspace(workspacePath, url, destination) {
+  if (!url || !/^https?:\/\//i.test(String(url))) throw new Error('download_file requires an http(s) URL');
+  const filename = inferFilenameFromUrl(url);
+  const relativePath = safeRelativeAssetPath(destination, path.join('assets', 'downloads', filename));
+  const fullPath = resolveWorkspacePath(workspacePath, relativePath);
+  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Download failed with HTTP ${response.status}`);
+  const buffer = Buffer.from(await response.arrayBuffer());
+  fs.writeFileSync(fullPath, buffer);
+  return {
+    success: true,
+    url,
+    path: path.relative(path.resolve(workspacePath), fullPath),
+    size: buffer.length,
+    contentType: response.headers.get('content-type') || '',
+    summary: `Downloaded ${filename} (${buffer.length} bytes)`
+  };
+}
+
+function runUtilityCommand(executable, args, cwd, timeoutMs = 30000) {
+  return new Promise(resolve => {
+    const child = spawn(executable, args, { cwd, windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    const timeout = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch (e) {}
+    }, timeoutMs);
+    child.stdout.on('data', data => { stdout += data.toString(); });
+    child.stderr.on('data', data => { stderr += data.toString(); });
+    child.on('error', error => {
+      clearTimeout(timeout);
+      resolve({ success: false, code: null, stdout, stderr, error: error.message });
+    });
+    child.on('close', code => {
+      clearTimeout(timeout);
+      resolve({ success: code === 0, code, stdout, stderr, error: code === 0 ? '' : stderr || stdout });
+    });
+  });
+}
+
+async function inspectArchiveInWorkspace(workspacePath, relativePath) {
+  const fullPath = resolveWorkspacePath(workspacePath, relativePath);
+  if (!fs.existsSync(fullPath)) throw new Error('Archive does not exist');
+  const stat = fs.statSync(fullPath);
+  const ext = path.extname(fullPath).toLowerCase();
+  const tarResult = await runUtilityCommand('tar', ['-tf', fullPath], workspacePath, 30000);
+  const entries = tarResult.success
+    ? tarResult.stdout.split(/\r?\n/).map(line => line.trim()).filter(Boolean).slice(0, 500)
+    : [];
+  return {
+    success: tarResult.success,
+    path: relativePath,
+    extension: ext,
+    size: stat.size,
+    entries,
+    entryCount: entries.length,
+    error: tarResult.success ? '' : tarResult.error,
+    summary: tarResult.success ? `Archive contains ${entries.length} visible entries.` : `Archive inspection failed: ${tarResult.error}`
+  };
+}
+
+async function extractArchiveInWorkspace(workspacePath, relativePath, destination) {
+  const sourceFullPath = resolveWorkspacePath(workspacePath, relativePath);
+  if (!fs.existsSync(sourceFullPath)) throw new Error('Archive does not exist');
+  const fallbackDest = path.join('assets', 'extracted', path.basename(relativePath, path.extname(relativePath)));
+  const destRel = safeRelativeAssetPath(destination, fallbackDest);
+  const destFullPath = resolveWorkspacePath(workspacePath, destRel);
+  fs.mkdirSync(destFullPath, { recursive: true });
+  const result = await runUtilityCommand('tar', ['-xf', sourceFullPath, '-C', destFullPath], workspacePath, 60000);
+  if (!result.success) throw new Error(result.error || 'Archive extraction failed');
+  const files = listWorkspaceTree(workspacePath, destRel, 250);
+  return {
+    success: true,
+    path: relativePath,
+    destination: destRel,
+    files,
+    summary: `Extracted archive to ${destRel} (${files.length} listed entries).`
+  };
+}
+
+function detectBinaryAssetKind(buffer, ext) {
+  const first = buffer.slice(0, 16).toString('hex');
+  if (buffer.slice(0, 4).toString('utf8') === 'glTF') return 'glb';
+  if (first.startsWith('89504e47')) return 'png';
+  if (first.startsWith('ffd8ff')) return 'jpeg';
+  if (first.startsWith('504b0304')) return 'zip';
+  if (ext === '.gltf') return 'gltf';
+  if (ext === '.glb') return 'glb';
+  if (ext === '.obj') return 'obj';
+  if (ext === '.fbx') return 'fbx';
+  return ext.replace(/^\./, '') || 'binary';
+}
+
+function inspectBinaryAssetInWorkspace(workspacePath, relativePath) {
+  const fullPath = resolveWorkspacePath(workspacePath, relativePath);
+  if (!fs.existsSync(fullPath)) throw new Error('Asset does not exist');
+  const stat = fs.statSync(fullPath);
+  const ext = path.extname(fullPath).toLowerCase();
+  const buffer = fs.readFileSync(fullPath);
+  const kind = detectBinaryAssetKind(buffer, ext);
+  const details = {};
+  if (kind === 'glb' && buffer.length >= 12) {
+    details.magic = buffer.slice(0, 4).toString('utf8');
+    details.version = buffer.readUInt32LE(4);
+    details.declaredLength = buffer.readUInt32LE(8);
+  }
+  if (kind === 'gltf') {
+    try {
+      const parsed = JSON.parse(buffer.toString('utf8'));
+      details.asset = parsed.asset || {};
+      details.meshes = Array.isArray(parsed.meshes) ? parsed.meshes.length : 0;
+      details.materials = Array.isArray(parsed.materials) ? parsed.materials.length : 0;
+      details.images = Array.isArray(parsed.images) ? parsed.images.length : 0;
+    } catch (e) {
+      details.parseError = e.message;
+    }
+  }
+  return {
+    success: true,
+    path: relativePath,
+    extension: ext,
+    kind,
+    size: stat.size,
+    modifiedAt: stat.mtime.toISOString(),
+    details,
+    summary: `Inspected ${kind} asset ${relativePath} (${stat.size} bytes).`
+  };
+}
+
+function listAssetMetadataInWorkspace(workspacePath, relativePath) {
+  const entries = listWorkspaceTree(workspacePath, relativePath || 'assets', 300);
+  const assetExts = new Set(['.glb', '.gltf', '.obj', '.fbx', '.png', '.jpg', '.jpeg', '.webp', '.svg', '.mtl', '.bin', '.zip']);
+  const assets = entries
+    .filter(entry => !entry.isDir && assetExts.has(path.extname(entry.path).toLowerCase()))
+    .map(entry => ({ ...entry, extension: path.extname(entry.path).toLowerCase() }));
+  return {
+    success: true,
+    path: relativePath || 'assets',
+    assets,
+    count: assets.length,
+    summary: `Found ${assets.length} asset-like files under ${relativePath || 'assets'}.`
+  };
+}
+
+function readWorkspaceFileBase64(workspacePath, relativePath) {
+  const fullPath = resolveWorkspacePath(workspacePath, relativePath);
+  if (!fs.existsSync(fullPath)) throw new Error('File does not exist');
+  const stat = fs.statSync(fullPath);
+  if (!stat.isFile()) throw new Error('Path is not a file');
+  const ext = path.extname(fullPath).toLowerCase();
+  const mimeTypes = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp',
+    '.gif': 'image/gif'
+  };
+  return {
+    success: true,
+    path: relativePath,
+    mimeType: mimeTypes[ext] || 'application/octet-stream',
+    size: stat.size,
+    data: fs.readFileSync(fullPath).toString('base64')
+  };
+}
+
+let browserWorker = null;
+
+function ensureBrowserWorker() {
+  if (browserWorker && !browserWorker.isDestroyed()) return browserWorker;
+  browserWorker = new BrowserWindow({
+    show: false,
+    width: 1280,
+    height: 800,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true
+    }
+  });
+  return browserWorker;
+}
+
+async function getBrowserSnapshot(win) {
+  const data = await win.webContents.executeJavaScript(`(() => {
+    const links = Array.from(document.querySelectorAll('a')).slice(0, 80).map((a, index) => ({
+      index,
+      text: (a.innerText || a.textContent || '').trim().slice(0, 160),
+      href: a.href || ''
+    }));
+    return {
+      url: location.href,
+      title: document.title || '',
+      text: (document.body && document.body.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 4000),
+      links
+    };
+  })()`);
+  return { success: true, ...data };
+}
+
+async function browserOpenUrl(url) {
+  if (!/^https?:\/\//i.test(String(url || '')) && !/^file:\/\//i.test(String(url || ''))) throw new Error('open_url requires http(s) or file URL');
+  const win = ensureBrowserWorker();
+  await win.loadURL(url);
+  return await getBrowserSnapshot(win);
+}
+
+async function browserSearchWeb(query) {
+  if (!String(query || '').trim()) throw new Error('search_web requires query');
+  return await browserOpenUrl(`https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`);
+}
+
+async function browserClickElement(selector, text) {
+  const win = ensureBrowserWorker();
+  const result = await win.webContents.executeJavaScript(`(() => {
+    const selector = ${JSON.stringify(selector || '')};
+    const text = ${JSON.stringify(text || '')}.toLowerCase();
+    let el = selector ? document.querySelector(selector) : null;
+    if (!el && text) {
+      el = Array.from(document.querySelectorAll('a,button,[role="button"],input[type="submit"]')).find(node => (node.innerText || node.textContent || node.value || '').toLowerCase().includes(text));
+    }
+    if (!el) return { clicked: false, error: 'Element not found' };
+    el.click();
+    return { clicked: true };
+  })()`);
+  if (!result.clicked) return { success: false, error: result.error };
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  return await getBrowserSnapshot(win);
+}
+
+async function browserFillInput(selector, value) {
+  const win = ensureBrowserWorker();
+  const result = await win.webContents.executeJavaScript(`(() => {
+    const el = document.querySelector(${JSON.stringify(selector || '')});
+    if (!el) return { filled: false, error: 'Input not found' };
+    el.focus();
+    el.value = ${JSON.stringify(String(value || ''))};
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return { filled: true };
+  })()`);
+  return result.filled ? await getBrowserSnapshot(win) : { success: false, error: result.error };
+}
+
+async function browserNavigateBack() {
+  const win = ensureBrowserWorker();
+  if (win.webContents.canGoBack()) {
+    win.webContents.goBack();
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  return await getBrowserSnapshot(win);
+}
+
+async function browserDownloadFromPage(workspacePath, selector, url, destination) {
+  let targetUrl = url;
+  if (!targetUrl) {
+    const win = ensureBrowserWorker();
+    targetUrl = await win.webContents.executeJavaScript(`(() => {
+      const selector = ${JSON.stringify(selector || '')};
+      const el = selector ? document.querySelector(selector) : document.querySelector('a[href]');
+      return el && (el.href || el.src) || '';
+    })()`);
+  }
+  return await downloadFileToWorkspace(workspacePath, targetUrl, destination);
+}
+
+async function browserWaitForPage(timeoutMs) {
+  const win = ensureBrowserWorker();
+  await new Promise(resolve => setTimeout(resolve, Math.min(Math.max(Number(timeoutMs) || 1000, 100), 30000)));
+  return await getBrowserSnapshot(win);
+}
+
+async function takeBrowserScreenshot(workspacePath, destination) {
+  const win = ensureBrowserWorker();
+  const image = await win.webContents.capturePage();
+  const fallback = path.join('.orion', 'screenshots', `screenshot-${Date.now()}.png`);
+  const rel = safeRelativeAssetPath(destination, fallback);
+  const fullPath = resolveWorkspacePath(workspacePath, rel);
+  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+  const png = image.toPNG();
+  fs.writeFileSync(fullPath, png);
+  const size = image.getSize();
+  return { success: true, path: rel, width: size.width, height: size.height, size: png.length, summary: `Captured screenshot ${rel} (${size.width}x${size.height}).` };
+}
+
+// Captures the actual desktop screen (where a launched native/Python GUI window appears) and
+// saves it into the workspace. Unlike takeBrowserScreenshot, this sees real OS windows.
+async function captureDesktopScreenshot(workspacePath, destination, prefix = 'preview') {
+  const { desktopCapturer, screen } = require('electron');
+  const primary = screen.getPrimaryDisplay();
+  const scale = primary.scaleFactor || 1;
+  const thumbnailSize = {
+    width: Math.round(primary.size.width * scale),
+    height: Math.round(primary.size.height * scale)
+  };
+  const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize });
+  if (!sources.length) throw new Error('No screen sources available for capture.');
+  const primarySource = sources.find(s => String(s.display_id) === String(primary.id)) || sources[0];
+  const image = primarySource.thumbnail;
+  if (!image || image.isEmpty()) throw new Error('Captured screen image was empty.');
+  const fallback = path.join('.orion', 'screenshots', `${prefix}-${Date.now()}.png`);
+  const rel = safeRelativeAssetPath(destination, fallback);
+  const fullPath = resolveWorkspacePath(workspacePath, rel);
+  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+  const png = image.toPNG();
+  fs.writeFileSync(fullPath, png);
+  const size = image.getSize();
+  return { rel, png, size };
+}
+
+// Launches a workspace app (e.g. a Python/pygame game) as a persistent, tracked session, lets it
+// warm up, captures a desktop screenshot so the agent can SEE it, and then LEAVES IT RUNNING. The
+// agent decides what happens next — wait longer and capture_screen again, read_command_output to
+// watch progress (e.g. ML training improving over time), or kill_command when done. It never
+// force-closes the app, so a slow-starting or long-running program is not cut off prematurely.
+// A generous session timeout is the only backstop so nothing leaks forever.
+async function previewWorkspaceApp(workspacePath, { command, warmupMs, destination, processId, timeoutMs } = {}) {
+  if (!workspacePath || !fs.existsSync(workspacePath)) {
+    return { success: false, error: 'No active workspace directory found.' };
+  }
+
+  let resolvedCommand = String(command || '').trim();
+  if (!resolvedCommand) {
+    const configuredEntry = getWorkspaceEntrypoint(readAppConfig(), workspacePath);
+    if (configuredEntry && configuredEntry.command) {
+      resolvedCommand = configuredEntry.command;
+    } else {
+      const files = fs.readdirSync(workspacePath);
+      const foundPy = ['main.py', 'app.py', 'index.py', 'game.py'].find(f => files.includes(f));
+      if (foundPy) resolvedCommand = `python ${foundPy}`;
+    }
+  }
+  if (!resolvedCommand) {
+    return { success: false, error: 'Could not determine what to preview. Set a workspace entrypoint or pass an explicit command.' };
+  }
+
+  // Start as a persistent tracked session. startCommandSession validates the command and throws
+  // if it is denied. The default backstop is generous (10 min) so long warm-ups / training runs
+  // are not killed; the agent should kill_command explicitly when finished.
+  let session;
+  try {
+    session = startCommandSession({
+      command: resolvedCommand,
+      cwd: workspacePath,
+      processId: processId || `preview_${Date.now()}`,
+      timeoutMs: timeoutMs || 10 * 60 * 1000
+    });
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+
+  const resolvedWarmup = Math.min(Math.max(parseInt(warmupMs, 10) || 4000, 1000), 60000);
+  await new Promise(resolve => setTimeout(resolve, resolvedWarmup));
+
+  const stillRunning = !!activeProcesses[session.id];
+
+  // If it already exited non-zero during warm-up, it likely crashed on startup. Report that with
+  // its output instead of screenshotting an empty desktop. (Nothing to manage — already exited.)
+  if (!stillRunning && session.exitCode !== 0 && session.status !== 'completed') {
+    return {
+      success: false,
+      crashed: true,
+      processId: session.id,
+      command: resolvedCommand,
+      exitCode: session.exitCode,
+      stderr: (session.stderr || '').slice(-2000),
+      error: `The app exited (code ${session.exitCode}) before a window could be captured — it likely crashed on startup. Inspect the error output and fix it.`
+    };
+  }
+
+  let shot = null;
+  let captureError = null;
+  try {
+    shot = await captureDesktopScreenshot(workspacePath, destination, 'preview');
+  } catch (err) {
+    captureError = err.message;
+  }
+
+  // IMPORTANT: do not kill. The app is left running and managed by its session id so the agent can
+  // wait, re-screenshot, watch output, or kill it on its own terms.
+  const manageHint = `Process id "${session.id}" is left running — wait and capture_screen again to see later state, read_command_output to watch progress, or kill_command when done.`;
+  return {
+    success: true,
+    processId: session.id,
+    command: resolvedCommand,
+    running: stillRunning,
+    exitedDuringWarmup: !stillRunning,
+    exitCode: stillRunning ? null : session.exitCode,
+    path: shot ? shot.rel : '',
+    width: shot ? shot.size.width : 0,
+    height: shot ? shot.size.height : 0,
+    size: shot ? shot.png.length : 0,
+    warmupMs: resolvedWarmup,
+    backstopTimeoutMs: session.timeoutMs,
+    stderr: (session.stderr || '').slice(-2000),
+    captureError: captureError || undefined,
+    summary: shot
+      ? `Previewed "${resolvedCommand}" (${stillRunning ? 'still running' : 'exited during warm-up'}); captured ${shot.rel} (${shot.size.width}x${shot.size.height}). ${manageHint}`
+      : `Launched "${resolvedCommand}" but screen capture failed: ${captureError || 'unknown error'}. ${manageHint}`
+  };
+}
+
+// On-demand desktop screenshot of whatever is currently on screen (e.g. an app previously launched
+// with preview_app, now further along). Optionally waits first so the agent can let an app reach a
+// more interesting state before capturing — the agent controls the timing, nothing is auto-closed.
+async function captureScreenForAgent(workspacePath, { destination, delayMs } = {}) {
+  if (!workspacePath || !fs.existsSync(workspacePath)) {
+    return { success: false, error: 'No active workspace directory found.' };
+  }
+  const wait = Math.min(Math.max(parseInt(delayMs, 10) || 0, 0), 120000);
+  if (wait > 0) await new Promise(resolve => setTimeout(resolve, wait));
+  try {
+    const shot = await captureDesktopScreenshot(workspacePath, destination, 'capture');
+    return {
+      success: true,
+      path: shot.rel,
+      width: shot.size.width,
+      height: shot.size.height,
+      size: shot.png.length,
+      waitedMs: wait,
+      summary: `Captured the current screen to ${shot.rel} (${shot.size.width}x${shot.size.height})${wait ? ` after waiting ${wait}ms` : ''}.`
+    };
+  } catch (err) {
+    return { success: false, error: `Screen capture failed: ${err.message}` };
+  }
+}
+
+function inspectScreenshotInWorkspace(workspacePath, relativePath) {
+  const asset = inspectBinaryAssetInWorkspace(workspacePath, relativePath);
+  return {
+    ...asset,
+    screenshot: true,
+    summary: `Screenshot ${relativePath}: ${asset.kind}, ${asset.size} bytes.`
+  };
+}
+
+function compareScreenshotToGoalInWorkspace(workspacePath, relativePath, goal, observations) {
+  const screenshot = inspectScreenshotInWorkspace(workspacePath, relativePath);
+  const obs = String(observations || '').trim();
+  const goalText = String(goal || '').trim();
+  const satisfied = obs && /appears|visible|present|matches|satisfied|fits|shown|contains/i.test(obs) && !/not visible|missing|absent|does not|failed/i.test(obs);
+  return {
+    success: true,
+    path: relativePath,
+    goal: goalText,
+    status: satisfied ? 'appears_satisfied' : 'needs_more_visual_evidence',
+    confidence: satisfied ? 0.65 : 0.2,
+    evidence: obs || `Local screenshot metadata is available (${screenshot.kind}, ${screenshot.size} bytes), but no visual observation text was provided.`,
+    limitation: obs ? '' : 'This local tool does not perform semantic computer vision by itself; use the screenshot evidence with model/user visual inspection before marking visual win conditions complete.',
+    summary: satisfied ? `Screenshot appears to satisfy goal based on supplied observations: ${goalText}` : `Screenshot comparison needs more visual evidence for: ${goalText}`
+  };
 }
 
 function createWindow() {
@@ -40,7 +706,7 @@ function createWindow() {
     fullscreen: true, // Launch in fullscreen mode
     frame: false, // Borderless window to enable custom title bar matching screenshot
     backgroundColor: '#0c0c0e',
-    icon: path.join(__dirname, 'assets', 'icon.png'),
+    icon: path.join(__dirname, 'assets', process.platform === 'win32' ? 'icon.ico' : 'icon.png'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -54,7 +720,323 @@ function createWindow() {
   // mainWindow.webContents.openDevTools();
 }
 
-app.whenReady().then(() => {
+// ── PACKAGED-APP AUTO-UPDATE ───────────────────────────────────────────────────────────────
+// The packaged .exe loads its code from resources/app. When the developer updates the source
+// tree, the running app would otherwise stay frozen at build time. On startup the packaged app
+// checks the source tree for newer runtime files, copies any that differ, and relaunches so the
+// new code takes effect — no manual copying or repackaging for JS/CSS/HTML changes.
+const AUTO_UPDATE_FILES = ['main.js', 'preload.js', 'agent.js', 'renderer.js', 'styles.css', 'index.html', 'operational-context.js', 'safety.js', 'package.json'];
+
+function isLikelySourceDir(dir) {
+  try {
+    return !!dir
+      && fs.existsSync(path.join(dir, 'agent.js'))
+      && fs.existsSync(path.join(dir, 'renderer.js'))
+      && fs.existsSync(path.join(dir, 'package.json'));
+  } catch (_) {
+    return false;
+  }
+}
+
+// Where to pull updates from: an explicit config override wins; otherwise infer the project root
+// from the standard packaged layout (<root>/dist/<name>/resources/app -> four levels up).
+function resolveUpdateSourceDir() {
+  try {
+    const cfg = readAppConfig();
+    const configured = (cfg.updateSourceDir || '').trim();
+    if (configured && isLikelySourceDir(configured)) return configured;
+    const inferred = path.resolve(__dirname, '..', '..', '..', '..');
+    if (isLikelySourceDir(inferred)) return inferred;
+  } catch (_) {}
+  return '';
+}
+
+// Pure, testable core: returns the list of files whose source bytes differ from the running copy.
+function computeSourceUpdates(srcDir, destDir, files = AUTO_UPDATE_FILES) {
+  const changed = [];
+  if (!srcDir || !destDir || path.resolve(srcDir) === path.resolve(destDir)) return changed;
+  for (const f of files) {
+    try {
+      const srcPath = path.join(srcDir, f);
+      if (!fs.existsSync(srcPath)) continue;
+      const srcBuf = fs.readFileSync(srcPath);
+      let destBuf = null;
+      try { destBuf = fs.readFileSync(path.join(destDir, f)); } catch (_) {}
+      if (!destBuf || !srcBuf.equals(destBuf)) changed.push(f);
+    } catch (_) {}
+  }
+  return changed;
+}
+
+function readPackageMetadata(baseDir = __dirname) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(baseDir, 'package.json'), 'utf8'));
+  } catch (_) {
+    return {};
+  }
+}
+
+function getLatestRuntimeMtime(baseDir = __dirname, files = AUTO_UPDATE_FILES) {
+  let latest = 0;
+  for (const f of files) {
+    try {
+      const stat = fs.statSync(path.join(baseDir, f));
+      latest = Math.max(latest, stat.mtimeMs || 0);
+    } catch (_) {}
+  }
+  return latest ? new Date(latest) : null;
+}
+
+function formatRuntimeDate(date) {
+  if (!date || Number.isNaN(date.getTime())) return '';
+  return date.toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric'
+  });
+}
+
+function getAppRuntimeInfo() {
+  const pkg = readPackageMetadata();
+  const runtimeDate = getLatestRuntimeMtime();
+  const version = (app && app.getVersion ? app.getVersion() : '') || pkg.version || '0.0.0';
+  return {
+    name: pkg.productName || pkg.name || 'Orion AI',
+    version,
+    runtimeDate: runtimeDate ? runtimeDate.toISOString() : '',
+    runtimeDateLabel: formatRuntimeDate(runtimeDate),
+    isPackaged: !!(app && app.isPackaged)
+  };
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function buildUpdateSplashHtml({ changed = [] } = {}) {
+  const info = getAppRuntimeInfo();
+  const changedText = changed.length
+    ? changed.slice(0, 4).join(', ') + (changed.length > 4 ? ` +${changed.length - 4} more` : '')
+    : 'runtime files';
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Updating Orion AI</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07090f;
+      --panel: rgba(17, 23, 36, 0.92);
+      --border: rgba(151,164,196,.18);
+      --text: #f1f1f4;
+      --muted: #8f98b8;
+      --accent: #8273f4;
+      --success: #46d59b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 50% -18%, rgba(130,115,244,.22), transparent 38%),
+        linear-gradient(180deg, #0b0f18 0%, var(--bg) 100%);
+      color: var(--text);
+      font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      user-select: none;
+    }
+    .shell {
+      width: min(560px, calc(100vw - 44px));
+      padding: 28px;
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: var(--panel);
+      box-shadow: 0 30px 90px rgba(0,0,0,.48), inset 0 1px rgba(255,255,255,.03);
+    }
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 22px; }
+    .orb {
+      width: 34px;
+      height: 34px;
+      border: 1px solid rgba(130,115,244,.55);
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(190,181,255,.72), rgba(130,115,244,.36) 42%, rgba(28,24,72,.7) 58%, transparent 60%);
+      box-shadow: 0 0 34px rgba(130,115,244,.22), inset 0 0 16px rgba(190,181,255,.16);
+      animation: breathe 1.6s ease-in-out infinite;
+    }
+    .title { font-size: 13px; font-weight: 700; letter-spacing: .02em; }
+    .meta { margin-top: 2px; color: var(--muted); font-size: 11px; }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 24px;
+      line-height: 1.18;
+      letter-spacing: -0.02em;
+    }
+    p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 22px;
+      padding: 12px 13px;
+      border: 1px solid rgba(151,164,196,.14);
+      border-radius: 10px;
+      background: rgba(255,255,255,.025);
+      color: #c7ccec;
+      font-size: 12px;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 12px rgba(130,115,244,.5);
+      animation: pulse 1s ease-in-out infinite;
+    }
+    .bar {
+      position: relative;
+      height: 3px;
+      margin-top: 18px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: rgba(151,164,196,.12);
+    }
+    .bar::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 38%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, transparent, var(--accent), var(--success));
+      animation: sweep 1.2s ease-in-out infinite;
+    }
+    body[data-phase="relaunch"] .dot {
+      background: var(--success);
+      box-shadow: 0 0 12px rgba(70,213,155,.45);
+    }
+    @keyframes breathe { 50% { transform: scale(1.05); filter: brightness(1.18); } }
+    @keyframes pulse { 50% { transform: scale(.72); opacity: .68; } }
+    @keyframes sweep { 0% { transform: translateX(-110%); } 100% { transform: translateX(280%); } }
+    @media (prefers-reduced-motion: reduce) {
+      .orb, .dot, .bar::before { animation: none; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <div class="brand">
+      <div class="orb" aria-hidden="true"></div>
+      <div>
+        <div class="title">Orion AI</div>
+        <div class="meta">v${escapeHtml(info.version)}${info.runtimeDateLabel ? ` · ${escapeHtml(info.runtimeDateLabel)}` : ''}</div>
+      </div>
+    </div>
+    <h1>Updating local build</h1>
+    <p>Orion found newer source files and is syncing the packaged app before opening the workspace.</p>
+    <div class="status" aria-live="polite">
+      <span class="dot"></span>
+      <span id="status-text">Applying ${escapeHtml(changedText)} from the local source tree...</span>
+    </div>
+    <div class="bar" aria-hidden="true"></div>
+  </main>
+  <script>
+    var relaunchText = "Update applied. Relaunching Orion with the latest local code...";
+    window.setUpdatePhase = function (phase, text) {
+      document.body.dataset.phase = phase || "";
+      var status = document.getElementById("status-text");
+      if (!text && phase === "relaunch") text = relaunchText;
+      if (status && text) status.textContent = text;
+    };
+  </script>
+</body>
+</html>`;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function showUpdateSplashWindow(updateInfo) {
+  const updateWindow = new BrowserWindow({
+    width: 560,
+    height: 360,
+    frame: false,
+    resizable: false,
+    movable: true,
+    alwaysOnTop: true,
+    backgroundColor: '#07090f',
+    title: 'Updating Orion AI',
+    icon: path.join(__dirname, 'assets', process.platform === 'win32' ? 'icon.ico' : 'icon.png'),
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+  updateWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(buildUpdateSplashHtml(updateInfo))}`);
+  return updateWindow;
+}
+
+function syncSourceUpdateFiles(srcDir, destDir, changed) {
+  for (const f of changed) {
+    const srcPath = path.join(srcDir, f);
+    const destPath = path.join(destDir, f);
+    fs.writeFileSync(destPath, fs.readFileSync(srcPath));
+    try {
+      const stat = fs.statSync(srcPath);
+      fs.utimesSync(destPath, stat.atime, stat.mtime);
+    } catch (_) {}
+  }
+}
+
+async function checkForSourceUpdatesAndRelaunch() {
+  let updateWindow = null;
+  try {
+    if (!app.isPackaged) return false; // running from source (npm start) — already current
+    const srcDir = resolveUpdateSourceDir();
+    if (!srcDir) return false;
+    const changed = computeSourceUpdates(srcDir, __dirname);
+    if (!changed.length) return false;
+    updateWindow = showUpdateSplashWindow({ changed });
+    await Promise.race([
+      new Promise(resolve => updateWindow.webContents.once('did-finish-load', resolve)),
+      sleep(800)
+    ]);
+
+    syncSourceUpdateFiles(srcDir, __dirname, changed);
+    try {
+      await updateWindow.webContents.executeJavaScript(
+        `window.setUpdatePhase("relaunch", "Update applied. Relaunching Orion with the latest local code...")`
+      );
+    } catch (_) {}
+    await sleep(900);
+    console.log('Auto-update: synced newer files and relaunching ->', changed.join(', '));
+    app.relaunch();
+    app.exit(0);
+    return true;
+  } catch (e) {
+    // Any failure must not block launch — fall through and run with whatever is on disk.
+    if (updateWindow && !updateWindow.isDestroyed()) {
+      try { updateWindow.close(); } catch (_) {}
+    }
+    console.error('Auto-update check failed:', e);
+    return false;
+  }
+}
+
+app.whenReady().then(async () => {
+  // If a newer source tree is found, this copies it in and relaunches; bail so we don't briefly
+  // run stale code. Content comparison makes the next launch a no-op, so there is no relaunch loop.
+  if (await checkForSourceUpdatesAndRelaunch()) return;
+
   createWindow();
   startPhoneCompanionServer();
 
@@ -71,9 +1053,34 @@ app.on('window-all-closed', function () {
   if (process.platform !== 'darwin') app.quit();
 });
 
-function readAppConfig() {
-  const configPath = path.join(__dirname, 'config.json');
+
+function atomicWriteFileSync(filePath, content, encoding = 'utf8') {
+  const tempPath = filePath + '.tmp';
   try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(tempPath, content, encoding);
+    fs.renameSync(tempPath, filePath);
+  } catch (e) {
+    if (fs.existsSync(tempPath)) {
+      try { fs.unlinkSync(tempPath); } catch(err) {}
+    }
+    throw e;
+  }
+}
+
+function getConfigPath() {
+  const base = app && app.getPath ? app.getPath('userData') : __dirname;
+  return path.join(base, 'config.json');
+}
+
+function readAppConfig() {
+  const configPath = getConfigPath();
+  const legacyConfigPath = path.join(__dirname, 'config.json');
+  try {
+    if (!fs.existsSync(configPath) && configPath !== legacyConfigPath && fs.existsSync(legacyConfigPath)) {
+      fs.mkdirSync(path.dirname(configPath), { recursive: true });
+      fs.copyFileSync(legacyConfigPath, configPath);
+    }
     if (fs.existsSync(configPath)) {
       return JSON.parse(fs.readFileSync(configPath, 'utf8'));
     }
@@ -84,8 +1091,19 @@ function readAppConfig() {
 }
 
 function writeAppConfig(config) {
-  const configPath = path.join(__dirname, 'config.json');
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+  const configPath = getConfigPath();
+  const tempPath = path.join(path.dirname(configPath), 'config.tmp.json');
+  try {
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(tempPath, JSON.stringify(config, null, 2), 'utf8');
+    fs.renameSync(tempPath, configPath);
+  } catch (e) {
+    console.error('Error writing config:', e);
+    if (fs.existsSync(tempPath)) {
+      try { fs.unlinkSync(tempPath); } catch(err) {}
+    }
+    throw e;
+  }
 }
 
 function getLocalWifiAddress() {
@@ -109,110 +1127,1810 @@ function ensureCompanionToken(config) {
   return config.phoneCompanionToken;
 }
 
-function companionHtml(token) {
+function ensureCompanionPairingCode(config) {
+  const expiresAt = Date.parse(config.phoneCompanionPairingExpiresAt || '');
+  if (config.phoneCompanionPairingCode && String(config.phoneCompanionPairingCode).length >= 12 && expiresAt > Date.now()) {
+    return config.phoneCompanionPairingCode;
+  }
+  config.phoneCompanionPairingCode = crypto.randomBytes(12).toString('base64url');
+  config.phoneCompanionPairingExpiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  writeAppConfig(config);
+  return config.phoneCompanionPairingCode;
+}
+
+async function buildCompanionPairingAnnouncement({ address, port, pairingCode, expiresAt }) {
+  const pairUrl = `http://${address}:${port}/?pair=${encodeURIComponent(pairingCode)}`;
+  const qrSvg = await QRCode.toString(pairUrl, {
+    type: 'svg',
+    margin: 1,
+    width: 180,
+    color: { dark: '#111827', light: '#ffffff' }
+  });
+  return {
+    type: 'phone-companion-pairing',
+    pairUrl,
+    pairingCode,
+    expiresAt: expiresAt || '',
+    qrSvg,
+    networkEnabled: address !== '127.0.0.1' && address !== 'localhost',
+    title: 'Pair Phone Companion',
+    description: 'Scan this QR code from your phone, then approve the pairing on this desktop.'
+  };
+}
+
+function getCompanionDevices(config) {
+  return Array.isArray(config.phoneCompanionDevices) ? config.phoneCompanionDevices : [];
+}
+
+function saveCompanionDevice(config, device) {
+  const devices = getCompanionDevices(config).filter(d => d.id !== device.id);
+  devices.push(device);
+  config.phoneCompanionDevices = devices;
+  writeAppConfig(config);
+  return device;
+}
+
+function createCompanionDeviceSession(config, deviceName) {
+  const now = new Date().toISOString();
+  const device = {
+    id: crypto.randomBytes(12).toString('base64url'),
+    name: String(deviceName || 'Phone').slice(0, 80),
+    secret: crypto.randomBytes(24).toString('base64url'),
+    approved: true,
+    revoked: false,
+    pairedAt: now,
+    lastSeenAt: now,
+    selectedConversationId: null
+  };
+  return saveCompanionDevice(config, device);
+}
+
+function authenticateCompanionRequest(req, config) {
+  const auth = String(req.headers.authorization || '');
+  const bearer = auth.match(/^Bearer\s+(.+)$/i);
+  const session = bearer ? bearer[1] : String(req.headers['x-orion-session'] || '');
+  const deviceId = String(req.headers['x-orion-device-id'] || '');
+  if (!session || !deviceId) return null;
+  const device = getCompanionDevices(config).find(d => d.id === deviceId && d.secret === session && d.approved && !d.revoked);
+  if (!device) return null;
+  device.lastSeenAt = new Date().toISOString();
+  saveCompanionDevice(config, device);
+  return device;
+}
+
+function companionDevicePublic(device) {
+  return {
+    id: device.id,
+    name: device.name,
+    approved: !!device.approved,
+    revoked: !!device.revoked,
+    pairedAt: device.pairedAt || '',
+    lastSeenAt: device.lastSeenAt || ''
+  };
+}
+
+function companionManifest() {
+  return {
+    name: 'Orion AI Phone Companion',
+    short_name: 'Orion',
+    description: 'Control Orion AI from your phone on your local Wi-Fi.',
+    start_url: '/',
+    scope: '/',
+    display: 'standalone',
+    background_color: '#09090d',
+    theme_color: '#2563eb',
+    orientation: 'portrait',
+    icons: [
+      { src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any maskable' }
+    ]
+  };
+}
+
+function companionServiceWorker() {
+  return `const CACHE = 'orion-phone-companion-v1';
+const SHELL = ['/icon.svg'];
+self.addEventListener('install', event => {
+  event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));
+});
+self.addEventListener('activate', event => {
+  event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(key => key !== CACHE).map(key => caches.delete(key)))).then(() => self.clients.claim()));
+});
+self.addEventListener('fetch', event => {
+  const url = new URL(event.request.url);
+  if (url.pathname.startsWith('/api/') || url.pathname === '/' || url.pathname === '/manifest.webmanifest' || url.pathname === '/sw.js') return;
+  event.respondWith(fetch(event.request).catch(() => caches.match(event.request)));
+});`;
+}
+
+function companionIconSvg() {
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <radialGradient id="g" cx="30%" cy="20%" r="80%">
+      <stop offset="0%" stop-color="#60a5fa"/>
+      <stop offset="42%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </radialGradient>
+    <filter id="s" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#000" flood-opacity=".35"/>
+    </filter>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#09090d"/>
+  <path filter="url(#s)" d="M256 68c103.8 0 188 84.2 188 188s-84.2 188-188 188S68 359.8 68 256 152.2 68 256 68Z" fill="url(#g)"/>
+  <path d="M258 134c64 0 117 50 121 113 4 70-52 132-123 132-37 0-70-16-93-42l50-50c9 13 24 22 42 22 29 0 53-24 53-53s-24-53-53-53c-18 0-34 9-44 23l-50-50c23-26 57-42 97-42Z" fill="#fff"/>
+</svg>`;
+}
+
+function companionHtml(pairingCode) {
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Orion AI Phone Companion</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Orion</title>
+  <meta name="theme-color" content="#f7f7f5">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,100..800;1,100..800&family=Outfit:wght@100..900&display=swap" rel="stylesheet">
   <style>
-    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background: #09090d; color: #f4f2ff; }
+    :root {
+      color-scheme: dark;
+      --bg: #07070a;
+      --panel: rgba(20, 20, 31, 0.6);
+      --panel-strong: rgba(28, 28, 43, 0.85);
+      --line: rgba(96, 165, 250, 0.16);
+      --text: #f3f1fe;
+      --muted: #9f9aa7;
+      --accent: #60a5fa;
+      --accent-strong: #2563eb;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
     * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 20% 0%, rgba(128, 90, 213, .24), transparent 30%), #09090d; }
-    header { position: sticky; top: 0; z-index: 2; padding: 16px; border-bottom: 1px solid #252235; background: rgba(9, 9, 13, .92); backdrop-filter: blur(16px); }
-    h1 { margin: 0; font-size: 1.05rem; letter-spacing: 0; }
-    .meta { margin-top: 6px; color: #9d96b8; font-size: .78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    main { padding: 14px; padding-bottom: 150px; }
-    .status { color: #a78bfa; font-size: .78rem; margin-bottom: 10px; min-height: 18px; }
-    .message { padding: 12px; border: 1px solid #252235; border-radius: 8px; margin: 10px 0; line-height: 1.45; white-space: pre-wrap; word-break: break-word; background: #111019; }
-    .message.user { border-color: rgba(167,139,250,.4); background: #171326; }
-    .message.assistant { border-color: rgba(72,187,120,.25); }
-    .message.system { color: #a9a3bf; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .78rem; }
-    .role { display: block; margin-bottom: 6px; color: #b8a7ff; font-size: .72rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
-    form { position: fixed; left: 0; right: 0; bottom: 0; padding: 12px; border-top: 1px solid #252235; background: rgba(9, 9, 13, .96); backdrop-filter: blur(16px); }
-    textarea { width: 100%; min-height: 72px; resize: vertical; border: 1px solid #312b46; border-radius: 8px; padding: 12px; background: #12111a; color: #fff; font: inherit; }
-    button { width: 100%; margin-top: 10px; min-height: 44px; border: 0; border-radius: 8px; background: #8b5cf6; color: #fff; font-weight: 800; font-size: .95rem; }
-    button:disabled { opacity: .55; }
-    .empty { color: #9d96b8; text-align: center; padding: 48px 12px; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: radial-gradient(circle at 18% -10%, rgba(37,99,235,.22), transparent 34%), radial-gradient(circle at 86% 0%, rgba(14,165,233,.13), transparent 34%), linear-gradient(180deg,#090b12 0%,#07070a 45%,#050508 100%);
+      overflow-x: hidden;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image: linear-gradient(rgba(255,255,255,.02) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.015) 1px, transparent 1px);
+      background-size: 32px 32px;
+      mask-image: linear-gradient(to bottom, rgba(0,0,0,.8), transparent 65%);
+    }
+    .app-shell { min-height: 100vh; padding-bottom: calc(164px + env(safe-area-inset-bottom)); }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      padding: calc(14px + env(safe-area-inset-top)) 16px 12px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(7,7,10,.82);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+    }
+    .topline { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .brand { display: flex; align-items: center; min-width: 0; gap: 10px; }
+    .mark {
+      width: 36px;
+      height: 36px;
+      border-radius: 12px;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(145deg, #60a5fa, #2563eb 58%, #111827);
+      box-shadow: 0 10px 30px rgba(37,99,235,.26);
+      font-weight: 900;
+      color: #fff;
+    }
+    h1 { margin: 0; font-size: 1.05rem; letter-spacing: 0; line-height: 1.1; font-weight: 700; }
+    .meta { margin-top: 4px; color: var(--muted); font-size: .76rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 68vw; }
+    .status-pill {
+      flex: 0 0 auto;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(20,20,31,.6);
+      color: var(--muted);
+      font-size: .72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .status-pill.running {
+      color: #e8ddff;
+      border-color: rgba(16,185,129,.35);
+      background: rgba(16,185,129,.12);
+    }
+    
+    /* Indicator Banner */
+    .indicator-banner {
+      padding: 10px 14px;
+      border-radius: 10px;
+      margin-top: 12px;
+      font-size: 0.78rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border: 1px solid transparent;
+      font-weight: 500;
+    }
+    .indicator-banner.active-running {
+      background: rgba(16, 185, 129, 0.08);
+      border-color: rgba(16, 185, 129, 0.2);
+      color: #34d399;
+    }
+    .indicator-banner.background-running {
+      background: rgba(245, 158, 11, 0.08);
+      border-color: rgba(245, 158, 11, 0.2);
+      color: #fbbf24;
+    }
+    .indicator-banner.background-running button {
+      background: #fbbf24;
+      color: #0c0c0e;
+      font-weight: 700;
+      border: 0;
+      padding: 4px 8px;
+      border-radius: 6px;
+      font-size: 0.72rem;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .indicator-banner.idle {
+      background: rgba(255, 255, 255, 0.02);
+      border-color: rgba(255, 255, 255, 0.05);
+      color: var(--muted);
+    }
+
+    .context-card {
+      margin-top: 12px;
+      padding: 12px;
+      border: 1px solid rgba(255,255,255,.05);
+      border-radius: 14px;
+      background: linear-gradient(180deg, rgba(24,23,36,.5), rgba(13,13,20,.4));
+    }
+    .context-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--muted); font-size: .75rem; }
+    .model { color: var(--text); font-weight: 700; }
+    .substatus { margin-top: 8px; color: var(--accent); font-size: .76rem; min-height: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    
+    .install-tip { display: none; margin-top: 10px; padding: 9px 10px; border: 1px dashed rgba(96,165,250,.36); border-radius: 12px; color: #bfdbfe; background: rgba(37,99,235,.1); font-size: .76rem; line-height: 1.35; }
+    .install-tip.visible { display: block; }
+    
+    main { position: relative; z-index: 1; padding: 14px; display: flex; flex-direction: column; gap: 16px; }
+    
+    /* Plan Panel */
+    .plan-panel {
+      display: none;
+      padding: 14px;
+      border-radius: 14px;
+      border: 1px solid rgba(245, 158, 11, 0.3);
+      background: linear-gradient(135deg, rgba(245, 158, 11, 0.08), rgba(167, 139, 250, 0.04));
+      margin-bottom: 4px;
+    }
+    .plan-panel.visible { display: block; }
+    .plan-title { font-size: .86rem; font-weight: 800; margin-bottom: 4px; color: #fbbf24; }
+    .plan-copy { color: var(--muted); font-size: .78rem; line-height: 1.35; margin-bottom: 10px; }
+    
+    /* Dashboard and Cards */
+    .dashboard-panel { display: flex; flex-direction: column; gap: 12px; }
+    .panel-header-row { display: flex; align-items: center; justify-content: space-between; }
+    .sub-panel-title { font-size: .74rem; color: #93c5fd; font-weight: 850; text-transform: uppercase; letter-spacing: .08em; }
+    
+    .btn-sm-primary {
+      min-height: 32px;
+      padding: 0 12px;
+      font-size: 0.78rem;
+      border-radius: 8px;
+      font-weight: 700;
+      background: var(--accent-strong);
+      color: #fff;
+      border: 0;
+      box-shadow: 0 4px 12px rgba(37, 99, 235, 0.22);
+      cursor: pointer;
+      font-family: inherit;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      white-space: nowrap;
+      transition: transform .16s ease, border-color .16s ease, background .16s ease, opacity .16s ease;
+    }
+    .btn-sm {
+      min-height: 28px;
+      padding: 0 10px;
+      font-size: 0.75rem;
+      border-radius: 6px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.1);
+      color: var(--text);
+      cursor: pointer;
+      font-family: inherit;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      white-space: nowrap;
+      transition: transform .16s ease, border-color .16s ease, background .16s ease, opacity .16s ease;
+    }
+
+    .dashboard-card {
+      padding: 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      background: var(--panel);
+    }
+    .dashboard-card.active-card {
+      border-left: 4px solid var(--accent);
+      background: linear-gradient(180deg, rgba(37, 99, 235, 0.05), rgba(20, 20, 31, 0.6));
+    }
+    .dashboard-cards-grid { display: flex; flex-direction: column; gap: 8px; }
+    .attention-card {
+      border: 1px solid rgba(245, 158, 11, 0.25);
+      background: linear-gradient(135deg, rgba(245, 158, 11, 0.05), rgba(20, 20, 31, 0.6));
+    }
+    .card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+    .card-title { font-size: 0.94rem; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+    .substatus-text { font-size: 0.74rem; color: var(--muted); min-height: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .badge { display: inline-flex; align-items: center; padding: 2px 6px; border-radius: 4px; font-size: 0.64rem; font-weight: 700; text-transform: uppercase; }
+    .badge.success { background: rgba(16, 185, 129, 0.1); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.2); }
+    .badge.warning { background: rgba(245, 158, 11, 0.1); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.2); }
+    .badge.danger { background: rgba(239, 68, 68, 0.1); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.2); }
+    .badge.muted { background: rgba(255, 255, 255, 0.04); color: var(--muted); border: 1px solid rgba(255, 255, 255, 0.06); }
+    .badge.active-view { background: rgba(37, 99, 235, 0.12); color: #93c5fd; border: 1px solid rgba(96, 165, 250, 0.22); }
+    .badge.pulse { animation: status-pulse 1.8s infinite; }
+    @keyframes status-pulse {
+      0% { opacity: 0.6; }
+      50% { opacity: 1; }
+      100% { opacity: 0.6; }
+    }
+
+    .queued-list { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+    .queued-item { font-size: 0.72rem; color: #d1d5db; background: rgba(255,255,255,0.02); padding: 6px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.04); }
+
+    .recent-tasks-list { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow-y: auto; padding-right: 4px; }
+    .task-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.05); background: rgba(255,255,255,0.01); cursor: pointer; transition: all 0.2s ease; }
+    .task-row:hover { border-color: rgba(167, 139, 250, 0.18); background: rgba(167, 139, 250, 0.02); }
+    .task-row.active-row { border-color: rgba(167, 139, 250, 0.3); background: rgba(167, 139, 250, 0.05); }
+    .task-row-title { font-size: 0.82rem; font-weight: 600; color: var(--text); }
+    .task-row-meta { font-size: 0.7rem; color: var(--muted); margin-top: 2px; }
+
+    /* Upgraded Activity Panel with Tabs */
+    .activity-panel {
+      padding: 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      background: var(--panel);
+    }
+    .tab-header { display: flex; gap: 4px; border-bottom: 1px solid rgba(255,255,255,0.06); padding-bottom: 6px; margin-bottom: 10px; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .tab-btn {
+      flex: 1;
+      min-height: 30px;
+      padding: 0 10px;
+      font-size: 0.72rem;
+      border-radius: 6px;
+      background: transparent;
+      border: 0;
+      color: var(--muted);
+      cursor: pointer;
+      font-weight: 600;
+      text-align: center;
+      white-space: nowrap;
+      box-shadow: none;
+      font-family: inherit;
+    }
+    .tab-btn.active {
+      background: rgba(37, 99, 235, 0.15);
+      color: #93c5fd;
+      border: 1px solid rgba(96, 165, 250, 0.22);
+    }
+    .tab-content { position: relative; }
+    .tab-pane { display: none; font-size: 0.74rem; color: var(--muted); white-space: pre-wrap; word-break: break-all; max-height: 180px; overflow-y: auto; line-height: 1.4; }
+    .tab-pane.active { display: block; }
+    .terminal-logs { font-family: 'JetBrains Mono', Consolas, monospace; background: #040406; color: #34d399; padding: 8px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.04); margin: 0; font-size: 0.68rem; line-height: 1.35; max-height: 140px; overflow: auto; }
+    .test-result-block { border-bottom: 1px solid rgba(255,255,255,0.04); padding-bottom: 6px; margin-bottom: 6px; }
+    .test-result-block:last-child { border-bottom: 0; }
+
+    /* Action Grouping */
+    .action-grouping { display: flex; flex-direction: column; gap: 8px; margin-bottom: 4px; }
+    .control-row { display: flex; gap: 8px; }
+    .control-row button { flex: 1; min-width: 0; min-height: 38px; border-radius: 12px; background: rgba(20,20,31,.6); border: 1px solid var(--line); color: var(--text); box-shadow: none; font-size: 0.8rem; font-weight: 700; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; text-align: center; white-space: nowrap; transition: transform .16s ease, border-color .16s ease, background .16s ease, opacity .16s ease; }
+    .control-row button:hover { border-color: rgba(167, 139, 250, 0.35); background: rgba(167, 139, 250, 0.04); }
+    .approve-button { width: 100%; background: #f59e0b; color: #0c0c0e; font-weight: 850; box-shadow: 0 12px 26px rgba(245,158,11,.18); cursor: pointer; }
+    .project-select-panel { display: flex; flex-direction: column; gap: 8px; }
+    select {
+      width: 100%;
+      min-height: 38px;
+      border-radius: 10px;
+      border: 1px solid rgba(96,165,250,.22);
+      background: rgba(20,20,31,.9);
+      color: var(--text);
+      padding: 0 10px;
+      font: inherit;
+      font-size: .78rem;
+      outline: none;
+    }
+    
+    .messages { display: flex; flex-direction: column; gap: 12px; max-height: 320px; overflow-y: auto; padding-right: 4px; }
+    .message { max-width: 92%; padding: 12px 13px; border: 1px solid rgba(255,255,255,.05); border-radius: 17px; line-height: 1.48; white-space: pre-wrap; word-break: break-word; background: rgba(20,20,31,.4); box-shadow: 0 12px 30px rgba(0,0,0,.12); font-size: 0.8rem; }
+    .message.user { align-self: flex-end; border-color: rgba(96,165,250,.28); background: linear-gradient(135deg, rgba(37,99,235,.16), rgba(24,32,54,.84)); }
+    .message.assistant { align-self: flex-start; border-color: rgba(52,211,153,.15); }
+    .message.system { align-self: center; max-width: 100%; color: var(--muted); font-family: 'JetBrains Mono', monospace; font-size: .74rem; background: rgba(12,12,18,.5); }
+    .role { display: block; margin-bottom: 6px; color: #93c5fd; font-size: .64rem; font-weight: 850; text-transform: uppercase; letter-spacing: .08em; }
+    
+    form { position: fixed; z-index: 8; left: 0; right: 0; bottom: 0; padding: 12px 12px calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid rgba(255,255,255,.06); background: rgba(7,7,10,.9); backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px); }
+    .composer { display: flex; gap: 10px; align-items: flex-end; }
+    textarea { width: 100%; min-height: 54px; max-height: 132px; resize: none; border: 1px solid rgba(96,165,250,.22); border-radius: 15px; padding: 12px 13px; background: rgba(20,20,31,.9); color: var(--text); font: inherit; line-height: 1.35; outline: none; }
+    textarea:focus { border-color: rgba(96,165,250,.52); box-shadow: 0 0 0 3px rgba(37,99,235,.1); }
+    button.send-button { border: 0; border-radius: 14px; background: var(--accent-strong); color: #fff; font-weight: 850; font-size: .9rem; min-height: 48px; padding: 0 15px; box-shadow: 0 12px 26px rgba(37,99,235,.28); cursor: pointer; font-family: inherit; }
+    .send-button { flex: 0 0 auto; min-width: 72px; }
+    button:active { transform: translateY(1px); }
+    button:disabled { opacity: .55; cursor: wait; }
+    
+    .empty { color: var(--muted); text-align: center; padding: 36px 12px; font-size: 0.76rem; }
+    /* Codex-inspired mobile shell, Orion palette */
+    :root {
+      color-scheme: light;
+      --bg: #f7f7f5;
+      --panel: rgba(255,255,255,.82);
+      --panel-strong: #ffffff;
+      --line: rgba(24,24,27,.09);
+      --text: #18181b;
+      --muted: #6f6f76;
+      --accent: #7c3aed;
+      --accent-strong: #5b2a86;
+      --success: #16a34a;
+      --warning: #b45309;
+      --danger: #dc2626;
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    body {
+      background:
+        radial-gradient(circle at 50% -16%, rgba(124,58,237,.12), transparent 34%),
+        linear-gradient(180deg, #fbfbfa 0%, #f7f7f5 60%, #f1f0ee 100%);
+    }
+    body::before { display: none; }
+    .app-shell {
+      min-height: 100vh;
+      padding-bottom: calc(94px + env(safe-area-inset-bottom));
+      background: transparent;
+    }
+    header {
+      border-bottom: 0;
+      background: linear-gradient(180deg, rgba(247,247,245,.98), rgba(247,247,245,.78));
+      padding: calc(14px + env(safe-area-inset-top)) 18px 10px;
+    }
+    .topline {
+      display: grid;
+      grid-template-columns: 44px 1fr 44px;
+      align-items: center;
+      min-height: 48px;
+    }
+    .brand {
+      justify-self: center;
+      justify-content: center;
+      gap: 0;
+      text-align: center;
+    }
+    .brand::before,
+    .status-pill::after {
+      width: 44px;
+      height: 44px;
+      border-radius: 22px;
+      display: grid;
+      place-items: center;
+      background: rgba(255,255,255,.76);
+      box-shadow: 0 10px 28px rgba(24,24,27,.08);
+      color: var(--text);
+      font-size: 1.35rem;
+      line-height: 1;
+    }
+    .brand::before {
+      content: "\\2039";
+      position: absolute;
+      left: 18px;
+      font-size: 2rem;
+      padding-bottom: 4px;
+    }
+    .status-pill::after {
+      content: "\\22ee";
+      position: absolute;
+      right: 18px;
+      top: calc(14px + env(safe-area-inset-top));
+      font-weight: 800;
+    }
+    .mark { display: none; }
+    h1 {
+      font-size: 1.03rem;
+      font-weight: 800;
+      color: var(--text);
+    }
+    .brand h1 { font-size: 0; }
+    .brand h1::after { content: "Orion"; font-size: 1.08rem; }
+    .meta {
+      max-width: 72vw;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: .72rem;
+    }
+    .status-pill {
+      width: 0;
+      height: 0;
+      padding: 0;
+      border: 0;
+      overflow: hidden;
+      background: transparent;
+      color: transparent;
+    }
+    .context-card {
+      margin-top: 12px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+    }
+    .context-row {
+      justify-content: center;
+      font-size: .8rem;
+      gap: 8px;
+    }
+    .context-row span:first-child { display: none; }
+    .model {
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .substatus {
+      text-align: center;
+      color: var(--muted);
+      font-size: .74rem;
+      margin-top: 3px;
+    }
+    .indicator-banner {
+      margin-top: 12px;
+      padding: 0;
+      border: 0;
+      background: transparent !important;
+      color: var(--text) !important;
+      justify-content: center;
+      font-size: .78rem;
+      gap: 8px;
+    }
+    .indicator-banner::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: #c9c9cf;
+    }
+    .indicator-banner.active-running::before { background: var(--success); }
+    .indicator-banner.background-running::before { background: #f59e0b; }
+    .indicator-banner button {
+      border: 0;
+      border-radius: 999px;
+      background: #ece8f4 !important;
+      color: var(--accent-strong) !important;
+      padding: 5px 9px;
+      font: inherit;
+      font-size: .72rem;
+      font-weight: 800;
+    }
+    main {
+      padding: 18px 20px 22px;
+      gap: 28px;
+    }
+    .dashboard-panel,
+    .recent-tasks-section,
+    .chat-section,
+    .activity-panel {
+      gap: 14px;
+    }
+    .dashboard-panel {
+      display: grid;
+      grid-template-areas:
+        "top"
+        "projects"
+        "active"
+        "plan"
+        "actions"
+        "attention"
+        "queued"
+        "recents";
+    }
+    .dashboard-panel > .panel-header-row { grid-area: top; }
+    .project-select-panel { grid-area: projects; }
+    #active-task-container { grid-area: active; }
+    #plan-panel { grid-area: plan; }
+    .action-grouping { grid-area: actions; }
+    #attention-tasks-container { grid-area: attention; }
+    #queued-prompts-container { grid-area: queued; }
+    .recent-tasks-section { grid-area: recents; }
+    .panel-header-row {
+      align-items: center;
+      gap: 12px;
+    }
+    .sub-panel-title {
+      color: var(--text);
+      font-size: .92rem;
+      text-transform: none;
+      letter-spacing: 0;
+      font-weight: 850;
+    }
+    .dashboard-panel > .panel-header-row .sub-panel-title::before { content: "Projects"; }
+    .dashboard-panel > .panel-header-row .sub-panel-title { font-size: 0; }
+    .dashboard-panel > .panel-header-row .sub-panel-title::before { font-size: 1rem; }
+    .btn-sm-primary {
+      min-height: 48px;
+      padding: 0 18px;
+      border-radius: 999px;
+      background: #151518;
+      box-shadow: 0 12px 30px rgba(24,24,27,.16);
+      font-size: .9rem;
+    }
+    .btn-sm-primary::before { content: "\\270e "; }
+    .dashboard-card,
+    .activity-panel,
+    .plan-panel {
+      border: 0;
+      background: transparent;
+      box-shadow: none;
+      padding: 0;
+      border-radius: 0;
+    }
+    .project-select-panel {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
+    .project-select-panel .panel-header-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    select {
+      min-height: 50px;
+      border-radius: 15px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.9);
+      color: var(--text);
+      font-size: .95rem;
+      box-shadow: 0 8px 24px rgba(24,24,27,.05);
+    }
+    .badge {
+      border-radius: 999px;
+      border: 0 !important;
+      background: #eeeeef !important;
+      color: var(--muted) !important;
+      text-transform: none;
+      font-size: .72rem;
+      padding: 4px 8px;
+    }
+    .badge.success { background: rgba(22,163,74,.12) !important; color: #15803d !important; }
+    .badge.warning { background: rgba(245,158,11,.15) !important; color: #92400e !important; }
+    .badge.active-view { background: rgba(124,58,237,.13) !important; color: var(--accent-strong) !important; }
+    .dashboard-card.active-card {
+      background: #ffffff;
+      border: 1px solid var(--line);
+      border-left: 0;
+      border-radius: 18px;
+      padding: 14px;
+      box-shadow: 0 12px 30px rgba(24,24,27,.06);
+    }
+    .card-title {
+      font-size: 1rem;
+      font-weight: 750;
+    }
+    .substatus-text,
+    .task-row-meta {
+      color: var(--muted);
+      font-size: .76rem;
+    }
+    .control-row {
+      gap: 10px;
+    }
+    .control-row button,
+    .btn-sm {
+      min-height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255,255,255,.78);
+      color: var(--text);
+      box-shadow: 0 8px 20px rgba(24,24,27,.04);
+      font-size: .82rem;
+      font-weight: 750;
+    }
+    .plan-panel {
+      padding: 14px;
+      border-radius: 18px;
+      background: #fff7ed;
+      border: 1px solid rgba(245,158,11,.22);
+    }
+    .plan-title { color: #92400e; }
+    .approve-button {
+      min-height: 44px;
+      border: 0;
+      border-radius: 999px;
+      background: #151518;
+      color: #fff;
+    }
+    .approve-button.approved {
+      background: linear-gradient(145deg, #2fb37e, #1f9d6a);
+      color: #fff;
+      cursor: default;
+      box-shadow: 0 10px 24px rgba(47,179,126,.22);
+    }
+    .recent-tasks-section .sub-panel-title::before { content: "Recents"; }
+    .recent-tasks-section .sub-panel-title { font-size: 0; }
+    .recent-tasks-section .sub-panel-title::before { font-size: 1rem; }
+    .recent-tasks-list {
+      max-height: none;
+      gap: 0;
+      overflow: visible;
+    }
+    .task-row {
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      padding: 13px 0;
+      border-bottom: 1px solid rgba(24,24,27,.06);
+    }
+    .task-row.active-row {
+      background: transparent;
+      border-color: rgba(24,24,27,.08);
+    }
+    .task-row-title {
+      color: var(--text);
+      font-size: .96rem;
+      font-weight: 500;
+    }
+    .task-row-right .badge:not(.success):not(.warning) { display: none; }
+    .activity-panel {
+      display: none;
+      background: #ffffff;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 14px;
+      box-shadow: 0 12px 30px rgba(24,24,27,.05);
+    }
+    .activity-panel:has(.tab-pane.active:not(:empty)) { display: block; }
+    .tab-header {
+      border: 0;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+    .tab-btn {
+      border-radius: 999px;
+      background: #f0f0f1;
+      color: var(--muted);
+    }
+    .tab-btn.active {
+      background: #151518;
+      color: #fff;
+      border: 0;
+    }
+    .tab-pane {
+      color: var(--muted);
+      word-break: break-word;
+    }
+    .terminal-logs {
+      background: #f6f6f7;
+      color: #166534;
+      border: 1px solid var(--line);
+    }
+    .messages {
+      max-height: none;
+      gap: 16px;
+      overflow: visible;
+    }
+    .chat-section .sub-panel-title::before { content: "Chat"; }
+    .chat-section .sub-panel-title { font-size: 0; }
+    .chat-section .sub-panel-title::before { font-size: 1rem; }
+    .message {
+      border: 0;
+      box-shadow: none;
+      max-width: 100%;
+      background: transparent;
+      color: var(--text);
+      padding: 0;
+      font-size: .98rem;
+      line-height: 1.48;
+    }
+    .message.user {
+      max-width: 78%;
+      align-self: flex-end;
+      background: #ececec;
+      border-radius: 22px;
+      padding: 14px 16px;
+    }
+    .message.assistant { align-self: stretch; }
+    .message.system {
+      align-self: stretch;
+      font-family: inherit;
+      color: var(--muted);
+      background: transparent;
+      font-size: .82rem;
+    }
+    .role { display: none; }
+    .queued-item {
+      background: #ffffff;
+      border: 1px solid var(--line);
+      color: var(--text);
+      border-radius: 12px;
+    }
+    .install-tip.visible {
+      background: #fff;
+      color: var(--muted);
+      border: 1px solid var(--line);
+    }
+    form {
+      border-top: 0;
+      background: linear-gradient(180deg, rgba(247,247,245,0), rgba(247,247,245,.96) 24%, rgba(247,247,245,.98));
+      padding: 12px 20px calc(12px + env(safe-area-inset-bottom));
+    }
+    .composer {
+      align-items: center;
+      gap: 10px;
+    }
+    .composer::before {
+      content: "+";
+      flex: 0 0 46px;
+      height: 46px;
+      border-radius: 999px;
+      display: grid;
+      place-items: center;
+      background: #fff;
+      color: #151518;
+      font-size: 1.8rem;
+      line-height: 1;
+      box-shadow: 0 10px 24px rgba(24,24,27,.08);
+    }
+    textarea {
+      min-height: 48px;
+      max-height: 110px;
+      border: 1px solid rgba(24,24,27,.06);
+      border-radius: 999px;
+      background: #ffffff;
+      color: var(--text);
+      padding: 12px 48px 12px 18px;
+      box-shadow: 0 10px 24px rgba(24,24,27,.08);
+      font-size: .95rem;
+    }
+    textarea:focus {
+      border-color: rgba(124,58,237,.22);
+      box-shadow: 0 0 0 4px rgba(124,58,237,.08), 0 10px 24px rgba(24,24,27,.08);
+    }
+    button.send-button {
+      min-width: 46px;
+      width: 46px;
+      min-height: 46px;
+      padding: 0;
+      border-radius: 999px;
+      background: var(--accent-strong);
+      font-size: 0;
+      box-shadow: 0 12px 26px rgba(91,42,134,.22);
+    }
+    button.send-button::before {
+      content: "\\203a";
+      font-size: 2rem;
+      line-height: 1;
+      transform: rotate(-90deg);
+      display: inline-block;
+      margin-top: 2px;
+    }
+    .empty {
+      color: var(--muted);
+      font-size: .86rem;
+    }
+    .mission-mobile-card { display: none; }
+    .mission-mobile-card.visible { display: block; }
+    .mission-mobile-title { font-size: .96rem; font-weight: 760; line-height: 1.35; margin: 7px 0; }
+    .mission-mobile-objective { color: var(--muted); font-size: .78rem; margin-bottom: 10px; }
+    .mission-mobile-condition { display: flex; align-items: flex-start; gap: 8px; padding: 5px 0; color: var(--muted); font-size: .78rem; }
+    .mission-mobile-dot { width: 8px; height: 8px; flex: 0 0 auto; margin-top: 3px; border-radius: 50%; background: #a1a1aa; }
+    .mission-mobile-condition.in_progress .mission-mobile-dot { background: #d97706; }
+    .mission-mobile-condition.satisfied .mission-mobile-dot { background: #059669; }
+    .mission-mobile-blocker { margin-top: 7px; padding: 7px 9px; border-left: 2px solid #dc2626; border-radius: 4px; background: rgba(220,38,38,.06); color: #991b1b; font-size: .75rem; }
+    /* Unified Orion dark companion theme */
+    :root {
+      color-scheme: dark;
+      --bg: #090b12;
+      --panel: #111724;
+      --panel-strong: #151c2a;
+      --line: rgba(151,164,196,.15);
+      --text: #f4f6fb;
+      --muted: #8994a9;
+      --accent: #8273f4;
+      --accent-strong: #6f5bea;
+      --success: #46d59b;
+      --warning: #f2b84b;
+      --danger: #f16876;
+      font-family: "Segoe UI Variable", Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    body {
+      background: radial-gradient(circle at 50% -12%, rgba(96,78,210,.16), transparent 30%), var(--bg);
+      color: var(--text);
+    }
+    .app-shell { background: transparent; }
+    header {
+      border-bottom: 1px solid var(--line);
+      background: rgba(9,11,18,.9);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+    }
+    .brand::before,
+    .status-pill::after { display: none; }
+    .status-pill {
+      position: absolute;
+      top: calc(18px + env(safe-area-inset-top));
+      right: 18px;
+      width: auto;
+      height: auto;
+      overflow: visible;
+      padding: 5px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(21,28,42,.9);
+      color: var(--muted);
+      font-size: .66rem;
+      font-weight: 750;
+    }
+    .status-pill.running { border-color: rgba(130,115,244,.28); color: #c9c2ff; }
+    .brand::before,
+    .status-pill::after {
+      background: rgba(21,28,42,.88);
+      color: var(--text);
+      border: 1px solid var(--line);
+      box-shadow: 0 10px 28px rgba(0,0,0,.24);
+    }
+    h1, .sub-panel-title, .card-title { color: var(--text); }
+    .model, .meta, .substatus, .substatus-text, .task-row-meta { color: var(--muted); }
+    .indicator-banner { color: var(--text) !important; }
+    .indicator-banner::before { background: #596378; }
+    .indicator-banner button { background: rgba(130,115,244,.13) !important; color: #c9c2ff !important; }
+    main { gap: 24px; }
+    .dashboard-panel {
+      grid-template-areas:
+        "top"
+        "projects"
+        "active"
+        "mission"
+        "plan"
+        "actions"
+        "attention"
+        "queued"
+        "recents";
+    }
+    #mission-context-card { grid-area: mission; }
+    .dashboard-card.active-card,
+    .mission-mobile-card.visible,
+    .activity-panel,
+    .plan-panel {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: linear-gradient(145deg, rgba(21,28,42,.96), rgba(14,19,30,.96));
+      box-shadow: 0 16px 38px rgba(0,0,0,.2), inset 0 1px rgba(255,255,255,.02);
+      padding: 14px;
+    }
+    .mission-mobile-card.visible { animation: mobile-card-enter .24s cubic-bezier(.2,.8,.2,1) both; }
+    .mission-mobile-title { color: var(--text); }
+    .mission-mobile-objective, .mission-mobile-condition { color: var(--muted); }
+    .mission-mobile-condition.in_progress .mission-mobile-dot { background: var(--warning); box-shadow: 0 0 9px rgba(242,184,75,.28); }
+    .mission-mobile-condition.satisfied .mission-mobile-dot { background: var(--success); box-shadow: 0 0 9px rgba(70,213,155,.24); }
+    .mission-mobile-blocker { background: rgba(241,104,118,.08); color: #ffb5bd; border-color: var(--danger); }
+    select,
+    textarea {
+      border-color: var(--line);
+      background: rgba(17,23,36,.96);
+      color: var(--text);
+      box-shadow: inset 0 1px rgba(255,255,255,.018), 0 10px 26px rgba(0,0,0,.13);
+    }
+    textarea::placeholder { color: #657086; }
+    select:focus,
+    textarea:focus { border-color: rgba(130,115,244,.62); box-shadow: 0 0 0 3px rgba(130,115,244,.1); }
+    .btn-sm-primary,
+    button.send-button {
+      background: linear-gradient(145deg, #8f80ff, #6654e7);
+      color: white;
+      box-shadow: 0 12px 28px rgba(85,67,216,.28);
+    }
+    .control-row button,
+    .btn-sm {
+      border-color: var(--line);
+      background: rgba(17,23,36,.86);
+      color: var(--text);
+      box-shadow: none;
+    }
+    .control-row button:active,
+    .btn-sm:active,
+    .send-button:active { transform: scale(.98); }
+    .badge { background: rgba(137,148,169,.12) !important; color: var(--muted) !important; }
+    .badge.success { background: rgba(70,213,155,.12) !important; color: #7aebbb !important; }
+    .badge.warning { background: rgba(242,184,75,.13) !important; color: #f7ce7d !important; }
+    .badge.active-view { background: rgba(130,115,244,.15) !important; color: #c9c2ff !important; }
+    .task-row { border-color: rgba(151,164,196,.1); }
+    .task-row:hover, .task-row.active-row { background: rgba(130,115,244,.055); }
+    .task-row-title { color: var(--text); }
+    .activity-panel { display: block; }
+    .tab-btn { background: rgba(137,148,169,.1); color: var(--muted); }
+    .tab-btn.active { background: rgba(130,115,244,.18); color: #d8d3ff; border: 1px solid rgba(130,115,244,.28); }
+    .tab-pane { color: var(--muted); }
+    .terminal-logs { background: #080b11; color: #78e7b7; border-color: var(--line); }
+    .message { color: var(--text); }
+    .message.user { background: rgba(130,115,244,.16); border: 1px solid rgba(130,115,244,.22); }
+    .message.system { color: var(--muted); }
+    .queued-item { background: var(--panel); border-color: var(--line); color: var(--text); }
+    .install-tip.visible { background: var(--panel); color: var(--muted); border-color: var(--line); }
+    form {
+      border-top: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(9,11,18,0), rgba(9,11,18,.96) 24%, rgba(9,11,18,.99));
+    }
+    .composer::before { background: var(--panel-strong); color: var(--text); border: 1px solid var(--line); box-shadow: 0 10px 24px rgba(0,0,0,.22); }
+    button.send-button::before { content: "\\2191"; font-size: 1.25rem; transform: none; margin: 0; }
+    .empty { color: var(--muted); }
+    @keyframes mobile-card-enter {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+    }
+    @media (min-width:700px) {
+      .app-shell { max-width: 760px; margin: 0 auto; border-left: 1px solid rgba(255,255,255,.05); border-right: 1px solid rgba(255,255,255,.05); }
+      form { left: 50%; transform: translateX(-50%); max-width: 760px; }
+      .meta { max-width: 520px; }
+    }
+    /* ── NEW TASK BOTTOM SHEET ──────────────────── */
+    .sheet-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.52); z-index:40; backdrop-filter:blur(3px); -webkit-backdrop-filter:blur(3px); }
+    .sheet-overlay.open { display:block; }
+    .new-task-sheet {
+      position:fixed; bottom:0; left:0; right:0; z-index:41;
+      background:var(--panel-strong); border-radius:24px 24px 0 0;
+      border-top:1px solid var(--line);
+      box-shadow:0 -24px 60px rgba(0,0,0,.48);
+      padding-bottom:calc(24px + env(safe-area-inset-bottom));
+      transform:translateY(100%);
+      transition:transform .32s cubic-bezier(.2,.8,.2,1);
+      max-height:86vh; overflow-y:auto;
+    }
+    .new-task-sheet.open { transform:translateY(0); }
+    .sheet-handle { width:36px; height:4px; background:rgba(255,255,255,.18); border-radius:2px; margin:10px auto 18px; }
+    .sheet-header { padding:0 20px 14px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); }
+    .sheet-title { font-size:1rem; font-weight:700; color:var(--text); }
+    .sheet-close-btn { width:30px; height:30px; border-radius:50%; background:rgba(255,255,255,.07); border:1px solid var(--line); color:var(--muted); font-size:1.1rem; cursor:pointer; display:grid; place-items:center; line-height:1; }
+    .sheet-section { padding:14px 20px 0; }
+    .sheet-label { font-size:.68rem; font-weight:700; letter-spacing:.08em; color:var(--muted); text-transform:uppercase; margin-bottom:9px; }
+    .proj-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .proj-tile {
+      padding:11px 13px; border-radius:14px;
+      border:1px solid var(--line); background:rgba(17,23,36,.7);
+      cursor:pointer; transition:border-color .15s,background .15s,transform .12s;
+      text-align:left;
+    }
+    .proj-tile:active { transform:scale(.97); }
+    .proj-tile.selected { border-color:rgba(130,115,244,.55); background:rgba(130,115,244,.12); box-shadow:0 0 0 2px rgba(130,115,244,.12); }
+    .proj-tile.standalone { grid-column:1/-1; border-color:rgba(70,213,155,.22); background:rgba(70,213,155,.05); }
+    .proj-tile.standalone.selected { border-color:rgba(70,213,155,.55); background:rgba(70,213,155,.1); }
+    .proj-tile-name { font-size:.86rem; font-weight:650; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .proj-tile.standalone .proj-tile-name { color:var(--success); }
+    .proj-tile-meta { font-size:.71rem; color:var(--muted); margin-top:3px; }
+    .sheet-textarea { width:100%; min-height:78px; background:rgba(9,11,18,.7); border:1px solid var(--line); border-radius:14px; color:var(--text); font-size:.95rem; font-family:inherit; padding:12px 14px; resize:none; outline:none; box-sizing:border-box; margin-top:12px; }
+    .sheet-textarea:focus { border-color:rgba(130,115,244,.62); box-shadow:0 0 0 3px rgba(130,115,244,.09); }
+    .sheet-textarea::placeholder { color:#657086; }
+    .sheet-start-btn { margin-top:10px; width:100%; min-height:48px; border-radius:14px; background:linear-gradient(145deg,#8f80ff,#6654e7); color:white; font-size:.95rem; font-weight:700; border:0; cursor:pointer; box-shadow:0 12px 28px rgba(85,67,216,.28); transition:opacity .15s,transform .12s; }
+    .sheet-start-btn:active { transform:scale(.98); opacity:.9; }
+    .sheet-start-btn:disabled { opacity:.45; cursor:not-allowed; }
+    /* ── FORM MODE BAR (steer / revise) ─────────── */
+    .form-mode-bar { display:none; align-items:center; gap:8px; padding:8px 20px 0; font-size:.78rem; font-weight:650; }
+    .form-mode-bar.visible { display:flex; }
+    .form-mode-bar .mode-icon { font-size:.85rem; }
+    .form-mode-bar .mode-label { color:var(--warning); }
+    .form-mode-bar.revise-mode .mode-label { color:var(--accent); }
+    .form-mode-bar .mode-cancel { margin-left:auto; padding:3px 10px; border-radius:999px; background:rgba(255,255,255,.06); border:1px solid var(--line); color:var(--muted); font-size:.73rem; cursor:pointer; }
+    /* ── TOP ROW ─────────────────────────────────── */
+    .workspace-header-row { display:flex; align-items:center; gap:8px; padding-bottom:4px; }
+    .workspace-header-row .sub-panel-title { flex:1; }
+    .btn-new-task { padding:6px 14px; border-radius:999px; background:rgba(130,115,244,.15); border:1px solid rgba(130,115,244,.28); color:#c9c2ff; font-size:.8rem; font-weight:700; cursor:pointer; white-space:nowrap; transition:background .15s; }
+    .btn-new-task:active { background:rgba(130,115,244,.26); }
+    /* ── CONTEXTUAL CONTROLS ─────────────────────── */
+    .ctx-controls-running, .ctx-controls-idle { display:none; }
+    .ctx-controls-running.visible, .ctx-controls-idle.visible { display:block; }
+    /* ── MESSAGE MARKDOWN ────────────────────────── */
+    .message code { font-family:'JetBrains Mono',monospace; font-size:.82em; background:rgba(130,115,244,.14); border:1px solid rgba(130,115,244,.18); border-radius:5px; padding:1px 5px; }
+    .message pre { background:rgba(9,11,18,.8); border:1px solid var(--line); border-radius:10px; padding:12px 14px; overflow-x:auto; margin:8px 0; }
+    .message pre code { background:none; border:none; padding:0; font-size:.82rem; color:#78e7b7; }
+    .message strong { color:var(--text); font-weight:700; }
+    .message em { font-style:italic; color:var(--muted); }
   </style>
 </head>
 <body>
-  <header>
-    <h1>Orion AI</h1>
-    <div class="meta" id="meta">Connecting...</div>
-  </header>
-  <main>
-    <div class="status" id="status"></div>
-    <div id="messages"><div class="empty">Loading conversation...</div></div>
-  </main>
-  <form id="prompt-form">
-    <textarea id="prompt" placeholder="Send a prompt to Orion..." autocomplete="off"></textarea>
-    <button id="send" type="submit">Send to Orion</button>
-  </form>
+  <div class="app-shell">
+    <header>
+      <div class="topline">
+        <div class="brand"><div class="mark">O</div><div><h1>Orion</h1><div class="meta" id="meta">Connecting...</div></div></div>
+        <div class="status-pill" id="status-pill">Offline</div>
+      </div>
+      <div id="global-indicator-banner" class="indicator-banner idle">
+        <span>Agent is currently idle</span>
+      </div>
+      <div class="context-card">
+        <div class="context-row"><span>Model</span><span class="model" id="model">-</span></div>
+        <div class="substatus" id="status"></div>
+        <div class="install-tip" id="install-tip">Install this companion from your browser menu with Add to Home Screen. Full PWA install support may require HTTPS on some phones.</div>
+      </div>
+    </header>
+    <main>
+      <!-- Mobile task console -->
+      <section class="dashboard-panel">
+        <div class="workspace-header-row">
+          <div class="sub-panel-title">Tasks</div>
+          <span class="badge muted" id="project-count-badge">0 Projects</span>
+          <button id="new-task" type="button" class="btn-new-task">+ New Task</button>
+        </div>
+        <select id="project-select" style="display:none;"><option value="">Standalone conversation</option></select>
+        
+        <div id="active-task-container" class="dashboard-card active-card">
+          <div class="empty">Loading tasks...</div>
+        </div>
+
+        <div id="mission-context-card" class="dashboard-card mission-mobile-card">
+          <div class="panel-header-row">
+            <div class="sub-panel-title">Mission Control</div>
+            <span class="badge muted" id="mission-context-revision">Not set</span>
+          </div>
+          <div class="mission-mobile-title" id="mission-context-title"></div>
+          <div class="mission-mobile-objective" id="mission-context-objective"></div>
+          <div id="mission-context-conditions"></div>
+          <div id="mission-context-blockers"></div>
+        </div>
+
+        <section class="plan-panel" id="plan-panel">
+          <div class="plan-title">Plan waiting for approval</div>
+          <div class="plan-copy">Review the latest plan in chat. Start it here when the direction looks right.</div>
+          <button class="approve-button" id="approve-plan" type="button">Start Implementation</button>
+          <div class="control-row" style="margin-top: 8px;">
+            <button id="deny-plan" type="button">Deny</button>
+            <button id="revise-plan" type="button">Revise</button>
+          </div>
+        </section>
+
+        <div class="action-grouping">
+          <div class="ctx-controls-running" id="ctx-controls-running">
+            <div class="control-row">
+              <button id="steer-task" type="button">Steer</button>
+              <button id="stop-task" type="button">Pause</button>
+            </div>
+          </div>
+          <div class="ctx-controls-idle" id="ctx-controls-idle">
+            <div class="control-row">
+              <button id="resume-task" type="button">Resume</button>
+              <button id="refresh-state" type="button">Refresh</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="attention-tasks-container" class="dashboard-cards-grid"></div>
+        <div id="queued-prompts-container" class="dashboard-card" style="display: none;"></div>
+
+        <div class="recent-tasks-section">
+          <div class="sub-panel-title">Recents</div>
+          <div id="recent-tasks-list" class="recent-tasks-list">
+            <div class="empty">Loading...</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Upgraded Activity Panel -->
+      <section class="activity-panel">
+        <div class="sub-panel-title" style="margin-bottom: 8px;">Activity</div>
+        <div class="tab-header">
+          <button class="tab-btn active" data-tab="tab-output">Output</button>
+          <button class="tab-btn" data-tab="tab-walkthrough">Walkthrough</button>
+          <button class="tab-btn" data-tab="tab-files">Files</button>
+          <button class="tab-btn" data-tab="tab-tests">Tests</button>
+          <button class="tab-btn" data-tab="tab-launch">Launch</button>
+        </div>
+        <div class="tab-content">
+          <div id="tab-output" class="tab-pane active">Latest output will appear here.</div>
+          <div id="tab-walkthrough" class="tab-pane">No walkthrough yet.</div>
+          <div id="tab-files" class="tab-pane">No changed files.</div>
+          <div id="tab-tests" class="tab-pane">No test results.</div>
+          <div id="tab-launch" class="tab-pane">
+            <div id="launch-url-container" style="margin-bottom: 8px; font-weight: 600;">No app launch URL recorded.</div>
+            <pre id="launch-logs-container" class="terminal-logs">No launch logs yet.</pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="chat-section">
+        <div class="sub-panel-title" style="margin-bottom: 8px;">Chat</div>
+        <div class="messages" id="messages"><div class="empty">Loading conversation...</div></div>
+      </section>
+
+      <!-- Hidden deprecated elements to maintain compatibility/avoid query errors -->
+      <div style="display:none;">
+        <select id="conversation-select"></select>
+        <button id="new-task-dup"></button>
+        <div id="queue-line"></div>
+        <div id="latest-output"></div>
+        <div id="preview-panel"></div>
+        <div id="tasks"></div>
+      </div>
+    </main>
+  </div>
+  <!-- New Task Bottom Sheet -->
+  <div class="sheet-overlay" id="sheet-overlay"></div>
+  <div class="new-task-sheet" id="new-task-sheet">
+    <div class="sheet-handle"></div>
+    <div class="sheet-header">
+      <div class="sheet-title">New Task</div>
+      <button class="sheet-close-btn" id="sheet-close" type="button">&#x2715;</button>
+    </div>
+    <div class="sheet-section">
+      <div class="sheet-label">Select a project</div>
+      <div class="proj-grid" id="proj-grid">
+        <div class="proj-tile standalone selected" data-path="">
+          <div class="proj-tile-name">&#x2726; Standalone</div>
+          <div class="proj-tile-meta">No project workspace</div>
+        </div>
+      </div>
+    </div>
+    <div class="sheet-section">
+      <div class="sheet-label">Initial prompt <span style="font-weight:400;text-transform:none;letter-spacing:0;color:#657086;">(optional)</span></div>
+      <textarea class="sheet-textarea" id="sheet-prompt" placeholder="What should Orion build or work on?" rows="3"></textarea>
+      <button class="sheet-start-btn" id="sheet-start" type="button">Start Task</button>
+    </div>
+  </div>
+  <div class="form-mode-bar" id="form-mode-bar">
+    <span class="mode-icon">&#x25B6;</span>
+    <span class="mode-label" id="form-mode-label">Steering</span>
+    <button class="mode-cancel" id="form-mode-cancel" type="button">Cancel</button>
+  </div>
+  <form id="prompt-form"><div class="composer"><textarea id="prompt" placeholder="Ask Orion..." autocomplete="off" rows="2"></textarea><button class="send-button" id="send" type="submit">Send</button></div></form>
   <script>
-    const token = ${JSON.stringify(token)};
+    const pairingCode = ${JSON.stringify(pairingCode)};
+    const sessionKey = 'orionPhoneCompanionSession';
+    let deviceSession = null;
+    try { deviceSession = JSON.parse(localStorage.getItem(sessionKey) || 'null'); } catch (e) { deviceSession = null; }
+    
     const messagesEl = document.getElementById('messages');
     const metaEl = document.getElementById('meta');
+    const modelEl = document.getElementById('model');
     const statusEl = document.getElementById('status');
+    const statusPillEl = document.getElementById('status-pill');
+    const planPanelEl = document.getElementById('plan-panel');
+    const approvePlanEl = document.getElementById('approve-plan');
+    const denyPlanEl = document.getElementById('deny-plan');
+    const revisePlanEl = document.getElementById('revise-plan');
+    const refreshStateEl = document.getElementById('refresh-state');
+    const stopTaskEl = document.getElementById('stop-task');
+    const resumeTaskEl = document.getElementById('resume-task');
+    const newTaskEl = document.getElementById('new-task');
+    const steerTaskEl = document.getElementById('steer-task');
+    const projectSelectEl = document.getElementById('project-select');
+    const projectCountBadgeEl = document.getElementById('project-count-badge');
+
+    // New Console elements
+    const globalIndicatorBanner = document.getElementById('global-indicator-banner');
+    const activeTaskContainer = document.getElementById('active-task-container');
+    const attentionTasksContainer = document.getElementById('attention-tasks-container');
+    const queuedPromptsContainer = document.getElementById('queued-prompts-container');
+    const recentTasksList = document.getElementById('recent-tasks-list');
+    const missionContextCard = document.getElementById('mission-context-card');
+    const missionContextRevision = document.getElementById('mission-context-revision');
+    const missionContextTitle = document.getElementById('mission-context-title');
+    const missionContextObjective = document.getElementById('mission-context-objective');
+    const missionContextConditions = document.getElementById('mission-context-conditions');
+    const missionContextBlockers = document.getElementById('mission-context-blockers');
+
+    const installTipEl = document.getElementById('install-tip');
     const form = document.getElementById('prompt-form');
     const promptEl = document.getElementById('prompt');
-    const sendEl = document.getElementById('send');
-    let lastSignature = '';
+    const formModeBar = document.getElementById('form-mode-bar');
+    const formModeLabel = document.getElementById('form-mode-label');
+    const formModeCancel = document.getElementById('form-mode-cancel');
+    const sheetOverlay = document.getElementById('sheet-overlay');
+    const newTaskSheet = document.getElementById('new-task-sheet');
+    const sheetClose = document.getElementById('sheet-close');
+    const projGrid = document.getElementById('proj-grid');
+    const sheetPrompt = document.getElementById('sheet-prompt');
+    const sheetStart = document.getElementById('sheet-start');
+    const ctxRunning = document.getElementById('ctx-controls-running');
+    const ctxIdle = document.getElementById('ctx-controls-idle');
 
-    function escapeHtml(value) {
-      return String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch]));
+    let lastSignature = '';
+    let projectSelectInitialized = false;
+    let lastProjectOptionsSignature = '';
+    let currentConversationId = '';
+    let formMode = 'prompt'; // 'prompt' | 'steer' | 'revise'
+    let availableProjects = [];
+    let selectedSheetProject = '';
+
+    // ── Simple markdown renderer ──────────────────────────────
+    function renderMarkdown(text) {
+      if (!text) return '';
+      let s = String(text);
+      const blocks = [];
+      s = s.replace(/\`\`\`([\w]*)\n?([\s\S]*?)\`\`\`/g, (_, lang, code) => {
+        const idx = blocks.length;
+        blocks.push('<pre><code>' + escapeHtml(code.replace(/^\n|\n$/g, '')) + '</code></pre>');
+        return '\x00BLOCK' + idx + '\x00';
+      });
+      s = escapeHtml(s);
+      s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+      s = s.replace(/\*(.+?)\*/g, '<em>$1</em>');
+      s = s.replace(/\`([^\`]+?)\`/g, '<code>$1</code>');
+      s = s.replace(/\n/g, '<br>');
+      s = s.replace(/\x00BLOCK(\d+)\x00/g, (_, i) => blocks[parseInt(i)]);
+      return s;
     }
 
-    async function loadState() {
+    // ── Form mode (steer / revise / prompt) ──────────────────
+    function setFormMode(mode) {
+      formMode = mode;
+      if (mode === 'steer') {
+        formModeBar.className = 'form-mode-bar visible';
+        formModeLabel.textContent = 'Steering active work';
+        promptEl.placeholder = 'How should Orion adjust its approach?';
+        promptEl.focus();
+      } else if (mode === 'revise') {
+        formModeBar.className = 'form-mode-bar revise-mode visible';
+        formModeLabel.textContent = 'Revising plan';
+        promptEl.placeholder = 'What should change in the plan?';
+        promptEl.focus();
+      } else {
+        formMode = 'prompt';
+        formModeBar.className = 'form-mode-bar';
+        promptEl.placeholder = 'Ask Orion...';
+      }
+    }
+    formModeCancel.addEventListener('click', () => setFormMode('prompt'));
+
+    // ── New Task Sheet ────────────────────────────────────────
+    function openSheet() {
+      sheetOverlay.classList.add('open');
+      newTaskSheet.classList.add('open');
+      rebuildProjGrid();
+      sheetPrompt.value = '';
+      setTimeout(() => sheetPrompt.focus(), 320);
+    }
+    function closeSheet() {
+      sheetOverlay.classList.remove('open');
+      newTaskSheet.classList.remove('open');
+    }
+    function selectSheetProject(path) {
+      selectedSheetProject = path;
+      projGrid.querySelectorAll('.proj-tile').forEach(t => t.classList.toggle('selected', t.dataset.path === path));
+    }
+    function rebuildProjGrid() {
+      let html = '<div class="proj-tile standalone' + (selectedSheetProject === '' ? ' selected' : '') + '" data-path=""><div class="proj-tile-name">&#x2726; Standalone</div><div class="proj-tile-meta">No project workspace</div></div>';
+      availableProjects.forEach(p => {
+        const meta = p.conversationCount ? p.conversationCount + ' conversation' + (p.conversationCount === 1 ? '' : 's') : 'No conversations yet';
+        html += '<div class="proj-tile' + (selectedSheetProject === p.path ? ' selected' : '') + '" data-path="' + escapeHtml(p.path) + '"><div class="proj-tile-name">' + escapeHtml(p.name) + '</div><div class="proj-tile-meta">' + escapeHtml(meta) + '</div></div>';
+      });
+      projGrid.innerHTML = html;
+      projGrid.querySelectorAll('.proj-tile').forEach(t => t.addEventListener('click', () => selectSheetProject(t.dataset.path)));
+    }
+    sheetOverlay.addEventListener('click', closeSheet);
+    sheetClose.addEventListener('click', closeSheet);
+    newTaskEl.addEventListener('click', openSheet);
+    sheetStart.addEventListener('click', async () => {
+      sheetStart.disabled = true;
+      const projectPath = selectedSheetProject;
+      const initialPrompt = sheetPrompt.value.trim();
       try {
-        const res = await fetch('/api/state?token=' + encodeURIComponent(token));
-        const state = await res.json();
-        if (!state.success) throw new Error(state.error || 'Failed to load state');
-        metaEl.textContent = (state.title || 'No active conversation') + (state.workspace ? ' · ' + state.workspace : '');
-        statusEl.textContent = state.running ? 'Orion is working...' : '';
-        const signature = JSON.stringify({ running: state.running, messages: state.messages });
-        if (signature !== lastSignature) {
-          lastSignature = signature;
-          if (!state.messages || state.messages.length === 0) {
-            messagesEl.innerHTML = '<div class="empty">No messages yet.</div>';
-          } else {
-            messagesEl.innerHTML = state.messages.map(msg => (
-              '<div class="message ' + escapeHtml(msg.role) + '"><span class="role">' + escapeHtml(msg.role) + '</span>' + escapeHtml(msg.text) + '</div>'
-            )).join('');
-            window.scrollTo(0, document.body.scrollHeight);
-          }
+        const res = await companionFetch('/api/conversations/new', { method: 'POST', body: JSON.stringify({ prompt: '', projectPath }) });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'New task failed');
+        currentConversationId = data.conversationId || currentConversationId;
+        closeSheet();
+        if (initialPrompt) {
+          const pRes = await companionFetch('/api/prompt', { method: 'POST', body: JSON.stringify({ prompt: initialPrompt }) });
+          const pData = await pRes.json();
+          if (!pData.success) statusEl.textContent = pData.error || 'Send failed';
         }
+        await loadState();
+      } catch (err) {
+        statusEl.textContent = err.message;
+      } finally {
+        sheetStart.disabled = false;
+      }
+    });
+    
+    function escapeHtml(value) { return String(value || '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch])); }
+    
+    async function switchTask(taskId) {
+      if (!taskId) return;
+      statusEl.textContent = 'Switching console view...';
+      try {
+        const res = await companionFetch('/api/conversations/switch', { method:'POST', body: JSON.stringify({ conversationId: taskId }) });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Switch failed');
+        await loadState();
       } catch (error) {
         statusEl.textContent = error.message;
       }
     }
+    window.switchTask = switchTask;
 
+    async function loadState() {
+      try {
+        if (!deviceSession) {
+          statusEl.textContent = 'Pairing with Orion...';
+          statusPillEl.textContent = 'Pairing';
+          const pairResult = await pairIfNeeded();
+          if (!pairResult.success) {
+            statusPillEl.textContent = 'Pairing';
+            if (!pairResult.pending) {
+              statusEl.innerHTML = 'Pairing denied. <button class="btn-sm" onclick="location.reload()">Retry Pairing</button>';
+              clearInterval(statePollInterval);
+            }
+            return;
+          }
+        }
+        const res = await companionFetch('/api/state');
+        if (res.status === 401) {
+          localStorage.removeItem(sessionKey);
+          deviceSession = null;
+          statusEl.textContent = 'Session invalid or revoked. Re-pairing...';
+          setTimeout(() => { location.reload(); }, 1500);
+          return;
+        }
+        const state = await res.json();
+        if (!state.success) throw new Error(state.error || 'Failed to load state');
+        
+        currentConversationId = state.conversationId || '';
+        metaEl.textContent = state.title || 'No active conversation';
+        modelEl.textContent = state.model || '-';
+        const phoneSubStatus = state.subStatus || '';
+        const phoneAgentState = state.awaitingPlanApproval
+          ? 'Review'
+          : (!state.running
+            ? 'Ready'
+            : (/run_tests|test|verif/i.test(phoneSubStatus)
+              ? 'Verifying'
+              : (/running tool/i.test(phoneSubStatus) || state.executionMode === 'executing' || state.executionMode === 'direct' ? 'Acting' : 'Thinking')));
+        statusPillEl.textContent = phoneAgentState;
+        statusPillEl.classList.toggle('running', !!state.running);
+        statusEl.textContent = state.subStatus || state.workspace || '';
+        
+        planPanelEl.classList.toggle('visible', !!state.awaitingPlanApproval);
+        
+        // 1. Render Globally Running / View Indicator
+        const viewingId = state.conversationId;
+        const runningId = state.runningConversationId;
+        const globalRunning = !!state.globalRunning;
+
+        if (globalRunning) {
+          if (viewingId === runningId) {
+            globalIndicatorBanner.className = 'indicator-banner active-running';
+            globalIndicatorBanner.innerHTML = '<span>Viewing globally running task</span>';
+          } else {
+            const runningTaskObj = (state.conversations || []).find(c => c.id === runningId);
+            const runningTitle = runningTaskObj ? runningTaskObj.title : 'Another Task';
+            globalIndicatorBanner.className = 'indicator-banner background-running';
+            globalIndicatorBanner.innerHTML = '<span>Running: <strong>' + escapeHtml(runningTitle) + '</strong></span><button onclick="switchTask(\\\'' + escapeHtml(runningId) + '\\\')">Switch View</button>';
+          }
+        } else {
+          globalIndicatorBanner.className = 'indicator-banner idle';
+          globalIndicatorBanner.innerHTML = '<span>Agent is currently idle</span>';
+        }
+
+        // 2. Render Active Task Card
+        const activeConv = (state.conversations || []).find(c => c.id === viewingId);
+        if (activeConv) {
+          const isRunning = globalRunning && runningId === viewingId;
+          const statusText = isRunning ? 'Running' : (activeConv.awaitingPlanApproval ? 'Needs Attention' : 'Idle');
+          const badgeClass = isRunning ? 'success' : (activeConv.awaitingPlanApproval ? 'warning' : 'muted');
+          
+          activeTaskContainer.innerHTML = \`
+            <div class="card-header">
+              <span class="sub-panel-title">Current Task View</span>
+              <div style="display:flex; gap:6px;">
+                <span class="badge \${badgeClass} \${isRunning ? 'pulse' : ''}">\${statusText}</span>
+                <span class="badge active-view">Viewing</span>
+              </div>
+            </div>
+            <div class="card-title">\${escapeHtml(activeConv.title)}</div>
+            <div class="substatus-text">\${escapeHtml(state.subStatus || state.workspace || '')}</div>
+          \`;
+        } else {
+          activeTaskContainer.innerHTML = '<div class="empty">No task selected</div>';
+        }
+
+        // Mission-level context follows the selected conversation without exposing discarded noise.
+        const missionContext = state.operationalContext || {};
+        const hasMissionContext = !!(missionContext.mission || (missionContext.winConditions || []).length);
+        missionContextCard.classList.toggle('visible', hasMissionContext);
+        if (hasMissionContext) {
+          missionContextRevision.textContent = 'r' + (missionContext.revision || 0);
+          missionContextTitle.textContent = missionContext.mission || 'Mission not defined';
+          missionContextObjective.textContent = missionContext.activeSubplan
+            ? 'Now: ' + missionContext.activeSubplan.title + ' (' + missionContext.activeSubplan.status + ')'
+            : (missionContext.activeObjective ? 'Objective: ' + missionContext.activeObjective : 'No active objective');
+          missionContextConditions.innerHTML = (missionContext.winConditions || []).map(condition =>
+            '<div class="mission-mobile-condition ' + escapeHtml(condition.status) + '">' +
+              '<span class="mission-mobile-dot"></span><span>' + escapeHtml(condition.title) + '</span>' +
+            '</div>'
+          ).join('');
+          missionContextBlockers.innerHTML = (missionContext.blockers || []).map(blocker =>
+            '<div class="mission-mobile-blocker">Blocked: ' + escapeHtml(blocker.title) + '</div>'
+          ).join('');
+        }
+
+        // 3. Needs Attention / Plan Waiting Tasks
+        const attentionTasks = (state.conversations || []).filter(c => c.awaitingPlanApproval);
+        if (attentionTasks.length > 0) {
+          attentionTasksContainer.innerHTML = attentionTasks.map(c => {
+            const isViewing = c.id === viewingId;
+            return '<div class="dashboard-card attention-card">' +
+              '<div class="card-header">' +
+                '<span class="badge warning">Plan Awaiting Approval</span>' +
+                (isViewing ? '<span class="badge active-view">Viewing</span>' : '') +
+              '</div>' +
+              '<div class="card-title">' + escapeHtml(c.title) + '</div>' +
+              '<div class="card-actions" style="margin-top: 8px;">' +
+                (isViewing ? '' : '<button class="btn-sm" onclick="switchTask(\\\'' + escapeHtml(c.id) + '\\\')">Switch to Approve</button>') +
+              '</div>' +
+            '</div>';
+          }).join('');
+        } else {
+          attentionTasksContainer.innerHTML = '';
+        }
+
+        // 4. Queued Prompts
+        if (state.queuedPrompts > 0) {
+          queuedPromptsContainer.innerHTML = \`
+            <div class="sub-panel-title">Queued Prompts (\${state.queuedPrompts})</div>
+            <div class="queued-list">
+              \${(state.queuedPromptPreview || []).map(p => '<div class="queued-item">' + escapeHtml(p) + '</div>').join('')}
+            </div>
+          \`;
+          queuedPromptsContainer.style.display = 'block';
+        } else {
+          queuedPromptsContainer.style.display = 'none';
+        }
+
+        // 5. Recent Tasks List
+        if (state.conversations && state.conversations.length > 0) {
+          recentTasksList.innerHTML = state.conversations.map(c => {
+            const isViewing = c.id === viewingId;
+            const isRunning = globalRunning && c.id === runningId;
+            const isAwaiting = !!c.awaitingPlanApproval;
+            
+            let badgesHtml = '';
+            if (isViewing) badgesHtml += '<span class="badge active-view" style="margin-left:4px;">Viewing</span>';
+            if (isRunning) badgesHtml += '<span class="badge success pulse" style="margin-left:4px;">Running</span>';
+            if (isAwaiting) badgesHtml += '<span class="badge warning" style="margin-left:4px;">Attention</span>';
+            if (!isViewing && !isRunning && !isAwaiting) badgesHtml += '<span class="badge muted" style="margin-left:4px;">Ready</span>';
+
+            const timeText = new Date(c.updatedAt || 0).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+            return '<div class="task-row' + (isViewing ? ' active-row' : '') + '" onclick="switchTask(\\\'' + escapeHtml(c.id) + '\\\')">' +
+              '<div class="task-row-left" style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding-right:8px;">' +
+                '<div class="task-row-title" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + escapeHtml(c.title) + '</div>' +
+                '<div class="task-row-meta">Updated: ' + timeText + ' - ' + c.taskCount + ' items</div>' +
+              '</div>' +
+              '<div class="task-row-right" style="display:flex; align-items:center;">' +
+                badgesHtml +
+              '</div>' +
+            '</div>';
+          }).join('');
+        } else {
+          recentTasksList.innerHTML = '<div class="empty">No tasks in workspace.</div>';
+        }
+
+        // 6. Upgraded Activity Tab Content
+        const preview = state.preview || {};
+        document.getElementById('tab-output').textContent = preview.latestAssistantOutput || 'No assistant output yet.';
+        
+        const walkthroughPane = document.getElementById('tab-walkthrough');
+        walkthroughPane.textContent = preview.workWalkthrough || 'No walkthrough yet.';
+
+        const filesPane = document.getElementById('tab-files');
+        if (Array.isArray(preview.changedFiles) && preview.changedFiles.length) {
+          filesPane.innerHTML = preview.changedFiles.map(f => '<div style="margin-bottom:4px; font-family: monospace; font-size: 0.72rem;">' + escapeHtml(f) + '</div>').join('');
+        } else {
+          filesPane.textContent = 'No changed files recorded.';
+        }
+
+        const testsPane = document.getElementById('tab-tests');
+        if (Array.isArray(preview.testResults) && preview.testResults.length) {
+          testsPane.innerHTML = preview.testResults.map(r => '<div class="test-result-block" style="font-family: monospace; white-space: pre-wrap;">' + escapeHtml(r) + '</div>').join('');
+        } else {
+          testsPane.textContent = 'No test results recorded.';
+        }
+
+        const launchUrlContainer = document.getElementById('launch-url-container');
+        if (preview.appLaunchUrl) {
+          launchUrlContainer.innerHTML = '<strong>Launch URL:</strong> <a href="' + escapeHtml(preview.appLaunchUrl) + '" target="_blank" style="color:var(--accent); text-decoration:underline;">' + escapeHtml(preview.appLaunchUrl) + '</a>';
+        } else {
+          launchUrlContainer.textContent = 'No app launch URL recorded.';
+        }
+
+        const launchLogsContainer = document.getElementById('launch-logs-container');
+        launchLogsContainer.textContent = preview.appLaunchLogs || 'No launch logs yet.';
+
+        const projects = Array.isArray(state.projects) ? state.projects : [];
+        availableProjects = projects;
+        projectCountBadgeEl.textContent = projects.length + (projects.length === 1 ? ' Project' : ' Projects');
+
+        // Keep hidden select in sync for compatibility
+        const projectOptionsSignature = JSON.stringify(projects.map(p => p.path));
+        if (projectOptionsSignature !== lastProjectOptionsSignature) {
+          projectSelectEl.innerHTML = '<option value="">Standalone conversation</option>' + projects.map(p => '<option value="' + escapeHtml(p.path) + '">' + escapeHtml(p.name) + '</option>').join('');
+          lastProjectOptionsSignature = projectOptionsSignature;
+        }
+
+        // Update contextual controls visibility
+        const isRunning = !!state.running;
+        ctxRunning.classList.toggle('visible', isRunning);
+        ctxIdle.classList.toggle('visible', !isRunning);
+
+        // 7. Render Messages Feed
+        const signature = JSON.stringify({ running: state.running, subStatus: state.subStatus, plan: state.awaitingPlanApproval, conversations: state.conversations, projects: state.projects, messages: state.messages });
+        if (signature !== lastSignature) {
+          lastSignature = signature;
+          messagesEl.innerHTML = !state.messages || state.messages.length === 0 ? '<div class="empty">No messages yet.</div>' : state.messages.map(msg => '<div class="message ' + escapeHtml(msg.role) + '"><span class="role">' + escapeHtml(msg.role) + '</span>' + (msg.role === 'system' ? escapeHtml(msg.text) : renderMarkdown(msg.text)) + '</div>').join('');
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+      } catch (error) {
+        statusEl.textContent = error.message;
+        statusPillEl.textContent = 'Offline';
+        statusPillEl.classList.remove('running');
+      }
+    }
+    
+    approvePlanEl.addEventListener('click', async () => {
+      const originalLabel = approvePlanEl.textContent;
+      approvePlanEl.disabled = true;
+      approvePlanEl.textContent = 'Starting…';
+      statusEl.textContent = 'Starting approved plan...';
+      try {
+        const res = await companionFetch('/api/approve-plan', { method: 'POST' });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Approval failed');
+        approvePlanEl.classList.add('approved');
+        approvePlanEl.textContent = '✓ Implementation Started';
+        await loadState();
+      } catch (error) {
+        statusEl.textContent = error.message;
+        approvePlanEl.disabled = false;
+        approvePlanEl.textContent = originalLabel;
+      }
+    });
+    denyPlanEl.addEventListener('click', async () => {
+      const res = await companionFetch('/api/deny-plan', { method: 'POST' });
+      const data = await res.json();
+      if (!data.success) statusEl.textContent = data.error || 'Deny failed';
+      await loadState();
+    });
+    revisePlanEl.addEventListener('click', () => setFormMode('revise'));
+    refreshStateEl.addEventListener('click', loadState);
+    steerTaskEl.addEventListener('click', () => setFormMode('steer'));
+    stopTaskEl.addEventListener('click', async () => {
+      stopTaskEl.disabled = true;
+      statusEl.textContent = 'Stopping active work...';
+      try {
+        const res = await companionFetch('/api/stop', { method: 'POST' });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Stop failed');
+        await loadState();
+      } catch (error) {
+        statusEl.textContent = error.message;
+      } finally {
+        stopTaskEl.disabled = false;
+      }
+    });
+    resumeTaskEl.addEventListener('click', async () => {
+      resumeTaskEl.disabled = true;
+      statusEl.textContent = 'Resuming work...';
+      try {
+        const res = await companionFetch('/api/resume', { method: 'POST' });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Resume failed');
+        await loadState();
+      } catch (error) {
+        statusEl.textContent = error.message;
+      } finally {
+        resumeTaskEl.disabled = false;
+      }
+    });
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
-      const prompt = promptEl.value.trim();
-      if (!prompt) return;
-      sendEl.disabled = true;
+      const text = promptEl.value.trim();
+      if (!text) return;
+      document.getElementById('send').disabled = true;
       statusEl.textContent = 'Sending...';
       try {
-        const res = await fetch('/api/prompt?token=' + encodeURIComponent(token), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt })
-        });
-        const data = await res.json();
-        if (!data.success) throw new Error(data.error || 'Send failed');
+        if (formMode === 'steer') {
+          const res = await companionFetch('/api/steer', { method: 'POST', body: JSON.stringify({ prompt: text }) });
+          const data = await res.json();
+          if (!data.success) throw new Error(data.error || 'Steer failed');
+          setFormMode('prompt');
+        } else if (formMode === 'revise') {
+          const res = await companionFetch('/api/revise-plan', { method: 'POST', body: JSON.stringify({ feedback: text }) });
+          const data = await res.json();
+          if (!data.success) throw new Error(data.error || 'Revision failed');
+          setFormMode('prompt');
+        } else {
+          if (!currentConversationId) {
+            const newTaskRes = await companionFetch('/api/conversations/new', { method: 'POST', body: JSON.stringify({ prompt: '', projectPath: '' }) });
+            const newTask = await newTaskRes.json();
+            if (!newTask.success) throw new Error(newTask.error || 'New task failed');
+            currentConversationId = newTask.conversationId || currentConversationId;
+          }
+          const res = await companionFetch('/api/prompt', { method: 'POST', body: JSON.stringify({ prompt: text }) });
+          const data = await res.json();
+          if (!data.success) throw new Error(data.error || 'Send failed');
+        }
         promptEl.value = '';
         await loadState();
       } catch (error) {
         statusEl.textContent = error.message;
       } finally {
-        sendEl.disabled = false;
+        document.getElementById('send').disabled = false;
       }
     });
+    promptEl.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); form.requestSubmit(); } });
+    
+    // Wire tab clicks
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const parent = btn.closest('.activity-panel');
+        parent.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        parent.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+        btn.classList.add('active');
+        const targetId = btn.getAttribute('data-tab');
+        document.getElementById(targetId).classList.add('active');
+      });
+    });
 
+    window.addEventListener('beforeinstallprompt', event => { event.preventDefault(); installTipEl.classList.add('visible'); installTipEl.textContent = 'This companion is installable. Open your browser menu and choose Install app or Add to Home Screen.'; });
+    async function companionFetch(url, options = {}) {
+      const headers = Object.assign({ 'Content-Type': 'application/json' }, options.headers || {});
+      if (deviceSession) {
+        headers.Authorization = 'Bearer ' + deviceSession.secret;
+        headers['X-Orion-Device-Id'] = deviceSession.deviceId;
+      }
+      return fetch(url, Object.assign({}, options, { headers }));
+    }
+    let isPairing = false;
+    async function pairIfNeeded() {
+      if (deviceSession) return { success: true };
+      if (isPairing) return { success: false, pending: true };
+      isPairing = true;
+      const code = new URLSearchParams(location.search).get('pair') || pairingCode;
+      const name = (navigator.userAgent || 'Phone').slice(0, 64);
+      try {
+        const res = await fetch('/api/pair', { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ pairingCode: code, deviceName: name }) });
+        const data = await res.json();
+        if (!data.success) {
+          statusEl.textContent = data.error || 'Pairing pending or denied';
+          return { success: false, pending: data.pending !== false };
+        }
+        deviceSession = { deviceId: data.device.id, secret: data.sessionSecret };
+        localStorage.setItem(sessionKey, JSON.stringify(deviceSession));
+        statusEl.textContent = 'Connected';
+        return { success: true };
+      } catch (err) {
+        statusEl.textContent = 'Connection error: ' + err.message;
+        return { success: false, pending: true };
+      } finally {
+        isPairing = false;
+      }
+    }
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
     loadState();
-    setInterval(loadState, 2500);
+    const statePollInterval = setInterval(loadState, 3000);
   </script>
 </body>
 </html>`;
@@ -267,6 +2985,49 @@ function runGitCommand(cwd, args, timeoutMs = 30000) {
   });
 }
 
+let lastLaunchLogs = '';
+
+function appendLaunchLog(data) {
+  lastLaunchLogs += data;
+  if (lastLaunchLogs.length > 50000) {
+    lastLaunchLogs = lastLaunchLogs.slice(-20000);
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.executeJavaScript(`window.lastLaunchLogs = ${JSON.stringify(lastLaunchLogs)}`).catch(() => {});
+  }
+}
+
+function spawnInternalCommand(workspacePath, executable, args = []) {
+  if (!executable) throw new Error('Missing executable');
+  lastLaunchLogs = '';
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.executeJavaScript(`window.lastLaunchLogs = ''; window.lastLaunchUrl = '';`).catch(() => {});
+  }
+  const child = spawn(executable, args, {
+    cwd: workspacePath,
+    env: { ...process.env, PAGER: 'cat' },
+    windowsHide: true,
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  child.stdout.on('data', data => {
+    const text = data.toString();
+    appendLaunchLog(text);
+    const match = text.match(/https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0):\d+/i);
+    if (match) {
+      const url = match[0];
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.executeJavaScript(`window.lastLaunchUrl = ${JSON.stringify(url)}`).catch(() => {});
+      }
+    }
+  });
+  child.stderr.on('data', data => {
+    appendLaunchLog(data.toString());
+  });
+  child.unref();
+  return child;
+}
+
 async function callRendererFunction(functionName, arg) {
   if (!mainWindow || mainWindow.isDestroyed()) throw new Error('Orion window is not ready');
   const script = arg === undefined
@@ -281,25 +3042,139 @@ function startPhoneCompanionServer() {
   if (companionServer) return;
   const config = readAppConfig();
   const port = Number(config.phoneCompanionPort || 5000);
+  const enableCompanion = config.enablePhoneCompanion !== false;
+  const host = enableCompanion ? '0.0.0.0' : '127.0.0.1';
   companionToken = ensureCompanionToken(config);
+  const pairingCode = ensureCompanionPairingCode(config);
 
   companionServer = http.createServer(async (req, res) => {
     try {
+      const latestConfig = readAppConfig();
       const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
       if (url.pathname === '/') {
+        const freshPairingCode = ensureCompanionPairingCode(readAppConfig());
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-        res.end(companionHtml(companionToken));
+        res.end(companionHtml(freshPairingCode));
         return;
       }
 
-      if (url.searchParams.get('token') !== companionToken) {
+      if (req.method === 'GET' && url.pathname === '/icon.svg') {
+        res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Cache-Control': 'public, max-age=86400' });
+        res.end(companionIconSvg());
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/manifest.webmanifest') {
+        res.writeHead(200, { 'Content-Type': 'application/manifest+json; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(companionManifest(), null, 2));
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/sw.js') {
+        res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store', 'Service-Worker-Allowed': '/' });
+        res.end(companionServiceWorker());
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/pair') {
+        const bodyText = await readRequestBody(req);
+        const body = bodyText ? JSON.parse(bodyText) : {};
+        const submittedPairingCode = String(body.pairingCode || '');
+        const configuredPairingCode = String(latestConfig.phoneCompanionPairingCode || pairingCode);
+        const pairingExpired = Date.parse(latestConfig.phoneCompanionPairingExpiresAt || '') <= Date.now();
+        const matchesConfiguredCode = submittedPairingCode === configuredPairingCode;
+        const matchesServedCode = submittedPairingCode === String(pairingCode || '');
+        if ((!matchesConfiguredCode || pairingExpired) && !matchesServedCode) {
+          sendJson(res, 401, { success: false, error: 'Invalid pairing code' });
+          return;
+        }
+        if (pairingExpired || !matchesConfiguredCode) {
+          const writableConfig = readAppConfig();
+          writableConfig.phoneCompanionPairingCode = submittedPairingCode;
+          writableConfig.phoneCompanionPairingExpiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+          writeAppConfig(writableConfig);
+        }
+        const deviceName = String(body.deviceName || 'Phone').slice(0, 80);
+        const requireDesktopApproval = latestConfig.phoneCompanionRequireDesktopApproval === true;
+        let approved = !requireDesktopApproval;
+        let pending = false;
+        if (requireDesktopApproval) {
+          try {
+            const approval = await callRendererFunction('approvePhoneCompanionPairing', { deviceName });
+            approved = approval && approval.approved !== false;
+            pending = approval && approval.pending === true;
+          } catch (e) {
+            approved = false;
+          }
+        }
+        if (!approved) {
+          sendJson(res, 403, { success: false, error: pending ? 'Desktop approval required' : 'Pairing denied', pending });
+          return;
+        }
+        const writableConfig = readAppConfig();
+        const device = createCompanionDeviceSession(writableConfig, deviceName);
+        sendJson(res, 200, { success: true, device: companionDevicePublic(device), sessionSecret: device.secret });
+        return;
+      }
+
+      const device = authenticateCompanionRequest(req, latestConfig);
+      if (!device) {
         sendJson(res, 401, { success: false, error: 'Unauthorized companion request' });
         return;
       }
 
+      if (req.method === 'GET' && url.pathname === '/api/devices') {
+        sendJson(res, 200, { success: true, devices: getCompanionDevices(latestConfig).map(companionDevicePublic) });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/devices/revoke') {
+        const bodyText = await readRequestBody(req);
+        const body = bodyText ? JSON.parse(bodyText) : {};
+        const revokeId = String(body.deviceId || device.id);
+        const writableConfig = readAppConfig();
+        const devices = getCompanionDevices(writableConfig).map(d => d.id === revokeId ? { ...d, revoked: true } : d);
+        writableConfig.phoneCompanionDevices = devices;
+        writeAppConfig(writableConfig);
+        sendJson(res, 200, { success: true, revoked: revokeId });
+        return;
+      }
+
       if (req.method === 'GET' && url.pathname === '/api/state') {
-        const state = await callRendererFunction('getPhoneCompanionState');
-        sendJson(res, 200, { success: true, ...state });
+        const state = await callRendererFunction('getPhoneCompanionState', device.selectedConversationId);
+        sendJson(res, 200, { success: true, device: companionDevicePublic(device), ...state });
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/preview') {
+        const state = await callRendererFunction('getPhoneCompanionState', device.selectedConversationId);
+        sendJson(res, 200, { success: true, preview: state.preview || {} });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/conversations/switch') {
+        const bodyText = await readRequestBody(req);
+        const body = bodyText ? JSON.parse(bodyText) : {};
+        const targetId = String(body.conversationId || '');
+        if (targetId) {
+          device.selectedConversationId = targetId;
+          const writableConfig = readAppConfig();
+          saveCompanionDevice(writableConfig, device);
+        }
+        sendJson(res, 200, { success: true, conversationId: targetId });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/conversations/new') {
+        const bodyText = await readRequestBody(req);
+        const body = bodyText ? JSON.parse(bodyText) : {};
+        const result = await callRendererFunction('startPhoneCompanionTask', body);
+        if (result && result.success && result.conversationId) {
+          device.selectedConversationId = result.conversationId;
+          const writableConfig = readAppConfig();
+          saveCompanionDevice(writableConfig, device);
+        }
+        sendJson(res, 200, { success: true, ...result });
         return;
       }
 
@@ -311,7 +3186,47 @@ function startPhoneCompanionServer() {
           sendJson(res, 400, { success: false, error: 'Missing prompt' });
           return;
         }
-        const result = await callRendererFunction('submitPhoneCompanionPrompt', prompt);
+        const result = await callRendererFunction('submitPhoneCompanionPrompt', { prompt, conversationId: device.selectedConversationId });
+        sendJson(res, 200, { success: true, ...result });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/approve-plan') {
+        const result = await callRendererFunction('approvePhoneCompanionPlan', device.selectedConversationId);
+        sendJson(res, 200, { success: true, ...result });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/steer') {
+        const bodyText = await readRequestBody(req);
+        const body = bodyText ? JSON.parse(bodyText) : {};
+        const result = await callRendererFunction('steerPhoneCompanionTask', { prompt: String(body.prompt || body.feedback || '').trim(), conversationId: device.selectedConversationId });
+        sendJson(res, 200, { success: true, ...result });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/deny-plan') {
+        const result = await callRendererFunction('denyPhoneCompanionPlan', device.selectedConversationId);
+        sendJson(res, 200, { success: true, ...result });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/revise-plan') {
+        const bodyText = await readRequestBody(req);
+        const body = bodyText ? JSON.parse(bodyText) : {};
+        const result = await callRendererFunction('revisePhoneCompanionPlan', { feedback: String(body.feedback || '').trim(), conversationId: device.selectedConversationId });
+        sendJson(res, 200, { success: true, ...result });
+        return;
+      }
+
+      if (req.method === 'POST' && (url.pathname === '/api/stop' || url.pathname === '/api/pause')) {
+        const result = await callRendererFunction('stopPhoneCompanionTask', device.selectedConversationId);
+        sendJson(res, 200, { success: true, ...result });
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/resume') {
+        const result = await callRendererFunction('resumePhoneCompanionTask', device.selectedConversationId);
         sendJson(res, 200, { success: true, ...result });
         return;
       }
@@ -322,15 +3237,25 @@ function startPhoneCompanionServer() {
     }
   });
 
-  companionServer.listen(port, '0.0.0.0', () => {
-    const address = getLocalWifiAddress();
-    const url = `http://${address}:${port}/?token=${companionToken}`;
-    console.log(`Orion phone companion listening at ${url}`);
-    setTimeout(() => {
+  companionServer.listen(port, host, () => {
+    const address = enableCompanion ? getLocalWifiAddress() : '127.0.0.1';
+    const url = `http://${address}:${port}/?pair=${encodeURIComponent(pairingCode)}`;
+    console.log(`Orion phone companion listening at ${url} (Host: ${host})`);
+    setTimeout(async () => {
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.executeJavaScript(
-          `window.appendSystemMessage && window.appendSystemMessage(${JSON.stringify(`Phone Companion is available on this Wi-Fi at ${url}`)}, { dedupeKey: 'phone-companion-url', windowMs: 60000 })`
-        ).catch(() => {});
+        try {
+          const payload = await buildCompanionPairingAnnouncement({
+            address,
+            port,
+            pairingCode,
+            expiresAt: readAppConfig().phoneCompanionPairingExpiresAt || ''
+          });
+          mainWindow.webContents.executeJavaScript(
+            `window.showPhoneCompanionPairingCard && window.showPhoneCompanionPairingCard(${JSON.stringify(payload)}, { dedupeKey: 'phone-companion-pairing', windowMs: 60000 })`
+          ).catch(() => {});
+        } catch (e) {
+          console.error('Failed to build phone companion pairing card:', e);
+        }
       }
     }, 2500);
   });
@@ -338,6 +3263,71 @@ function startPhoneCompanionServer() {
   companionServer.on('error', (error) => {
     console.error('Phone companion server failed:', error);
   });
+}
+
+async function enablePhoneCompanionLanMode() {
+  const config = readAppConfig();
+  config.enablePhoneCompanion = true;
+  writeAppConfig(config);
+  await stopPhoneCompanionServer();
+  startPhoneCompanionServer();
+  return await getPhoneCompanionPairingPayload();
+}
+
+ipcMain.handle('get-phone-companion-pairing', async () => {
+  return await getPhoneCompanionPairingPayload();
+});
+
+ipcMain.handle('enable-phone-companion-lan', async () => {
+  return await enablePhoneCompanionLanMode();
+});
+
+ipcMain.handle('get-phone-companion-devices', async () => {
+  const config = readAppConfig();
+  return getCompanionDevices(config).map(companionDevicePublic);
+});
+
+ipcMain.handle('revoke-phone-companion-device', async (event, deviceId) => {
+  const config = readAppConfig();
+  const devices = getCompanionDevices(config).map(d => d.id === deviceId ? { ...d, revoked: true } : d);
+  config.phoneCompanionDevices = devices;
+  writeAppConfig(config);
+  return { success: true, revoked: deviceId };
+});
+
+async function getPhoneCompanionPairingPayload() {
+  const config = readAppConfig();
+  const port = Number(config.phoneCompanionPort || 5000);
+  const enableCompanion = config.enablePhoneCompanion !== false;
+  const address = enableCompanion ? getLocalWifiAddress() : '127.0.0.1';
+  const pairingCode = ensureCompanionPairingCode(config);
+  const latestConfig = readAppConfig();
+  if (!enableCompanion) {
+    return {
+      success: true,
+      type: 'phone-companion-pairing',
+      enabled: false,
+      networkEnabled: false,
+      bindHost: '127.0.0.1',
+      address,
+      port,
+      title: 'Pair Phone Companion',
+      description: 'Phone Companion is off. Use the Phone button to enable Wi-Fi pairing.'
+    };
+  }
+  return {
+    success: true,
+    enabled: true,
+    bindHost: '0.0.0.0',
+    address,
+    port,
+    ...(await buildCompanionPairingAnnouncement({
+      address,
+      port,
+      pairingCode,
+      expiresAt: latestConfig.phoneCompanionPairingExpiresAt || ''
+    }))
+  };
 }
 
 // --- IPC WINDOW CONTROLS ---
@@ -351,7 +3341,7 @@ ipcMain.on('window-minimize', () => {
 
 ipcMain.on('window-maximize', () => {
   if (mainWindow) {
-    if (mainWindow.isFullscreen()) {
+    if (mainWindow.isFullScreen()) {
       mainWindow.setFullScreen(false);
       mainWindow.maximize();
     } else if (mainWindow.isMaximized()) {
@@ -403,10 +3393,10 @@ ipcMain.handle('launch-workspace-app', async (event, workspacePath) => {
     
     // 1. Check for index.html (standard web games/apps)
     if (files.includes('index.html')) {
-      const fullPath = path.join(workspacePath, 'index.html');
       const { shell } = require('electron');
-      await shell.openPath(fullPath);
-      return { success: true, message: 'Opened index.html in default browser.' };
+      const url = await startStaticWorkspaceServer(workspacePath);
+      await shell.openExternal(url);
+      return { success: true, message: `Opened index.html at ${url}.`, url };
     }
     
     // 2. Check for package.json
@@ -423,7 +3413,11 @@ ipcMain.handle('launch-workspace-app', async (event, workspacePath) => {
       }
       
       if (cmd) {
-        launchCommandInWorkspace(workspacePath, cmd);
+        if (cmd === 'npm start') {
+          launchInternalCommandInWorkspace(workspacePath, 'npm', ['start']);
+        } else {
+          launchInternalCommandInWorkspace(workspacePath, 'npm', ['run', 'dev']);
+        }
         return { success: true, message: `Started background server with command: "${cmd}"` };
       }
     }
@@ -433,19 +3427,19 @@ ipcMain.handle('launch-workspace-app', async (event, workspacePath) => {
     const foundPy = pythonFiles.find(f => files.includes(f));
     if (foundPy) {
       launchCommandInWorkspace(workspacePath, `python ${foundPy}`);
-      return { success: true, message: `Started Python application: "python ${foundPy}"` };
+      return { success: true, message: `Started Python application in terminal: "python ${foundPy}"` };
     }
     
     // 4. Check for Cargo.toml (Rust)
     if (files.includes('Cargo.toml')) {
       launchCommandInWorkspace(workspacePath, 'cargo run');
-      return { success: true, message: 'Started Cargo application: "cargo run"' };
+      return { success: true, message: 'Started Cargo application in terminal: "cargo run"' };
     }
     
     // 5. Check for Go files
     if (files.includes('go.mod') || files.some(f => f.endsWith('.go'))) {
       launchCommandInWorkspace(workspacePath, 'go run .');
-      return { success: true, message: 'Started Go application: "go run ."' };
+      return { success: true, message: 'Started Go application in terminal: "go run ."' };
     }
     
     return { success: false, error: 'Could not auto-detect a runnable entry point (index.html, package.json, main.py, Cargo.toml, etc.).' };
@@ -486,13 +3480,28 @@ function escapePowerShellSingle(value) {
 }
 
 function launchCommandInWorkspace(workspacePath, command) {
+  if (!command) throw new Error('Missing command');
+  if (isDestructiveCommand(command)) {
+    throw new Error('Command is in the deny-list and cannot be executed.');
+  }
+
   if (process.platform === 'win32') {
     const commandText = `Set-Location -LiteralPath '${escapePowerShellSingle(workspacePath)}'; ${command}`;
-    const runCmd = `Start-Process powershell -ArgumentList '-NoExit', '-Command', '${escapePowerShellSingle(commandText)}'`;
-    exec(runCmd);
+    spawn('cmd.exe', [
+      '/c',
+      'start',
+      'powershell.exe',
+      '-NoExit',
+      '-Command',
+      commandText
+    ], { windowsHide: true, detached: true, stdio: 'ignore' });
   } else {
     spawn('bash', ['-lc', command], { cwd: workspacePath, detached: true, stdio: 'ignore' });
   }
+}
+
+function launchInternalCommandInWorkspace(workspacePath, executable, args = []) {
+  spawnInternalCommand(workspacePath, executable, args);
 }
 
 ipcMain.handle('get-workspace-entrypoint', async (event, workspacePath) => {
@@ -559,6 +3568,10 @@ ipcMain.handle('read-config', async () => {
   return readAppConfig();
 });
 
+ipcMain.handle('get-app-runtime-info', async () => {
+  return getAppRuntimeInfo();
+});
+
 ipcMain.handle('write-config', async (event, config) => {
   try {
     writeAppConfig(config);
@@ -573,7 +3586,7 @@ ipcMain.handle('list-files', async (event, dirPath) => {
   try {
     if (!dirPath) return [];
     if (!fs.existsSync(dirPath)) {
-      fs.mkdirSync(dirPath, { recursive: true });
+      throw new Error(`Directory does not exist: ${dirPath}`);
     }
     
     // Recursive directory helper, excluding node_modules, .git, etc.
@@ -583,7 +3596,7 @@ ipcMain.handle('list-files', async (event, dirPath) => {
       
       list.forEach((file) => {
         const filePath = path.join(dir, file);
-        const stat = fs.statSync(filePath);
+        const stat = fs.lstatSync(filePath);
         const relPath = path.relative(rootDir, filePath);
         
         // Exclude common build/version control folders
@@ -591,7 +3604,9 @@ ipcMain.handle('list-files', async (event, dirPath) => {
           return;
         }
         
-        if (stat.isDirectory()) {
+        if (stat.isSymbolicLink()) {
+          return;
+        } else if (stat.isDirectory()) {
           results.push({ name: file, path: relPath, isDir: true });
           results = results.concat(getFiles(filePath, rootDir));
         } else {
@@ -604,7 +3619,7 @@ ipcMain.handle('list-files', async (event, dirPath) => {
     return getFiles(dirPath, dirPath);
   } catch (e) {
     console.error('Error listing files:', e);
-    return [];
+    return { error: e.message };
   }
 });
 
@@ -632,6 +3647,195 @@ ipcMain.handle('read-file', async (event, { workspacePath, relativePath, options
   }
 });
 
+ipcMain.handle('delete-path', async (event, { workspacePath, relativePath }) => {
+  try {
+    return deleteWorkspacePath(workspacePath, relativePath);
+  } catch (e) {
+    console.error('Error deleting path:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('move-path', async (event, { workspacePath, fromPath, toPath }) => {
+  try {
+    return moveWorkspacePath(workspacePath, fromPath, toPath);
+  } catch (e) {
+    console.error('Error moving path:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('rename-path', async (event, { workspacePath, relativePath, newName }) => {
+  try {
+    const safeName = String(newName || '').trim();
+    if (!safeName || /[\\/]/.test(safeName)) throw new Error('Rename requires a plain file or folder name');
+    const parent = path.dirname(relativePath);
+    const toPath = parent === '.' ? safeName : path.join(parent, safeName);
+    return moveWorkspacePath(workspacePath, relativePath, toPath);
+  } catch (e) {
+    console.error('Error renaming path:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('copy-path', async (event, { workspacePath, fromPath, toPath }) => {
+  try {
+    return copyWorkspacePath(workspacePath, fromPath, toPath);
+  } catch (e) {
+    console.error('Error copying path:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('download-file', async (event, { workspacePath, url, destination }) => {
+  try {
+    return await downloadFileToWorkspace(workspacePath, url, destination);
+  } catch (e) {
+    console.error('Error downloading file:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('inspect-archive', async (event, { workspacePath, relativePath }) => {
+  try {
+    return await inspectArchiveInWorkspace(workspacePath, relativePath);
+  } catch (e) {
+    console.error('Error inspecting archive:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('extract-archive', async (event, { workspacePath, relativePath, destination }) => {
+  try {
+    return await extractArchiveInWorkspace(workspacePath, relativePath, destination);
+  } catch (e) {
+    console.error('Error extracting archive:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('inspect-binary-asset', async (event, { workspacePath, relativePath }) => {
+  try {
+    return inspectBinaryAssetInWorkspace(workspacePath, relativePath);
+  } catch (e) {
+    console.error('Error inspecting binary asset:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('list-asset-metadata', async (event, { workspacePath, relativePath }) => {
+  try {
+    return listAssetMetadataInWorkspace(workspacePath, relativePath);
+  } catch (e) {
+    console.error('Error listing asset metadata:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('browser-open-url', async (event, { url }) => {
+  try {
+    return await browserOpenUrl(url);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('browser-search-web', async (event, { query }) => {
+  try {
+    return await browserSearchWeb(query);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('browser-click-element', async (event, { selector, text }) => {
+  try {
+    return await browserClickElement(selector, text);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('browser-fill-input', async (event, { selector, value }) => {
+  try {
+    return await browserFillInput(selector, value);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('browser-navigate-back', async () => {
+  try {
+    return await browserNavigateBack();
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('browser-download-from-page', async (event, { workspacePath, selector, url, destination }) => {
+  try {
+    return await browserDownloadFromPage(workspacePath, selector, url, destination);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('browser-wait-for-page', async (event, { timeoutMs }) => {
+  try {
+    return await browserWaitForPage(timeoutMs);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('take-screenshot', async (event, { workspacePath, destination }) => {
+  try {
+    return await takeBrowserScreenshot(workspacePath, destination);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('preview-workspace-app', async (event, { workspacePath, command, warmupMs, destination, processId, timeoutMs }) => {
+  try {
+    return await previewWorkspaceApp(workspacePath, { command, warmupMs, destination, processId, timeoutMs });
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('capture-screen', async (event, { workspacePath, destination, delayMs }) => {
+  try {
+    return await captureScreenForAgent(workspacePath, { destination, delayMs });
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('inspect-screenshot', async (event, { workspacePath, relativePath }) => {
+  try {
+    return inspectScreenshotInWorkspace(workspacePath, relativePath);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('read-workspace-file-base64', async (event, { workspacePath, relativePath }) => {
+  try {
+    return readWorkspaceFileBase64(workspacePath, relativePath);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('compare-screenshot-to-goal', async (event, { workspacePath, relativePath, goal, observations }) => {
+  try {
+    return compareScreenshotToGoalInWorkspace(workspacePath, relativePath, goal, observations);
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
 ipcMain.handle('write-file', async (event, { workspacePath, relativePath, content }) => {
   try {
     const workspaceRoot = path.resolve(workspacePath);
@@ -639,13 +3843,140 @@ ipcMain.handle('write-file', async (event, { workspacePath, relativePath, conten
     const backupPath = createFileBackup(fullPath, workspaceRoot);
     // Create folder structure if it doesn't exist
     fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-    fs.writeFileSync(fullPath, content, 'utf8');
+    atomicWriteFileSync(fullPath, content, 'utf8');
     return { success: true, backupPath };
   } catch (e) {
     console.error('Error writing file:', e);
     return { error: e.message };
   }
 });
+
+function applyPatch(original, operation) {
+  let updated = original;
+  let details = {};
+
+  if (operation.type === 'replace') {
+    if (!operation.target) throw new Error('replace requires target');
+    if (operation.replacement === undefined) throw new Error('replace requires replacement');
+    const count = Math.max(parseInt(operation.count, 10) || 1, 1);
+    let replacements = 0;
+    while (replacements < count) {
+      const index = updated.indexOf(operation.target);
+      if (index === -1) break;
+      updated = updated.slice(0, index) + operation.replacement + updated.slice(index + operation.target.length);
+      replacements++;
+    }
+    if (replacements === 0) throw new Error('Target content block not found');
+    details = { replacements };
+  } else if (operation.type === 'replace_regex') {
+    if (!operation.pattern) throw new Error('replace_regex requires pattern');
+    if (operation.replacement === undefined) throw new Error('replace_regex requires replacement');
+    const flags = operation.flags || '';
+    const safeFlags = Array.from(new Set(flags.replace(/[^gimsuy]/g, '').split(''))).join('');
+    const context = vm.createContext({
+      updated,
+      pattern: operation.pattern,
+      flags: safeFlags.includes('g') ? safeFlags : safeFlags + 'g',
+      replacement: operation.replacement,
+      result: null,
+      error: null
+    });
+    try {
+      vm.runInContext(`
+        try {
+          const regex = new RegExp(pattern, flags);
+          const matches = updated.match(regex);
+          const replacements = matches ? matches.length : 0;
+          const newUpdated = updated.replace(regex, replacement);
+          result = { replacements, newUpdated };
+        } catch (e) {
+          error = e.message;
+        }
+      `, context, { timeout: 250 });
+      if (context.error) throw new Error(context.error);
+      if (!context.result) throw new Error('Regex evaluation failed');
+      const { replacements, newUpdated } = context.result;
+      if (replacements === 0) throw new Error('Regex pattern did not match');
+      updated = newUpdated;
+      details = { replacements };
+    } catch (e) {
+      if (e.message.includes('timed out')) {
+        throw new Error('Regex execution timed out (possible ReDoS)');
+      }
+      throw e;
+    }
+  } else if (operation.type === 'insert') {
+    if (!operation.anchor) throw new Error('insert requires anchor');
+    if (operation.content === undefined) throw new Error('insert requires content');
+    const position = operation.position === 'before' ? 'before' : 'after';
+    const index = updated.indexOf(operation.anchor);
+    if (index === -1) throw new Error('Anchor content not found');
+    const insertAt = position === 'before' ? index : index + operation.anchor.length;
+    let content = operation.content;
+    // Prevent token fusion at line boundaries. When inserting AFTER an anchor that ends its
+    // line (next char is a newline), content that does not already begin on a new line would
+    // otherwise fuse onto the anchor's line (e.g. "import sys" + "import random" =>
+    // "import sysimport random"). Symmetrically for BEFORE an anchor that starts its line.
+    // Inline inserts (anchor not at a line edge) are untouched, preserving existing behavior.
+    if (position === 'after') {
+      const anchorEndsLine = insertAt >= updated.length || updated[insertAt] === '\n';
+      if (anchorEndsLine && content.length && !content.startsWith('\n')) {
+        content = '\n' + content;
+      }
+    } else {
+      const anchorStartsLine = insertAt === 0 || updated[insertAt - 1] === '\n';
+      if (anchorStartsLine && content.length && !content.endsWith('\n')) {
+        content = content + '\n';
+      }
+    }
+    updated = updated.slice(0, insertAt) + content + updated.slice(insertAt);
+    details = { position };
+  } else if (operation.type === 'replace_range') {
+    const startLine = parseInt(operation.startLine, 10);
+    const endLine = parseInt(operation.endLine, 10);
+    if (!Number.isInteger(startLine) || !Number.isInteger(endLine) || startLine < 1 || endLine < startLine) {
+      throw new Error('replace_range requires valid 1-based startLine and endLine');
+    }
+    if (operation.content === undefined) throw new Error('replace_range requires content');
+    const hasFinalNewline = updated.endsWith('\n');
+    const lines = updated.split(/\r?\n/);
+    if (hasFinalNewline) lines.pop();
+    if (endLine > lines.length) throw new Error(`Line range exceeds file length (${lines.length} lines)`);
+    const newLines = String(operation.content).split(/\r?\n/);
+    lines.splice(startLine - 1, endLine - startLine + 1, ...newLines);
+    updated = lines.join('\n') + (hasFinalNewline ? '\n' : '');
+    details = { startLine, endLine };
+  } else {
+    throw new Error(`Unsupported patch operation: ${operation.type}`);
+  }
+
+  return { updated, details };
+}
+
+function buildPatchProof(original, updated) {
+  const originalLines = String(original).split(/\r?\n/);
+  const updatedLines = String(updated).split(/\r?\n/);
+  let start = 0;
+  while (start < originalLines.length && start < updatedLines.length && originalLines[start] === updatedLines[start]) {
+    start++;
+  }
+  let endOriginal = originalLines.length - 1;
+  let endUpdated = updatedLines.length - 1;
+  while (endOriginal >= start && endUpdated >= start && originalLines[endOriginal] === updatedLines[endUpdated]) {
+    endOriginal--;
+    endUpdated--;
+  }
+  const contextStart = Math.max(start - 2, 0);
+  const contextEndOriginal = Math.min(endOriginal + 2, originalLines.length - 1);
+  const contextEndUpdated = Math.min(endUpdated + 2, updatedLines.length - 1);
+  return {
+    startLine: start + 1,
+    originalEndLine: Math.max(endOriginal + 1, start + 1),
+    updatedEndLine: Math.max(endUpdated + 1, start + 1),
+    originalSnippet: originalLines.slice(contextStart, contextEndOriginal + 1).join('\n'),
+    updatedSnippet: updatedLines.slice(contextStart, contextEndUpdated + 1).join('\n')
+  };
+}
 
 ipcMain.handle('patch-file', async (event, { workspacePath, relativePath, operation }) => {
   try {
@@ -655,71 +3986,40 @@ ipcMain.handle('patch-file', async (event, { workspacePath, relativePath, operat
     if (!fs.existsSync(fullPath)) throw new Error('File does not exist');
 
     const original = fs.readFileSync(fullPath, 'utf8');
-    let updated = original;
-    let details = {};
-
-    if (operation.type === 'replace') {
-      if (!operation.target) throw new Error('replace requires target');
-      if (operation.replacement === undefined) throw new Error('replace requires replacement');
-      const count = Math.max(parseInt(operation.count, 10) || 1, 1);
-      let replacements = 0;
-      while (replacements < count) {
-        const index = updated.indexOf(operation.target);
-        if (index === -1) break;
-        updated = updated.slice(0, index) + operation.replacement + updated.slice(index + operation.target.length);
-        replacements++;
-      }
-      if (replacements === 0) throw new Error('Target content block not found');
-      details = { replacements };
-    } else if (operation.type === 'replace_regex') {
-      if (!operation.pattern) throw new Error('replace_regex requires pattern');
-      if (operation.replacement === undefined) throw new Error('replace_regex requires replacement');
-      const flags = operation.flags || '';
-      const safeFlags = Array.from(new Set(flags.replace(/[^gimsuy]/g, '').split(''))).join('');
-      const regex = new RegExp(operation.pattern, safeFlags.includes('g') ? safeFlags : safeFlags + 'g');
-      const matches = updated.match(regex);
-      const replacements = matches ? matches.length : 0;
-      updated = updated.replace(regex, operation.replacement);
-      if (replacements === 0) throw new Error('Regex pattern did not match');
-      details = { replacements };
-    } else if (operation.type === 'insert') {
-      if (!operation.anchor) throw new Error('insert requires anchor');
-      if (operation.content === undefined) throw new Error('insert requires content');
-      const position = operation.position === 'before' ? 'before' : 'after';
-      const index = updated.indexOf(operation.anchor);
-      if (index === -1) throw new Error('Anchor content not found');
-      const insertAt = position === 'before' ? index : index + operation.anchor.length;
-      updated = updated.slice(0, insertAt) + operation.content + updated.slice(insertAt);
-      details = { position };
-    } else if (operation.type === 'replace_range') {
-      const startLine = parseInt(operation.startLine, 10);
-      const endLine = parseInt(operation.endLine, 10);
-      if (!Number.isInteger(startLine) || !Number.isInteger(endLine) || startLine < 1 || endLine < startLine) {
-        throw new Error('replace_range requires valid 1-based startLine and endLine');
-      }
-      if (operation.content === undefined) throw new Error('replace_range requires content');
-      const hasFinalNewline = updated.endsWith('\n');
-      const lines = updated.split(/\r?\n/);
-      if (hasFinalNewline) lines.pop();
-      if (endLine > lines.length) throw new Error(`Line range exceeds file length (${lines.length} lines)`);
-      const newLines = String(operation.content).split(/\r?\n/);
-      lines.splice(startLine - 1, endLine - startLine + 1, ...newLines);
-      updated = lines.join('\n') + (hasFinalNewline ? '\n' : '');
-      details = { startLine, endLine };
-    } else {
-      throw new Error(`Unsupported patch operation: ${operation.type}`);
-    }
+    const { updated, details } = applyPatch(original, operation);
 
     if (updated === original) {
       return { success: true, changed: false, message: 'Patch produced no content changes.', details };
     }
 
     const backupPath = createFileBackup(fullPath, workspaceRoot);
-    fs.writeFileSync(fullPath, updated, 'utf8');
-    return { success: true, changed: true, message: `Patched ${relativePath} successfully.`, details, backupPath };
+    atomicWriteFileSync(fullPath, updated, 'utf8');
+    return { success: true, changed: true, message: `Patched ${relativePath} successfully.`, details, proof: buildPatchProof(original, updated), backupPath };
   } catch (e) {
     console.error('Error patching file:', e);
     return { error: e.message };
+  }
+});
+
+ipcMain.handle('get-home-dir', () => os.homedir());
+ipcMain.handle('get-user-data-path', () => app.getPath('userData'));
+
+ipcMain.handle('write-run-artifact', async (event, payload) => {
+  try {
+    const artifactPath = writeRunArtifact(payload || {});
+    return { success: true, artifactPath };
+  } catch (e) {
+    console.error('Error writing run artifact:', e);
+    return { success: false, error: e.message };
+  }
+});
+
+ipcMain.handle('list-run-artifacts', async (event, conversationId) => {
+  try {
+    return { success: true, artifacts: listRunArtifacts(conversationId) };
+  } catch (e) {
+    console.error('Error listing run artifacts:', e);
+    return { success: false, error: e.message, artifacts: [] };
   }
 });
 
@@ -807,14 +4107,29 @@ ipcMain.handle('fetch-web-page', async (event, { url }) => {
 let activeProcesses = {};
 let commandSessions = {};
 let commandAliases = {};
+const MAX_COMMAND_OUTPUT_CHARS = 200000;
+const MAX_COMMAND_SESSIONS = 100;
 
 function registerCommandSession(processId, session, child) {
   commandSessions[processId] = session;
   activeProcesses[processId] = child;
 
-  const match = processId.match(/^cmd_(conv_\d+)_(.+)$/);
+  const match = processId.match(/^cmd_(conv[_-][a-zA-Z0-9_-]+)_(.+)$/);
   if (match && match[2]) {
     commandAliases[match[2]] = processId;
+  }
+}
+
+function pruneCommandSessions() {
+  const completedIds = Object.keys(commandSessions)
+    .filter(id => !activeProcesses[id])
+    .sort((a, b) => (commandSessions[a].finishedAt || commandSessions[a].startedAt) - (commandSessions[b].finishedAt || commandSessions[b].startedAt));
+  while (completedIds.length > MAX_COMMAND_SESSIONS) {
+    const id = completedIds.shift();
+    delete commandSessions[id];
+    Object.keys(commandAliases).forEach(alias => {
+      if (commandAliases[alias] === id) delete commandAliases[alias];
+    });
   }
 }
 
@@ -829,21 +4144,33 @@ function killProcessTree(child, callback) {
   }
 
   if (process.platform === 'win32') {
-    exec(`taskkill /PID ${child.pid} /T /F`, (error) => {
-      if (error) {
+    spawn('taskkill', ['/PID', child.pid, '/T', '/F'], { windowsHide: true }).on('close', (code) => {
+      if (code !== 0) {
         try { child.kill(); } catch (e) {}
       }
-      if (callback) callback(error);
+      if (callback) callback(code !== 0 ? new Error('Taskkill failed') : null);
     });
     return;
   }
 
   try {
-    child.kill('SIGTERM');
-  } catch (e) {}
+    if (child.pid) {
+      process.kill(-child.pid, 'SIGTERM');
+    } else {
+      child.kill('SIGTERM');
+    }
+  } catch (e) {
+    try { child.kill('SIGTERM'); } catch(e2) {}
+  }
   setTimeout(() => {
     try {
-      if (!child.killed) child.kill('SIGKILL');
+      if (!child.killed) {
+        if (child.pid) {
+          process.kill(-child.pid, 'SIGKILL');
+        } else {
+          child.kill('SIGKILL');
+        }
+      }
     } catch (e) {}
     if (callback) callback();
   }, 1000);
@@ -851,10 +4178,17 @@ function killProcessTree(child, callback) {
 
 function startCommandSession({ command, cwd, processId, timeoutMs }) {
   if (!command) throw new Error('Missing command');
+
+  const classification = classifyCommandRequest(command, { source: 'freeform' });
+  if (!classification.allowed) {
+    throw new Error(classification.reason);
+  }
+
   if (!processId) processId = 'cmd_' + Date.now();
   
-  const shell = process.platform === 'win32' ? 'powershell.exe' : 'bash';
-  const shellArgs = process.platform === 'win32' ? ['-NoProfile', '-Command'] : ['-c'];
+  const shellSpec = getCommandShellSpec(command);
+  const shell = shellSpec.executable;
+  const shellArgs = shellSpec.args;
   const resolvedTimeoutMs = Math.min(Math.max(parseInt(timeoutMs, 10) || 120000, 1000), 30 * 60 * 1000);
   
   const session = {
@@ -870,12 +4204,22 @@ function startCommandSession({ command, cwd, processId, timeoutMs }) {
     timedOut: false,
     killed: false,
     stdout: '',
-    stderr: ''
+    stderr: '',
+    commandCategory: classification.category
   };
+  if (cwd && !fs.existsSync(cwd)) {
+    try {
+      fs.mkdirSync(cwd, { recursive: true });
+    } catch (e) {
+      console.error('Failed to create command cwd directory:', e);
+    }
+  }
+
   const child = spawn(shell, [...shellArgs, command], {
     cwd: cwd,
     env: { ...process.env, PAGER: 'cat' },
-    windowsHide: true
+    windowsHide: true,
+    detached: process.platform !== 'win32'
   });
   
   registerCommandSession(processId, session, child);
@@ -886,7 +4230,11 @@ function startCommandSession({ command, cwd, processId, timeoutMs }) {
     } else {
       session.stdout += text;
     }
-    mainWindow.webContents.send(`cmd-output-${processId}`, { type, text });
+    if (session.stdout.length > MAX_COMMAND_OUTPUT_CHARS) session.stdout = session.stdout.slice(-MAX_COMMAND_OUTPUT_CHARS);
+    if (session.stderr.length > MAX_COMMAND_OUTPUT_CHARS) session.stderr = session.stderr.slice(-MAX_COMMAND_OUTPUT_CHARS);
+    if (mainWindow && mainWindow.webContents && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(`cmd-output-${processId}`, { type, text });
+    }
   };
   
   const timeout = setTimeout(() => {
@@ -913,6 +4261,7 @@ function startCommandSession({ command, cwd, processId, timeoutMs }) {
     } else {
       session.status = code === 0 ? 'completed' : 'failed';
     }
+    pruneCommandSessions();
   });
   
   child.on('error', (err) => {
@@ -921,9 +4270,57 @@ function startCommandSession({ command, cwd, processId, timeoutMs }) {
     session.error = err.message;
     session.finishedAt = Date.now();
     session.status = 'error';
+    pruneCommandSessions();
   });
   
   return session;
+}
+
+function getCommandShellSpec(command) {
+  if (process.platform !== 'win32') {
+    return { executable: 'bash', args: ['-c'] };
+  }
+  if (commandLooksPowerShellSpecific(command)) {
+    return {
+      executable: resolveWindowsShellExecutable('powershell.exe'),
+      args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command']
+    };
+  }
+  return {
+    executable: resolveWindowsShellExecutable('cmd.exe'),
+    args: ['/d', '/s', '/c']
+  };
+}
+
+function commandLooksPowerShellSpecific(command) {
+  const text = String(command || '');
+  return /\b(Get|Set|New|Remove|Select|Where|ForEach|Start|Stop|Test|Resolve|Copy|Move|Clear|Write|Read|Invoke|Import|Export|ConvertTo|Out)-[A-Za-z]/.test(text)
+    || /\b\$\w+/.test(text)
+    || /\|\s*(Select-Object|Where-Object|ForEach-Object|Sort-Object|Format-Table|Format-List)\b/i.test(text)
+    || /\b-NoProfile\b|\b-ExecutionPolicy\b/i.test(text);
+}
+
+function resolveWindowsShellExecutable(preferred = 'powershell.exe') {
+  if (process.platform !== 'win32') return preferred;
+  const windir = process.env.WINDIR || process.env.SystemRoot || 'C:\\Windows';
+  const candidates = preferred.toLowerCase().includes('cmd')
+    ? [
+        path.join(windir, 'System32', 'cmd.exe'),
+        path.join(windir, 'Sysnative', 'cmd.exe'),
+        'cmd.exe'
+      ]
+    : [
+        path.join(windir, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+        path.join(windir, 'Sysnative', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+        'powershell.exe'
+      ];
+  return candidates.find(candidate => {
+    try {
+      return candidate.includes(path.sep) ? fs.existsSync(candidate) : true;
+    } catch (e) {
+      return false;
+    }
+  }) || preferred;
 }
 
 function commandSessionSummary(session, maxChars = 8000) {
@@ -937,6 +4334,7 @@ function commandSessionSummary(session, maxChars = 8000) {
     startedAt: session.startedAt,
     finishedAt: session.finishedAt,
     timeoutMs: session.timeoutMs,
+    commandCategory: session.commandCategory,
     exitCode: session.exitCode,
     error: session.error,
     timedOut: session.timedOut,
@@ -954,9 +4352,12 @@ ipcMain.handle('run-command', (event, { command, cwd, processId, timeoutMs }) =>
           clearInterval(poll);
           resolve({
             code: session.exitCode,
+            stdout: session.stdout,
+            stderr: session.stderr,
             error: session.error,
             timedOut: session.timedOut,
-            killed: session.killed
+            killed: session.killed,
+            timeoutMs: session.timeoutMs
           });
         }
       }, 200);
@@ -1023,3 +4424,356 @@ ipcMain.handle('kill-commands-for-conversation', (event, conversationId) => {
   });
   return { success: true, killed };
 });
+
+// --- LOCAL SEMANTIC CODEBASE INDEXING (RAG) SYSTEM ---
+function chunkText(text, maxChunkSize = 1200, overlap = 150) {
+  const lines = text.split(/\r?\n/);
+  const chunks = [];
+  let currentChunk = [];
+  let currentLength = 0;
+  let startLine = 1;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    currentChunk.push(line);
+    currentLength += line.length + 1;
+
+    if (currentLength >= maxChunkSize) {
+      chunks.push({
+        text: currentChunk.join('\n'),
+        startLine: startLine,
+        endLine: i + 1
+      });
+      const backtrackLines = Math.min(currentChunk.length - 1, Math.ceil(overlap / 50));
+      currentChunk = currentChunk.slice(-backtrackLines);
+      currentLength = currentChunk.join('\n').length + 1;
+      startLine = i + 1 - backtrackLines + 1;
+    }
+  }
+
+  if (currentChunk.length > 0) {
+    chunks.push({
+      text: currentChunk.join('\n'),
+      startLine: startLine,
+      endLine: lines.length
+    });
+  }
+  return chunks;
+}
+
+function cosineSimilarity(vecA, vecB) {
+  if (!vecA || !vecB || vecA.length !== vecB.length) return 0;
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < vecA.length; i++) {
+    dotProduct += vecA[i] * vecB[i];
+    normA += vecA[i] * vecA[i];
+    normB += vecB[i] * vecB[i];
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+async function getGeminiEmbedding(text, apiKey) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${apiKey}`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: "models/text-embedding-004",
+      content: { parts: [{ text }] }
+    })
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Embedding API returned HTTP ${response.status}: ${errorText}`);
+  }
+  const data = await response.json();
+  if (!data.embedding || !data.embedding.values) {
+    throw new Error('Embedding values missing in API response');
+  }
+  return data.embedding.values;
+}
+
+function listFilesRecursive(dirPath) {
+  const getFiles = (dir, rootDir) => {
+    let results = [];
+    if (!fs.existsSync(dir)) return results;
+    const list = fs.readdirSync(dir);
+    list.forEach((file) => {
+      const filePath = path.join(dir, file);
+      const stat = fs.lstatSync(filePath);
+      const relPath = path.relative(rootDir, filePath);
+      
+      if (file === 'node_modules' || file === '.git' || file === 'dist' || file === '.gemini' || file === 'build' || file === '.ruff_cache' || file === '.pytest_cache' || file === '__pycache__' || file === '.venv' || file === 'venv' || file === 'env' || file === '.tox' || file === '.next' || file === '.codex-remote-attachments' || file === '.idea' || file === '.vscode' || file === 'coverage') {
+        return;
+      }
+      
+      if (stat.isSymbolicLink()) {
+        return;
+      } else if (stat.isDirectory()) {
+        results.push({ name: file, path: relPath, isDir: true });
+        results = results.concat(getFiles(filePath, rootDir));
+      } else {
+        results.push({ name: file, path: relPath, isDir: false, size: stat.size });
+      }
+    });
+    return results;
+  };
+  return getFiles(dirPath, dirPath);
+}
+
+const activeWorkspaceIndices = {};
+async function runBackgroundIndexing(workspacePath, apiKey) {
+  if (activeWorkspaceIndices[workspacePath]?.status === 'indexing') {
+    return;
+  }
+  
+  activeWorkspaceIndices[workspacePath] = { status: 'indexing', progress: 0, total: 0 };
+  updateRagStatusInRenderer(workspacePath, 'Scanning...');
+
+  try {
+    const files = listFilesRecursive(workspacePath);
+    const indexableFiles = files.filter(f => {
+      if (f.isDir) return false;
+      return isIndexableWorkspaceFile(f.name);
+    });
+
+    const indexDir = path.join(app.getPath('userData'), 'orion-embeddings');
+    if (!fs.existsSync(indexDir)) {
+      fs.mkdirSync(indexDir, { recursive: true });
+    }
+    const indexFilename = crypto.createHash('sha256').update(workspacePath).digest('hex') + '.json';
+    const indexPath = path.join(indexDir, indexFilename);
+
+    let indexData = { workspace: workspacePath, files: {}, chunks: [] };
+    if (fs.existsSync(indexPath)) {
+      try {
+        indexData = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+      } catch (e) {
+        indexData = { workspace: workspacePath, files: {}, chunks: [] };
+      }
+    }
+
+    const relativePaths = new Set(indexableFiles.map(f => f.path));
+    let indexChanged = false;
+    for (const relPath of Object.keys(indexData.files)) {
+      if (!relativePaths.has(relPath)) {
+        delete indexData.files[relPath];
+        indexData.chunks = indexData.chunks.filter(c => c.path !== relPath);
+        indexChanged = true;
+      }
+    }
+
+    const filesToEmbed = [];
+    indexableFiles.forEach(f => {
+      const fullPath = path.join(workspacePath, f.path);
+      if (!fs.existsSync(fullPath)) return;
+      const content = fs.readFileSync(fullPath, 'utf8');
+      const hash = crypto.createHash('md5').update(content).digest('hex');
+      const existingFile = indexData.files[f.path];
+
+      if (!existingFile || existingFile.hash !== hash) {
+        filesToEmbed.push({ relPath: f.path, fullPath, content, hash });
+      }
+    });
+
+    if (filesToEmbed.length === 0) {
+      if (indexChanged) {
+        atomicWriteFileSync(indexPath, JSON.stringify(indexData, null, 2), 'utf8');
+      }
+      activeWorkspaceIndices[workspacePath] = { status: 'ready', progress: indexableFiles.length, total: indexableFiles.length };
+      updateRagStatusInRenderer(workspacePath, 'Semantic Ready');
+      return;
+    }
+
+    let progress = 0;
+    const total = filesToEmbed.length;
+    activeWorkspaceIndices[workspacePath] = { status: 'indexing', progress, total };
+    updateRagStatusInRenderer(workspacePath, `Indexing (0/${total})`);
+
+    for (const file of filesToEmbed) {
+      indexData.chunks = indexData.chunks.filter(c => c.path !== file.relPath);
+      const chunks = chunkText(file.content);
+      let embeddedAllChunks = true;
+      
+      for (let idx = 0; idx < chunks.length; idx++) {
+        const chunk = chunks[idx];
+        try {
+          const vector = await getGeminiEmbedding(chunk.text, apiKey);
+          indexData.chunks.push({
+            path: file.relPath,
+            startLine: chunk.startLine,
+            endLine: chunk.endLine,
+            text: chunk.text,
+            vector
+          });
+          await new Promise(r => setTimeout(r, 100));
+        } catch (err) {
+          embeddedAllChunks = false;
+          console.error(`Failed to embed chunk ${idx} of ${file.relPath}:`, err);
+        }
+      }
+
+      if (embeddedAllChunks) {
+        indexData.files[file.relPath] = { hash: file.hash };
+      } else {
+        delete indexData.files[file.relPath];
+      }
+      atomicWriteFileSync(indexPath, JSON.stringify(indexData, null, 2), 'utf8');
+
+      progress++;
+      activeWorkspaceIndices[workspacePath] = { status: 'indexing', progress, total };
+      updateRagStatusInRenderer(workspacePath, `Indexing (${progress}/${total})`);
+    }
+
+    activeWorkspaceIndices[workspacePath] = { status: 'ready', progress: indexableFiles.length, total: indexableFiles.length };
+    updateRagStatusInRenderer(workspacePath, 'Semantic Ready');
+
+  } catch (err) {
+    console.error('Error in background indexing:', err);
+    updateRagStatusInRenderer(workspacePath, 'Indexing Failed');
+  }
+}
+
+function updateRagStatusInRenderer(workspacePath, statusText) {
+  const windows = BrowserWindow.getAllWindows();
+  windows.forEach(win => {
+    if (!win.isDestroyed()) {
+      win.webContents.executeJavaScript(`if (window.onRagStatusChange) window.onRagStatusChange(${JSON.stringify(statusText)});`).catch(() => {});
+    }
+  });
+}
+
+ipcMain.handle('index-workspace', async (event, workspacePath) => {
+  if (!workspacePath) return { success: false, error: 'No workspace path' };
+  const config = readAppConfig();
+  const apiKey = config.geminiApiKey;
+  if (!apiKey) {
+    updateRagStatusInRenderer(workspacePath, 'Awaiting API Key');
+    return { success: false, error: 'Awaiting API Key' };
+  }
+  
+  runBackgroundIndexing(workspacePath, apiKey);
+  return { success: true };
+});
+
+ipcMain.handle('search-embeddings', async (event, { query, limit }) => {
+  try {
+    const config = readAppConfig();
+    const apiKey = config.geminiApiKey;
+    if (!apiKey) throw new Error('API key is not configured');
+    
+    const queryVector = await getGeminiEmbedding(query, apiKey);
+    
+    const windows = BrowserWindow.getAllWindows();
+    let currentWorkspacePath = '';
+    if (windows.length > 0) {
+      const activeProj = await windows[0].webContents.executeJavaScript('window.getCurrentProject ? window.getCurrentProject() : null').catch(() => null);
+      currentWorkspacePath = activeProj || '';
+    }
+    if (!currentWorkspacePath) {
+      currentWorkspacePath = config.defaultWorkspacePath || '';
+    }
+    if (!currentWorkspacePath) throw new Error('No active workspace');
+    
+    const indexDir = path.join(app.getPath('userData'), 'orion-embeddings');
+    const indexFilename = crypto.createHash('sha256').update(currentWorkspacePath).digest('hex') + '.json';
+    const indexPath = path.join(indexDir, indexFilename);
+    
+    if (!fs.existsSync(indexPath)) {
+      return { success: true, results: [], message: 'No index built yet for this workspace.' };
+    }
+    
+    const indexData = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+    const chunks = indexData.chunks || [];
+    
+    const scoredChunks = chunks.map(chunk => {
+      const sim = cosineSimilarity(queryVector, chunk.vector);
+      return {
+        path: chunk.path,
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        text: chunk.text,
+        similarity: sim
+      };
+    });
+    
+    scoredChunks.sort((a, b) => b.similarity - a.similarity);
+    const topResults = scoredChunks.slice(0, parseInt(limit, 10) || 5);
+    
+    return { success: true, results: topResults };
+  } catch (err) {
+    console.error('Error searching embeddings:', err);
+    return { success: false, error: err.message };
+  }
+});
+
+if (process.env.NODE_ENV === 'test') {
+  module.exports = {
+    escapePowerShellSingle,
+    startCommandSession,
+    killProcessTree,
+    startPhoneCompanionServer,
+    ensureCompanionToken,
+    stopPhoneCompanionServer,
+    writeRunArtifact,
+    resolveWorkspacePath,
+    deleteWorkspacePath,
+    moveWorkspacePath,
+    copyWorkspacePath,
+    listRunArtifacts,
+    downloadFileToWorkspace,
+    inspectArchiveInWorkspace,
+    extractArchiveInWorkspace,
+    inspectBinaryAssetInWorkspace,
+    listAssetMetadataInWorkspace,
+    readWorkspaceFileBase64,
+    compareScreenshotToGoalInWorkspace,
+    classifyCommandRequest,
+    getCommandShellSpec,
+    commandLooksPowerShellSpecific,
+    previewWorkspaceApp,
+    spawnInternalCommand,
+    buildCompanionPairingAnnouncement,
+    enablePhoneCompanionLanMode,
+    getPhoneCompanionPairingForTest: getPhoneCompanionPairingPayload,
+    getCompanionServer: () => companionServer,
+    chunkText,
+    cosineSimilarity,
+    getGeminiEmbedding
+  };
+}
+
+if (process.env.NODE_ENV === 'test') {
+  module.exports.applyPatch = applyPatch;
+  module.exports.buildPatchProof = buildPatchProof;
+  module.exports.computeSourceUpdates = computeSourceUpdates;
+  module.exports.getAppRuntimeInfo = getAppRuntimeInfo;
+  module.exports.buildUpdateSplashHtml = buildUpdateSplashHtml;
+  module.exports.syncSourceUpdateFiles = syncSourceUpdateFiles;
+  module.exports.isLikelySourceDir = isLikelySourceDir;
+}
+
+if (process.env.NODE_ENV === 'test') {
+  module.exports.isDestructiveCommand = isDestructiveCommand;
+}
+
+if (process.env.NODE_ENV === 'test') {
+  module.exports.activeProcesses = activeProcesses;
+  module.exports.commandSessions = commandSessions;
+}
+
+if (process.env.NODE_ENV === 'test') {
+  module.exports.getCompanionServer = () => companionServer;
+}
+
+if (process.env.NODE_ENV === 'test') {
+  module.exports.resetCompanionServer = () => {
+    if (companionServer) {
+      try { companionServer.close(); } catch (e) {}
+    }
+    companionServer = null;
+  };
+}

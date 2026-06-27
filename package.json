@@ -5,7 +5,8 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "package": "electron-packager . OrionAI --platform=win32 --arch=x64 --out=dist --overwrite --icon=assets/icon.ico"
+    "package": "electron-packager . OrionAI --platform=win32 --arch=x64 --out=dist --overwrite --icon=assets/icon.ico --ignore=\"^/config\\.json$\" --ignore=\"^/standalone-workspaces($|/)\" --ignore=\"^/\\.orion($|/)\" --ignore=\"^/tests($|/)\" --ignore=\"^/test-runner\\.js$\"",
+    "test": "node test-runner.js"
   },
   "keywords": [
     "orion",
@@ -17,10 +18,15 @@
   "author": "Antigravity Dev team",
   "license": "MIT",
   "dependencies": {
-    "marked": "^12.0.1"
+    "marked": "^12.0.1",
+    "prismjs": "^1.30.0",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
-    "electron": "^30.0.1",
-    "electron-packager": "^17.1.2"
+    "electron": "^42.2.0",
+    "electron-packager": "^17.1.2",
+    "proxyquire": "^2.1.3",
+    "sinon": "^22.0.0",
+    "tape": "^5.9.0"
   }
 }

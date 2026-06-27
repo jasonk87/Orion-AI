@@ -1,3 +1,34 @@
+// Configure marked to escape HTML content to prevent XSS vulnerability in Electron renderer
+if (typeof marked !== 'undefined') {
+  marked.use({
+    renderer: {
+      html(htmlText) {
+        return htmlText.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      }
+    }
+  });
+}
+
+function sanitizeRenderedMarkdown(container) {
+  container.querySelectorAll('a[href]').forEach(link => {
+    const href = link.getAttribute('href') || '';
+    if (!/^(https?:|mailto:|orion-file:)/i.test(href)) {
+      link.removeAttribute('href');
+      link.removeAttribute('target');
+      link.removeAttribute('rel');
+      return;
+    }
+    if (/^https?:/i.test(href)) {
+      link.setAttribute('target', '_blank');
+      link.setAttribute('rel', 'noopener noreferrer');
+    }
+  });
+  container.querySelectorAll('img[src]').forEach(image => {
+    const src = image.getAttribute('src') || '';
+    if (!/^https?:/i.test(src)) image.removeAttribute('src');
+  });
+}
+
 // STATE MANAGEMENT
 let appConfig = {
   geminiApiKey: '',
@@ -7,24 +38,31 @@ let appConfig = {
   compactThresholdTokens: 100000,
   autoCompact: true,
   modelContextBudgets: {
+    'gemini-3.5-flash': 1000000,
+    'gemini-3.1-pro-preview': 1000000,
+    'gemini-3.1-flash-lite': 1000000,
+    'gemini-3-flash-preview': 1000000,
     'gemini-2.5-flash-lite': 1000000,
     'gemini-2.5-flash': 1000000,
     'gemini-2.5-pro': 1000000,
     default: 128000
   },
   commandTimeoutMs: 120000,
+  modelCallDelayMs: 0,
   regressionTestCommand: 'npm test',
   autoTest: true,
   planningMode: true
 };
 
 let currentWorkspace = '';
+let cachedUserDataPath = '';
 let activeConversationId = null;
 let conversations = []; // { id, title, messages, tasks, testResults }
 let activeProcessId = null;
 let projects = []; // Array of workspace folder paths
 let activeAiBubble = null; // Currently rendering AI message bubble
 let currentFileTreeItems = [];
+let currentRunArtifacts = [];
 let expandedFileFolders = new Set();
 
 // DOM ELEMENTS
@@ -33,6 +71,7 @@ const el = {
   btnMinimize: document.getElementById('btn-minimize'),
   btnMaximize: document.getElementById('btn-maximize'),
   btnClose: document.getElementById('btn-close'),
+  appVersionMeta: document.getElementById('app-version-meta'),
   workspaceLabel: document.getElementById('workspace-label'),
   
   // Sidebar items
@@ -43,6 +82,7 @@ const el = {
   btnSettings: document.getElementById('btn-settings'),
   btnChangeWorkspace: document.getElementById('btn-change-workspace'),
   btnSyncFiles: document.getElementById('btn-sync-files'),
+  btnPhoneCompanion: document.getElementById('btn-phone-companion'),
   btnAddProject: document.getElementById('btn-add-project'),
   btnProjectFilter: document.getElementById('btn-project-filter'),
   
@@ -54,7 +94,6 @@ const el = {
   btnSubmit: document.getElementById('btn-submit'),
   modelSelect: document.getElementById('model-select'),
   chatTitle: document.getElementById('chat-title'),
-  
   // Settings modal
   settingsModal: document.getElementById('settings-modal'),
   btnSettingsClose: document.getElementById('btn-settings-close'),
@@ -65,6 +104,7 @@ const el = {
   settingWorkspacePath: document.getElementById('setting-workspace-path'),
   settingTestCmd: document.getElementById('setting-test-cmd'),
   settingCommandTimeout: document.getElementById('setting-command-timeout'),
+  settingModelCallDelay: document.getElementById('setting-model-call-delay'),
   settingCompactThreshold: document.getElementById('setting-compact-threshold'),
   settingAutoTest: document.getElementById('setting-auto-test'),
   settingPlanningMode: document.getElementById('setting-planning-mode'),
@@ -73,31 +113,73 @@ const el = {
   // Right Agent Panel
   taskChecklist: document.getElementById('task-checklist-container'),
   taskCompletionBadge: document.getElementById('task-completion-badge'),
+  operationalContextPanel: document.getElementById('operational-context-panel'),
+  operationalContextRevision: document.getElementById('operational-context-revision'),
+  btnEditOperationalContext: document.getElementById('btn-edit-operational-context'),
+  operationalContextModal: document.getElementById('operational-context-modal'),
+  btnOperationalContextClose: document.getElementById('btn-operational-context-close'),
+  btnOperationalContextSave: document.getElementById('btn-operational-context-save'),
+  operationalMissionInput: document.getElementById('operational-mission-input'),
+  operationalObjectiveInput: document.getElementById('operational-objective-input'),
+  operationalWinConditionsInput: document.getElementById('operational-win-conditions-input'),
   testIndicator: document.getElementById('test-indicator'),
   lblTestCmd: document.getElementById('lbl-test-cmd'),
   testResults: document.getElementById('test-results-container'),
   btnRunTestsManually: document.getElementById('btn-run-tests-manually'),
   fileTree: document.getElementById('file-tree-container'),
   fileCountBadge: document.getElementById('file-count-badge'),
+  artifactList: document.getElementById('artifact-list-container'),
+  artifactCountBadge: document.getElementById('artifact-count-badge'),
+  phoneCompanionModal: document.getElementById('phone-companion-modal'),
+  btnPhoneCompanionClose: document.getElementById('btn-phone-companion-close'),
+  phoneCompanionQr: document.getElementById('phone-companion-qr'),
+  phoneCompanionPairUrl: document.getElementById('phone-companion-pair-url'),
+  phoneCompanionMeta: document.getElementById('phone-companion-meta'),
   workspaceEntrypointInput: document.getElementById('workspace-entrypoint-input'),
   btnSaveEntrypoint: document.getElementById('btn-save-entrypoint'),
+  rightSidebar: document.getElementById('right-sidebar'),
+  btnToggleRightSidebar: document.getElementById('btn-toggle-right-sidebar'),
+  btnToggleLeftSidebar: document.getElementById('btn-toggle-left-sidebar'),
+  leftSidebar: document.getElementById('left-sidebar'),
+  btnCommandPalette: document.getElementById('btn-command-palette'),
+  commandPaletteModal: document.getElementById('command-palette-modal'),
+  agentStatePill: document.getElementById('agent-state-pill'),
+  agentStateText: document.getElementById('agent-state-text'),
+  agentStateDetail: document.getElementById('agent-state-detail'),
+  workspaceFilesPanel: document.getElementById('workspace-files-panel'),
+  runArtifactsPanel: document.getElementById('run-artifacts-panel'),
+  toastRegion: document.getElementById('toast-region'),
+  btnStartOpenRepo: document.getElementById('btn-start-open-repo'),
+  btnStartNewTask: document.getElementById('btn-start-new-task'),
+  btnStartResume: document.getElementById('btn-start-resume'),
   fileViewerModal: document.getElementById('file-viewer-modal'),
   fileViewerTitle: document.getElementById('file-viewer-title'),
   fileViewerContent: document.getElementById('file-viewer-content'),
+  fileViewerImageShell: document.getElementById('file-viewer-image-shell'),
+  fileViewerImage: document.getElementById('file-viewer-image'),
+  fileViewerImageMeta: document.getElementById('file-viewer-image-meta'),
   btnFileViewerClose: document.getElementById('btn-file-viewer-close'),
   btnFileViewerMention: document.getElementById('btn-file-viewer-mention')
 };
 
 let viewedFilePath = '';
+let agentPresenceTimer = null;
+let agentCompletionTimer = null;
 
 // INITIALIZE APP
 document.addEventListener('DOMContentLoaded', async () => {
   setupWindowControls();
   await loadSettings();
+  await refreshAppRuntimeInfo();
+  try { cachedUserDataPath = await window.api.getUserDataPath(); } catch (_) {}
   setupSettingsModal();
   setupFileViewerModal();
+  setupOperationalContextEditor();
   setupWorkspaceHandlers();
+  setupStartActions();
   setupEntrypointControls();
+  setupProgressiveDisclosure();
+  setupRightSidebarToggle();
   setupChatHandlers();
   
   // Bind manual task checklist add button
@@ -156,6 +238,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   } else {
     createNewConversation();
   }
+  refreshPhoneCompanionPairing();
+  removeLegacyPhoneCompanionTokenBubbles();
 });
 
 // --- ELECTRON WINDOW BINDINGS ---
@@ -163,6 +247,27 @@ function setupWindowControls() {
   el.btnMinimize.addEventListener('click', () => window.api.minimizeWindow());
   el.btnMaximize.addEventListener('click', () => window.api.maximizeWindow());
   el.btnClose.addEventListener('click', () => window.api.closeWindow());
+}
+
+async function refreshAppRuntimeInfo() {
+  if (!el.appVersionMeta || !window.api || !window.api.getAppRuntimeInfo) return;
+  try {
+    const info = await window.api.getAppRuntimeInfo();
+    const parts = [];
+    if (info && info.version) parts.push(`v${info.version}`);
+    if (info && info.runtimeDateLabel) parts.push(info.runtimeDateLabel);
+    if (!parts.length) {
+      el.appVersionMeta.textContent = '';
+      el.appVersionMeta.style.display = 'none';
+      return;
+    }
+    el.appVersionMeta.textContent = parts.join(' · ');
+    el.appVersionMeta.title = `Orion AI ${parts.join(' · ')}`;
+    el.appVersionMeta.style.display = 'inline-flex';
+  } catch (e) {
+    el.appVersionMeta.textContent = '';
+    el.appVersionMeta.style.display = 'none';
+  }
 }
 
 // --- SETTINGS CONFIGURATION ---
@@ -179,6 +284,7 @@ async function loadSettings() {
   el.settingWorkspacePath.value = appConfig.defaultWorkspacePath || '';
   if (el.settingTestCmd) el.settingTestCmd.value = appConfig.regressionTestCommand || 'npm test';
   if (el.settingCommandTimeout) el.settingCommandTimeout.value = appConfig.commandTimeoutMs || 120000;
+  if (el.settingModelCallDelay) el.settingModelCallDelay.value = appConfig.modelCallDelayMs || 0;
   el.settingCompactThreshold.value = appConfig.compactThresholdTokens || 100000;
   if (el.settingAutoTest) el.settingAutoTest.checked = appConfig.autoTest !== false;
   el.settingPlanningMode.checked = appConfig.planningMode !== false;
@@ -203,6 +309,10 @@ async function initModelDropdown() {
   
   // Static Gemini list
   const geminiModels = [
+    { value: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash' },
+    { value: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro Preview' },
+    { value: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash-Lite' },
+    { value: 'gemini-3-flash-preview', name: 'Gemini 3 Flash Preview' },
     { value: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
     { value: 'gemini-2.5-flash-lite', name: 'Gemini 2.5 Flash Lite' },
     { value: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' }
@@ -283,6 +393,7 @@ function setupSettingsModal() {
     appConfig.defaultWorkspacePath = el.settingWorkspacePath.value.trim();
     appConfig.regressionTestCommand = el.settingTestCmd ? el.settingTestCmd.value.trim() : appConfig.regressionTestCommand;
     appConfig.commandTimeoutMs = el.settingCommandTimeout ? (parseInt(el.settingCommandTimeout.value) || 120000) : appConfig.commandTimeoutMs;
+    appConfig.modelCallDelayMs = el.settingModelCallDelay ? Math.min(Math.max(parseInt(el.settingModelCallDelay.value) || 0, 0), 60000) : (appConfig.modelCallDelayMs || 0);
     appConfig.compactThresholdTokens = parseInt(el.settingCompactThreshold.value) || 100000;
     appConfig.autoTest = el.settingAutoTest ? el.settingAutoTest.checked : true;
     appConfig.planningMode = el.settingPlanningMode.checked;
@@ -316,6 +427,12 @@ function setupWorkspaceHandlers() {
   };
   
   el.workspaceLabel.addEventListener('click', triggerWorkspaceSelect);
+  el.workspaceLabel.addEventListener('keydown', event => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      triggerWorkspaceSelect();
+    }
+  });
   el.btnChangeWorkspace.addEventListener('click', triggerWorkspaceSelect);
   
   if (el.btnAddProject) {
@@ -338,6 +455,29 @@ function setupWorkspaceHandlers() {
       triggerWorkspaceSelect();
     }
   });
+  if (el.btnPhoneCompanion) {
+    el.btnPhoneCompanion.addEventListener('click', async () => {
+      if (window.api && typeof window.api.enablePhoneCompanionLan === 'function') {
+        try {
+          const payload = await window.api.enablePhoneCompanionLan();
+          if (payload && payload.success !== false) {
+            updatePhoneCompanionPairingPanel(payload);
+          }
+        } catch (error) {
+          console.warn('Could not enable phone companion LAN mode:', error);
+          await refreshPhoneCompanionPairing();
+        }
+      } else {
+        await refreshPhoneCompanionPairing();
+      }
+      if (el.phoneCompanionModal) el.phoneCompanionModal.classList.add('active');
+    });
+  }
+  if (el.btnPhoneCompanionClose) {
+    el.btnPhoneCompanionClose.addEventListener('click', () => {
+      if (el.phoneCompanionModal) el.phoneCompanionModal.classList.remove('active');
+    });
+  }
   
   if (el.btnRunTestsManually) {
     el.btnRunTestsManually.addEventListener('click', () => {
@@ -356,7 +496,7 @@ async function setWorkspace(folderPath) {
   // Set current parent project
   currentWorkspace = folderPath;
   expandedFileFolders = new Set();
-  el.workspaceLabel.textContent = folderPath;
+  el.workspaceLabel.textContent = folderPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || folderPath;
   
   renderProjectsList();
   
@@ -372,38 +512,58 @@ async function setWorkspace(folderPath) {
 // PROJECTS LIST STORAGE & MANAGEMENT
 function loadProjectsFromStorage() {
   const raw = localStorage.getItem('ag2_projects');
-  if (raw) {
+  const backup = localStorage.getItem('ag2_projects_backup');
+  try {
+    projects = JSON.parse(raw);
+    if (!Array.isArray(projects)) throw new Error('Not an array');
+  } catch (e) {
+    console.warn("Failed to parse ag2_projects, trying backup", e);
     try {
-      projects = JSON.parse(raw);
-    } catch (e) {
+      projects = JSON.parse(backup);
+      if (!Array.isArray(projects)) throw new Error('Not an array');
+    } catch (e2) {
       projects = [];
     }
   }
 }
 
 function saveProjectsToStorage() {
-  localStorage.setItem('ag2_projects', JSON.stringify(projects));
+  try {
+    const serialized = JSON.stringify(projects);
+    localStorage.setItem('ag2_projects', serialized);
+    localStorage.setItem('ag2_projects_backup', serialized);
+  } catch (e) {
+    console.error("Failed to save projects to storage", e);
+  }
 }
 
 // PROJECTS LIST ARCHITECTURE COMPLETED - DUPES REMOVED
 
 async function syncWorkspaceFiles() {
   if (!currentWorkspace) return;
+  if (el.workspaceFilesPanel) el.workspaceFilesPanel.classList.remove('contextual-panel-hidden');
   el.fileTree.innerHTML = '<p class="empty-state">Scanning directory...</p>';
   loadWorkspaceEntrypoint();
+  
+  if (window.api && typeof window.api.indexWorkspace === 'function') {
+    window.api.indexWorkspace(currentWorkspace).catch(() => {});
+  }
   
   const files = await window.api.listFiles(currentWorkspace);
   el.fileCountBadge.textContent = files.length;
   
   if (files.length === 0) {
+    currentFileTreeItems = [];
     el.fileTree.innerHTML = '<p class="empty-state">No files found.</p>';
     autoDetectTestCommand(files);
+    loadRunArtifacts();
     return;
   }
 
   currentFileTreeItems = files;
   renderFileTree(files);
   autoDetectTestCommand(files);
+  loadRunArtifacts();
   return;
   
   el.fileTree.innerHTML = '';
@@ -443,6 +603,104 @@ function setupEntrypointControls() {
     if (event.key === 'Enter') {
       event.preventDefault();
       saveWorkspaceEntrypointFromInput();
+    }
+  });
+}
+
+function setupRightSidebarToggle() {
+  if (!el.btnToggleRightSidebar || !el.rightSidebar) return;
+  
+  const storedCollapsed = localStorage.getItem('rightSidebarCollapsed');
+  const isCollapsed = storedCollapsed === null ? true : (storedCollapsed === 'true');
+  
+  setRightSidebarCollapsed(isCollapsed, false);
+  
+  el.btnToggleRightSidebar.addEventListener('click', () => {
+    setRightSidebarCollapsed(!el.rightSidebar.classList.contains('collapsed'));
+  });
+}
+
+function setRightSidebarCollapsed(collapsed, persist = true) {
+  if (!el.rightSidebar) return;
+  el.rightSidebar.classList.toggle('collapsed', collapsed);
+  if (el.btnToggleRightSidebar) el.btnToggleRightSidebar.setAttribute('aria-expanded', String(!collapsed));
+  if (persist) localStorage.setItem('rightSidebarCollapsed', String(collapsed));
+}
+
+function revealAgentPanel(reason = '') {
+  const wasCollapsed = el.rightSidebar && el.rightSidebar.classList.contains('collapsed');
+  setRightSidebarCollapsed(false, false);
+  if (reason && wasCollapsed) showToast(reason, 'attention');
+}
+
+function setLeftSidebarCollapsed(collapsed, persist = true) {
+  if (!el.leftSidebar) return;
+  el.leftSidebar.classList.toggle('collapsed', collapsed);
+  if (el.btnToggleLeftSidebar) el.btnToggleLeftSidebar.setAttribute('aria-expanded', String(!collapsed));
+  if (persist) localStorage.setItem('leftSidebarCollapsed', String(collapsed));
+}
+
+function runCommandPaletteAction(command) {
+  const targets = {
+    'new-task': el.btnNewChat,
+    'open-workspace': el.btnChangeWorkspace,
+    'sync-files': el.btnSyncFiles,
+    'agent-panel': el.btnToggleRightSidebar,
+    phone: el.btnPhoneCompanion,
+    launch: document.getElementById('btn-launch-app'),
+    settings: el.btnSettings
+  };
+  const target = targets[command];
+  if (target) target.click();
+}
+
+function setupProgressiveDisclosure() {
+  if (el.leftSidebar && el.btnToggleLeftSidebar) {
+    const stored = localStorage.getItem('leftSidebarCollapsed');
+    const collapsed = stored === null ? window.innerWidth < 980 : stored === 'true';
+    setLeftSidebarCollapsed(collapsed, false);
+    el.btnToggleLeftSidebar.addEventListener('click', () => {
+      setLeftSidebarCollapsed(!el.leftSidebar.classList.contains('collapsed'));
+    });
+  }
+
+  const closePalette = () => el.commandPaletteModal && el.commandPaletteModal.classList.remove('active');
+  const openPalette = () => {
+    if (!el.commandPaletteModal) return;
+    el.commandPaletteModal.classList.add('active');
+    const firstCommand = el.commandPaletteModal.querySelector('.command-item');
+    if (firstCommand) firstCommand.focus();
+  };
+  if (el.btnCommandPalette) el.btnCommandPalette.addEventListener('click', openPalette);
+  if (el.commandPaletteModal) {
+    el.commandPaletteModal.addEventListener('click', event => {
+      if (event.target === el.commandPaletteModal) closePalette();
+      const item = event.target.closest('.command-item');
+      if (!item) return;
+      runCommandPaletteAction(item.dataset.command);
+      closePalette();
+    });
+  }
+  document.addEventListener('keydown', event => {
+    const paletteOpen = el.commandPaletteModal && el.commandPaletteModal.classList.contains('active');
+    if (paletteOpen && event.key === 'Tab') {
+      const items = [...el.commandPaletteModal.querySelectorAll('.command-item')];
+      if (items.length) {
+        const currentIndex = items.indexOf(document.activeElement);
+        const nextIndex = event.shiftKey
+          ? (currentIndex <= 0 ? items.length - 1 : currentIndex - 1)
+          : (currentIndex >= items.length - 1 ? 0 : currentIndex + 1);
+        event.preventDefault();
+        items[nextIndex].focus();
+      }
+    } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+      event.preventDefault();
+      paletteOpen ? closePalette() : openPalette();
+    } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'n') {
+      event.preventDefault();
+      createNewConversation();
+    } else if (event.key === 'Escape' && el.commandPaletteModal && el.commandPaletteModal.classList.contains('active')) {
+      closePalette();
     }
   });
 }
@@ -521,6 +779,9 @@ function renderFileTreeChildren(childrenMap, container, depth) {
     const row = document.createElement('div');
     row.className = `file-node ${node.isDir ? 'folder' : 'file'}`;
     row.style.paddingLeft = `${depth * 14 + 6}px`;
+    row.draggable = true;
+    row.dataset.path = node.path;
+    row.dataset.isdir = node.isDir ? 'true' : 'false';
     
     const isExpanded = expandedFileFolders.has(node.path);
     const hasChildren = node.isDir && node.children.size > 0;
@@ -532,7 +793,33 @@ function renderFileTreeChildren(childrenMap, container, depth) {
       <span class="file-icon">${icon}</span>
       <span class="file-name" title="${escapeHtml(node.path)}">${escapeHtml(node.name)}</span>
       ${node.isDir ? '' : '<button class="file-mention-btn" title="Mention this file in chat">@</button>'}
+      <button class="file-action-btn file-rename-btn" title="Rename">rn</button>
+      <button class="file-action-btn file-copy-btn" title="Copy">cp</button>
+      <button class="file-action-btn file-move-btn" title="Move or rename">mv</button>
+      <button class="file-action-btn file-delete-btn" title="Delete">del</button>
     `;
+
+    row.addEventListener('dragstart', (event) => {
+      event.dataTransfer.setData('text/x-orion-path', node.path);
+      event.dataTransfer.effectAllowed = 'move';
+    });
+
+    if (node.isDir) {
+      row.addEventListener('dragover', (event) => {
+        const sourcePath = event.dataTransfer.types.includes('text/x-orion-path');
+        if (sourcePath) {
+          event.preventDefault();
+          row.classList.add('drag-over');
+        }
+      });
+      row.addEventListener('dragleave', () => row.classList.remove('drag-over'));
+      row.addEventListener('drop', async (event) => {
+        event.preventDefault();
+        row.classList.remove('drag-over');
+        const sourcePath = event.dataTransfer.getData('text/x-orion-path');
+        await moveWorkspacePathIntoDirectory(sourcePath, node.path);
+      });
+    }
     
     if (node.isDir) {
       row.addEventListener('click', () => {
@@ -554,6 +841,34 @@ function renderFileTreeChildren(childrenMap, container, depth) {
         });
       }
     }
+    const moveButton = row.querySelector('.file-move-btn');
+    if (moveButton) {
+      moveButton.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        await moveWorkspacePath(node.path);
+      });
+    }
+    const renameButton = row.querySelector('.file-rename-btn');
+    if (renameButton) {
+      renameButton.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        await renameWorkspacePath(node.path);
+      });
+    }
+    const copyButton = row.querySelector('.file-copy-btn');
+    if (copyButton) {
+      copyButton.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        await copyWorkspacePath(node.path);
+      });
+    }
+    const deleteButton = row.querySelector('.file-delete-btn');
+    if (deleteButton) {
+      deleteButton.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        await deleteWorkspacePath(node.path);
+      });
+    }
     
     container.appendChild(row);
     
@@ -561,6 +876,151 @@ function renderFileTreeChildren(childrenMap, container, depth) {
       renderFileTreeChildren(node.children, container, depth + 1);
     }
   });
+}
+
+async function moveWorkspacePathIntoDirectory(sourcePath, directoryPath) {
+  if (!sourcePath || !directoryPath || sourcePath === directoryPath) return;
+  if (directoryPath.startsWith(`${sourcePath}\\`) || directoryPath.startsWith(`${sourcePath}/`)) {
+    alert('Cannot move a folder into itself.');
+    return;
+  }
+  const fileName = sourcePath.split(/[\\/]/).pop();
+  const destination = `${directoryPath}\\${fileName}`;
+  if (destination === sourcePath) return;
+  const result = await window.api.movePath(currentWorkspace, sourcePath, destination);
+  if (result.success) {
+    appendSystemMessage(`Moved ${sourcePath} to ${destination}.`);
+    await syncWorkspaceFiles();
+  } else {
+    alert(`Move failed: ${result.error}`);
+  }
+}
+
+async function deleteWorkspacePath(relativePath) {
+  if (!currentWorkspace || !relativePath) return;
+  const approved = await window.api.showConfirmDialog(`Delete "${relativePath}" from the workspace?`, 'Delete Workspace Item');
+  if (!approved) return;
+  const result = await window.api.deletePath(currentWorkspace, relativePath);
+  if (result.success) {
+    appendSystemMessage(`Deleted ${relativePath}${result.backupPath ? ` (backup: ${result.backupPath})` : ''}.`);
+    await syncWorkspaceFiles();
+  } else {
+    alert(`Delete failed: ${result.error}`);
+  }
+}
+
+async function moveWorkspacePath(relativePath) {
+  if (!currentWorkspace || !relativePath) return;
+  const destination = prompt('Move or rename to this workspace-relative path:', relativePath);
+  if (!destination || destination.trim() === relativePath) return;
+  const result = await window.api.movePath(currentWorkspace, relativePath, destination.trim());
+  if (result.success) {
+    appendSystemMessage(`Moved ${relativePath} to ${destination.trim()}.`);
+    await syncWorkspaceFiles();
+  } else {
+    alert(`Move failed: ${result.error}`);
+  }
+}
+
+async function renameWorkspacePath(relativePath) {
+  if (!currentWorkspace || !relativePath) return;
+  const currentName = relativePath.split(/[\\/]/).pop();
+  const newName = prompt('Rename to:', currentName);
+  if (!newName || newName.trim() === currentName) return;
+  const result = await window.api.renamePath(currentWorkspace, relativePath, newName.trim());
+  if (result.success) {
+    appendSystemMessage(`Renamed ${relativePath} to ${newName.trim()}.`);
+    await syncWorkspaceFiles();
+  } else {
+    alert(`Rename failed: ${result.error}`);
+  }
+}
+
+async function copyWorkspacePath(relativePath) {
+  if (!currentWorkspace || !relativePath) return;
+  const destination = prompt('Copy to this workspace-relative path:', relativePath);
+  if (!destination || destination.trim() === relativePath) return;
+  const result = await window.api.copyPath(currentWorkspace, relativePath, destination.trim());
+  if (result.success) {
+    appendSystemMessage(`Copied ${relativePath} to ${destination.trim()}.`);
+    await syncWorkspaceFiles();
+  } else {
+    alert(`Copy failed: ${result.error}`);
+  }
+}
+
+async function loadRunArtifacts() {
+  if (!el.artifactList || !window.api.listRunArtifacts) return;
+  const result = await window.api.listRunArtifacts(activeConversationId);
+  const runArtifacts = result && result.success ? result.artifacts : [];
+  const artifacts = mergeRunAndWorkspaceScreenshotArtifacts(runArtifacts);
+  currentRunArtifacts = artifacts;
+  if (el.artifactCountBadge) el.artifactCountBadge.textContent = artifacts.length;
+  if (el.runArtifactsPanel) el.runArtifactsPanel.classList.toggle('contextual-panel-hidden', artifacts.length === 0);
+  if (!artifacts.length) {
+    el.artifactList.innerHTML = '<p class="empty-state">Artifacts are saved outside the project after runs.</p>';
+    return;
+  }
+  el.artifactList.innerHTML = artifacts.slice(0, 12).map(renderArtifactListItem).join('');
+  el.artifactList.querySelectorAll('[data-artifact-index]').forEach(button => {
+    button.addEventListener('click', () => openRunArtifactByIndex(Number(button.dataset.artifactIndex)));
+  });
+}
+
+function mergeRunAndWorkspaceScreenshotArtifacts(runArtifacts = []) {
+  const merged = Array.isArray(runArtifacts) ? [...runArtifacts] : [];
+  const existingScreenshots = new Set(merged
+    .filter(item => item && item.artifactType === 'screenshot')
+    .map(item => `${item.workspacePath || currentWorkspace}|${item.screenshotPath}`));
+  getWorkspaceScreenshotArtifacts().forEach(item => {
+    const key = `${item.workspacePath}|${item.screenshotPath}`;
+    if (!existingScreenshots.has(key)) {
+      existingScreenshots.add(key);
+      merged.push(item);
+    }
+  });
+  return merged.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+}
+
+function getWorkspaceScreenshotArtifacts() {
+  if (!currentWorkspace || !Array.isArray(currentFileTreeItems)) return [];
+  return currentFileTreeItems
+    .filter(file => file && !file.isDir && /^\.orion[\\/]+screenshots[\\/]+.+\.(png|jpe?g|webp)$/i.test(file.path))
+    .map(file => ({
+      artifactType: 'screenshot',
+      displayName: file.path.split(/[\\/]/).pop(),
+      fileName: file.path.split(/[\\/]/).pop(),
+      artifactPath: file.path,
+      workspacePath: currentWorkspace,
+      screenshotPath: file.path,
+      createdAt: new Date().toISOString(),
+      size: file.size || 0,
+      summary: 'Workspace screenshot'
+    }));
+}
+
+function renderArtifactListItem(item, index) {
+  const isScreenshot = item.artifactType === 'screenshot' && item.screenshotPath;
+  const displayName = item.displayName || item.fileName || 'artifact';
+  const metaParts = [];
+  if (item.artifactType === 'screenshot') metaParts.push('Screenshot');
+  else metaParts.push('Run summary');
+  if (item.width && item.height) metaParts.push(`${item.width}x${item.height}`);
+  if (item.createdAt) metaParts.push(new Date(item.createdAt).toLocaleString());
+  const tag = isScreenshot ? 'button' : 'div';
+  const actionAttrs = isScreenshot ? ` type="button" data-artifact-index="${index}" aria-label="View screenshot artifact ${escapeHtml(displayName)}"` : '';
+  return `
+    <${tag} class="artifact-item ${isScreenshot ? 'previewable' : ''}" title="${escapeHtml(item.summary || item.artifactPath || item.screenshotPath || '')}"${actionAttrs}>
+      <span class="artifact-name">${escapeHtml(displayName)}</span>
+      <span class="artifact-meta">${escapeHtml(metaParts.join(' / '))}</span>
+    </${tag}>
+  `;
+}
+
+async function openRunArtifactByIndex(index) {
+  const item = currentRunArtifacts[index];
+  if (!item || item.artifactType !== 'screenshot') return;
+  await openImageArtifact(item);
 }
 
 async function autoDetectTestCommand(files) {
@@ -641,6 +1101,7 @@ async function openFileViewer(relPath) {
   if (!currentWorkspace || !relPath) return;
   viewedFilePath = relPath;
   el.fileViewerTitle.textContent = relPath;
+  setFileViewerMode('text');
   el.fileViewerContent.textContent = 'Loading...';
   el.fileViewerModal.classList.add('active');
   
@@ -652,8 +1113,48 @@ async function openFileViewer(relPath) {
   el.fileViewerContent.textContent = content || '';
 }
 
+async function openImageArtifact(item) {
+  const workspacePath = item.workspacePath || currentWorkspace;
+  const relPath = item.screenshotPath || item.path;
+  if (!workspacePath || !relPath || !window.api.readWorkspaceFileBase64) {
+    showToast('Screenshot artifact is missing its workspace path.', 'attention');
+    return;
+  }
+  viewedFilePath = relPath;
+  el.fileViewerTitle.textContent = relPath;
+  setFileViewerMode('image');
+  if (el.fileViewerImageMeta) el.fileViewerImageMeta.textContent = 'Loading screenshot...';
+  el.fileViewerModal.classList.add('active');
+
+  const file = await window.api.readWorkspaceFileBase64(workspacePath, relPath);
+  if (!file || file.success === false) {
+    if (el.fileViewerImageMeta) el.fileViewerImageMeta.textContent = `Error loading screenshot: ${file && file.error ? file.error : 'unknown error'}`;
+    if (el.fileViewerImage) el.fileViewerImage.removeAttribute('src');
+    return;
+  }
+  const mimeType = file.mimeType || 'image/png';
+  if (el.fileViewerImage) el.fileViewerImage.src = `data:${mimeType};base64,${file.data}`;
+  const dimensions = item.width && item.height ? `${item.width}x${item.height}` : '';
+  const size = item.size ? `${Math.round(item.size / 1024)} KB` : '';
+  if (el.fileViewerImageMeta) {
+    el.fileViewerImageMeta.textContent = [dimensions, size, item.toolName || 'screenshot'].filter(Boolean).join(' / ');
+  }
+}
+
+function setFileViewerMode(mode) {
+  const imageMode = mode === 'image';
+  if (el.fileViewerContent) {
+    el.fileViewerContent.hidden = imageMode;
+    if (!imageMode) el.fileViewerContent.textContent = '';
+  }
+  if (el.fileViewerImageShell) el.fileViewerImageShell.hidden = !imageMode;
+  if (!imageMode && el.fileViewerImage) el.fileViewerImage.removeAttribute('src');
+  if (!imageMode && el.fileViewerImageMeta) el.fileViewerImageMeta.textContent = '';
+}
+
 function closeFileViewer() {
   viewedFilePath = '';
+  setFileViewerMode('text');
   if (el.fileViewerModal) el.fileViewerModal.classList.remove('active');
 }
 
@@ -668,10 +1169,17 @@ function setupChatHandlers() {
   });
   
   el.chatInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && e.ctrlKey) {
       e.preventDefault();
       if (window.isAgentRunning && window.isAgentRunning()) {
         triggerSteer();
+      } else {
+        submitMessage();
+      }
+    } else if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      if (window.isAgentRunning && window.isAgentRunning()) {
+        triggerQueue();
       } else {
         submitMessage();
       }
@@ -693,6 +1201,16 @@ function setupChatHandlers() {
   
   document.getElementById('btn-steer').addEventListener('click', triggerSteer);
   document.getElementById('btn-queue').addEventListener('click', triggerQueue);
+  el.messagesContainer.addEventListener('click', handleQueuedPromptActionClick);
+  const addFileButton = document.getElementById('btn-add-file');
+  if (addFileButton) {
+    addFileButton.addEventListener('click', () => {
+      const needsSpace = el.chatInput.value && !/\s$/.test(el.chatInput.value);
+      el.chatInput.value += `${needsSpace ? ' ' : ''}@`;
+      el.chatInput.focus();
+      el.chatInput.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+  }
   
   el.btnNewChat.addEventListener('click', createNewConversation);
   if (el.btnAddConversation) {
@@ -712,9 +1230,9 @@ function triggerSteer() {
   const text = el.chatInput.value.trim();
   if (!text) return;
   
-  if (window.steeringQueue) {
-    window.steeringQueue.push(text);
-    appendSteeringMessage(text);
+  if (enqueueSteeringForConversation(text, activeConversationId)) {
+    appendSteeringMessage(text, activeConversationId);
+    checkpointSteeringInstruction(text, activeConversationId);
   }
   el.chatInput.value = '';
   document.getElementById('btn-steer').style.display = 'none';
@@ -726,34 +1244,302 @@ function triggerQueue() {
   if (!text) return;
   
   if (window.promptQueue) {
-    window.promptQueue.push({ prompt: text, modelSelectValue: el.modelSelect.value, conversationId: activeConversationId });
-    appendQueuedMessage(text);
+    const queueItem = {
+      id: createQueuedPromptId(),
+      prompt: text,
+      modelSelectValue: el.modelSelect.value,
+      conversationId: activeConversationId,
+      source: 'user-queue',
+      createdAt: Date.now()
+    };
+    window.promptQueue.push(queueItem);
+    appendQueuedMessage(text, queueItem);
   }
   el.chatInput.value = '';
   document.getElementById('btn-steer').style.display = 'none';
   document.getElementById('btn-queue').style.display = 'none';
 }
 
-function appendSteeringMessage(text) {
-  renderUserMessage(`[🎯 Steering] ${text}`);
-  const conv = conversations.find(c => c.id === activeConversationId);
+function enqueueSteeringForConversation(text, conversationId = activeConversationId) {
+  if (!text || !conversationId) return false;
+  if (!window.steeringQueue || Array.isArray(window.steeringQueue)) {
+    window.steeringQueue = {};
+  }
+  window.steeringQueue[conversationId] = window.steeringQueue[conversationId] || [];
+  window.steeringQueue[conversationId].push(text);
+  return true;
+}
+
+function checkpointSteeringInstruction(text, conversationId = activeConversationId) {
+  const conv = conversations.find(c => c.id === conversationId);
+  const workspace = (conv && (conv.workspace || conv.projectPath)) || currentWorkspace;
+  if (workspace && window.mutateOperationalContext) {
+    window.mutateOperationalContext(workspace, 'checkpoint', {
+      reason: 'user_steering',
+      summary: `User steering received: ${text.slice(0, 800)}`,
+      nextAction: 'Apply the steering instruction before continuing the active subplan.'
+    }).catch(error => console.warn('Could not checkpoint steering:', error));
+  }
+}
+
+function appendSteeringMessage(text, conversationId = activeConversationId) {
+  if (conversationId === activeConversationId) {
+    renderSystemBubble(`[Steering] ${text}`);
+  }
+  const conv = conversations.find(c => c.id === conversationId);
   if (conv) {
-    conv.messages.push({ role: 'user', text: `[🎯 Steering] ${text}` });
+    conv.messages.push({ role: 'steering', source: 'steering', text: `[Steering] ${text}`, createdAt: Date.now() });
     saveConversationsToStorage();
   }
 }
 
-function appendQueuedMessage(text) {
-  renderSystemBubble(`⏳ Prompt Queued: "${text}"`);
-  const conv = conversations.find(c => c.id === activeConversationId);
+function setupStartActions() {
+  if (el.btnStartOpenRepo) {
+    el.btnStartOpenRepo.addEventListener('click', async () => {
+      const folderPath = await window.api.selectWorkspace();
+      if (folderPath) setWorkspace(folderPath);
+    });
+  }
+  if (el.btnStartNewTask) {
+    el.btnStartNewTask.addEventListener('click', () => {
+      el.chatInput.focus();
+    });
+  }
+  if (el.btnStartResume) {
+    el.btnStartResume.addEventListener('click', () => {
+      const existing = conversations.find(c => c.messages && c.messages.length > 0);
+      if (existing) selectConversation(existing.id);
+      el.chatInput.focus();
+    });
+  }
+}
+
+function createQueuedPromptId() {
+  return 'queue_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+}
+
+function appendQueuedMessage(text, queueItem = {}) {
+  const item = {
+    id: queueItem.id || createQueuedPromptId(),
+    prompt: text,
+    modelSelectValue: queueItem.modelSelectValue || (el.modelSelect && el.modelSelect.value),
+    conversationId: queueItem.conversationId || activeConversationId,
+    source: queueItem.source || 'user-queue',
+    createdAt: queueItem.createdAt || Date.now()
+  };
+  if (item.conversationId === activeConversationId) {
+    el.welcomeSplash.style.display = 'none';
+    el.messagesContainer.style.display = 'flex';
+    renderQueuedPromptBubble(item);
+  }
+  const conv = conversations.find(c => c.id === item.conversationId);
   if (conv) {
-    conv.messages.push({ role: 'system', text: `⏳ Prompt Queued: "${text}"` });
+    conv.messages.push({
+      role: 'system',
+      source: 'queued-prompt',
+      text: `Prompt queued: "${text}"`,
+      queueId: item.id,
+      queuedPrompt: text,
+      queueState: 'queued',
+      modelSelectValue: item.modelSelectValue,
+      createdAt: item.createdAt
+    });
     saveConversationsToStorage();
   }
+}
+
+function getPromptQueueIndex(queueId, conversationId) {
+  if (!queueId || !Array.isArray(window.promptQueue)) return -1;
+  return window.promptQueue.findIndex(item =>
+    item && item.id === queueId && (!conversationId || item.conversationId === conversationId)
+  );
+}
+
+function removePromptQueueItem(queueId, conversationId) {
+  const index = getPromptQueueIndex(queueId, conversationId);
+  if (index === -1) return null;
+  const [item] = window.promptQueue.splice(index, 1);
+  return item || null;
+}
+
+function findQueuedPromptMessage(queueId, conversationId) {
+  const conv = conversations.find(c => c.id === conversationId);
+  if (!conv || !Array.isArray(conv.messages)) return { conv: null, message: null };
+  const message = conv.messages.find(msg => msg && msg.queueId === queueId);
+  return { conv, message };
+}
+
+function getQueuedPromptStatus(item) {
+  const queueId = item.id || item.queueId;
+  const conversationId = item.conversationId || activeConversationId;
+  const queueIndex = getPromptQueueIndex(queueId, conversationId);
+  const queueState = item.queueState || 'queued';
+  if (queueState === 'steered') return 'Converted to steering';
+  if (queueState === 'sent') return 'Sent to Orion';
+  if (queueIndex === 0) return 'Runs next';
+  if (queueIndex > 0) return `Queued #${queueIndex + 1}`;
+  return 'No longer queued';
+}
+
+function buildQueuedPromptBubble(item) {
+  const queueId = String(item.id || item.queueId || '');
+  const conversationId = String(item.conversationId || activeConversationId || '');
+  const prompt = String(item.prompt || item.queuedPrompt || '');
+  const queueIndex = getPromptQueueIndex(queueId, conversationId);
+  const isPending = queueIndex !== -1;
+  const runningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+  const isThisConversationRunning = !!(window.isAgentRunning && window.isAgentRunning() && runningId === conversationId);
+  const canSteer = isPending && isThisConversationRunning;
+  const canSendNow = isPending;
+  const statusText = getQueuedPromptStatus(item);
+  const resolvedClass = isPending ? '' : ' is-resolved';
+  const steerTitle = canSteer
+    ? 'Turn this queued prompt into steering for the current run'
+    : 'Steer is available only while this conversation is the running task';
+  const sendTitle = canSendNow
+    ? 'Move this prompt to the front of the queue, or start it if Orion is idle'
+    : 'This queued prompt has already been handled';
+
+  const bubble = document.createElement('div');
+  bubble.className = `message-bubble queued-prompt-bubble${resolvedClass}`;
+  bubble.dataset.queueId = queueId;
+  bubble.dataset.conversationId = conversationId;
+  bubble.innerHTML = `
+    <div class="message-header queued">Queued Prompt</div>
+    <div class="message-body queued-prompt-body">
+      <div class="queued-prompt-copy">${escapeHtml(prompt).replace(/\n/g, '<br>')}</div>
+      <div class="queued-prompt-footer">
+        <span class="queued-prompt-status">${escapeHtml(statusText)}</span>
+        <div class="queued-prompt-actions">
+          <button class="queued-prompt-action" type="button" data-action="steer" data-queue-id="${escapeHtml(queueId)}" data-conversation-id="${escapeHtml(conversationId)}" title="${escapeHtml(steerTitle)}"${canSteer ? '' : ' disabled'}>Steer</button>
+          <button class="queued-prompt-action primary" type="button" data-action="send-now" data-queue-id="${escapeHtml(queueId)}" data-conversation-id="${escapeHtml(conversationId)}" title="${escapeHtml(sendTitle)}"${canSendNow ? '' : ' disabled'}>Send now</button>
+        </div>
+      </div>
+    </div>
+  `;
+  return bubble;
+}
+
+function renderQueuedPromptBubble(item) {
+  const stickToBottom = shouldAutoScrollChat();
+  el.messagesContainer.appendChild(buildQueuedPromptBubble(item));
+  scrollChatToBottomIfNeeded(stickToBottom);
+}
+
+function refreshQueuedPromptBubble(queueId, conversationId) {
+  if (conversationId !== activeConversationId || !el.messagesContainer) return;
+  const bubble = el.messagesContainer.querySelector(`[data-queue-id="${queueId}"]`);
+  if (!bubble) return;
+  const { message } = findQueuedPromptMessage(queueId, conversationId);
+  const item = message
+    ? {
+        ...message,
+        id: message.queueId,
+        prompt: message.queuedPrompt,
+        conversationId
+      }
+    : { id: queueId, conversationId };
+  const stickToBottom = shouldAutoScrollChat();
+  bubble.replaceWith(buildQueuedPromptBubble(item));
+  scrollChatToBottomIfNeeded(stickToBottom);
+}
+
+function setQueuedPromptMessageState(queueId, conversationId, queueState) {
+  const { conv, message } = findQueuedPromptMessage(queueId, conversationId);
+  if (message) {
+    message.queueState = queueState;
+    message.updatedAt = Date.now();
+    if (queueState === 'steered') {
+      message.text = `Queued prompt converted to steering: "${message.queuedPrompt || ''}"`;
+    } else if (queueState === 'sent') {
+      message.text = `Queued prompt sent: "${message.queuedPrompt || ''}"`;
+    }
+  }
+  if (conv) saveConversationsToStorage();
+  refreshQueuedPromptBubble(queueId, conversationId);
+}
+
+function handleQueuedPromptActionClick(event) {
+  const button = event.target.closest('.queued-prompt-action');
+  if (!button || button.disabled) return;
+  event.preventDefault();
+  const queueId = button.dataset.queueId;
+  const conversationId = button.dataset.conversationId || activeConversationId;
+  if (button.dataset.action === 'steer') {
+    promoteQueuedPromptToSteering(queueId, conversationId);
+  } else if (button.dataset.action === 'send-now') {
+    sendQueuedPromptNow(queueId, conversationId);
+  }
+}
+
+function promoteQueuedPromptToSteering(queueId, conversationId) {
+  const runningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+  const isThisConversationRunning = !!(window.isAgentRunning && window.isAgentRunning() && runningId === conversationId);
+  if (!isThisConversationRunning) {
+    showToast('Steer is available only for the task currently running.', 'attention');
+    refreshQueuedPromptBubble(queueId, conversationId);
+    return;
+  }
+  const item = removePromptQueueItem(queueId, conversationId);
+  if (!item) {
+    showToast('That queued prompt is no longer waiting.', 'attention');
+    setQueuedPromptMessageState(queueId, conversationId, 'sent');
+    return;
+  }
+  if (enqueueSteeringForConversation(item.prompt, conversationId)) {
+    setQueuedPromptMessageState(queueId, conversationId, 'steered');
+    checkpointSteeringInstruction(item.prompt, conversationId);
+    showToast('Queued prompt changed to steering.', 'success');
+  }
+}
+
+function sendQueuedPromptNow(queueId, conversationId) {
+  const item = removePromptQueueItem(queueId, conversationId);
+  if (!item) {
+    showToast('That queued prompt is no longer waiting.', 'attention');
+    setQueuedPromptMessageState(queueId, conversationId, 'sent');
+    return;
+  }
+  const conv = conversations.find(c => c.id === conversationId);
+  if (!conv) return;
+
+  if (window.isAgentRunning && window.isAgentRunning()) {
+    window.promptQueue.unshift(item);
+    setQueuedPromptMessageState(queueId, conversationId, 'queued');
+    refreshQueuedPromptBubble(queueId, conversationId);
+    showToast('Queued prompt moved to the front.', 'success');
+    return;
+  }
+
+  if (!window.runAgentLoop) {
+    window.promptQueue.unshift(item);
+    showToast('Agent engine is still loading. The prompt is first in queue.', 'attention');
+    refreshQueuedPromptBubble(queueId, conversationId);
+    return;
+  }
+
+  setQueuedPromptMessageState(queueId, conversationId, 'sent');
+  if (!item.alreadyRendered && conv.messages) {
+    conv.messages.push({ role: 'user', source: item.source || 'queue', text: item.prompt, createdAt: Date.now() });
+    saveConversationsToStorage();
+  }
+  if (conversationId === activeConversationId && !item.alreadyRendered) {
+    renderUserMessage(item.prompt);
+  }
+  window.runAgentLoop(item.prompt, item.modelSelectValue || (el.modelSelect && el.modelSelect.value), conv, {
+    source: item.source || 'queue'
+  }).catch(error => {
+    console.error('Queued prompt send-now run failed:', error);
+    appendSystemMessage(`Queued prompt failed to start: ${error.message}`, { conversationId });
+  });
+}
+
+function markQueuedPromptRunning(queueId, conversationId) {
+  setQueuedPromptMessageState(queueId, conversationId, 'sent');
 }
 
 function createNewConversation() {
-  const newId = 'conv_' + Date.now();
+  const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
   const title = 'New Conversation';
   
   const newConv = {
@@ -780,7 +1566,7 @@ function createNewConversation() {
 }
 
 function createNewConversationUnderProject(projectPath) {
-  const newId = 'conv_' + Date.now();
+  const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
   const title = 'New Conversation';
   
   const newConv = {
@@ -806,15 +1592,55 @@ function createNewConversationUnderProject(projectPath) {
   el.chatInput.focus();
 }
 
+function getStandaloneWorkspaceRoot() {
+  const configured = (appConfig.standaloneWorkspaceRoot || '').trim();
+  if (configured) return configured.replace(/[\\\/]+$/, '');
+  return appConfig.standaloneWorkspaceDefault || 'C:\\Users\\Owner\\Desktop\\Projects\\OrionAI\\standalone-workspaces';
+}
+
+function getStandaloneWorkspaceForTitle(title, convId) {
+  const slug = slugify(title || 'new-conversation') || 'new-conversation';
+  // Append a short unique suffix derived from the conversation ID so two
+  // conversations with identical titles never share the same workspace folder.
+  const suffix = convId ? '-' + String(convId).replace(/[^a-z0-9]/gi, '').slice(-8) : '';
+  return getStandaloneWorkspaceRoot() + '\\' + slug + suffix;
+}
+
+function createPhoneConversation({ projectPath = '', title = 'New Phone Task' } = {}) {
+  const convId = 'conv-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
+  const normalizedProjectPath = String(projectPath || '').trim();
+  const conv = {
+    id: convId,
+    title,
+    messages: [],
+    createdAt: Date.now(),
+    workspace: normalizedProjectPath || '',
+    projectPath: normalizedProjectPath,
+    tasks: [],
+    awaitingPlanApproval: false,
+    planApproved: false
+  };
+  conversations.unshift(conv);
+  saveConversationsToStorage();
+  return conv;
+}
+
 function loadConversationsFromStorage() {
   const raw = localStorage.getItem('ag2_conversations');
-  if (raw) {
+  const backup = localStorage.getItem('ag2_conversations_backup');
+  try {
+    conversations = JSON.parse(raw);
+    if (!Array.isArray(conversations)) throw new Error('Not an array');
+  } catch(e) {
+    console.warn("Failed to parse ag2_conversations, trying backup", e);
     try {
-      conversations = JSON.parse(raw);
-    } catch(e) {
+      conversations = JSON.parse(backup);
+      if (!Array.isArray(conversations)) throw new Error('Not an array');
+    } catch (e2) {
       conversations = [];
     }
   }
+  scrubLegacyPhoneCompanionTokenMessages();
 }
 
 function migrateConversations() {
@@ -832,14 +1658,84 @@ function migrateConversations() {
         updated = true;
       }
     }
+    if (Array.isArray(c.messages)) {
+      const before = c.messages.length;
+      c.messages = c.messages.filter(msg => !isLegacyPhoneCompanionTokenMessage(msg && msg.text));
+      if (c.messages.length !== before) updated = true;
+    }
   });
   if (updated) {
     saveConversationsToStorage();
   }
 }
 
+function isLegacyPhoneCompanionTokenMessage(text) {
+  return /Phone Companion is available on this Wi-Fi at .*[\?&]token=/i.test(String(text || ''));
+}
+
+function removeLegacyPhoneCompanionTokenBubbles() {
+  if (!el.messagesContainer) return;
+  el.messagesContainer.querySelectorAll('.message-bubble').forEach(bubble => {
+    if (isLegacyPhoneCompanionTokenMessage(bubble.textContent || '')) {
+      bubble.remove();
+    }
+  });
+}
+
+const CHAT_BOTTOM_THRESHOLD_PX = 96;
+
+function shouldAutoScrollChat() {
+  if (!el.chatFeed) return false;
+  const distanceFromBottom = el.chatFeed.scrollHeight - el.chatFeed.scrollTop - el.chatFeed.clientHeight;
+  return distanceFromBottom <= CHAT_BOTTOM_THRESHOLD_PX;
+}
+
+function scrollChatToBottom() {
+  if (el.chatFeed) {
+    el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+  }
+}
+
+function scrollChatToBottomIfNeeded(shouldScroll) {
+  if (shouldScroll) scrollChatToBottom();
+}
+
+function isEmptyThinkingPlaceholder(text, logs = []) {
+  const hasLogs = Array.isArray(logs) && logs.length > 0;
+  return String(text || '').trim() === 'Thinking...' && !hasLogs;
+}
+
+function scrubLegacyPhoneCompanionTokenMessages() {
+  let updated = false;
+  conversations.forEach(c => {
+    if (!Array.isArray(c.messages)) return;
+    const before = c.messages.length;
+    c.messages = c.messages.filter(msg => !isLegacyPhoneCompanionTokenMessage(msg && msg.text));
+    if (c.messages.length !== before) updated = true;
+  });
+  if (updated) saveConversationsToStorage();
+}
+
+async function refreshPhoneCompanionPairing() {
+  if (!window.api || typeof window.api.getPhoneCompanionPairing !== 'function') return;
+  try {
+    const payload = await window.api.getPhoneCompanionPairing();
+    if (payload && payload.success !== false) {
+      updatePhoneCompanionPairingPanel(payload);
+    }
+  } catch (error) {
+    console.warn('Phone companion pairing payload unavailable:', error);
+  }
+}
+
 function saveConversationsToStorage() {
-  localStorage.setItem('ag2_conversations', JSON.stringify(conversations));
+  try {
+    const serialized = JSON.stringify(conversations);
+    localStorage.setItem('ag2_conversations', serialized);
+    localStorage.setItem('ag2_conversations_backup', serialized);
+  } catch (e) {
+    console.error("Failed to save conversations to storage", e);
+  }
 }
 
 function renderConversationList() {
@@ -894,14 +1790,16 @@ function selectConversation(id) {
   if (conv.workspace) {
     currentWorkspace = conv.workspace;
     expandedFileFolders = new Set();
-    el.workspaceLabel.textContent = conv.workspace;
+    const wsName = conv.workspace.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || conv.workspace;
+    el.workspaceLabel.textContent = wsName;
     syncWorkspaceFiles();
   } else {
     // Brand new conversation
     currentWorkspace = '';
-    el.workspaceLabel.textContent = conv.projectPath ? `${conv.projectPath} > [Pending First Message]` : 'Pending First Message';
+    el.workspaceLabel.textContent = conv.projectPath ? conv.projectPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || conv.projectPath : '';
     el.fileTree.innerHTML = '<p class="empty-state">Workspace will initialize upon sending your first prompt.</p>';
     el.fileCountBadge.textContent = '0';
+    if (el.workspaceFilesPanel) el.workspaceFilesPanel.classList.add('contextual-panel-hidden');
   }
   
   renderConversationList();
@@ -922,20 +1820,41 @@ function selectConversation(id) {
       if (msg.role === 'user') {
         renderUserMessage(msg.text);
       } else if (msg.role === 'assistant') {
-        renderAiMessage(msg.text, msg.logs);
-      } else if (msg.role === 'system') {
+        if (isEmptyThinkingPlaceholder(msg.text, msg.logs)) return;
+        renderAiMessage(msg.text, msg.logs, activeConversationId, msg);
+      } else if (msg.role === 'steering') {
         renderSystemBubble(msg.text);
+      } else if (msg.role === 'system') {
+        if (msg.source === 'queued-prompt') {
+          renderQueuedPromptBubble({
+            ...msg,
+            id: msg.queueId,
+            prompt: msg.queuedPrompt,
+            conversationId: activeConversationId
+          });
+        } else {
+          renderSystemBubble(msg.text);
+        }
       }
     });
     window.clearActiveAiBubble();
+    removeLegacyPhoneCompanionTokenBubbles();
   }
   
   // Reload tasks & tests
   updateTasksChecklist(conv.tasks);
   updateTestResultsPanel(conv.testResults);
+  refreshOperationalContext(conv.workspace);
+  loadRunArtifacts();
+  if (conv.awaitingPlanApproval && !conv.planApproved) {
+    revealAgentPanel('A plan is ready for review.');
+    renderAgentPresence('attention', 'Review needed', 'Implementation plan is waiting for approval');
+  } else if (!(window.isAgentRunning && window.isAgentRunning())) {
+    renderAgentPresence('idle', 'Ready', '');
+  }
   
   // Scroll to bottom
-  el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+  scrollChatToBottom();
   
   // Focus the input box so the user can immediately type
   el.chatInput.focus();
@@ -966,22 +1885,22 @@ async function submitMessage() {
   
   // Initialize title & folder path if first prompt
   if (!conv.workspace) {
-    const title = prompt.length > 25 ? prompt.substring(0, 25) + '...' : prompt;
+    const title = generateConversationTitle(prompt);
     conv.title = title;
     el.chatTitle.textContent = title;
-    
+    renderConversationList();
+
     if (conv.projectPath) {
       conv.workspace = conv.projectPath;
     } else {
-      const slug = slugify(title);
-      conv.workspace = 'C:\\Users\\Owner\\.gemini\\antigravity\\scratch\\standalone' + '\\' + slug;
+      conv.workspace = getStandaloneWorkspaceForTitle(title, conv.id);
     }
   }
-  
+
   // Ensure currentWorkspace is locked onto this isolated folder
   currentWorkspace = conv.workspace;
   expandedFileFolders = new Set();
-  el.workspaceLabel.textContent = currentWorkspace;
+  el.workspaceLabel.textContent = currentWorkspace.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || currentWorkspace;
   syncWorkspaceFiles();
   
   // Update messages history
@@ -991,8 +1910,8 @@ async function submitMessage() {
   renderConversationList();
   renderProjectsList();
   
-  // Scroll to bottom
-  el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+  // Scroll to bottom for the local send action.
+  scrollChatToBottom();
   
   // Trigger local Agent loop
   if (window.runAgentLoop) {
@@ -1002,9 +1921,25 @@ async function submitMessage() {
       appendSystemMessage("Another conversation is currently running. This prompt was queued for this conversation.");
     } else {
       await window.runAgentLoop(prompt, selectedModel, conv);
+      loadRunArtifacts();
     }
   } else {
-    appendSystemMessage("Agent engine is loading... please try again in a moment.");
+    appendSystemMessage("Agent engine is loading... your message will run automatically when ready.");
+    const pendingPrompt = prompt;
+    const pendingConv = conv;
+    const waitForEngine = setInterval(async () => {
+      if (window.runAgentLoop) {
+        clearInterval(waitForEngine);
+        const selectedModel = el.modelSelect.value;
+        if (window.isAgentRunning && window.isAgentRunning()) {
+          window.promptQueue.push({ prompt: pendingPrompt, modelSelectValue: selectedModel, conversationId: pendingConv.id, alreadyRendered: true });
+        } else {
+          await window.runAgentLoop(pendingPrompt, selectedModel, pendingConv);
+          loadRunArtifacts();
+        }
+      }
+    }, 500);
+    setTimeout(() => clearInterval(waitForEngine), 30000);
   }
 }
 
@@ -1013,6 +1948,59 @@ function slugify(text) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/(^-|-$)+/g, '');
+}
+
+function toTitleCase(str) {
+  const minors = new Set(['a', 'an', 'the', 'and', 'but', 'or', 'for', 'nor', 'on', 'at', 'to', 'by', 'in', 'of', 'up', 'as', 'is', 'it', 'vs']);
+  const upperAbbrevs = new Set(['ai', 'llm', 'gpt', 'api', 'url', 'ui', 'ux', 'css', 'html', 'json', 'sql', 'db', 'cli', 'sdk', 'aws', 'ide', 'gpu', 'cpu', 'ram', 'os', 'ci', 'cd', 'qa', 'jwt', 'ssh', 'ftp', 'http', 'https', 'xml', 'csv', 'pdf', 'id', 'io']);
+  return String(str || '')
+    .toLowerCase()
+    .trim()
+    .replace(/\b\w+/g, (word, offset) => {
+      if (upperAbbrevs.has(word)) return word.toUpperCase();
+      if (offset === 0 || !minors.has(word)) return word.charAt(0).toUpperCase() + word.slice(1);
+      return word;
+    });
+}
+
+function generateConversationTitle(prompt) {
+  let text = String(prompt || '').trim();
+
+  // Strip common leading filler patterns
+  const leadingFillers = [
+    /^i have a (?:program|project|app|application|file|script|tool|repo|repository) called\s+/i,
+    /^(?:can|could) you (?:please\s+)?/i,
+    /^please\s+/i,
+    /^i (?:need|want|would like) (?:you to\s+)?/i,
+    /^help me (?:with\s+)?/i,
+    /^orion[,\s]+/i,
+  ];
+  for (const pat of leadingFillers) {
+    text = text.replace(pat, '').trim();
+  }
+
+  // If the text contains multiple sentences, take only the first meaningful one
+  const sentenceBreak = text.search(/[.!?]\s+[A-Za-z]/);
+  if (sentenceBreak > 8) text = text.substring(0, sentenceBreak).trim();
+
+  // Strip location context ("in my projects folder on my desktop", etc.)
+  text = text
+    .replace(/\s+in my (?:projects?\s+folder(?:\s+on my desktop)?|desktop(?:\s+projects?\s+folder)?|projects?)\s*$/i, '')
+    .replace(/\s+on my desktop\s*$/i, '')
+    .replace(/\s+located (?:at|in)\s+\S+\s*$/i, '')
+    .trim();
+
+  // Collapse whitespace
+  text = text.replace(/\s+/g, ' ').trim();
+
+  // Truncate at word boundary to ~45 chars
+  if (text.length > 45) {
+    const cut = text.substring(0, 45);
+    const lastSpace = cut.lastIndexOf(' ');
+    text = (lastSpace > 15 ? cut.substring(0, lastSpace) : cut) + '...';
+  }
+
+  return toTitleCase(text) || 'New Conversation';
 }
 
 function normalizeConversationWorkspace(conv) {
@@ -1031,17 +2019,25 @@ function normalizeConversationWorkspace(conv) {
 
 // RENDER HELPER FUNCTIONS
 function renderUserMessage(text) {
+  const stickToBottom = shouldAutoScrollChat();
   const bubble = document.createElement('div');
   bubble.className = 'message-bubble';
   bubble.innerHTML = `
     <div class="message-header user">🧑 User</div>
     <div class="message-body">${escapeHtml(text).replace(/\n/g, '<br>')}</div>
   `;
+  sanitizeRenderedMarkdown(bubble);
   el.messagesContainer.appendChild(bubble);
-  el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+  scrollChatToBottomIfNeeded(stickToBottom);
 }
 
 function appendSystemMessage(text, options = {}) {
+  if (isLegacyPhoneCompanionTokenMessage(text)) {
+    removeLegacyPhoneCompanionTokenBubbles();
+    return;
+  }
+  const runningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+  const targetId = options.conversationId || runningId || activeConversationId;
   const dedupeKey = options.dedupeKey || text;
   const windowMs = Number(options.windowMs || 1500);
   window.recentSystemMessages = window.recentSystemMessages || {};
@@ -1050,7 +2046,7 @@ function appendSystemMessage(text, options = {}) {
   if (now - lastAt < windowMs) {
     return;
   }
-  const conv = conversations.find(c => c.id === activeConversationId);
+  const conv = conversations.find(c => c.id === targetId);
   if (conv && options.dedupeKey) {
     conv.systemMessageDedupe = conv.systemMessageDedupe || {};
     const convLastAt = conv.systemMessageDedupe[dedupeKey] || 0;
@@ -1061,14 +2057,124 @@ function appendSystemMessage(text, options = {}) {
   }
   window.recentSystemMessages[dedupeKey] = now;
   
-  renderSystemBubble(text);
+  if (targetId === activeConversationId) {
+    renderSystemBubble(text);
+  }
   if (conv) {
-    conv.messages.push({ role: 'system', text: text });
+    const sysMsg = { role: 'system', text: text };
+    if (options.source === 'plan-approval') {
+      sysMsg.source = 'plan-approval'; // Matches: role: 'system', source: 'plan-approval'
+    } else if (options.source) {
+      sysMsg.source = options.source;
+    }
+    conv.messages.push(sysMsg);
     saveConversationsToStorage();
   }
 }
 
+function shouldDedupeSystemCard(dedupeKey, windowMs = 1500) {
+  const key = dedupeKey || 'system-card';
+  const now = Date.now();
+  window.recentSystemMessages = window.recentSystemMessages || {};
+  const lastAt = window.recentSystemMessages[key] || 0;
+  if (now - lastAt < windowMs) return true;
+  const conv = conversations.find(c => c.id === activeConversationId);
+  if (conv) {
+    conv.systemMessageDedupe = conv.systemMessageDedupe || {};
+    const convLastAt = conv.systemMessageDedupe[key] || 0;
+    if (now - convLastAt < windowMs) return true;
+    conv.systemMessageDedupe[key] = now;
+  }
+  window.recentSystemMessages[key] = now;
+  return false;
+}
+
+function showPhoneCompanionPairingCard(payload = {}, options = {}) {
+  updatePhoneCompanionPairingPanel(payload);
+  removeLegacyPhoneCompanionTokenBubbles();
+}
+
+function updatePhoneCompanionPairingPanel(payload = {}) {
+  const pairUrl = String(payload.pairUrl || '');
+  const networkEnabled = payload.networkEnabled !== false && !!pairUrl;
+  const expiresText = payload.expiresAt ? `Expires: ${new Date(payload.expiresAt).toLocaleTimeString()}` : 'Short-lived pairing link';
+  if (el.btnPhoneCompanion) {
+    el.btnPhoneCompanion.style.display = '';
+    el.btnPhoneCompanion.classList.toggle('has-pairing', networkEnabled);
+  }
+  if (el.phoneCompanionQr) {
+    el.phoneCompanionQr.innerHTML = networkEnabled
+      ? String(payload.qrSvg || '')
+      : '<div class="phone-companion-disabled">Wi-Fi pairing is off</div>';
+  }
+  if (el.phoneCompanionPairUrl) {
+    el.phoneCompanionPairUrl.textContent = networkEnabled
+      ? pairUrl
+      : 'Click Phone to enable Wi-Fi pairing for this session.';
+  }
+  if (el.phoneCompanionMeta) {
+    el.phoneCompanionMeta.textContent = networkEnabled
+      ? `${expiresText}. Desktop approval required.`
+      : 'LAN companion mode is disabled by default. No localhost QR is shown for phones.';
+  }
+  refreshPairedDevicesList().catch(() => {});
+}
+
+async function refreshPairedDevicesList() {
+  const listContainer = document.getElementById('paired-devices-list');
+  const sectionContainer = document.getElementById('paired-devices-section');
+  if (!listContainer || !sectionContainer || !window.api || typeof window.api.getPhoneCompanionDevices !== 'function') return;
+
+  try {
+    const devices = await window.api.getPhoneCompanionDevices();
+    if (devices && devices.length > 0) {
+      sectionContainer.style.display = 'block';
+      listContainer.innerHTML = devices.map(d => {
+        const lastSeen = d.lastSeenAt ? new Date(d.lastSeenAt).toLocaleTimeString() : 'Never';
+        const statusText = d.revoked ? 'Revoked' : 'Active';
+        const badgeClass = d.revoked ? 'fail' : 'pass';
+        
+        return `
+          <div class="device-item" style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: 6px; font-size: 0.8rem; font-family: var(--font-sans);">
+            <div style="display: flex; flex-direction: column; gap: 2px;">
+              <div style="font-weight: 600; color: var(--text-primary);">${escapeHtml(d.name)}</div>
+              <div style="font-size: 0.72rem; color: var(--text-muted);">Last seen: ${escapeHtml(lastSeen)}</div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span class="status-indicator ${badgeClass}" style="font-size: 0.65rem; padding: 2px 6px; border-radius: 4px; font-weight: 700; text-transform: uppercase;">${statusText}</span>
+              ${!d.revoked ? `<button class="btn-secondary" style="padding: 2px 6px; font-size: 0.7rem; border-color: var(--error-color); color: var(--error-color); cursor: pointer;" onclick="revokeDevice('${escapeHtml(d.id)}')">Revoke</button>` : ''}
+            </div>
+          </div>
+        `;
+      }).join('');
+    } else {
+      sectionContainer.style.display = 'none';
+    }
+  } catch (error) {
+    console.warn('Failed to fetch phone companion devices:', error);
+  }
+}
+
+window.revokeDevice = async (id) => {
+  if (confirm("Are you sure you want to revoke this paired phone's access?")) {
+    if (window.api && typeof window.api.revokePhoneCompanionDevice === 'function') {
+      await window.api.revokePhoneCompanionDevice(id);
+      await refreshPairedDevicesList();
+    }
+  }
+};
+
+setInterval(() => {
+  if (el.phoneCompanionModal && el.phoneCompanionModal.classList.contains('active')) {
+    refreshPairedDevicesList().catch(() => {});
+  }
+}, 4000);
+
 function renderSystemBubble(text) {
+  if (isLegacyPhoneCompanionTokenMessage(text)) {
+    return;
+  }
+  const stickToBottom = shouldAutoScrollChat();
   const bubble = document.createElement('div');
   bubble.className = 'message-bubble';
   bubble.innerHTML = `
@@ -1076,11 +2182,46 @@ function renderSystemBubble(text) {
     <div class="message-body" style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-muted);">${escapeHtml(text)}</div>
   `;
   el.messagesContainer.appendChild(bubble);
-  el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+  scrollChatToBottomIfNeeded(stickToBottom);
+}
+
+function renderPhoneCompanionPairingCard(payload) {
+  const stickToBottom = shouldAutoScrollChat();
+  const bubble = document.createElement('div');
+  bubble.className = 'message-bubble companion-pairing-card';
+  const qrSvg = String(payload.qrSvg || '');
+  const pairUrl = String(payload.pairUrl || '');
+  const expiresText = payload.expiresAt ? `Expires: ${new Date(payload.expiresAt).toLocaleTimeString()}` : 'Short-lived pairing link';
+  bubble.innerHTML = `
+    <div class="message-header" style="color: var(--accent-secondary);">Phone Companion Pairing</div>
+    <div class="message-body" style="font-family: var(--font-sans); color: var(--text);">
+      <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+        <div data-companion-qr="true" aria-label="Phone Companion pairing QR code" style="background:#fff; padding:8px; border-radius:8px; line-height:0;">${qrSvg}</div>
+        <div style="min-width:220px; flex:1;">
+          <div style="font-weight:700; margin-bottom:6px;">Scan to pair a phone</div>
+          <div style="color: var(--text-muted); margin-bottom:8px;">Desktop approval is required before this phone can control Orion.</div>
+          <div data-pair-url="${escapeHtml(pairUrl)}" style="font-family: var(--font-mono); font-size:.76rem; word-break:break-all;">${escapeHtml(pairUrl)}</div>
+          <div data-pairing-metadata="true" style="color: var(--text-muted); font-size:.74rem; margin-top:8px;">${escapeHtml(expiresText)}</div>
+        </div>
+      </div>
+    </div>
+  `;
+  el.messagesContainer.appendChild(bubble);
+  scrollChatToBottomIfNeeded(stickToBottom);
 }
 
 // Generates structural AI Response with step thought details
-function renderAiMessage(text, logs = []) {
+function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null) {
+  const targetId = conversationId || activeConversationId;
+  if (targetId !== activeConversationId) {
+    return;
+  }
+  const hasLogs = Array.isArray(logs) && logs.length > 0;
+  const isThinkingPlaceholder = String(text || '').trim() === 'Thinking...';
+  if (!activeAiBubble && isThinkingPlaceholder && !hasLogs) {
+    return;
+  }
+  const stickToBottom = shouldAutoScrollChat();
   let bubble;
   const isNew = !activeAiBubble;
   
@@ -1093,7 +2234,7 @@ function renderAiMessage(text, logs = []) {
   }
   
   let logsHtml = '';
-  if (logs && logs.length > 0) {
+  if (hasLogs) {
     const isRunning = window.isAgentRunning && window.isAgentRunning();
     const displayStyle = isRunning ? 'flex' : 'none';
     const arrowSymbol = isRunning ? '▲' : '▼';
@@ -1130,24 +2271,61 @@ function renderAiMessage(text, logs = []) {
   }
   
   // Render markdown text
-  const renderedMarkdown = typeof marked !== 'undefined' ? marked.parse(text) : escapeHtml(text);
+  const displayText = isThinkingPlaceholder ? '' : String(text || '');
+  const renderedMarkdown = displayText
+    ? (typeof marked !== 'undefined' ? marked.parse(displayText) : escapeHtml(displayText))
+    : '';
   
   let runningIndicatorHtml = '';
+  let planApprovalHtml = '';
   const runningConversationId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+  const activeConv = typeof conversations !== 'undefined'
+    ? conversations.find(c => c.id === activeConversationId)
+    : null;
+  // Decide whether THIS bubble is the plan-approval card. On a fresh live render the message
+  // object is not threaded in, so fall back to conversation state (the active bubble during a
+  // planning yield is the plan bubble). On reloads the persisted msgMeta.isPlanApprovalCard
+  // identifies the exact bubble so the card does not bleed onto execution bubbles.
+  const isPlanBubble = msgMeta
+    ? !!msgMeta.isPlanApprovalCard
+    : !!(activeConv && activeConv.awaitingPlanApproval && !activeConv.planApproved);
+  if (isPlanBubble) {
+    if (activeConv && activeConv.planApproved) {
+      // The plan was approved — show a persistent "started" state instead of removing the card,
+      // so the chat clearly reflects that the button was pressed.
+      planApprovalHtml = `
+        <div class="plan-approval-actions approved">
+          <div class="plan-approval-copy">
+            <span class="plan-approval-title">Implementation started</span>
+            <span class="plan-approval-subtitle">Orion is building from this approved plan.</span>
+          </div>
+          <button class="btn-approve-plan approved" type="button" disabled>✓ Implementation Started</button>
+        </div>
+      `;
+    } else if (activeConv && activeConv.awaitingPlanApproval && !(window.isAgentRunning && window.isAgentRunning())) {
+      planApprovalHtml = `
+        <div class="plan-approval-actions">
+          <div class="plan-approval-copy">
+            <span class="plan-approval-title">Plan ready for review</span>
+            <span class="plan-approval-subtitle">Start when the direction looks right.</span>
+          </div>
+          <button class="btn-approve-plan" type="button">Start Implementation</button>
+        </div>
+      `;
+    }
+  }
   if (window.isAgentRunning && window.isAgentRunning() && runningConversationId === activeConversationId) {
     const stepNum = window.currentLoopCount || 1;
     
     // Check if the current conversation's plan has been approved
     let isApproved = false;
-    if (typeof conversations !== 'undefined' && typeof activeConversationId !== 'undefined') {
-      const activeConv = conversations.find(c => c.id === activeConversationId);
-      if (activeConv && activeConv.planApproved) {
-        isApproved = true;
-      }
+    if (activeConv && activeConv.planApproved) {
+      isApproved = true;
     }
     
-    const statusLabel = isApproved 
-      ? `Executing autonomously (Step ${stepNum})...` 
+    const executionMode = window.getAgentExecutionMode ? window.getAgentExecutionMode() : 'planning';
+    const statusLabel = isApproved || executionMode === 'direct' || executionMode === 'executing' || executionMode === 'answer'
+      ? `Working (Step ${stepNum})...`
       : `Preparing implementation plan (Step ${stepNum})...`;
       
     const subStatus = window.getAgentSubStatus ? window.getAgentSubStatus() : '';
@@ -1170,9 +2348,11 @@ function renderAiMessage(text, logs = []) {
     ${logsHtml}
     <div class="message-body">
       ${renderedMarkdown}
+      ${planApprovalHtml}
       ${runningIndicatorHtml}
     </div>
   `;
+  sanitizeRenderedMarkdown(bubble);
   
   // Format code blocks
   if (isNew) {
@@ -1186,7 +2366,11 @@ function renderAiMessage(text, logs = []) {
       openFileViewer(relPath);
     });
   });
-  Prism.highlightAllUnder(bubble);
+  const approveButton = bubble.querySelector('.btn-approve-plan');
+  if (approveButton) {
+    approveButton.addEventListener('click', () => approveCurrentPlanAndContinue({ button: approveButton }));
+  }
+  if (typeof Prism !== 'undefined') Prism.highlightAllUnder(bubble);
   
   // Inject copy & edit buttons into pre blocks
   bubble.querySelectorAll('pre').forEach(pre => {
@@ -1228,7 +2412,7 @@ function renderAiMessage(text, logs = []) {
     });
   });
   
-  el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+  scrollChatToBottomIfNeeded(stickToBottom);
 }
 
 // LOG TOGGLING HELPER
@@ -1248,7 +2432,7 @@ window.toggleLogs = function(headerElement) {
 function updateTasksChecklist(tasks) {
   if (!tasks || tasks.length === 0) {
     el.taskChecklist.innerHTML = '<p class="empty-state">No tasks active. Start a conversation with a plan to see items here.</p>';
-    el.taskCompletionBadge.textContent = '0%';
+    el.taskCompletionBadge.style.display = 'none';
     return;
   }
   
@@ -1273,6 +2457,119 @@ function updateTasksChecklist(tasks) {
   
   const percentage = Math.round((completedCount / tasks.length) * 100);
   el.taskCompletionBadge.textContent = `${percentage}%`;
+  el.taskCompletionBadge.style.display = '';
+}
+
+function updateOperationalContext(state) {
+  if (!el.operationalContextPanel || !el.operationalContextRevision) return;
+  const context = state && window.OrionOperationalContext
+    ? window.OrionOperationalContext.normalizeContext(state)
+    : null;
+  if (!context || (!context.mission.statement && context.winConditions.length === 0)) {
+    el.operationalContextRevision.style.display = 'none';
+    el.operationalContextRevision.textContent = '';
+    el.operationalContextPanel.innerHTML = '<p class="empty-state">Define a mission to give Orion durable operational direction.</p>';
+    return;
+  }
+
+  const satisfied = context.winConditions.filter(item => item.status === 'satisfied').length;
+  const winProgress = context.winConditions.length ? `${satisfied}/${context.winConditions.length}` : 'No conditions';
+  const blockers = context.blockers.active;
+  if (blockers.length > 0) {
+    revealAgentPanel('Orion needs attention: an active blocker was recorded.');
+    if (!(window.isAgentRunning && window.isAgentRunning())) {
+      renderAgentPresence('attention', 'Needs attention', blockers[0].title);
+    }
+  }
+  const conditionMarkup = context.winConditions.slice(0, 8).map(item => `
+    <div class="mission-condition ${item.status}">
+      <span class="mission-condition-dot"></span>
+      <span>${escapeHtml(item.title)}</span>
+    </div>
+  `).join('');
+  const blockerMarkup = blockers.slice(0, 4).map(item => `<div class="mission-blocker">${escapeHtml(item.title)}</div>`).join('');
+
+  el.operationalContextRevision.textContent = `r${context.revision}`;
+  el.operationalContextRevision.style.display = '';
+  el.operationalContextPanel.innerHTML = `
+    <div class="mission-label">Mission</div>
+    <div class="mission-statement">${escapeHtml(context.mission.statement || 'Not defined')}</div>
+    <div class="mission-meta-row">
+      <span>${escapeHtml(context.activeObjective ? context.activeObjective.title : 'No active objective')}</span>
+      <span>${winProgress}</span>
+    </div>
+    ${context.activeSubplan ? `<div class="mission-subplan"><strong>Now:</strong> ${escapeHtml(context.activeSubplan.title)} <span class="mission-status">${escapeHtml(context.activeSubplan.status)}</span></div>` : ''}
+    ${conditionMarkup ? `<div class="mission-conditions">${conditionMarkup}</div>` : ''}
+    ${blockerMarkup ? `<div class="mission-blockers"><div class="mission-label">Blockers</div>${blockerMarkup}</div>` : ''}
+  `;
+}
+
+async function refreshOperationalContext(workspace = currentWorkspace) {
+  if (!workspace || !window.readOperationalContext) {
+    updateOperationalContext(null);
+    return;
+  }
+  const result = await window.readOperationalContext(workspace);
+  updateOperationalContext(result && result.state);
+}
+
+function closeOperationalContextEditor() {
+  if (el.operationalContextModal) el.operationalContextModal.classList.remove('active');
+}
+
+async function openOperationalContextEditor() {
+  if (!currentWorkspace) {
+    alert('Choose a workspace or start a conversation before defining a mission.');
+    return;
+  }
+  const result = await window.readOperationalContext(currentWorkspace);
+  const context = result && result.state
+    ? window.OrionOperationalContext.normalizeContext(result.state)
+    : window.OrionOperationalContext.createEmptyContext();
+  el.operationalMissionInput.value = context.mission.statement;
+  el.operationalObjectiveInput.value = context.activeObjective ? context.activeObjective.title : '';
+  el.operationalWinConditionsInput.value = context.winConditions.map(item => item.title).join('\n');
+  el.operationalContextModal.classList.add('active');
+  el.operationalMissionInput.focus();
+}
+
+async function saveOperationalContextEditor() {
+  const mission = el.operationalMissionInput.value.trim();
+  if (!mission) {
+    alert('Mission is required.');
+    el.operationalMissionInput.focus();
+    return;
+  }
+  const winConditions = el.operationalWinConditionsInput.value
+    .split(/\r?\n/)
+    .map(title => title.trim())
+    .filter(Boolean)
+    .filter((title, index, all) => all.findIndex(candidate => candidate.toLowerCase() === title.toLowerCase()) === index)
+    .map(title => ({ title }));
+  el.btnOperationalContextSave.disabled = true;
+  try {
+    await window.mutateOperationalContext(currentWorkspace, 'update_mission_context', {
+      mission,
+      activeObjective: el.operationalObjectiveInput.value.trim(),
+      winConditions
+    });
+    closeOperationalContextEditor();
+    appendSystemMessage(`Mission Control updated with ${winConditions.length} win condition${winConditions.length === 1 ? '' : 's'}.`);
+  } catch (error) {
+    alert(`Could not save mission: ${error.message}`);
+  } finally {
+    el.btnOperationalContextSave.disabled = false;
+  }
+}
+
+function setupOperationalContextEditor() {
+  if (!el.operationalContextModal) return;
+  el.btnEditOperationalContext.addEventListener('click', openOperationalContextEditor);
+  el.btnOperationalContextClose.addEventListener('click', closeOperationalContextEditor);
+  el.btnOperationalContextSave.addEventListener('click', saveOperationalContextEditor);
+  el.operationalContextModal.addEventListener('click', event => {
+    if (event.target === el.operationalContextModal) closeOperationalContextEditor();
+  });
 }
 
 // --- REGRESSION TEST PANEL ---
@@ -1360,20 +2657,89 @@ function escapeHtml(text) {
 
 // Export config so agent.js can use it
 window.getAppConfig = () => appConfig;
+window.getActiveConversationId = () => activeConversationId;
 window.getCurrentWorkspace = () => currentWorkspace;
+window.changeActiveWorkspace = function(folderPath) {
+  if (activeConversationId) {
+    const conv = conversations.find(c => c.id === activeConversationId);
+    if (conv) {
+      conv.workspace = folderPath;
+      conv.projectPath = folderPath;
+      saveConversationsToStorage();
+    }
+  }
+  if (!projects.includes(folderPath)) {
+    projects.push(folderPath);
+    saveProjectsToStorage();
+    renderProjectsList();
+  }
+  currentWorkspace = folderPath;
+  expandedFileFolders = new Set();
+  el.workspaceLabel.textContent = folderPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || folderPath;
+  syncWorkspaceFiles();
+  refreshOperationalContext();
+};
 window.getSelectedModel = () => el.modelSelect ? el.modelSelect.value : appConfig.defaultModel;
 window.selectConversationById = selectConversation;
 window.updateTasksChecklist = updateTasksChecklist;
+window.updateOperationalContext = updateOperationalContext;
+window.refreshOperationalContext = refreshOperationalContext;
 window.updateTestResultsPanel = updateTestResultsPanel;
 window.runRegressionTests = runRegressionTests;
+window.loadRunArtifacts = loadRunArtifacts;
 window.renderAiMessage = renderAiMessage;
 window.appendSystemMessage = appendSystemMessage;
+window.markQueuedPromptRunning = markQueuedPromptRunning;
+window.saveConversationsToStorage = saveConversationsToStorage;
+window.showPhoneCompanionPairingCard = showPhoneCompanionPairingCard;
 window.syncWorkspaceFiles = syncWorkspaceFiles;
 window.refreshWorkspaceEntrypoint = loadWorkspaceEntrypoint;
+
 
 window.clearActiveAiBubble = () => {
   activeAiBubble = null;
 };
+
+function renderAgentPresence(state, label, detail) {
+  if (!el.agentStatePill) return;
+  el.agentStatePill.className = `agent-state-pill ${state}`;
+  el.agentStateText.textContent = label;
+  el.agentStateDetail.textContent = detail || '';
+}
+
+function refreshAgentPresence() {
+  const running = window.isAgentRunning && window.isAgentRunning();
+  const conv = conversations.find(item => item.id === activeConversationId);
+  if (conv && conv.awaitingPlanApproval && !conv.planApproved) {
+    renderAgentPresence('attention', 'Review needed', 'Implementation plan is waiting for approval');
+    return;
+  }
+  if (!running) return;
+  const mode = window.getAgentExecutionMode ? window.getAgentExecutionMode() : 'executing';
+  const subStatus = window.getAgentSubStatus ? window.getAgentSubStatus() : '';
+  if (/run_tests|test|verif/i.test(subStatus)) {
+    renderAgentPresence('verifying', 'Verifying', subStatus);
+  } else if (/running tool/i.test(subStatus) || mode === 'executing' || mode === 'direct') {
+    renderAgentPresence('acting', 'Acting', subStatus || 'Working through the current objective');
+  } else if (/waiting|cooldown|retry/i.test(subStatus)) {
+    renderAgentPresence('waiting', 'Waiting', subStatus);
+  } else {
+    renderAgentPresence('thinking', 'Thinking', subStatus || 'Choosing the next useful action');
+  }
+}
+
+function showToast(message, tone = 'default') {
+  if (!el.toastRegion || !message) return;
+  const toast = document.createElement('div');
+  toast.className = `orion-toast ${tone}`;
+  toast.textContent = message;
+  el.toastRegion.replaceChildren(toast);
+  setTimeout(() => toast.classList.add('visible'), 10);
+  setTimeout(() => {
+    toast.classList.remove('visible');
+    setTimeout(() => toast.remove(), 220);
+  }, 3200);
+}
 
 window.onAgentStatusChange = (running) => {
   const submitBtn = el.btnSubmit;
@@ -1382,46 +2748,412 @@ window.onAgentStatusChange = (running) => {
   
   if (running) {
     submitBtn.classList.add('btn-stop');
-    submitBtn.innerHTML = '⏹';
+    submitBtn.innerHTML = '&#9209;';
     submitBtn.title = 'Stop agent task execution';
+    clearTimeout(agentCompletionTimer);
+    refreshAgentPresence();
+    clearInterval(agentPresenceTimer);
+    agentPresenceTimer = setInterval(refreshAgentPresence, 250);
   } else {
+    clearInterval(agentPresenceTimer);
+    agentPresenceTimer = null;
     submitBtn.classList.remove('btn-stop');
-    submitBtn.innerHTML = '✦';
+    submitBtn.innerHTML = '&#10022;';
     submitBtn.title = 'Send message';
     steerBtn.style.display = 'none';
     queueBtn.style.display = 'none';
+    const conv = conversations.find(item => item.id === activeConversationId);
+    if (conv && conv.awaitingPlanApproval && !conv.planApproved) {
+      revealAgentPanel('A plan is ready for review.');
+      renderAgentPresence('attention', 'Review needed', 'Implementation plan is waiting for approval');
+    } else {
+      renderAgentPresence('complete', 'Complete', 'Orion finished the current run');
+      showToast('Orion finished the current run.', 'success');
+      agentCompletionTimer = setTimeout(() => renderAgentPresence('idle', 'Ready', ''), 2600);
+    }
   }
 };
 window.renderUserMessageInChat = renderUserMessage;
-window.getPhoneCompanionState = () => {
-  const conv = conversations.find(c => c.id === activeConversationId);
+window.getPhoneCompanionState = async (targetConversationId) => {
+  const resolvedId = targetConversationId || activeConversationId;
+  const conv = conversations.find(c => c.id === resolvedId);
   const messages = conv && conv.messages ? conv.messages.slice(-40).map(msg => ({
     role: msg.role,
     text: msg.role === 'assistant' && msg.text === 'Thinking...' && msg.logs && msg.logs.length
       ? msg.logs.map(log => log.content || log.result || '').filter(Boolean).join('\n')
       : (msg.text || '')
   })) : [];
+  const latestOutput = messages.slice().reverse().find(msg => msg.role === 'assistant' || msg.role === 'system');
+  const latestAssistant = conv && conv.messages ? conv.messages.slice().reverse().find(msg => msg.role === 'assistant') : null;
+  const latestText = latestAssistant ? (latestAssistant.text || '') : '';
+  const changedFiles = [];
+  const testResults = [];
+  (latestAssistant && Array.isArray(latestAssistant.logs) ? latestAssistant.logs : []).forEach(log => {
+    if (log.tool === 'write_file' || log.tool === 'modify_file' || log.tool === 'patch_file') {
+      const params = log.params || {};
+      if (params.path && !changedFiles.includes(params.path)) changedFiles.push(params.path);
+    }
+    if (log.tool === 'run_tests' || log.tool === 'run_command') {
+      testResults.push(log.result || '');
+    }
+  });
+  const walkthroughIndex = latestText.indexOf('\n\n## Work Walkthrough');
+  const workWalkthrough = walkthroughIndex === -1 ? '' : latestText.slice(walkthroughIndex).trim();
+  const conversationsSummary = conversations.map(c => ({
+    id: c.id,
+    title: c.title || 'New Conversation',
+    active: c.id === resolvedId,
+    isDesktopActive: c.id === activeConversationId,
+    awaitingPlanApproval: !!(c.awaitingPlanApproval && !c.planApproved),
+    taskCount: Array.isArray(c.tasks) ? c.tasks.length : 0,
+    updatedAt: c.updatedAt || c.createdAt || 0
+  }));
   
+  const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
+  const globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+  const isActiveTargetRunning = isGlobalRunning && globalRunningId === resolvedId;
+  const companionWorkspace = conv ? (conv.workspace || conv.projectPath || currentWorkspace || '') : currentWorkspace;
+  const operationalResult = companionWorkspace && window.readOperationalContext
+    ? await window.readOperationalContext(companionWorkspace)
+    : null;
+  const operationalState = operationalResult && operationalResult.state
+    ? window.OrionOperationalContext.normalizeContext(operationalResult.state)
+    : window.OrionOperationalContext.createEmptyContext();
+  const operationalContext = {
+    revision: operationalState.revision,
+    mission: operationalState.mission.statement,
+    activeObjective: operationalState.activeObjective ? operationalState.activeObjective.title : '',
+    activeSubplan: operationalState.activeSubplan ? {
+      title: operationalState.activeSubplan.title,
+      status: operationalState.activeSubplan.status,
+      nextAction: operationalState.activeSubplan.nextAction
+    } : null,
+    winConditions: operationalState.winConditions.map(item => ({ id: item.id, title: item.title, status: item.status, evidenceCount: item.evidence.length })),
+    blockers: operationalState.blockers.active.map(item => ({ id: item.id, title: item.title, details: item.details })),
+    lastDistillation: operationalState.lastDistillation
+  };
+
   return {
-    conversationId: activeConversationId,
+    conversationId: resolvedId,
     title: conv ? conv.title : '',
-    workspace: conv ? (conv.workspace || conv.projectPath || currentWorkspace || '') : currentWorkspace,
-    running: window.isAgentRunning ? window.isAgentRunning() : false,
+    conversations: conversationsSummary,
+    workspace: companionWorkspace,
+    running: isActiveTargetRunning,
+    globalRunning: isGlobalRunning,
+    runningConversationId: globalRunningId,
+    queuedPrompts: window.promptQueue ? window.promptQueue.filter(q => q.conversationId === resolvedId).length : 0,
+    queuedPromptPreview: window.promptQueue ? window.promptQueue.filter(q => q.conversationId === resolvedId).map(q => q.prompt).slice(0, 3) : [],
+    subStatus: isActiveTargetRunning && window.getAgentSubStatus ? window.getAgentSubStatus() : '',
+    executionMode: isActiveTargetRunning && window.getAgentExecutionMode ? window.getAgentExecutionMode() : 'idle',
+    awaitingPlanApproval: !!(conv && conv.awaitingPlanApproval && !conv.planApproved),
+    tasks: conv && Array.isArray(conv.tasks) ? conv.tasks : [],
     model: window.getSelectedModel(),
-    messages
+    messages,
+    latestOutput: latestOutput ? latestOutput.text : '',
+    operationalContext,
+    preview: {
+      latestAssistantOutput: latestText,
+      workWalkthrough,
+      changedFiles,
+      testResults,
+      appLaunchUrl: window.lastLaunchUrl || '',
+      appLaunchLogs: window.lastLaunchLogs || ''
+    }
   };
 };
 
-window.submitPhoneCompanionPrompt = async (prompt) => {
-  const text = String(prompt || '').trim();
-  if (!text) return { success: false, error: 'Missing prompt' };
-  if (!activeConversationId || !conversations.find(c => c.id === activeConversationId)) {
-    createNewConversation();
+let isPairingConfirmOpen = false;
+let lastConfirmTime = 0;
+window.approvePhoneCompanionPairing = async (request) => {
+  if (isPairingConfirmOpen) {
+    return { approved: false, pending: true };
   }
-  el.chatInput.value = text;
-  await submitMessage();
-  return { success: true, queued: window.isAgentRunning && window.isAgentRunning() };
+  const now = Date.now();
+  if (now - lastConfirmTime < 5000) {
+    return { approved: false, pending: true };
+  }
+  isPairingConfirmOpen = true;
+  lastConfirmTime = now;
+  const name = request && request.deviceName ? request.deviceName : 'Phone';
+  let approved = true;
+  try {
+    if (window.confirm) {
+      approved = window.confirm(`Allow ${name} to control Orion from Phone Companion?`);
+    }
+  } finally {
+    isPairingConfirmOpen = false;
+  }
+  return { approved, pending: false };
 };
+
+
+// No longer switches desktop conversation
+window.switchPhoneCompanionConversation = async (conversationId) => {
+  const conv = conversations.find(c => c.id === conversationId);
+  if (!conv) return { success: false, error: 'Conversation not found' };
+  // We don't call selectConversation(conversationId) because we want the phone to be independent
+  return { success: true, conversationId };
+};
+
+function hasRequiredTestingPlanSection(content) {
+  if (!content || typeof content !== 'string') return false;
+  const testingPlanRegex = /^#+\s*.*?(?:testing\s+plan|test\s+plan|validation\s+plan)\b/im;
+  return testingPlanRegex.test(content);
+}
+
+window.startPhoneCompanionTask = async (options = {}) => {
+  const conv = createPhoneConversation({
+    projectPath: options.projectPath || '',
+    title: 'New Phone Task'
+  });
+
+  const prompt = String(options.prompt || '').trim();
+  if (prompt) {
+    await window.submitPhoneCompanionPrompt({ prompt, conversationId: conv.id });
+  }
+  return { success: true, conversationId: conv.id, workspace: conv.workspace, projectPath: conv.projectPath };
+};
+
+window.submitPhoneCompanionPrompt = async (options) => {
+  // Can be called with either a string or an options object
+  const text = typeof options === 'string' ? options.trim() : String(options.prompt || '').trim();
+  let targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
+
+  if (!text) return { success: false, error: 'Missing prompt' };
+
+  let conv = conversations.find(c => c.id === targetId);
+  if (!conv) {
+    conv = createPhoneConversation({
+      projectPath: typeof options === 'object' ? options.projectPath || '' : '',
+      title: 'New Phone Task'
+    });
+    targetId = conv.id;
+  }
+
+  // Generate a short title if it's new
+  if (conv.messages.length === 0 || conv.title === 'New Phone Task' || conv.title === 'Untitled Conversation') {
+    conv.title = text.length > 40 ? text.substring(0, 40) + '...' : text;
+  }
+  normalizeConversationWorkspace(conv);
+  if (!conv.workspace) {
+    conv.workspace = conv.projectPath || getStandaloneWorkspaceForTitle(conv.title, conv.id);
+  }
+  saveConversationsToStorage();
+
+  const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
+
+  if (isGlobalRunning) {
+    window.promptQueue.push({ prompt: text, modelSelectValue: window.getSelectedModel(), conversationId: targetId, source: 'phone' });
+    if (conv.messages) {
+      conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now() });
+      saveConversationsToStorage();
+    }
+    if (targetId === activeConversationId) {
+      renderUserMessage(text);
+      appendSystemMessage("Phone companion prompt queued for the active conversation.");
+    }
+    return { success: true, queued: true };
+  }
+
+  // Directly run agent loop on the target conversation (without forcing desktop UI switch)
+  if (conv.messages) {
+    conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now() });
+    saveConversationsToStorage();
+  }
+  if (targetId === activeConversationId) {
+    renderUserMessage(text);
+  }
+  window.runAgentLoop(text, window.getSelectedModel(), conv, { source: 'phone' })
+    .catch(err => console.error("Phone-started agent loop failed:", err));
+
+  return { success: true, queued: false };
+};
+
+window.steerPhoneCompanionTask = async (options) => {
+  const text = typeof options === 'string' ? options.trim() : String(options.prompt || '').trim();
+  const targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
+  if (!text) return { success: false, error: 'Missing steering prompt' };
+
+  const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
+  const globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+
+  if (!isGlobalRunning || globalRunningId !== targetId) {
+    return await window.submitPhoneCompanionPrompt(options);
+  }
+
+  window.steeringQueue = window.steeringQueue || {};
+  window.steeringQueue[targetId] = window.steeringQueue[targetId] || [];
+  window.steeringQueue[targetId].push(text);
+  if (targetId === activeConversationId) {
+    appendSystemMessage("Phone companion steering note received.");
+  }
+  return { success: true, steered: true };
+};
+
+window.approvePhoneCompanionPlan = async (targetId) => {
+  const resolvedId = targetId || activeConversationId;
+  const conv = conversations.find(c => c.id === resolvedId);
+  if (!conv || !conv.awaitingPlanApproval) return { success: false, error: 'No plan waiting for approval' };
+
+  if (!appConfig.geminiApiKey) {
+    return { success: false, error: 'Missing Gemini API key on desktop' };
+  }
+
+  // Re-validate the testing plan section in implementation_plan.md
+  let planIsValid = false;
+  try {
+    const workspace = conv.workspace || currentWorkspace;
+    const planContent = await window.api.readFile(workspace, 'implementation_plan.md', { maxChars: 100000 });
+    const planText = typeof planContent === 'string'
+      ? planContent
+      : (planContent && !planContent.error && typeof planContent.content === 'string' ? planContent.content : '');
+    planIsValid = hasRequiredTestingPlanSection(planText);
+  } catch (err) {
+    console.error('Error validating plan during phone approval:', err);
+  }
+
+  if (!planIsValid) {
+    return { success: false, error: "Missing or invalid '## Testing Plan' section in implementation_plan.md" };
+  }
+
+  conv.planApproved = true;
+  conv.awaitingPlanApproval = false;
+
+  const approvalText = "Plan approved via Phone Companion. Continuing implementation.";
+  appendSystemMessage(approvalText, { conversationId: resolvedId, source: 'plan-approval' });
+
+  const prompt = 'PLAN APPROVED — EXECUTE NOW. Do not summarize, describe, or restate the plan. Do not rewrite STRATEGY.md or implementation_plan.md — they are already approved. Read implementation_plan.md once to understand the tasks, then immediately start creating and editing the actual source code files. Work through every task. Update the checklist only for completed milestones. Run the test suite when done. Provide a Work Walkthrough.';
+  const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
+  if (isGlobalRunning) {
+    window.promptQueue.push({ prompt, modelSelectValue: window.getSelectedModel(), conversationId: resolvedId, source: 'plan-approval' });
+    return { success: true, queued: true };
+  }
+
+  window.runAgentLoop(prompt, window.getSelectedModel(), conv, { source: 'plan-approval', internalPrompt: true })
+    .catch(err => console.error("Phone-started agent loop failed:", err));
+  return { success: true, queued: false };
+};
+
+window.denyPhoneCompanionPlan = async (targetId) => {
+  const resolvedId = targetId || activeConversationId;
+  const conv = conversations.find(c => c.id === resolvedId);
+  if (!conv) return { success: false, error: 'No active conversation' };
+  conv.awaitingPlanApproval = false;
+  conv.planApproved = false;
+  if (resolvedId === activeConversationId) {
+    appendSystemMessage("Phone companion denied the pending plan.");
+  }
+  saveConversationsToStorage();
+  return { success: true, denied: true };
+};
+
+window.revisePhoneCompanionPlan = async (options) => {
+  const text = typeof options === 'string' ? options.trim() : String(options.feedback || 'Revise the pending plan before implementing.').trim();
+  const targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
+  if (!text) return { success: false, error: 'Missing revision feedback' };
+  return await window.submitPhoneCompanionPrompt({ prompt: `[Plan revision] ${text}`, conversationId: targetId });
+};
+
+window.stopPhoneCompanionTask = async (targetId) => {
+  const resolvedId = targetId || activeConversationId;
+  const globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+
+  if (globalRunningId === resolvedId && window.stopAgentExecution) {
+    window.stopAgentExecution();
+    if (resolvedId === activeConversationId) {
+      appendSystemMessage("Phone companion requested pause/stop.", {
+        dedupeKey: `phone-stop-${resolvedId}`,
+        windowMs: 3000
+      });
+    }
+    return { success: true, stopped: true };
+  }
+  return { success: true, stopped: false };
+};
+
+window.resumePhoneCompanionTask = async (targetId) => {
+  const resolvedId = targetId || activeConversationId;
+  const prompt = 'Continue the previous task. First inspect current state and recent output, then continue only if it is still safe and useful.';
+  return await window.submitPhoneCompanionPrompt({ prompt, conversationId: resolvedId });
+};
+
+async function approveCurrentPlanAndContinue(options = {}) {
+  const button = options.button || null;
+  const originalLabel = button ? button.textContent : '';
+  const restoreButton = () => {
+    if (!button) return;
+    button.disabled = false;
+    button.classList.remove('approved');
+    button.textContent = originalLabel || 'Start Implementation';
+  };
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Starting…';
+  }
+
+  const conv = conversations.find(c => c.id === activeConversationId);
+  if (!conv) { restoreButton(); return { success: false, error: 'No active conversation' }; }
+  if (!conv.awaitingPlanApproval) { restoreButton(); return { success: false, error: 'No plan is awaiting approval' }; }
+  if (!appConfig.geminiApiKey) {
+    el.settingsModal.classList.add('active');
+    appendSystemMessage("Please enter and save your Gemini API Key first.");
+    restoreButton();
+    return { success: false, error: 'Missing Gemini API key' };
+  }
+
+  // Re-validate the testing plan section in implementation_plan.md
+  let planIsValid = false;
+  try {
+    const workspace = conv.workspace || currentWorkspace;
+    const planContent = await window.api.readFile(workspace, 'implementation_plan.md', { maxChars: 100000 });
+    const planText = typeof planContent === 'string'
+      ? planContent
+      : (planContent && !planContent.error && typeof planContent.content === 'string' ? planContent.content : '');
+    planIsValid = hasRequiredTestingPlanSection(planText);
+  } catch (err) {
+    console.error('Error validating plan during approval:', err);
+  }
+
+  if (!planIsValid) {
+    appendSystemMessage("Approval rejected: The implementation plan is missing a valid '## Testing Plan' section. Please ask the agent to revise the plan.");
+    restoreButton();
+    return { success: false, error: "Missing or invalid '## Testing Plan' section in implementation_plan.md" };
+  }
+
+  if (button) {
+    button.classList.add('approved');
+    button.disabled = true;
+    button.textContent = '✓ Implementation Started';
+    // Update the surrounding card immediately so it matches the persistent "started" state
+    // rendered on reload — no flicker, and it clearly reflects that the button was pressed.
+    const card = button.closest('.plan-approval-actions');
+    if (card) card.classList.add('approved');
+    const title = card && card.querySelector('.plan-approval-title');
+    if (title) title.textContent = 'Implementation started';
+    const subtitle = card && card.querySelector('.plan-approval-subtitle');
+    if (subtitle) subtitle.textContent = 'Orion is building from this approved plan.';
+  }
+
+  conv.planApproved = true;
+  conv.awaitingPlanApproval = false;
+
+  const approvalText = "Plan approved. Continuing implementation.";
+  appendSystemMessage(approvalText, { conversationId: activeConversationId, source: 'plan-approval' });
+
+  const prompt = 'PLAN APPROVED — EXECUTE NOW. Do not summarize, describe, or restate the plan. Do not rewrite STRATEGY.md or implementation_plan.md — they are already approved. Read implementation_plan.md once to understand the tasks, then immediately start creating and editing the actual source code files. Work through every task. Update the checklist only for completed milestones. Run the test suite when done. Provide a Work Walkthrough.';
+
+  if (window.runAgentLoop) {
+    if (window.isAgentRunning && window.isAgentRunning()) {
+      window.promptQueue.push({ prompt, modelSelectValue: el.modelSelect.value, conversationId: conv.id, alreadyRendered: true, source: 'plan-approval' });
+      appendSystemMessage("Another task is currently running. Approved plan execution was queued.");
+      return { success: true, queued: true };
+    }
+    window.runAgentLoop(prompt, el.modelSelect.value, conv, { source: 'plan-approval', internalPrompt: true })
+      .catch(err => console.error("Desktop-started agent loop failed:", err));
+    return { success: true, queued: false };
+  }
+  return { success: false, error: 'Agent engine is not ready' };
+}
 
 function deleteConversation(id) {
   const convToDelete = conversations.find(c => c.id === id);
@@ -1471,7 +3203,8 @@ function renderProjectsList() {
   
   projects.forEach(path => {
     const isCurrent = path === currentWorkspace || (activeConv && activeConv.projectPath === path);
-    const name = path.substring(path.lastIndexOf('\\') + 1) || path;
+    const rawName = path.substring(path.lastIndexOf('\\') + 1) || path;
+    const name = toTitleCase(rawName);
     
     const projectContainer = document.createElement('div');
     projectContainer.className = 'project-container';
@@ -1585,7 +3318,8 @@ function filterProjects(query) {
   el.projectList.innerHTML = '';
   
   projects.forEach(path => {
-    const name = path.substring(path.lastIndexOf('\\') + 1) || path;
+    const rawName = path.substring(path.lastIndexOf('\\') + 1) || path;
+    const name = toTitleCase(rawName);
     if (!name.toLowerCase().includes(query.toLowerCase())) return;
     
     const activeConv = conversations.find(c => c.id === activeConversationId);
@@ -1684,3 +3418,24 @@ function filterProjects(query) {
 
 window.renderConversationList = renderConversationList;
 window.renderProjectsList = renderProjectsList;
+
+window.onRagStatusChange = (statusText) => {
+  const badge = document.getElementById('rag-index-status');
+  if (!badge) return;
+  badge.textContent = statusText;
+  badge.style.display = statusText ? 'inline-block' : 'none';
+  
+  if (statusText.startsWith('Indexing')) {
+    badge.textContent = 'Indexing…';
+    badge.className = 'badge warning pulse';
+  } else if (statusText === 'Semantic Ready') {
+    badge.textContent = 'Indexed';
+    badge.className = 'badge success';
+  } else if (statusText === 'Awaiting API Key') {
+    badge.className = 'badge danger';
+  } else {
+    badge.className = 'badge muted';
+  }
+};
+
+window.getCurrentProject = () => currentWorkspace;
