@@ -7,6 +7,8 @@ const html = fs.readFileSync(path.join(__dirname, '../index.html'), 'utf8').repl
 const main = fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8').replace(/\r\n/g, '\n');
 const renderer = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8').replace(/\r\n/g, '\n');
 const preload = fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8').replace(/\r\n/g, '\n');
+const companionHtml = fs.readFileSync(path.join(__dirname, '../lib/companion-html.js'), 'utf8').replace(/\r\n/g, '\n');
+const ipcUiJs = fs.readFileSync(path.join(__dirname, '../lib/ipc-ui.js'), 'utf8').replace(/\r\n/g, '\n');
 
 test('desktop uses the unified Orion command-center design system', (t) => {
   t.ok(styles.includes('--bg-primary: #090b12'), 'uses graphite Orion background');
@@ -34,13 +36,13 @@ test('desktop polish includes accessible focus and reduced-motion behavior', (t)
 });
 
 test('phone companion finishes with the same dark theme and complete mission hierarchy', (t) => {
-  const unifiedThemeIndex = main.indexOf('Unified Orion dark companion theme');
-  const legacyLightIndex = main.indexOf('Codex-inspired mobile shell, Orion palette');
+  const unifiedThemeIndex = companionHtml.indexOf('Unified Orion dark companion theme');
+  const legacyLightIndex = companionHtml.indexOf('Codex-inspired mobile shell, Orion palette');
   t.ok(unifiedThemeIndex > legacyLightIndex, 'unified dark theme wins the cascade');
-  t.ok(main.slice(unifiedThemeIndex).includes('color-scheme: dark'), 'phone declares dark controls');
-  t.ok(main.slice(unifiedThemeIndex).includes('#mission-context-card { grid-area: mission; }'), 'Mission Control has an explicit mobile layout area');
-  t.ok(main.slice(unifiedThemeIndex).includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
-  t.ok(main.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
+  t.ok(companionHtml.slice(unifiedThemeIndex).includes('color-scheme: dark'), 'phone declares dark controls');
+  t.ok(companionHtml.slice(unifiedThemeIndex).includes('#mission-context-card { grid-area: mission; }'), 'Mission Control has an explicit mobile layout area');
+  t.ok(companionHtml.slice(unifiedThemeIndex).includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
+  t.ok(companionHtml.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
   t.end();
 });
 
@@ -63,13 +65,13 @@ test('agent presence communicates meaningful execution phases', (t) => {
   });
   t.ok(styles.includes('.agent-state-pill.verifying'), 'styles verification distinctly');
   t.ok(styles.includes('.orion-toast.success'), 'provides completion feedback');
-  t.ok(main.includes("? 'Verifying'"), 'phone uses the same verification state language');
+  t.ok(companionHtml.includes("? 'Verifying'"), 'phone uses the same verification state language');
   t.end();
 });
 
 test('window maximize control uses the correct Electron fullscreen API', (t) => {
-  t.ok(main.includes('mainWindow.isFullScreen()'), 'main process uses BrowserWindow.isFullScreen()');
-  t.notOk(main.includes('mainWindow.isFullscreen()'), 'main process does not call the non-existent isFullscreen() API');
+  t.ok(ipcUiJs.includes('mainWindow.isFullScreen()'), 'main process uses BrowserWindow.isFullScreen()');
+  t.notOk(ipcUiJs.includes('mainWindow.isFullscreen()'), 'main process does not call the non-existent isFullscreen() API');
   t.end();
 });
 
@@ -80,7 +82,7 @@ test('desktop exposes quiet runtime version and update state UI', (t) => {
   t.ok(renderer.includes('refreshAppRuntimeInfo'), 'renderer populates runtime metadata on startup');
   t.ok(preload.includes('getAppRuntimeInfo'), 'preload exposes runtime metadata IPC');
   t.ok(main.includes('buildUpdateSplashHtml'), 'main process owns the pre-render update splash');
-  t.ok(main.includes('Updating local build'), 'update splash has user-facing maintenance copy');
+  t.ok(ipcUiJs.includes('Updating local build'), 'update splash has user-facing maintenance copy');
   t.ok(main.includes('syncSourceUpdateFiles'), 'source updater copies files through a named sync helper');
   t.end();
 });

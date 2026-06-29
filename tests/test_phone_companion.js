@@ -88,6 +88,7 @@ function makeElectronMock(handlers = {}) {
           };
         }
         loadFile() {}
+        on() {}
         isDestroyed() { return false; }
         static getAllWindows() { return []; }
       },
@@ -103,21 +104,41 @@ function makeElectronMock(handlers = {}) {
 }
 
 async function startMainWithConfig(port, config, handlers) {
-  const fsMock = makeFsMock({
+  const configData = {
     phoneCompanionPort: port,
     phoneCompanionPairingCode: 'pair-code-123456',
     phoneCompanionPairingExpiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
     phoneCompanionDevices: [],
     ...config
-  });
+  };
+  // fsMock kept for backward-compat with test assertions that call fsMock._config()
+  const fsMock = { _config: () => configData };
+  // Use a global config stub so readAppConfig/writeAppConfig in all modules (including
+  // ipc-server.js) use the in-memory configData rather than the real config file.
+  const configMock = {
+    readAppConfig: () => ({ ...configData }),
+    writeAppConfig: (cfg) => { Object.assign(configData, cfg); },
+    atomicWriteFileSync: require('fs').writeFileSync,
+    getConfigPath: () => require('path').join(require('os').tmpdir(), 'orion-config-test.json'),
+    '@global': true,
+    '@noCallThru': true
+  };
   const electron = makeElectronMock(handlers);
+  // Make the os mock global so ipc-server.js uses the controlled network address.
   const osMock = {
     networkInterfaces: () => ({
       WiFi: [{ family: 'IPv4', internal: false, address: '192.168.50.25' }],
       Loopback: [{ family: 'IPv4', internal: true, address: '127.0.0.1' }]
-    })
+    }),
+    homedir: require('os').homedir,
+    tmpdir: require('os').tmpdir,
+    '@global': true
   };
-  const main = proxyquire('../main.js', { electron: electron.mock, fs: fsMock, os: osMock });
+  const main = proxyquire('../main.js', {
+    electron: electron.mock,
+    './lib/config': configMock,
+    os: osMock
+  });
   main.resetCompanionServer();
   main.startPhoneCompanionServer();
   await new Promise(resolve => setTimeout(resolve, 150));
