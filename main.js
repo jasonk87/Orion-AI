@@ -47,7 +47,7 @@ function registerAllHandlers() {
 
   ipcFileTools.registerHandlers(ipcMain);
   ipcShell.registerHandlers(ipcMain, { getWorkspaceEntrypoint, readAppConfig, startStaticWorkspaceServer });
-  ipcWorkspace.registerHandlers(ipcMain);
+  ipcWorkspace.registerHandlers(ipcMain, { startStaticWorkspaceServer });
   ipcServer.registerHandlers(ipcMain);
   ipcUi.registerHandlers(ipcMain);
   symbolIndex.registerHandlers(ipcMain);
@@ -91,43 +91,38 @@ app.on('window-all-closed', () => {
 // ── Test exports ───────────────────────────────────────────────────────────────
 
 if (process.env.NODE_ENV === 'test') {
-  const ipcFileToolsMod = require('./lib/ipc-file-tools');
-  const ipcShellMod = require('./lib/ipc-shell');
-  const ipcWorkspaceMod = require('./lib/ipc-workspace');
-  const ipcServerMod = require('./lib/ipc-server');
-  const ipcUiMod = require('./lib/ipc-ui');
   const { resolveWorkspacePath, classifyCommandRequest, isDestructiveCommand } = require('./safety');
   const { readAppConfig } = require('./lib/config');
 
   module.exports = {
     // ipc-shell
-    escapePowerShellSingle: ipcShellMod.escapePowerShellSingle || ipcWorkspaceMod.escapePowerShellSingle,
-    startCommandSession: ipcShellMod.startCommandSession,
-    killProcessTree: ipcShellMod.killProcessTree,
-    commandLooksPowerShellSpecific: ipcShellMod.commandLooksPowerShellSpecific,
-    getCommandShellSpec: ipcShellMod.getCommandShellSpec,
-    previewWorkspaceApp: ipcShellMod.previewWorkspaceApp,
+    escapePowerShellSingle: ipcShell.escapePowerShellSingle || ipcWorkspace.escapePowerShellSingle,
+    startCommandSession: ipcShell.startCommandSession,
+    killProcessTree: ipcShell.killProcessTree,
+    commandLooksPowerShellSpecific: ipcShell.commandLooksPowerShellSpecific,
+    getCommandShellSpec: ipcShell.getCommandShellSpec,
+    previewWorkspaceApp: ipcShell.previewWorkspaceApp,
     // ipc-file-tools
-    writeRunArtifact: ipcFileToolsMod.writeRunArtifact,
-    listRunArtifacts: ipcFileToolsMod.listRunArtifacts,
-    deleteWorkspacePath: ipcFileToolsMod.deleteWorkspacePath,
-    moveWorkspacePath: ipcFileToolsMod.moveWorkspacePath,
-    copyWorkspacePath: ipcFileToolsMod.copyWorkspacePath,
-    downloadFileToWorkspace: ipcFileToolsMod.downloadFileToWorkspace,
-    inspectArchiveInWorkspace: ipcFileToolsMod.inspectArchiveInWorkspace,
-    extractArchiveInWorkspace: ipcFileToolsMod.extractArchiveInWorkspace,
-    inspectBinaryAssetInWorkspace: ipcFileToolsMod.inspectBinaryAssetInWorkspace,
-    listAssetMetadataInWorkspace: ipcFileToolsMod.listAssetMetadataInWorkspace,
-    readWorkspaceFileBase64: ipcFileToolsMod.readWorkspaceFileBase64,
-    compareScreenshotToGoalInWorkspace: ipcFileToolsMod.compareScreenshotToGoalInWorkspace,
-    applyPatch: ipcFileToolsMod.applyPatch,
-    buildPatchProof: ipcFileToolsMod.buildPatchProof,
+    writeRunArtifact: ipcFileTools.writeRunArtifact,
+    listRunArtifacts: ipcFileTools.listRunArtifacts,
+    deleteWorkspacePath: ipcFileTools.deleteWorkspacePath,
+    moveWorkspacePath: ipcFileTools.moveWorkspacePath,
+    copyWorkspacePath: ipcFileTools.copyWorkspacePath,
+    downloadFileToWorkspace: ipcFileTools.downloadFileToWorkspace,
+    inspectArchiveInWorkspace: ipcFileTools.inspectArchiveInWorkspace,
+    extractArchiveInWorkspace: ipcFileTools.extractArchiveInWorkspace,
+    inspectBinaryAssetInWorkspace: ipcFileTools.inspectBinaryAssetInWorkspace,
+    listAssetMetadataInWorkspace: ipcFileTools.listAssetMetadataInWorkspace,
+    readWorkspaceFileBase64: ipcFileTools.readWorkspaceFileBase64,
+    compareScreenshotToGoalInWorkspace: ipcFileTools.compareScreenshotToGoalInWorkspace,
+    applyPatch: ipcFileTools.applyPatch,
+    buildPatchProof: ipcFileTools.buildPatchProof,
     // ipc-server
-    startPhoneCompanionServer: ipcServerMod.startPhoneCompanionServer,
-    stopPhoneCompanionServer: ipcServerMod.stopPhoneCompanionServer,
-    enablePhoneCompanionLanMode: ipcServerMod.enablePhoneCompanionLanMode,
-    buildCompanionPairingAnnouncement: ipcServerMod.buildCompanionPairingAnnouncement,
-    getPhoneCompanionPairingForTest: ipcServerMod.getPhoneCompanionPairingPayload,
+    startPhoneCompanionServer: ipcServer.startPhoneCompanionServer,
+    stopPhoneCompanionServer: ipcServer.stopPhoneCompanionServer,
+    enablePhoneCompanionLanMode: ipcServer.enablePhoneCompanionLanMode,
+    buildCompanionPairingAnnouncement: ipcServer.buildCompanionPairingAnnouncement,
+    getPhoneCompanionPairingForTest: ipcServer.getPhoneCompanionPairingPayload,
     getCompanionServer: () => shared.companionServer,
     resetCompanionServer: () => {
       if (shared.companionServer) {
@@ -136,22 +131,22 @@ if (process.env.NODE_ENV === 'test') {
       shared.companionServer = null;
     },
     // ipc-workspace
-    chunkText: ipcWorkspaceMod.chunkText,
-    cosineSimilarity: ipcWorkspaceMod.cosineSimilarity,
-    getGeminiEmbedding: ipcWorkspaceMod.getGeminiEmbedding,
-    spawnInternalCommand: ipcWorkspaceMod.spawnInternalCommand,
+    chunkText: ipcWorkspace.chunkText,
+    cosineSimilarity: ipcWorkspace.cosineSimilarity,
+    getGeminiEmbedding: ipcWorkspace.getGeminiEmbedding,
+    spawnInternalCommand: ipcWorkspace.spawnInternalCommand,
     // ipc-ui
-    computeSourceUpdates: ipcUiMod.computeSourceUpdates,
-    getAppRuntimeInfo: ipcUiMod.getAppRuntimeInfo,
-    buildUpdateSplashHtml: ipcUiMod.buildUpdateSplashHtml,
-    syncSourceUpdateFiles: ipcUiMod.syncSourceUpdateFiles,
-    isLikelySourceDir: ipcUiMod.isLikelySourceDir,
+    computeSourceUpdates: ipcUi.computeSourceUpdates,
+    getAppRuntimeInfo: ipcUi.getAppRuntimeInfo,
+    buildUpdateSplashHtml: ipcUi.buildUpdateSplashHtml,
+    syncSourceUpdateFiles: ipcUi.syncSourceUpdateFiles,
+    isLikelySourceDir: ipcUi.isLikelySourceDir,
     // safety / shared
     resolveWorkspacePath,
     classifyCommandRequest,
     isDestructiveCommand,
     activeProcesses: shared.activeProcesses,
     commandSessions: shared.commandSessions,
-    ensureCompanionToken: ipcServerMod.ensureCompanionToken
+    ensureCompanionToken: ipcServer.ensureCompanionToken
   };
 }

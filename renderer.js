@@ -869,7 +869,7 @@ async function moveWorkspacePathIntoDirectory(sourcePath, directoryPath) {
 async function deleteWorkspacePath(relativePath) {
   if (!currentWorkspace || !relativePath) return;
   const approved = await window.api.showConfirmDialog(`Delete "${relativePath}" from the workspace?`, 'Delete Workspace Item');
-  if (!approved) return;
+  if (!approved?.confirmed) return;
   const result = await window.api.deletePath(currentWorkspace, relativePath);
   if (result.success) {
     appendSystemMessage(`Deleted ${relativePath}${result.backupPath ? ` (backup: ${result.backupPath})` : ''}.`);
@@ -1756,11 +1756,11 @@ function renderConversationList() {
     item.querySelector('.delete-btn').addEventListener('click', async (e) => {
       e.stopPropagation();
       const approved = await window.api.showConfirmDialog(`Delete conversation "${conv.title}"?`, 'Delete Conversation');
-      if (approved) {
+      if (approved?.confirmed) {
         deleteConversation(conv.id);
       }
     });
-    
+
     el.conversationList.appendChild(item);
   });
 }
@@ -3384,7 +3384,7 @@ function buildProjectCard(path) {
   projectHeader.querySelector('.delete-btn').addEventListener('click', async (e) => {
     e.stopPropagation();
     const approved = await window.api.showConfirmDialog(`Remove project "${name}" and delete its conversations?`, 'Remove Project');
-    if (approved) {
+    if (approved?.confirmed) {
       removeProject(path);
     }
   });
@@ -3427,7 +3427,7 @@ function buildProjectCard(path) {
       convItem.querySelector('.delete-btn').addEventListener('click', async (e) => {
         e.stopPropagation();
         const approved = await window.api.showConfirmDialog(`Delete conversation "${conv.title}"?`, 'Delete Conversation');
-        if (approved) {
+        if (approved?.confirmed) {
           deleteConversation(conv.id);
         }
       });
