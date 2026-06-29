@@ -12,7 +12,7 @@ CRITICAL RULES:
    FILE EDIT DISCIPLINE: If you have edited the same file more than twice in a row, STOP and read_file the complete current version before making any further changes. Identify ALL remaining issues in one pass, then fix them in a single edit. Incremental micro-patches on the same file create cascading bugs and waste loops. Write complete, correct implementations the first time rather than patching incrementally.
 3. WEB RESEARCH: If you are unsure about an API, library, framework, command, model parameter, error message, current behavior, or documentation detail, use "google_search" and then "fetch_web_page" on the most relevant official docs or primary source before editing. Do not use web search to answer facts about the user's local machine, workspace state, installed tools, paths, memory, disk, processes, environment variables, or runtime output; inspect local state instead. Do not invent configuration files or API shapes when files are missing or the correct implementation is unclear. Do not say you reviewed, checked, verified, or confirmed documentation unless you actually used these web tools in the current task and can name the source URL. If docs appear to say something surprising, quote or paraphrase the exact relevant rule before changing files.
 4. CONTEXT INTEGRITY: Keep files clean, respect formatting, and preserve comments that are unrelated to your edits.
-5. NOTES AND MEMORY: Use project/standalone notes as durable working memory. Read them when orienting, and update them when you learn durable facts: architecture, important files, commands, decisions, user preferences, gotchas, open tasks, test status, and future repair notes. Project notes are shared across every conversation in the same project; standalone notes belong only to that standalone conversation. Keep notes concise and useful, not a transcript.
+5. NOTES AND MEMORY: Use project/standalone notes as durable working memory. Read them when orienting, and update them when you learn durable facts: architecture, important files, commands, decisions, user preferences, gotchas, open tasks, test status, and future repair notes. Project notes are shared across every conversation in the same project; standalone notes belong only to that standalone conversation. Keep notes concise and useful, not a transcript. Additionally, use append_project_memory to persist important architectural decisions, API shapes, recurring gotchas, and per-workspace patterns so future sessions start with that context already loaded.
 5A. OPERATIONAL CONTEXT: For long-running or multi-subplan goals, maintain mission, measurable win conditions, active objective/subplan, blockers, and retained discoveries with the operational-context tools. Treat operational context as canonical working state, not another chat transcript. Promote durable lessons; discard summaries of fixed errors, dead ends, and temporary output. Never mark a subplan or win condition complete without concrete evidence from tests, inspected output, or explicit user confirmation.
 6. DESIGN QUALITY — NON-NEGOTIABLE: Visual polish is a hard requirement, not a nice-to-have. For ANY app, game, dashboard, or UI-facing tool, you MUST meet the following minimum bar before considering the task complete — even if the user did not explicitly ask for it:
    (a) STYLING: Use a proper CSS framework (Tailwind, MUI, Chakra, etc.) or write thorough custom CSS. Zero bare/unstyled HTML is acceptable in a delivered product. Every element must have intentional color, spacing, typography, and layout.
@@ -47,7 +47,8 @@ Tools available:
 - launch_workspace_app: Launch the active workspace app using Orion's app detection. For a GUI program with an event loop (pygame, tkinter, a game window), do NOT verify it with run_command — that blocks until timeout. Use preview_app, which launches it, screenshots it, and leaves it running under your control (wait + capture_screen, read_command_output, or kill_command).
 - set_workspace_entrypoint: Set or clear the launch entry point command for this workspace.
 - git_push: Push the current Git branch, or the current branch to a requested remote branch, when the user asks.
-- read_file: Read a file's content. Use startLine/endLine or maxChars for large files.
+- read_file: Read a file's content. For large files, first call get_symbol_index to locate the exact function/class by line number, then read only that range with startLine/endLine.
+- get_symbol_index: Returns function, class, and arrow-function symbols with line numbers for every JS/TS file in the workspace. Always call this before read_file on large source files — identify the target symbol's line range first.
 - write_file: Write a new file. Existing non-governance files require allowOverwrite=true and overwriteReason; prefer patch_file for source edits. STRATEGY.md and implementation_plan.md are governance files.
 - modify_file: Edit a specific section of a file (search and replace).
 - patch_file: Targeted file update using line ranges, anchors, exact replacement, or regex. Prefer this over rewriting large files.
@@ -73,7 +74,10 @@ Tools available:
 - capture_screen: Takes another OS-level desktop screenshot — for NATIVE apps (pygame, tkinter) previously launched with preview_app. Do NOT use for web apps; use open_url + take_screenshot instead.
 - inspect_screenshot_with_model: Sends a workspace screenshot to the active chat LLM's multimodal vision for semantic visual inspection against a goal.
 - sync_workspace_env: Safely write configured API keys/search IDs into .env-style files without exposing the secret values in chat or tool output.
-- set_task_checklist: Set the UI checklist of tasks (array of {title, status}). Status can be 'pending', 'in-progress', 'completed'. Use only for milestone changes, not routine progress churn.`;
+- set_task_checklist: Set the UI checklist of tasks (array of {title, status}). Status can be 'pending', 'in-progress', 'completed'. Use only for milestone changes, not routine progress churn.
+- step_complete: Emit after completing each step of an approved implementation plan. Orion auto-runs tests and injects a [POST-STEP VERIFICATION: ...] message. If tests fail you must fix them before the next step.
+- read_project_memory: Reads the persistent per-workspace project memory: architectural decisions, API shapes, gotchas, and preferences saved from prior sessions.
+- append_project_memory: Appends a durable fact to the workspace project memory. Use whenever you discover a decision, pattern, API shape, or constraint that future sessions should know.`;
 
 // Keep track of active agent running state
 let isAgentRunning = false;
@@ -342,6 +346,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const scopedNotes = await readScopedNotes(workspacePath, conversation);
   const operationalContext = await readOperationalContext(workspacePath);
   let workingState = operationalContext.state;
+  const projectMemory = (workspacePath && window.api && window.api.readProjectMemory)
+    ? await window.api.readProjectMemory(workspacePath).catch(() => ({ facts: [] }))
+    : { facts: [] };
 
   // Resolve the whole routing decision up front so message construction and the loop
   // share one consistent verdict.
@@ -456,7 +463,22 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   // Canonical operational state seeds reasoning. Conversation remains a bounded UI/input view;
   // old model and tool turns are deliberately not replayed as task truth.
   let messages = OperationalContext.buildReasoningMessages(workingState, conversation.messages, promptForModel);
+
+  // OC injection optimization: subsequent turns inject a short header instead of full OC state
+  const OC_SHORT_HEADER = '[Operational context on file — request specific sections if needed: goals, current_task, do_not_touch, notes]';
+  let useOCShortHeader = false;
+  if (resetMissionState) conversation._ocFirstTurnDone = false;
+  if (hasOperationalMissionState(workingState) && conversation._ocFirstTurnDone) {
+    useOCShortHeader = true;
+    if (messages[0] && messages[0].parts && messages[0].parts[0]) {
+      messages[0].parts[0].text = OC_SHORT_HEADER;
+    }
+  } else if (hasOperationalMissionState(workingState)) {
+    conversation._ocFirstTurnDone = true;
+  }
+
   const refreshWorkingStateMessage = () => {
+    if (useOCShortHeader) return;
     if (messages[0] && messages[0].parts && messages[0].parts[0]) {
       messages[0].parts[0].text = OperationalContext.formatForPrompt(workingState) || messages[0].parts[0].text;
     }
@@ -473,6 +495,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         role: 'model',
         parts: [{ text: 'Understood. I will use these durable notes as context for this task.' }]
       }
+    );
+  }
+
+  if (projectMemory.facts && projectMemory.facts.length > 0) {
+    const memText = projectMemory.facts.map((f, i) => `${i + 1}. [${f.category || 'general'}] ${f.text}`).join('\n');
+    messages.splice(2, 0,
+      { role: 'user', parts: [{ text: `[ORION PROJECT MEMORY]\nPersistent workspace facts from prior sessions. Reference these when relevant.\n\n${memText}` }] },
+      { role: 'model', parts: [{ text: 'Understood. I have the workspace project memory loaded.' }] }
     );
   }
 
@@ -2077,6 +2107,44 @@ async function executeTool(name, args, workspace, config, conversation) {
       };
       if (window.saveConversationsToStorage) window.saveConversationsToStorage();
       return { success: true, status: 'questions_presented', _forceYield: true };
+    }
+
+    case 'step_complete': {
+      const stepLabel = String(args.step || args.label || 'current step').trim();
+      let verification = `[POST-STEP VERIFICATION: Step "${stepLabel}" complete.`;
+      if (config.autoTest) {
+        const testRes = await window.runRegressionTests();
+        if (testRes.success) {
+          verification += ` Tests passing. ✓]`;
+        } else {
+          verification += ` Tests FAILED — fix before continuing.\n${testRes.output || ''}]`;
+        }
+      } else {
+        verification += ` No test command configured.]`;
+      }
+      return { success: true, verification };
+    }
+
+    case 'get_symbol_index': {
+      if (!workspace) throw new Error('No active workspace');
+      const result = await window.api.getSymbolIndex(workspace);
+      if (!result.success) throw new Error(result.error || 'Symbol index failed');
+      return result;
+    }
+
+    case 'read_project_memory': {
+      if (!workspace) throw new Error('No active workspace');
+      const result = await window.api.readProjectMemory(workspace);
+      if (!result || !result.success) return { facts: [], lastUpdated: null, message: 'No project memory found.' };
+      return result;
+    }
+
+    case 'append_project_memory': {
+      if (!workspace) throw new Error('No active workspace');
+      if (!args.text) throw new Error("Missing 'text' parameter");
+      const result = await window.api.appendProjectMemory(workspace, { text: args.text, category: args.category || 'general' });
+      if (!result || !result.success) throw new Error((result && result.error) || 'Failed to append project memory');
+      return { success: true, message: `Memory appended: "${args.text}"` };
     }
 
     default:
@@ -4292,11 +4360,44 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
             },
             required: ["intro", "questions"]
           }
+        },
+        {
+          name: "get_symbol_index",
+          description: "Returns a symbol index for all JS/TS files in the workspace: function names, class names, and arrow functions with their line numbers. Use this BEFORE read_file on large source files — find the target symbol's line range first, then read only that range.",
+          parameters: { type: "OBJECT", properties: {} }
+        },
+        {
+          name: "step_complete",
+          description: "Emit after completing each step of an approved implementation plan. Orion auto-runs the configured test command and injects a [POST-STEP VERIFICATION: ...] message. If tests fail you must fix them before the next step.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              step: { type: "STRING", description: "Short description of the step just completed, e.g. 'Add auth middleware'." }
+            },
+            required: ["step"]
+          }
+        },
+        {
+          name: "read_project_memory",
+          description: "Reads the persistent per-workspace project memory: architectural decisions, API shapes, gotchas, and preferences saved from prior sessions.",
+          parameters: { type: "OBJECT", properties: {} }
+        },
+        {
+          name: "append_project_memory",
+          description: "Appends a durable fact to the workspace project memory. Use when you discover an architectural decision, API shape, gotcha, recurring pattern, or constraint that future sessions should know.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              text: { type: "STRING", description: "The fact to store. Be specific and actionable." },
+              category: { type: "STRING", description: "Optional category, e.g. architecture, api, gotcha, command, preference." }
+            },
+            required: ["text"]
+          }
         }
       ]
     }
   ]);
-  
+
   const ollamaMessages = [];
   if (systemInstruction) {
     ollamaMessages.push({ role: 'system', content: systemInstruction });
@@ -4924,6 +5025,39 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
                 }
               },
               required: ["intro", "questions"]
+            }
+          },
+          {
+            name: "get_symbol_index",
+            description: "Returns a symbol index for all JS/TS files in the workspace: function names, class names, and arrow functions with their line numbers. Use this BEFORE read_file on large source files — find the target symbol's line range first, then read only that range.",
+            parameters: { type: "OBJECT", properties: {} }
+          },
+          {
+            name: "step_complete",
+            description: "Emit after completing each step of an approved implementation plan. Orion auto-runs the configured test command and injects a [POST-STEP VERIFICATION: ...] message. If tests fail you must fix them before the next step.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                step: { type: "STRING", description: "Short description of the step just completed, e.g. 'Add auth middleware'." }
+              },
+              required: ["step"]
+            }
+          },
+          {
+            name: "read_project_memory",
+            description: "Reads the persistent per-workspace project memory: architectural decisions, API shapes, gotchas, and preferences saved from prior sessions.",
+            parameters: { type: "OBJECT", properties: {} }
+          },
+          {
+            name: "append_project_memory",
+            description: "Appends a durable fact to the workspace project memory. Use when you discover an architectural decision, API shape, gotcha, recurring pattern, or constraint that future sessions should know.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                text: { type: "STRING", description: "The fact to store. Be specific and actionable." },
+                category: { type: "STRING", description: "Optional category, e.g. architecture, api, gotcha, command, preference." }
+              },
+              required: ["text"]
             }
           }
         ]

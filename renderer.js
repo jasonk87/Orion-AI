@@ -564,36 +564,6 @@ async function syncWorkspaceFiles() {
   renderFileTree(files);
   autoDetectTestCommand(files);
   loadRunArtifacts();
-  return;
-  
-  el.fileTree.innerHTML = '';
-  
-  // Sort files: directories first, then files alphabetically
-  files.sort((a, b) => {
-    if (a.isDir && !b.isDir) return -1;
-    if (!a.isDir && a.isDir) return 1;
-    return a.path.localeCompare(b.path);
-  });
-  
-  files.forEach(file => {
-    const fileNode = document.createElement('div');
-    fileNode.className = `file-node ${file.isDir ? 'folder' : 'file'}`;
-    fileNode.style.paddingLeft = `${(file.path.split('\\').length - 1) * 8 + 6}px`;
-    
-    const icon = file.isDir ? '📁' : '📄';
-    fileNode.innerHTML = `
-      <span class="file-icon">${icon}</span>
-      <span class="file-name" title="${file.path}">${file.name}</span>
-    `;
-    
-    if (!file.isDir) {
-      fileNode.addEventListener('click', () => insertFileReference(file.path));
-    }
-    
-    el.fileTree.appendChild(fileNode);
-  });
-  
-  autoDetectTestCommand(files);
 }
 
 function setupEntrypointControls() {
@@ -3373,106 +3343,106 @@ function removeProject(path) {
   }
 }
 
+// Shared helper — builds one project card and appends it to el.projectList
+function buildProjectCard(path) {
+  const activeConv = conversations.find(c => c.id === activeConversationId);
+  const isCurrent = path === currentWorkspace || (activeConv && activeConv.projectPath === path);
+  const rawName = path.substring(path.lastIndexOf('\\') + 1) || path;
+  const name = toTitleCase(rawName);
+
+  const projectContainer = document.createElement('div');
+  projectContainer.className = 'project-container';
+  projectContainer.style.display = 'flex';
+  projectContainer.style.flexDirection = 'column';
+  projectContainer.style.marginBottom = '8px';
+
+  const projectHeader = document.createElement('div');
+  projectHeader.className = `project-item ${isCurrent ? 'active' : ''}`;
+  projectHeader.style.display = 'flex';
+  projectHeader.style.alignItems = 'center';
+
+  projectHeader.innerHTML = `
+    <span class="folder-icon">📁</span>
+    <div class="project-details" style="flex: 1; overflow: hidden;">
+      <span class="project-name" style="font-weight:600;">${escapeHtml(name)}</span>
+      <span class="project-subtext" title="${escapeHtml(path)}" style="font-size: 0.65rem;">${escapeHtml(path)}</span>
+    </div>
+    <button class="add-conv-btn" title="New Conversation in Project" style="background:transparent; border:none; color:var(--text-muted); cursor:pointer; font-size:1.1rem; padding:0 4px; line-height:1; margin-right:4px;">+</button>
+    <button class="delete-btn" title="Remove project" style="background:transparent; border:none; color:var(--text-muted); cursor:pointer; font-size:1.1rem; padding:0 4px; line-height:1;">&times;</button>
+  `;
+
+  projectHeader.querySelector('.project-details').addEventListener('click', () => {
+    setWorkspace(path);
+  });
+
+  projectHeader.querySelector('.add-conv-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    setWorkspace(path);
+    createNewConversationUnderProject(path);
+  });
+
+  projectHeader.querySelector('.delete-btn').addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const approved = await window.api.showConfirmDialog(`Remove project "${name}" and delete its conversations?`, 'Remove Project');
+    if (approved) {
+      removeProject(path);
+    }
+  });
+
+  projectContainer.appendChild(projectHeader);
+
+  // Indented child conversations
+  const convsList = document.createElement('div');
+  convsList.className = 'project-conversations-list';
+  convsList.style.paddingLeft = '20px';
+  convsList.style.display = 'flex';
+  convsList.style.flexDirection = 'column';
+  convsList.style.gap = '2px';
+  convsList.style.marginTop = '2px';
+
+  const projectConversations = conversations.filter(c => c.projectPath === path);
+  if (projectConversations.length === 0) {
+    convsList.innerHTML = `<div class="empty-state" style="padding: 4px; text-align: left; font-size: 0.75rem; font-style: italic; color: var(--text-muted);">No conversations yet</div>`;
+  } else {
+    projectConversations.forEach(conv => {
+      const isConvActive = conv.id === activeConversationId;
+      const convItem = document.createElement('div');
+      convItem.className = `conversation-item ${isConvActive ? 'active' : ''}`;
+      convItem.style.padding = '4px 8px';
+      convItem.style.borderRadius = '4px';
+      convItem.style.display = 'flex';
+      convItem.style.alignItems = 'center';
+
+      convItem.innerHTML = `
+        <div class="conversation-details" style="flex: 1; overflow: hidden; display: flex; flex-direction: column;">
+          <span class="conversation-name" style="font-size: 0.8rem; color: ${isConvActive ? 'var(--text-primary)' : 'var(--text-secondary)'}; font-weight: ${isConvActive ? '500' : 'normal'};">${escapeHtml(conv.title)}</span>
+        </div>
+        <button class="delete-btn" title="Delete conversation" style="background:transparent; border:none; color:var(--text-muted); cursor:pointer; font-size:1.1rem; padding:0 4px; line-height:1;">&times;</button>
+      `;
+
+      convItem.querySelector('.conversation-details').addEventListener('click', () => {
+        selectConversation(conv.id);
+      });
+
+      convItem.querySelector('.delete-btn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const approved = await window.api.showConfirmDialog(`Delete conversation "${conv.title}"?`, 'Delete Conversation');
+        if (approved) {
+          deleteConversation(conv.id);
+        }
+      });
+
+      convsList.appendChild(convItem);
+    });
+  }
+
+  projectContainer.appendChild(convsList);
+  el.projectList.appendChild(projectContainer);
+}
+
 function renderProjectsList() {
   el.projectList.innerHTML = '';
-  
-  const activeConv = conversations.find(c => c.id === activeConversationId);
-  
-  projects.forEach(path => {
-    const isCurrent = path === currentWorkspace || (activeConv && activeConv.projectPath === path);
-    const rawName = path.substring(path.lastIndexOf('\\') + 1) || path;
-    const name = toTitleCase(rawName);
-    
-    const projectContainer = document.createElement('div');
-    projectContainer.className = 'project-container';
-    projectContainer.style.display = 'flex';
-    projectContainer.style.flexDirection = 'column';
-    projectContainer.style.marginBottom = '8px';
-    
-    const projectHeader = document.createElement('div');
-    projectHeader.className = `project-item ${isCurrent ? 'active' : ''}`;
-    projectHeader.style.display = 'flex';
-    projectHeader.style.alignItems = 'center';
-    
-    projectHeader.innerHTML = `
-      <span class="folder-icon">📁</span>
-      <div class="project-details" style="flex: 1; overflow: hidden;">
-        <span class="project-name" style="font-weight:600;">${escapeHtml(name)}</span>
-        <span class="project-subtext" title="${escapeHtml(path)}" style="font-size: 0.65rem;">${escapeHtml(path)}</span>
-      </div>
-      <button class="add-conv-btn" title="New Conversation in Project" style="background:transparent; border:none; color:var(--text-muted); cursor:pointer; font-size:1.1rem; padding:0 4px; line-height:1; margin-right:4px;">+</button>
-      <button class="delete-btn" title="Remove project" style="background:transparent; border:none; color:var(--text-muted); cursor:pointer; font-size:1.1rem; padding:0 4px; line-height:1;">&times;</button>
-    `;
-    
-    projectHeader.querySelector('.project-details').addEventListener('click', () => {
-      setWorkspace(path);
-    });
-    
-    projectHeader.querySelector('.add-conv-btn').addEventListener('click', (e) => {
-      e.stopPropagation();
-      setWorkspace(path);
-      createNewConversationUnderProject(path);
-    });
-    
-    projectHeader.querySelector('.delete-btn').addEventListener('click', async (e) => {
-      e.stopPropagation();
-      const approved = await window.api.showConfirmDialog(`Remove project "${name}" and delete its conversations?`, 'Remove Project');
-      if (approved) {
-        removeProject(path);
-      }
-    });
-    
-    projectContainer.appendChild(projectHeader);
-    
-    // Indented child conversations
-    const convsList = document.createElement('div');
-    convsList.className = 'project-conversations-list';
-    convsList.style.paddingLeft = '20px';
-    convsList.style.display = 'flex';
-    convsList.style.flexDirection = 'column';
-    convsList.style.gap = '2px';
-    convsList.style.marginTop = '2px';
-    
-    const projectConversations = conversations.filter(c => c.projectPath === path);
-    if (projectConversations.length === 0) {
-      convsList.innerHTML = `<div class="empty-state" style="padding: 4px; text-align: left; font-size: 0.75rem; font-style: italic; color: var(--text-muted);">No conversations yet</div>`;
-    } else {
-      projectConversations.forEach(conv => {
-        const isConvActive = conv.id === activeConversationId;
-        const convItem = document.createElement('div');
-        convItem.className = `conversation-item ${isConvActive ? 'active' : ''}`;
-        convItem.style.padding = '4px 8px';
-        convItem.style.borderRadius = '4px';
-        convItem.style.display = 'flex';
-        convItem.style.alignItems = 'center';
-        
-        convItem.innerHTML = `
-          <div class="conversation-details" style="flex: 1; overflow: hidden; display: flex; flex-direction: column;">
-            <span class="conversation-name" style="font-size: 0.8rem; color: ${isConvActive ? 'var(--text-primary)' : 'var(--text-secondary)'}; font-weight: ${isConvActive ? '500' : 'normal'};">${escapeHtml(conv.title)}</span>
-          </div>
-          <button class="delete-btn" title="Delete conversation" style="background:transparent; border:none; color:var(--text-muted); cursor:pointer; font-size:1.1rem; padding:0 4px; line-height:1;">&times;</button>
-        `;
-        
-        convItem.querySelector('.conversation-details').addEventListener('click', () => {
-          selectConversation(conv.id);
-        });
-        
-        convItem.querySelector('.delete-btn').addEventListener('click', async (e) => {
-          e.stopPropagation();
-          const approved = await window.api.showConfirmDialog(`Delete conversation "${conv.title}"?`, 'Delete Conversation');
-          if (approved) {
-            deleteConversation(conv.id);
-          }
-        });
-        
-        convsList.appendChild(convItem);
-      });
-    }
-    
-    projectContainer.appendChild(convsList);
-    el.projectList.appendChild(projectContainer);
-  });
-  
+
   if (projects.length === 0) {
     el.projectList.innerHTML = `
       <div class="project-item active" id="default-proj-item">
@@ -3483,7 +3453,10 @@ function renderProjectsList() {
         </div>
       </div>
     `;
+    return;
   }
+
+  projects.forEach(path => buildProjectCard(path));
 }
 
 function filterProjects(query) {
@@ -3491,105 +3464,14 @@ function filterProjects(query) {
     renderProjectsList();
     return;
   }
-  
+
   el.projectList.innerHTML = '';
-  
+
   projects.forEach(path => {
     const rawName = path.substring(path.lastIndexOf('\\') + 1) || path;
     const name = toTitleCase(rawName);
     if (!name.toLowerCase().includes(query.toLowerCase())) return;
-    
-    const activeConv = conversations.find(c => c.id === activeConversationId);
-    const isCurrent = path === currentWorkspace || (activeConv && activeConv.projectPath === path);
-    
-    const projectContainer = document.createElement('div');
-    projectContainer.className = 'project-container';
-    projectContainer.style.display = 'flex';
-    projectContainer.style.flexDirection = 'column';
-    projectContainer.style.marginBottom = '8px';
-    
-    const projectHeader = document.createElement('div');
-    projectHeader.className = `project-item ${isCurrent ? 'active' : ''}`;
-    projectHeader.style.display = 'flex';
-    projectHeader.style.alignItems = 'center';
-    
-    projectHeader.innerHTML = `
-      <span class="folder-icon">📁</span>
-      <div class="project-details" style="flex: 1; overflow: hidden;">
-        <span class="project-name" style="font-weight:600;">${escapeHtml(name)}</span>
-        <span class="project-subtext" title="${escapeHtml(path)}" style="font-size: 0.65rem;">${escapeHtml(path)}</span>
-      </div>
-      <button class="add-conv-btn" title="New Conversation in Project" style="background:transparent; border:none; color:var(--text-muted); cursor:pointer; font-size:1.1rem; padding:0 4px; line-height:1; margin-right:4px;">+</button>
-      <button class="delete-btn" title="Remove project" style="background:transparent; border:none; color:var(--text-muted); cursor:pointer; font-size:1.1rem; padding:0 4px; line-height:1;">&times;</button>
-    `;
-    
-    projectHeader.querySelector('.project-details').addEventListener('click', () => {
-      setWorkspace(path);
-    });
-    
-    projectHeader.querySelector('.add-conv-btn').addEventListener('click', (e) => {
-      e.stopPropagation();
-      setWorkspace(path);
-      createNewConversationUnderProject(path);
-    });
-    
-    projectHeader.querySelector('.delete-btn').addEventListener('click', async (e) => {
-      e.stopPropagation();
-      const approved = await window.api.showConfirmDialog(`Remove project "${name}" and delete its conversations?`, 'Remove Project');
-      if (approved) {
-        removeProject(path);
-      }
-    });
-    
-    projectContainer.appendChild(projectHeader);
-    
-    // Indented child conversations
-    const convsList = document.createElement('div');
-    convsList.className = 'project-conversations-list';
-    convsList.style.paddingLeft = '20px';
-    convsList.style.display = 'flex';
-    convsList.style.flexDirection = 'column';
-    convsList.style.gap = '2px';
-    convsList.style.marginTop = '2px';
-    
-    const projectConversations = conversations.filter(c => c.projectPath === path);
-    if (projectConversations.length === 0) {
-      convsList.innerHTML = `<div class="empty-state" style="padding: 4px; text-align: left; font-size: 0.75rem; font-style: italic; color: var(--text-muted);">No conversations yet</div>`;
-    } else {
-      projectConversations.forEach(conv => {
-        const isConvActive = conv.id === activeConversationId;
-        const convItem = document.createElement('div');
-        convItem.className = `conversation-item ${isConvActive ? 'active' : ''}`;
-        convItem.style.padding = '4px 8px';
-        convItem.style.borderRadius = '4px';
-        convItem.style.display = 'flex';
-        convItem.style.alignItems = 'center';
-        
-        convItem.innerHTML = `
-          <div class="conversation-details" style="flex: 1; overflow: hidden; display: flex; flex-direction: column;">
-            <span class="conversation-name" style="font-size: 0.8rem; color: ${isConvActive ? 'var(--text-primary)' : 'var(--text-secondary)'}; font-weight: ${isConvActive ? '500' : 'normal'};">${escapeHtml(conv.title)}</span>
-          </div>
-          <button class="delete-btn" title="Delete conversation" style="background:transparent; border:none; color:var(--text-muted); cursor:pointer; font-size:1.1rem; padding:0 4px; line-height:1;">&times;</button>
-        `;
-        
-        convItem.querySelector('.conversation-details').addEventListener('click', () => {
-          selectConversation(conv.id);
-        });
-        
-        convItem.querySelector('.delete-btn').addEventListener('click', async (e) => {
-          e.stopPropagation();
-          const approved = await window.api.showConfirmDialog(`Delete conversation "${conv.title}"?`, 'Delete Conversation');
-          if (approved) {
-            deleteConversation(conv.id);
-          }
-        });
-        
-        convsList.appendChild(convItem);
-      });
-    }
-    
-    projectContainer.appendChild(convsList);
-    el.projectList.appendChild(projectContainer);
+    buildProjectCard(path);
   });
 }
 

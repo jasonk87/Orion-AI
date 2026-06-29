@@ -52,6 +52,10 @@ contextBridge.exposeInMainWorld('api', {
   compareScreenshotToGoal: (workspacePath, relativePath, goal, observations) => ipcRenderer.invoke('compare-screenshot-to-goal', { workspacePath, relativePath, goal, observations }),
   indexWorkspace: (workspacePath) => ipcRenderer.invoke('index-workspace', workspacePath),
   searchEmbeddings: (query, limit) => ipcRenderer.invoke('search-embeddings', { query, limit }),
+  getSymbolIndex: (workspacePath) => ipcRenderer.invoke('orion:get-symbol-index', workspacePath),
+  readProjectMemory: (workspacePath) => ipcRenderer.invoke('orion:read-project-memory', workspacePath),
+  writeProjectMemory: (workspacePath, memory) => ipcRenderer.invoke('orion:write-project-memory', { workspacePath, memory }),
+  appendProjectMemory: (workspacePath, fact) => ipcRenderer.invoke('orion:append-project-memory', { workspacePath, fact }),
   
   // Config Controls
   readConfig: () => ipcRenderer.invoke('read-config'),
