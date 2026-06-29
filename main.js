@@ -11,8 +11,8 @@ const ipcWorkspace = require('./lib/ipc-workspace');
 const ipcServer = require('./lib/ipc-server');
 const ipcUi = require('./lib/ipc-ui');
 const symbolIndex = require('./lib/symbol-index');
-const projectMemory = require('./lib/project-memory');
 const ipcSkill = require('./lib/ipc-skill');
+const ipcMemory = require('./lib/ipc-memory');
 
 // ── Window creation ────────────────────────────────────────────────────────────
 
@@ -52,8 +52,8 @@ function registerAllHandlers() {
   ipcServer.registerHandlers(ipcMain);
   ipcUi.registerHandlers(ipcMain);
   symbolIndex.registerHandlers(ipcMain);
-  projectMemory.registerHandlers(ipcMain);
   ipcSkill.registerHandlers(ipcMain);
+  ipcMemory.registerHandlers(ipcMain);
 }
 
 // ── App lifecycle ──────────────────────────────────────────────────────────────

@@ -81,8 +81,21 @@ Tools available:
 - discover_skills: List all registered skills in the skill registry, optionally filtered by group. Call this before attempting a complex or repetitive task to check if a reusable skill already exists.
 - run_skill: Execute a registered skill by name with the given inputs. Returns the skill's outputs.
 - create_skill: Write, test, and register a new reusable skill. Use this when you encounter a capability gap that would benefit from a reusable, testable function. Skills authored by Orion are marked createdBy: "orion" and are available immediately after registration.
+- remember_fact: Store a durable fact in global or project memory. scope="global" for cross-project facts (user habits, preferences, people), scope="project" for workspace-specific facts.
+- remember_decision: Store an architectural or design decision in project memory with optional context about why it was made.
+- remember_preference: Store a user preference at global or project level. Call this immediately when the user expresses how they like things done.
+- recall_memory: Read memory for the given scope ("global", "project", or "all"). Call this at the start of a session with an active workspace to orient yourself.
+- save_session_summary: Save what was accomplished this session: summary, decisions, discoveries, completed tasks, and open items. Call when the user says they're wrapping up or switching tasks.
 
-SKILL REGISTRY GUIDANCE: The skill registry is a library of reusable, tested capabilities. Before starting a complex or repetitive task, call discover_skills to check if a relevant skill already exists. If a task requires a capability that doesn't exist yet and would be useful in the future, use create_skill to author it — provide the JS implementation and a test that exits 0 on success. Skills are stored persistently and shared across all conversations.\`;
+SKILL REGISTRY GUIDANCE: The skill registry is a library of reusable, tested capabilities. Before starting a complex or repetitive task, call discover_skills to check if a relevant skill already exists. If a task requires a capability that doesn't exist yet and would be useful in the future, use create_skill to author it — provide the JS implementation and a test that exits 0 on success. Skills are stored persistently and shared across all conversations.
+
+MEMORY PROTOCOL:
+- SESSION START: When a workspace is active, call recall_memory with scope="all" to load project context and orient yourself before responding.
+- USER PREFERENCES: When the user expresses a preference ("I like X", "always do Y", "don't do Z", "I prefer X"), call remember_preference immediately — do not wait.
+- DESIGN DECISIONS: When a significant architectural or design decision is made, call remember_decision with the decision and why.
+- DURABLE FACTS: When you discover a fact about the project or user that future sessions should know, call remember_fact.
+- SESSION END: When the user indicates they are wrapping up, switching tasks, or says they are done, call save_session_summary with what was accomplished, what was decided, and what remains open.
+- SCOPE: Global memory is for things true across all projects (user identity, habits, people, cross-project preferences). Project memory is for things specific to the current workspace.`;
 
 // Keep track of active agent running state
 let isAgentRunning = false;
@@ -2181,6 +2194,82 @@ async function executeTool(name, args, workspace, config, conversation) {
       });
       if (!result.success) throw new Error(result.error || 'create_skill failed');
       return { success: true, manifest: result.manifest, message: `Skill '${args.name}' created and registered.` };
+    }
+
+    case 'remember_fact': {
+      const scope = args.scope || 'project';
+      const text = args.text;
+      const category = args.category || 'general';
+      if (!text) throw new Error("Missing 'text' parameter");
+      if (scope === 'global') {
+        const result = await window.api.appendGlobalFact(text, category);
+        if (!result || !result.success) throw new Error((result && result.error) || 'appendGlobalFact failed');
+        return { success: true, message: `Global fact stored: "${text}"` };
+      } else {
+        if (!workspace) throw new Error('No active workspace');
+        const result = await window.api.appendProjectFact(workspace, text, category);
+        if (!result || !result.success) throw new Error((result && result.error) || 'appendProjectFact failed');
+        return { success: true, message: `Project fact stored: "${text}"` };
+      }
+    }
+
+    case 'remember_decision': {
+      if (!workspace) throw new Error('No active workspace');
+      if (!args.text) throw new Error("Missing 'text' parameter");
+      const result = await window.api.appendProjectDecision(workspace, args.text, args.context || '');
+      if (!result || !result.success) throw new Error((result && result.error) || 'appendProjectDecision failed');
+      return { success: true, message: `Decision stored: "${args.text}"` };
+    }
+
+    case 'remember_preference': {
+      const scope = args.scope || 'project';
+      const text = args.text;
+      if (!text) throw new Error("Missing 'text' parameter");
+      if (scope === 'global') {
+        const mem = await window.api.readGlobalMemory();
+        const prefs = (mem && mem.user && Array.isArray(mem.user.preferences)) ? mem.user.preferences : [];
+        prefs.push({ text, addedAt: new Date().toISOString() });
+        const result = await window.api.writeGlobalMemory({ user: Object.assign({}, (mem && mem.user) || {}, { preferences: prefs }) });
+        if (!result || !result.success) throw new Error((result && result.error) || 'writeGlobalMemory failed');
+        return { success: true, message: `Global preference stored: "${text}"` };
+      } else {
+        const wp = args.workspacePath || workspace;
+        if (!wp) throw new Error('No active workspace');
+        const result = await window.api.appendProjectPreference(wp, text);
+        if (!result || !result.success) throw new Error((result && result.error) || 'appendProjectPreference failed');
+        return { success: true, message: `Project preference stored: "${text}"` };
+      }
+    }
+
+    case 'recall_memory': {
+      const scope = args.scope || 'project';
+      const wp = args.workspacePath || workspace;
+      const output = {};
+      if (scope === 'global' || scope === 'all') {
+        const g = await window.api.readGlobalMemory();
+        output.global = g || {};
+      }
+      if ((scope === 'project' || scope === 'all') && wp) {
+        const p = await window.api.readProjectMemory(wp);
+        output.project = p || {};
+      }
+      return output;
+    }
+
+    case 'save_session_summary': {
+      const wp = args.workspacePath || workspace;
+      if (!wp) throw new Error('No active workspace');
+      if (!args.summary) throw new Error("Missing 'summary' parameter");
+      const sessionData = {
+        summary: args.summary,
+        decisions: args.decisions || [],
+        discoveries: args.discoveries || [],
+        tasksCompleted: args.tasksCompleted || [],
+        openItems: args.openItems || []
+      };
+      const result = await window.api.saveSession(wp, sessionData);
+      if (!result || !result.success) throw new Error((result && result.error) || 'saveSession failed');
+      return { success: true, sessionId: result.session && result.session.sessionId, message: 'Session summary saved.' };
     }
 
     default:
@@ -4468,6 +4557,72 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
             },
             required: ["name", "group", "description", "implementation"]
           }
+        },
+        {
+          name: "remember_fact",
+          description: "Store a durable fact in global or project memory. Use scope='global' for cross-project facts (user habits, people, identity), scope='project' for workspace-specific facts.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              scope: { type: "STRING", description: "global or project (default: project)." },
+              text: { type: "STRING", description: "The fact to store." },
+              category: { type: "STRING", description: "Optional category, e.g. architecture, api, gotcha, preference." }
+            },
+            required: ["text"]
+          }
+        },
+        {
+          name: "remember_decision",
+          description: "Store an architectural or design decision in project memory with optional context about why it was made.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              text: { type: "STRING", description: "The decision that was made." },
+              context: { type: "STRING", description: "Optional: why this decision was made." },
+              workspacePath: { type: "STRING", description: "Optional workspace path override." }
+            },
+            required: ["text"]
+          }
+        },
+        {
+          name: "remember_preference",
+          description: "Store a user preference at global or project level. Call immediately when the user expresses how they like things done.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              scope: { type: "STRING", description: "global or project (default: project)." },
+              text: { type: "STRING", description: "The preference to store, e.g. 'Always use TypeScript interfaces over type aliases'." },
+              workspacePath: { type: "STRING", description: "Optional workspace path override (project scope only)." }
+            },
+            required: ["text"]
+          }
+        },
+        {
+          name: "recall_memory",
+          description: "Read memory for the given scope. Call at the start of a session with an active workspace to orient yourself with prior context.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              scope: { type: "STRING", description: "global, project, or all (default: project)." },
+              workspacePath: { type: "STRING", description: "Optional workspace path override." }
+            }
+          }
+        },
+        {
+          name: "save_session_summary",
+          description: "Save a summary of this session: what was accomplished, decisions made, discoveries, completed tasks, and open items. Call when the user is wrapping up or switching tasks.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              workspacePath: { type: "STRING", description: "Optional workspace path override." },
+              summary: { type: "STRING", description: "What was accomplished this session." },
+              decisions: { type: "ARRAY", items: { type: "STRING" }, description: "Decisions made this session." },
+              discoveries: { type: "ARRAY", items: { type: "STRING" }, description: "Interesting things discovered." },
+              tasksCompleted: { type: "ARRAY", items: { type: "STRING" }, description: "Tasks completed this session." },
+              openItems: { type: "ARRAY", items: { type: "STRING" }, description: "Open items or follow-ups remaining." }
+            },
+            required: ["summary"]
+          }
         }
       ]
     }
@@ -5172,6 +5327,72 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
                 test: { type: "STRING", description: "Full JS test source using Node assert. Must exit 0 on success, non-zero on failure." }
               },
               required: ["name", "group", "description", "implementation"]
+            }
+          },
+          {
+            name: "remember_fact",
+            description: "Store a durable fact in global or project memory. Use scope='global' for cross-project facts (user habits, people, identity), scope='project' for workspace-specific facts.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                scope: { type: "STRING", description: "global or project (default: project)." },
+                text: { type: "STRING", description: "The fact to store." },
+                category: { type: "STRING", description: "Optional category, e.g. architecture, api, gotcha, preference." }
+              },
+              required: ["text"]
+            }
+          },
+          {
+            name: "remember_decision",
+            description: "Store an architectural or design decision in project memory with optional context about why it was made.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                text: { type: "STRING", description: "The decision that was made." },
+                context: { type: "STRING", description: "Optional: why this decision was made." },
+                workspacePath: { type: "STRING", description: "Optional workspace path override." }
+              },
+              required: ["text"]
+            }
+          },
+          {
+            name: "remember_preference",
+            description: "Store a user preference at global or project level. Call immediately when the user expresses how they like things done.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                scope: { type: "STRING", description: "global or project (default: project)." },
+                text: { type: "STRING", description: "The preference to store." },
+                workspacePath: { type: "STRING", description: "Optional workspace path override (project scope only)." }
+              },
+              required: ["text"]
+            }
+          },
+          {
+            name: "recall_memory",
+            description: "Read memory for the given scope. Call at the start of a session with an active workspace to orient yourself with prior context.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                scope: { type: "STRING", description: "global, project, or all (default: project)." },
+                workspacePath: { type: "STRING", description: "Optional workspace path override." }
+              }
+            }
+          },
+          {
+            name: "save_session_summary",
+            description: "Save a summary of this session: what was accomplished, decisions made, discoveries, completed tasks, and open items. Call when the user is wrapping up or switching tasks.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                workspacePath: { type: "STRING", description: "Optional workspace path override." },
+                summary: { type: "STRING", description: "What was accomplished this session." },
+                decisions: { type: "ARRAY", items: { type: "STRING" }, description: "Decisions made this session." },
+                discoveries: { type: "ARRAY", items: { type: "STRING" }, description: "Interesting things discovered." },
+                tasksCompleted: { type: "ARRAY", items: { type: "STRING" }, description: "Tasks completed this session." },
+                openItems: { type: "ARRAY", items: { type: "STRING" }, description: "Open items or follow-ups remaining." }
+              },
+              required: ["summary"]
             }
           }
         ]

@@ -82,5 +82,25 @@ contextBridge.exposeInMainWorld('api', {
   discoverSkills: (group) => ipcRenderer.invoke('orion:discover-skills', { group }),
   runSkill: (name, inputs) => ipcRenderer.invoke('orion:run-skill', { name, inputs }),
   createSkill: (payload) => ipcRenderer.invoke('orion:create-skill', payload),
-  listSkillGroups: () => ipcRenderer.invoke('orion:list-skill-groups')
+  listSkillGroups: () => ipcRenderer.invoke('orion:list-skill-groups'),
+
+  // Global Memory
+  readGlobalMemory: () => ipcRenderer.invoke('orion:read-global-memory'),
+  writeGlobalMemory: (updates) => ipcRenderer.invoke('orion:write-global-memory', updates),
+  appendGlobalFact: (text, category) => ipcRenderer.invoke('orion:append-global-fact', { text, category }),
+  updateUserProfile: (updates) => ipcRenderer.invoke('orion:update-user-profile', { updates }),
+
+  // Project Memory (extended)
+  appendProjectFact: (workspacePath, text, category) => ipcRenderer.invoke('orion:append-project-fact', { workspacePath, text, category }),
+  appendProjectDecision: (workspacePath, text, context) => ipcRenderer.invoke('orion:append-project-decision', { workspacePath, text, context }),
+  appendProjectPreference: (workspacePath, text) => ipcRenderer.invoke('orion:append-project-preference', { workspacePath, text }),
+
+  // Skill Memory
+  readSkillMemory: () => ipcRenderer.invoke('orion:read-skill-memory'),
+  appendSkillPattern: (pattern) => ipcRenderer.invoke('orion:append-skill-pattern', { pattern }),
+
+  // Session Memory
+  saveSession: (workspacePath, sessionData) => ipcRenderer.invoke('orion:save-session', { workspacePath, sessionData }),
+  listSessions: (workspacePath, limit) => ipcRenderer.invoke('orion:list-sessions', { workspacePath, limit }),
+  readSession: (workspacePath, sessionId) => ipcRenderer.invoke('orion:read-session', { workspacePath, sessionId })
 });
