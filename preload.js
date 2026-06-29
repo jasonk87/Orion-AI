@@ -76,5 +76,11 @@ contextBridge.exposeInMainWorld('api', {
     return () => {
       ipcRenderer.removeListener(`cmd-output-${processId}`, listener);
     };
-  }
+  },
+
+  // Skill Registry
+  discoverSkills: (group) => ipcRenderer.invoke('orion:discover-skills', { group }),
+  runSkill: (name, inputs) => ipcRenderer.invoke('orion:run-skill', { name, inputs }),
+  createSkill: (payload) => ipcRenderer.invoke('orion:create-skill', payload),
+  listSkillGroups: () => ipcRenderer.invoke('orion:list-skill-groups')
 });

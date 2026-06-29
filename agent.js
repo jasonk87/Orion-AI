@@ -77,7 +77,12 @@ Tools available:
 - set_task_checklist: Set the UI checklist of tasks (array of {title, status}). Status can be 'pending', 'in-progress', 'completed'. Use only for milestone changes, not routine progress churn.
 - step_complete: Emit after completing each step of an approved implementation plan. Orion auto-runs tests and injects a [POST-STEP VERIFICATION: ...] message. If tests fail you must fix them before the next step.
 - read_project_memory: Reads the persistent per-workspace project memory: architectural decisions, API shapes, gotchas, and preferences saved from prior sessions.
-- append_project_memory: Appends a durable fact to the workspace project memory. Use whenever you discover a decision, pattern, API shape, or constraint that future sessions should know.`;
+- append_project_memory: Appends a durable fact to the workspace project memory. Use whenever you discover a decision, pattern, API shape, or constraint that future sessions should know.
+- discover_skills: List all registered skills in the skill registry, optionally filtered by group. Call this before attempting a complex or repetitive task to check if a reusable skill already exists.
+- run_skill: Execute a registered skill by name with the given inputs. Returns the skill's outputs.
+- create_skill: Write, test, and register a new reusable skill. Use this when you encounter a capability gap that would benefit from a reusable, testable function. Skills authored by Orion are marked createdBy: "orion" and are available immediately after registration.
+
+SKILL REGISTRY GUIDANCE: The skill registry is a library of reusable, tested capabilities. Before starting a complex or repetitive task, call discover_skills to check if a relevant skill already exists. If a task requires a capability that doesn't exist yet and would be useful in the future, use create_skill to author it — provide the JS implementation and a test that exits 0 on success. Skills are stored persistently and shared across all conversations.\`;
 
 // Keep track of active agent running state
 let isAgentRunning = false;
@@ -2081,22 +2086,22 @@ async function executeTool(name, args, workspace, config, conversation) {
           }
         }
       }
-      
+
       // Update local storage representation in target conversation
       conversation.tasks = args.tasks;
-      
+
       // Update UI checklist only if target conversation is active
       if (window.getActiveConversationId && conversation.id === window.getActiveConversationId()) {
         window.updateTasksChecklist(args.tasks);
       }
-      
+
       if (window.saveConversationsToStorage) {
         window.saveConversationsToStorage();
       }
-      
+
       return { success: true, message: `Checklist updated with ${args.tasks.length} items.` };
     }
-    
+
     case 'ask_clarifying_questions': {
       if (!args.questions || !Array.isArray(args.questions) || args.questions.length === 0) {
         throw new Error("ask_clarifying_questions requires a non-empty 'questions' array.");
@@ -2145,6 +2150,37 @@ async function executeTool(name, args, workspace, config, conversation) {
       const result = await window.api.appendProjectMemory(workspace, { text: args.text, category: args.category || 'general' });
       if (!result || !result.success) throw new Error((result && result.error) || 'Failed to append project memory');
       return { success: true, message: `Memory appended: "${args.text}"` };
+    }
+
+    case 'discover_skills': {
+      const result = await window.api.discoverSkills(args.group || null);
+      if (!result.success) throw new Error(result.error || 'discover_skills failed');
+      return { skills: result.skills, count: result.skills.length };
+    }
+
+    case 'run_skill': {
+      if (!args.name) throw new Error("Missing 'name' parameter");
+      const result = await window.api.runSkill(args.name, args.inputs || {});
+      if (!result.success) throw new Error(result.error || `Skill '${args.name}' failed`);
+      return result.outputs;
+    }
+
+    case 'create_skill': {
+      if (!args.name) throw new Error("Missing 'name' parameter");
+      if (!args.group) throw new Error("Missing 'group' parameter");
+      if (!args.description) throw new Error("Missing 'description' parameter");
+      if (!args.implementation) throw new Error("Missing 'implementation' parameter");
+      const result = await window.api.createSkill({
+        name: args.name,
+        group: args.group,
+        description: args.description,
+        inputs: args.inputs || {},
+        outputs: args.outputs || {},
+        implementation: args.implementation,
+        test: args.test || null
+      });
+      if (!result.success) throw new Error(result.error || 'create_skill failed');
+      return { success: true, manifest: result.manifest, message: `Skill '${args.name}' created and registered.` };
     }
 
     default:
@@ -4393,6 +4429,45 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
             },
             required: ["text"]
           }
+        },
+        {
+          name: "discover_skills",
+          description: "Lists all registered skills in the skill registry. Call this before starting a complex or repetitive task to check if a reusable skill already exists.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              group: { type: "STRING", description: "Optional group filter: utility, files, coding, home, calendar, research." }
+            }
+          }
+        },
+        {
+          name: "run_skill",
+          description: "Executes a registered skill by name with the given inputs. Returns the skill's output object.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              name: { type: "STRING", description: "The skill name as registered (e.g. word-count)." },
+              inputs: { type: "OBJECT", description: "Key-value inputs matching the skill's input schema." }
+            },
+            required: ["name"]
+          }
+        },
+        {
+          name: "create_skill",
+          description: "Authors, tests, and registers a new reusable skill. The skill implementation must be a CommonJS module exporting async function(inputs). The test must exit 0 on success.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              name: { type: "STRING", description: "Kebab-case skill name, unique in the registry." },
+              group: { type: "STRING", description: "Group: utility, files, coding, home, calendar, or research." },
+              description: { type: "STRING", description: "Human-readable description used by the agent to decide when to invoke this skill." },
+              inputs: { type: "OBJECT", description: "JSON schema of inputs: { paramName: { type, description, required } }." },
+              outputs: { type: "OBJECT", description: "JSON schema of outputs: { resultName: { type, description } }." },
+              implementation: { type: "STRING", description: "Full CommonJS JS source: module.exports = async function(inputs) { ... }." },
+              test: { type: "STRING", description: "Full JS test source using Node assert. Must exit 0 on success, non-zero on failure." }
+            },
+            required: ["name", "group", "description", "implementation"]
+          }
         }
       ]
     }
@@ -5058,6 +5133,45 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
                 category: { type: "STRING", description: "Optional category, e.g. architecture, api, gotcha, command, preference." }
               },
               required: ["text"]
+            }
+          },
+          {
+            name: "discover_skills",
+            description: "Lists all registered skills in the skill registry. Call this before starting a complex or repetitive task to check if a reusable skill already exists.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                group: { type: "STRING", description: "Optional group filter: utility, files, coding, home, calendar, research." }
+              }
+            }
+          },
+          {
+            name: "run_skill",
+            description: "Executes a registered skill by name with the given inputs. Returns the skill's output object.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                name: { type: "STRING", description: "The skill name as registered (e.g. word-count)." },
+                inputs: { type: "OBJECT", description: "Key-value inputs matching the skill's input schema." }
+              },
+              required: ["name"]
+            }
+          },
+          {
+            name: "create_skill",
+            description: "Authors, tests, and registers a new reusable skill. The skill implementation must be a CommonJS module exporting async function(inputs). The test must exit 0 on success.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                name: { type: "STRING", description: "Kebab-case skill name, unique in the registry." },
+                group: { type: "STRING", description: "Group: utility, files, coding, home, calendar, or research." },
+                description: { type: "STRING", description: "Human-readable description used by the agent to decide when to invoke this skill." },
+                inputs: { type: "OBJECT", description: "JSON schema of inputs: { paramName: { type, description, required } }." },
+                outputs: { type: "OBJECT", description: "JSON schema of outputs: { resultName: { type, description } }." },
+                implementation: { type: "STRING", description: "Full CommonJS JS source: module.exports = async function(inputs) { ... }." },
+                test: { type: "STRING", description: "Full JS test source using Node assert. Must exit 0 on success, non-zero on failure." }
+              },
+              required: ["name", "group", "description", "implementation"]
             }
           }
         ]
