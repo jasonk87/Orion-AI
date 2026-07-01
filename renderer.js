@@ -2797,13 +2797,17 @@ window.onAgentStatusChange = (running) => {
 };
 window.renderUserMessageInChat = renderUserMessage;
 window.getPhoneCompanionState = async (targetConversationId) => {
-  const resolvedId = targetConversationId || activeConversationId;
-  const conv = conversations.find(c => c.id === resolvedId);
+  const requestedId = String(targetConversationId || '');
+  const requestedConv = requestedId ? conversations.find(c => c.id === requestedId) : null;
+  const activeConv = activeConversationId ? conversations.find(c => c.id === activeConversationId) : null;
+  const conv = requestedConv || activeConv || conversations[0] || null;
+  const resolvedId = conv ? conv.id : '';
   const messages = conv && conv.messages ? conv.messages.slice(-40).map(msg => ({
     role: msg.role,
+    content: msg.content || msg.text || '',
     text: msg.role === 'assistant' && msg.text === 'Thinking...' && msg.logs && msg.logs.length
       ? msg.logs.map(log => log.content || log.result || '').filter(Boolean).join('\n')
-      : (msg.text || '')
+      : (msg.text || msg.content || '')
   })) : [];
   const latestOutput = messages.slice().reverse().find(msg => msg.role === 'assistant' || msg.role === 'system');
   const latestAssistant = conv && conv.messages ? conv.messages.slice().reverse().find(msg => msg.role === 'assistant') : null;
@@ -2824,12 +2828,24 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   const conversationsSummary = conversations.map(c => ({
     id: c.id,
     title: c.title || 'New Conversation',
+    workspace: c.workspace || '',
+    projectPath: c.projectPath || '',
     active: c.id === resolvedId,
     isDesktopActive: c.id === activeConversationId,
     awaitingPlanApproval: !!(c.awaitingPlanApproval && !c.planApproved),
     taskCount: Array.isArray(c.tasks) ? c.tasks.length : 0,
     updatedAt: c.updatedAt || c.createdAt || 0
   }));
+  const projectSummaries = projects.map(path => {
+    const name = path.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || path;
+    const projectConversations = conversations.filter(c => c.projectPath === path);
+    return {
+      path,
+      name,
+      conversationCount: projectConversations.length,
+      updatedAt: projectConversations.reduce((latest, c) => Math.max(latest, c.updatedAt || c.createdAt || 0), 0)
+    };
+  });
   
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
   const globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
@@ -2859,6 +2875,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     conversationId: resolvedId,
     title: conv ? conv.title : '',
     conversations: conversationsSummary,
+    projects: projectSummaries,
     workspace: companionWorkspace,
     running: isActiveTargetRunning,
     globalRunning: isGlobalRunning,
@@ -2882,6 +2899,15 @@ window.getPhoneCompanionState = async (targetConversationId) => {
       appLaunchLogs: window.lastLaunchLogs || ''
     }
   };
+};
+
+window.deletePhoneCompanionConversation = async (conversationId) => {
+  const id = String(conversationId || '');
+  if (!id) return { success: false, error: 'Missing conversation id' };
+  const conv = conversations.find(c => c.id === id);
+  if (!conv) return { success: false, error: 'Conversation not found' };
+  deleteConversation(id);
+  return { success: true, deleted: id };
 };
 
 let isPairingConfirmOpen = false;
@@ -2914,7 +2940,7 @@ window.switchPhoneCompanionConversation = async (conversationId) => {
   const conv = conversations.find(c => c.id === conversationId);
   if (!conv) return { success: false, error: 'Conversation not found' };
   // We don't call selectConversation(conversationId) because we want the phone to be independent
-  return { success: true, conversationId };
+  return { success: true, conversationId: conv.id, title: conv.title || 'New Conversation' };
 };
 
 function hasRequiredTestingPlanSection(content) {
@@ -2974,7 +3000,7 @@ window.submitPhoneCompanionPrompt = async (options) => {
       renderUserMessage(text);
       appendSystemMessage("Phone companion prompt queued for the active conversation.");
     }
-    return { success: true, queued: true };
+    return { success: true, queued: true, conversationId: targetId, title: conv.title || 'New Conversation' };
   }
 
   // Directly run agent loop on the target conversation (without forcing desktop UI switch)
@@ -2988,7 +3014,7 @@ window.submitPhoneCompanionPrompt = async (options) => {
   window.runAgentLoop(text, window.getSelectedModel(), conv, { source: 'phone' })
     .catch(err => console.error("Phone-started agent loop failed:", err));
 
-  return { success: true, queued: false };
+  return { success: true, queued: false, conversationId: targetId, title: conv.title || 'New Conversation' };
 };
 
 window.steerPhoneCompanionTask = async (options) => {
