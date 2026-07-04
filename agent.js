@@ -874,7 +874,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // Call API (Gemini or Ollama) with automatic transient error retry and warnings
       let response;
       try {
-        agentSubStatus = `Calling ${activeRunModelName.startsWith('gemini-') ? 'Gemini' : 'Ollama (' + activeRunModelName + ')'} API...`;
+        agentSubStatus = `Calling ${activeRunModelName.startsWith('gemini-') ? 'Gemini' : (activeRunModelName.startsWith('claude') ? 'Claude (' + activeRunModelName + ')' : 'Ollama (' + activeRunModelName + ')')} API...`;
         persistCurrentAgentLogs({ render: true });
         const modelCallDelayMs = Math.min(Math.max(parseInt(config.modelCallDelayMs, 10) || 0, 0), 60000);
         if (modelCallDelayMs > 0) {
@@ -886,18 +886,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         // Send a trimmed copy for this call only — the canonical `messages` array (used for
         // compaction's real token count and any future turn) keeps the full untrimmed history.
         const messagesForApiCall = trimAgedToolResultsFromMessages(messages);
+        const onApiWarning = (warningMsg) => {
+          agentSubStatus = warningMsg;
+          conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
+          window.renderAiMessage(lastTextResponse, currentAgentLogs);
+        };
         if (activeRunModelName.startsWith('gemini-')) {
-          response = await callGeminiAPI(messagesForApiCall, activeRunModelName, config.geminiApiKey, (warningMsg) => {
-            agentSubStatus = warningMsg;
-            conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
-            window.renderAiMessage(lastTextResponse, currentAgentLogs);
-          }, false, { signal: getActiveRunSignal() });
+          response = await callGeminiAPI(messagesForApiCall, activeRunModelName, config.geminiApiKey, onApiWarning, false, { signal: getActiveRunSignal() });
+        } else if (activeRunModelName.startsWith('claude')) {
+          response = await callAnthropicAPI(messagesForApiCall, activeRunModelName, config.anthropicApiKey, onApiWarning, false, { signal: getActiveRunSignal() });
         } else {
-          response = await callOllamaAPI(messagesForApiCall, activeRunModelName, (warningMsg) => {
-            agentSubStatus = warningMsg;
-            conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
-            window.renderAiMessage(lastTextResponse, currentAgentLogs);
-          }, false, { signal: getActiveRunSignal() });
+          response = await callOllamaAPI(messagesForApiCall, activeRunModelName, onApiWarning, false, { signal: getActiveRunSignal() });
         }
         if (response && response._orionActiveModelName) {
           activeRunModelName = response._orionActiveModelName;
@@ -5634,6 +5633,11 @@ function getNextGeminiModelForHighDemand(modelName) {
 // unrecognized Gemini family, so behavior there is unaffected.
 function resolveUtilityModelName(modelName) {
   const name = String(modelName || '');
+  // When the main loop runs on Claude, still route the cheap JSON-classification / token-counting /
+  // compaction-summary calls to a cheap Gemini model rather than paying Claude rates for bookkeeping.
+  // This is the ideal cost split: Claude does the hard reasoning, flash-lite does the plumbing. Falls
+  // back gracefully (regexFallback in the classifiers) if no Gemini key is configured.
+  if (name.startsWith('claude')) return 'gemini-2.5-flash-lite';
   if (!name.startsWith('gemini-')) return name;
   if (name.startsWith('gemini-3')) return 'gemini-3.1-flash-lite';
   if (name.startsWith('gemini-2.5')) return 'gemini-2.5-flash-lite';
@@ -6301,6 +6305,178 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
   };
 }
 
+// ── ANTHROPIC (CLAUDE) PROVIDER ────────────────────────────────────────────────
+// Mirrors the Ollama provider's shape: convert the canonical Gemini-format tool schema and
+// message history into Anthropic's format, POST to the Messages API, then normalize the reply
+// back to Gemini's `candidates[0].content.parts` so the rest of the agent loop is provider-agnostic.
+
+// Gemini declares schema types in uppercase (OBJECT/STRING/ARRAY/...). Anthropic's input_schema is
+// plain JSON Schema (lowercase). Recurse so nested object properties and array items convert too.
+function lowercaseJsonSchemaTypes(schema) {
+  if (!schema || typeof schema !== 'object') return schema;
+  if (typeof schema.type === 'string') schema.type = schema.type.toLowerCase();
+  if (schema.properties && typeof schema.properties === 'object') {
+    for (const key in schema.properties) lowercaseJsonSchemaTypes(schema.properties[key]);
+  }
+  if (schema.items) lowercaseJsonSchemaTypes(schema.items);
+  return schema;
+}
+
+function convertGeminiToAnthropicTools(declarations) {
+  return (declarations || []).map(fd => {
+    const inputSchema = lowercaseJsonSchemaTypes(JSON.parse(JSON.stringify(fd.parameters || {})));
+    if (!inputSchema.type) inputSchema.type = 'object';
+    if (!inputSchema.properties) inputSchema.properties = {};
+    return {
+      name: fd.name,
+      description: fd.description,
+      input_schema: inputSchema
+    };
+  });
+}
+
+// Anthropic requires every tool_use block to carry an id that its matching tool_result references
+// by tool_use_id. The Gemini message shape has no ids — it pairs a model turn's functionCalls with
+// the very next tool turn's functionResponses positionally — so we synthesize ids deterministically
+// as we walk the history in order, remembering the ids from the latest assistant turn to attach to
+// the tool_results that follow it.
+function convertGeminiToAnthropicMessages(geminiMessages) {
+  const out = [];
+  let toolUseCounter = 0;
+  let lastToolUseIds = [];
+
+  (geminiMessages || []).forEach(msg => {
+    if (msg.role === 'user') {
+      const text = (msg.parts || []).map(p => p.text).filter(Boolean).join('');
+      out.push({ role: 'user', content: text || '(no content)' });
+    } else if (msg.role === 'model') {
+      const blocks = [];
+      lastToolUseIds = [];
+      (msg.parts || []).forEach(p => {
+        if (p.text) blocks.push({ type: 'text', text: p.text });
+        if (p.functionCall) {
+          const id = `toolu_orion_${toolUseCounter++}`;
+          lastToolUseIds.push(id);
+          blocks.push({ type: 'tool_use', id, name: p.functionCall.name, input: p.functionCall.args || {} });
+        }
+      });
+      if (blocks.length === 0) blocks.push({ type: 'text', text: '(no content)' });
+      out.push({ role: 'assistant', content: blocks });
+    } else if (msg.role === 'tool') {
+      const blocks = [];
+      let idx = 0;
+      (msg.parts || []).forEach(p => {
+        if (p.functionResponse) {
+          const responseObj = p.functionResponse.response || {};
+          const content = typeof responseObj === 'object' ? JSON.stringify(responseObj) : String(responseObj);
+          const toolUseId = lastToolUseIds[idx] || `toolu_orion_orphan_${toolUseCounter++}`;
+          idx++;
+          blocks.push({ type: 'tool_result', tool_use_id: toolUseId, content });
+        }
+      });
+      if (blocks.length > 0) out.push({ role: 'user', content: blocks });
+    }
+  });
+
+  // Anthropic wants strictly alternating roles; Orion occasionally emits two user-role messages in a
+  // row (e.g. a tool_result immediately followed by injected steering/system text). Merge adjacent
+  // same-role messages, normalizing string content into text blocks so mixed content stays valid.
+  const merged = [];
+  out.forEach(msg => {
+    const prev = merged[merged.length - 1];
+    if (prev && prev.role === msg.role) {
+      const toBlocks = (c) => Array.isArray(c) ? c : [{ type: 'text', text: String(c) }];
+      prev.content = [...toBlocks(prev.content), ...toBlocks(msg.content)];
+    } else {
+      merged.push({ role: msg.role, content: msg.content });
+    }
+  });
+  return merged;
+}
+
+function getAnthropicMaxTokens(modelName) {
+  // Opus/Sonnet handle large outputs; keep a generous but bounded ceiling for agent turns.
+  if (/opus|sonnet|fable/.test(modelName)) return 16384;
+  return 8192;
+}
+
+async function callAnthropicAPI(messages, modelName, apiKey, onWarning, disableTools = false, options = {}) {
+  if (!apiKey) throw createNonRetryableModelError('Anthropic API key is not configured. Add it in Settings to use Claude models.');
+  const url = 'https://api.anthropic.com/v1/messages';
+
+  // In the disable-tools analysis phase, strip tool blocks entirely (same as the Gemini path) so we
+  // never send tool_use/tool_result without a tools array, which Anthropic rejects.
+  const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
+  const anthropicMessages = convertGeminiToAnthropicMessages(processedMessages);
+
+  const systemText = disableTools
+    ? (SYSTEM_INSTRUCTION.split('Tools available:')[0] + '\n\nCRITICAL: You are in an analysis phase. DO NOT request any tool use. Provide your analysis in plain text only.')
+    : SYSTEM_INSTRUCTION;
+
+  const requestBody = {
+    model: modelName,
+    max_tokens: getAnthropicMaxTokens(modelName),
+    temperature: 0,
+    system: systemText,
+    messages: anthropicMessages
+  };
+  if (!disableTools) {
+    requestBody.tools = convertGeminiToAnthropicTools(buildAgentToolDeclarations());
+  }
+
+  const attempts = MODEL_API_MAX_ATTEMPTS;
+  let delay = 1500;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const response = await fetchWithTimeout(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true'
+        },
+        body: JSON.stringify(requestBody),
+        signal: options.signal
+      }, MODEL_API_REQUEST_TIMEOUT_MS, 'Anthropic messages request');
+
+      if (response.ok) {
+        const data = await response.json();
+        const parts = [];
+        (data.content || []).forEach(block => {
+          if (block.type === 'text' && block.text) parts.push({ text: block.text });
+          else if (block.type === 'tool_use') parts.push({ functionCall: { name: block.name, args: block.input || {} } });
+        });
+        return { _orionActiveModelName: modelName, candidates: [{ content: { parts } }] };
+      }
+
+      const errorText = await response.text();
+      const status = response.status;
+      const apiError = describeModelApiError(status, errorText);
+      const retryDelayMs = Math.min(apiError.retryDelayMs || delay, MODEL_API_MAX_RETRY_WAIT_MS);
+
+      // 401/403 (bad key) and 400 (malformed request) are not worth retrying.
+      if (status === 401 || status === 403 || status === 400) {
+        throw createNonRetryableModelError(`Anthropic API HTTP ${status}: ${apiError.message}`);
+      }
+      if (i === attempts) {
+        throw new Error(`Anthropic API HTTP ${status} after ${attempts} attempts: ${apiError.message}`);
+      }
+      if (onWarning) onWarning(`Anthropic API HTTP ${status} for ${modelName}; retrying in ${Math.ceil(retryDelayMs / 1000)}s (attempt ${i}/${attempts}).`);
+      await sleepRespectingStop(retryDelayMs);
+      delay = Math.min(delay * 2, MODEL_API_MAX_RETRY_WAIT_MS);
+    } catch (err) {
+      if (err && err.nonRetryable) throw err;
+      if (isUserStopError && isUserStopError(err)) throw err;
+      if (i === attempts) throw err;
+      if (onWarning) onWarning(`Anthropic API request failed (${err.message}); retrying (attempt ${i}/${attempts}).`);
+      await sleepRespectingStop(delay);
+      delay = Math.min(delay * 2, MODEL_API_MAX_RETRY_WAIT_MS);
+    }
+  }
+  throw new Error('Anthropic API: exhausted retries.');
+}
+
 // Lightweight per-turn token savings, distinct from compactHistory's heavyweight summarization
 // (which only triggers near the context-window threshold). Old, large, read-only tool outputs
 // (a full directory listing, a large file read, a search result) are still resent on every
@@ -6860,6 +7036,9 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     getNextGeminiModelForHighDemand,
     resolveUtilityModelName,
     trimAgedToolResultsFromMessages,
+    convertGeminiToAnthropicTools,
+    convertGeminiToAnthropicMessages,
+    callAnthropicAPI,
     summarizeToolStart,
     buildRepeatedFailureKey,
     updateWalkthroughItem,
