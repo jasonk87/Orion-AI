@@ -381,15 +381,21 @@ test('local system fact failures do not become fake blockers or web research', (
   const localFolderGuidance = agent.buildLocalInspectionNoToolGuidance('I have a folder on my desktop called rocket sumo, recommend similar games and improvements');
   t.ok(
     localFolderGuidance.includes('Get-ChildItem') && localFolderGuidance.includes('change_workspace'),
-    'local project no-tool recovery tells Orion to locate the folder then change workspace'
+    'local project no-tool recovery tells Orion to try change_workspace then fall back to a directory search'
+  );
+  // Regression: guidance previously told Orion to manually search with Get-ChildItem BEFORE
+  // calling change_workspace, even though change_workspace already fuzzy-matches folder names
+  // (ignoring spaces/hyphens/case) against Desktop/Desktop\Projects/Desktop\projects. A manual
+  // search using the user's literal phrasing (e.g. "mayor life") can miss a real folder named
+  // "Mayor-Life" that change_workspace's fuzzy resolver would have found directly, sending Orion
+  // down a wrong-directory rabbit hole. change_workspace must be tried first now.
+  t.ok(
+    localFolderGuidance.indexOf('change_workspace') < localFolderGuidance.indexOf('Get-ChildItem'),
+    'local project recovery tries change_workspace (fuzzy name resolution) before a manual directory search'
   );
   t.ok(
-    localFolderGuidance.indexOf('Get-ChildItem') < localFolderGuidance.indexOf('change_workspace'),
-    'local project recovery searches before changing workspace when the path is unverified'
-  );
-  t.ok(
-    localFolderGuidance.includes('verified real path'),
-    'local project recovery requires a verified path before workspace change'
+    localFolderGuidance.includes('fuzzy'),
+    'local project recovery explains that change_workspace already fuzzy-matches folder names'
   );
   t.ok(agentJs.includes('LOCAL PROJECTS BEFORE CLARIFICATION'), 'system prompt requires project inspection before clarification');
   t.ok(agentJs.includes('TOP-LEVEL FOLDER LISTS'), 'system prompt distinguishes top-level listings from recursive searches');

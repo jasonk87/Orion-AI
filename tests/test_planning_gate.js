@@ -635,6 +635,107 @@ test('stall detection also treats successful file edits/commands as progress, no
   t.end();
 });
 
+// Regression: a fresh task's mission-state reset only ever cleared whatever workspace was active
+// at the very start of the turn. When a request named a project that wasn't the active workspace
+// yet (e.g. "I have a game called X"), the turn would call change_workspace mid-run to locate it —
+// and if that landed on a directory (e.g. a shared parent "projects" folder) that already had its
+// own leftover operational-context.json from an unrelated past task, that old mission/blockers got
+// picked up and used to evaluate completion for today's unrelated request, wrongly reporting
+// "blocked" over e.g. a years-old "Embedding API not available" blocker that has nothing to do
+// with the current task. The reset must re-apply wherever change_workspace actually lands.
+test('fresh-task mission reset follows change_workspace to wherever the turn actually lands', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+
+  const staleContext = {
+    version: 1,
+    revision: 5,
+    mission: { statement: 'Execute the strategy in STRATEGY.md.', createdAt: '2026-06-01T00:00:00.000Z', updatedAt: '2026-06-01T00:00:00.000Z' },
+    winConditions: [],
+    activeObjective: null,
+    activeSubplan: null,
+    blockers: { active: [{ id: 'b1', title: 'Embedding API not available', details: '', source: '', severity: 'major', nature: 'transient', count: 1, createdAt: '2026-06-01T00:00:00.000Z', updatedAt: '2026-06-01T00:00:00.000Z' }], resolved: [] },
+    discoveries: [],
+    discarded: [],
+    latestEvidence: [],
+    lastDistillation: null,
+    lastCheckpoint: null,
+    createdAt: '2026-06-01T00:00:00.000Z',
+    updatedAt: '2026-06-01T00:00:00.000Z'
+  };
+
+  const writes = [];
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0 });
+  global.window.getCurrentWorkspace = () => '/test/bogus-workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    readFile: async (workspacePath, filePath) => {
+      if (workspacePath === 'C:\\Users\\Owner\\Desktop\\projects' && filePath === '.orion/context/operational-context.json') {
+        return JSON.stringify(staleContext);
+      }
+      return { error: 'File does not exist' };
+    },
+    writeFile: async (workspacePath, filePath, content) => {
+      writes.push({ workspacePath, filePath, content });
+      return { success: true };
+    },
+    listFiles: async (workspacePath) => {
+      if (workspacePath === 'C:\\Users\\Owner\\Desktop\\projects') return [{ path: 'SomeOtherProject', isDir: true, size: 0 }];
+      return { error: 'Directory does not exist' };
+    },
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+  };
+
+  const conversation = {
+    id: 'test-stale-mission-follow',
+    messages: [],
+    awaitingPlanApproval: false,
+    planApproved: false,
+    workspace: '/test/bogus-workspace'
+  };
+
+  let turnCount = 0;
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"read-only inspection"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    turnCount++;
+    const respondWith = (functionCall) => ({ ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall }] } }] }) });
+    if (turnCount === 1) return respondWith({ name: 'change_workspace', args: { path: 'C:\\Users\\Owner\\Desktop\\projects' } });
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'I found the projects folder.' }] } }] }) };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => {
+      if (delay !== 500) return originalSetTimeout(fn, delay);
+      return null;
+    };
+
+    await window.runAgentLoop('i have a game called mayor life, give me ideas', 'gemini-1', conversation);
+
+    const contextWrite = writes.find(w => w.workspacePath === 'C:\\Users\\Owner\\Desktop\\projects' && w.filePath === '.orion/context/operational-context.json');
+    t.ok(contextWrite, 'the workspace change_workspace landed on had its operational context rewritten');
+    const written = contextWrite ? JSON.parse(contextWrite.content) : null;
+    t.equal(written && written.mission && written.mission.statement, '', 'the stale unrelated mission is cleared, not carried into the new task');
+    t.equal(written && written.blockers && written.blockers.active.length, 0, 'the stale unrelated blocker (e.g. an old Embedding API failure) does not carry over either');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+
+  t.end();
+});
+
 test('buildRemainingWorkSummary lists pending tasks and next action honestly', (t) => {
   const pending = [
     { title: 'Implement food spawning', status: 'pending' },

@@ -575,13 +575,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     window.appendSystemMessage(`Planning mode: direct task, no implementation plan required. ${planningDecision.reason || ''}`.trim());
   }
 
-  // Structural reset of stale mission state for genuinely new work.
-  if (resetMissionState && workspacePath && hasOperationalMissionState(workingState)) {
-    try {
-      const emptyState = OperationalContext.createEmptyContext();
-      await window.api.writeFile(workspacePath, OPERATIONAL_CONTEXT_PATH, `${JSON.stringify(emptyState, null, 2)}\n`);
-      workingState = emptyState;
-    } catch (_) {}
+  // Structural reset of stale mission state for genuinely new work. This only clears whatever
+  // workspace is active right now; if change_workspace moves the turn to a different directory
+  // mid-run (e.g. resolving a named project), the same reset is re-applied there — see the
+  // change_workspace handling in the tool-execution loop below.
+  if (resetMissionState && workspacePath) {
+    const cleared = await clearStaleMissionStateIfPresent(workspacePath);
+    if (cleared) workingState = cleared;
   }
 
   // Canonical operational state seeds reasoning. Conversation remains a bounded UI/input view;
@@ -1301,6 +1301,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           }
           if (toolName === 'change_workspace' && result && result.success) {
             workspacePath = conversation.workspace;
+            // A fresh (non-approved-plan) task must not inherit whatever mission/blockers happen
+            // to already exist in the workspace this landed on — otherwise an old, unrelated
+            // mission (e.g. from a shared parent "projects" folder holding many past sessions)
+            // can make the completion gate report today's unrelated request as "blocked."
+            if (resetMissionState) {
+              const cleared = await clearStaleMissionStateIfPresent(workspacePath);
+              if (cleared) workingState = cleared;
+            }
           }
           currentAgentLogs[logIndex].status = isFailedToolResult(result) ? 'error' : 'success';
           currentAgentLogs[logIndex].result = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
@@ -2928,6 +2936,25 @@ async function readOperationalContext(workspace) {
   }
 }
 
+// A fresh (non-approved-plan) task must not inherit an unrelated mission/blockers left over in a
+// workspace's operational context — including a workspace the turn only reaches mid-run via
+// change_workspace, e.g. after a fuzzy folder search lands on a shared parent directory that
+// happens to hold an old, unrelated project's stale state. Reads fresh from disk (not any
+// already-loaded in-memory state) since the caller may not have loaded this exact path yet.
+async function clearStaleMissionStateIfPresent(workspace) {
+  if (!workspace) return null;
+  try {
+    const current = await readOperationalContext(workspace);
+    if (!hasOperationalMissionState(current.state)) return null;
+    const emptyState = OperationalContext.createEmptyContext();
+    const writeResult = await window.api.writeFile(workspace, OPERATIONAL_CONTEXT_PATH, `${JSON.stringify(emptyState, null, 2)}\n`);
+    if (writeResult && writeResult.error) return null;
+    return emptyState;
+  } catch (_) {
+    return null;
+  }
+}
+
 async function appendOperationalJournal(workspace, event, revision) {
   const existing = await window.api.readFile(workspace, OPERATIONAL_CONTEXT_JOURNAL_PATH, { maxChars: 500000 });
   const lines = typeof existing === 'string' ? existing.trim().split(/\r?\n/).filter(Boolean) : [];
@@ -4387,7 +4414,7 @@ function buildLocalInspectionNoToolGuidance(userPrompt, planningDecision) {
     ? !!planningDecision.needsLocalInspection
     : isLocalProjectOrFolderRequest(userPrompt);
   if (needsLocalProject) {
-    return ' The user named a local folder/project/program. Use local filesystem tools now: if the exact absolute path is not already verified, run a bounded PowerShell `Get-ChildItem` directory search/listing of likely parent folders such as Desktop and Desktop\\Projects with `-Directory`, `-Depth 2` or `-Depth 3`, and `-ErrorAction SilentlyContinue`; then call `change_workspace` with the verified real path. Do not ask the user to paste contents, do not claim Desktop access is unavailable, and do not use clarifying questions before inspecting.';
+    return ' The user named a local folder/project/program. Call `change_workspace` with that name directly FIRST — it already searches Desktop, Desktop\\Projects, and Desktop\\projects and fuzzy-matches the name (ignoring spaces/hyphens/underscores/case), so "mayor life" resolves to a folder literally named "Mayor-Life" without any manual search. Only if `change_workspace` itself reports the path does not exist should you fall back to a bounded PowerShell `Get-ChildItem` directory search/listing (`-Directory`, `-Depth 2` or `-Depth 3`, `-ErrorAction SilentlyContinue`) — and even then, prefer matching by fuzzy substring (ignore spaces/hyphens) rather than the user\'s literal phrasing, since folder names rarely match natural-language phrasing exactly. Do not ask the user to paste contents, do not claim Desktop access is unavailable, and do not use clarifying questions before inspecting.';
   }
   if (isLocalSystemFactRequest(userPrompt)) {
     return ' The user asked about this local computer. Call local inspection commands now, such as `systeminfo`, CPU/RAM/disk/process commands, or another available local route. Do not answer with acknowledgement only.';
