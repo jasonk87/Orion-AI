@@ -2076,13 +2076,13 @@ function renderConversationList() {
     const age = 'now';
     
     item.innerHTML = `
-      <div class="conversation-details" style="flex: 1; overflow: hidden;">
+      <div class="conversation-details row-details-flex">
         <span class="conversation-name">${escapeHtml(conv.title)}</span>
         <span class="conversation-time">${age}</span>
       </div>
-      <button class="delete-btn" title="Delete conversation" style="background:transparent; border:none; color:var(--text-muted); cursor:pointer; font-size:1.1rem; padding:0 4px; line-height:1;">&times;</button>
+      <button class="delete-btn icon-btn-ghost" title="Delete conversation">&times;</button>
     `;
-    
+
     item.querySelector('.conversation-details').addEventListener('click', () => selectConversation(conv.id));
     
     item.querySelector('.delete-btn').addEventListener('click', async (e) => {
@@ -3940,12 +3940,12 @@ function buildProjectCard(path) {
 
   projectHeader.innerHTML = `
     <span class="folder-icon">📁</span>
-    <div class="project-details" style="flex: 1; overflow: hidden;">
+    <div class="project-details row-details-flex">
       <span class="project-name" style="font-weight:600;">${escapeHtml(name)}</span>
       <span class="project-subtext" title="${escapeHtml(path)}" style="font-size: 0.65rem;">${escapeHtml(path)}</span>
     </div>
-    <button class="add-conv-btn" title="New Conversation in Project" style="background:transparent; border:none; color:var(--text-muted); cursor:pointer; font-size:1.1rem; padding:0 4px; line-height:1; margin-right:4px;">+</button>
-    <button class="delete-btn" title="Remove project" style="background:transparent; border:none; color:var(--text-muted); cursor:pointer; font-size:1.1rem; padding:0 4px; line-height:1;">&times;</button>
+    <button class="add-conv-btn icon-btn-ghost icon-btn-spaced" title="New Conversation in Project">+</button>
+    <button class="delete-btn icon-btn-ghost" title="Remove project">&times;</button>
   `;
 
   projectHeader.querySelector('.project-details').addEventListener('click', () => {
@@ -3996,10 +3996,10 @@ function buildProjectCard(path) {
       convItem.style.alignItems = 'center';
 
       convItem.innerHTML = `
-        <div class="conversation-details" style="flex: 1; overflow: hidden; display: flex; flex-direction: column;">
+        <div class="conversation-details row-details-flex" style="display: flex; flex-direction: column;">
           <span class="conversation-name" style="font-size: 0.8rem; color: ${isConvActive ? 'var(--text-primary)' : 'var(--text-secondary)'}; font-weight: ${isConvActive ? '500' : 'normal'};">${escapeHtml(conv.title)}</span>
         </div>
-        <button class="delete-btn" title="Delete conversation" style="background:transparent; border:none; color:var(--text-muted); cursor:pointer; font-size:1.1rem; padding:0 4px; line-height:1;">&times;</button>
+        <button class="delete-btn icon-btn-ghost" title="Delete conversation">&times;</button>
       `;
 
       convItem.querySelector('.conversation-details').addEventListener('click', () => {

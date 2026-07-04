@@ -1712,6 +1712,26 @@ code {
   color: var(--error-color) !important;
 }
 
+/* Ghost icon button used for sidebar row actions (delete, add-conversation) */
+.icon-btn-ghost {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 1.1rem;
+  padding: 0 4px;
+  line-height: 1;
+}
+.icon-btn-ghost.icon-btn-spaced {
+  margin-right: 4px;
+}
+
+/* Row detail column that fills remaining sidebar row width and clips overflow */
+.row-details-flex {
+  flex: 1;
+  overflow: hidden;
+}
+
 /* ADD CONVERSATION BUTTON FOR PROJECT ITEMS */
 .project-item .add-conv-btn {
   opacity: 0;
