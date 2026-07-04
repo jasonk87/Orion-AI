@@ -475,7 +475,11 @@ test('agent and renderer wire operational context into both providers and Missio
   const agent = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
   const renderer = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8');
   const html = fs.readFileSync(path.join(__dirname, '../index.html'), 'utf8');
-  t.equal((agent.match(/\? OPERATIONAL_CONTEXT_TOOL_DECLARATIONS :/g) || []).length, 2, 'shares tool declarations across Gemini and Ollama');
+  // Tool declarations are now a single buildAgentToolDeclarations() source of truth consumed by
+  // every provider, so the operational-context spread appears once (in the builder) rather than
+  // being duplicated per provider — and both providers consume that shared builder.
+  t.equal((agent.match(/\? OPERATIONAL_CONTEXT_TOOL_DECLARATIONS :/g) || []).length, 1, 'operational-context tools are gated once in the shared tool builder');
+  t.equal((agent.match(/functionDeclarations: buildAgentToolDeclarations\(\)/g) || []).length, 2, 'both Gemini and Ollama providers consume the shared tool builder');
   t.ok(agent.includes('OperationalContext.buildReasoningMessages(workingState'), 'builds provider input from working state first');
   t.notOk(agent.includes('conversation.messages.forEach(msg =>'), 'does not reconstruct task state from full chat transcript');
   t.ok(agent.includes('evaluateWorkingStateCompletion'), 'uses a single completion gate before finalizing');

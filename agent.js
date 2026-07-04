@@ -5694,889 +5694,12 @@ function convertGeminiToOllamaMessages(geminiMessages) {
   return ollamaMessages;
 }
 
-function convertGeminiToOllamaTools(geminiTools) {
-  const ollamaTools = [];
-  if (geminiTools && geminiTools[0] && geminiTools[0].functionDeclarations) {
-    geminiTools[0].functionDeclarations.forEach(fd => {
-      const parameters = JSON.parse(JSON.stringify(fd.parameters || {}));
-      if (parameters.type) {
-        parameters.type = parameters.type.toLowerCase();
-      }
-      if (parameters.properties) {
-        for (const key in parameters.properties) {
-          if (parameters.properties[key].type) {
-            parameters.properties[key].type = parameters.properties[key].type.toLowerCase();
-          }
-        }
-      }
-      
-      ollamaTools.push({
-        type: 'function',
-        function: {
-          name: fd.name,
-          description: fd.description,
-          parameters: parameters
-        }
-      });
-    });
-  }
-  return ollamaTools;
-}
-
-async function callOllamaAPI(messages, modelName, onWarning, disableTools = false, options = {}) {
-  const url = `http://localhost:11434/api/chat`;
-  
-  // Format standard Orion AI system instruction
-  const systemInstruction = SYSTEM_INSTRUCTION;
-  
-  const ollamaTools = convertGeminiToOllamaTools([
-    {
-      functionDeclarations: [
-        ...(agentExecutionMode === 'executing' ? OPERATIONAL_CONTEXT_TOOL_DECLARATIONS : []),
-        ...ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS,
-        {
-          name: "list_files",
-          description: "Returns a curated project file inventory for the active workspace by default. The default hides generated caches, dependencies, runtime/user data, backups, and sensitive-looking files; use mode='all' only when the user explicitly needs a raw workspace listing.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              mode: { type: "STRING", enum: ["project", "all"], description: "Use 'project' for the curated default inventory. Use 'all' only for an explicit raw recursive listing." },
-              maxFiles: { type: "NUMBER", description: "Maximum curated project files to return before truncation. Ignored for mode='all'." }
-            }
-          }
-        },
-        {
-          name: "get_workspace_info",
-          description: "Returns the active workspace directory, conversation scope, and project metadata. Use when the user asks where the project/program is or asks for the directory.",
-          parameters: { type: "OBJECT", properties: {} }
-        },
-        {
-          name: "change_workspace",
-          description: "Changes the active workspace directory of this conversation to a new absolute directory path on your computer. Use this only after the path is explicit or locally verified. The executor also resolves obvious folder-name variants such as spaces, hyphens, underscores, casing, and minor dictation/autocorrect differences against nearby Desktop/Projects directories before failing. For fuzzy Desktop/project names, first resolve the real folder with a bounded run_command Get-ChildItem search; if this tool fails because the path does not exist, search/list candidate directories before retrying with another path.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              path: { type: "STRING", description: "The verified absolute path to the directory you want to set as the active workspace." }
-            },
-            required: ["path"]
-          }
-        },
-        {
-          name: "open_workspace_folder",
-          description: "Opens the active workspace directory in the operating system file explorer.",
-          parameters: { type: "OBJECT", properties: {} }
-        },
-        {
-          name: "launch_workspace_app",
-          description: "Launches/runs the active workspace app using Orion's app detection. Use when the user asks to run, launch, or open the program.",
-          parameters: { type: "OBJECT", properties: {} }
-        },
-        {
-          name: "set_workspace_entrypoint",
-          description: "Sets or clears the saved launch entry point command for the active workspace. Use after identifying the correct way to run a project, or when the user asks to set the entry point.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              command: { type: "STRING", description: "Command to run from the workspace root, such as python app.py or npm run dev. Leave blank to clear." },
-              label: { type: "STRING", description: "Optional human-readable label." }
-            }
-          }
-        },
-        {
-          name: "git_push",
-          description: "Pushes the current Git branch to GitHub/Git when the user explicitly asks. If branch is omitted, pushes the current branch to the same branch name on the remote.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              remote: { type: "STRING", description: "Git remote name. Defaults to origin." },
-              branch: { type: "STRING", description: "Remote branch name to push to. Defaults to current branch." },
-              setUpstream: { type: "BOOLEAN", description: "Whether to set upstream with -u. Defaults to true." }
-            }
-          }
-        },
-        {
-          name: "read_file",
-          description: "Reads the entire content of a file located at path relative to the workspace root.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              path: { type: "STRING", description: "Relative path of the file to read" },
-              startLine: { type: "NUMBER", description: "Optional 1-based start line for targeted reads." },
-              endLine: { type: "NUMBER", description: "Optional 1-based end line for targeted reads." },
-              maxChars: { type: "NUMBER", description: "Optional maximum characters to return." }
-            },
-            required: ["path"]
-          }
-        },
-        {
-          name: "write_file",
-          description: "Creates a new file. Existing non-governance files require allowOverwrite=true and overwriteReason; prefer patch_file for source edits. STRATEGY.md and implementation_plan.md are governance files.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              path: { type: "STRING", description: "Relative path of the file to create" },
-              content: { type: "STRING", description: "Text content of the file" },
-              allowOverwrite: { type: "BOOLEAN", description: "Must be true to overwrite an existing non-plan file. Prefer patch_file for edits." },
-              overwriteReason: { type: "STRING", description: "Required when allowOverwrite is true; explain why a full rewrite is necessary." }
-            },
-            required: ["path", "content"]
-          }
-        },
-        {
-          name: "modify_file",
-          description: "Edits a file by replacing a contiguous block of text. Specify the target content to look for and the replacement content to put in its place.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              path: { type: "STRING", description: "Relative path of the file to modify" },
-              target: { type: "STRING", description: "The exact block of code to search for. Must be unique in the file." },
-              replacement: { type: "STRING", description: "The replacement block of code" }
-            },
-            required: ["path", "target", "replacement"]
-          }
-        },
-        {
-          name: "patch_file",
-          description: "Applies a targeted file patch without rewriting the whole file. Prefer this for large files. Supports operation.type values: replace, replace_regex, insert, replace_range.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              path: { type: "STRING", description: "Relative path of the file to patch" },
-              operation: {
-                type: "OBJECT",
-                properties: {
-                  type: { type: "STRING", description: "replace, replace_regex, insert, or replace_range" },
-                  target: { type: "STRING", description: "Exact text for replace" },
-                  replacement: { type: "STRING", description: "Replacement text for replace or replace_regex" },
-                  pattern: { type: "STRING", description: "JavaScript regex pattern for replace_regex" },
-                  flags: { type: "STRING", description: "Regex flags such as gim" },
-                  anchor: { type: "STRING", description: "Anchor text for insert" },
-                  position: { type: "STRING", description: "before or after for insert" },
-                  content: { type: "STRING", description: "Inserted content or replacement range content" },
-                  startLine: { type: "NUMBER", description: "1-based start line for replace_range" },
-                  endLine: { type: "NUMBER", description: "1-based end line for replace_range" },
-                  count: { type: "NUMBER", description: "Maximum replacements for replace" }
-                },
-                required: ["type"]
-              }
-            },
-            required: ["path", "operation"]
-          }
-        },
-        {
-          name: "run_command",
-          description: "Runs a command in powershell in the workspace directory, waits for completion, and returns code, stdout, stderr, and timeout status. For local machine facts, a non-zero exit proves only that this command attempt failed; try a different local route before concluding the task is blocked. For a top-level Desktop/folder listing, use a non-recursive command such as Get-ChildItem -LiteralPath \"C:\\Users\\Owner\\Desktop\" -Directory | Select-Object -ExpandProperty Name; do not add -Depth/-Recurse unless nested folders are explicitly requested.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              command: { type: "STRING", description: "Powershell command to run" },
-              timeoutMs: { type: "NUMBER", description: "Optional timeout in milliseconds before Orion stops the command." }
-            },
-            required: ["command"]
-          }
-        },
-        {
-          name: "start_command",
-          description: "Starts a shell command asynchronously with a timeout and returns immediately with a processId. Use for long-running tests, dev servers, or commands that may take a while. Use the returned id for later status/output/kill calls.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              command: { type: "STRING", description: "Powershell command to run" },
-              processId: { type: "STRING", description: "Optional stable id for this command session." },
-              timeoutMs: { type: "NUMBER", description: "Optional timeout in milliseconds before Orion stops the command." }
-            },
-            required: ["command"]
-          }
-        },
-        {
-          name: "get_command_status",
-          description: "Checks status for a command started with start_command.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              processId: { type: "STRING", description: "The command session id returned by start_command." }
-            },
-            required: ["processId"]
-          }
-        },
-        {
-          name: "read_command_output",
-          description: "Reads accumulated stdout and stderr from a command started with start_command.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              processId: { type: "STRING", description: "The command session id returned by start_command." },
-              maxChars: { type: "NUMBER", description: "Maximum number of trailing output characters to return." }
-            },
-            required: ["processId"]
-          }
-        },
-        {
-          name: "kill_command",
-          description: "Stops a running command session started with start_command.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              processId: { type: "STRING", description: "The command session id returned by start_command." }
-            },
-            required: ["processId"]
-          }
-        },
-        {
-          name: "schedule_followup",
-          description: "Schedules Orion to continue this same conversation after a delay. Use whenever you say you will wait, check progress later, inspect long-running tests/training, or continue after N seconds/minutes.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              delaySeconds: { type: "NUMBER", description: "Delay before continuing, in seconds. Maximum 3600." },
-              prompt: { type: "STRING", description: "Instruction Orion should run when the timer fires." },
-              purpose: { type: "STRING", description: "Optional stable dedupe key, e.g. training-progress or test-check." }
-            },
-            required: ["delaySeconds", "prompt"]
-          }
-        },
-        {
-          name: "read_notes",
-          description: "Reads durable notes for the current scope. Project conversations share project notes; standalone conversations have private standalone notes.",
-          parameters: { type: "OBJECT", properties: {} }
-        },
-        {
-          name: "update_notes",
-          description: "Updates durable project/standalone notes with concise facts, architecture decisions, commands, gotchas, open tasks, and future repair notes.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              content: { type: "STRING", description: "Markdown note content to write or append." },
-              mode: { type: "STRING", description: "Use replace to rewrite notes or append to add a new note. Defaults to replace." }
-            },
-            required: ["content"]
-          }
-        },
-        {
-          name: "run_tests",
-          description: "Runs the regression test command configured for the workspace.",
-          parameters: { type: "OBJECT", properties: {} }
-        },
-        {
-          name: "google_search",
-          description: "Searches Google for current documentation, API references, examples, and troubleshooting. Do not use for facts about this local machine, workspace state, installed tools, paths, memory, disk, processes, or environment variables; inspect local state instead.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              query: { type: "STRING", description: "Search query, preferably including the product/library and exact API or error." },
-              numResults: { type: "NUMBER", description: "Number of results to return, from 1 to 10." }
-            },
-            required: ["query"]
-          }
-        },
-        {
-          name: "fetch_web_page",
-          description: "Fetches readable text from a specific http(s) page, usually an official docs page found with google_search.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              url: { type: "STRING", description: "The http(s) URL to fetch." }
-            },
-            required: ["url"]
-          }
-        },
-        {
-          name: "sync_workspace_env",
-          description: "Writes the user's configured Gemini API key, Google API key, Google Search API key, and Google Search Engine ID into workspace .env files without exposing secret values in chat or tool output. Also creates .env.example and updates .gitignore by default.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              envPath: { type: "STRING", description: "Environment file path relative to workspace. Defaults to .env." },
-              examplePath: { type: "STRING", description: "Example env file path relative to workspace. Defaults to .env.example." },
-              includeGemini: { type: "BOOLEAN", description: "Whether to include Gemini/Google API key variables. Defaults to true." },
-              includeSearch: { type: "BOOLEAN", description: "Whether to include Google Search Engine ID and Search API key variables. Defaults to true." },
-              updateGitignore: { type: "BOOLEAN", description: "Whether to add env files to .gitignore. Defaults to true." },
-              createExample: { type: "BOOLEAN", description: "Whether to create/update .env.example. Defaults to true." }
-            }
-          }
-        },
-        {
-          name: "set_task_checklist",
-          description: "Sets the task checklist in the side panel for meaningful milestones only. Pass an array of items with a status ('pending', 'in-progress', 'completed'); do not call this just to refresh in-progress state.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              tasks: {
-                type: "ARRAY",
-                items: {
-                  type: "OBJECT",
-                  properties: {
-                    title: { type: "STRING" },
-                    status: { type: "STRING", description: "Task status. Use pending, in-progress, or completed." }
-                  },
-                  required: ["title", "status"]
-                }
-              }
-            },
-          }
-        },
-        {
-          name: "grep_search",
-          description: "Searches file contents across the workspace for a literal string or regex pattern. Returns matching file paths, line numbers, and the matched line text. Use this before writing new code that depends on an existing pattern — e.g. to find how other similar UI elements wire up event listeners before adding one, or to find every call site of a function before renaming it. Prefer this over reading whole files when you just need to locate where something is defined or used.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              pattern: { type: "STRING", description: "The literal text or regex pattern to search for." },
-              regex: { type: "BOOLEAN", description: "Treat pattern as a regular expression. Defaults to false (literal substring match)." },
-              caseSensitive: { type: "BOOLEAN", description: "Case-sensitive match. Defaults to false." },
-              filePattern: { type: "STRING", description: "Optional file extension filter, e.g. '.js' or '.html'. Searches all text files if omitted." },
-              maxResults: { type: "NUMBER", description: "Maximum number of matches to return before truncation. Defaults to 100." }
-            },
-            required: ["pattern"]
-          }
-        },
-        {
-          name: "search_embeddings",
-          description: "Searches the workspace files semantically using vector embeddings of code chunks. Returns the most relevant code snippets with line numbers and file paths.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              query: { type: "STRING", description: "The semantic search query, e.g. 'how is configuration loaded'" },
-              limit: { type: "NUMBER", description: "Optional maximum number of results to return. Defaults to 5." }
-            },
-            required: ["query"]
-          }
-        },
-        {
-          name: "ask_clarifying_questions",
-          description: "Pauses and presents 2-3 structured clarifying questions to the user when key design decisions are unspecified. Use BEFORE writing STRATEGY.md when the request leaves critical choices open (visual style, core mechanic, scale/performance strategy, framework). Do not use this as a substitute for inspecting an existing local folder/project/program; if the user named one, call local tools first and ask only for ambiguities that remain after inspection. IMPORTANT: Do NOT say 'Task finished' or any completion text when calling this tool — the task is paused awaiting answers, not done. The user sees an interactive card with radio options, recommended badges, and a free-text 'Other' fallback. Their answers resume the agent automatically.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              intro: { type: "STRING", description: "Brief intro sentence shown above the questions, e.g. 'Before I write the strategy, a few quick design questions:'" },
-              questions: {
-                type: "ARRAY",
-                description: "2-3 clarifying questions to present.",
-                items: {
-                  type: "OBJECT",
-                  properties: {
-                    header: { type: "STRING", description: "Short chip label for the question, max 12 chars, e.g. 'Visual Style'" },
-                    question: { type: "STRING", description: "The full question text to display." },
-                    options: {
-                      type: "ARRAY",
-                      description: "2-4 multiple-choice options.",
-                      items: {
-                        type: "OBJECT",
-                        properties: {
-                          label: { type: "STRING", description: "Option label shown to user." },
-                          description: { type: "STRING", description: "Optional one-line explanation of this choice." },
-                          recommended: { type: "BOOLEAN", description: "If true, badges this option as recommended." }
-                        },
-                        required: ["label"]
-                      }
-                    }
-                  },
-                  required: ["header", "question", "options"]
-                }
-              }
-            },
-            required: ["intro", "questions"]
-          }
-        },
-        {
-          name: "get_symbol_index",
-          description: "Returns a symbol index for all JS/TS files in the workspace: function names, class names, and arrow functions with their line numbers. Use this BEFORE read_file on large source files — find the target symbol's line range first, then read only that range.",
-          parameters: { type: "OBJECT", properties: {} }
-        },
-        {
-          name: "step_complete",
-          description: "Emit after completing each step of an approved implementation plan. Orion auto-runs the configured test command and injects a [POST-STEP VERIFICATION: ...] message. If tests fail you must fix them before the next step.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              step: { type: "STRING", description: "Short description of the step just completed, e.g. 'Add auth middleware'." }
-            },
-            required: ["step"]
-          }
-        },
-        {
-          name: "read_project_memory",
-          description: "Reads the persistent per-workspace project memory: architectural decisions, API shapes, gotchas, and preferences saved from prior sessions.",
-          parameters: { type: "OBJECT", properties: {} }
-        },
-        {
-          name: "append_project_memory",
-          description: "Appends a durable fact to the workspace project memory. Use when you discover an architectural decision, API shape, gotcha, recurring pattern, or constraint that future sessions should know.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              text: { type: "STRING", description: "The fact to store. Be specific and actionable." },
-              category: { type: "STRING", description: "Optional category, e.g. architecture, api, gotcha, command, preference." }
-            },
-            required: ["text"]
-          }
-        },
-        {
-          name: "discover_skills",
-          description: "Lists all registered skills in the skill registry. Call this before starting a complex or repetitive task to check if a reusable skill already exists.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              group: { type: "STRING", description: "Optional group filter: utility, files, coding, home, calendar, research." }
-            }
-          }
-        },
-        {
-          name: "run_skill",
-          description: "Executes a registered skill by name with the given inputs. Returns the skill's output object.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              name: { type: "STRING", description: "The skill name as registered (e.g. word-count)." },
-              inputs: { type: "OBJECT", description: "Key-value inputs matching the skill's input schema." }
-            },
-            required: ["name"]
-          }
-        },
-        {
-          name: "create_skill",
-          description: "Authors, tests, and registers a new reusable skill. The skill implementation must be a CommonJS module exporting async function(inputs). The test must exit 0 on success.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              name: { type: "STRING", description: "Kebab-case skill name, unique in the registry." },
-              group: { type: "STRING", description: "Group: utility, files, coding, home, calendar, or research." },
-              description: { type: "STRING", description: "Human-readable description used by the agent to decide when to invoke this skill." },
-              inputs: { type: "OBJECT", description: "JSON schema of inputs: { paramName: { type, description, required } }." },
-              outputs: { type: "OBJECT", description: "JSON schema of outputs: { resultName: { type, description } }." },
-              implementation: { type: "STRING", description: "Full CommonJS JS source: module.exports = async function(inputs) { ... }." },
-              test: { type: "STRING", description: "Full JS test source using Node assert. Must exit 0 on success, non-zero on failure." }
-            },
-            required: ["name", "group", "description", "implementation"]
-          }
-        },
-        {
-          name: "remember_fact",
-          description: "Store a durable fact in global or project memory. Use scope='global' for cross-project facts (user habits, people, identity), scope='project' for workspace-specific facts.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              scope: { type: "STRING", description: "global or project (default: project)." },
-              text: { type: "STRING", description: "The fact to store." },
-              category: { type: "STRING", description: "Optional category, e.g. architecture, api, gotcha, preference." }
-            },
-            required: ["text"]
-          }
-        },
-        {
-          name: "remember_decision",
-          description: "Store an architectural or design decision in project memory with optional context about why it was made.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              text: { type: "STRING", description: "The decision that was made." },
-              context: { type: "STRING", description: "Optional: why this decision was made." },
-              workspacePath: { type: "STRING", description: "Optional workspace path override." }
-            },
-            required: ["text"]
-          }
-        },
-        {
-          name: "remember_preference",
-          description: "Store a user preference at global or project level. Call immediately when the user expresses how they like things done.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              scope: { type: "STRING", description: "global or project (default: project)." },
-              text: { type: "STRING", description: "The preference to store, e.g. 'Always use TypeScript interfaces over type aliases'." },
-              workspacePath: { type: "STRING", description: "Optional workspace path override (project scope only)." }
-            },
-            required: ["text"]
-          }
-        },
-        {
-          name: "recall_memory",
-          description: "Read memory for the given scope. Call at the start of a session with an active workspace to orient yourself with prior context.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              scope: { type: "STRING", description: "global, project, or all (default: project)." },
-              workspacePath: { type: "STRING", description: "Optional workspace path override." }
-            }
-          }
-        },
-        {
-          name: "save_session_summary",
-          description: "Save a summary of this session: what was accomplished, decisions made, discoveries, completed tasks, and open items. Call when the user is wrapping up or switching tasks.",
-          parameters: {
-            type: "OBJECT",
-            properties: {
-              workspacePath: { type: "STRING", description: "Optional workspace path override." },
-              summary: { type: "STRING", description: "What was accomplished this session." },
-              decisions: { type: "ARRAY", items: { type: "STRING" }, description: "Decisions made this session." },
-              discoveries: { type: "ARRAY", items: { type: "STRING" }, description: "Interesting things discovered." },
-              tasksCompleted: { type: "ARRAY", items: { type: "STRING" }, description: "Tasks completed this session." },
-              openItems: { type: "ARRAY", items: { type: "STRING" }, description: "Open items or follow-ups remaining." }
-            },
-            required: ["summary"]
-          }
-        }
-      ]
-    }
-  ]);
-
-  const ollamaMessages = [];
-  if (systemInstruction) {
-    ollamaMessages.push({ role: 'system', content: systemInstruction });
-  }
-  
-  ollamaMessages.push(...convertGeminiToOllamaMessages(messages));
-  
-  const requestBody = {
-    model: modelName,
-    messages: ollamaMessages,
-    stream: false,
-    options: {
-      temperature: 0
-    }
-  };
-  
-  if (!disableTools) {
-    requestBody.tools = ollamaTools;
-  }
-  
-  const response = await fetchWithTimeout(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(requestBody),
-    signal: options.signal
-  }, MODEL_API_REQUEST_TIMEOUT_MS, 'Ollama chat request');
-  
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Ollama API HTTP ${response.status}: ${errText}`);
-  }
-  
-  const responseData = await response.json();
-  
-  // Format back to Gemini style candidates response
-  const candidateParts = [];
-  const message = responseData.message || {};
-  if (message.content) {
-    candidateParts.push({ text: message.content });
-  }
-  if (message.tool_calls) {
-    message.tool_calls.forEach(tc => {
-      let args = tc.function.arguments;
-      if (typeof args === 'string') {
-        try {
-          args = JSON.parse(args);
-        } catch (e) {
-          args = {};
-        }
-      }
-      candidateParts.push({
-        functionCall: {
-          name: tc.function.name,
-          args: args || {}
-        }
-      });
-    });
-  }
-  
-  return {
-    _orionActiveModelName: modelName,
-    candidates: [
-      {
-        content: {
-          parts: candidateParts
-        }
-      }
-    ]
-  };
-}
-
-// Lightweight per-turn token savings, distinct from compactHistory's heavyweight summarization
-// (which only triggers near the context-window threshold). Old, large, read-only tool outputs
-// (a full directory listing, a large file read, a search result) are still resent on every
-// subsequent API call even though the model rarely needs to re-see the exact bytes once a few
-// turns have passed — it either already acted on that information or would re-run the tool if it
-// needed the data again. Only read-only/inventory tools are eligible: never trim edit/write/test
-// results (patch_file, write_file, modify_file, run_tests, etc.), since those carry the actual
-// evidence the completion gate and verification logic depend on.
-const TOOL_RESULT_TRIM_THRESHOLD_CHARS = 4000;
-const TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES = 6;
-const TRIMMABLE_TOOL_RESULT_NAMES = new Set([
-  'list_files', 'read_file', 'get_symbol_index', 'read_command_output',
-  'google_search', 'fetch_web_page', 'read_notes', 'read_operational_context',
-  'read_project_memory', 'recall_memory', 'discover_skills'
-]);
-
-function trimAgedToolResultsFromMessages(messages) {
-  if (!Array.isArray(messages) || messages.length <= TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES) return messages;
-  const cutoff = messages.length - TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES;
-  let changedAny = false;
-  const result = messages.map((msg, index) => {
-    if (index >= cutoff || !msg || msg.role !== 'tool' || !Array.isArray(msg.parts)) return msg;
-    let msgChanged = false;
-    const newParts = msg.parts.map(part => {
-      const name = part && part.functionResponse && part.functionResponse.name;
-      if (!name || !TRIMMABLE_TOOL_RESULT_NAMES.has(name)) return part;
-      const response = part.functionResponse.response;
-      let serialized;
-      try {
-        serialized = JSON.stringify(response || {});
-      } catch (_) {
-        return part;
-      }
-      if (serialized.length <= TOOL_RESULT_TRIM_THRESHOLD_CHARS) return part;
-      msgChanged = true;
-      return {
-        functionResponse: {
-          name,
-          response: {
-            trimmed: true,
-            originalLength: serialized.length,
-            note: `This ${name} output (${serialized.length} chars) is from an earlier turn and was collapsed to save tokens. Re-run ${name} if you need this data again.`
-          }
-        }
-      };
-    });
-    if (!msgChanged) return msg;
-    changedAny = true;
-    return { ...msg, parts: newParts };
-  });
-  return changedAny ? result : messages;
-}
-
-function sanitizeMessagesForTextOnly(messages) {
-  const cleanMessages = [];
-  messages.forEach(msg => {
-    if (msg.role === 'tool') {
-      return;
-    }
-    const textParts = (msg.parts || []).filter(part => part.text !== undefined && part.text !== null);
-    if (textParts.length > 0) {
-      cleanMessages.push({
-        role: msg.role,
-        parts: textParts.map(p => ({ text: p.text }))
-      });
-    } else {
-      const originalFunctionCalls = (msg.parts || [])
-        .filter(part => part.functionCall !== undefined && part.functionCall !== null)
-        .map(part => part.functionCall.name);
-      if (originalFunctionCalls.length > 0) {
-        cleanMessages.push({
-          role: msg.role,
-          parts: [{ text: `[Orion: Model executed tool call(s): ${originalFunctionCalls.join(', ')}]` }]
-        });
-      }
-    }
-  });
-
-  const merged = [];
-  cleanMessages.forEach(msg => {
-    if (merged.length > 0 && merged[merged.length - 1].role === msg.role) {
-      merged[merged.length - 1].parts.push(...msg.parts);
-    } else {
-      merged.push({
-        role: msg.role,
-        parts: [...msg.parts]
-      });
-    }
-  });
-  return merged;
-}
-
-function parseModelJsonObject(text) {
-  const raw = String(text || '').trim();
-  if (!raw) return {};
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    const match = raw.match(/\{[\s\S]*\}/);
-    if (match) {
-      try {
-        return JSON.parse(match[0]);
-      } catch (inner) {}
-    }
-  }
-  return {};
-}
-
-function buildScreenshotInspectionPrompt(goal) {
-  return `You are Orion's visual verification eye. Inspect this screenshot against the mission goal.
-
-Goal: ${goal}
-
-Return compact JSON only with:
-{
-  "status": "appears_satisfied" | "partially_satisfied" | "not_satisfied" | "uncertain",
-  "confidence": 0.0-1.0,
-  "observations": ["specific visible evidence"],
-  "missing": ["what is missing or unclear"],
-  "recommendation": "next action for the agent"
-}
-
-Be strict. If the screenshot does not clearly show the requested objective, say not_satisfied or uncertain.`;
-}
-
-function normalizeScreenshotInspectionResult({ text, path, goal, providerName }) {
-  const parsed = parseModelJsonObject(text);
-  const allowed = ['appears_satisfied', 'partially_satisfied', 'not_satisfied', 'uncertain'];
-  const status = allowed.includes(parsed.status) ? parsed.status : 'uncertain';
-  const confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0));
-  const observations = Array.isArray(parsed.observations) ? parsed.observations.map(item => String(item).slice(0, 500)).filter(Boolean).slice(0, 8) : [];
-  const missing = Array.isArray(parsed.missing) ? parsed.missing.map(item => String(item).slice(0, 500)).filter(Boolean).slice(0, 8) : [];
-  const recommendation = String(parsed.recommendation || '').slice(0, 1000);
-
-  return {
-    success: true,
-    path,
-    goal,
-    status,
-    confidence,
-    observations,
-    missing,
-    recommendation,
-    evidence: observations.join('; ') || text || `${providerName} inspected screenshot but returned no observations.`,
-    summary: `${providerName} judged screenshot ${status} for goal "${goal}" (confidence ${confidence.toFixed(2)}).`
-  };
-}
-
-async function inspectScreenshotWithModel({ imageBase64, mimeType, path, goal, modelName, apiKey }) {
-  if (!modelName) throw new Error('Active chat model is required for multimodal screenshot inspection.');
-  if (modelName.startsWith('gemini-')) {
-    return await inspectScreenshotWithGemini({ imageBase64, mimeType, path, goal, modelName, apiKey });
-  }
-  return await inspectScreenshotWithOllama({ imageBase64, path, goal, modelName });
-}
-
-async function inspectScreenshotWithGemini({ imageBase64, mimeType, path, goal, modelName, apiKey }) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
-  const prompt = buildScreenshotInspectionPrompt(goal);
-
-  const requestBody = {
-    contents: [{
-      role: 'user',
-      parts: [
-        { text: prompt },
-        { inline_data: { mime_type: mimeType, data: imageBase64 } }
-      ]
-    }],
-    generationConfig: {
-      temperature: 0,
-      responseMimeType: 'application/json'
-    }
-  };
-
-  const response = await fetchWithTimeout(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(requestBody)
-  }, MODEL_API_REQUEST_TIMEOUT_MS, 'Gemini vision screenshot inspection');
-
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Gemini vision inspection failed HTTP ${response.status}: ${errText}`);
-  }
-
-  const data = await response.json();
-  const text = data.candidates && data.candidates[0] && data.candidates[0].content &&
-    data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
-    data.candidates[0].content.parts[0].text;
-  return normalizeScreenshotInspectionResult({ text, path, goal, providerName: modelName });
-}
-
-async function inspectScreenshotWithOllama({ imageBase64, path, goal, modelName }) {
-  const response = await fetchWithTimeout('http://localhost:11434/api/chat', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: modelName,
-      messages: [{
-        role: 'user',
-        content: buildScreenshotInspectionPrompt(goal),
-        images: [imageBase64]
-      }],
-      stream: false,
-      format: 'json',
-      options: {
-        temperature: 0
-      }
-    })
-  }, MODEL_API_REQUEST_TIMEOUT_MS, 'Ollama vision screenshot inspection');
-
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Ollama vision inspection failed HTTP ${response.status}: ${errText}`);
-  }
-
-  const data = await response.json();
-  const text = data && data.message && data.message.content;
-  return normalizeScreenshotInspectionResult({ text, path, goal, providerName: modelName });
-}
-
-// GEMINI API UTILITIES
-async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTools = false, options = {}) {
-  let activeModelName = modelName;
-  
-  const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
-
-  // Format body, translating role: 'tool' to role: 'user' for Gemini REST API compatibility
-  const formattedContents = processedMessages.map(msg => {
-    if (msg.role === 'tool') {
-      return {
-        role: 'user',
-        parts: msg.parts
-      };
-    }
-    return msg;
-  });
-  
-  // Merge consecutive messages with the same role to enforce strictly alternating roles (user <-> model)
-  const mergedContents = [];
-  formattedContents.forEach(msg => {
-    if (mergedContents.length > 0 && mergedContents[mergedContents.length - 1].role === msg.role) {
-      mergedContents[mergedContents.length - 1].parts.push(...msg.parts);
-    } else {
-      mergedContents.push({
-        role: msg.role,
-        parts: [...msg.parts]
-      });
-    }
-  });
-  
-  const requestBody = {
-    contents: mergedContents,
-    systemInstruction: {
-      parts: [{ text: disableTools ? (SYSTEM_INSTRUCTION.split('Tools available:')[0] + '\n\nCRITICAL: You are in an analysis phase. DO NOT output any function calls. Provide your analysis in markdown text only.') : SYSTEM_INSTRUCTION }]
-    },
-    generationConfig: {
-      ...(modelName.includes('thinking') || modelName.includes('2.5') ? {
-        thinkingConfig: {
-          thinkingBudget: GEMINI_THINKING_BUDGET
-        }
-      } : {
-        temperature: 0
-      })
-    },
-    safetySettings: [
-      {
-        category: "HARM_CATEGORY_HARASSMENT",
-        threshold: "BLOCK_NONE"
-      },
-      {
-        category: "HARM_CATEGORY_HATE_SPEECH",
-        threshold: "BLOCK_NONE"
-      },
-      {
-        category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-        threshold: "BLOCK_NONE"
-      },
-      {
-        category: "HARM_CATEGORY_DANGEROUS_CONTENT",
-        threshold: "BLOCK_NONE"
-      }
-    ],
-    tools: [
-      {
-        functionDeclarations: [
+// Single source of truth for the agent's tool declarations, consumed by every provider
+// (Gemini, Ollama, and Anthropic). Previously this ~480-line array was duplicated verbatim
+// inside callGeminiAPI and callOllamaAPI, which silently drifted out of sync. Reads the
+// module-level agentExecutionMode so operational-context tools are only offered during execution.
+function buildAgentToolDeclarations() {
+  return [
           ...(agentExecutionMode === 'executing' ? OPERATIONAL_CONTEXT_TOOL_DECLARATIONS : []),
           ...ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS,
           {
@@ -7029,7 +6152,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
               type: "OBJECT",
               properties: {
                 scope: { type: "STRING", description: "global or project (default: project)." },
-                text: { type: "STRING", description: "The preference to store." },
+                text: { type: "STRING", description: "The preference to store, e.g. 'Always use TypeScript interfaces over type aliases'." },
                 workspacePath: { type: "STRING", description: "Optional workspace path override (project scope only)." }
               },
               required: ["text"]
@@ -7062,7 +6185,408 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
               required: ["summary"]
             }
           }
-        ]
+  ];
+}
+
+
+function convertGeminiToOllamaTools(geminiTools) {
+  const ollamaTools = [];
+  if (geminiTools && geminiTools[0] && geminiTools[0].functionDeclarations) {
+    geminiTools[0].functionDeclarations.forEach(fd => {
+      const parameters = JSON.parse(JSON.stringify(fd.parameters || {}));
+      if (parameters.type) {
+        parameters.type = parameters.type.toLowerCase();
+      }
+      if (parameters.properties) {
+        for (const key in parameters.properties) {
+          if (parameters.properties[key].type) {
+            parameters.properties[key].type = parameters.properties[key].type.toLowerCase();
+          }
+        }
+      }
+      
+      ollamaTools.push({
+        type: 'function',
+        function: {
+          name: fd.name,
+          description: fd.description,
+          parameters: parameters
+        }
+      });
+    });
+  }
+  return ollamaTools;
+}
+
+async function callOllamaAPI(messages, modelName, onWarning, disableTools = false, options = {}) {
+  const url = `http://localhost:11434/api/chat`;
+  
+  // Format standard Orion AI system instruction
+  const systemInstruction = SYSTEM_INSTRUCTION;
+  
+  const ollamaTools = convertGeminiToOllamaTools([
+    {
+      functionDeclarations: buildAgentToolDeclarations()
+    }
+  ]);
+
+  const ollamaMessages = [];
+  if (systemInstruction) {
+    ollamaMessages.push({ role: 'system', content: systemInstruction });
+  }
+  
+  ollamaMessages.push(...convertGeminiToOllamaMessages(messages));
+  
+  const requestBody = {
+    model: modelName,
+    messages: ollamaMessages,
+    stream: false,
+    options: {
+      temperature: 0
+    }
+  };
+  
+  if (!disableTools) {
+    requestBody.tools = ollamaTools;
+  }
+  
+  const response = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestBody),
+    signal: options.signal
+  }, MODEL_API_REQUEST_TIMEOUT_MS, 'Ollama chat request');
+  
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Ollama API HTTP ${response.status}: ${errText}`);
+  }
+  
+  const responseData = await response.json();
+  
+  // Format back to Gemini style candidates response
+  const candidateParts = [];
+  const message = responseData.message || {};
+  if (message.content) {
+    candidateParts.push({ text: message.content });
+  }
+  if (message.tool_calls) {
+    message.tool_calls.forEach(tc => {
+      let args = tc.function.arguments;
+      if (typeof args === 'string') {
+        try {
+          args = JSON.parse(args);
+        } catch (e) {
+          args = {};
+        }
+      }
+      candidateParts.push({
+        functionCall: {
+          name: tc.function.name,
+          args: args || {}
+        }
+      });
+    });
+  }
+  
+  return {
+    _orionActiveModelName: modelName,
+    candidates: [
+      {
+        content: {
+          parts: candidateParts
+        }
+      }
+    ]
+  };
+}
+
+// Lightweight per-turn token savings, distinct from compactHistory's heavyweight summarization
+// (which only triggers near the context-window threshold). Old, large, read-only tool outputs
+// (a full directory listing, a large file read, a search result) are still resent on every
+// subsequent API call even though the model rarely needs to re-see the exact bytes once a few
+// turns have passed — it either already acted on that information or would re-run the tool if it
+// needed the data again. Only read-only/inventory tools are eligible: never trim edit/write/test
+// results (patch_file, write_file, modify_file, run_tests, etc.), since those carry the actual
+// evidence the completion gate and verification logic depend on.
+const TOOL_RESULT_TRIM_THRESHOLD_CHARS = 4000;
+const TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES = 6;
+const TRIMMABLE_TOOL_RESULT_NAMES = new Set([
+  'list_files', 'read_file', 'get_symbol_index', 'read_command_output',
+  'google_search', 'fetch_web_page', 'read_notes', 'read_operational_context',
+  'read_project_memory', 'recall_memory', 'discover_skills'
+]);
+
+function trimAgedToolResultsFromMessages(messages) {
+  if (!Array.isArray(messages) || messages.length <= TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES) return messages;
+  const cutoff = messages.length - TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES;
+  let changedAny = false;
+  const result = messages.map((msg, index) => {
+    if (index >= cutoff || !msg || msg.role !== 'tool' || !Array.isArray(msg.parts)) return msg;
+    let msgChanged = false;
+    const newParts = msg.parts.map(part => {
+      const name = part && part.functionResponse && part.functionResponse.name;
+      if (!name || !TRIMMABLE_TOOL_RESULT_NAMES.has(name)) return part;
+      const response = part.functionResponse.response;
+      let serialized;
+      try {
+        serialized = JSON.stringify(response || {});
+      } catch (_) {
+        return part;
+      }
+      if (serialized.length <= TOOL_RESULT_TRIM_THRESHOLD_CHARS) return part;
+      msgChanged = true;
+      return {
+        functionResponse: {
+          name,
+          response: {
+            trimmed: true,
+            originalLength: serialized.length,
+            note: `This ${name} output (${serialized.length} chars) is from an earlier turn and was collapsed to save tokens. Re-run ${name} if you need this data again.`
+          }
+        }
+      };
+    });
+    if (!msgChanged) return msg;
+    changedAny = true;
+    return { ...msg, parts: newParts };
+  });
+  return changedAny ? result : messages;
+}
+
+function sanitizeMessagesForTextOnly(messages) {
+  const cleanMessages = [];
+  messages.forEach(msg => {
+    if (msg.role === 'tool') {
+      return;
+    }
+    const textParts = (msg.parts || []).filter(part => part.text !== undefined && part.text !== null);
+    if (textParts.length > 0) {
+      cleanMessages.push({
+        role: msg.role,
+        parts: textParts.map(p => ({ text: p.text }))
+      });
+    } else {
+      const originalFunctionCalls = (msg.parts || [])
+        .filter(part => part.functionCall !== undefined && part.functionCall !== null)
+        .map(part => part.functionCall.name);
+      if (originalFunctionCalls.length > 0) {
+        cleanMessages.push({
+          role: msg.role,
+          parts: [{ text: `[Orion: Model executed tool call(s): ${originalFunctionCalls.join(', ')}]` }]
+        });
+      }
+    }
+  });
+
+  const merged = [];
+  cleanMessages.forEach(msg => {
+    if (merged.length > 0 && merged[merged.length - 1].role === msg.role) {
+      merged[merged.length - 1].parts.push(...msg.parts);
+    } else {
+      merged.push({
+        role: msg.role,
+        parts: [...msg.parts]
+      });
+    }
+  });
+  return merged;
+}
+
+function parseModelJsonObject(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (match) {
+      try {
+        return JSON.parse(match[0]);
+      } catch (inner) {}
+    }
+  }
+  return {};
+}
+
+function buildScreenshotInspectionPrompt(goal) {
+  return `You are Orion's visual verification eye. Inspect this screenshot against the mission goal.
+
+Goal: ${goal}
+
+Return compact JSON only with:
+{
+  "status": "appears_satisfied" | "partially_satisfied" | "not_satisfied" | "uncertain",
+  "confidence": 0.0-1.0,
+  "observations": ["specific visible evidence"],
+  "missing": ["what is missing or unclear"],
+  "recommendation": "next action for the agent"
+}
+
+Be strict. If the screenshot does not clearly show the requested objective, say not_satisfied or uncertain.`;
+}
+
+function normalizeScreenshotInspectionResult({ text, path, goal, providerName }) {
+  const parsed = parseModelJsonObject(text);
+  const allowed = ['appears_satisfied', 'partially_satisfied', 'not_satisfied', 'uncertain'];
+  const status = allowed.includes(parsed.status) ? parsed.status : 'uncertain';
+  const confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0));
+  const observations = Array.isArray(parsed.observations) ? parsed.observations.map(item => String(item).slice(0, 500)).filter(Boolean).slice(0, 8) : [];
+  const missing = Array.isArray(parsed.missing) ? parsed.missing.map(item => String(item).slice(0, 500)).filter(Boolean).slice(0, 8) : [];
+  const recommendation = String(parsed.recommendation || '').slice(0, 1000);
+
+  return {
+    success: true,
+    path,
+    goal,
+    status,
+    confidence,
+    observations,
+    missing,
+    recommendation,
+    evidence: observations.join('; ') || text || `${providerName} inspected screenshot but returned no observations.`,
+    summary: `${providerName} judged screenshot ${status} for goal "${goal}" (confidence ${confidence.toFixed(2)}).`
+  };
+}
+
+async function inspectScreenshotWithModel({ imageBase64, mimeType, path, goal, modelName, apiKey }) {
+  if (!modelName) throw new Error('Active chat model is required for multimodal screenshot inspection.');
+  if (modelName.startsWith('gemini-')) {
+    return await inspectScreenshotWithGemini({ imageBase64, mimeType, path, goal, modelName, apiKey });
+  }
+  return await inspectScreenshotWithOllama({ imageBase64, path, goal, modelName });
+}
+
+async function inspectScreenshotWithGemini({ imageBase64, mimeType, path, goal, modelName, apiKey }) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+  const prompt = buildScreenshotInspectionPrompt(goal);
+
+  const requestBody = {
+    contents: [{
+      role: 'user',
+      parts: [
+        { text: prompt },
+        { inline_data: { mime_type: mimeType, data: imageBase64 } }
+      ]
+    }],
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: 'application/json'
+    }
+  };
+
+  const response = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestBody)
+  }, MODEL_API_REQUEST_TIMEOUT_MS, 'Gemini vision screenshot inspection');
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Gemini vision inspection failed HTTP ${response.status}: ${errText}`);
+  }
+
+  const data = await response.json();
+  const text = data.candidates && data.candidates[0] && data.candidates[0].content &&
+    data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
+    data.candidates[0].content.parts[0].text;
+  return normalizeScreenshotInspectionResult({ text, path, goal, providerName: modelName });
+}
+
+async function inspectScreenshotWithOllama({ imageBase64, path, goal, modelName }) {
+  const response = await fetchWithTimeout('http://localhost:11434/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: modelName,
+      messages: [{
+        role: 'user',
+        content: buildScreenshotInspectionPrompt(goal),
+        images: [imageBase64]
+      }],
+      stream: false,
+      format: 'json',
+      options: {
+        temperature: 0
+      }
+    })
+  }, MODEL_API_REQUEST_TIMEOUT_MS, 'Ollama vision screenshot inspection');
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Ollama vision inspection failed HTTP ${response.status}: ${errText}`);
+  }
+
+  const data = await response.json();
+  const text = data && data.message && data.message.content;
+  return normalizeScreenshotInspectionResult({ text, path, goal, providerName: modelName });
+}
+
+// GEMINI API UTILITIES
+async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTools = false, options = {}) {
+  let activeModelName = modelName;
+  
+  const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
+
+  // Format body, translating role: 'tool' to role: 'user' for Gemini REST API compatibility
+  const formattedContents = processedMessages.map(msg => {
+    if (msg.role === 'tool') {
+      return {
+        role: 'user',
+        parts: msg.parts
+      };
+    }
+    return msg;
+  });
+  
+  // Merge consecutive messages with the same role to enforce strictly alternating roles (user <-> model)
+  const mergedContents = [];
+  formattedContents.forEach(msg => {
+    if (mergedContents.length > 0 && mergedContents[mergedContents.length - 1].role === msg.role) {
+      mergedContents[mergedContents.length - 1].parts.push(...msg.parts);
+    } else {
+      mergedContents.push({
+        role: msg.role,
+        parts: [...msg.parts]
+      });
+    }
+  });
+  
+  const requestBody = {
+    contents: mergedContents,
+    systemInstruction: {
+      parts: [{ text: disableTools ? (SYSTEM_INSTRUCTION.split('Tools available:')[0] + '\n\nCRITICAL: You are in an analysis phase. DO NOT output any function calls. Provide your analysis in markdown text only.') : SYSTEM_INSTRUCTION }]
+    },
+    generationConfig: {
+      ...(modelName.includes('thinking') || modelName.includes('2.5') ? {
+        thinkingConfig: {
+          thinkingBudget: GEMINI_THINKING_BUDGET
+        }
+      } : {
+        temperature: 0
+      })
+    },
+    safetySettings: [
+      {
+        category: "HARM_CATEGORY_HARASSMENT",
+        threshold: "BLOCK_NONE"
+      },
+      {
+        category: "HARM_CATEGORY_HATE_SPEECH",
+        threshold: "BLOCK_NONE"
+      },
+      {
+        category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        threshold: "BLOCK_NONE"
+      },
+      {
+        category: "HARM_CATEGORY_DANGEROUS_CONTENT",
+        threshold: "BLOCK_NONE"
+      }
+    ],
+    tools: [
+      {
+        functionDeclarations: buildAgentToolDeclarations()
       }
     ]
   };

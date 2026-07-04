@@ -2250,12 +2250,17 @@ test('grep_search surfaces a backend failure as a thrown error instead of a sile
   t.end();
 });
 
-test('grep_search is declared in both the Ollama and Gemini tool schemas', (t) => {
+test('grep_search is declared in the shared tool-declaration source consumed by every provider', (t) => {
   const fs = require('fs');
   const path = require('path');
   const agentSource = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
+  // Tool declarations now live in a single buildAgentToolDeclarations() source of truth, so each
+  // tool name appears exactly once (previously the whole array was duplicated per provider).
   const declarationMatches = agentSource.match(/name: "grep_search"/g) || [];
-  t.equal(declarationMatches.length, 2, 'grep_search is declared once for Ollama tools and once for Gemini tools');
+  t.equal(declarationMatches.length, 1, 'grep_search is declared exactly once in the shared tool source');
+  t.ok(agentSource.includes('function buildAgentToolDeclarations()'), 'the shared tool-declaration builder exists');
+  const consumers = agentSource.match(/functionDeclarations: buildAgentToolDeclarations\(\)/g) || [];
+  t.equal(consumers.length, 2, 'both the Gemini and Ollama providers consume the shared builder');
   t.ok(agentSource.includes("case 'grep_search'"), 'the executor has a grep_search case');
   t.end();
 });
