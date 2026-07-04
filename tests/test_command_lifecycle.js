@@ -251,6 +251,39 @@ test('run-command sessions retain captured stdout in main process', (t) => {
   }, 100);
 });
 
+// Regression: a real transcript showed `python -c "from x import y; print(y('literal'))"` fail
+// with exit code 1 six times in a row, no matter how the model varied its quoting. Reproduced the
+// root cause directly: Node's default Windows argument quoting re-escapes the already-fully-formed
+// `command` string passed to cmd.exe as one argv element, so Python actually received only `"from`
+// and crashed with "unterminated string literal" — the corruption happened in Node's spawn call,
+// below anything the model could control. windowsVerbatimArguments:true on that spawn fixes it.
+test('a command with embedded quotes and a semicolon survives startCommandSession on Windows', (t) => {
+  if (process.platform !== 'win32') {
+    t.pass('Windows-only quoting corruption check skipped on non-Windows');
+    t.end();
+    return;
+  }
+
+  const command = `node -e "const x = 'literal'; console.log('embedded-quote-smoke: ' + x)"`;
+  const session = main.startCommandSession({
+    command,
+    cwd: __dirname,
+    processId: `quote_smoke_${Date.now()}`,
+    timeoutMs: 10000
+  });
+
+  const started = Date.now();
+  const poll = setInterval(() => {
+    if (session.status !== 'running' || Date.now() - started > 5000) {
+      clearInterval(poll);
+      t.equal(session.status, 'completed', 'the command completed instead of being killed/timing out');
+      t.equal(session.exitCode, 0, 'the command exited successfully, not with a shell-quoting syntax error');
+      t.ok(session.stdout.includes('embedded-quote-smoke: literal'), 'the embedded single-quoted string literal survived intact');
+      t.end();
+    }
+  }, 100);
+});
+
 // Regression: the regression test command used to be a single global appConfig field
 // (regressionTestCommand), so a command detected/set for one project (e.g. a Python project's
 // "python get_models_test.py") silently applied to every other workspace too — including a real
