@@ -828,6 +828,30 @@ test('list_files curated inventory hides noisy and sensitive workspace paths by 
   t.end();
 });
 
+// Regression: a real workspace showed implementation_plan.md, STRATEGY.md, and
+// work_walkthrough.md sitting alongside real project files in list_files output, and a stray
+// controller.html.bak backup outside .orion/ (from an edit backup written next to the source
+// file). None of these are project files the user wrote — they're Orion's own planning/backup
+// artifacts and should not clutter the default project inventory.
+test('list_files curated inventory hides Orion-generated planning docs and backup files', (t) => {
+  const inventory = agent.buildCuratedFileInventory([
+    { path: 'server.js', isDir: false, size: 10 },
+    { path: 'public/controller.html', isDir: false, size: 10 },
+    { path: 'implementation_plan.md', isDir: false, size: 20 },
+    { path: 'STRATEGY.md', isDir: false, size: 20 },
+    { path: 'work_walkthrough.md', isDir: false, size: 20 },
+    { path: 'public/controller.html.bak', isDir: false, size: 10 }
+  ]);
+
+  const returnedPaths = inventory.files.map(file => file.path);
+  t.deepEqual(returnedPaths, ['server.js', 'public/controller.html'], 'default inventory keeps only real project source files');
+  t.ok(inventory.omitted.some(item => item.path === 'implementation_plan.md'), 'hides the implementation plan Orion wrote');
+  t.ok(inventory.omitted.some(item => item.path === 'STRATEGY.md'), 'hides the strategy doc Orion wrote');
+  t.ok(inventory.omitted.some(item => item.path === 'work_walkthrough.md'), 'hides the work walkthrough Orion wrote');
+  t.ok(inventory.omitted.some(item => item.path === 'public/controller.html.bak'), 'hides a stray edit backup outside .orion/');
+  t.end();
+});
+
 test('blocked planning writes are not reported as touched files', (t) => {
   const summary = agent.buildFinalVerificationSummary([
     { kind: 'file', toolName: 'write_file', path: 'tic_tac_toe.py', status: 'error', label: 'Write `tic_tac_toe.py`', detail: 'Planning Mode Active' },

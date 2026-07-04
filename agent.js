@@ -1807,6 +1807,24 @@ function hiddenDirectoryForInventory(pathValue) {
   return null;
 }
 
+// Root-level docs Orion itself writes during planning/execution (mission scratch files, not
+// project source). Hidden from the default inventory so listing a workspace shows the user's
+// actual project, not Orion's own working notes about that project.
+const ORION_ARTIFACT_FILENAMES = new Set(['implementation_plan.md', 'strategy.md', 'work_walkthrough.md']);
+
+function orionArtifactFileForInventory(pathValue, isDir = false) {
+  if (isDir) return null;
+  const segments = inventoryPathSegments(pathValue);
+  const basename = (segments[segments.length - 1] || '').toLowerCase();
+  if (ORION_ARTIFACT_FILENAMES.has(basename)) {
+    return { path: normalizeInventoryPath(pathValue), reason: 'Orion-generated planning artifact' };
+  }
+  if (/\.bak$/.test(basename)) {
+    return { path: normalizeInventoryPath(pathValue), reason: 'Orion edit backup' };
+  }
+  return null;
+}
+
 function sensitiveFileForInventory(pathValue, isDir = false) {
   if (isDir) return null;
   const segments = inventoryPathSegments(pathValue);
@@ -1860,6 +1878,11 @@ function buildCuratedFileInventory(files, options = {}) {
     const sensitiveFile = sensitiveFileForInventory(file.path, file.isDir);
     if (sensitiveFile) {
       addOmittedInventoryPath(omittedByPath, sensitiveFile);
+      continue;
+    }
+    const orionArtifact = orionArtifactFileForInventory(file.path, file.isDir);
+    if (orionArtifact) {
+      addOmittedInventoryPath(omittedByPath, orionArtifact);
       continue;
     }
     visible.push(file);
