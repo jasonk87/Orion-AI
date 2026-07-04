@@ -1022,10 +1022,25 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           const workspaceInspectionGuidance = reviewOnly
             ? ' The user asked you to inspect the active workspace and report findings. Call `list_files` now, then read the relevant source files with `read_file`. Do not ask the user which files or program to inspect when a workspace is already active.'
             : '';
+          // Telling the model only what NOT to do ("don't mention tools or this correction") gives
+          // it nothing concrete to answer instead — a small model tends to just describe the
+          // correction in its own words rather than follow it. Quoting the user's actual message
+          // back gives it something concrete to respond to, on top of whatever specific redirection
+          // (local-project/workspace-review) already applies.
+          const directAnswerGuidance = ` Directly write your natural reply to the user's message now, continuing the conversation as if answering for the first time. The user's message was: "${String(userPrompt || '').replace(/"/g, "'").slice(0, 500)}"`;
           messages.push({
             role: 'user',
             parts: [{
-              text: `[SYSTEM: ${guidance}${localInspectionGuidance}${workspaceInspectionGuidance}]`
+              text: `[SYSTEM: ${guidance}${localInspectionGuidance}${workspaceInspectionGuidance}${directAnswerGuidance}]`
+            }]
+          });
+          continue;
+        }
+        if (looksLikeLeakedNoToolCorrection(textVal) && (workWalkthrough || []).length === 0 && consecutiveNoToolCalls < 3 && loopCount < maxLoops) {
+          messages.push({
+            role: 'user',
+            parts: [{
+              text: `[SYSTEM: Your last reply described an internal correction instead of answering. Do not mention tools, workspace status, or any correction at all. Write only your direct, natural reply to the user's message now: "${String(userPrompt || '').replace(/"/g, "'").slice(0, 500)}"]`
             }]
           });
           continue;
@@ -4583,6 +4598,18 @@ function shouldHaveUsedToolsButDidNot(text, workWalkthrough, userPrompt = '', co
   return false;
 }
 
+// The model_no_tool_use correction tells the model what NOT to do ("don't mention tools,
+// workspace, or this correction") but gives it nothing concrete to redirect toward — a small model
+// frequently just paraphrases the correction back instead of answering the user's actual message.
+// A real transcript showed exactly this: the user asked to keep discussing a topic, and the model
+// replied "My previous response... did not require workspace interaction or an implementation
+// plan. I am ready for your next instruction" — describing the internal nudge instead of engaging
+// with the topic at all.
+function looksLikeLeakedNoToolCorrection(text) {
+  const normalized = String(text || '').toLowerCase();
+  return /\b(did not require (workspace|tools?|an implementation plan)|no workspace interaction|ready for (your )?next instruction|mention(ed)? (this|the) correction|previous response (was|did not)|does not require (tools?|workspace)|not require workspace interaction)\b/.test(normalized);
+}
+
 function isGenericNonAnswer(text) {
   const normalized = String(text || '').toLowerCase().replace(/[^\w\s']/g, '').replace(/\s+/g, ' ').trim();
   if (!normalized) return true;
@@ -6941,6 +6968,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     requestNeedsLocalInspection,
     buildLocalInspectionNoToolGuidance,
     isGenericNonAnswer,
+    looksLikeLeakedNoToolCorrection,
     requestNeedsActionableFinalAnswer,
     answerHasActionableFinalContent,
     getReviewCoverage,

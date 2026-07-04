@@ -1046,6 +1046,75 @@ test('a real detected regression stops the run with a specific message, not a ge
   t.end();
 });
 
+// Regression: a user asked Orion to keep discussing a topic ("let's talk about this: ...").
+// Orion's internal correction for a too-terse first reply told the model "don't mention tools,
+// workspace, or this correction" — but gave it nothing concrete to redirect toward, so the model
+// just paraphrased the correction back instead of answering: "My previous response... did not
+// require workspace interaction or an implementation plan. I am ready for your next instruction."
+// looksLikeLeakedNoToolCorrection() detects this specific failure mode so a stronger retry can fire.
+test('looksLikeLeakedNoToolCorrection detects a model describing its own internal correction instead of answering', (t) => {
+  const leaked = 'Understood. My previous response was a discussion about game features and did not require workspace interaction or an implementation plan. I am ready for your next instruction.';
+  t.equal(agent.looksLikeLeakedNoToolCorrection(leaked), true, 'the exact leaked phrasing from the transcript is detected');
+  t.equal(
+    agent.looksLikeLeakedNoToolCorrection("Sure! Let's dig into Assetto Corsa's tire model and how that could inspire Apex Velocity's pit-stop mechanic."),
+    false,
+    'a genuine on-topic reply is not flagged'
+  );
+  t.equal(agent.looksLikeLeakedNoToolCorrection(''), false, 'empty text is not flagged');
+  t.end();
+});
+
+test('a leaked no-tool-use correction triggers a stronger retry instead of being accepted as the final answer', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0 });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = { readFile: async () => '', listFiles: async () => ([]) };
+
+  const conversation = { id: 'test-leaked-correction', messages: [], awaitingPlanApproval: false, planApproved: true };
+
+  let turnCount = 0;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"conversational follow-up"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    turnCount++;
+    const textReply = (text) => ({ ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text }] } }] }) });
+    if (turnCount === 1) return textReply(''); // empty first reply triggers the no-tool-use correction
+    if (turnCount === 2) return textReply('Understood. My previous response was a discussion about game features and did not require workspace interaction or an implementation plan. I am ready for your next instruction.');
+    return textReply("Sure — Assetto Corsa's tire wear model could work great for a pit-strategy mechanic in Apex Velocity.");
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
+    await window.runAgentLoop("let's talk about this: Apex Velocity racing ideas", 'gemini-1', conversation);
+
+    const aiMessage = conversation.messages.find(m => m.role === 'assistant');
+    t.ok(aiMessage, 'assistant message was created');
+    t.ok(turnCount >= 3, 'the loop made at least three real model calls instead of accepting the leaked correction on the second');
+    t.notOk(/did not require workspace interaction|ready for your next instruction/i.test(aiMessage.text),
+      'the leaked correction text is not what gets shown to the user as the final answer');
+    t.ok(aiMessage.text.includes('Assetto Corsa'), 'the eventual real, on-topic answer is what gets shown');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+
+  t.end();
+});
+
 // Regression: a transcript showed Orion retry a failing `python -c "..."` command six times in a
 // row, each attempt only cosmetically different (single vs double quotes, a redundant `import
 // sys`, swapping print() for sys.stdout.write()) — but the repeated-failure guard keys on an exact
