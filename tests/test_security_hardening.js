@@ -129,3 +129,17 @@ test('config merge preserves saved credentials when incoming config has empty de
   t.equal(merged.phoneCompanionPort, 45678, 'phone companion falls back to its default port, not Flask\'s common default of 5000');
   t.end();
 });
+
+// Regression: the port default changed from 5000 to 45678 to stop colliding with Flask's own
+// default dev port, but existing installs already had 5000 baked into config.json from an earlier
+// writeAppConfig call (this field has never been exposed in any settings UI, so any persisted
+// 5000 is guaranteed to be the old default, not a deliberate user choice). Changing the code
+// default alone does nothing for those installs unless the persisted value is migrated too.
+test('a persisted phoneCompanionPort of exactly 5000 is migrated to the new default, not preserved', (t) => {
+  const merged = configModule.mergeConfigWithSource({ phoneCompanionPort: 5000 }, {});
+  t.equal(merged.phoneCompanionPort, 45678, 'a pre-existing 5000 value is treated as the old default and replaced');
+
+  const untouched = configModule.mergeConfigWithSource({ phoneCompanionPort: 51234 }, {});
+  t.equal(untouched.phoneCompanionPort, 51234, 'a genuinely different persisted port is left alone');
+  t.end();
+});
