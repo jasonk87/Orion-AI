@@ -126,6 +126,6 @@ test('config merge preserves saved credentials when incoming config has empty de
   t.equal(merged.googleSearchApiKey, 'saved-search-key', 'Google Search key is preserved from existing/source config');
   t.equal(merged.defaultModel, 'gemini-2.5-flash-lite', 'non-secret model selection is still allowed to change');
   t.equal(merged.enablePhoneCompanion, true, 'phone companion stays enabled by default');
-  t.equal(merged.phoneCompanionPort, 5000, 'phone companion falls back to port 5000');
+  t.equal(merged.phoneCompanionPort, 45678, 'phone companion falls back to its default port, not Flask\'s common default of 5000');
   t.end();
 });
