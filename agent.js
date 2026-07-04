@@ -788,6 +788,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // break file B and C too, leaving three broken files instead of fixing A before continuing —
     // exactly what a real transcript showed happening across Barracks.js/ArcheryRange.js/Spearman.js.
     const brokenFiles = new Map(); // path (lowercased) -> reason string
+    // Counts consecutive edits to the same file that each introduced a NEW syntax/regression
+    // error. A patch_file result that embeds a syntax warning still reports success:true, so it
+    // never registers with the ordinary repeated-tool-failure counter below — a transcript showed
+    // four consecutive replace_range attempts on the same file each reintroduce a fresh syntax
+    // error (miscalculated line ranges drifting after each edit) with zero escalation ever firing.
+    const consecutiveEditFailureCounts = new Map(); // path (lowercased) -> streak count
     const toolEvidenceLedger = [];
     const maxMalformedToolRetries = 5;
     const canExecuteThisTask = () => !config.planningMode || conversation.planApproved || planningBypassedForTask;
@@ -1517,6 +1523,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           }
           // Track/clear broken-file state for the cross-file breakage guard above.
           const editMessage = result && typeof result.message === 'string' ? result.message : '';
+          const introducedFailure = /SYNTAX ERROR DETECTED/.test(editMessage) || /REGRESSION DETECTED/.test(editMessage);
           if (/SYNTAX ERROR DETECTED/.test(editMessage)) {
             brokenFiles.set(editKey, { reason: 'syntax error', path: args.path });
           } else if (/REGRESSION DETECTED/.test(editMessage)) {
@@ -1524,6 +1531,16 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           } else {
             // This edit to this exact file came back clean — it's no longer blocking other files.
             brokenFiles.delete(editKey);
+          }
+          if (introducedFailure) {
+            const failureStreak = (consecutiveEditFailureCounts.get(editKey) || 0) + 1;
+            consecutiveEditFailureCounts.set(editKey, failureStreak);
+            if (failureStreak >= 3 && result && typeof result === 'object' && !Array.isArray(result)) {
+              const escalation = await buildRepeatedEditFailureEscalation(workspacePath, args.path, failureStreak);
+              result.message = `${result.message || ''}\n\n${escalation}`;
+            }
+          } else {
+            consecutiveEditFailureCounts.delete(editKey);
           }
         }
         // A successful read_file clears the read-required gate for that file. When the gate was
@@ -3936,6 +3953,34 @@ async function checkJsSyntaxAfterEdit(workspace, filePath) {
     // Never let the syntax checker itself block a real edit from completing.
     return { ok: true };
   }
+}
+
+// A file over this size is risky to rewrite wholesale with write_file — one bad generation can
+// silently drop unrelated content the model never re-reads carefully. Below it, a full rewrite of
+// the broken section is the safer move once incremental line-based patches keep drifting.
+const LARGE_FILE_REWRITE_RISK_THRESHOLD_CHARS = 12000;
+
+// A patch_file/write_file/modify_file result that embeds a syntax/regression warning still
+// reports success:true, so it never registers with the repeated-tool-failure counter used
+// elsewhere — a transcript showed four consecutive replace_range attempts on the same file each
+// reintroduce a fresh syntax error (line numbers drifting after every edit) with zero escalation.
+// This builds a strategy-change nudge once that streak crosses a threshold. Large files must NOT
+// be told to do a full rewrite — that risks losing unrelated content the model won't re-verify —
+// so the guidance differs by file size.
+async function buildRepeatedEditFailureEscalation(workspace, filePath, failureStreak) {
+  let isLarge = true; // fail safe toward the more conservative guidance if size can't be determined
+  try {
+    const content = await window.api.readFile(workspace, filePath, { maxChars: 20000 });
+    const text = typeof content === 'string' ? content : '';
+    const truncated = /\[Orion\] File truncated at/.test(text);
+    isLarge = truncated || text.length > LARGE_FILE_REWRITE_RISK_THRESHOLD_CHARS;
+  } catch (_) {
+    isLarge = true;
+  }
+  if (isLarge) {
+    return `[WARNING] REPEATED EDIT FAILURE: this file has had ${failureStreak} consecutive edits each introduce a new syntax/regression error. This file is large — do NOT rewrite the whole file with write_file, that risks silently losing unrelated content. Instead: read the exact current section immediately before each patch, use modify_file with an exact, unique target string (not replace_range by line number, which drifts as line numbers shift between edits), and make one small, single-purpose change at a time.`;
+  }
+  return `[WARNING] REPEATED EDIT FAILURE: this file has had ${failureStreak} consecutive edits each introduce a new syntax/regression error. This file is small enough to rewrite safely — read its full current content, then use write_file to replace the whole broken section (or the whole file) with complete, correct code in one shot instead of continuing to guess line ranges with patch_file.`;
 }
 
 async function findMissingHtmlLocalReferences(workspace, htmlPath, htmlContent) {
@@ -7040,6 +7085,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     hasUnresolvedRegressionWarning,
     looksLikePlaceholderTestOutput,
     checkJsSyntaxAfterEdit,
+    buildRepeatedEditFailureEscalation,
     summarizeToolStart,
     buildRepeatedFailureKey,
     updateWalkthroughItem,

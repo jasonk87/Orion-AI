@@ -911,6 +911,33 @@ test('a syntax error introduced by an edit is captured as an unresolved regressi
   t.end();
 });
 
+// Regression: a transcript showed four consecutive patch_file attempts on the same file each
+// reintroduce a fresh syntax error (replace_range line numbers drifting after every edit), with
+// zero escalation, because a patch result embedding a syntax warning still reports success:true —
+// it never registers with the ordinary repeated-tool-failure counter. The user explicitly required
+// that the escalation NEVER suggest a full write_file rewrite for a large file (risk of silently
+// losing unrelated content) — only small files should get that suggestion.
+test('buildRepeatedEditFailureEscalation recommends different strategies for small vs large files', async (t) => {
+  const originalApi = global.window.api;
+
+  global.window.api = { readFile: async () => 'short file content' };
+  const smallGuidance = await agent.buildRepeatedEditFailureEscalation('/test/workspace', 'small.js', 3);
+  t.ok(/small enough to rewrite safely/.test(smallGuidance), 'a small file is told a full rewrite is safe');
+  t.notOk(/do NOT rewrite/.test(smallGuidance), 'a small file is not given the large-file warning');
+
+  global.window.api = { readFile: async () => 'x'.repeat(20000) };
+  const largeGuidance = await agent.buildRepeatedEditFailureEscalation('/test/workspace', 'big.js', 3);
+  t.ok(/do NOT rewrite the whole file/.test(largeGuidance), 'a large file is explicitly told not to do a full rewrite');
+  t.ok(/exact, unique target string/.test(largeGuidance), 'a large file is steered toward modify_file over line-based replace_range');
+
+  global.window.api = { readFile: async () => { throw new Error('read failed'); } };
+  const unknownSizeGuidance = await agent.buildRepeatedEditFailureEscalation('/test/workspace', 'unknown.js', 3);
+  t.ok(/do NOT rewrite the whole file/.test(unknownSizeGuidance), 'when file size cannot be determined, the safer (large-file) guidance is used');
+
+  global.window.api = originalApi;
+  t.end();
+});
+
 // Regression: a project's `npm test` script was a placeholder (`echo "no tests configured"`)
 // that always exits 0. A run_tests/run_command call against it looked like real verification to
 // the gates even though nothing was actually tested.
@@ -1103,6 +1130,72 @@ test('launch_workspace_app tells the model to verify even when nothing was captu
     delete global.window.lastLaunchLogs;
     delete global.window.lastLaunchUrl;
   }
+  t.end();
+});
+
+test('three consecutive syntax-error-introducing patches to the same file trigger a strategy-change escalation', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: false });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    readFile: async () => 'x'.repeat(20000), // large file -> escalation must not suggest a full rewrite
+    patchFile: async (workspace, filePath) => ({ success: true, changed: true, message: `Patched ${filePath} successfully.\n[WARNING] SYNTAX ERROR DETECTED: node --check failed:\nSyntaxError: Unexpected token` }),
+    listFiles: async () => ([]),
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+  };
+
+  const conversation = { id: 'test-repeated-edit-escalation', messages: [], awaitingPlanApproval: false, planApproved: true };
+
+  let turnCount = 0;
+  let lastContentsSeen = null;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    turnCount++;
+    lastContentsSeen = contents;
+    const patchCall = (target) => ({
+      ok: true,
+      json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'patch_file', args: { path: 'server.js', operation: { type: 'replace', target, replacement: 'y' } } } }] } }] })
+    });
+    if (turnCount === 1) return patchCall('a'); // 1st edit
+    if (turnCount === 2) return patchCall('c'); // 2nd edit -> next edit to this file now requires a read first
+    if (turnCount === 3) {
+      // read_file to satisfy the edit-thrash guard before the 3rd edit
+      return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'read_file', args: { path: 'server.js' } } }] } }] }) };
+    }
+    if (turnCount === 4) return patchCall('e'); // 3rd consecutive syntax-error-introducing edit -> escalation fires
+    return {
+      ok: true,
+      json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'Stopping to reconsider the approach for server.js.' }] } }] })
+    };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
+    await window.runAgentLoop('fix the syntax error in server.js', 'gemini-1', conversation);
+
+    const contentsText = JSON.stringify(lastContentsSeen);
+    t.ok(/REPEATED EDIT FAILURE/.test(contentsText), 'the escalation warning reaches the model in conversation history after the 3rd consecutive failure');
+    t.ok(/do NOT rewrite the whole file/.test(contentsText), 'the large-file guidance (not a full rewrite) is what gets sent, matching the large mocked file content');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+
   t.end();
 });
 
