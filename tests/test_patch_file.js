@@ -85,6 +85,27 @@ test('patch file - inline insert mid-line is unchanged', (t) => {
   t.end();
 });
 
+test('patch file - insert refuses to duplicate content that already exists in the file', (t) => {
+  // Regression: a retried/re-issued insert call with the same non-trivial content must not
+  // silently duplicate a method/field. Short inserts (below the threshold) are still allowed.
+  const original = 'class Player {\n  takeDamage(amount) {\n    this.hp -= amount;\n  }\n}\n';
+  const op = {
+    type: 'insert',
+    anchor: 'class Player {',
+    position: 'after',
+    content: '\n  takeDamage(amount) {\n    this.hp -= amount;\n  }\n'
+  };
+  t.throws(() => main.applyPatch(original, op), /already exists/, 'duplicate non-trivial insert is rejected');
+  t.end();
+});
+
+test('patch file - insert still allows short/trivial repeated content', (t) => {
+  const original = 'A B C';
+  const op = { type: 'insert', anchor: 'A', position: 'after', content: ' B' };
+  t.doesNotThrow(() => main.applyPatch(original, op), 'short content below the duplicate-detection threshold is allowed');
+  t.end();
+});
+
 test('patch file - replace_range', (t) => {
   const original = 'line1\nline2\nline3\nline4\n';
   const op = { type: 'replace_range', startLine: 2, endLine: 3, content: 'new2\nnew3' };

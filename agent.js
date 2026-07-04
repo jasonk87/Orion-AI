@@ -2056,10 +2056,14 @@ async function executeTool(name, args, workspace, config, conversation) {
       if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
       
       let testFeedback = "";
+      const writeSyntaxCheck = await checkJsSyntaxAfterEdit(workspace, args.path);
+      if (!writeSyntaxCheck.ok) {
+        testFeedback += `\n[WARNING] SYNTAX ERROR DETECTED: node --check failed for ${args.path}:\n${writeSyntaxCheck.error}`;
+      }
       if (config.autoTest) {
         const testRes = await window.runRegressionTests();
         if (beforePass && !testRes.success) {
-          testFeedback = "\n[WARNING] REGRESSION DETECTED: Regression tests failed after this write. Please review your modifications.";
+          testFeedback += "\n[WARNING] REGRESSION DETECTED: Regression tests failed after this write. Please review your modifications.";
         }
       }
       const missingHtmlRefs = await findMissingHtmlLocalReferences(workspace, args.path, args.content);
@@ -2105,13 +2109,17 @@ async function executeTool(name, args, workspace, config, conversation) {
       if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
       
       let testFeedback = "";
+      const modifySyntaxCheck = await checkJsSyntaxAfterEdit(workspace, args.path);
+      if (!modifySyntaxCheck.ok) {
+        testFeedback += `\n[WARNING] SYNTAX ERROR DETECTED: node --check failed for ${args.path}:\n${modifySyntaxCheck.error}`;
+      }
       if (config.autoTest) {
         const testRes = await window.runRegressionTests();
         if (beforePass && !testRes.success) {
-          testFeedback = "\n[WARNING] REGRESSION DETECTED: Regression tests failed after this edit. Please inspect your change.";
+          testFeedback += "\n[WARNING] REGRESSION DETECTED: Regression tests failed after this edit. Please inspect your change.";
         }
       }
-      
+
       return {
         success: true,
         message: `File modified successfully.${testFeedback}`,
@@ -2135,10 +2143,14 @@ async function executeTool(name, args, workspace, config, conversation) {
       if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
 
       let testFeedback = "";
+      const patchSyntaxCheck = await checkJsSyntaxAfterEdit(workspace, args.path);
+      if (!patchSyntaxCheck.ok) {
+        testFeedback += `\n[WARNING] SYNTAX ERROR DETECTED: node --check failed for ${args.path}:\n${patchSyntaxCheck.error}`;
+      }
       if (config.autoTest) {
         const testRes = await window.runRegressionTests();
         if (beforePass && !testRes.success) {
-          testFeedback = "\n[WARNING] REGRESSION DETECTED: Regression tests failed after this patch. Please inspect your change.";
+          testFeedback += "\n[WARNING] REGRESSION DETECTED: Regression tests failed after this patch. Please inspect your change.";
         }
       }
 
@@ -3694,10 +3706,11 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
     // Presence of a run_tests/run_command call was being treated as "verified", even when the
     // most recent evidence was a failure.
     const message = result && typeof result.message === 'string' ? result.message : '';
-    item.regressionDetected = /REGRESSION DETECTED/.test(message);
+    const hasSyntaxError = /SYNTAX ERROR DETECTED/.test(message);
+    item.regressionDetected = hasSyntaxError || /REGRESSION DETECTED/.test(message);
     const backupDetail = result && result.backupPath ? `Backup: \`${result.backupPath}\`` : '';
     item.detail = item.regressionDetected
-      ? `${backupDetail ? `${backupDetail} — ` : ''}⚠ Regression detected: tests failed after this change.`
+      ? `${backupDetail ? `${backupDetail} — ` : ''}⚠ ${hasSyntaxError ? 'Syntax error introduced by this change.' : 'Regression detected: tests failed after this change.'}`
       : backupDetail;
   } else if (toolName === 'set_task_checklist') {
     item.detail = result && result.skipped ? result.message : '';
@@ -3715,11 +3728,19 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
     const timedOut = result && result.timedOut ? ', timed out' : '';
     const killed = result && result.killed ? ', stopped' : '';
     const timeout = result && result.timeoutMs ? `, timeout: ${result.timeoutMs}ms` : '';
+    item.output = result ? `${result.stdout || ''}\n${result.stderr || ''}`.trim() : '';
     item.detail = `Exit: ${result && result.exitCode !== undefined ? result.exitCode : 'unknown'}${timedOut}${killed}${timeout}`;
+    if (looksLikePlaceholderTestOutput(item.output)) {
+      item.detail += ' — output looks like a placeholder/no-op test script, not real verification.';
+    }
   } else if (toolName === 'start_command') {
     item.detail = result && result.id ? `Session: \`${result.id}\`, timeout: ${result.timeoutMs || 'default'}ms` : '';
   } else if (toolName === 'run_tests') {
+    item.output = result && result.output ? String(result.output) : '';
     item.detail = result && result.success ? 'Passed' : 'Failed or unavailable';
+    if (looksLikePlaceholderTestOutput(item.output)) {
+      item.detail += ' — output looks like a placeholder/no-op test script, not real verification.';
+    }
   } else if (toolName === 'schedule_followup') {
     item.detail = result && result.replacedExisting ? 'Replaced an existing related timer' : '';
   } else if (result && result.summary && (
@@ -3772,11 +3793,46 @@ function isPlanMutationItem(item) {
   return !!(item && item.kind === 'plan');
 }
 
+// Some project test scripts are a literal no-op (e.g. `echo "no tests configured" && exit 0`,
+// left in place as a placeholder by a scaffolding tool). Such a script exits 0 and looks like a
+// passing test run, but the output text itself says nothing was actually tested — treating this
+// as real verification would let a broken change through a gate that never ran any assertions.
+function looksLikePlaceholderTestOutput(output) {
+  const text = String(output || '').toLowerCase();
+  if (!text.trim()) return false;
+  return /(no tests?\s*(configured|found|specified|to run|available)|no test (files|suites)\s*(found|matched)|test (command|script) not (configured|specified)|error:\s*no test specified|0 tests?\s*(found|ran|matched|passed)|nothing to test)/.test(text);
+}
+
 function isRealVerificationCommand(command) {
   const text = String(command || '').toLowerCase().trim();
   if (!text) return false;
   if (/^(mkdir|md|new-item|copy|cp|move|mv|ren|rename|dir|ls|get-childitem)\b/.test(text)) return false;
   return /\b(pytest|unittest|python\s+-m\s+py_compile|python\s+-m\s+compileall|npm\s+test|npm\s+run\s+(test|build|lint|typecheck)|pnpm\s+(test|build|lint|typecheck)|yarn\s+(test|build|lint|typecheck)|node\s+--check|node\s+[\w./\\-]*test[\w./\\-]*\.js|tsc\b|eslint\b|ruff\b|mypy\b|go\s+test|cargo\s+test|dotnet\s+test|mvn\s+test|gradle\s+test|smoke|--smoke-test|playwright|vitest|jest|tap|tape)\b/.test(text);
+}
+
+function isSyntaxCheckableJsPath(filePath) {
+  const p = String(filePath || '');
+  return /\.(js|mjs|cjs)$/i.test(p) && !/\.min\.js$/i.test(p);
+}
+
+// Any edit tool (write_file/modify_file/patch_file) can silently corrupt a JS file's syntax —
+// e.g. patch_file's replace_range deleting a method signature by line-count miscalculation.
+// A project's own test command may be a placeholder (see looksLikePlaceholderTestOutput) and
+// never catch this, so run a fast, tool-independent `node --check` right after the write.
+async function checkJsSyntaxAfterEdit(workspace, filePath) {
+  if (!isSyntaxCheckableJsPath(filePath)) return { ok: true };
+  if (!window.api || typeof window.api.runCommand !== 'function') return { ok: true };
+  try {
+    const safePath = String(filePath).replace(/"/g, '\\"');
+    const processId = `syntaxcheck_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const result = await window.api.runCommand(`node --check "${safePath}"`, workspace, processId, 15000);
+    if (result && result.code === 0) return { ok: true };
+    const errText = (result && (result.stderr || result.error || result.stdout)) || 'Unknown syntax check failure';
+    return { ok: false, error: String(errText).trim().split('\n').slice(0, 6).join('\n') };
+  } catch (err) {
+    // Never let the syntax checker itself block a real edit from completing.
+    return { ok: true };
+  }
 }
 
 async function findMissingHtmlLocalReferences(workspace, htmlPath, htmlContent) {
@@ -3816,6 +3872,7 @@ async function findMissingHtmlLocalReferences(workspace, htmlPath, htmlContent) 
 function isVerificationItem(item) {
   if (!item) return false;
   if (item.status === 'error') return false;
+  if (looksLikePlaceholderTestOutput(item.output)) return false;
   if (item.toolName === 'run_tests' || item.kind === 'test') return true;
   if (item.toolName === 'run_command') return isRealVerificationCommand(item.command);
   if (item.toolName === 'start_command') return isRealVerificationCommand(item.command);
@@ -6802,6 +6859,8 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     isVerificationItem,
     hasVerificationAfterLastFileEdit,
     hasUnresolvedRegressionWarning,
+    looksLikePlaceholderTestOutput,
+    checkJsSyntaxAfterEdit,
     updateWalkthroughItem,
     buildPostEditEvidencePrompt,
     buildFinalVerificationSummary,

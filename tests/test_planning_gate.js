@@ -864,6 +864,76 @@ test('verification-status helpers require a check to actually pass, not just run
   t.end();
 });
 
+// Regression: a real run showed patch_file's replace_range corrupting a file's syntax (deleting
+// a method signature via a stale/miscalculated line range) without the project's own test command
+// ever catching it, since that project's `npm test` was a placeholder script. A tool-independent
+// `node --check` right after the edit catches this kind of corruption regardless of what (if
+// anything) the project's own test command actually verifies.
+test('checkJsSyntaxAfterEdit runs node --check on JS files and skips non-JS paths', async (t) => {
+  const originalApi = global.window.api;
+  const calls = [];
+  global.window.api = {
+    runCommand: async (command) => {
+      calls.push(command);
+      if (command.includes('broken.js')) {
+        return { code: 1, stderr: 'SyntaxError: Unexpected token' };
+      }
+      return { code: 0, stdout: '' };
+    }
+  };
+
+  const okResult = await agent.checkJsSyntaxAfterEdit('/test/workspace', 'src/good.js');
+  t.equal(okResult.ok, true, 'valid JS reports ok');
+
+  const badResult = await agent.checkJsSyntaxAfterEdit('/test/workspace', 'src/broken.js');
+  t.equal(badResult.ok, false, 'invalid JS reports not ok');
+  t.ok(badResult.error.includes('Unexpected token'), 'error text is surfaced');
+
+  const skipped = await agent.checkJsSyntaxAfterEdit('/test/workspace', 'README.md');
+  t.equal(skipped.ok, true, 'non-JS files are skipped entirely');
+  t.equal(calls.length, 2, 'node --check was only invoked for the two .js paths, not README.md');
+
+  global.window.api = originalApi;
+  t.end();
+});
+
+test('a syntax error introduced by an edit is captured as an unresolved regression, distinct from a test-suite regression', (t) => {
+  const item = { label: 'Wrote broken.js' };
+  agent.updateWalkthroughItem(item, 'write_file', { path: 'broken.js' }, {
+    success: true,
+    message: 'File written to broken.js successfully.\n[WARNING] SYNTAX ERROR DETECTED: node --check failed for broken.js:\nSyntaxError: Unexpected token'
+  }, null);
+  t.equal(item.regressionDetected, true, 'a syntax error is treated as an unresolved regression');
+  t.ok(item.detail.includes('Syntax error'), 'the walkthrough detail distinguishes a syntax error from a test regression');
+
+  t.equal(agent.hasUnresolvedRegressionWarning([item]), true, 'a syntax error with no later verification is unresolved');
+  t.equal(agent.hasUnresolvedRegressionWarning([item, { toolName: 'run_tests', status: 'done' }]), false, 'a later passing verification resolves it');
+  t.end();
+});
+
+// Regression: a project's `npm test` script was a placeholder (`echo "no tests configured"`)
+// that always exits 0. A run_tests/run_command call against it looked like real verification to
+// the gates even though nothing was actually tested.
+test('looksLikePlaceholderTestOutput identifies no-op test scripts, not real test output', (t) => {
+  t.equal(agent.looksLikePlaceholderTestOutput('no tests configured'), true);
+  t.equal(agent.looksLikePlaceholderTestOutput('Error: no test specified'), true);
+  t.equal(agent.looksLikePlaceholderTestOutput('0 tests found'), true);
+  t.equal(agent.looksLikePlaceholderTestOutput(''), false, 'empty output is not treated as a placeholder match');
+  t.equal(agent.looksLikePlaceholderTestOutput('12 passing (45ms)'), false, 'real test output is not flagged');
+  t.end();
+});
+
+test('a run_tests call against a placeholder test script does not count as verification', (t) => {
+  const placeholderItem = { toolName: 'run_tests', status: 'done' };
+  agent.updateWalkthroughItem(placeholderItem, 'run_tests', {}, { success: true, output: 'no tests configured' }, null);
+  t.equal(agent.isVerificationItem(placeholderItem), false, 'placeholder output is rejected as verification even though the tool reported success');
+
+  const realItem = { toolName: 'run_tests', status: 'done' };
+  agent.updateWalkthroughItem(realItem, 'run_tests', {}, { success: true, output: '5 passing' }, null);
+  t.equal(agent.isVerificationItem(realItem), true, 'real test output still counts as verification');
+  t.end();
+});
+
 test('a real detected regression stops the run with a specific message, not a generic "unverified" one', async (t) => {
   const originalRunAgentLoop = global.window.runAgentLoop;
   const originalSetTimeout = global.setTimeout;
