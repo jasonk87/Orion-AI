@@ -6,7 +6,7 @@
   const MAX_DISCOVERIES = 100;
   const MAX_DISCARDED = 50;
   const MAX_EVIDENCE = 50;
-  const MAX_CHAT_VIEW_MESSAGES = 6;
+  const MAX_CHAT_VIEW_MESSAGES = 16;
   const COMPLETION_STATUSES = ['continue_work', 'ask_clarification', 'blocked', 'ready_for_final'];
 
   function isoNow(now) {
@@ -451,12 +451,24 @@
     return lines.join('\n');
   }
 
+  // Assistant text that narrates the agent's own operational status (auth/tool failures,
+  // "I will now do X" promises) must not be replayed as if it were still current — the
+  // operational context above is the canonical source for that. A substantive answer to the
+  // user's actual question (e.g. a list of suggestions) is not self-diagnosis and is safe to
+  // replay so later turns can resolve references like "number 1" or "that idea" back to it.
+  function looksLikeSelfDiagnosisOrPromise(text) {
+    const normalized = String(text || '').toLowerCase();
+    return /\bi (?:encountered|previously|will now|cannot|can't|couldn't|could not|am unable|was unable)\b/.test(normalized) ||
+      /\b(prevents? me from|blocked me from|api (?:key|authentication) error|access (?:is|was) denied)\b/.test(normalized);
+  }
+
   function buildRecentChatView(messages, currentInput = '', limit = MAX_CHAT_VIEW_MESSAGES) {
     const input = cleanText(currentInput, 12000);
     const view = (Array.isArray(messages) ? messages : [])
-      .filter(message => message && message.role === 'user')
+      .filter(message => message && (message.role === 'user' || message.role === 'assistant'))
       .map(message => ({ role: message.role, text: cleanText(message.text, 3000) }))
-      .filter(message => message.text && message.text !== 'Thinking...' && !message.text.startsWith('[COMPACTED CONTEXT SUMMARY]'));
+      .filter(message => message.text && message.text !== 'Thinking...' && !message.text.startsWith('[COMPACTED CONTEXT SUMMARY]'))
+      .filter(message => message.role !== 'assistant' || !looksLikeSelfDiagnosisOrPromise(message.text));
     if (view.length && view[view.length - 1].role === 'user' && view[view.length - 1].text === input) view.pop();
     return view.slice(-Math.max(0, Number(limit) || MAX_CHAT_VIEW_MESSAGES));
   }
@@ -475,8 +487,8 @@
     ];
     const chatView = buildRecentChatView(conversationMessages, currentInput);
     if (chatView.length) {
-      messages.push({ role: 'user', parts: [{ text: `[RECENT USER CHAT VIEW - non-canonical]\nThis is only the user's recent intent/context. Previous assistant prose, errors, and self-diagnoses are deliberately excluded; use operational context, notes, files, and tool results for task facts.\n\n${chatView.map(item => `${item.role}: ${item.text}`).join('\n\n')}` }] });
-      messages.push({ role: 'model', parts: [{ text: 'Recent user chat received as non-canonical context.' }] });
+      messages.push({ role: 'user', parts: [{ text: `[RECENT USER CHAT VIEW - non-canonical]\nThis carries the user's recent intent plus your own recent substantive replies, so you can resolve references like "number 1" or "that idea" back to what you actually said. Self-diagnosis of your own past errors/blockers and "I will now..." promises are deliberately excluded from this view — those are not replayed, so use operational context, notes, files, and tool results for task facts, blockers, and completion evidence, not this chat view.\n\n${chatView.map(item => `${item.role}: ${item.text}`).join('\n\n')}` }] });
+      messages.push({ role: 'model', parts: [{ text: 'Recent chat (including my own prior replies, excluding self-diagnosis/promises) received as non-canonical context.' }] });
     }
     messages.push({ role: 'user', parts: [{ text: cleanText(currentInput, 12000) }] });
     return messages;

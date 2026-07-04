@@ -3440,8 +3440,15 @@ function getPlanningToolGate(config, canExecute, toolName, args = {}, options = 
   if (!destructiveTools.includes(toolName)) {
     return { allowed: true, forceYield: false, reason: '' };
   }
+  // Writing STRATEGY.md is never risky (it's a planning doc, not source/destructive), so it must
+  // always be allowed — regardless of whether the routing classifier called this turn 'plan' or
+  // 'direct'. Gating it on strategyRequired caused the write to be rejected whenever routing said
+  // 'direct' even though the system prompt separately tells Orion to write STRATEGY.md first for
+  // any game/app request with open design decisions, and then let implementation_plan.md through
+  // immediately afterward without ever validating a strategy (see isPlanWrite below), silently
+  // skipping the grounding the ritual was supposed to enforce.
   const isStrategyWrite = toolName === 'write_file' && isStrategyPath(args.path);
-  if (strategyRequired && isStrategyWrite) {
+  if (isStrategyWrite) {
     return { allowed: true, forceYield: false, reason: 'Writing STRATEGY.md is allowed during refinement.' };
   }
   const isPlanWrite = toolName === 'write_file' && isImplementationPlanPath(args.path);
@@ -4099,9 +4106,11 @@ Decision guidance:
 - Prefer direct for recommendations or improvement ideas about an existing local folder/project/program; inspect the project first, then answer from evidence.
 - Prefer direct for a small number of safe commands that gather facts, even if the answer has several sections.
 - Prefer plan only when the task requires a coordinated implementation, risky changes, many file edits, architecture/design choices, migrations, security-sensitive changes, or user review before modifying the workspace.
+- Prefer plan when the user moves from discussing/recommending an idea to actually telling you to build, add, or implement it as a real feature — especially a new game, new subsystem, or anything needing new architecture (new physics/rendering, new UI, new server logic, multiple files). "What do you think of X" and "recommend improvements" are direct; "let's add X" or "go build X" for that same substantial idea is plan, even mid-conversation.
 - Prefer answer when no local tools or workspace actions are needed at all.
 - NEVER return plan for a read-only question about what a local program/project/file does or contains.
 - NEVER return plan for a code review, bug hunt, typo check, or analysis of a local project — these are read-only inspection tasks.
+- NEVER return direct for a request to actually build/add/implement a substantial new game, feature, or system with multiple new parts (new UI, new physics/logic, new server-side state) just because earlier turns in the conversation were only brainstorming — the shift from "ideas" to "let's build it" is what makes it plan-worthy.
 
 Examples:
 - "what python environments do i have installed on this computer" -> direct
@@ -4127,6 +4136,10 @@ Examples:
 - "explain how PATH works on Windows" -> answer
 - "build me a Python desktop app" -> plan
 - "refactor the authentication flow" -> plan
+- "i have a folder on my desktop called rocket sumo, recommend similar games" -> direct
+- "lets add this game to the collection with the others, ensure smooth animated professional performance" -> plan
+- "go ahead and implement the racing game idea we just discussed, with a real 3D physics engine and new controller UI" -> plan
+- "let's build that feature you suggested" -> plan
 
 Be practical and avoid ceremony. Decide from task complexity and risk, not from whether the response may need multiple bullet points.
 

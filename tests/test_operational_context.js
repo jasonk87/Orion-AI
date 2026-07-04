@@ -396,7 +396,7 @@ test('new model turn receives mission state even when old chat is reduced', (t) 
   t.end();
 });
 
-test('recent chat view excludes assistant prose and stale self-diagnoses', (t) => {
+test('recent chat view excludes stale assistant self-diagnoses and promises', (t) => {
   const state = missionState();
   const priorChat = [
     { role: 'user', text: 'Can you review this program?' },
@@ -407,10 +407,31 @@ test('recent chat view excludes assistant prose and stale self-diagnoses', (t) =
   const view = operational.buildRecentChatView(priorChat, 'Start now.');
   const messages = operational.buildReasoningMessages(state, priorChat, 'Start now.');
   const joined = JSON.stringify(messages);
-  t.deepEqual(view.map(item => item.role), ['user', 'user'], 'recent chat view carries user turns only');
+  t.deepEqual(view.map(item => item.role), ['user', 'user'], 'self-diagnostic/promise assistant turns are filtered out');
   t.ok(joined.includes('Please actually inspect it.'), 'latest user intent remains visible');
   t.notOk(joined.includes('API authentication error'), 'assistant auth self-diagnosis is not replayed');
   t.notOk(joined.includes('I will now read files'), 'assistant promises are not replayed as evidence');
+  t.end();
+});
+
+// Regression: a user asking a follow-up like "I like number 1, but..." a couple of turns after
+// the assistant's own numbered list was previously unresolvable, because buildRecentChatView
+// dropped ALL assistant messages (see git history) — including substantive answers that were
+// never replayed, so the model had no idea what "number 1" referred to. Only self-diagnosis/
+// promise prose (asserted above) should be excluded; ordinary answers must survive into view.
+test('recent chat view retains substantive assistant answers so later turns can reference them', (t) => {
+  const state = missionState();
+  const priorChat = [
+    { role: 'user', text: 'Give me some game ideas using a phone as a controller.' },
+    { role: 'assistant', text: '1. Apex Velocity: a simulation racing game with tilt steering.\n2. Astro Drifters: an anti-gravity racer.' },
+    { role: 'user', text: 'I like number 1, but I want the steering to work like the other games in this series instead of tilt.' }
+  ];
+  const view = operational.buildRecentChatView(priorChat, 'Continue.');
+  const messages = operational.buildReasoningMessages(state, priorChat, 'Continue.');
+  const joined = JSON.stringify(messages);
+  t.deepEqual(view.map(item => item.role), ['user', 'assistant', 'user'], 'substantive assistant answer is retained alongside user turns');
+  t.ok(joined.includes('Apex Velocity'), 'the assistant\'s own prior numbered list is visible for back-reference');
+  t.ok(joined.includes('I like number 1'), 'the follow-up referencing it is also visible');
   t.end();
 });
 
