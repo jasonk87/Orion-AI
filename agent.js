@@ -405,6 +405,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   config.modelName = modelName || config.modelName || 'gemini-2.5-flash-lite';
   let activeRunModelName = config.modelName;
   config.activeRunModelName = activeRunModelName;
+  // Preserved so a temporary escalation to a stronger model (see the repeated-edit-failure
+  // handling below) can revert once the file it was escalated for gets a clean edit, instead of
+  // silently staying on the more expensive model for the rest of the conversation.
+  const userSelectedModelName = activeRunModelName;
+  let modelEscalatedForEditKey = null;
   let workspacePath = resolveConversationWorkspace(conversation);
   const promptSource = options.source || 'user';
   const isInternalPrompt = !!options.internalPrompt || promptSource === 'followup' || promptSource === 'system' || promptSource === 'plan-approval';
@@ -1556,9 +1561,33 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             if (failureStreak >= 3 && result && typeof result === 'object' && !Array.isArray(result)) {
               const escalation = await buildRepeatedEditFailureEscalation(workspacePath, args.path, failureStreak);
               result.message = `${result.message || ''}\n\n${escalation}`;
+              // Repeated syntax/regression errors on the same file despite a strategy-change nudge
+              // suggest the current model can't reliably reconstruct this file's code, not just a
+              // tooling gap — escalate to a stronger model for the turns needed to fix it, then
+              // revert once this file gets a clean edit so the rest of the run doesn't silently
+              // stay on the more expensive model.
+              if (!modelEscalatedForEditKey) {
+                const strongerModel = activeRunModelName.startsWith('gemini-') ? getNextGeminiModelForHighDemand(activeRunModelName) : null;
+                if (strongerModel) {
+                  modelEscalatedForEditKey = editKey;
+                  activeRunModelName = strongerModel;
+                  config.activeRunModelName = strongerModel;
+                  const escalationNote = `Escalating to ${strongerModel} after ${failureStreak} consecutive syntax/regression errors editing ${args.path}.`;
+                  currentAgentLogs.push({ type: 'thought', content: escalationNote });
+                  if (window.appendSystemMessage) window.appendSystemMessage(escalationNote, { conversationId: conversation.id });
+                }
+              }
             }
           } else {
             consecutiveEditFailureCounts.delete(editKey);
+            if (modelEscalatedForEditKey === editKey) {
+              const revertNote = `${args.path} was edited cleanly; reverting to ${userSelectedModelName}.`;
+              currentAgentLogs.push({ type: 'thought', content: revertNote });
+              if (window.appendSystemMessage) window.appendSystemMessage(revertNote, { conversationId: conversation.id });
+              activeRunModelName = userSelectedModelName;
+              config.activeRunModelName = userSelectedModelName;
+              modelEscalatedForEditKey = null;
+            }
           }
         }
         // A successful read_file clears the read-required gate for that file. When the gate was
@@ -7128,6 +7157,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     buildRepeatedEditFailureEscalation,
     looksLikeLaunchOnlyRequest,
     hasFailedLaunchAttemptThisRun,
+    getNextGeminiModelForHighDemand,
     summarizeToolStart,
     buildRepeatedFailureKey,
     updateWalkthroughItem,

@@ -1292,6 +1292,95 @@ test('a plain launch request is blocked from silently editing source files after
   t.end();
 });
 
+// Regression: after a strategy-change nudge, the model may still fail to fix the file — that
+// points at a raw capability limit (miscounting lines across a large edit), not a missing
+// guardrail. Once the repeated-edit-failure threshold hits, escalate to a stronger model for the
+// turns needed to fix the file, then revert once it gets a clean edit so the rest of the run
+// doesn't silently stay on the more expensive model for no reason.
+test('repeated edit failures escalate to a stronger model, then revert once the file is fixed', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: false });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+
+  let patchCallCount = 0;
+  global.window.api = {
+    readFile: async () => 'x'.repeat(20000),
+    patchFile: async (workspace, filePath) => {
+      patchCallCount++;
+      // First 3 patches introduce a syntax error; the 4th (after escalation) is clean.
+      const broken = patchCallCount <= 3;
+      return {
+        success: true,
+        changed: true,
+        message: `Patched ${filePath} successfully.${broken ? '\n[WARNING] SYNTAX ERROR DETECTED: node --check failed:\nSyntaxError: Unexpected token' : ''}`
+      };
+    },
+    listFiles: async () => ([]),
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+  };
+
+  const conversation = { id: 'test-model-escalation', messages: [], awaitingPlanApproval: false, planApproved: true };
+
+  let turnCount = 0;
+  const modelsRequested = [];
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    turnCount++;
+    const modelMatch = String(url).match(/\/models\/([^:]+):generateContent/);
+    modelsRequested.push(modelMatch ? modelMatch[1] : null);
+
+    const patchCall = (target) => ({
+      ok: true,
+      json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'patch_file', args: { path: 'server.js', operation: { type: 'replace', target, replacement: 'y' } } } }] } }] })
+    });
+    const readCall = () => ({
+      ok: true,
+      json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'read_file', args: { path: 'server.js' } } }] } }] })
+    });
+    if (turnCount === 1) return patchCall('a'); // 1st edit, streak=1, still original model
+    if (turnCount === 2) return patchCall('c'); // 2nd edit, streak=2, still original model, needs-read set
+    if (turnCount === 3) return readCall();      // satisfy edit-thrash guard
+    if (turnCount === 4) return patchCall('e'); // 3rd edit, streak=3 -> escalation triggers after this
+    if (turnCount === 5) return readCall();      // satisfy edit-thrash guard again (request still uses escalated model)
+    if (turnCount === 6) return patchCall('g'); // 4th edit, this one is clean -> reverts after this
+    return {
+      ok: true,
+      json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'server.js is fixed now.' }] } }] })
+    };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
+    await window.runAgentLoop('fix the syntax error in server.js', 'gemini-2.5-flash-lite', conversation);
+
+    t.equal(modelsRequested[0], 'gemini-2.5-flash-lite', 'turn 1 uses the originally selected model');
+    t.equal(modelsRequested[3], 'gemini-2.5-flash-lite', 'turn 4 (the request that triggers escalation) still uses the original model — escalation applies to the NEXT call');
+    t.equal(modelsRequested[4], 'gemini-2.5-flash', 'turn 5 (right after the 3rd consecutive failure) is escalated to the stronger model');
+    t.equal(modelsRequested[5], 'gemini-2.5-flash', 'turn 6 (the clean fix attempt) still runs on the escalated model');
+    t.equal(modelsRequested[6], 'gemini-2.5-flash-lite', 'turn 7 (after the clean edit) reverts back to the originally selected model');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+
+  t.end();
+});
+
 test('a real detected regression stops the run with a specific message, not a generic "unverified" one', async (t) => {
   const originalRunAgentLoop = global.window.runAgentLoop;
   const originalSetTimeout = global.setTimeout;
