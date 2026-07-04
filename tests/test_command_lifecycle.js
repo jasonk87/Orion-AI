@@ -350,9 +350,10 @@ test('a spawn failure in spawnInternalCommand does not crash the process', (t) =
 // Regression: `spawn('npm', ...)` fails with ENOENT on Windows, because `npm` is actually an
 // `npm.cmd` shim, not a raw .exe, and Node's spawn() doesn't resolve .cmd extensions the way a
 // real shell does. This is why launch_workspace_app's "npm start"/"npm run dev" auto-detection
-// never actually launched anything on Windows — it just silently (and, before the previous fix,
-// fatally) failed. Routing through cmd.exe lets Windows resolve npm the same way a typed terminal
-// command would.
+// never actually launched anything on Windows — it just silently (and, before an earlier fix,
+// fatally) failed. Bypassing the shim and running npm's own CLI script directly through node.exe
+// (a real .exe, bundled with every Node install) resolves it the same way a typed terminal
+// command would, without needing cmd.exe at all.
 test('spawnInternalCommand can actually run npm on Windows instead of failing with ENOENT', (t) => {
   if (process.platform !== 'win32') {
     t.pass('Windows-only npm resolution check skipped on non-Windows');
@@ -367,6 +368,9 @@ test('spawnInternalCommand can actually run npm on Windows instead of failing wi
   const child = main.spawnInternalCommand(ws, 'npm', ['--version']);
   t.ok(child.pid, 'the wrapped npm invocation has a pid');
 
+  let stdout = '';
+  child.stdout.on('data', d => { stdout += d.toString(); });
+
   const timeout = setTimeout(() => {
     t.fail('npm --version did not close within the timeout');
     t.end();
@@ -375,6 +379,42 @@ test('spawnInternalCommand can actually run npm on Windows instead of failing wi
   child.on('close', code => {
     clearTimeout(timeout);
     t.equal(code, 0, 'npm --version actually ran and exited cleanly, instead of ENOENT-failing');
+    t.ok(/\d+\.\d+\.\d+/.test(stdout.trim()), 'npm printed a real version number');
+    t.end();
+  });
+});
+
+// Regression: even after npm resolution stopped ENOENT-failing, its output was still silently
+// lost. Directly reproduced: a detached child that itself runs through cmd.exe (whether via our
+// own wrapping or Node's shell:true) loses piped stdout on Windows entirely — the process exits
+// cleanly with no output at all, even redirected to a file from inside the detached cmd.exe. This
+// only happens for the nested-shell case; a real .exe spawned directly (like node.exe running
+// npm-cli.js) does not have this problem, confirmed detached and non-detached side by side.
+test('spawnInternalCommand output survives being detached (the actual launch mode it always uses)', (t) => {
+  if (process.platform !== 'win32') {
+    t.pass('Windows-only detached-output check skipped on non-Windows');
+    t.end();
+    return;
+  }
+
+  const os = require('os');
+  const path = require('path');
+  const ws = require('fs').mkdtempSync(path.join(os.tmpdir(), 'orion-npm-detached-output-'));
+
+  const child = main.spawnInternalCommand(ws, 'npm', ['--version']);
+  t.ok(child.pid, 'the launched process has a pid');
+
+  let stdout = '';
+  child.stdout.on('data', d => { stdout += d.toString(); });
+
+  const timeout = setTimeout(() => {
+    t.fail('npm --version did not close within the timeout');
+    t.end();
+  }, 10000);
+
+  child.on('close', () => {
+    clearTimeout(timeout);
+    t.ok(stdout.trim().length > 0, 'output was actually captured from the detached process, not silently lost');
     t.end();
   });
 });
