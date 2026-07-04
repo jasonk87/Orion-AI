@@ -967,6 +967,145 @@ test('work-walkthrough labels distinguish read/modify/patch calls instead of usi
   t.end();
 });
 
+// Regression: launch_workspace_app only confirms the OS accepted the spawn call, not that the app
+// is actually running. A transcript showed it launch the same app twice ("can you launch it" then
+// "can you launch it again") and declare success both times with zero follow-up check either time.
+test('hasVerificationAfterLastAppLaunch requires a real check after launching, not just the launch itself', (t) => {
+  const launchOnly = [{ toolName: 'launch_workspace_app', status: 'done' }];
+  t.equal(agent.hasVerificationAfterLastAppLaunch(launchOnly), false, 'a launch with no follow-up check is unverified');
+
+  const launchThenCheck = [
+    { toolName: 'launch_workspace_app', status: 'done' },
+    { toolName: 'open_url', status: 'done' }
+  ];
+  t.equal(agent.hasVerificationAfterLastAppLaunch(launchThenCheck), true, 'open_url after a launch counts as verification');
+
+  const launchTwiceNoCheck = [
+    { toolName: 'launch_workspace_app', status: 'done' },
+    { toolName: 'open_url', status: 'done' },
+    { toolName: 'launch_workspace_app', status: 'done' }
+  ];
+  t.equal(agent.hasVerificationAfterLastAppLaunch(launchTwiceNoCheck), false,
+    'a second launch after the first was verified resets the requirement — verifying the first launch does not cover the second');
+
+  const failedLaunch = [{ toolName: 'launch_workspace_app', status: 'error' }];
+  t.equal(agent.isAppLaunchItem(failedLaunch[0]), false, 'a failed launch attempt is not treated as a launch needing verification');
+
+  const failedCheck = [
+    { toolName: 'launch_workspace_app', status: 'done' },
+    { toolName: 'open_url', status: 'error' }
+  ];
+  t.equal(agent.hasVerificationAfterLastAppLaunch(failedCheck), false, 'a failed open_url attempt does not count as verification');
+
+  const noLaunchAtAll = [{ toolName: 'read_file', status: 'done' }];
+  t.equal(agent.hasVerificationAfterLastAppLaunch(noLaunchAtAll), true, 'a turn with no launch at all has nothing to verify');
+  t.end();
+});
+
+test('launching an app and declaring success without checking is caught, exactly like an unverified file edit', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0 });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.lastLaunchLogs = '';
+  global.window.lastLaunchUrl = '';
+  global.window.api = {
+    readFile: async () => '',
+    listFiles: async () => ([]),
+    launchWorkspaceApp: async () => ({ success: true, message: 'Started background server with command: "npm start"' })
+  };
+
+  const conversation = { id: 'test-launch-no-verify', messages: [], awaitingPlanApproval: false, planApproved: true };
+
+  let turnCount = 0;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"launching a program"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    turnCount++;
+    if (turnCount === 1) {
+      return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'launch_workspace_app', args: {} } }] } }] }) };
+    }
+    return {
+      ok: true,
+      json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'The application has been launched.' }] } }] })
+    };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : (delay === 1500 ? fn() : originalSetTimeout(fn, delay)));
+    await window.runAgentLoop('can you launch it', 'gemini-1', conversation);
+
+    const aiMessage = conversation.messages.find(m => m.role === 'assistant');
+    t.ok(aiMessage, 'assistant message was created');
+    t.ok(/did not verify it/.test(aiMessage.text), 'the run reports that the launch was not verified, instead of declaring success');
+    t.notOk(/has been launched\.$/.test(aiMessage.text.trim()), 'the unverified "launched" claim is not what reaches the user as final');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+    delete global.window.lastLaunchLogs;
+    delete global.window.lastLaunchUrl;
+  }
+
+  t.end();
+});
+
+test('launch_workspace_app surfaces captured output/URL into the tool result instead of just the spawn-succeeded message', async (t) => {
+  global.window.lastLaunchLogs = 'Server listening at http://localhost:5173\n';
+  global.window.lastLaunchUrl = 'http://localhost:5173';
+  global.window.api = {
+    launchWorkspaceApp: async () => ({ success: true, message: 'Started background server with command: "npm start"' })
+  };
+  const originalSetTimeout = global.setTimeout;
+  global.setTimeout = (fn, delay) => (delay === 1500 ? fn() : originalSetTimeout(fn, delay));
+
+  try {
+    const result = await agent.executeTool('launch_workspace_app', {}, '/test/workspace', {}, { id: 'test-surface' });
+    t.ok(result.capturedOutput.includes('localhost:5173'), 'captured launch output is included in the tool result');
+    t.equal(result.detectedUrl, 'http://localhost:5173', 'the detected URL is included in the tool result');
+    t.ok(/Confirm with open_url/.test(result.verificationNote), 'a verification note tells the model to confirm before assuming success');
+  } finally {
+    global.setTimeout = originalSetTimeout;
+    delete global.window.lastLaunchLogs;
+    delete global.window.lastLaunchUrl;
+  }
+  t.end();
+});
+
+test('launch_workspace_app tells the model to verify even when nothing was captured', async (t) => {
+  global.window.lastLaunchLogs = '';
+  global.window.lastLaunchUrl = '';
+  global.window.api = {
+    launchWorkspaceApp: async () => ({ success: true, message: 'Started configured entry point: "python app.py"' })
+  };
+  const originalSetTimeout = global.setTimeout;
+  global.setTimeout = (fn, delay) => (delay === 1500 ? fn() : originalSetTimeout(fn, delay));
+
+  try {
+    const result = await agent.executeTool('launch_workspace_app', {}, '/test/workspace', {}, { id: 'test-surface-empty' });
+    t.equal(result.capturedOutput, '', 'no output was captured for this launch path');
+    t.equal(result.detectedUrl, '', 'no URL was detected');
+    t.ok(/does not capture output|failed silently/.test(result.verificationNote), 'the note explains nothing was captured and verification is still required');
+  } finally {
+    global.setTimeout = originalSetTimeout;
+    delete global.window.lastLaunchLogs;
+    delete global.window.lastLaunchUrl;
+  }
+  t.end();
+});
+
 test('a real detected regression stops the run with a specific message, not a generic "unverified" one', async (t) => {
   const originalRunAgentLoop = global.window.runAgentLoop;
   const originalSetTimeout = global.setTimeout;

@@ -1193,6 +1193,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             lastTextResponse = `I changed source file(s) (${filesTouchedThisRun.map(path => `\`${path}\``).join(', ')}) but did not verify the change with a real test, smoke check, or manual run. This is not complete — ask me to continue and I should run the appropriate check (run_tests, run_command, or a manual smoke check) and confirm it passes, or clearly explain why no check is possible.`;
             break;
           }
+          if (workWalkthrough.some(isAppLaunchItem) && !hasVerificationAfterLastAppLaunch(workWalkthrough)) {
+            lastTextResponse = `I launched the workspace app, but launching only confirms the OS accepted the spawn call — it does not confirm the app is actually running. I did not verify it with a screenshot, a URL check, or reading its output. This is not complete — ask me to continue and I should check with open_url, capture_screen, or read_command_output before assuming it launched successfully.`;
+            break;
+          }
         }
         if (!memoryNudgeSent && !reviewOnly && turnDidSubstantiveInspection(workWalkthrough) &&
             !turnAlreadyWroteMemory(workWalkthrough) && !isGenericNonAnswer(textVal) && loopCount < maxLoops) {
@@ -2027,7 +2031,24 @@ async function executeTool(name, args, workspace, config, conversation) {
     case 'launch_workspace_app': {
       const result = await window.api.launchWorkspaceApp(workspace);
       if (!result.success) throw new Error(result.error || 'Failed to launch workspace app');
-      return result;
+      // Success here only means the OS accepted the spawn call — the process may still be
+      // starting, may fail moments later (missing deps, port conflict), or may never bind
+      // anything. Wait briefly and surface whatever output/URL was actually captured so the model
+      // has real evidence instead of just this "spawn succeeded" message, and is explicitly told
+      // it still needs to verify further either way.
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      const capturedOutput = typeof window.lastLaunchLogs === 'string' ? window.lastLaunchLogs.trim() : '';
+      const capturedUrl = typeof window.lastLaunchUrl === 'string' ? window.lastLaunchUrl.trim() : '';
+      return {
+        ...result,
+        capturedOutput: capturedOutput.slice(-4000),
+        detectedUrl: capturedUrl,
+        verificationNote: capturedUrl
+          ? `Detected URL: ${capturedUrl}. Confirm with open_url or a screenshot before assuming it is fully working.`
+          : (capturedOutput
+            ? 'No URL detected yet in the captured output above. Verify with open_url, capture_screen, or read_command_output before assuming success.'
+            : 'No output captured yet — the process may still be starting, may have failed silently, or this launch path does not capture output. Verify with open_url, capture_screen, or read_command_output before assuming it launched successfully.')
+      };
     }
 
     case 'set_workspace_entrypoint': {
@@ -3968,6 +3989,28 @@ function hasVerificationAfterLastFileEdit(items) {
   const lastEditIndex = list.findLastIndex(item => isFileMutationItem(item));
   if (lastEditIndex === -1) return true;
   return list.slice(lastEditIndex + 1).some(item => isVerificationItem(item));
+}
+
+function isAppLaunchItem(item) {
+  return !!(item && item.toolName === 'launch_workspace_app' && item.status !== 'error');
+}
+
+// launch_workspace_app only confirms the OS accepted the spawn call, not that the process is
+// actually running — a transcript showed it launch the same app twice ("can you launch it again")
+// and declare success both times with zero follow-up check either time. Treat these tools as real
+// evidence the launch was verified, the same way file edits require a real test/smoke check.
+function isAppLaunchVerificationItem(item) {
+  if (!item || item.status === 'error') return false;
+  return ['open_url', 'capture_screen', 'take_screenshot', 'preview_app', 'read_command_output',
+    'get_command_status', 'inspect_screenshot', 'inspect_screenshot_with_model', 'compare_screenshot_to_goal']
+    .includes(item.toolName);
+}
+
+function hasVerificationAfterLastAppLaunch(items) {
+  const list = Array.isArray(items) ? items : [];
+  const lastLaunchIndex = list.findLastIndex(isAppLaunchItem);
+  if (lastLaunchIndex === -1) return true;
+  return list.slice(lastLaunchIndex + 1).some(isAppLaunchVerificationItem);
 }
 
 // write_file/modify_file/patch_file run their own auto-test-before/after-edit check internally
@@ -6991,6 +7034,9 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     isRealVerificationCommand,
     isVerificationItem,
     hasVerificationAfterLastFileEdit,
+    isAppLaunchItem,
+    isAppLaunchVerificationItem,
+    hasVerificationAfterLastAppLaunch,
     hasUnresolvedRegressionWarning,
     looksLikePlaceholderTestOutput,
     checkJsSyntaxAfterEdit,
