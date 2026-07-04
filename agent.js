@@ -1780,6 +1780,7 @@ const HIDDEN_DIRECTORY_REASONS = new Map([
   ['coverage', 'test coverage output'],
   ['target', 'build output'],
   ['.orion', 'Orion runtime metadata/backups'],
+  ['.claude', 'Claude Code tool settings'],
   ['instance', 'runtime/user data'],
   ['user_data', 'runtime/user data'],
   ['chroma', 'vector database files'],

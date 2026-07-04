@@ -811,6 +811,7 @@ test('list_files curated inventory hides noisy and sensitive workspace paths by 
     { path: '.env', isDir: false, size: 20 },
     { path: '.env.example', isDir: false, size: 20 },
     { path: '.orion/backups/agent.js.bak', isDir: false, size: 10 },
+    { path: '.claude/settings.local.json', isDir: false, size: 20 },
     { path: 'instance/users.json', isDir: false, size: 20 },
     { path: 'src/__pycache__/main.cpython-313.pyc', isDir: false, size: 10 },
     { path: 'node_modules/pkg/index.js', isDir: false, size: 10 },
@@ -820,8 +821,9 @@ test('list_files curated inventory hides noisy and sensitive workspace paths by 
   const returnedPaths = inventory.files.map(file => file.path);
   t.deepEqual(returnedPaths, ['agent.js', 'lib/shared.js', '.env.example'], 'default inventory keeps source files and safe examples only');
   t.equal(inventory.mode, 'project', 'default mode is project inventory');
-  t.equal(inventory.totals.hidden, 6, 'hidden count includes runtime, cache, dependency, and sensitive paths');
+  t.equal(inventory.totals.hidden, 7, 'hidden count includes runtime, cache, dependency, tool-settings, and sensitive paths');
   t.ok(inventory.omitted.some(item => item.path === '.orion'), 'collapses Orion runtime metadata');
+  t.ok(inventory.omitted.some(item => item.path === '.claude'), 'collapses Claude Code tool settings');
   t.ok(inventory.omitted.some(item => item.path === 'instance'), 'collapses instance/user data');
   t.ok(inventory.omitted.some(item => item.path === '.env'), 'omits actual env files');
   t.ok(inventory.warning.includes('mode="all"'), 'warning points to explicit raw listing escape hatch');
