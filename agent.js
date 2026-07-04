@@ -1330,6 +1330,24 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           continue;
         }
         
+        // Launch-only scope guard: a plain "launch/run this" request is low-risk and read-only —
+        // it does not authorize repeated source edits just because the launch failed on a
+        // pre-existing bug. Block the first edit attempt this turn and require the model to report
+        // the failure and ask before making changes, instead of silently starting to fix code
+        // nobody asked it to touch.
+        if ((toolName === 'write_file' || toolName === 'modify_file' || toolName === 'patch_file') &&
+            !workWalkthrough.some(isFileMutationItem) &&
+            looksLikeLaunchOnlyRequest(userPrompt) &&
+            hasFailedLaunchAttemptThisRun(workWalkthrough)) {
+          const blockMsg = `EDIT BLOCKED: The user only asked you to launch/run this program — that is a low-risk, read-only request. The launch failed because of a pre-existing issue, but nothing authorized you to start editing source files to fix it. Do not make this edit. Instead, explain what failed and why, and ask the user whether they want you to attempt a fix before making any changes.`;
+          currentAgentLogs[logIndex].status = 'error';
+          currentAgentLogs[logIndex].result = blockMsg;
+          updateWalkthroughItem(walkthroughItem, toolName, args, { error: blockMsg }, new Error(blockMsg));
+          toolResponseParts.push({ functionResponse: { name: toolName, response: { error: blockMsg, blocked: 'launch_only_scope' } } });
+          persistCurrentAgentLogs({ render: true });
+          continue;
+        }
+
         // Hard thrash guard: block repeated edits to the same file without an intervening read
         if ((toolName === 'write_file' || toolName === 'modify_file' || toolName === 'patch_file') && args.path) {
           const editKey = String(args.path).toLowerCase();
@@ -4743,6 +4761,28 @@ function turnAlreadyWroteMemory(workWalkthrough) {
   return (workWalkthrough || []).some(item => item && MEMORY_WRITE_TOOLS.has(item.toolName));
 }
 
+// A transcript showed a plain "can you launch this program?" request silently escalate into 7+
+// unrequested edits to server.js after the launch failed on a pre-existing bug — the user only
+// asked for a low-risk, read-only action, but got repeated, increasingly destructive-feeling
+// source edits with no check-in. This distinguishes a pure launch/run request (no edit/fix
+// language) from one that already authorizes changes.
+function looksLikeLaunchOnlyRequest(prompt) {
+  const text = String(prompt || '').toLowerCase();
+  if (!text.trim()) return false;
+  const hasLaunchVerb = /\b(launch|run|start|open|boot up|fire up|spin up|execute)\b/.test(text);
+  const hasEditVerb = /\b(fix|edit|change|modify|update|debug|repair|patch|refactor|add|build|implement|create|remove|delete|rewrite)\b/.test(text);
+  return hasLaunchVerb && !hasEditVerb;
+}
+
+// Only the FIRST edit attempt of a turn needs to be intercepted — once the user has been asked and
+// responds (their reply naturally won't match looksLikeLaunchOnlyRequest if it authorizes a fix,
+// e.g. "yes fix it"), the gate no longer applies to that follow-up turn.
+function hasFailedLaunchAttemptThisRun(items) {
+  const list = Array.isArray(items) ? items : [];
+  return list.some(item => item && item.status === 'error' &&
+    (item.toolName === 'launch_workspace_app' || item.toolName === 'run_command' || item.toolName === 'start_command'));
+}
+
 function isLocalProjectOrFolderRequest(prompt) {
   const text = String(prompt || '').toLowerCase();
   const tokens = new Set(tokenizeIntentText(prompt));
@@ -7086,6 +7126,8 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     looksLikePlaceholderTestOutput,
     checkJsSyntaxAfterEdit,
     buildRepeatedEditFailureEscalation,
+    looksLikeLaunchOnlyRequest,
+    hasFailedLaunchAttemptThisRun,
     summarizeToolStart,
     buildRepeatedFailureKey,
     updateWalkthroughItem,

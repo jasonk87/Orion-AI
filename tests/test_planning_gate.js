@@ -1199,6 +1199,99 @@ test('three consecutive syntax-error-introducing patches to the same file trigge
   t.end();
 });
 
+// Regression: a plain "can you launch this program?" request silently escalated into 7+
+// unrequested edits to server.js after the launch failed on a pre-existing bug — the user asked
+// for a low-risk, read-only action and got repeated, destructive-feeling source changes with no
+// check-in at all.
+test('looksLikeLaunchOnlyRequest and hasFailedLaunchAttemptThisRun identify the exact scope-creep scenario', (t) => {
+  t.equal(agent.looksLikeLaunchOnlyRequest('can you launch this program?'), true, 'a plain launch request has no edit language');
+  t.equal(agent.looksLikeLaunchOnlyRequest('can you run it'), true, 'a plain run request has no edit language');
+  t.equal(agent.looksLikeLaunchOnlyRequest('can you fix the bug and launch it'), false, 'edit language in the same request removes the restriction');
+  t.equal(agent.looksLikeLaunchOnlyRequest('yes, please fix it'), false, 'an explicit follow-up authorization is not treated as launch-only');
+  t.equal(agent.looksLikeLaunchOnlyRequest('what does this project do'), false, 'a request with no launch verb at all does not match');
+  t.equal(agent.looksLikeLaunchOnlyRequest(''), false, 'empty text does not match');
+
+  const failedLaunch = [{ toolName: 'launch_workspace_app', status: 'error' }];
+  t.equal(agent.hasFailedLaunchAttemptThisRun(failedLaunch), true, 'a failed launch_workspace_app is detected');
+
+  const failedNpmStart = [{ toolName: 'run_command', status: 'error', command: 'npm start' }];
+  t.equal(agent.hasFailedLaunchAttemptThisRun(failedNpmStart), true, 'a failed run_command (e.g. npm start) is detected');
+
+  const successfulLaunch = [{ toolName: 'launch_workspace_app', status: 'done' }];
+  t.equal(agent.hasFailedLaunchAttemptThisRun(successfulLaunch), false, 'a successful launch is not a failed attempt');
+
+  const unrelatedFailure = [{ toolName: 'read_file', status: 'error' }];
+  t.equal(agent.hasFailedLaunchAttemptThisRun(unrelatedFailure), false, 'an unrelated failed tool call does not count');
+  t.end();
+});
+
+test('a plain launch request is blocked from silently editing source files after the launch fails', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0 });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    readFile: async () => '',
+    listFiles: async () => ([]),
+    launchWorkspaceApp: async () => ({ success: false, error: 'npm start exited with code 1' }),
+    patchFile: async () => ({ success: true, changed: true, message: 'Patched server.js successfully.' })
+  };
+
+  const conversation = { id: 'test-launch-only-scope', messages: [], awaitingPlanApproval: false, planApproved: true };
+
+  let turnCount = 0;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"launching a program"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    turnCount++;
+    if (turnCount === 1) {
+      return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'launch_workspace_app', args: {} } }] } }] }) };
+    }
+    if (turnCount === 2) {
+      // The model tries to "fix" server.js immediately after the failed launch, unprompted.
+      return {
+        ok: true,
+        json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'patch_file', args: { path: 'server.js', operation: { type: 'replace', target: 'x', replacement: 'y' } } } }] } }] })
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'The launch failed. Want me to look into fixing it?' }] } }] })
+    };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
+    await window.runAgentLoop('can you launch this program?', 'gemini-1', conversation);
+
+    const aiMessage = conversation.messages.find(m => m.role === 'assistant');
+    const toolCalls = (aiMessage.logs || []).filter(l => l.type === 'tool_call');
+    const patchAttempt = toolCalls.find(c => c.tool === 'patch_file');
+    t.ok(patchAttempt, 'the patch_file attempt was made by the model');
+    t.equal(patchAttempt.status, 'error', 'the unrequested edit was blocked, not allowed through');
+    t.ok(String(patchAttempt.result).includes('only asked you to launch'), 'the block explains the launch-only scope');
+    t.ok(/want me to look into fixing/i.test(aiMessage.text), 'the model asks the user before making changes, instead of silently editing');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+
+  t.end();
+});
+
 test('a real detected regression stops the run with a specific message, not a generic "unverified" one', async (t) => {
   const originalRunAgentLoop = global.window.runAgentLoop;
   const originalSetTimeout = global.setTimeout;
