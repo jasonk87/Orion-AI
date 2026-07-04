@@ -2214,17 +2214,24 @@ async function submitMessage() {
   renderUserMessage(prompt);
   el.chatInput.value = '';
   
-  // Initialize title & folder path if first prompt
-  if (!conv.workspace) {
-    const title = generateConversationTitle(prompt);
-    conv.title = title;
-    el.chatTitle.textContent = title;
+  // Rename the conversation from its first message. Gated on message count/title rather than
+  // `!conv.workspace` — for project-scoped conversations, normalizeConversationWorkspace() above
+  // already fills in conv.workspace from conv.projectPath before this point, which made the old
+  // `!conv.workspace` check always false and silently skipped the rename for every conversation
+  // created under a project (they kept the "New Conversation" title forever).
+  if (conv.messages.length === 0 && (!conv.title || conv.title === 'New Conversation')) {
+    conv.title = generateConversationTitle(prompt);
+    el.chatTitle.textContent = conv.title;
     renderConversationList();
+  }
 
+  // Initialize the folder path if this is still the first prompt (project-scoped conversations
+  // already have this from normalizeConversationWorkspace above).
+  if (!conv.workspace) {
     if (conv.projectPath) {
       conv.workspace = conv.projectPath;
     } else {
-      conv.workspace = getStandaloneWorkspaceForTitle(title, conv.id);
+      conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id);
     }
   }
 

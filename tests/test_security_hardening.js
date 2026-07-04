@@ -107,6 +107,47 @@ test('config failures and command retention safeguards are wired', (t) => {
   t.end();
 });
 
+// Regression: conversations created under an existing project never got renamed from "New
+// Conversation" after the first message. normalizeConversationWorkspace() runs first in
+// submitMessage() and fills in conv.workspace from conv.projectPath for any project-scoped
+// conversation — so the old `if (!conv.workspace)` gate around the title-rename logic was always
+// false by the time it ran for those conversations, silently skipping the rename forever.
+// Standalone conversations (no projectPath) were unaffected, which is why the bug only showed up
+// for chats opened inside a project.
+test('conversation rename is not defeated by project workspace normalization running first', (t) => {
+  t.notOk(
+    /if \(!conv\.workspace\) \{\s*const title = generateConversationTitle/.test(rendererJs),
+    'the rename gate no longer keys off !conv.workspace, which normalizeConversationWorkspace() already sets for project-scoped conversations'
+  );
+  t.ok(
+    /conv\.messages\.length === 0 && \(!conv\.title \|\| conv\.title === 'New Conversation'\)/.test(rendererJs),
+    'the rename gate checks message count and title instead, so it fires regardless of whether a project workspace was already normalized'
+  );
+  t.ok(
+    rendererJs.indexOf('normalizeConversationWorkspace(conv);') < rendererJs.indexOf("conv.messages.length === 0 && (!conv.title || conv.title === 'New Conversation')"),
+    'workspace normalization still runs before the rename check (order preserved, only the gate condition changed)'
+  );
+  t.end();
+});
+
+// Regression: generateConversationTitle() itself (the actual text-cleanup logic) must keep
+// stripping filler phrases and truncating sensibly — this only tests the function's own behavior,
+// not the gating bug above.
+test('generateConversationTitle strips filler phrases and truncates sensibly', (t) => {
+  const titleFn = rendererJs.match(/function generateConversationTitle\(prompt\) \{[\s\S]*?\n\}/);
+  const caseFn = rendererJs.match(/function toTitleCase\(str\) \{[\s\S]*?\n\}/);
+  t.ok(titleFn, 'generateConversationTitle function body is present in renderer.js');
+  t.ok(caseFn, 'toTitleCase function body is present in renderer.js');
+
+  const sandbox = new Function(`${caseFn[0]}\n${titleFn[0]}\nreturn generateConversationTitle;`)();
+
+  t.equal(sandbox('can you help me build a snake game'), 'Build a Snake Game', 'strips leading filler like "can you help me"');
+  t.equal(sandbox('please launch the rocket sumo server'), 'Launch the Rocket Sumo Server', 'strips leading "please"');
+  t.equal(sandbox(''), 'New Conversation', 'empty input falls back to the default title');
+  t.ok(sandbox('a'.repeat(80)).length <= 48, 'long input is truncated to a reasonable length');
+  t.end();
+});
+
 test('config merge preserves saved credentials when incoming config has empty defaults', (t) => {
   const merged = configModule.mergeConfigWithSource(
     {
