@@ -575,15 +575,37 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   // below what the user explicitly picked. Reuses the existing escalation family-mapping so a
   // later reactive escalation (see repeated-edit-failure handling below) still composes cleanly
   // on top of this baseline instead of fighting it.
+  //
+  // A deep-task upgrade must survive the WHOLE approved-plan lifecycle (planning -> approval ->
+  // execution -> auto-continue), not just the single call where classifyPlanningNeed happened to
+  // return "deep". Plan-approval replies and internal follow-ups re-enter runAgentLoop as fresh
+  // calls with a fresh local activeRunModelName, and their own planningDecision never carries
+  // taskComplexity (only classifyPlanningNeed sets it) — without persisting the decision on the
+  // conversation object, the upgrade silently evaporates right as real execution starts, which is
+  // exactly when the model most needs the extra capability.
+  if (resetMissionState) {
+    // A genuinely new task: forget any previous mission's upgrade and let it recompute fresh.
+    delete conversation._proactiveDeepTaskModel;
+    delete conversation._proactiveDeepTaskBaseModel;
+  }
   const taskComplexity = planningDecision.taskComplexity || (planningDecision.mode === 'plan' ? 'deep' : 'standard');
   if (taskComplexity === 'deep') {
     const upgraded = getNextGeminiModelForHighDemand(userSelectedModelName);
     if (upgraded) {
       activeRunModelName = upgraded;
       config.activeRunModelName = activeRunModelName;
+      conversation._proactiveDeepTaskModel = upgraded;
+      conversation._proactiveDeepTaskBaseModel = userSelectedModelName;
       currentAgentLogs.push(`[Model] Proactively using ${activeRunModelName} for this deep task (upgraded from ${userSelectedModelName}).`);
       if (window.appendSystemMessage) window.appendSystemMessage(`Using ${activeRunModelName} for this task — it looks like it needs a stronger model than ${userSelectedModelName}.`, { conversationId: conversation.id });
     }
+  } else if (conversation._proactiveDeepTaskModel && conversation._proactiveDeepTaskBaseModel === userSelectedModelName) {
+    // This call didn't freshly classify complexity (a plan-approval reply, an internal follow-up,
+    // or an already-approved continuation) but a deep-task upgrade is still active for the
+    // current unresolved mission and the user hasn't changed their model selection since — keep
+    // using it instead of reverting to the base model mid-execution.
+    activeRunModelName = conversation._proactiveDeepTaskModel;
+    config.activeRunModelName = activeRunModelName;
   }
 
   // A genuinely new task resets the auto-continue budget and stall tracking so prior runs
@@ -1600,11 +1622,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           } else {
             consecutiveEditFailureCounts.delete(editKey);
             if (modelEscalatedForEditKey === editKey) {
-              const revertNote = `${args.path} was edited cleanly; reverting to ${userSelectedModelName}.`;
+              // Revert to the proactive deep-task baseline if one is still active for this
+              // mission, not all the way past it to the user's raw selection — the task is
+              // still deep even though this one file is now fixed.
+              const revertTarget = conversation._proactiveDeepTaskModel || userSelectedModelName;
+              const revertNote = `${args.path} was edited cleanly; reverting to ${revertTarget}.`;
               currentAgentLogs.push({ type: 'thought', content: revertNote });
               if (window.appendSystemMessage) window.appendSystemMessage(revertNote, { conversationId: conversation.id });
-              activeRunModelName = userSelectedModelName;
-              config.activeRunModelName = userSelectedModelName;
+              activeRunModelName = revertTarget;
+              config.activeRunModelName = revertTarget;
               modelEscalatedForEditKey = null;
             }
           }

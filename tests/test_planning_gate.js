@@ -2030,6 +2030,93 @@ test('a task classified as light complexity never downgrades below the user\'s e
   t.end();
 });
 
+// Regression: a real transcript showed the proactive deep-task model upgrade only lasting for
+// the planning turn — the moment the user approved the plan, execution silently reverted to the
+// base model (gemini-2.5-flash-lite), which then repeatedly corrupted the file with syntax
+// errors before the REACTIVE escalation eventually kicked in. Root cause: the plan-approval
+// branch's planningDecision never carries taskComplexity (only classifyPlanningNeed sets it), so
+// without persisting the upgrade on the conversation object, a fresh runAgentLoop call for the
+// approval turn recomputed taskComplexity as "standard" and used the raw base model for all the
+// actual editing. The fix persists the upgrade on conversation._proactiveDeepTaskModel so it
+// survives into the approval/execution call.
+test('a proactive deep-task model upgrade survives into the plan-approval/execution turn instead of silently reverting', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: false });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    readFile: async (workspacePath, filePath) => {
+      if (filePath === 'STRATEGY.md') return validStrategy();
+      if (filePath === 'implementation_plan.md') return '# Plan\n\n## Testing Plan\n\nRun the tests.';
+      return '';
+    },
+    writeFile: async () => ({ success: true }),
+    listFiles: async () => ([]),
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+  };
+
+  const conversation = { id: 'test-proactive-persist', messages: [], awaitingPlanApproval: false, planApproved: false };
+
+  const modelsRequested = [];
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes("Classify whether this Orion AI request should require an implementation plan")) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"plan","taskComplexity":"deep","reason":"large multi-file rework"}' }] } }] }) };
+    }
+    if (lastText.includes("Classify the user's latest message about a pending implementation plan")) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"intent":"approve","reason":""}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    const modelMatch = String(url).match(/\/models\/([^:]+):generateContent/);
+    modelsRequested.push(modelMatch ? modelMatch[1] : null);
+    return {
+      ok: true,
+      json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'write_file', args: { path: 'implementation_plan.md', content: 'plan' } } }] } }] })
+    };
+  };
+
+  try {
+    // Turn 1: fresh task, classified deep -> plan is written and pauses for approval.
+    await window.runAgentLoop('fix the apex velocity game and get it working properly', 'gemini-2.5-flash-lite', conversation);
+    t.equal(modelsRequested[0], 'gemini-2.5-flash', 'the planning turn itself is already upgraded for a deep task');
+    t.equal(conversation.awaitingPlanApproval, true, 'the plan is written and pauses for approval');
+    t.equal(conversation._proactiveDeepTaskModel, 'gemini-2.5-flash', 'the upgrade is persisted on the conversation for the approval turn to reuse');
+
+    // Turn 2: a brand-new runAgentLoop call for the user's "approve" reply. This is exactly the
+    // call that silently reverted to the base model before this fix.
+    global.fetch = async (url, options) => {
+      const body = JSON.parse(options.body);
+      const contents = body.contents || [];
+      const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+      if (lastText.includes("Classify the user's latest message about a pending implementation plan")) {
+        return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"intent":"approve","reason":""}' }] } }] }) };
+      }
+      if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+      const modelMatch = String(url).match(/\/models\/([^:]+):generateContent/);
+      modelsRequested.push(modelMatch ? modelMatch[1] : null);
+      return {
+        ok: true,
+        json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'Approved and continuing.' }] } }] })
+      };
+    };
+    await window.runAgentLoop('approved, go ahead', 'gemini-2.5-flash-lite', conversation);
+    t.equal(modelsRequested[1], 'gemini-2.5-flash', 'the approval/execution turn keeps the upgraded model instead of reverting to the base model');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+  }
+  t.end();
+});
+
 // Phase 4c of the reliability/cost pass: old, large, read-only tool outputs (a directory
 // listing, a large file read) are resent on every subsequent API call for the rest of the run
 // even though the model rarely needs the exact bytes again once a few turns have passed. This
