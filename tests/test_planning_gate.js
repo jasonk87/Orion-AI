@@ -826,6 +826,123 @@ test('direct-mode edits without any mission state still require verification evi
   t.end();
 });
 
+// Regression: a real run showed patch_file's own auto-test-after-edit check detecting a real
+// regression ("[WARNING] REGRESSION DETECTED...]" embedded in the tool result message), but the
+// run kept patching more files anyway instead of stopping to fix it — because that warning text
+// was never captured on the walkthrough item, and a failed run_tests/run_command call was still
+// being treated as "verification happened" since only the tool name/command was checked, not
+// whether it actually passed.
+test('verification-status helpers require a check to actually pass, not just run', (t) => {
+  const failedRunTests = [
+    { kind: 'file', path: 'a.js', status: 'done' },
+    { toolName: 'run_tests', status: 'error' }
+  ];
+  t.equal(agent.hasVerificationAfterLastFileEdit(failedRunTests), false, 'a failed run_tests call is not verification');
+
+  const passedRunTests = [
+    { kind: 'file', path: 'a.js', status: 'done' },
+    { toolName: 'run_tests', status: 'done' }
+  ];
+  t.equal(agent.hasVerificationAfterLastFileEdit(passedRunTests), true, 'a passing run_tests call is real verification');
+
+  const item = { label: 'Wrote a.js' };
+  agent.updateWalkthroughItem(item, 'patch_file', { path: 'a.js' }, {
+    success: true,
+    message: 'File patched successfully.\n[WARNING] REGRESSION DETECTED: Regression tests failed after this patch. Please inspect your change.'
+  }, null);
+  t.equal(item.regressionDetected, true, 'the regression warning embedded in an otherwise-successful patch result is captured on the item');
+  t.ok(item.detail.includes('Regression detected'), 'the walkthrough detail surfaces the regression to the user, not just internal gating');
+
+  const cleanItem = { label: 'Wrote b.js' };
+  agent.updateWalkthroughItem(cleanItem, 'patch_file', { path: 'b.js' }, { success: true, message: 'File patched successfully.' }, null);
+  t.equal(cleanItem.regressionDetected, false, 'a clean patch result is not flagged');
+
+  t.equal(agent.hasUnresolvedRegressionWarning([item]), true, 'a regression-flagged edit with no later verification is unresolved');
+  t.equal(agent.hasUnresolvedRegressionWarning([item, { toolName: 'run_tests', status: 'done' }]), false, 'a later passing verification resolves the regression');
+  t.equal(agent.hasUnresolvedRegressionWarning([item, cleanItem]), true, 'more edits alone do not resolve a previously detected regression without a real passing check');
+
+  t.end();
+});
+
+test('a real detected regression stops the run with a specific message, not a generic "unverified" one', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: true });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  let regressionCheckCount = 0;
+  global.window.runRegressionTests = async () => {
+    regressionCheckCount++;
+    // First call (before the edit) reports passing; second call (after the edit) reports failing —
+    // matching the tool handler's own beforePass/afterPass comparison that decides whether to embed
+    // the "[WARNING] REGRESSION DETECTED...]" text.
+    return { success: regressionCheckCount % 2 === 1, output: regressionCheckCount % 2 === 1 ? 'ok' : 'FAIL: 1 test failed' };
+  };
+  global.window.api = {
+    readFile: async () => '',
+    patchFile: async () => ({ success: true, changed: true, message: 'Patched src/game/units/MilitaryUnit.js successfully.' }),
+    listFiles: async () => ([{ path: 'test.txt', isDir: false, size: 100 }]),
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+  };
+
+  const conversation = { id: 'test-real-regression', messages: [], awaitingPlanApproval: false, planApproved: true };
+
+  let turnCount = 0;
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    turnCount++;
+    if (turnCount === 1) {
+      return {
+        ok: true,
+        json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'patch_file', args: { path: 'src/game/units/MilitaryUnit.js', operation: { type: 'insert', anchor: 'x', content: 'y', position: 'before' } } } }] } }] })
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        candidates: [{
+          finishReason: 'STOP',
+          content: { parts: [{ text: 'Added the new AI state handling to MilitaryUnit.js as requested.' }] }
+        }]
+      })
+    };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => {
+      if (delay !== 500) return originalSetTimeout(fn, delay);
+      return null;
+    };
+
+    await window.runAgentLoop('add AI states to MilitaryUnit.js', 'gemini-1', conversation);
+
+    const aiMessage = conversation.messages.find(m => m.role === 'assistant');
+    t.ok(aiMessage, 'assistant message was created');
+    t.ok(aiMessage.text.includes('regression test check that ran after one of these edits FAILED'), 'the run reports the specific regression failure, not a generic unverified message');
+    t.notOk(aiMessage.text.includes('did not verify the change with a real test'), 'this is not mistaken for the generic missing-verification case');
+    t.ok(aiMessage.text.includes('MilitaryUnit.js'), 'the affected file is named');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+    delete global.window.runRegressionTests;
+  }
+
+  t.end();
+});
+
 // Regression: stall detection previously only counted completed checklist items + satisfied win
 // conditions as "progress". A model that made real file edits/commands but forgot to check off a
 // task looked identical to a pass that only produced failures, and both got flagged as stalled

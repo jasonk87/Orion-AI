@@ -472,6 +472,7 @@
       /completed the next batch of implementation steps/.test(normalized) ||
       /i paused after several automatic continuation passes/.test(normalized) ||
       /did not verify the change with a real test/.test(normalized) ||
+      /regression test check that ran after one of these edits failed/.test(normalized) ||
       /i made progress but the plan is not finished yet/.test(normalized) ||
       normalized.trim().startsWith('task finished.');
   }

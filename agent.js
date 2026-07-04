@@ -1165,6 +1165,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           // in the latter case, stop honestly instead of finishing silently.
           const filesTouchedThisRun = [...new Set(workWalkthrough.filter(isFileMutationItem).map(item => item.path))]
             .filter(path => !isImplementationPlanPath(path) && !isStrategyPath(path));
+          if (filesTouchedThisRun.length > 0 && hasUnresolvedRegressionWarning(workWalkthrough)) {
+            lastTextResponse = `I changed source file(s) (${filesTouchedThisRun.map(path => `\`${path}\``).join(', ')}) and the regression test check that ran after one of these edits FAILED — this is not unverified, it is verified and broken. This is not complete — ask me to continue and I should read the failing output, fix what broke, and rerun the check until it passes before doing anything else.`;
+            break;
+          }
           if (filesTouchedThisRun.length > 0 && !hasVerificationAfterLastFileEdit(workWalkthrough)) {
             lastTextResponse = `I changed source file(s) (${filesTouchedThisRun.map(path => `\`${path}\``).join(', ')}) but did not verify the change with a real test, smoke check, or manual run. This is not complete — ask me to continue and I should run the appropriate check (run_tests, run_command, or a manual smoke check) and confirm it passes, or clearly explain why no check is possible.`;
             break;
@@ -3684,7 +3688,17 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
     return;
   }
   if (toolName === 'write_file' || toolName === 'modify_file' || toolName === 'patch_file') {
-    item.detail = result && result.backupPath ? `Backup: \`${result.backupPath}\`` : '';
+    // The auto-test-after-edit regression warning lives only in result.message (surfaced to the
+    // model as tool-response text) — it was never captured on the walkthrough item itself, so the
+    // verification gates below had no way to see that a change actually broke the test suite.
+    // Presence of a run_tests/run_command call was being treated as "verified", even when the
+    // most recent evidence was a failure.
+    const message = result && typeof result.message === 'string' ? result.message : '';
+    item.regressionDetected = /REGRESSION DETECTED/.test(message);
+    const backupDetail = result && result.backupPath ? `Backup: \`${result.backupPath}\`` : '';
+    item.detail = item.regressionDetected
+      ? `${backupDetail ? `${backupDetail} — ` : ''}⚠ Regression detected: tests failed after this change.`
+      : backupDetail;
   } else if (toolName === 'set_task_checklist') {
     item.detail = result && result.skipped ? result.message : '';
   } else if (toolName === 'get_workspace_info') {
@@ -3794,13 +3808,19 @@ async function findMissingHtmlLocalReferences(workspace, htmlPath, htmlContent) 
   return missing;
 }
 
+// A check that RAN is not the same as a check that PASSED. This must reject failed verification
+// attempts (item.status === 'error', e.g. a run_tests call that came back with success: false),
+// not just require that a verification-shaped tool was called — otherwise a turn where npm test
+// runs and fails still counts as "verified", and the run keeps going instead of stopping to fix
+// the actual failure.
 function isVerificationItem(item) {
   if (!item) return false;
+  if (item.status === 'error') return false;
   if (item.toolName === 'run_tests' || item.kind === 'test') return true;
   if (item.toolName === 'run_command') return isRealVerificationCommand(item.command);
   if (item.toolName === 'start_command') return isRealVerificationCommand(item.command);
   // A bounded GUI preview that actually captured a screenshot is real evidence the app rendered.
-  if (item.toolName === 'preview_app') return item.status !== 'error';
+  if (item.toolName === 'preview_app') return true;
   return false;
 }
 
@@ -3809,6 +3829,24 @@ function hasVerificationAfterLastFileEdit(items) {
   const lastEditIndex = list.findLastIndex(item => isFileMutationItem(item));
   if (lastEditIndex === -1) return true;
   return list.slice(lastEditIndex + 1).some(item => isVerificationItem(item));
+}
+
+// write_file/modify_file/patch_file run their own auto-test-before/after-edit check internally
+// (see the tool handlers) and surface a "[WARNING] REGRESSION DETECTED...]" string embedded in
+// the tool result's message — but that text was never captured onto the walkthrough item itself
+// (only the backup path was), so this gate had no way to see that an edit's own auto-test check
+// found a real regression. updateWalkthroughItem now sets item.regressionDetected for these tools;
+// this walks backward from the most recent item and treats a regression as unresolved unless a
+// genuine passing verification (isVerificationItem) shows up after it.
+function hasUnresolvedRegressionWarning(items) {
+  const list = Array.isArray(items) ? items : [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    const item = list[i];
+    if (!item) continue;
+    if (isVerificationItem(item)) return false;
+    if (item.regressionDetected) return true;
+  }
+  return false;
 }
 
 function hasReadAfterLastFileEdit(items) {
@@ -3821,14 +3859,30 @@ function hasReadAfterLastFileEdit(items) {
 function buildPostEditEvidencePrompt(items, options = {}) {
   const list = Array.isArray(items) ? items : [];
   if (!options.canExecute) return '';
-  if ((options.promptCount || 0) >= (options.maxPrompts || 2)) return '';
   const filesTouched = [...new Set(list.filter(isFileMutationItem).map(item => item.path))];
   if (!filesTouched.length) return '';
+  const fileList = filesTouched.map(path => `\`${path}\``).join(', ');
+
+  // A regression that was actually detected and never resolved takes priority over the generic
+  // "did you verify" nudge, and is not subject to the same nudge-count cap — letting a known
+  // broken change slide after 2 attempts is worse than letting an unverified-but-possibly-fine one
+  // slide, and the hard verification gate later in the loop will stop the run either way.
+  if (hasUnresolvedRegressionWarning(list)) {
+    return `[SYSTEM: Regression detected. Your own edit to ${fileList} triggered an automatic regression-test check that FAILED — this is not "unverified", it is verified and broken.
+
+Do not continue implementing further steps. Fix the actual regression now:
+- Read the failing output (rerun the project's regression command directly if the failure reason isn't already visible).
+- Identify what your change broke and fix it in the affected file(s).
+- Rerun the regression command and confirm it passes before doing anything else.
+
+Do not report this step as complete until the regression is actually fixed and verified passing.]`;
+  }
+
+  if ((options.promptCount || 0) >= (options.maxPrompts || 2)) return '';
   const missingRead = !hasReadAfterLastFileEdit(list);
   const missingVerification = !hasVerificationAfterLastFileEdit(list);
   if (!missingRead && !missingVerification) return '';
 
-  const fileList = filesTouched.map(path => `\`${path}\``).join(', ');
   return `[SYSTEM: Post-edit evidence gate. You changed source files (${fileList}) but have not yet produced enough evidence to finish.
 
 Before giving a final answer:
@@ -6747,6 +6801,8 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     isRealVerificationCommand,
     isVerificationItem,
     hasVerificationAfterLastFileEdit,
+    hasUnresolvedRegressionWarning,
+    updateWalkthroughItem,
     buildPostEditEvidencePrompt,
     buildFinalVerificationSummary,
     stripEchoedSystemScaffold,
