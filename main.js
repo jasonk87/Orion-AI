@@ -139,6 +139,7 @@ if (process.env.NODE_ENV === 'test') {
     normalizeConversationIdForCommandSession: ipcShell.normalizeConversationIdForCommandSession,
     commandLooksPowerShellSpecific: ipcShell.commandLooksPowerShellSpecific,
     hasUnquotedSemicolon: ipcShell.hasUnquotedSemicolon,
+    pickBestClickCandidate: ipcShell.pickBestClickCandidate,
     getCommandShellSpec: ipcShell.getCommandShellSpec,
     previewWorkspaceApp: ipcShell.previewWorkspaceApp,
     // ipc-file-tools

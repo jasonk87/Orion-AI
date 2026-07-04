@@ -115,6 +115,34 @@ test('commands with a real unquoted semicolon route to PowerShell instead of sil
   t.end();
 });
 
+// Regression: a real auth page had a tab button labeled "Register" (outside any <form>, just
+// toggling which form is visible) sitting right next to that form's actual submit button, also
+// labeled "Register". click_element{text:"Register"} always picked whichever matched first in DOM
+// order — the tab, which came first in the markup — so the registration form was never actually
+// submitted, with no error to indicate anything went wrong.
+test('pickBestClickCandidate prefers a form submit button over a same-labeled tab/toggle button', (t) => {
+  const candidates = [
+    { text: 'Login', insideForm: false },
+    { text: 'Register', insideForm: false }, // the auth-tab button — appears first in DOM order
+    { text: 'Register', insideForm: true }   // the form's actual submit button
+  ];
+  const best = main.pickBestClickCandidate(candidates, 'Register');
+  t.ok(best && best.insideForm === true, 'the in-form submit button is chosen over the earlier same-labeled tab button');
+
+  const onlyOneMatch = main.pickBestClickCandidate([{ text: 'Sign In', insideForm: true }], 'sign in');
+  t.ok(onlyOneMatch && onlyOneMatch.insideForm === true, 'an unambiguous single match still works as before');
+
+  const noMatch = main.pickBestClickCandidate([{ text: 'Cancel', insideForm: false }], 'Submit');
+  t.equal(noMatch, null, 'no candidate is returned when nothing matches the requested text');
+
+  const exactPreferred = main.pickBestClickCandidate(
+    [{ text: 'Register now', insideForm: false }, { text: 'Register', insideForm: false }],
+    'Register'
+  );
+  t.equal(exactPreferred.text, 'Register', 'an exact text match is preferred over a longer partial match, even outside a form');
+  t.end();
+});
+
 test('conversation command matching handles raw and normalized process ids', (t) => {
   const conversationId = 'conv-123-abc';
   t.equal(main.normalizeConversationIdForCommandSession(conversationId), 'conv_123_abc', 'normalizes conversation id for command sessions');
