@@ -261,6 +261,66 @@ test('packaged updater tracks all runtime modules required by main process', (t)
   t.end();
 });
 
+// Regression: launch_workspace_app never tracked or killed a workspace's previously-launched
+// process before starting a new one. Re-running "run this program" (after a hard stop, a retry,
+// or just asking again) piled up untracked processes with no way for Orion to find or kill them —
+// exactly the "starting new programs but not ending the old ones" behavior a user reported.
+test('relaunching a workspace app kills the previously tracked instance first', (t) => {
+  const os = require('os');
+  const path = require('path');
+  const ws = require('fs').mkdtempSync(path.join(os.tmpdir(), 'orion-relaunch-'));
+
+  const first = main.spawnInternalCommand(ws, process.execPath, ['-e', 'setInterval(() => {}, 1000)']);
+  t.ok(first.pid, 'first process has a pid');
+  t.equal(main.launchedWorkspaceProcesses.get(main.workspaceKey(ws)), first.pid, 'first process is tracked for this workspace');
+
+  const started = Date.now();
+  const poll = setInterval(() => {
+    let firstStillAlive = true;
+    try { process.kill(first.pid, 0); } catch (_) { firstStillAlive = false; }
+
+    if (!firstStillAlive || Date.now() - started > 5000) {
+      clearInterval(poll);
+      t.notOk(firstStillAlive, 'the first process is no longer running after the relaunch killed it');
+      try { process.kill(second.pid, 'SIGKILL'); } catch (_) {}
+      t.end();
+    }
+  }, 100);
+
+  // Relaunching for the SAME workspace should kill `first` before starting `second`.
+  const second = main.spawnInternalCommand(ws, process.execPath, ['-e', 'setInterval(() => {}, 1000)']);
+  t.ok(second.pid, 'second process has a pid');
+  t.notEqual(second.pid, first.pid, 'the second process is a genuinely new process');
+  t.equal(main.launchedWorkspaceProcesses.get(main.workspaceKey(ws)), second.pid, 'tracking now points at the second process');
+});
+
+test('killTrackedWorkspaceProcess is a no-op when nothing is tracked, and clears its own entry after killing', (t) => {
+  const os = require('os');
+  const path = require('path');
+  const ws = require('fs').mkdtempSync(path.join(os.tmpdir(), 'orion-relaunch-notrack-'));
+
+  t.doesNotThrow(() => main.killTrackedWorkspaceProcess(ws), 'killing with nothing tracked for this workspace does not throw');
+
+  const child = require('child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
+  child.unref();
+  main.trackWorkspaceProcess(ws, child.pid);
+  t.equal(main.launchedWorkspaceProcesses.get(main.workspaceKey(ws)), child.pid, 'process is tracked after trackWorkspaceProcess');
+
+  main.killTrackedWorkspaceProcess(ws);
+  t.notOk(main.launchedWorkspaceProcesses.has(main.workspaceKey(ws)), 'tracking entry is cleared after killing');
+
+  const started = Date.now();
+  const poll = setInterval(() => {
+    let stillAlive = true;
+    try { process.kill(child.pid, 0); } catch (_) { stillAlive = false; }
+    if (!stillAlive || Date.now() - started > 5000) {
+      clearInterval(poll);
+      t.notOk(stillAlive, 'the tracked process was actually killed');
+      t.end();
+    }
+  }, 100);
+});
+
 test('preview_app launches a persistent session and does NOT auto-close', async (t) => {
   const fs = require('fs');
   const os = require('os');

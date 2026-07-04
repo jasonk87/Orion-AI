@@ -175,6 +175,12 @@ if (process.env.NODE_ENV === 'test') {
     cosineSimilarity: ipcWorkspace.cosineSimilarity,
     getGeminiEmbedding: ipcWorkspace.getGeminiEmbedding,
     spawnInternalCommand: ipcWorkspace.spawnInternalCommand,
+    workspaceKey: ipcWorkspace.workspaceKey,
+    launchCommandInWorkspace: ipcWorkspace.launchCommandInWorkspace,
+    trackWorkspaceProcess: ipcWorkspace.trackWorkspaceProcess,
+    killTrackedWorkspaceProcess: ipcWorkspace.killTrackedWorkspaceProcess,
+    findChildProcessId: ipcWorkspace.findChildProcessId,
+    launchedWorkspaceProcesses: ipcWorkspace.launchedWorkspaceProcesses,
     // ipc-ui
     computeSourceUpdates: ipcUi.computeSourceUpdates,
     getAppRuntimeInfo: ipcUi.getAppRuntimeInfo,
