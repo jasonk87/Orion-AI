@@ -347,6 +347,38 @@ test('a spawn failure in spawnInternalCommand does not crash the process', (t) =
   }, 500);
 });
 
+// Regression: `spawn('npm', ...)` fails with ENOENT on Windows, because `npm` is actually an
+// `npm.cmd` shim, not a raw .exe, and Node's spawn() doesn't resolve .cmd extensions the way a
+// real shell does. This is why launch_workspace_app's "npm start"/"npm run dev" auto-detection
+// never actually launched anything on Windows — it just silently (and, before the previous fix,
+// fatally) failed. Routing through cmd.exe lets Windows resolve npm the same way a typed terminal
+// command would.
+test('spawnInternalCommand can actually run npm on Windows instead of failing with ENOENT', (t) => {
+  if (process.platform !== 'win32') {
+    t.pass('Windows-only npm resolution check skipped on non-Windows');
+    t.end();
+    return;
+  }
+
+  const os = require('os');
+  const path = require('path');
+  const ws = require('fs').mkdtempSync(path.join(os.tmpdir(), 'orion-npm-resolve-'));
+
+  const child = main.spawnInternalCommand(ws, 'npm', ['--version']);
+  t.ok(child.pid, 'the wrapped npm invocation has a pid');
+
+  const timeout = setTimeout(() => {
+    t.fail('npm --version did not close within the timeout');
+    t.end();
+  }, 10000);
+
+  child.on('close', code => {
+    clearTimeout(timeout);
+    t.equal(code, 0, 'npm --version actually ran and exited cleanly, instead of ENOENT-failing');
+    t.end();
+  });
+});
+
 test('preview_app launches a persistent session and does NOT auto-close', async (t) => {
   const fs = require('fs');
   const os = require('os');
