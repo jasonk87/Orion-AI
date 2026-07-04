@@ -1439,9 +1439,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             }
           }
         }
-        // A successful read_file clears the read-required gate for that file
+        // A successful read_file clears the read-required gate for that file. When the gate was
+        // actually blocking an edit, tell the model to retry that edit now instead of stopping or
+        // re-reading again — otherwise a small/fast model can burn the rest of the turn re-reading
+        // the same file repeatedly without ever producing the corrected edit the guard was for.
         if (toolName === 'read_file' && args.path && !isFailedToolResult(result)) {
-          fileNeedsReadBeforeEdit.delete(String(args.path).toLowerCase());
+          const readKey = String(args.path).toLowerCase();
+          const wasBlocked = fileNeedsReadBeforeEdit.has(readKey);
+          fileNeedsReadBeforeEdit.delete(readKey);
+          if (wasBlocked && result && typeof result === 'object' && !Array.isArray(result)) {
+            result.editRetryReminder = `You previously had an edit to ${args.path} blocked until you re-read it. You have now read its current content above. Retry the edit you were making now, using this fresh content, instead of reading this file again or stopping without editing.`;
+          }
         }
 
         toolResponseParts.push({
@@ -1598,11 +1606,19 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       ? workingState.winConditions.filter(condition => condition.status === 'satisfied').length : 0;
     const progressScore = completedChecklist + satisfiedWins;
 
+    // Real workspace edits/commands this pass are also genuine progress, even if the model never
+    // called set_task_checklist to check anything off. Checklist bookkeeping is a courtesy the
+    // model can forget to do — it must not be the only signal stall detection trusts, or a pass
+    // that made real file edits (but no checklist update) looks identical to a pass that thrashed
+    // on nothing but failed tool calls, and both get stopped prematurely as "stalled."
+    const EDIT_OR_COMMAND_TOOLS = new Set(['write_file', 'modify_file', 'patch_file', 'run_command', 'start_command', 'run_tests']);
+    const hadSuccessfulEditOrCommandThisPass = (workWalkthrough || []).some(item => item && item.status !== 'error' && EDIT_OR_COMMAND_TOOLS.has(item.toolName));
+
     conversation._planExecAutoContinues = conversation._planExecAutoContinues || 0;
     if (typeof conversation._lastProgressScore !== 'number') conversation._lastProgressScore = -1;
-    if (progressScore > conversation._lastProgressScore) {
+    if (progressScore > conversation._lastProgressScore || hadSuccessfulEditOrCommandThisPass) {
       conversation._stallPasses = 0;
-      conversation._lastProgressScore = progressScore;
+      conversation._lastProgressScore = Math.max(progressScore, conversation._lastProgressScore);
     } else {
       conversation._stallPasses = (conversation._stallPasses || 0) + 1;
     }

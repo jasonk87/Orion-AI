@@ -535,6 +535,106 @@ test('repeated tool failures during execution do not re-trigger plan approval UI
   t.end();
 });
 
+// Regression: the edit-thrash guard blocked repeated edits to the same file until a read_file
+// happened, but a small/fast model would sometimes just re-read the file repeatedly afterward
+// without ever retrying the edit the guard was blocking — wasting the rest of the turn. The fix
+// attaches a reminder to the read_file tool response telling the model to retry the edit now.
+test('edit-blocked guard reminds the model to retry the edit after it re-reads the file', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0 });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    readFile: async () => 'const x = 1;\nconst y = 2;\nconst z = 3;\n',
+    writeFile: async () => ({ success: true, backupPath: null }),
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+    listFiles: async () => ([{ path: 'test.txt', isDir: false, size: 100 }]),
+  };
+
+  const conversation = {
+    id: 'test-edit-retry-reminder',
+    messages: [],
+    awaitingPlanApproval: false,
+    planApproved: true,
+  };
+
+  let turnCount = 0;
+  let readFileResponseSeen = null;
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+
+    // The routing classifier and the per-turn countTokens preflight each make their own fetch
+    // call before the actual model turn; neither may consume a slot in the turnCount sequence
+    // below, or every branch shifts and the intended modify/modify/modify(blocked)/read_file
+    // sequence never actually happens.
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) {
+      return { ok: true, json: async () => ({ totalTokens: 100 }) };
+    }
+
+    // Function-call responses are serialized as {role: 'user', parts: [{functionResponse}]} rather
+    // than a distinct 'tool' role, so search all parts for the read_file response directly.
+    for (const message of contents) {
+      const readResponse = (message.parts || []).find(p => p.functionResponse && p.functionResponse.name === 'read_file');
+      if (readResponse) readFileResponseSeen = readResponse.functionResponse.response;
+    }
+
+    turnCount++;
+    const respondWith = (functionCall) => ({
+      ok: true,
+      json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall }] } }] })
+    });
+
+    if (turnCount === 1) return respondWith({ name: 'modify_file', args: { path: 'a.js', target: 'const x = 1;', replacement: 'const x = 10;' } });
+    if (turnCount === 2) return respondWith({ name: 'modify_file', args: { path: 'a.js', target: 'const y = 2;', replacement: 'const y = 20;' } });
+    // Third edit to the same file without an intervening read should be blocked by the thrash guard.
+    if (turnCount === 3) return respondWith({ name: 'modify_file', args: { path: 'a.js', target: 'const z = 3;', replacement: 'const z = 30;' } });
+    if (turnCount === 4) return respondWith({ name: 'read_file', args: { path: 'a.js' } });
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'All edits are complete now.' }] } }] }) };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => {
+      if (delay !== 500) return originalSetTimeout(fn, delay);
+      return null;
+    };
+
+    await window.runAgentLoop('edit the file twice then edit again', 'gemini-1', conversation);
+
+    t.ok(readFileResponseSeen, 'the read_file call after being blocked produced a visible tool response');
+    t.ok(readFileResponseSeen && readFileResponseSeen.editRetryReminder, 'the read_file response includes a reminder to retry the blocked edit');
+    t.ok(readFileResponseSeen && readFileResponseSeen.editRetryReminder.includes('a.js'), 'the reminder names the file that was blocked');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+
+  t.end();
+});
+
+// Regression: stall detection previously only counted completed checklist items + satisfied win
+// conditions as "progress". A model that made real file edits/commands but forgot to check off a
+// task looked identical to a pass that only produced failures, and both got flagged as stalled
+// after enough passes — stopping a run that was actually still making progress.
+test('stall detection also treats successful file edits/commands as progress, not just checklist completion', (t) => {
+  const agentSource = require('fs').readFileSync(require('path').join(__dirname, '../agent.js'), 'utf8');
+  t.ok(agentSource.includes('hadSuccessfulEditOrCommandThisPass'), 'stall detection tracks successful edits/commands this pass');
+  t.ok(agentSource.includes('progressScore > conversation._lastProgressScore || hadSuccessfulEditOrCommandThisPass'),
+    'a pass resets stall tracking on either checklist progress or a successful edit/command, not checklist progress alone');
+  t.end();
+});
+
 test('buildRemainingWorkSummary lists pending tasks and next action honestly', (t) => {
   const pending = [
     { title: 'Implement food spawning', status: 'pending' },
