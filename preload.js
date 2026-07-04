@@ -18,6 +18,7 @@ contextBridge.exposeInMainWorld('api', {
   gitPush: (workspacePath, remote, branch, setUpstream) => ipcRenderer.invoke('git-push', { workspacePath, remote, branch, setUpstream }),
   listDirectoryChildren: (dirPath) => ipcRenderer.invoke('list-directory-children', dirPath),
   listFiles: (dirPath) => ipcRenderer.invoke('list-files', dirPath),
+  grepSearch: (workspacePath, pattern, options) => ipcRenderer.invoke('grep-search', { workspacePath, pattern, options }),
   readFile: (workspacePath, relativePath, options) => ipcRenderer.invoke('read-file', { workspacePath, relativePath, options }),
   deletePath: (workspacePath, relativePath) => ipcRenderer.invoke('delete-path', { workspacePath, relativePath }),
   movePath: (workspacePath, fromPath, toPath) => ipcRenderer.invoke('move-path', { workspacePath, fromPath, toPath }),

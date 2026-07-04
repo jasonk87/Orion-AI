@@ -2181,3 +2181,82 @@ test('utility/classifier call sites are wrapped with resolveUtilityModelName ins
   t.end();
 });
 
+// grep_search closes a real gap: the system prompt referenced a "grep_search" tool for years
+// (as an example local tool) but it was never declared in the tool schema and had no executor —
+// the model could never actually call it. This wires it up for real: a literal/regex content
+// search across the workspace, delegated to window.api.grepSearch (the IPC-backed
+// implementation), with the same truncation-safety mindset as the other inspection tools.
+test('grep_search requires a pattern argument', async (t) => {
+  global.window.api = { grepSearch: async () => ({ success: true, results: [] }) };
+  try {
+    await agent.executeTool('grep_search', {}, '/test/workspace', {});
+    t.fail('should have thrown for a missing pattern');
+  } catch (e) {
+    t.ok(/pattern/i.test(e.message), 'error names the missing pattern parameter');
+  }
+  t.end();
+});
+
+test('grep_search passes the workspace, pattern, and options through to window.api.grepSearch with sane defaults', async (t) => {
+  let capturedArgs = null;
+  global.window.api = {
+    grepSearch: async (workspace, pattern, options) => {
+      capturedArgs = { workspace, pattern, options };
+      return { success: true, results: [{ path: 'server.js', line: 42, text: "socket.on('input', (inputs) => {" }] };
+    }
+  };
+  const result = await agent.executeTool('grep_search', { pattern: "socket.on('input'" }, '/test/workspace', {});
+  t.equal(capturedArgs.workspace, '/test/workspace', 'the active workspace is passed through');
+  t.equal(capturedArgs.pattern, "socket.on('input'", 'the literal pattern is passed through');
+  t.equal(capturedArgs.options.regex, false, 'regex defaults to false for a plain literal search');
+  t.equal(capturedArgs.options.caseSensitive, false, 'caseSensitive defaults to false');
+  t.equal(capturedArgs.options.maxResults, 100, 'maxResults defaults to 100');
+  t.equal(result.results[0].path, 'server.js', 'the match result is returned to the model');
+  t.end();
+});
+
+test('grep_search forwards regex/caseSensitive/filePattern/maxResults when the model specifies them', async (t) => {
+  let capturedArgs = null;
+  global.window.api = {
+    grepSearch: async (workspace, pattern, options) => {
+      capturedArgs = { workspace, pattern, options };
+      return { success: true, results: [] };
+    }
+  };
+  await agent.executeTool('grep_search', {
+    pattern: 'addEventListener\\(.close-btn',
+    regex: true,
+    caseSensitive: true,
+    filePattern: '.html',
+    maxResults: 25
+  }, '/test/workspace', {});
+  t.equal(capturedArgs.options.regex, true, 'regex flag is forwarded');
+  t.equal(capturedArgs.options.caseSensitive, true, 'caseSensitive flag is forwarded');
+  t.equal(capturedArgs.options.filePattern, '.html', 'filePattern is forwarded');
+  t.equal(capturedArgs.options.maxResults, 25, 'maxResults is forwarded');
+  t.end();
+});
+
+test('grep_search surfaces a backend failure as a thrown error instead of a silent empty result', async (t) => {
+  global.window.api = {
+    grepSearch: async () => ({ success: false, error: 'Directory does not exist: /test/workspace' })
+  };
+  try {
+    await agent.executeTool('grep_search', { pattern: 'foo' }, '/test/workspace', {});
+    t.fail('should have thrown when the backend reports failure');
+  } catch (e) {
+    t.ok(/Directory does not exist/.test(e.message), 'the underlying error message is surfaced to the model');
+  }
+  t.end();
+});
+
+test('grep_search is declared in both the Ollama and Gemini tool schemas', (t) => {
+  const fs = require('fs');
+  const path = require('path');
+  const agentSource = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
+  const declarationMatches = agentSource.match(/name: "grep_search"/g) || [];
+  t.equal(declarationMatches.length, 2, 'grep_search is declared once for Ollama tools and once for Gemini tools');
+  t.ok(agentSource.includes("case 'grep_search'"), 'the executor has a grep_search case');
+  t.end();
+});
+

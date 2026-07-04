@@ -77,6 +77,7 @@ Tools available:
 - git_push: Push the current Git branch, or the current branch to a requested remote branch, when the user asks.
 - read_file: Read a file's content. For large files, first call get_symbol_index to locate the exact function/class by line number, then read only that range with startLine/endLine.
 - get_symbol_index: Returns function, class, and arrow-function symbols with line numbers for every JS/TS file in the workspace. Always call this before read_file on large source files — identify the target symbol's line range first. For any source file roughly above 300 lines or a few thousand characters, prefer get_symbol_index plus a targeted read_file(startLine, endLine) over reading the whole file in one call — a full read of a large file costs many times the tokens of a scoped read and usually contains far more than the current task needs.
+- grep_search: Searches file contents across the workspace for a literal string or regex pattern, returning matching file paths, line numbers, and line text. Use this before writing code that depends on an existing pattern (e.g. how similar buttons/components wire up event listeners) or before renaming/removing something, to find every call site first. Do not invent a function or API you have not verified exists in this codebase — grep_search or read_file to confirm it first.
 - write_file: Write a new file. Existing non-governance files require allowOverwrite=true and overwriteReason; prefer patch_file for source edits. STRATEGY.md and implementation_plan.md are governance files.
 - modify_file: Edit a specific section of a file (search and replace).
 - patch_file: Targeted file update using line ranges, anchors, exact replacement, or regex. Prefer this over rewriting large files.
@@ -2212,7 +2213,19 @@ async function executeTool(name, args, workspace, config, conversation) {
       if (!result.success) return { success: false, results: [], message: 'Semantic search is not available for this workspace. Use read_file or run_command to find what you need instead.' };
       return result;
     }
-    
+
+    case 'grep_search': {
+      if (!args.pattern) throw new Error("Missing 'pattern' parameter");
+      const result = await window.api.grepSearch(workspace, args.pattern, {
+        regex: !!args.regex,
+        caseSensitive: !!args.caseSensitive,
+        filePattern: args.filePattern,
+        maxResults: Number.isFinite(Number(args.maxResults)) ? Number(args.maxResults) : 100
+      });
+      if (!result || result.success === false) throw new Error((result && result.error) || 'grep_search failed');
+      return result;
+    }
+
     case 'read_file': {
       if (!args.path) throw new Error("Missing 'path' parameter");
       const content = await window.api.readFile(workspace, args.path, {
@@ -6003,6 +6016,21 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
           }
         },
         {
+          name: "grep_search",
+          description: "Searches file contents across the workspace for a literal string or regex pattern. Returns matching file paths, line numbers, and the matched line text. Use this before writing new code that depends on an existing pattern — e.g. to find how other similar UI elements wire up event listeners before adding one, or to find every call site of a function before renaming it. Prefer this over reading whole files when you just need to locate where something is defined or used.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              pattern: { type: "STRING", description: "The literal text or regex pattern to search for." },
+              regex: { type: "BOOLEAN", description: "Treat pattern as a regular expression. Defaults to false (literal substring match)." },
+              caseSensitive: { type: "BOOLEAN", description: "Case-sensitive match. Defaults to false." },
+              filePattern: { type: "STRING", description: "Optional file extension filter, e.g. '.js' or '.html'. Searches all text files if omitted." },
+              maxResults: { type: "NUMBER", description: "Maximum number of matches to return before truncation. Defaults to 100." }
+            },
+            required: ["pattern"]
+          }
+        },
+        {
           name: "search_embeddings",
           description: "Searches the workspace files semantically using vector embeddings of code chunks. Returns the most relevant code snippets with line numbers and file paths.",
           parameters: {
@@ -6831,6 +6859,21 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
                 }
               },
               required: ["tasks"]
+            }
+          },
+          {
+            name: "grep_search",
+            description: "Searches file contents across the workspace for a literal string or regex pattern. Returns matching file paths, line numbers, and the matched line text. Use this before writing new code that depends on an existing pattern — e.g. to find how other similar UI elements wire up event listeners before adding one, or to find every call site of a function before renaming it. Prefer this over reading whole files when you just need to locate where something is defined or used.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                pattern: { type: "STRING", description: "The literal text or regex pattern to search for." },
+                regex: { type: "BOOLEAN", description: "Treat pattern as a regular expression. Defaults to false (literal substring match)." },
+                caseSensitive: { type: "BOOLEAN", description: "Case-sensitive match. Defaults to false." },
+                filePattern: { type: "STRING", description: "Optional file extension filter, e.g. '.js' or '.html'. Searches all text files if omitted." },
+                maxResults: { type: "NUMBER", description: "Maximum number of matches to return before truncation. Defaults to 100." }
+              },
+              required: ["pattern"]
             }
           },
           {
