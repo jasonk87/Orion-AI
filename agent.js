@@ -76,7 +76,7 @@ Tools available:
 - set_workspace_entrypoint: Set or clear the launch entry point command for this workspace.
 - git_push: Push the current Git branch, or the current branch to a requested remote branch, when the user asks.
 - read_file: Read a file's content. For large files, first call get_symbol_index to locate the exact function/class by line number, then read only that range with startLine/endLine.
-- get_symbol_index: Returns function, class, and arrow-function symbols with line numbers for every JS/TS file in the workspace. Always call this before read_file on large source files — identify the target symbol's line range first.
+- get_symbol_index: Returns function, class, and arrow-function symbols with line numbers for every JS/TS file in the workspace. Always call this before read_file on large source files — identify the target symbol's line range first. For any source file roughly above 300 lines or a few thousand characters, prefer get_symbol_index plus a targeted read_file(startLine, endLine) over reading the whole file in one call — a full read of a large file costs many times the tokens of a scoped read and usually contains far more than the current task needs.
 - write_file: Write a new file. Existing non-governance files require allowOverwrite=true and overwriteReason; prefer patch_file for source edits. STRATEGY.md and implementation_plan.md are governance files.
 - modify_file: Edit a specific section of a file (search and replace).
 - patch_file: Targeted file update using line ranges, anchors, exact replacement, or regex. Prefer this over rewriting large files.
@@ -476,7 +476,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     agentExecutionMode = 'executing';
   } else if (conversation.awaitingPlanApproval && !conversation.planApproved) {
     // The user is replying to a pending plan. The model classifies their reply.
-    approvalIntent = await classifyPlanApprovalIntent(userPrompt, modelName, config.geminiApiKey);
+    approvalIntent = await classifyPlanApprovalIntent(userPrompt, resolveUtilityModelName(modelName), config.geminiApiKey);
     if (approvalIntent.intent === 'approve') {
       const planText = await readImplementationPlanText(workspacePath);
       if (hasRequiredTestingPlanSection(planText)) {
@@ -508,7 +508,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // unless the model judges it a genuinely new plan-worthy task.
     const decision = config.planningMode === false
       ? { mode: 'direct', reason: 'Planning mode disabled.' }
-      : await classifyPlanningNeed(userPrompt, modelName, config.geminiApiKey);
+      : await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config.geminiApiKey);
     // A mission is genuinely in progress when an active subplan still has work or any win
     // condition is unsatisfied. While that is true we must NEVER downgrade to a re-plan: doing
     // so clears planApproved and wipes the operational context (mission/subplan/win conditions),
@@ -534,7 +534,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     agentExecutionMode = 'direct';
   } else {
     // Fresh task, nothing pending or approved. The model decides plan / direct / answer.
-    const decision = await classifyPlanningNeed(userPrompt, modelName, config.geminiApiKey);
+    const decision = await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config.geminiApiKey);
     planningDecision = decision;
     reviewOnly = !!decision.reviewOnly;
     resetMissionState = true; // a fresh task should not inherit a previous mission's state
@@ -566,6 +566,24 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       benefitsFromWorkspaceContext: requestPlausiblyBenefitsFromWorkspaceContext(userPrompt),
       ...planningDecision
     };
+  }
+
+  // Proactive model tier selection: pick capability up front instead of only reacting after
+  // repeated edit failures already happened. The user's selected model is a FLOOR, never a
+  // ceiling — a "deep" task (multi-file implementation, non-trivial refactor, or anything
+  // plan-worthy) is upgraded one tier for the whole run, but a "light" task never downgrades
+  // below what the user explicitly picked. Reuses the existing escalation family-mapping so a
+  // later reactive escalation (see repeated-edit-failure handling below) still composes cleanly
+  // on top of this baseline instead of fighting it.
+  const taskComplexity = planningDecision.taskComplexity || (planningDecision.mode === 'plan' ? 'deep' : 'standard');
+  if (taskComplexity === 'deep') {
+    const upgraded = getNextGeminiModelForHighDemand(userSelectedModelName);
+    if (upgraded) {
+      activeRunModelName = upgraded;
+      config.activeRunModelName = activeRunModelName;
+      currentAgentLogs.push(`[Model] Proactively using ${activeRunModelName} for this deep task (upgraded from ${userSelectedModelName}).`);
+      if (window.appendSystemMessage) window.appendSystemMessage(`Using ${activeRunModelName} for this task — it looks like it needs a stronger model than ${userSelectedModelName}.`, { conversationId: conversation.id });
+    }
   }
 
   // A genuinely new task resets the auto-continue budget and stall tracking so prior runs
@@ -732,12 +750,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
     // Check if we need to compact context
     try {
-      const tokenCount = await countTokens(messages, modelName, config.geminiApiKey, { signal: getActiveRunSignal() });
+      const tokenCount = await countTokens(messages, resolveUtilityModelName(modelName), config.geminiApiKey, { signal: getActiveRunSignal() });
       console.log("Current conversation tokens:", tokenCount);
       const compactThreshold = getCompactionThreshold(modelName, config);
       if (config.autoCompact !== false && tokenCount > compactThreshold) {
         window.appendSystemMessage(`Context reached ${tokenCount} tokens; compacting for ${modelName} at threshold ${compactThreshold}.`);
-        const compactResult = await compactHistory(messages, modelName, config.geminiApiKey);
+        const compactResult = await compactHistory(messages, resolveUtilityModelName(modelName), config.geminiApiKey);
         persistCompactedConversation(conversation, compactResult.summary);
         await appendScopedNotes(workspacePath, conversation, `\n\n## Context Compaction ${new Date().toISOString()}\n${compactResult.summary}\n`);
         const checkpoint = await checkpointOperationalContext(workspacePath, 'context_compaction', 'Conversation context was compacted; canonical mission state was preserved.', 'Continue the active subplan from operational context.');
@@ -4540,12 +4558,13 @@ async function classifyPlanningNeed(userPrompt, modelName, apiKey) {
     mode: 'plan',
     reason: 'Could not safely classify task complexity.',
     needsLocalInspection: isLocalProjectOrFolderRequest(userPrompt),
-    benefitsFromWorkspaceContext: requestPlausiblyBenefitsFromWorkspaceContext(userPrompt)
+    benefitsFromWorkspaceContext: requestPlausiblyBenefitsFromWorkspaceContext(userPrompt),
+    taskComplexity: 'standard'
   });
   const prompt = `Classify whether this Orion AI request should require an implementation plan before acting.
 
 Return only compact JSON with:
-{"mode":"plan"|"direct"|"answer","reviewOnly":true|false,"needsLocalInspection":true|false,"benefitsFromWorkspaceContext":true|false,"reason":"short reason"}
+{"mode":"plan"|"direct"|"answer","reviewOnly":true|false,"needsLocalInspection":true|false,"benefitsFromWorkspaceContext":true|false,"taskComplexity":"light"|"standard"|"deep","reason":"short reason"}
 
 Definitions:
 - plan: broad or complex work where the user should review direction first, such as creating a substantial new project, major redesign/refactor, architecture change, risky migration, security-sensitive change, or ambiguous multi-step coding task that will modify the workspace.
@@ -4554,6 +4573,7 @@ Definitions:
 - reviewOnly: true ONLY when the user asked you to FIND/review/audit issues, bugs, typos, or faults WITHOUT being asked to fix them. In that case present findings as a report and do not modify files. Otherwise false.
 - needsLocalInspection: true when the user named or clearly implied a specific local folder/project/program/repo on this machine (e.g. "the game on my desktop called X") and the request asks to inspect, describe, or improve it. Otherwise false.
 - benefitsFromWorkspaceContext: true when the request asks for ideas, suggestions, design direction, or improvements that reference this app/codebase itself (its features, code, or workspace) rather than being a purely generic/abstract question. Otherwise false.
+- taskComplexity: how demanding the underlying work itself is, independent of mode. "light" = a quick lookup, a chat answer, or a single trivial edit. "standard" = a normal bounded task — a few file edits, a well-defined bug fix, a routine command. "deep" = multi-file implementation, a non-trivial refactor, or anything that would also be classified mode:"plan". Default to "standard" when unsure.
 
 Decision guidance:
 - Prefer direct for read-only local inspection or inventory tasks, including listing installed runtimes, checking versions, checking PATH, finding executables, showing files, or running safe diagnostic commands.
@@ -4624,12 +4644,14 @@ ${JSON.stringify(String(userPrompt || ''))}`;
       data.candidates[0].content.parts[0].text;
     const parsed = JSON.parse(text || '{}');
     const mode = ['plan', 'direct', 'answer'].includes(parsed.mode) ? parsed.mode : 'plan';
+    const taskComplexity = ['light', 'standard', 'deep'].includes(parsed.taskComplexity) ? parsed.taskComplexity : 'standard';
     return {
       mode,
       reviewOnly: !!parsed.reviewOnly,
       reason: String(parsed.reason || ''),
       needsLocalInspection: !!parsed.needsLocalInspection,
-      benefitsFromWorkspaceContext: !!parsed.benefitsFromWorkspaceContext
+      benefitsFromWorkspaceContext: !!parsed.benefitsFromWorkspaceContext,
+      taskComplexity
     };
   } catch (e) {
     console.error('Planning need classifier failed:', e);
@@ -5559,6 +5581,21 @@ function getNextGeminiModelForHighDemand(modelName) {
     'gemini-2.5-flash': 'gemini-2.5-pro'
   };
   return fallbackChain[modelName] || null;
+}
+
+// classifyPlanningNeed/classifyPlanApprovalIntent/countTokens/compactHistory are all small,
+// single-purpose utility calls (a JSON classification, a token count, a summary) that a cheap
+// model handles identically well — but previously received the user's full modelName, so
+// selecting gemini-2.5-pro for real coding work meant every one of these utility calls also went
+// out at pro pricing for no reason. Maps any selected model down to the cheapest tier in its own
+// family; falls back to the original name unchanged for non-Gemini models (e.g. Ollama) or an
+// unrecognized Gemini family, so behavior there is unaffected.
+function resolveUtilityModelName(modelName) {
+  const name = String(modelName || '');
+  if (!name.startsWith('gemini-')) return name;
+  if (name.startsWith('gemini-3')) return 'gemini-3.1-flash-lite';
+  if (name.startsWith('gemini-2.5')) return 'gemini-2.5-flash-lite';
+  return name;
 }
 
 // OLLAMA API UTILITIES & TRANSLATION HELPERS
@@ -7172,6 +7209,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     looksLikeLaunchOnlyRequest,
     hasFailedLaunchAttemptThisRun,
     getNextGeminiModelForHighDemand,
+    resolveUtilityModelName,
     summarizeToolStart,
     buildRepeatedFailureKey,
     updateWalkthroughItem,

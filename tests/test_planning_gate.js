@@ -1916,3 +1916,135 @@ test('approved-plan continuation does not wipe an in-progress mission when re-cl
   t.end();
 });
 
+// Phase 1 of the reliability/cost pass: cheap utility/classifier calls (planning classification,
+// approval-intent classification, token counting, history compaction) should not inherit the
+// user's full model selection — a plain JSON classification call going out on gemini-2.5-pro
+// pricing wastes money for no accuracy benefit. resolveUtilityModelName maps any selected model
+// down to the cheapest tier in its own family, leaving non-Gemini models (e.g. Ollama) unchanged.
+test('resolveUtilityModelName maps to the cheapest tier in each Gemini family and passes through non-Gemini models unchanged', (t) => {
+  t.equal(agent.resolveUtilityModelName('gemini-2.5-pro'), 'gemini-2.5-flash-lite', '2.5 family collapses to 2.5-flash-lite');
+  t.equal(agent.resolveUtilityModelName('gemini-2.5-flash'), 'gemini-2.5-flash-lite', '2.5-flash also collapses to 2.5-flash-lite');
+  t.equal(agent.resolveUtilityModelName('gemini-2.5-flash-lite'), 'gemini-2.5-flash-lite', 'already-cheapest 2.5 model is unchanged');
+  t.equal(agent.resolveUtilityModelName('gemini-3.1-pro-preview'), 'gemini-3.1-flash-lite', '3.x family collapses to 3.1-flash-lite');
+  t.equal(agent.resolveUtilityModelName('gemini-3.5-flash'), 'gemini-3.1-flash-lite', '3.5-flash also collapses to 3.1-flash-lite');
+  t.equal(agent.resolveUtilityModelName('gemini-3-flash-preview'), 'gemini-3.1-flash-lite', 'one-off 3-flash-preview still matches the 3.x family prefix');
+  t.equal(agent.resolveUtilityModelName('gemini-3.1-flash-lite'), 'gemini-3.1-flash-lite', 'already-cheapest 3.x model is unchanged');
+  t.equal(agent.resolveUtilityModelName('llama3'), 'llama3', 'non-Gemini models (e.g. Ollama) pass through unchanged');
+  t.equal(agent.resolveUtilityModelName(''), '', 'empty/undefined model name does not throw and passes through');
+  t.end();
+});
+
+// Phase 2 of the reliability/cost pass: instead of only reacting after repeated edit
+// failures already happened, a "deep" task (per classifyPlanningNeed's new taskComplexity
+// field) proactively upgrades the model for the WHOLE run from turn 1, before any damage
+// can occur. The user's selection is a floor, never a ceiling.
+test('a task classified as deep complexity proactively upgrades the model from turn 1', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: false });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    readFile: async () => '',
+    listFiles: async () => ([]),
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+  };
+
+  const conversation = { id: 'test-proactive-deep', messages: [], awaitingPlanApproval: false, planApproved: false };
+
+  const modelsRequested = [];
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","taskComplexity":"deep","reason":"large multi-file task"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    const modelMatch = String(url).match(/\/models\/([^:]+):generateContent/);
+    modelsRequested.push(modelMatch ? modelMatch[1] : null);
+    return {
+      ok: true,
+      json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'done.' }] } }] })
+    };
+  };
+
+  try {
+    await window.runAgentLoop('do a large multi-file refactor', 'gemini-2.5-flash-lite', conversation);
+    t.equal(modelsRequested[0], 'gemini-2.5-flash', 'turn 1 is already upgraded to the stronger model for a deep task, before any edits happen');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+  }
+  t.end();
+});
+
+test('a task classified as light complexity never downgrades below the user\'s explicit model selection', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: false });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    readFile: async () => '',
+    listFiles: async () => ([]),
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+  };
+
+  const conversation = { id: 'test-proactive-light', messages: [], awaitingPlanApproval: false, planApproved: false };
+
+  const modelsRequested = [];
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"answer","taskComplexity":"light","reason":"quick lookup"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    const modelMatch = String(url).match(/\/models\/([^:]+):generateContent/);
+    modelsRequested.push(modelMatch ? modelMatch[1] : null);
+    return {
+      ok: true,
+      json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'quick answer.' }] } }] })
+    };
+  };
+
+  try {
+    await window.runAgentLoop('what does this function do', 'gemini-2.5-pro', conversation);
+    t.equal(modelsRequested[0], 'gemini-2.5-pro', 'a light task never downgrades below the user\'s explicit gemini-2.5-pro selection');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+  }
+  t.end();
+});
+
+// The four call sites (classifyPlanApprovalIntent, classifyPlanningNeed x2, countTokens,
+// compactHistory) must actually use the resolved cheap model, not the raw modelName.
+test('utility/classifier call sites are wrapped with resolveUtilityModelName instead of using the raw modelName', (t) => {
+  const fs = require('fs');
+  const path = require('path');
+  const agentSource = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
+
+  t.ok(agentSource.includes('classifyPlanApprovalIntent(userPrompt, resolveUtilityModelName(modelName), config.geminiApiKey)'),
+    'classifyPlanApprovalIntent call site uses the resolved cheap model');
+  const planningNeedMatches = agentSource.match(/classifyPlanningNeed\(userPrompt, resolveUtilityModelName\(modelName\), config\.geminiApiKey\)/g) || [];
+  t.equal(planningNeedMatches.length, 2, 'both classifyPlanningNeed call sites use the resolved cheap model');
+  t.ok(agentSource.includes('countTokens(messages, resolveUtilityModelName(modelName), config.geminiApiKey'),
+    'countTokens call site uses the resolved cheap model');
+  t.ok(agentSource.includes('compactHistory(messages, resolveUtilityModelName(modelName), config.geminiApiKey)'),
+    'compactHistory call site uses the resolved cheap model');
+  t.end();
+});
+
