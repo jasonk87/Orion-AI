@@ -1429,7 +1429,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         const resultError = getToolFailureSignal(result);
         if (resultError) {
           const baseFailure = classifyAgentFailure({ toolName, args, result, errorText: resultError });
-          const failureKey = `${toolName}:${stableStringify(args)}:${String(resultError).slice(0, 240)}`;
+          const failureKey = (toolName === 'run_command' || toolName === 'start_command')
+            ? buildRepeatedFailureKey(toolName, args, baseFailure.category)
+            : `${toolName}:${stableStringify(args)}:${String(resultError).slice(0, 240)}`;
           const failureCount = (repeatedToolFailures.get(failureKey) || 0) + 1;
           repeatedToolFailures.set(failureKey, failureCount);
           const failure = classifyAgentFailure({ toolName, args, result, errorText: resultError, failureCount });
@@ -4912,6 +4914,26 @@ async function sleepWithModelApiStatus(ms, label, onWarning) {
   }
 }
 
+// Small models often retry a broken run_command/start_command with only cosmetic differences —
+// different quote style, a redundant `import sys`, swapping print() for sys.stdout.write() — that
+// make each attempt look like a "new" command to an exact-args match, so the repeated-failure
+// guard below never accumulates a count and never engages. A real transcript showed six such
+// variations of the same failing `python -c "..."` invocation run back to back with no escalation.
+// Normalize away superficial command text and key on the failure category instead so these collapse
+// into one growing counter.
+function buildRepeatedFailureKey(toolName, args, category) {
+  if (toolName === 'run_command' || toolName === 'start_command') {
+    const normalizedCommand = String((args && args.command) || '')
+      .toLowerCase()
+      .replace(/["'`]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 60);
+    return `${toolName}:${normalizedCommand}:${category}`;
+  }
+  return `${toolName}:${stableStringify(args)}:${category}`;
+}
+
 function stableStringify(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
@@ -6945,6 +6967,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     looksLikePlaceholderTestOutput,
     checkJsSyntaxAfterEdit,
     summarizeToolStart,
+    buildRepeatedFailureKey,
     updateWalkthroughItem,
     buildPostEditEvidencePrompt,
     buildFinalVerificationSummary,

@@ -1046,6 +1046,39 @@ test('a real detected regression stops the run with a specific message, not a ge
   t.end();
 });
 
+// Regression: a transcript showed Orion retry a failing `python -c "..."` command six times in a
+// row, each attempt only cosmetically different (single vs double quotes, a redundant `import
+// sys`, swapping print() for sys.stdout.write()) — but the repeated-failure guard keys on an exact
+// match of the tool's args, so each "new" quoting variant reset the counter back to zero and the
+// guard never escalated even though it was the same failure repeating six times.
+test('repeated-failure key collapses cosmetically different run_command/start_command retries', (t) => {
+  const doubleQuoted = agent.buildRepeatedFailureKey(
+    'run_command',
+    { command: 'python -c "from werkzeug.security import generate_password_hash; print(generate_password_hash(\'password123\'))"' },
+    'tool_failure'
+  );
+  const singleQuoted = agent.buildRepeatedFailureKey(
+    'run_command',
+    { command: "python -c 'from werkzeug.security import generate_password_hash; print(generate_password_hash(\"password123\"))'" },
+    'tool_failure'
+  );
+  t.equal(doubleQuoted, singleQuoted, 'quote-style-only differences in an otherwise identical command collapse to the same key');
+
+  const differentCategory = agent.buildRepeatedFailureKey(
+    'run_command',
+    { command: 'python -c "from werkzeug.security import generate_password_hash; print(generate_password_hash(\'password123\'))"' },
+    'missing_dependency'
+  );
+  t.notEqual(doubleQuoted, differentCategory, 'a different failure category still produces a different key even for the same command');
+
+  const differentCommand = agent.buildRepeatedFailureKey('run_command', { command: 'npm test' }, 'tool_failure');
+  t.notEqual(doubleQuoted, differentCommand, 'a genuinely different command still produces a different key');
+
+  const startCommandKey = agent.buildRepeatedFailureKey('start_command', { command: 'python -c "print(1)"' }, 'tool_failure');
+  t.ok(startCommandKey.startsWith('start_command:'), 'start_command gets the same cosmetic-normalization treatment as run_command');
+  t.end();
+});
+
 // Regression: `npx jest --init` failed with stderr that already named the exact fix ("Option
 // \"init\" has been deprecated. Please use \"create-jest\" package..."), but Orion still burned
 // two web searches re-discovering that same replacement command instead of just running it. The
