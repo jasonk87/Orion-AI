@@ -860,14 +860,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           await sleepRespectingStop(modelCallDelayMs);
         }
         
+        // Send a trimmed copy for this call only — the canonical `messages` array (used for
+        // compaction's real token count and any future turn) keeps the full untrimmed history.
+        const messagesForApiCall = trimAgedToolResultsFromMessages(messages);
         if (activeRunModelName.startsWith('gemini-')) {
-          response = await callGeminiAPI(messages, activeRunModelName, config.geminiApiKey, (warningMsg) => {
+          response = await callGeminiAPI(messagesForApiCall, activeRunModelName, config.geminiApiKey, (warningMsg) => {
             agentSubStatus = warningMsg;
             conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
             window.renderAiMessage(lastTextResponse, currentAgentLogs);
           }, false, { signal: getActiveRunSignal() });
         } else {
-          response = await callOllamaAPI(messages, activeRunModelName, (warningMsg) => {
+          response = await callOllamaAPI(messagesForApiCall, activeRunModelName, (warningMsg) => {
             agentSubStatus = warningMsg;
             conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
             window.renderAiMessage(lastTextResponse, currentAgentLogs);
@@ -6234,6 +6237,59 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
   };
 }
 
+// Lightweight per-turn token savings, distinct from compactHistory's heavyweight summarization
+// (which only triggers near the context-window threshold). Old, large, read-only tool outputs
+// (a full directory listing, a large file read, a search result) are still resent on every
+// subsequent API call even though the model rarely needs to re-see the exact bytes once a few
+// turns have passed — it either already acted on that information or would re-run the tool if it
+// needed the data again. Only read-only/inventory tools are eligible: never trim edit/write/test
+// results (patch_file, write_file, modify_file, run_tests, etc.), since those carry the actual
+// evidence the completion gate and verification logic depend on.
+const TOOL_RESULT_TRIM_THRESHOLD_CHARS = 4000;
+const TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES = 6;
+const TRIMMABLE_TOOL_RESULT_NAMES = new Set([
+  'list_files', 'read_file', 'get_symbol_index', 'read_command_output',
+  'google_search', 'fetch_web_page', 'read_notes', 'read_operational_context',
+  'read_project_memory', 'recall_memory', 'discover_skills'
+]);
+
+function trimAgedToolResultsFromMessages(messages) {
+  if (!Array.isArray(messages) || messages.length <= TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES) return messages;
+  const cutoff = messages.length - TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES;
+  let changedAny = false;
+  const result = messages.map((msg, index) => {
+    if (index >= cutoff || !msg || msg.role !== 'tool' || !Array.isArray(msg.parts)) return msg;
+    let msgChanged = false;
+    const newParts = msg.parts.map(part => {
+      const name = part && part.functionResponse && part.functionResponse.name;
+      if (!name || !TRIMMABLE_TOOL_RESULT_NAMES.has(name)) return part;
+      const response = part.functionResponse.response;
+      let serialized;
+      try {
+        serialized = JSON.stringify(response || {});
+      } catch (_) {
+        return part;
+      }
+      if (serialized.length <= TOOL_RESULT_TRIM_THRESHOLD_CHARS) return part;
+      msgChanged = true;
+      return {
+        functionResponse: {
+          name,
+          response: {
+            trimmed: true,
+            originalLength: serialized.length,
+            note: `This ${name} output (${serialized.length} chars) is from an earlier turn and was collapsed to save tokens. Re-run ${name} if you need this data again.`
+          }
+        }
+      };
+    });
+    if (!msgChanged) return msg;
+    changedAny = true;
+    return { ...msg, parts: newParts };
+  });
+  return changedAny ? result : messages;
+}
+
 function sanitizeMessagesForTextOnly(messages) {
   const cleanMessages = [];
   messages.forEach(msg => {
@@ -7210,6 +7266,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     hasFailedLaunchAttemptThisRun,
     getNextGeminiModelForHighDemand,
     resolveUtilityModelName,
+    trimAgedToolResultsFromMessages,
     summarizeToolStart,
     buildRepeatedFailureKey,
     updateWalkthroughItem,

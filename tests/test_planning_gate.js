@@ -2030,6 +2030,52 @@ test('a task classified as light complexity never downgrades below the user\'s e
   t.end();
 });
 
+// Phase 4c of the reliability/cost pass: old, large, read-only tool outputs (a directory
+// listing, a large file read) are resent on every subsequent API call for the rest of the run
+// even though the model rarely needs the exact bytes again once a few turns have passed. This
+// is a lightweight per-call trim, distinct from compactHistory's heavyweight summarization —
+// it only ever touches read-only/inventory tool results, never edit/write/test results, which
+// carry the actual evidence the completion gate depends on.
+test('trimAgedToolResultsFromMessages collapses old large read-only tool outputs but preserves recent and small ones', (t) => {
+  const bigListing = 'x'.repeat(5000);
+  const smallListing = 'y'.repeat(100);
+
+  const buildToolMsg = (name, response) => ({ role: 'tool', parts: [{ functionResponse: { name, response } }] });
+
+  const messages = [
+    { role: 'user', parts: [{ text: 'list files' }] },
+    buildToolMsg('list_files', { files: bigListing }), // index 1 — old + large -> should trim
+    { role: 'model', parts: [{ text: 'ok' }] },
+    buildToolMsg('read_file', { content: smallListing }), // index 3 — old + small -> keep as-is
+    { role: 'model', parts: [{ text: 'ok' }] },
+    buildToolMsg('patch_file', { message: bigListing }), // index 5 — old + large but NOT trimmable tool -> keep
+    { role: 'model', parts: [{ text: 'ok' }] },
+    { role: 'user', parts: [{ text: 'read again' }] },
+    buildToolMsg('list_files', { files: bigListing }), // index 8 — within the last 6 messages -> keep even though large
+    { role: 'model', parts: [{ text: 'ok' }] },
+  ];
+
+  const trimmed = agent.trimAgedToolResultsFromMessages(messages);
+
+  t.notEqual(trimmed, messages, 'returns a new array when something changed');
+  t.ok(trimmed[1].parts[0].functionResponse.response.trimmed, 'old large list_files result is collapsed');
+  t.equal(trimmed[3].parts[0].functionResponse.response.content, smallListing, 'old but small read_file result is untouched');
+  t.equal(trimmed[5].parts[0].functionResponse.response.message, bigListing, 'patch_file result is never trimmed, even if old and large — it may carry verification evidence');
+  t.equal(trimmed[8].parts[0].functionResponse.response.files, bigListing, 'a large list_files result within the recent-message window is preserved');
+  t.equal(messages[1].parts[0].functionResponse.response.files, bigListing, 'the original messages array passed in is not mutated');
+  t.end();
+});
+
+test('trimAgedToolResultsFromMessages is a no-op for short conversations and returns the same reference', (t) => {
+  const messages = [
+    { role: 'user', parts: [{ text: 'hi' }] },
+    { role: 'model', parts: [{ text: 'hello' }] },
+  ];
+  const result = agent.trimAgedToolResultsFromMessages(messages);
+  t.equal(result, messages, 'short message arrays are returned unchanged by reference');
+  t.end();
+});
+
 // The four call sites (classifyPlanApprovalIntent, classifyPlanningNeed x2, countTokens,
 // compactHistory) must actually use the resolved cheap model, not the raw modelName.
 test('utility/classifier call sites are wrapped with resolveUtilityModelName instead of using the raw modelName', (t) => {
