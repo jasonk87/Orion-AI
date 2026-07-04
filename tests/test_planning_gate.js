@@ -1046,6 +1046,92 @@ test('a real detected regression stops the run with a specific message, not a ge
   t.end();
 });
 
+// Regression: a real transcript showed Orion break src/game/buildings/Barracks.js with a syntax
+// error, then move on and ALSO break ArcheryRange.js and Spearman.js instead of going back to fix
+// Barracks.js first — three broken files accumulated because the finish-time
+// hasUnresolvedRegressionWarning gate only runs when the model tries to produce a text-only final
+// answer, and this run never stopped calling tools. The cross-file breakage guard must block an
+// edit to a different file while an earlier one is left broken, and unblock once that file is
+// fixed (re-edited clean).
+test('editing a different file while an earlier one has an unresolved syntax error is blocked until it is fixed', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: false });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+
+  let fileACheckCount = 0;
+  const runCommandCalls = [];
+  global.window.api = {
+    readFile: async () => '',
+    patchFile: async (workspace, path) => ({ success: true, changed: true, message: `Patched ${path} successfully.` }),
+    listFiles: async () => ([{ path: 'test.txt', isDir: false, size: 100 }]),
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+    runCommand: async (command) => {
+      runCommandCalls.push(command);
+      if (command.includes('fileA.js')) {
+        fileACheckCount++;
+        // First check on fileA.js fails (the broken edit); the second (the fix) passes.
+        return fileACheckCount === 1 ? { code: 1, stderr: 'SyntaxError: Unexpected token' } : { code: 0, stdout: '' };
+      }
+      return { code: 0, stdout: '' };
+    }
+  };
+
+  const conversation = { id: 'test-cross-file-breakage', messages: [], awaitingPlanApproval: false, planApproved: true };
+
+  let turnCount = 0;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    turnCount++;
+    const patchCall = (path) => ({
+      ok: true,
+      json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'patch_file', args: { path, operation: { type: 'replace', target: 'x', replacement: 'y' } } } }] } }] })
+    });
+    if (turnCount === 1) return patchCall('src/fileA.js');       // breaks fileA.js
+    if (turnCount === 2) return patchCall('src/fileB.js');       // should be blocked: fileA.js still broken
+    if (turnCount === 3) return patchCall('src/fileA.js');       // fixes fileA.js
+    if (turnCount === 4) return patchCall('src/fileB.js');       // now allowed
+    return {
+      ok: true,
+      json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'Finished editing both files.' }] } }] })
+    };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
+    await window.runAgentLoop('edit fileA.js and fileB.js', 'gemini-1', conversation);
+
+    const toolCalls = (conversation.messages[conversation.messages.length - 1]?.logs || [])
+      .filter(l => l.type === 'tool_call');
+    const fileBAttempts = toolCalls.filter(c => c.tool === 'patch_file' && c.params && c.params.path === 'src/fileB.js');
+    t.equal(fileBAttempts.length, 2, 'fileB.js was attempted twice: once blocked, once allowed after the fix');
+    t.equal(fileBAttempts[0].status, 'error', 'the first fileB.js attempt was rejected while fileA.js was still broken');
+    t.ok(String(fileBAttempts[0].result).includes('fix_other_file_first') || String(fileBAttempts[0].result).includes('fileA.js'),
+      'the block explains which file needs to be fixed first');
+    t.equal(fileBAttempts[1].status, 'success', 'the second fileB.js attempt succeeded once fileA.js was fixed');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+    delete global.window.runRegressionTests;
+  }
+
+  t.end();
+});
+
 // Regression: stall detection previously only counted completed checklist items + satisfied win
 // conditions as "progress". A model that made real file edits/commands but forgot to check off a
 // task looked identical to a pass that only produced failures, and both got flagged as stalled

@@ -783,6 +783,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const repeatedToolFailures = new Map();
     const fileEditCounts = new Map();
     const fileNeedsReadBeforeEdit = new Set(); // files that must be read before the next edit
+    // Files whose most recent write/modify/patch embedded a SYNTAX ERROR/REGRESSION DETECTED
+    // warning and haven't been fixed since. Without this, a run can break file A, move on and
+    // break file B and C too, leaving three broken files instead of fixing A before continuing —
+    // exactly what a real transcript showed happening across Barracks.js/ArcheryRange.js/Spearman.js.
+    const brokenFiles = new Map(); // path (lowercased) -> reason string
     const toolEvidenceLedger = [];
     const maxMalformedToolRetries = 5;
     const canExecuteThisTask = () => !config.planningMode || conversation.planApproved || planningBypassedForTask;
@@ -1314,6 +1319,26 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           }
         }
 
+        // Cross-file breakage guard: if a previous edit left another file with an unresolved
+        // syntax error or regression, block edits to any OTHER file until that one is fixed.
+        // Without this, a run can leave a trail of broken files instead of fixing each one before
+        // moving on — the finish-time hasUnresolvedRegressionWarning gate never catches this
+        // because the model keeps calling tools and never tries to produce a final answer.
+        if ((toolName === 'write_file' || toolName === 'modify_file' || toolName === 'patch_file') && args.path && brokenFiles.size > 0) {
+          const editKey = String(args.path).toLowerCase();
+          const otherBroken = [...brokenFiles.entries()].find(([key]) => key !== editKey);
+          if (otherBroken) {
+            const { path: brokenPath, reason } = otherBroken[1];
+            const blockMsg = `EDIT BLOCKED: \`${brokenPath}\` was left with an unresolved ${reason} from a previous edit. Fix and re-verify that file before editing ${args.path}. Read \`${brokenPath}\`, correct the issue, and confirm the syntax check or regression test passes first.`;
+            currentAgentLogs[logIndex].status = 'error';
+            currentAgentLogs[logIndex].result = blockMsg;
+            updateWalkthroughItem(walkthroughItem, toolName, args, { error: blockMsg }, new Error(blockMsg));
+            toolResponseParts.push({ functionResponse: { name: toolName, response: { error: blockMsg, blocked: 'fix_other_file_first', brokenPath } } });
+            persistCurrentAgentLogs({ render: true });
+            continue;
+          }
+        }
+
         // Execute the tool
         let result;
         try {
@@ -1469,6 +1494,16 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               repeatedToolFailures.delete(key);
             }
           }
+          // Track/clear broken-file state for the cross-file breakage guard above.
+          const editMessage = result && typeof result.message === 'string' ? result.message : '';
+          if (/SYNTAX ERROR DETECTED/.test(editMessage)) {
+            brokenFiles.set(editKey, { reason: 'syntax error', path: args.path });
+          } else if (/REGRESSION DETECTED/.test(editMessage)) {
+            brokenFiles.set(editKey, { reason: 'regression (test suite failure)', path: args.path });
+          } else {
+            // This edit to this exact file came back clean — it's no longer blocking other files.
+            brokenFiles.delete(editKey);
+          }
         }
         // A successful read_file clears the read-required gate for that file. When the gate was
         // actually blocking an edit, tell the model to retry that edit now instead of stopping or
@@ -1480,6 +1515,19 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           fileNeedsReadBeforeEdit.delete(readKey);
           if (wasBlocked && result && typeof result === 'object' && !Array.isArray(result)) {
             result.editRetryReminder = `You previously had an edit to ${args.path} blocked until you re-read it. You have now read its current content above. Retry the edit you were making now, using this fresh content, instead of reading this file again or stopping without editing.`;
+          }
+        }
+        // A genuine passing verification (not a placeholder script) proves the workspace is
+        // healthy again, so it clears every file the cross-file breakage guard was tracking —
+        // not just the one most recently edited.
+        if (brokenFiles.size > 0 && !isFailedToolResult(result)) {
+          if (toolName === 'run_tests' && result && result.success && !looksLikePlaceholderTestOutput(result.output)) {
+            brokenFiles.clear();
+          } else if ((toolName === 'run_command' || toolName === 'start_command') && isRealVerificationCommand(args.command)) {
+            const combinedOutput = `${(result && result.stdout) || ''}\n${(result && result.stderr) || ''}`;
+            if (!looksLikePlaceholderTestOutput(combinedOutput)) {
+              brokenFiles.clear();
+            }
           }
         }
 
