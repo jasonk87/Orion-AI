@@ -938,6 +938,29 @@ test('buildRepeatedEditFailureEscalation recommends different strategies for sma
   t.end();
 });
 
+// Regression: Gemini's MALFORMED_FUNCTION_CALL retry loop repeated the exact same static "be
+// simpler" message on every attempt, with no adaptation and no attempt to name a likely cause. A
+// transcript showed this happen repeatedly while the model tried to embed a large, multi-hundred-
+// line code block (backtick template literals, nested quotes) as a single JSON string argument —
+// exactly the kind of payload most likely to break JSON generation. Once the first generic retry
+// fails, the guidance should name that cause and suggest a concrete fix instead of repeating itself.
+test('buildMalformedFunctionCallGuidance escalates after the first retry instead of repeating itself', (t) => {
+  const first = agent.buildMalformedFunctionCallGuidance(1);
+  t.notOk(/large, multi-line/.test(first), 'the first attempt gets the plain generic message');
+  t.ok(/valid JSON function call/.test(first), 'the first attempt still explains the basic requirement');
+
+  const second = agent.buildMalformedFunctionCallGuidance(2);
+  t.ok(/large, multi-line/.test(second), 'the second attempt names large multi-line code blocks as the likely cause');
+  t.ok(/template literals/.test(second), 'the second attempt calls out template literals/backticks specifically');
+  t.ok(/smaller edit/i.test(second), 'the second attempt suggests a concrete fix: splitting into a smaller edit');
+  t.ok(/failed 2 times/.test(second), 'the message reflects the actual attempt count');
+
+  const fourth = agent.buildMalformedFunctionCallGuidance(4);
+  t.ok(/failed 4 times/.test(fourth), 'later attempts keep reflecting the current attempt count');
+  t.notEqual(first, second, 'the escalated message is meaningfully different from the first attempt, not a repeat');
+  t.end();
+});
+
 // Regression: a project's `npm test` script was a placeholder (`echo "no tests configured"`)
 // that always exits 0. A run_tests/run_command call against it looked like real verification to
 // the gates even though nothing was actually tested.
@@ -1130,6 +1153,56 @@ test('launch_workspace_app tells the model to verify even when nothing was captu
     delete global.window.lastLaunchLogs;
     delete global.window.lastLaunchUrl;
   }
+  t.end();
+});
+
+test('a second consecutive MALFORMED_FUNCTION_CALL gets escalated guidance instead of the same generic retry message', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0 });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = { readFile: async () => '', listFiles: async () => ([]) };
+
+  const conversation = { id: 'test-malformed-escalation', messages: [], awaitingPlanApproval: false, planApproved: true };
+
+  let turnCount = 0;
+  let lastContentsSeen = null;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    turnCount++;
+    lastContentsSeen = contents;
+    if (turnCount <= 2) {
+      return { ok: true, json: async () => ({ candidates: [{ finishReason: 'MALFORMED_FUNCTION_CALL', content: { parts: [{ text: '[garbled attempt]' }] } }] }) };
+    }
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'Made a smaller edit instead.' }] } }] }) };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
+    await window.runAgentLoop('apply the change', 'gemini-1', conversation);
+
+    const contentsText = JSON.stringify(lastContentsSeen);
+    t.ok(/large, multi-line/.test(contentsText), 'the escalated guidance (naming large multi-line code blocks) reaches the model after the 2nd malformed call');
+    t.ok(/failed 2 times/.test(contentsText), 'the escalated guidance reflects the actual attempt count');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+
   t.end();
 });
 

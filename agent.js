@@ -947,9 +947,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           if (malformedCallsCount < maxMalformedToolRetries) {
             messages.push({
               role: 'user',
-              parts: [{
-                text: `[SYSTEM: The previous function call was malformed and was NOT executed — no process was started, no file was written. Please generate a valid JSON function call. Use simple, minimal arguments. Avoid namespace prefixes (like 'default_api.') and markdown code blocks around the call.]`
-              }]
+              parts: [{ text: `[SYSTEM: ${buildMalformedFunctionCallGuidance(malformedCallsCount)}]` }]
             });
             continue;
           }
@@ -4028,6 +4026,21 @@ async function buildRepeatedEditFailureEscalation(workspace, filePath, failureSt
     return `[WARNING] REPEATED EDIT FAILURE: this file has had ${failureStreak} consecutive edits each introduce a new syntax/regression error. This file is large — do NOT rewrite the whole file with write_file, that risks silently losing unrelated content. Instead: read the exact current section immediately before each patch, use modify_file with an exact, unique target string (not replace_range by line number, which drifts as line numbers shift between edits), and make one small, single-purpose change at a time.`;
   }
   return `[WARNING] REPEATED EDIT FAILURE: this file has had ${failureStreak} consecutive edits each introduce a new syntax/regression error. This file is small enough to rewrite safely — read its full current content, then use write_file to replace the whole broken section (or the whole file) with complete, correct code in one shot instead of continuing to guess line ranges with patch_file.`;
+}
+
+// Gemini's own MALFORMED_FUNCTION_CALL signal means it tried to generate a tool call but produced
+// invalid structure. The retry guidance used to be one static message repeated for every attempt,
+// with no adaptation and no attempt to name a likely cause — a transcript showed this happen
+// repeatedly while the model was trying to embed a large, multi-hundred-line code block (full of
+// backtick template literals and nested quotes) as a single JSON string argument to patch_file/
+// write_file, which is exactly the kind of payload most likely to break JSON generation. Once the
+// first generic retry doesn't resolve it, name that likely cause and suggest a concrete fix
+// (split into a smaller edit) instead of repeating "be simpler" with nothing to act on.
+function buildMalformedFunctionCallGuidance(attemptCount) {
+  if (attemptCount <= 1) {
+    return 'The previous function call was malformed and was NOT executed — no process was started, no file was written. Please generate a valid JSON function call. Use simple, minimal arguments. Avoid namespace prefixes (like \'default_api.\') and markdown code blocks around the call.';
+  }
+  return `The previous function call was malformed and was NOT executed — no process was started, no file was written. This has now failed ${attemptCount} times in a row. If you are trying to pass a large, multi-line block of code (especially one containing template literals with backticks and \${...}, or many embedded quotes) as a single argument, that is very likely why the call keeps failing to generate correctly. Break the change into a SMALLER edit: use modify_file with a short, exact target/replacement instead of one large multi-hundred-line block, or split the change into two or more smaller tool calls. Use simple, minimal arguments, no namespace prefixes, no markdown code blocks around the call.`;
 }
 
 async function findMissingHtmlLocalReferences(workspace, htmlPath, htmlContent) {
@@ -7155,6 +7168,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     looksLikePlaceholderTestOutput,
     checkJsSyntaxAfterEdit,
     buildRepeatedEditFailureEscalation,
+    buildMalformedFunctionCallGuidance,
     looksLikeLaunchOnlyRequest,
     hasFailedLaunchAttemptThisRun,
     getNextGeminiModelForHighDemand,
