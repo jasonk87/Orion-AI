@@ -1341,14 +1341,24 @@ code {
   font-size: 0.68rem;
 }
 
-.file-viewer-card {
-  width: min(1320px, 94vw);
-  height: min(920px, 92vh);
+/* .modal-card sets a fixed width: 500px later in this stylesheet; that rule has equal
+   specificity to a bare .file-viewer-card selector and appears after it in source order, so it
+   was winning and silently clobbering any size set here. Compound the selector with .modal-card
+   so this reliably wins regardless of source order. */
+.modal-card.file-viewer-card {
+  width: min(1600px, 96vw);
+  height: min(1000px, 94vh);
 }
 
-.file-viewer-body {
+/* .modal-body sets max-height: 450px and this rule didn't override it, so the content pane was
+   capped at 450px tall no matter how large .file-viewer-card grew — the actual cause of the
+   modal looking "scrunched into a small box" regardless of the card's own size. */
+.modal-body.file-viewer-body {
   padding: 0;
   overflow: hidden;
+  max-height: none;
+  flex: 1;
+  min-height: 0;
 }
 
 .file-viewer-image-shell {
