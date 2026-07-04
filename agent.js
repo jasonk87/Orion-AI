@@ -1154,6 +1154,21 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             lastTextResponse = `I cannot honestly mark this complete yet.\n\n${buildCompletionGateMessage(completionGate)}`;
             break;
           }
+        } else if (canExecuteThisTask() && agentExecutionMode !== 'answer') {
+          // No mission/plan state governs this turn (e.g. a small "direct" edit outside the full
+          // STRATEGY/plan/approval flow), so the richer completion gate above never runs. The
+          // soft evidence nudge earlier in this block (buildPostEditEvidencePrompt) is capped at
+          // postEditEvidencePrompts attempts and gives up silently once exhausted — without a
+          // hard stop here, a run could finish "done" having changed real source files with zero
+          // test/smoke verification. If execution reaches this point, either verification already
+          // happened, or the soft nudge budget is exhausted and the model still didn't verify —
+          // in the latter case, stop honestly instead of finishing silently.
+          const filesTouchedThisRun = [...new Set(workWalkthrough.filter(isFileMutationItem).map(item => item.path))]
+            .filter(path => !isImplementationPlanPath(path) && !isStrategyPath(path));
+          if (filesTouchedThisRun.length > 0 && !hasVerificationAfterLastFileEdit(workWalkthrough)) {
+            lastTextResponse = `I changed source file(s) (${filesTouchedThisRun.map(path => `\`${path}\``).join(', ')}) but did not verify the change with a real test, smoke check, or manual run. This is not complete — ask me to continue and I should run the appropriate check (run_tests, run_command, or a manual smoke check) and confirm it passes, or clearly explain why no check is possible.`;
+            break;
+          }
         }
         if (!memoryNudgeSent && !reviewOnly && turnDidSubstantiveInspection(workWalkthrough) &&
             !turnAlreadyWroteMemory(workWalkthrough) && !isGenericNonAnswer(textVal) && loopCount < maxLoops) {

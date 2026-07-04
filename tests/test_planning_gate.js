@@ -698,6 +698,84 @@ test('thought parts do not leak into the visible answer text', async (t) => {
   t.end();
 });
 
+// Regression: buildPostEditEvidencePrompt (the soft nudge asking Orion to verify a code change)
+// is capped at 2 attempts and silently gives up once exhausted. The hard block that actually
+// requires verification evidence (evaluateCompletionGate's requireVerificationEvidence) only ever
+// ran when a full mission/plan/win-condition state was active — a small "direct" edit outside that
+// flow could finish "done" having changed real source files with zero test/smoke verification.
+// This is a hard stop for that gap: once the soft nudge budget is exhausted, an unverified edit
+// must not be allowed to finish silently.
+test('direct-mode edits without any mission state still require verification evidence before finishing', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0 });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    readFile: async () => 'export function add(a, b) { return a + b; }\n',
+    writeFile: async () => ({ success: true, backupPath: null }),
+    listFiles: async () => ([{ path: 'math.js', isDir: false, size: 100 }]),
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+  };
+
+  const conversation = { id: 'test-unverified-edit', messages: [], awaitingPlanApproval: false, planApproved: true };
+
+  let turnCount = 0;
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    turnCount++;
+    if (turnCount === 1) {
+      return {
+        ok: true,
+        json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'modify_file', args: { path: 'math.js', target: 'a + b', replacement: 'a + b + 0' } } }] } }] })
+      };
+    }
+    // Every subsequent turn is a plain, substantive-looking final answer with NO tool calls and
+    // NO test/smoke check ever run — this must not be allowed to finish as "done".
+    return {
+      ok: true,
+      json: async () => ({
+        candidates: [{
+          finishReason: 'STOP',
+          content: { parts: [{ text: 'I updated math.js to adjust the addition logic as requested. The change is in place and ready to use.' }] }
+        }]
+      })
+    };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => {
+      if (delay !== 500) return originalSetTimeout(fn, delay);
+      return null;
+    };
+
+    await window.runAgentLoop('tweak the add function in math.js', 'gemini-1', conversation);
+
+    const aiMessage = conversation.messages.find(m => m.role === 'assistant');
+    t.ok(aiMessage, 'assistant message was created');
+    t.ok(aiMessage.text.includes('did not verify the change with a real test'), 'the run is honestly reported as unverified instead of finishing silently');
+    t.ok(aiMessage.text.includes('math.js'), 'the unverified file is named in the message');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+
+  t.end();
+});
+
 // Regression: stall detection previously only counted completed checklist items + satisfied win
 // conditions as "progress". A model that made real file edits/commands but forgot to check off a
 // task looked identical to a pass that only produced failures, and both got flagged as stalled
