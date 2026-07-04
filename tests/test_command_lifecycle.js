@@ -321,6 +321,32 @@ test('killTrackedWorkspaceProcess is a no-op when nothing is tracked, and clears
   }, 100);
 });
 
+// Regression: a live app crash showed "Uncaught Exception: Error: spawn npm ENOENT" thrown from
+// deep inside spawnInternalCommand right after launch_workspace_app reported success — the child
+// process had no 'error' listener, so Node rethrew the async spawn failure as an uncaught
+// exception and took down the entire Electron main process, not just the one tool call.
+test('a spawn failure in spawnInternalCommand does not crash the process', (t) => {
+  const os = require('os');
+  const path = require('path');
+  const ws = require('fs').mkdtempSync(path.join(os.tmpdir(), 'orion-spawn-crash-'));
+
+  const originalHandlers = process.listeners('uncaughtException');
+  process.removeAllListeners('uncaughtException');
+  let crashed = null;
+  process.on('uncaughtException', (err) => { crashed = err; });
+
+  t.doesNotThrow(() => {
+    main.spawnInternalCommand(ws, 'this-binary-definitely-does-not-exist-orion-test', []);
+  }, 'spawning a nonexistent executable does not throw synchronously');
+
+  setTimeout(() => {
+    process.removeAllListeners('uncaughtException');
+    for (const handler of originalHandlers) process.on('uncaughtException', handler);
+    t.equal(crashed, null, 'the async ENOENT spawn error was handled instead of crashing the process');
+    t.end();
+  }, 500);
+});
+
 test('preview_app launches a persistent session and does NOT auto-close', async (t) => {
   const fs = require('fs');
   const os = require('os');
