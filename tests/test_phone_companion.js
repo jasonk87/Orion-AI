@@ -80,6 +80,7 @@ function makeElectronMock(handlers = {}) {
               if (script.includes('approvePhoneCompanionPlan')) return { success: true, queued: false };
               if (script.includes('denyPhoneCompanionPlan')) return { success: true, denied: true };
               if (script.includes('revisePhoneCompanionPlan')) return { success: true, queued: true };
+              if (script.includes('submitPhoneCompanionClarification')) return handlers.clarificationSubmit || { success: true, queued: false };
               if (script.includes('stopPhoneCompanionTask')) return { success: true, stopped: true };
               if (script.includes('resumePhoneCompanionTask')) return { success: true, queued: true };
               if (script.includes('discoverPhoneCompanionSkills')) return handlers.skills || { skills: [{ name: 'demo-skill', description: 'demo' }], count: 1 };
@@ -329,6 +330,56 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
   t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt') && call.includes('C:\\\\Projects\\\\OrionTarget')), 'prompt endpoint forwards selected project path');
   t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt')), 'desktop bridge submitted prompt');
   t.ok(electron.calls.some(call => call.includes('approvePhoneCompanionPlan')), 'desktop bridge approved plan');
+
+  await closeServer(main.getCompanionServer());
+});
+
+// Regression: ask_clarifying_questions' interactive card (conversation.awaitingClarification —
+// intro + questions[].header/question/options[].label/description/recommended) was stored on the
+// desktop conversation object but never included in the phone's /api/state payload at all, and
+// lib/companion-html.js had zero rendering logic for it — the phone just showed generic text with
+// no way to actually answer the questions.
+test('Phone Companion surfaces and accepts answers to clarifying questions', async (t) => {
+  const clarificationPayload = {
+    conversationId: 'conv1',
+    title: 'Task One',
+    conversations: [{ id: 'conv1', title: 'Task One', active: true }],
+    tasks: [],
+    messages: [],
+    latestOutput: '',
+    awaitingClarification: {
+      intro: 'A few quick design questions before I proceed:',
+      questions: [
+        {
+          header: 'Simulation Depth',
+          question: 'How detailed should the physics be?',
+          options: [
+            { label: 'Arcade', description: 'Simplified, fun-first physics.', recommended: true },
+            { label: 'Full simulation', description: 'Realistic tire wear and fuel management.' }
+          ]
+        }
+      ]
+    },
+    preview: { latestAssistantOutput: '', workWalkthrough: '', changedFiles: [], testResults: [] }
+  };
+  const { main, electron } = await startMainWithConfig(1145, {}, { state: clarificationPayload });
+  const pair = await request('POST', 1145, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
+  const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+
+  const state = await request('GET', 1145, '/api/state', null, session);
+  t.equal(state.statusCode, 200, 'state endpoint succeeds');
+  t.ok(state.json.awaitingClarification, 'state payload carries the clarification question data');
+  t.equal(state.json.awaitingClarification.questions[0].header, 'Simulation Depth', 'question header is present');
+  t.equal(state.json.awaitingClarification.questions[0].options[0].recommended, true, 'recommended flag survives to the phone payload');
+
+  const missingAnswers = await request('POST', 1145, '/api/clarify', {}, session);
+  t.equal(missingAnswers.statusCode, 400, 'submitting with no answers is rejected');
+
+  const submit = await request('POST', 1145, '/api/clarify', {
+    answers: [{ header: 'Simulation Depth', question: 'How detailed should the physics be?', answer: 'Arcade' }]
+  }, session);
+  t.equal(submit.statusCode, 200, 'answer submission succeeds');
+  t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionClarification') && call.includes('Simulation Depth')), 'desktop bridge received the clarification answers');
 
   await closeServer(main.getCompanionServer());
 });

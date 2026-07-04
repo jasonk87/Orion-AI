@@ -3309,6 +3309,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
       active: c.id === resolvedId,
       isDesktopActive: c.id === activeConversationId,
       awaitingPlanApproval: !!(c.awaitingPlanApproval && !c.planApproved),
+      awaitingClarification: !!c.awaitingClarification,
       taskCount,
       messageCount,
       activityCount: messageCount + taskCount,
@@ -3361,6 +3362,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     subStatus: isActiveTargetRunning && window.getAgentSubStatus ? window.getAgentSubStatus() : '',
     executionMode: isActiveTargetRunning && window.getAgentExecutionMode ? window.getAgentExecutionMode() : 'idle',
     awaitingPlanApproval: !!(conv && conv.awaitingPlanApproval && !conv.planApproved),
+    awaitingClarification: (conv && conv.awaitingClarification) ? conv.awaitingClarification : null,
     tasks: conv && Array.isArray(conv.tasks) ? conv.tasks : [],
     model: window.getSelectedModel(),
     messages,
@@ -3597,6 +3599,45 @@ window.revisePhoneCompanionPlan = async (options) => {
   const targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
   if (!text) return { success: false, error: 'Missing revision feedback' };
   return await window.submitPhoneCompanionPrompt({ prompt: `[Plan revision] ${text}`, conversationId: targetId });
+};
+
+// Mirrors desktop's submitClarificationAnswers (which reads answers directly out of DOM radio
+// inputs), except the phone client already collected/validated the answers itself and just sends
+// them as {header, question, answer} objects — this reuses the exact same conv.awaitingClarification
+// shape and resume mechanism (a formatted "Here are my answers" user message, then window.runAgentLoop).
+window.submitPhoneCompanionClarification = async ({ conversationId, answers } = {}) => {
+  const resolvedId = conversationId || activeConversationId;
+  const conv = conversations.find(c => c.id === resolvedId);
+  if (!conv || !conv.awaitingClarification) return { success: false, error: 'No clarification questions waiting for answers' };
+  if (!Array.isArray(answers) || answers.length === 0) return { success: false, error: 'Missing answers' };
+
+  if (!appConfig.geminiApiKey) {
+    return { success: false, error: 'Missing Gemini API key on desktop' };
+  }
+
+  const formattedAnswers = answers.map(a => `${a.header}: ${a.answer}`).join('\n');
+  const userMessage = `Here are my answers:\n${formattedAnswers}`;
+
+  conv.awaitingClarification = null;
+  if (resolvedId === activeConversationId) {
+    renderUserMessage(userMessage);
+  }
+  conv.messages.push({ role: 'user', text: userMessage, source: 'clarification-answers' });
+  saveConversationsToStorage();
+
+  const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
+  if (isGlobalRunning) {
+    window.promptQueue.push({ prompt: userMessage, modelSelectValue: window.getSelectedModel(), conversationId: resolvedId, source: 'clarification-answers' });
+    persistAssistantStatusMessage(resolvedId, "Queued. Orion will continue once the current task finishes.", {
+      source: 'queue-status',
+      dedupeKey: `clarification-answers-queued-${resolvedId}`
+    });
+    return { success: true, queued: true };
+  }
+
+  window.runAgentLoop(userMessage, window.getSelectedModel(), conv, { source: 'clarification-answers', internalPrompt: true })
+    .catch(err => console.error('Phone clarification resume failed:', err));
+  return { success: true, queued: false };
 };
 
 window.stopPhoneCompanionTask = async (targetId) => {
