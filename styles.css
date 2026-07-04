@@ -1342,8 +1342,8 @@ code {
 }
 
 .file-viewer-card {
-  width: min(980px, 86vw);
-  height: min(760px, 84vh);
+  width: min(1320px, 94vw);
+  height: min(920px, 92vh);
 }
 
 .file-viewer-body {
@@ -1384,15 +1384,27 @@ code {
 .file-viewer-content {
   height: 100%;
   margin: 0;
-  padding: 18px;
+  padding: 22px 26px;
   overflow: auto;
   background: #08080b;
   color: var(--text-secondary);
   font-family: var(--font-mono);
-  font-size: 0.78rem;
-  line-height: 1.55;
+  font-size: 0.86rem;
+  line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.file-viewer-markdown {
+  height: 100%;
+  overflow: auto;
+  padding: 28px 40px;
+  background: #08080b;
+  font-size: 0.98rem;
+}
+
+.file-viewer-markdown[hidden] {
+  display: none;
 }
 
 /* SETTINGS MODAL */

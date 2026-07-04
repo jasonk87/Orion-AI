@@ -830,6 +830,17 @@ test('list_files curated inventory hides noisy and sensitive workspace paths by 
   t.end();
 });
 
+// Regression: a real implementation plan labeled steps "Estimated Time: 4 hours", "3 hours", etc.
+// — calibrated as if a human developer were writing that code by hand, not an AI agent executing
+// tool calls back-to-back. The system prompt had no guidance on this at all, so the model filled
+// the gap with generic human-project-plan conventions from its training.
+test('system prompt calibrates time estimates to an AI agent, not a human developer', (t) => {
+  t.ok(agentJs.includes('REALISTIC TIME ESTIMATES'), 'system prompt addresses plan time-estimate calibration');
+  t.ok(agentJs.includes('not for a human developer'), 'system prompt explicitly rules out human-developer-hours estimates');
+  t.ok(agentJs.includes('Never label a step "N hours"'), 'system prompt forbids hour-scale estimates calibrated to human authoring time');
+  t.end();
+});
+
 // Regression: a real workspace showed implementation_plan.md, STRATEGY.md, and
 // work_walkthrough.md sitting alongside real project files in list_files output, and a stray
 // controller.html.bak backup outside .orion/ (from an edit backup written next to the source

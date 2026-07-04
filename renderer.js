@@ -156,6 +156,7 @@ const el = {
   fileViewerModal: document.getElementById('file-viewer-modal'),
   fileViewerTitle: document.getElementById('file-viewer-title'),
   fileViewerContent: document.getElementById('file-viewer-content'),
+  fileViewerMarkdown: document.getElementById('file-viewer-markdown'),
   fileViewerImageShell: document.getElementById('file-viewer-image-shell'),
   fileViewerImage: document.getElementById('file-viewer-image'),
   fileViewerImageMeta: document.getElementById('file-viewer-image-meta'),
@@ -1072,16 +1073,31 @@ async function openFileViewer(relPath) {
   if (!currentWorkspace || !relPath) return;
   viewedFilePath = relPath;
   el.fileViewerTitle.textContent = relPath;
-  setFileViewerMode('text');
-  el.fileViewerContent.textContent = 'Loading...';
+  const isMarkdown = /\.(md|markdown)$/i.test(relPath);
+  setFileViewerMode(isMarkdown ? 'markdown' : 'text');
+  if (isMarkdown && el.fileViewerMarkdown) {
+    el.fileViewerMarkdown.innerHTML = '<p>Loading...</p>';
+  } else {
+    el.fileViewerContent.textContent = 'Loading...';
+  }
   el.fileViewerModal.classList.add('active');
-  
+
   const content = await window.api.readFile(currentWorkspace, relPath, { maxChars: 200000 });
   if (content && content.error) {
-    el.fileViewerContent.textContent = `Error loading file: ${content.error}`;
+    const errorText = `Error loading file: ${content.error}`;
+    if (isMarkdown && el.fileViewerMarkdown) {
+      el.fileViewerMarkdown.textContent = errorText;
+    } else {
+      el.fileViewerContent.textContent = errorText;
+    }
     return;
   }
-  el.fileViewerContent.textContent = content || '';
+  if (isMarkdown && el.fileViewerMarkdown) {
+    el.fileViewerMarkdown.innerHTML = typeof marked !== 'undefined' ? marked.parse(content || '') : escapeHtml(content || '');
+    sanitizeRenderedMarkdown(el.fileViewerMarkdown);
+  } else {
+    el.fileViewerContent.textContent = content || '';
+  }
 }
 
 async function openImageArtifact(item) {
@@ -1114,9 +1130,15 @@ async function openImageArtifact(item) {
 
 function setFileViewerMode(mode) {
   const imageMode = mode === 'image';
+  const markdownMode = mode === 'markdown';
+  const textMode = !imageMode && !markdownMode;
   if (el.fileViewerContent) {
-    el.fileViewerContent.hidden = imageMode;
-    if (!imageMode) el.fileViewerContent.textContent = '';
+    el.fileViewerContent.hidden = !textMode;
+    if (!textMode) el.fileViewerContent.textContent = '';
+  }
+  if (el.fileViewerMarkdown) {
+    el.fileViewerMarkdown.hidden = !markdownMode;
+    if (!markdownMode) el.fileViewerMarkdown.innerHTML = '';
   }
   if (el.fileViewerImageShell) el.fileViewerImageShell.hidden = !imageMode;
   if (!imageMode && el.fileViewerImage) el.fileViewerImage.removeAttribute('src');
