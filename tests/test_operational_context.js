@@ -392,7 +392,25 @@ test('new model turn receives mission state even when old chat is reduced', (t) 
   t.equal(messages[0].role, 'user', 'state envelope is first');
   t.ok(messages[0].parts[0].text.includes('Mission: Build a deep colony simulation.'), 'first provider turn carries mission');
   t.ok(messages[0].parts[0].text.includes('Win conditions'), 'first provider turn carries win conditions');
-  t.ok(messages.some(message => JSON.stringify(message).includes('[RECENT CHAT VIEW - non-canonical]')), 'chat is present only as view context');
+  t.ok(messages.some(message => JSON.stringify(message).includes('[RECENT USER CHAT VIEW - non-canonical]')), 'user chat is present only as view context');
+  t.end();
+});
+
+test('recent chat view excludes assistant prose and stale self-diagnoses', (t) => {
+  const state = missionState();
+  const priorChat = [
+    { role: 'user', text: 'Can you review this program?' },
+    { role: 'assistant', text: 'I encountered an API authentication error previously, which prevents me from accessing tools.' },
+    { role: 'assistant', text: 'I will now read files.' },
+    { role: 'user', text: 'Please actually inspect it.' }
+  ];
+  const view = operational.buildRecentChatView(priorChat, 'Start now.');
+  const messages = operational.buildReasoningMessages(state, priorChat, 'Start now.');
+  const joined = JSON.stringify(messages);
+  t.deepEqual(view.map(item => item.role), ['user', 'user'], 'recent chat view carries user turns only');
+  t.ok(joined.includes('Please actually inspect it.'), 'latest user intent remains visible');
+  t.notOk(joined.includes('API authentication error'), 'assistant auth self-diagnosis is not replayed');
+  t.notOk(joined.includes('I will now read files'), 'assistant promises are not replayed as evidence');
   t.end();
 });
 

@@ -1551,17 +1551,138 @@ code {
   border-top: 1px solid var(--border-color);
   display: flex;
   justify-content: flex-end;
+  gap: 10px;
+}
+
+.secondary-btn,
+.primary-btn {
+  min-height: 36px;
+  border-radius: 8px;
+  padding: 0 14px;
+  font-family: var(--font-sans);
+  font-weight: 700;
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.secondary-btn {
+  border: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+}
+
+.secondary-btn:hover {
+  border-color: var(--border-hover);
+  color: var(--text-primary);
+}
+
+.primary-btn {
+  border: 1px solid rgba(130, 115, 244, 0.4);
+  background: linear-gradient(135deg, var(--accent-color), #4f8dff);
+  color: #fff;
+  box-shadow: 0 10px 24px rgba(130, 115, 244, 0.22);
+}
+
+.primary-btn.danger {
+  border-color: rgba(248, 113, 113, 0.38);
+  background: linear-gradient(135deg, #ff7b7b, #be3246);
+  box-shadow: 0 10px 24px rgba(248, 113, 113, 0.18);
+}
+
+.orion-confirm-card {
+  max-width: 420px;
+}
+
+.orion-confirm-message {
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.device-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(151, 164, 196, 0.16);
+  border-radius: 8px;
+  background: rgba(17, 23, 36, 0.78);
+  font-family: var(--font-sans);
+  font-size: 0.8rem;
+  transition: border-color var(--transition-fast), background var(--transition-fast), transform var(--transition-fast);
+}
+
+.device-item:hover {
+  transform: translateY(-1px);
+  border-color: rgba(130, 115, 244, 0.28);
+  background: rgba(20, 28, 44, 0.86);
+}
+
+.device-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.device-name {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device-meta {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.device-actions .status-indicator {
+  padding: 2px 7px;
+  border-radius: 5px;
+  font-size: 0.64rem;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.btn-revoke-device {
+  min-height: 25px;
+  padding: 2px 8px;
+  border-color: rgba(248, 113, 113, 0.36);
+  color: #fca5a5;
+  font-size: 0.7rem;
+  cursor: pointer;
+}
+
+.btn-revoke-device:hover {
+  border-color: rgba(248, 113, 113, 0.58);
+  background: rgba(248, 113, 113, 0.08);
+  color: #fecaca;
 }
 
 /* DELETE BUTTON STYLING FOR SIDEBAR ITEMS */
 .project-item .delete-btn, .conversation-item .delete-btn {
-  opacity: 0;
+  opacity: 0.62;
   transition: var(--transition-fast);
   color: var(--text-muted);
+  width: 26px;
+  height: 26px;
+  border-radius: 6px !important;
 }
 
 .project-item:hover .delete-btn, .conversation-item:hover .delete-btn {
-  opacity: 0.6;
+  opacity: 0.82;
 }
 
 .project-item:hover .delete-btn:hover, .conversation-item:hover .delete-btn:hover {
@@ -1621,13 +1742,33 @@ code {
   color: var(--text-primary);
 }
 
-.btn-stop {
-  background-color: var(--error-color) !important;
-  color: white !important;
+.agent-stop-button {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(241, 104, 118, 0.34);
+  border-radius: 6px;
+  background: rgba(241, 104, 118, 0.1);
+  color: #ff9ba6;
+  cursor: pointer;
+  font-size: 0.68rem;
+  line-height: 1;
+  transition: var(--transition-fast);
 }
-.btn-stop:hover {
-  background-color: #ef4444 !important;
-  transform: scale(1.05);
+.agent-stop-button.visible {
+  display: inline-flex;
+}
+.agent-stop-button:hover {
+  border-color: rgba(241, 104, 118, 0.68);
+  background: rgba(241, 104, 118, 0.18);
+  color: #ffd5da;
+}
+.agent-stop-button:disabled {
+  cursor: wait;
+  opacity: 0.68;
 }
 
 /* MANUAL ADD TASK BUTTON */

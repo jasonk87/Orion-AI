@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld('api', {
   setWorkspaceEntrypoint: (workspacePath, entrypoint) => ipcRenderer.invoke('set-workspace-entrypoint', { workspacePath, entrypoint }),
   openWorkspaceFolder: (workspacePath) => ipcRenderer.invoke('open-workspace-folder', workspacePath),
   gitPush: (workspacePath, remote, branch, setUpstream) => ipcRenderer.invoke('git-push', { workspacePath, remote, branch, setUpstream }),
+  listDirectoryChildren: (dirPath) => ipcRenderer.invoke('list-directory-children', dirPath),
   listFiles: (dirPath) => ipcRenderer.invoke('list-files', dirPath),
   readFile: (workspacePath, relativePath, options) => ipcRenderer.invoke('read-file', { workspacePath, relativePath, options }),
   deletePath: (workspacePath, relativePath) => ipcRenderer.invoke('delete-path', { workspacePath, relativePath }),
@@ -61,6 +62,8 @@ contextBridge.exposeInMainWorld('api', {
   readConfig: () => ipcRenderer.invoke('read-config'),
   getAppRuntimeInfo: () => ipcRenderer.invoke('get-app-runtime-info'),
   writeConfig: (config) => ipcRenderer.invoke('write-config', config),
+  readConversations: () => ipcRenderer.invoke('read-conversations'),
+  writeConversations: (conversations) => ipcRenderer.invoke('write-conversations', conversations),
   
   // Shell Runner
   runCommand: (command, cwd, processId, timeoutMs) => ipcRenderer.invoke('run-command', { command, cwd, processId, timeoutMs }),

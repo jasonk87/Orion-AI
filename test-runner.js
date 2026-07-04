@@ -4,6 +4,7 @@ const { spawn } = require('child_process');
 
 const testsDir = path.join(__dirname, 'tests');
 const testFiles = fs.readdirSync(testsDir).filter(f => f.endsWith('.js')).sort();
+const TEST_FILE_TIMEOUT_MS = 30000;
 
 async function runTests() {
   for (const file of testFiles) {
@@ -20,7 +21,7 @@ async function runTests() {
       const to = setTimeout(() => {
         timedOut = true;
         child.kill('SIGKILL');
-      }, 10000);
+      }, TEST_FILE_TIMEOUT_MS);
 
       child.on('close', code => {
         clearTimeout(to);

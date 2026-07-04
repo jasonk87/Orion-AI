@@ -146,6 +146,7 @@ const el = {
   agentStatePill: document.getElementById('agent-state-pill'),
   agentStateText: document.getElementById('agent-state-text'),
   agentStateDetail: document.getElementById('agent-state-detail'),
+  btnStopAgent: document.getElementById('btn-stop-agent'),
   workspaceFilesPanel: document.getElementById('workspace-files-panel'),
   runArtifactsPanel: document.getElementById('run-artifacts-panel'),
   toastRegion: document.getElementById('toast-region'),
@@ -227,7 +228,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   renderProjectsList();
   
   // Load conversations from local storage
-  loadConversationsFromStorage();
+  await loadConversationsFromStorage();
   
   // Migrate any project conversations that accumulated in standalone list
   migrateConversations();
@@ -1131,12 +1132,16 @@ function closeFileViewer() {
 // --- CHAT INTERFACE & RENDERERS ---
 function setupChatHandlers() {
   el.btnSubmit.addEventListener('click', () => {
-    if (window.isAgentRunning && window.isAgentRunning()) {
-      window.stopAgentExecution();
-    } else {
-      submitMessage();
-    }
+    submitMessage();
   });
+  if (el.btnStopAgent) {
+    el.btnStopAgent.addEventListener('click', () => {
+      if (window.isAgentRunning && window.isAgentRunning() && window.stopAgentExecution) {
+        el.btnStopAgent.disabled = true;
+        window.stopAgentExecution({ mode: 'hard' });
+      }
+    });
+  }
   
   el.chatInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && e.ctrlKey) {
@@ -1596,22 +1601,89 @@ function createPhoneConversation({ projectPath = '', title = 'New Phone Task' } 
   return conv;
 }
 
-function loadConversationsFromStorage() {
-  const raw = localStorage.getItem('ag2_conversations');
-  const backup = localStorage.getItem('ag2_conversations_backup');
+let conversationSaveRevision = 0;
+let lastConversationDiskSaveError = '';
+
+function parseConversationStorageCandidate(raw, label) {
+  if (!raw) return [];
   try {
-    conversations = JSON.parse(raw);
-    if (!Array.isArray(conversations)) throw new Error('Not an array');
-  } catch(e) {
-    console.warn("Failed to parse ag2_conversations, trying backup", e);
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!Array.isArray(parsed)) throw new Error(`${label} is not an array`);
+    return parsed;
+  } catch (error) {
+    console.warn(`Failed to parse ${label}`, error);
+    return [];
+  }
+}
+
+function conversationMessageValue(conversation) {
+  const messages = Array.isArray(conversation && conversation.messages) ? conversation.messages : [];
+  let meaningfulAssistant = 0;
+  let logCount = 0;
+  messages.forEach(message => {
+    const role = normalizeConversationMessageRole(message);
+    const text = extractConversationMessageText(message);
+    const logs = extractConversationMessageLogs(message);
+    if (role === 'assistant' && text && text.trim() !== 'Thinking...') meaningfulAssistant++;
+    logCount += Array.isArray(logs) ? logs.length : 0;
+  });
+  return meaningfulAssistant * 100000 + logCount * 1000 + messages.length * 10;
+}
+
+function conversationSortTime(conversation) {
+  const messages = Array.isArray(conversation && conversation.messages) ? conversation.messages : [];
+  const messageTimes = messages
+    .map(message => Number(message && (message.updatedAt || message.createdAt || message.timestamp || 0)))
+    .filter(Boolean);
+  return Math.max(
+    Number(conversation && conversation.updatedAt || 0),
+    Number(conversation && conversation.createdAt || 0),
+    ...messageTimes,
+    0
+  );
+}
+
+function chooseRicherConversation(current, candidate) {
+  if (!current) return candidate;
+  const currentScore = conversationMessageValue(current);
+  const candidateScore = conversationMessageValue(candidate);
+  if (candidateScore !== currentScore) {
+    return candidateScore > currentScore ? candidate : current;
+  }
+  return conversationSortTime(candidate) >= conversationSortTime(current) ? candidate : current;
+}
+
+function mergeConversationSets(...sets) {
+  const byId = new Map();
+  sets.flat().forEach(conversation => {
+    if (!conversation || !conversation.id) return;
+    const existing = byId.get(conversation.id);
+    byId.set(conversation.id, chooseRicherConversation(existing, conversation));
+  });
+  return [...byId.values()].sort((a, b) => conversationSortTime(b) - conversationSortTime(a));
+}
+
+async function loadConversationsFromStorage() {
+  const local = parseConversationStorageCandidate(localStorage.getItem('ag2_conversations'), 'ag2_conversations');
+  const backup = parseConversationStorageCandidate(localStorage.getItem('ag2_conversations_backup'), 'ag2_conversations_backup');
+  let disk = [];
+  if (window.api && typeof window.api.readConversations === 'function') {
     try {
-      conversations = JSON.parse(backup);
-      if (!Array.isArray(conversations)) throw new Error('Not an array');
-    } catch (e2) {
-      conversations = [];
+      const result = await window.api.readConversations();
+      if (result && result.success && Array.isArray(result.conversations)) {
+        disk = result.conversations;
+      } else if (result && result.error) {
+        console.warn('Failed to read disk conversation store', result.error);
+      }
+    } catch (error) {
+      console.warn('Disk conversation store is unavailable', error);
     }
   }
+  conversations = mergeConversationSets(disk, local, backup);
   scrubLegacyPhoneCompanionTokenMessages();
+  if (conversations.length > 0) {
+    saveConversationsToStorage();
+  }
 }
 
 function migrateConversations() {
@@ -1693,6 +1765,99 @@ function isEmptyThinkingPlaceholder(text, logs = []) {
   return String(text || '').trim() === 'Thinking...' && !hasLogs;
 }
 
+function normalizeConversationMessageRole(msg) {
+  const role = String((msg && msg.role) || '').toLowerCase();
+  if (role === 'assistant' || role === 'model' || role === 'ai' || role === 'orion') return 'assistant';
+  if (role === 'user' || role === 'human') return 'user';
+  return role;
+}
+
+function extractConversationMessageText(msg) {
+  if (!msg) return '';
+  const directFields = [msg.text, msg.content, msg.output, msg.result, msg.message];
+  for (const field of directFields) {
+    if (typeof field === 'string' && field.trim()) return field;
+  }
+  const arrayFields = [msg.parts, msg.content];
+  for (const field of arrayFields) {
+    if (!Array.isArray(field)) continue;
+    const text = field.map(part => {
+      if (typeof part === 'string') return part;
+      if (!part || typeof part !== 'object') return '';
+      if (typeof part.text === 'string') return part.text;
+      if (typeof part.content === 'string') return part.content;
+      if (typeof part.output_text === 'string') return part.output_text;
+      return '';
+    }).filter(Boolean).join('\n');
+    if (text.trim()) return text;
+  }
+  return '';
+}
+
+function stringifyReplayToolResult(response) {
+  if (response === undefined || response === null) return '';
+  return typeof response === 'string' ? response : JSON.stringify(response, null, 2);
+}
+
+function responseLooksFailed(response) {
+  if (!response || typeof response !== 'object') return false;
+  if (response.error || response.failureCategory || response.repeatedFailure || response.blocked) return true;
+  if (response.success === false) return true;
+  if (response.exitCode !== undefined && Number(response.exitCode) !== 0) return true;
+  if (response.code !== undefined && Number(response.code) !== 0) return true;
+  return false;
+}
+
+function extractConversationMessageLogs(msg) {
+  if (Array.isArray(msg && msg.logs) && msg.logs.length) return msg.logs;
+  const turns = Array.isArray(msg && msg.turns) ? msg.turns : [];
+  const rebuiltLogs = [];
+  turns.forEach(turn => {
+    const modelParts = Array.isArray(turn && turn.modelParts) ? turn.modelParts : [];
+    modelParts.forEach(part => {
+      const call = part && part.functionCall;
+      if (!call) return;
+      rebuiltLogs.push({
+        type: 'tool_call',
+        tool: call.name || 'tool',
+        params: call.args || {},
+        status: 'running'
+      });
+    });
+
+    const responseParts = Array.isArray(turn && turn.toolResponseParts) ? turn.toolResponseParts : [];
+    responseParts.forEach(part => {
+      const fnResponse = part && part.functionResponse;
+      if (!fnResponse) return;
+      const response = fnResponse.response || {};
+      const pending = [...rebuiltLogs].reverse().find(log =>
+        log.type === 'tool_call' &&
+        log.tool === (fnResponse.name || log.tool) &&
+        (!log.result || log.status === 'running')
+      );
+      const target = pending || {
+        type: 'tool_call',
+        tool: fnResponse.name || 'tool',
+        params: {},
+        status: 'running'
+      };
+      target.status = responseLooksFailed(response) ? 'error' : 'success';
+      target.result = stringifyReplayToolResult(response);
+      if (!pending) rebuiltLogs.push(target);
+    });
+  });
+  return rebuiltLogs;
+}
+
+function normalizeConversationMessageForReplay(msg) {
+  return {
+    ...(msg || {}),
+    role: normalizeConversationMessageRole(msg),
+    text: extractConversationMessageText(msg),
+    logs: extractConversationMessageLogs(msg || {})
+  };
+}
+
 function scrubLegacyPhoneCompanionTokenMessages() {
   let updated = false;
   conversations.forEach(c => {
@@ -1717,13 +1882,128 @@ async function refreshPhoneCompanionPairing() {
 }
 
 function saveConversationsToStorage() {
+  const revision = ++conversationSaveRevision;
+  let snapshot = null;
   try {
-    const serialized = JSON.stringify(conversations);
+    snapshot = JSON.parse(JSON.stringify(conversations));
+  } catch (error) {
+    console.error("Failed to serialize conversations", error);
+    return;
+  }
+
+  if (window.api && typeof window.api.writeConversations === 'function') {
+    window.api.writeConversations({ revision, conversations: snapshot }).then(result => {
+      if (result && result.success) {
+        lastConversationDiskSaveError = '';
+      } else {
+        lastConversationDiskSaveError = result && result.error ? result.error : 'Unknown disk save error';
+        console.error("Failed to save conversations to disk", lastConversationDiskSaveError);
+      }
+    }).catch(error => {
+      lastConversationDiskSaveError = error.message || String(error);
+      console.error("Failed to save conversations to disk", error);
+    });
+  }
+
+  try {
+    const serialized = JSON.stringify(snapshot);
     localStorage.setItem('ag2_conversations', serialized);
     localStorage.setItem('ag2_conversations_backup', serialized);
   } catch (e) {
-    console.error("Failed to save conversations to storage", e);
+    console.error("Failed to save conversations to localStorage; disk persistence remains primary", e);
   }
+}
+
+function showOrionConfirmDialog({ title = 'Confirm action', message = '', confirmLabel = 'Confirm', danger = false } = {}) {
+  return new Promise(resolve => {
+    let overlay = document.getElementById('orion-confirm-modal');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.id = 'orion-confirm-modal';
+      overlay.className = 'modal-overlay orion-confirm-overlay';
+      overlay.innerHTML = `
+        <div class="modal-card orion-confirm-card" role="dialog" aria-modal="true" aria-labelledby="orion-confirm-title">
+          <div class="modal-header">
+            <h2 id="orion-confirm-title"></h2>
+            <button class="modal-close" id="orion-confirm-close" type="button" aria-label="Close">&times;</button>
+          </div>
+          <div class="modal-body">
+            <p id="orion-confirm-message" class="orion-confirm-message"></p>
+          </div>
+          <div class="modal-footer orion-confirm-actions">
+            <button class="secondary-btn" id="orion-confirm-cancel" type="button">Cancel</button>
+            <button class="primary-btn" id="orion-confirm-accept" type="button"></button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(overlay);
+    }
+
+    const titleEl = overlay.querySelector('#orion-confirm-title');
+    const messageEl = overlay.querySelector('#orion-confirm-message');
+    const acceptBtn = overlay.querySelector('#orion-confirm-accept');
+    const cancelBtn = overlay.querySelector('#orion-confirm-cancel');
+    const closeBtn = overlay.querySelector('#orion-confirm-close');
+    const previousActiveElement = document.activeElement;
+    titleEl.textContent = title;
+    messageEl.textContent = message;
+    acceptBtn.textContent = confirmLabel;
+    acceptBtn.classList.toggle('danger', !!danger);
+
+    const finish = confirmed => {
+      overlay.classList.remove('active');
+      acceptBtn.removeEventListener('click', onAccept);
+      cancelBtn.removeEventListener('click', onCancel);
+      closeBtn.removeEventListener('click', onCancel);
+      overlay.removeEventListener('click', onOverlay);
+      document.removeEventListener('keydown', onKeydown);
+      if (previousActiveElement && typeof previousActiveElement.focus === 'function') {
+        previousActiveElement.focus();
+      }
+      resolve({ confirmed: !!confirmed });
+    };
+    const onAccept = () => finish(true);
+    const onCancel = () => finish(false);
+    const onOverlay = event => {
+      if (event.target === overlay) finish(false);
+    };
+    const onKeydown = event => {
+      if (event.key === 'Escape') {
+        finish(false);
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const focusable = Array.from(overlay.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'))
+        .filter(node => !node.disabled && node.offsetParent !== null);
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    acceptBtn.addEventListener('click', onAccept);
+    cancelBtn.addEventListener('click', onCancel);
+    closeBtn.addEventListener('click', onCancel);
+    overlay.addEventListener('click', onOverlay);
+    document.addEventListener('keydown', onKeydown);
+    overlay.classList.add('active');
+    cancelBtn.focus();
+  });
+}
+
+function confirmConversationDelete(title) {
+  return showOrionConfirmDialog({
+    title: 'Delete conversation?',
+    message: `Delete "${title || 'Untitled Conversation'}" from Orion? This cannot be undone.`,
+    confirmLabel: 'Delete',
+    danger: true
+  });
 }
 
 function renderConversationList() {
@@ -1755,7 +2035,7 @@ function renderConversationList() {
     
     item.querySelector('.delete-btn').addEventListener('click', async (e) => {
       e.stopPropagation();
-      const approved = await window.api.showConfirmDialog(`Delete conversation "${conv.title}"?`, 'Delete Conversation');
+      const approved = await confirmConversationDelete(conv.title);
       if (approved?.confirmed) {
         deleteConversation(conv.id);
       }
@@ -1803,28 +2083,39 @@ function selectConversation(id) {
     el.messagesContainer.style.display = 'flex';
     el.messagesContainer.innerHTML = '';
     
-    conv.messages.forEach(msg => {
+    const replayMessages = conv.messages.map(normalizeConversationMessageForReplay);
+    replayMessages.forEach(replayMsg => {
+      const replayLogs = Array.isArray(replayMsg.logs) ? replayMsg.logs : [];
       window.clearActiveAiBubble();
-      if (msg.role === 'user') {
-        renderUserMessage(msg.text);
-      } else if (msg.role === 'assistant') {
-        if (isEmptyThinkingPlaceholder(msg.text, msg.logs)) return;
-        renderAiMessage(msg.text, msg.logs, activeConversationId, msg);
-      } else if (msg.role === 'steering') {
-        renderSystemBubble(msg.text);
-      } else if (msg.role === 'system') {
-        if (msg.source === 'queued-prompt') {
+      if (replayMsg.role === 'user') {
+        renderUserMessage(replayMsg.text);
+      } else if (replayMsg.role === 'assistant') {
+        if (isEmptyThinkingPlaceholder(replayMsg.text, replayLogs)) return;
+        renderAiMessage(replayMsg.text, replayLogs, activeConversationId, replayMsg);
+      } else if (replayMsg.role === 'steering') {
+        renderSystemBubble(replayMsg.text);
+      } else if (replayMsg.role === 'system') {
+        if (replayMsg.source === 'queued-prompt') {
           renderQueuedPromptBubble({
-            ...msg,
-            id: msg.queueId,
-            prompt: msg.queuedPrompt,
+            ...replayMsg,
+            id: replayMsg.queueId,
+            prompt: replayMsg.queuedPrompt,
             conversationId: activeConversationId
           });
         } else {
-          renderSystemBubble(msg.text);
+          renderSystemBubble(replayMsg.text);
         }
       }
     });
+    const queuedForThisConversation = Array.isArray(window.promptQueue)
+      && window.promptQueue.some(item => item && item.conversationId === activeConversationId);
+    const recoveredAssistantMessage = buildMissingAssistantResponseMessage(replayMessages, {
+      queued: queuedForThisConversation
+    });
+    if (recoveredAssistantMessage) {
+      window.clearActiveAiBubble();
+      renderAiMessage(recoveredAssistantMessage.text, [], activeConversationId, recoveredAssistantMessage);
+    }
     window.clearActiveAiBubble();
     removeLegacyPhoneCompanionTokenBubbles();
   }
@@ -1906,7 +2197,10 @@ async function submitMessage() {
     const selectedModel = el.modelSelect.value;
     if (window.isAgentRunning && window.isAgentRunning()) {
       window.promptQueue.push({ prompt, modelSelectValue: selectedModel, conversationId: conv.id, alreadyRendered: true });
-      appendSystemMessage("Another conversation is currently running. This prompt was queued for this conversation.");
+      persistAssistantStatusMessage(conv.id, "Queued. Orion will start this after the current task finishes.", {
+        source: 'queue-status',
+        dedupeKey: `queued-${conv.id}-${prompt}`
+      });
     } else {
       await window.runAgentLoop(prompt, selectedModel, conv);
       loadRunArtifacts();
@@ -1921,6 +2215,10 @@ async function submitMessage() {
         const selectedModel = el.modelSelect.value;
         if (window.isAgentRunning && window.isAgentRunning()) {
           window.promptQueue.push({ prompt: pendingPrompt, modelSelectValue: selectedModel, conversationId: pendingConv.id, alreadyRendered: true });
+          persistAssistantStatusMessage(pendingConv.id, "Queued. Orion will start this after the current task finishes.", {
+            source: 'queue-status',
+            dedupeKey: `queued-${pendingConv.id}-${pendingPrompt}`
+          });
         } else {
           await window.runAgentLoop(pendingPrompt, selectedModel, pendingConv);
           loadRunArtifacts();
@@ -2060,6 +2358,69 @@ function appendSystemMessage(text, options = {}) {
   }
 }
 
+const MISSING_ASSISTANT_RESPONSE_TEXT = 'Run ended before Orion saved an assistant response. This transcript only contains your prompt, so there is no assistant answer to replay.';
+
+function persistAssistantStatusMessage(conversationId, text, options = {}) {
+  const targetId = conversationId || activeConversationId;
+  const conv = conversations.find(c => c.id === targetId);
+  if (!conv) return null;
+  if (!Array.isArray(conv.messages)) conv.messages = [];
+
+  const dedupeKey = options.dedupeKey || `${options.source || 'assistant-status'}:${text}`;
+  const duplicate = conv.messages.some(msg =>
+    msg &&
+    msg.role === 'assistant' &&
+    msg.statusOnly &&
+    msg.dedupeKey === dedupeKey
+  );
+  if (duplicate) return null;
+
+  const message = {
+    role: 'assistant',
+    source: options.source || 'assistant-status',
+    text,
+    logs: Array.isArray(options.logs) ? options.logs : [],
+    turns: [],
+    statusOnly: true,
+    dedupeKey,
+    createdAt: Date.now()
+  };
+  conv.messages.push(message);
+  saveConversationsToStorage();
+  if (targetId === activeConversationId) {
+    renderAiMessage(text, message.logs, targetId, message);
+  }
+  renderConversationList();
+  renderProjectsList();
+  return message;
+}
+
+function buildMissingAssistantResponseMessage(normalizedMessages, options = {}) {
+  if (!Array.isArray(normalizedMessages) || normalizedMessages.length === 0) return null;
+  const lastUserIndex = normalizedMessages.map(msg => msg.role).lastIndexOf('user');
+  if (lastUserIndex === -1) return null;
+  const hasMeaningfulAssistantAfterUser = normalizedMessages.slice(lastUserIndex + 1).some(msg => {
+    if (!msg || msg.role !== 'assistant') return false;
+    const logs = Array.isArray(msg.logs) ? msg.logs : [];
+    return !isEmptyThinkingPlaceholder(msg.text, logs);
+  });
+  if (hasMeaningfulAssistantAfterUser) return null;
+  const queued = !!options.queued;
+  const text = queued
+    ? 'Queued. Orion will start this after the current task finishes.'
+    : MISSING_ASSISTANT_RESPONSE_TEXT;
+  return {
+    role: 'assistant',
+    source: queued ? 'queue-status' : 'missing-assistant-recovery',
+    text,
+    content: text,
+    logs: [],
+    turns: [],
+    statusOnly: true,
+    recovered: !queued
+  };
+}
+
 function shouldDedupeSystemCard(dedupeKey, windowMs = 1500) {
   const key = dedupeKey || 'system-card';
   const now = Date.now();
@@ -2123,18 +2484,21 @@ async function refreshPairedDevicesList() {
         const badgeClass = d.revoked ? 'fail' : 'pass';
         
         return `
-          <div class="device-item" style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: 6px; font-size: 0.8rem; font-family: var(--font-sans);">
-            <div style="display: flex; flex-direction: column; gap: 2px;">
-              <div style="font-weight: 600; color: var(--text-primary);">${escapeHtml(d.name)}</div>
-              <div style="font-size: 0.72rem; color: var(--text-muted);">Last seen: ${escapeHtml(lastSeen)}</div>
+          <div class="device-item">
+            <div class="device-copy">
+              <div class="device-name">${escapeHtml(d.name)}</div>
+              <div class="device-meta">Last seen: ${escapeHtml(lastSeen)}</div>
             </div>
-            <div style="display: flex; align-items: center; gap: 8px;">
-              <span class="status-indicator ${badgeClass}" style="font-size: 0.65rem; padding: 2px 6px; border-radius: 4px; font-weight: 700; text-transform: uppercase;">${statusText}</span>
-              ${!d.revoked ? `<button class="btn-secondary" style="padding: 2px 6px; font-size: 0.7rem; border-color: var(--error-color); color: var(--error-color); cursor: pointer;" onclick="revokeDevice('${escapeHtml(d.id)}')">Revoke</button>` : ''}
+            <div class="device-actions">
+              <span class="status-indicator ${badgeClass}">${statusText}</span>
+              ${!d.revoked ? `<button class="btn-secondary btn-revoke-device" type="button" data-revoke-device-id="${escapeHtml(d.id)}">Revoke</button>` : ''}
             </div>
           </div>
         `;
       }).join('');
+      listContainer.querySelectorAll('[data-revoke-device-id]').forEach(button => {
+        button.addEventListener('click', () => window.revokeDevice(button.dataset.revokeDeviceId || ''));
+      });
     } else {
       sectionContainer.style.display = 'none';
     }
@@ -2144,11 +2508,15 @@ async function refreshPairedDevicesList() {
 }
 
 window.revokeDevice = async (id) => {
-  if (confirm("Are you sure you want to revoke this paired phone's access?")) {
-    if (window.api && typeof window.api.revokePhoneCompanionDevice === 'function') {
-      await window.api.revokePhoneCompanionDevice(id);
-      await refreshPairedDevicesList();
-    }
+  const approved = await showOrionConfirmDialog({
+    title: 'Revoke phone access?',
+    message: "This phone will lose access to Orion immediately. You can pair it again later.",
+    confirmLabel: 'Revoke',
+    danger: true
+  });
+  if (approved?.confirmed && window.api && typeof window.api.revokePhoneCompanionDevice === 'function') {
+    await window.api.revokePhoneCompanionDevice(id);
+    await refreshPairedDevicesList();
   }
 };
 
@@ -2179,6 +2547,7 @@ function renderPhoneCompanionPairingCard(payload) {
   bubble.className = 'message-bubble companion-pairing-card';
   const qrSvg = String(payload.qrSvg || '');
   const pairUrl = String(payload.pairUrl || '');
+  const stableUrl = String(payload.stableUrl || pairUrl.replace(/\?.*$/, ''));
   const expiresText = payload.expiresAt ? `Expires: ${new Date(payload.expiresAt).toLocaleTimeString()}` : 'Short-lived pairing link';
   bubble.innerHTML = `
     <div class="message-header" style="color: var(--accent-secondary);">Phone Companion Pairing</div>
@@ -2186,9 +2555,10 @@ function renderPhoneCompanionPairingCard(payload) {
       <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
         <div data-companion-qr="true" aria-label="Phone Companion pairing QR code" style="background:#fff; padding:8px; border-radius:8px; line-height:0;">${qrSvg}</div>
         <div style="min-width:220px; flex:1;">
-          <div style="font-weight:700; margin-bottom:6px;">Scan to pair a phone</div>
-          <div style="color: var(--text-muted); margin-bottom:8px;">Desktop approval is required before this phone can control Orion.</div>
+          <div style="font-weight:700; margin-bottom:6px;">Scan once to trust this phone</div>
+          <div style="color: var(--text-muted); margin-bottom:8px;">After it connects, add the clean URL to your home screen so the icon opens your saved device session.</div>
           <div data-pair-url="${escapeHtml(pairUrl)}" style="font-family: var(--font-mono); font-size:.76rem; word-break:break-all;">${escapeHtml(pairUrl)}</div>
+          <div data-stable-phone-url="${escapeHtml(stableUrl)}" style="font-family: var(--font-mono); font-size:.76rem; word-break:break-all; margin-top:6px; color:var(--success-color);">${escapeHtml(stableUrl)}</div>
           <div data-pairing-metadata="true" style="color: var(--text-muted); font-size:.74rem; margin-top:8px;">${escapeHtml(expiresText)}</div>
         </div>
       </div>
@@ -2711,6 +3081,7 @@ window.runRegressionTests = runRegressionTests;
 window.loadRunArtifacts = loadRunArtifacts;
 window.renderAiMessage = renderAiMessage;
 window.appendSystemMessage = appendSystemMessage;
+window.persistAssistantStatusMessage = persistAssistantStatusMessage;
 window.markQueuedPromptRunning = markQueuedPromptRunning;
 window.saveConversationsToStorage = saveConversationsToStorage;
 window.showPhoneCompanionPairingCard = showPhoneCompanionPairingCard;
@@ -2769,9 +3140,12 @@ window.onAgentStatusChange = (running) => {
   const queueBtn = document.getElementById('btn-queue');
   
   if (running) {
-    submitBtn.classList.add('btn-stop');
-    submitBtn.innerHTML = '&#9209;';
-    submitBtn.title = 'Stop agent task execution';
+    submitBtn.innerHTML = '&#10022;';
+    submitBtn.title = 'Send or queue message';
+    if (el.btnStopAgent) {
+      el.btnStopAgent.classList.add('visible');
+      el.btnStopAgent.disabled = false;
+    }
     clearTimeout(agentCompletionTimer);
     refreshAgentPresence();
     clearInterval(agentPresenceTimer);
@@ -2779,9 +3153,12 @@ window.onAgentStatusChange = (running) => {
   } else {
     clearInterval(agentPresenceTimer);
     agentPresenceTimer = null;
-    submitBtn.classList.remove('btn-stop');
     submitBtn.innerHTML = '&#10022;';
     submitBtn.title = 'Send message';
+    if (el.btnStopAgent) {
+      el.btnStopAgent.classList.remove('visible');
+      el.btnStopAgent.disabled = false;
+    }
     steerBtn.style.display = 'none';
     queueBtn.style.display = 'none';
     const conv = conversations.find(item => item.id === activeConversationId);
@@ -2802,18 +3179,40 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   const activeConv = activeConversationId ? conversations.find(c => c.id === activeConversationId) : null;
   const conv = requestedConv || activeConv || conversations[0] || null;
   const resolvedId = conv ? conv.id : '';
-  const messages = conv && conv.messages ? conv.messages.slice(-40).map(msg => ({
-    role: msg.role,
-    content: msg.content || msg.text || '',
-    text: msg.role === 'assistant' && msg.text === 'Thinking...' && msg.logs && msg.logs.length
-      ? msg.logs.map(log => log.content || log.result || '').filter(Boolean).join('\n')
-      : (msg.text || msg.content || '')
-  })) : [];
+  const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
+  const globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+  const isActiveTargetRunning = isGlobalRunning && globalRunningId === resolvedId;
+  const queuedForResolvedConversation = Array.isArray(window.promptQueue)
+    && window.promptQueue.some(q => q && q.conversationId === resolvedId);
+  const normalizedPhoneMessages = conv && conv.messages
+    ? conv.messages.slice(-40).map(normalizeConversationMessageForReplay)
+    : [];
+  const recoveredAssistantMessage = buildMissingAssistantResponseMessage(normalizedPhoneMessages, {
+    queued: queuedForResolvedConversation
+  });
+  const messages = normalizedPhoneMessages.map(replayMsg => {
+    const replayLogs = Array.isArray(replayMsg.logs) ? replayMsg.logs : [];
+    const text = replayMsg.role === 'assistant' && replayMsg.text === 'Thinking...' && replayLogs.length
+      ? replayLogs.map(log => log.content || log.result || '').filter(Boolean).join('\n')
+      : replayMsg.text;
+    return {
+      role: replayMsg.role,
+      content: text,
+      text,
+      logs: replayMsg.role === 'assistant' ? replayLogs : []
+    };
+  });
+  if (recoveredAssistantMessage && !isActiveTargetRunning) {
+    messages.push(recoveredAssistantMessage);
+  }
   const latestOutput = messages.slice().reverse().find(msg => msg.role === 'assistant' || msg.role === 'system');
-  const latestAssistant = conv && conv.messages ? conv.messages.slice().reverse().find(msg => msg.role === 'assistant') : null;
+  const latestAssistant = conv && conv.messages
+    ? conv.messages.slice().reverse().map(normalizeConversationMessageForReplay).find(msg => msg.role === 'assistant')
+    : null;
   const latestText = latestAssistant ? (latestAssistant.text || '') : '';
   const changedFiles = [];
   const testResults = [];
+  const latestToolCalls = [];
   (latestAssistant && Array.isArray(latestAssistant.logs) ? latestAssistant.logs : []).forEach(log => {
     if (log.tool === 'write_file' || log.tool === 'modify_file' || log.tool === 'patch_file') {
       const params = log.params || {};
@@ -2822,20 +3221,41 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     if (log.tool === 'run_tests' || log.tool === 'run_command') {
       testResults.push(log.result || '');
     }
+    if (log.type === 'tool_call' || log.tool || log.type === 'thought') {
+      latestToolCalls.push({
+        type: log.type || 'tool_call',
+        content: log.content || '',
+        tool: log.tool || '',
+        status: log.status || 'running',
+        params: log.params || {},
+        result: log.result || ''
+      });
+    }
   });
   const walkthroughIndex = latestText.indexOf('\n\n## Work Walkthrough');
   const workWalkthrough = walkthroughIndex === -1 ? '' : latestText.slice(walkthroughIndex).trim();
-  const conversationsSummary = conversations.map(c => ({
-    id: c.id,
-    title: c.title || 'New Conversation',
-    workspace: c.workspace || '',
-    projectPath: c.projectPath || '',
-    active: c.id === resolvedId,
-    isDesktopActive: c.id === activeConversationId,
-    awaitingPlanApproval: !!(c.awaitingPlanApproval && !c.planApproved),
-    taskCount: Array.isArray(c.tasks) ? c.tasks.length : 0,
-    updatedAt: c.updatedAt || c.createdAt || 0
-  }));
+  const conversationsSummary = conversations.map(c => {
+    const normalizedMessages = Array.isArray(c.messages)
+      ? c.messages.map(normalizeConversationMessageForReplay)
+      : [];
+    const messageCount = normalizedMessages.filter(msg =>
+      msg.role === 'user' || msg.role === 'assistant' || msg.role === 'steering'
+    ).length;
+    const taskCount = Array.isArray(c.tasks) ? c.tasks.length : 0;
+    return {
+      id: c.id,
+      title: c.title || 'New Conversation',
+      workspace: c.workspace || '',
+      projectPath: c.projectPath || '',
+      active: c.id === resolvedId,
+      isDesktopActive: c.id === activeConversationId,
+      awaitingPlanApproval: !!(c.awaitingPlanApproval && !c.planApproved),
+      taskCount,
+      messageCount,
+      activityCount: messageCount + taskCount,
+      updatedAt: c.updatedAt || c.createdAt || 0
+    };
+  });
   const projectSummaries = projects.map(path => {
     const name = path.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || path;
     const projectConversations = conversations.filter(c => c.projectPath === path);
@@ -2847,9 +3267,6 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     };
   });
   
-  const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
-  const globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
-  const isActiveTargetRunning = isGlobalRunning && globalRunningId === resolvedId;
   const companionWorkspace = conv ? (conv.workspace || conv.projectPath || currentWorkspace || '') : currentWorkspace;
   const operationalResult = companionWorkspace && window.readOperationalContext
     ? await window.readOperationalContext(companionWorkspace)
@@ -2892,6 +3309,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     operationalContext,
     preview: {
       latestAssistantOutput: latestText,
+      latestToolCalls,
       workWalkthrough,
       changedFiles,
       testResults,
@@ -2977,6 +3395,13 @@ window.submitPhoneCompanionPrompt = async (options) => {
     });
     targetId = conv.id;
   }
+  const incomingProjectPath = typeof options === 'object' ? String(options.projectPath || '').trim() : '';
+  if (incomingProjectPath && !conv.projectPath) {
+    conv.projectPath = incomingProjectPath;
+  }
+  if (conv.projectPath && !conv.workspace) {
+    conv.workspace = conv.projectPath;
+  }
 
   // Generate a short title if it's new
   if (conv.messages.length === 0 || conv.title === 'New Phone Task' || conv.title === 'Untitled Conversation') {
@@ -2996,9 +3421,12 @@ window.submitPhoneCompanionPrompt = async (options) => {
       conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now() });
       saveConversationsToStorage();
     }
+    persistAssistantStatusMessage(targetId, "Queued. Orion will start this after the current task finishes.", {
+      source: 'queue-status',
+      dedupeKey: `phone-queued-${targetId}-${text}`
+    });
     if (targetId === activeConversationId) {
       renderUserMessage(text);
-      appendSystemMessage("Phone companion prompt queued for the active conversation.");
     }
     return { success: true, queued: true, conversationId: targetId, title: conv.title || 'New Conversation' };
   }
@@ -3012,7 +3440,13 @@ window.submitPhoneCompanionPrompt = async (options) => {
     renderUserMessage(text);
   }
   window.runAgentLoop(text, window.getSelectedModel(), conv, { source: 'phone' })
-    .catch(err => console.error("Phone-started agent loop failed:", err));
+    .catch(err => {
+      console.error("Phone-started agent loop failed:", err);
+      persistAssistantStatusMessage(targetId, `Orion could not start this phone request: ${err.message}`, {
+        source: 'agent-start-error',
+        dedupeKey: `phone-start-error-${targetId}-${text}`
+      });
+    });
 
   return { success: true, queued: false, conversationId: targetId, title: conv.title || 'New Conversation' };
 };
@@ -3074,6 +3508,10 @@ window.approvePhoneCompanionPlan = async (targetId) => {
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
   if (isGlobalRunning) {
     window.promptQueue.push({ prompt, modelSelectValue: window.getSelectedModel(), conversationId: resolvedId, source: 'plan-approval' });
+    persistAssistantStatusMessage(resolvedId, "Queued. Orion will continue the approved plan after the current task finishes.", {
+      source: 'queue-status',
+      dedupeKey: `plan-approval-queued-${resolvedId}`
+    });
     return { success: true, queued: true };
   }
 
@@ -3123,6 +3561,19 @@ window.resumePhoneCompanionTask = async (targetId) => {
   const resolvedId = targetId || activeConversationId;
   const prompt = 'Continue the previous task. First inspect current state and recent output, then continue only if it is still safe and useful.';
   return await window.submitPhoneCompanionPrompt({ prompt, conversationId: resolvedId });
+};
+
+window.discoverPhoneCompanionSkills = async (group) => {
+  const result = await window.api.discoverSkills(group || null);
+  if (!result || !result.success) return { skills: [], count: 0 };
+  return { skills: result.skills, count: result.skills.length };
+};
+
+window.runPhoneCompanionSkill = async ({ name, inputs } = {}) => {
+  if (!name) return { success: false, error: "Missing 'name' parameter" };
+  const result = await window.api.runSkill(name, inputs || {});
+  if (!result || !result.success) return { success: false, error: (result && result.error) || `Skill '${name}' failed` };
+  return { success: true, outputs: result.outputs };
 };
 
 function buildClarificationCardHtml(clarData) {
@@ -3409,7 +3860,12 @@ function buildProjectCard(path) {
 
   projectHeader.querySelector('.delete-btn').addEventListener('click', async (e) => {
     e.stopPropagation();
-    const approved = await window.api.showConfirmDialog(`Remove project "${name}" and delete its conversations?`, 'Remove Project');
+    const approved = await showOrionConfirmDialog({
+      title: 'Remove project?',
+      message: `Remove "${name}" and delete its conversations from Orion? This cannot be undone.`,
+      confirmLabel: 'Remove',
+      danger: true
+    });
     if (approved?.confirmed) {
       removeProject(path);
     }
@@ -3452,7 +3908,7 @@ function buildProjectCard(path) {
 
       convItem.querySelector('.delete-btn').addEventListener('click', async (e) => {
         e.stopPropagation();
-        const approved = await window.api.showConfirmDialog(`Delete conversation "${conv.title}"?`, 'Delete Conversation');
+        const approved = await confirmConversationDelete(conv.title);
         if (approved?.confirmed) {
           deleteConversation(conv.id);
         }

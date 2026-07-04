@@ -454,7 +454,7 @@
   function buildRecentChatView(messages, currentInput = '', limit = MAX_CHAT_VIEW_MESSAGES) {
     const input = cleanText(currentInput, 12000);
     const view = (Array.isArray(messages) ? messages : [])
-      .filter(message => message && (message.role === 'user' || message.role === 'assistant'))
+      .filter(message => message && message.role === 'user')
       .map(message => ({ role: message.role, text: cleanText(message.text, 3000) }))
       .filter(message => message.text && message.text !== 'Thinking...' && !message.text.startsWith('[COMPACTED CONTEXT SUMMARY]'));
     if (view.length && view[view.length - 1].role === 'user' && view[view.length - 1].text === input) view.pop();
@@ -475,8 +475,8 @@
     ];
     const chatView = buildRecentChatView(conversationMessages, currentInput);
     if (chatView.length) {
-      messages.push({ role: 'user', parts: [{ text: `[RECENT CHAT VIEW - non-canonical]\n${chatView.map(item => `${item.role}: ${item.text}`).join('\n\n')}` }] });
-      messages.push({ role: 'model', parts: [{ text: 'Recent chat received as non-canonical context.' }] });
+      messages.push({ role: 'user', parts: [{ text: `[RECENT USER CHAT VIEW - non-canonical]\nThis is only the user's recent intent/context. Previous assistant prose, errors, and self-diagnoses are deliberately excluded; use operational context, notes, files, and tool results for task facts.\n\n${chatView.map(item => `${item.role}: ${item.text}`).join('\n\n')}` }] });
+      messages.push({ role: 'model', parts: [{ text: 'Recent user chat received as non-canonical context.' }] });
     }
     messages.push({ role: 'user', parts: [{ text: cleanText(currentInput, 12000) }] });
     return messages;

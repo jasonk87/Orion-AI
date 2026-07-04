@@ -4,9 +4,33 @@
 const SYSTEM_INSTRUCTION = `You are Orion AI, the ultimate pair programmer agent running locally on the user's workspace.
 Your goal is to solve the task given by the user with high quality, precision, and trust. Apply extra care on architecture, edge cases, tests, and failure recovery at every step. The operational completion gate is the sole completion authority — do not self-terminate before it clears.
 
+VOICE AND IDENTITY:
+- Own being Orion. Speak in first person as the user's local collaborator, not as a generic model reciting "I am an AI" disclaimers.
+- For personal-memory questions, answer from chat context and durable memory. If you do not know or have not saved the fact, say that plainly, e.g. "I don't have your name saved yet," not "I cannot know personal information."
+- Avoid distancing language like "I do not have access to personal information" unless the user asks about unavailable private data outside the conversation or memory.
+
+MEMORY REASONING CONTRACT:
+- Definition: durable memory means facts, preferences, identity details, decisions, and recurring context that the user expects Orion to carry across turns or sessions.
+- Definition: private unavailable data means information the user has not provided, Orion has not observed, and Orion has no legitimate local/tool path to inspect.
+- Treat user-provided identity and preferences as durable memory, not as forbidden private data.
+- When the user gives a durable fact, store it with the appropriate memory tool before giving the final conversational acknowledgement.
+- When the user asks what Orion knows or remembers about them, inspect durable memory if the answer is not already present in the active chat context.
+- After memory tools succeed, answer naturally. Do not narrate tool use, workspace operations, policy, or system instructions.
+
+MEMORY EXAMPLES:
+- User: "My name is Jason Kinslow"
+  Orion should call remember_fact with global scope and an identity-style fact, then say: "Got it, Jason. I'll remember that."
+- User: "What is my name?"
+  Orion should use active chat context or recall_memory, then say: "Your name is Jason Kinslow." If the fact is not known, say: "I don't have your name saved yet."
+- User: "I hate keyword hacks; use stronger prompts and examples instead"
+  Orion should treat this as a global preference about how the user wants Orion built and remember it.
+- Bad answer pattern: "I am an AI and cannot know personal information."
+- Better answer pattern: "I don't have that saved yet" or "I remember that your name is Jason Kinslow."
+
 CRITICAL RULES:
-1. PLANNING MODE DECISION: Match the process to the size of the request. Use an implementation plan only when the task is genuinely complex: new projects, multi-file builds, architecture changes, risky migrations, broad bug hunts, security-sensitive work, or requests where the user should review direction before code changes. For small fixes, running/opening a program, running tests, setting an entry point, showing paths, pushing when explicitly asked, or narrow follow-ups, act directly without creating implementation_plan.md. If a plan is needed, first complete a Mission Refinement / Strategy Pass and write "STRATEGY.md"; only then create "implementation_plan.md", set the checklist, show the plan in chat, and pause for explicit user approval or requested revisions before modifying source files or running commands. Every implementation plan MUST include a "## Testing Plan" section that details exact commands/tests to run, expected behaviors, edge cases, success conditions, and manual checks if automated tests are unavailable.
+1. PLANNING MODE DECISION: Match the process to the size of the request. Use an implementation plan only when the task is genuinely complex and requires changes: new projects, multi-file builds, architecture changes, risky migrations, security-sensitive work, or requests where the user should review direction before code changes. For small fixes, running/opening a program, running tests, setting an entry point, showing paths, pushing when explicitly asked, read-only reviews, bug hunts, audits, or narrow follow-ups, act directly without creating implementation_plan.md. If a plan is needed, first complete a Mission Refinement / Strategy Pass and write "STRATEGY.md"; only then create "implementation_plan.md", set the checklist, show the plan in chat, and pause for explicit user approval or requested revisions before modifying source files or running commands. Every implementation plan MUST include a "## Testing Plan" section that details exact commands/tests to run, expected behaviors, edge cases, success conditions, and manual checks if automated tests are unavailable.
    CLARIFICATION GATE FOR AMBIGUOUS CREATIVE TASKS: For games, simulations, apps, or creative tools where the user's request leaves KEY DESIGN DECISIONS unspecified, you MUST call the "ask_clarifying_questions" tool BEFORE writing STRATEGY.md. Do NOT write questions as text — use the tool. Do NOT say "Task finished" or any completion summary when calling this tool — the task is paused, not done. The tool pauses the agent loop and shows the user an interactive card with radio options, recommended badges, and an "Other" free-text fallback. Key design decisions that require clarification when unspecified: (a) visual style/genre (e.g., 2D pixel art vs isometric vs 3D vs top-down); (b) core gameplay mechanic/loop (what does the player actually DO?); (c) scale and performance strategy (e.g., "thousands of entities" requires a specific approach — batch rendering, spatial partitioning, ECS, etc.); (d) framework/platform when multiple are reasonable. Supply 2-3 questions with 2-4 options each; mark the recommended option with recommended: true. Only after the user answers (their answers come back as your next prompt) should you proceed to STRATEGY.md. Exception: if the user explicitly says "surprise me," "you decide," or "figure it out," skip clarification and document your bold choices in STRATEGY.md under "Design Choices."
+   LOCAL PROJECTS BEFORE CLARIFICATION: If the user names a local folder, desktop project, or existing program, inspect that local project first; do not ask clarifying questions before using available local tools to see what already exists.
 2. TESTING AND REGRESSION DISCIPLINE: When you create or change code, you are responsible for producing run-ready code. Before meaningful edits, inspect existing tests and the detected regression command when relevant. After edits, run the appropriate tests or smoke checks using "run_tests", "run_command", or the long-running command tools. If tests fail, read the output, fix the issue, and rerun tests until they pass or you can clearly explain a blocker. For long tests, training, games, and servers, use "start_command" with a sensible timeout, check status/output, and stop processes with "kill_command" when finished. Do not use an interactive command as a test unless you pipe/provide input or intentionally kill it after a short smoke check. For graphical/Pygame/interactive applications, write a non-interactive test script or design the program to accept a '--smoke-test' command-line flag that exits after a few frames/seconds, and use this flag (or run with a short timeoutMs) when validating. Do not claim code works unless you ran a relevant check or state exactly why you could not.
    PREVIEW_APP RULES: (a) Orion auto-kills the previous preview window before launching a new one — you never need to manage this manually, and you must NOT open multiple game windows yourself. (b) When preview_app fails or the screenshot shows a crash/black screen: DO NOT STOP. Run "python -m py_compile <file>" to catch syntax errors, then read the crash output with read_command_output or run_command, fix the root cause, and retry preview_app. A single failed launch is NOT a reason to end the task. (c) Always call kill_command on the processId returned by preview_app when you are finished verifying, so the window is closed.
    FILE EDIT DISCIPLINE: If you have edited the same file more than twice in a row, STOP and read_file the complete current version before making any further changes. Identify ALL remaining issues in one pass, then fix them in a single edit. Incremental micro-patches on the same file create cascading bugs and waste loops. Write complete, correct implementations the first time rather than patching incrementally.
@@ -33,14 +57,17 @@ CRITICAL RULES:
 13. GEMINI APP DEFAULTS: For new Gemini Python projects, prefer the current "google-genai" package and "from google import genai" unless local files already use a different SDK. The model "gemini-2.5-flash-lite" is valid; do not downgrade it to older model names unless official docs or an API error proves it is unavailable.
 13A. PYTHON PACKAGE VERSIONS: Before pinning a specific package version in requirements.txt, check the active Python version with "python --version". Avoid pinning old versions (e.g., pygame==2.5.2, tensorflow==2.x) that require building from source and may lack pre-built wheels for the installed Python version. When in doubt, specify only a minimum version (e.g., pygame>=2.6.0) or no version at all. Always try "pip install <package>" (no version) first; only add a version constraint if the project explicitly requires one.
 14. USER-REQUESTED LOCAL/GIT OPERATIONS: When the user asks for the active directory, to open the folder, to launch/run the program, or to push to GitHub/Git, use the dedicated tools for those actions. Do not push to Git or launch apps unless the user asked for it. If the user explicitly asks you to run a command, run it directly unless it matches Orion's hard destructive block list; do not interrupt with extra approval prompts for ordinary user-requested commands. If the user asks to push without specifying a branch, push the current branch to the default remote.
-15. WORKSPACE AND SYSTEM-WIDE QUERIES: Prefer and prioritize files/code within the active workspace. If the user mentions a specific local folder, program, or path outside the workspace (like "on my desktop" or "in my projects folder"), ALWAYS investigate the local filesystem using your local tools (e.g., run_command, list_files, grep_search) BEFORE attempting a web search. You are fully authorized to run system commands using "run_command" to query, search, and identify paths outside the workspace folder in order to answer their questions. When the user names a specific program or project (e.g., "a program called X" or "my project named Y"), immediately use "change_workspace" directly to that project's path (e.g., C:\\Users\\Owner\\Desktop\\Projects\\X) and then read its key files — do NOT call "list_files" on the parent folder first, as parent folders may have hundreds of entries and the target may be truncated. If the path does not exist, try common spelling/casing variants, then use "run_command" with Get-ChildItem filtered by name.
+15. WORKSPACE AND SYSTEM-WIDE QUERIES: Prefer and prioritize files/code within the active workspace. If the user mentions a specific local folder, program, or path outside the workspace (like "on my desktop" or "in my projects folder"), ALWAYS investigate the local filesystem using your local tools (e.g., run_command, list_files, grep_search) BEFORE attempting a web search. You are fully authorized to run system commands using "run_command" to query, search, and identify paths outside the workspace folder in order to answer their questions. When the user provides an explicit absolute path, or names a project whose exact path is already known from the project list, use "change_workspace" to that verified path and then read its key files. When the user gives a fuzzy/local folder name, a dictated name, an autocorrect-prone name, or a Desktop/Projects location that has not been verified, FIRST resolve the real directory with a bounded filesystem check: run a targeted Get-ChildItem listing/search of C:\\Users\\Owner\\Desktop and C:\\Users\\Owner\\Desktop\\Projects (use -Directory, name filters, -Depth 2 or -Depth 3, and -ErrorAction SilentlyContinue). Do not make repeated guessed change_workspace calls. If change_workspace fails because the path does not exist, do not retry another guessed path until you list/search candidate directories and pick the closest real match from local evidence.
+   TOP-LEVEL FOLDER LISTS: If the user asks to list folders directly on the Desktop or in a named parent folder, do a non-recursive listing only: e.g. Get-ChildItem -LiteralPath "C:\\Users\\Owner\\Desktop" -Directory | Select-Object -ExpandProperty Name. Do not add -Depth or -Recurse for a top-level list request, and do not dump nested folder trees unless the user asks for nested contents.
+   EVIDENCE CONTINUITY: If an earlier step failed to find a local folder by a dictated/autocorrected name, but a later directory listing shows a close real folder name, connect that evidence back to the original request. Use the real path, change workspace, and continue the original inspection/advice task instead of asking the user to verify the spelling again.
 17. SIMPLE READ-ONLY QUESTIONS: For questions like "what is this program about", "tell me what X does", "describe this project" — do NOT call "update_mission_context", "start_subplan", or "evaluate_win_conditions". These operational planning tools are for long-running multi-step tasks only. For read-only questions: navigate to the project, read the key files (README, main entry, package.json / requirements.txt), and answer directly. Never set win conditions for a question that just needs file reading.
+   LOCAL PROJECT RECOMMENDATIONS: If the user asks for ideas, recommendations, comparisons, or improvements for an existing local project/folder/program, inspect that local project first, then recommend from evidence. Do not ask the user to describe what is inside before using local tools. Do not claim access is limited to explicitly provided paths when the user has named a Desktop/project location.
    WORKSPACE SELF-REFERENCE: When the user says "this code", "the code", "this program", "this project", "these files", "my code", "the app", "the whole program", or any similar self-referential phrase, they ALWAYS mean the code already in the active workspace. NEVER ask the user to provide or paste code. NEVER ask "which file?" or "which program?" when a workspace is active — read the workspace and figure it out. Call list_files immediately, then read ALL non-boilerplate source files you find (.py, .js, .ts, .html, .css, etc.) in one pass. If the root contains only cache/config files (.env, .gitignore, __pycache__, .ruff_cache, .orion, etc.), look one level deeper into subdirectories. Read first, ask never.
-18. FIND VS FIX: When the user asks you to "find", "look for", "check for", "review", "audit", or "identify" bugs/typos/issues/faults — your job is ONLY to read files and report what you found. Do NOT modify files, do NOT propose a fix implementation plan, and do NOT start fixing things. Present your findings clearly and ask the user which issues they want you to address. Only make changes when the user explicitly asks you to fix, patch, implement, or update something.
+18. FIND VS FIX: When the user asks you to "find", "look for", "check for", "review", "audit", or "identify" bugs/typos/issues/faults — your job is ONLY to inspect and report what you found. For a broad read-only review, you may use STRATEGY.md as a private review strategy/report outline, but never create implementation_plan.md, never show an approval gate, and never start fixing things. Do NOT modify source files or propose a fix implementation plan. Present your findings clearly and ask the user which issues they want you to address. Only make changes when the user explicitly asks you to fix, patch, implement, or update something.
 16. OPERATING SYSTEM AWARENESS: You are currently running on a Windows system. When guessing or constructing file paths outside the current workspace, ALWAYS use Windows path conventions (e.g., C:\\Users\\owner\\Desktop) with the literal resolved path — do NOT pass unexpanded PowerShell variables like $env:USERPROFILE as a path argument to any tool; resolve the path to a literal string first (e.g., C:\\Users\\owner). If you are unsure of the username, run 'echo $env:USERPROFILE' first. When searching for files on the Desktop or broad directories, ALWAYS limit recursive searches with '-Depth 2' or '-Depth 3' and add '-ErrorAction SilentlyContinue' to avoid timeouts from permission-denied folders. Never run an unbounded 'Get-ChildItem -Recurse' on C:\\ or the Desktop without a depth limit.
 
 Tools available:
-- list_files: List all files in the workspace (excluding node_modules).
+- list_files: List a curated project inventory by default. Generated caches, dependencies, runtime/user data, backups, and sensitive-looking files are hidden unless mode="all" is explicitly needed.
 - get_workspace_info: Return the active workspace directory and conversation scope.
 - change_workspace: Changes the active workspace directory of this conversation to a new absolute directory path on your computer. Use this when the user asks you to inspect or work on a project located outside the active standalone workspace folder.
 - open_workspace_folder: Open the active workspace folder in the OS file explorer.
@@ -105,6 +132,8 @@ let agentExecutionMode = 'idle';
 let resolvedHomeDir = 'C:\\Users\\Owner';
 let currentAgentLogs = [];
 let isStopRequested = false;
+let activeRunController = null;
+let stopRequestMode = 'none';
 const GEMINI_THINKING_BUDGET = 24576;
 const MODEL_API_REQUEST_TIMEOUT_MS = 600000;
 const MODEL_API_MAX_RETRY_WAIT_MS = 45000;
@@ -296,11 +325,31 @@ window.isAgentRunning = () => isAgentRunning;
 window.getRunningConversationId = () => runningConversationId;
 window.getAgentSubStatus = () => agentSubStatus;
 window.getAgentExecutionMode = () => agentExecutionMode;
-window.stopAgentExecution = () => {
+function createUserStopError(mode = stopRequestMode || 'hard') {
+  const err = new Error(mode === 'soft' ? 'Agent stop requested by user.' : 'Agent hard stop requested by user.');
+  err.userStop = true;
+  err.stopMode = mode;
+  return err;
+}
+
+function isUserStopError(error) {
+  return !!(error && (error.userStop || /stop requested by user|cancelled by user stop|aborted by user/i.test(String(error.message || ''))));
+}
+
+function getActiveRunSignal() {
+  return activeRunController ? activeRunController.signal : null;
+}
+
+function requestAgentStop(options = {}) {
+  const mode = options.mode === 'soft' ? 'soft' : 'hard';
   isStopRequested = true;
+  stopRequestMode = mode;
+  if (mode === 'hard' && activeRunController && !activeRunController.signal.aborted) {
+    activeRunController.abort();
+  }
   const targetConversationId = runningConversationId;
   if (targetConversationId) {
-    if (window.api.killCommandsForConversation) {
+    if (mode === 'hard' && window.api.killCommandsForConversation) {
       window.api.killCommandsForConversation(targetConversationId).then((result) => {
         if (result && result.killed) {
           window.appendSystemMessage(`Stop requested. Killed ${result.killed} running command(s) for this conversation.`);
@@ -312,16 +361,32 @@ window.stopAgentExecution = () => {
       window.promptQueue = window.promptQueue.filter(item => item.conversationId !== targetConversationId);
     }
   }
-  window.appendSystemMessage("Stop requested... task will abort on next turn.", {
-    dedupeKey: `stop-requested-${targetConversationId || 'global'}`,
+  const message = mode === 'soft'
+    ? 'Soft stop requested. Orion will finish the current atomic step, then stop before the next turn.'
+    : 'Hard stop requested. Orion is aborting model calls, killing running commands, and stopping this run.';
+  window.appendSystemMessage(message, {
+    dedupeKey: `stop-requested-${mode}-${targetConversationId || 'global'}`,
     windowMs: 3000
   });
+}
+
+window.stopAgentExecution = (options = {}) => {
+  requestAgentStop({ mode: options.mode || 'hard' });
 };
+window.softStopAgentExecution = () => requestAgentStop({ mode: 'soft' });
 
 // EXPOSE AGENT LOOP TO RENDERER
 window.runAgentLoop = async function(userPrompt, modelName, conversation, options = {}) {
   if (isAgentRunning) {
-    window.appendSystemMessage("An agent task is already running.");
+    const statusText = "Another Orion task is already running. This request needs to be queued or retried after the active task finishes.";
+    if (window.persistAssistantStatusMessage && conversation && conversation.id) {
+      window.persistAssistantStatusMessage(conversation.id, statusText, {
+        source: 'agent-start-blocked',
+        dedupeKey: `agent-start-blocked-${conversation.id}`
+      });
+    } else if (window.appendSystemMessage) {
+      window.appendSystemMessage(statusText);
+    }
     return;
   }
   
@@ -329,6 +394,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   runningConversationId = conversation.id;
   agentExecutionMode = 'planning';
   isStopRequested = false;
+  stopRequestMode = 'none';
+  activeRunController = new AbortController();
   window.currentLoopCount = 0;
   currentAgentLogs = [];
   if (window.onAgentStatusChange) window.onAgentStatusChange(true);
@@ -337,9 +404,26 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   config.modelName = modelName || config.modelName || 'gemini-2.5-flash-lite';
   let activeRunModelName = config.modelName;
   config.activeRunModelName = activeRunModelName;
-  let workspacePath = conversation.workspace || window.getCurrentWorkspace();
+  let workspacePath = resolveConversationWorkspace(conversation);
   const promptSource = options.source || 'user';
   const isInternalPrompt = !!options.internalPrompt || promptSource === 'followup' || promptSource === 'system' || promptSource === 'plan-approval';
+  let lastTextResponse = "Thinking...";
+  let aiMessageIndex = Array.isArray(conversation.messages) ? conversation.messages.length : 0;
+  let workWalkthrough = [];
+  const persistedVisualArtifactKeys = new Set();
+  let forceYield = false;
+  let autoContinueExecution = false;
+  let userRequestedStop = false;
+  let finalAnswerQualityPrompts = 0;
+  let finalAnswerQualityLoopExtensions = 0;
+
+  if (!Array.isArray(conversation.messages)) {
+    conversation.messages = [];
+  }
+  conversation.messages.push({ role: 'assistant', text: 'Thinking...', logs: [], turns: [], createdAt: Date.now() });
+  if (window.saveConversationsToStorage) {
+    window.saveConversationsToStorage();
+  }
 
   // ── INTENT ROUTING — driven by structural state, never by parsing the user's words ──
   // The dangerous flows (approval, continuation, execution) are decided entirely from
@@ -448,12 +532,34 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     planningDecision = decision;
     reviewOnly = !!decision.reviewOnly;
     resetMissionState = true; // a fresh task should not inherit a previous mission's state
-    if (decision.mode === 'direct') {
+    if (reviewOnly && planningDecision.mode === 'plan') {
+      planningDecision = {
+        ...planningDecision,
+        mode: 'direct',
+        reason: `${planningDecision.reason || ''} Review-only inspections use direct reporting with optional STRATEGY.md, not implementation approval.`.trim()
+      };
+    }
+    if (reviewOnly) {
       planningBypassedForTask = true;
       agentExecutionMode = 'direct';
-    } else if (decision.mode === 'answer') {
+    } else if (planningDecision.mode === 'direct') {
+      planningBypassedForTask = true;
+      agentExecutionMode = 'direct';
+    } else if (planningDecision.mode === 'answer') {
       agentExecutionMode = 'answer';
     }
+  }
+
+  // Every branch above sets planningDecision, but only the classifyPlanningNeed() branches
+  // populate needsLocalInspection/benefitsFromWorkspaceContext. Fill in the regex-based signal
+  // for the other branches (internal follow-ups, plan-approval replies, planning-mode-disabled)
+  // so downstream gates can always read planningDecision.* without re-deriving intent themselves.
+  if (planningDecision.needsLocalInspection === undefined || planningDecision.benefitsFromWorkspaceContext === undefined) {
+    planningDecision = {
+      needsLocalInspection: isLocalProjectOrFolderRequest(userPrompt),
+      benefitsFromWorkspaceContext: requestPlausiblyBenefitsFromWorkspaceContext(userPrompt),
+      ...planningDecision
+    };
   }
 
   // A genuinely new task resets the auto-continue budget and stall tracking so prior runs
@@ -528,7 +634,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   messages.splice(2, 0,
     {
       role: 'user',
-      parts: [{ text: `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nDo NOT run echo or whoami to discover these paths — use the values above directly.` }]
+      parts: [{ text: `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.` }]
     },
     {
       role: 'model',
@@ -568,7 +674,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
   if (config.planningMode !== false) {
     const reviewOnlyConstraint = reviewOnly
-      ? ' CRITICAL: The user asked you to FIND issues, not fix them. Read files, identify bugs/typos/structural faults, and present your findings as a clear report. Do NOT modify any files, do NOT propose implementation steps, and do NOT ask to approve a fix plan. End by summarizing what you found and asking the user which issues they want you to address.'
+      ? ' CRITICAL: The user asked you to FIND issues, not fix them. Treat the active workspace as the program under review. First inspect workspace inventory, then read the main entry points, adjacent modules, config/package files, and tests where present. A completed review must contain concrete findings tied to file paths and line/function context, severity/impact, or clearly say no specific issues were found after naming the files inspected. Do NOT stop after one file with generic potential risks. Do NOT ask which program to inspect or whether to continue inspecting. For a broad review, STRATEGY.md is allowed only as a private review strategy/report outline. Do NOT create implementation_plan.md, do NOT modify source files, do NOT start fixing issues, and do NOT ask to approve a fix plan. End by summarizing what you found and asking the user which issues they want you to address.'
       : '';
     messages.push({
       role: 'user',
@@ -593,19 +699,18 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     });
   }
 
-  let lastTextResponse = "Thinking...";
-  let aiMessageIndex = conversation.messages.length;
-  let workWalkthrough = [];
-  const persistedVisualArtifactKeys = new Set();
-  let forceYield = false;
-  // When a multi-phase approved plan runs out of loop budget with real work still pending,
-  // the run auto-continues in a fresh internal pass instead of falsely reporting "Task finished".
-  let autoContinueExecution = false;
-  let userRequestedStop = false;
-  let finalAnswerQualityPrompts = 0;
-  let finalAnswerQualityLoopExtensions = 0;
-  // Initialize AI message state in conversation list
-  conversation.messages.push({ role: 'assistant', text: 'Thinking...', logs: [], turns: [] });
+  function persistCurrentAgentLogs(options = {}) {
+    const msg = conversation.messages[aiMessageIndex];
+    if (!msg) return;
+    msg.text = lastTextResponse;
+    msg.logs = [...currentAgentLogs];
+    if (window.saveConversationsToStorage) {
+      window.saveConversationsToStorage();
+    }
+    if (options.render && window.renderAiMessage) {
+      window.renderAiMessage(lastTextResponse, currentAgentLogs, conversation.id, msg);
+    }
+  }
   
   try {
     if (approvalIntent && approvalIntent.intent === 'deny') {
@@ -621,7 +726,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
     // Check if we need to compact context
     try {
-      const tokenCount = await countTokens(messages, modelName, config.geminiApiKey);
+      const tokenCount = await countTokens(messages, modelName, config.geminiApiKey, { signal: getActiveRunSignal() });
       console.log("Current conversation tokens:", tokenCount);
       const compactThreshold = getCompactionThreshold(modelName, config);
       if (config.autoCompact !== false && tokenCount > compactThreshold) {
@@ -649,6 +754,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         window.saveConversationsToStorage();
       }
     } catch (e) {
+      if (isUserStopError(e)) throw e;
       console.error("Token count/compacting error:", e);
     }
     
@@ -669,6 +775,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     let postEditEvidenceLoopExtensions = 0;
     let completionGatePrompts = 0;
     let completionGateLoopExtensions = 0;
+    let reviewCompletionPrompts = 0;
+    let reviewCompletionLoopExtensions = 0;
+    let pendingWorkspaceResolutionPrompts = 0;
+    let memoryNudgeSent = false;
     const repeatedToolFailures = new Map();
     const fileEditCounts = new Map();
     const fileNeedsReadBeforeEdit = new Set(); // files that must be read before the next edit
@@ -688,8 +798,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       if (isStopRequested) {
         userRequestedStop = true;
         isStopRequested = false;
-        lastTextResponse = "Task aborted by user.";
-        currentAgentLogs.push({ type: 'thought', content: "🛑 Task execution stopped by user." });
+        const mode = stopRequestMode;
+        lastTextResponse = mode === 'soft' ? "Task stopped by user after the current step." : "Task aborted by user.";
+        currentAgentLogs.push({ type: 'thought', content: mode === 'soft' ? "Stop requested by user; stopping before the next turn." : "Task execution stopped by user." });
         break;
       }
       
@@ -706,12 +817,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       let response;
       try {
         agentSubStatus = `Calling ${activeRunModelName.startsWith('gemini-') ? 'Gemini' : 'Ollama (' + activeRunModelName + ')'} API...`;
-        window.renderAiMessage(lastTextResponse, currentAgentLogs);
+        persistCurrentAgentLogs({ render: true });
         const modelCallDelayMs = Math.min(Math.max(parseInt(config.modelCallDelayMs, 10) || 0, 0), 60000);
         if (modelCallDelayMs > 0) {
           agentSubStatus = `Waiting ${modelCallDelayMs}ms before the next model call...`;
           window.renderAiMessage(lastTextResponse, currentAgentLogs);
-          await sleep(modelCallDelayMs);
+          await sleepRespectingStop(modelCallDelayMs);
         }
         
         if (activeRunModelName.startsWith('gemini-')) {
@@ -719,20 +830,36 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             agentSubStatus = warningMsg;
             conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
             window.renderAiMessage(lastTextResponse, currentAgentLogs);
-          });
+          }, false, { signal: getActiveRunSignal() });
         } else {
           response = await callOllamaAPI(messages, activeRunModelName, (warningMsg) => {
             agentSubStatus = warningMsg;
             conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
             window.renderAiMessage(lastTextResponse, currentAgentLogs);
-          });
+          }, false, { signal: getActiveRunSignal() });
         }
         if (response && response._orionActiveModelName) {
           activeRunModelName = response._orionActiveModelName;
           config.activeRunModelName = activeRunModelName;
         }
+        if (isStopRequested) {
+          userRequestedStop = true;
+          isStopRequested = false;
+          lastTextResponse = stopRequestMode === 'soft' ? "Task stopped by user after the current model call." : "Task aborted by user.";
+          currentAgentLogs.push({ type: 'thought', content: stopRequestMode === 'soft' ? "Stop requested by user; stopping before tool execution." : "Task execution stopped by user." });
+          conversation.messages[aiMessageIndex].text = lastTextResponse;
+          break;
+        }
         agentSubStatus = 'Processing model response...';
       } catch (e) {
+        if (isUserStopError(e)) {
+          userRequestedStop = true;
+          isStopRequested = false;
+          lastTextResponse = stopRequestMode === 'soft' ? "Task stopped by user after the current step." : "Task aborted by user.";
+          currentAgentLogs.push({ type: 'thought', content: stopRequestMode === 'soft' ? "Stop requested by user; stopping before the next turn." : "Task execution stopped by user." });
+          conversation.messages[aiMessageIndex].text = lastTextResponse;
+          break;
+        }
         console.error(e);
         lastTextResponse = `Error contacting Model API: ${e.message}`;
         const retryDelayMs = parseRetryDelayMs(e.message);
@@ -872,25 +999,44 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           });
           continue;
         }
-        if (shouldHaveUsedToolsButDidNot(textVal, workWalkthrough, userPrompt) && consecutiveNoToolCalls < 3 && loopCount < maxLoops) {
+        if (shouldHaveUsedToolsButDidNot(textVal, workWalkthrough, userPrompt, {
+          reviewOnly,
+          needsLocalInspection: planningDecision.needsLocalInspection,
+          benefitsFromWorkspaceContext: planningDecision.benefitsFromWorkspaceContext
+        }) && consecutiveNoToolCalls < 3 && loopCount < maxLoops) {
           const guidance = buildFailureRecoveryGuidance(classifyAgentFailure({
             category: 'model_no_tool_use',
             errorText: textVal
           }));
-          const localInspectionGuidance = requestNeedsLocalInspection(userPrompt)
-            ? ' The user asked about this local computer. Call local inspection commands now, such as `systeminfo`, CPU/RAM/disk/process commands, or another available local route. Do not answer with acknowledgement only.'
+          const localInspectionGuidance = buildLocalInspectionNoToolGuidance(userPrompt, planningDecision);
+          const workspaceInspectionGuidance = reviewOnly
+            ? ' The user asked you to inspect the active workspace and report findings. Call `list_files` now, then read the relevant source files with `read_file`. Do not ask the user which files or program to inspect when a workspace is already active.'
             : '';
           messages.push({
             role: 'user',
             parts: [{
-              text: `[SYSTEM: ${guidance}${localInspectionGuidance}]`
+              text: `[SYSTEM: ${guidance}${localInspectionGuidance}${workspaceInspectionGuidance}]`
             }]
           });
           continue;
         }
-        if (isGenericNonAnswer(textVal) && requestNeedsLocalInspection(userPrompt) && (workWalkthrough || []).length === 0) {
+        if (isGenericNonAnswer(textVal) && (planningDecision.needsLocalInspection || isLocalSystemFactRequest(userPrompt)) && (workWalkthrough || []).length === 0) {
           lastTextResponse = 'I did not produce a real answer. This question needs local system inspection first, so I should run commands to check CPU/RAM/disk or clearly explain why that evidence cannot be gathered.';
           break;
+        }
+        if (reviewOnly && (workWalkthrough || []).length === 0) {
+          lastTextResponse = 'I did not inspect the workspace, so this is not a real review yet. I need to list the workspace files, read the relevant source files, and then report the findings.';
+          break;
+        }
+        if (!reviewOnly && (workWalkthrough || []).length === 0 && !hasPriorWorkspaceInspection(conversation) &&
+            planningDecision.benefitsFromWorkspaceContext && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
+          messages.push({
+            role: 'user',
+            parts: [{
+              text: '[SYSTEM: This request touches on this app\'s own features/codebase and no workspace inspection has happened yet in this conversation. Before answering, call `list_files`, then read the most relevant existing feature file(s) so your answer is grounded in what this codebase already has, rather than generic suggestions unrelated to the real implementation. Then answer the user\'s actual request.]'
+            }]
+          });
+          continue;
         }
         if (pendingTasks.length > 0 && canExecuteThisTask() && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
           console.log(`No tool calls, but there are ${pendingTasks.length} pending tasks. Continuing loop automatically.`);
@@ -926,6 +1072,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           messages.push({ role: 'user', parts: [{ text: epistemicCorrection }] });
           continue;
         }
+        const reviewCompletionPrompt = reviewOnly ? buildReviewOnlyCompletionGatePrompt(userPrompt, textVal, workWalkthrough) : '';
+        if (reviewCompletionPrompt && loopCount >= maxLoops && reviewCompletionLoopExtensions < 3) {
+          reviewCompletionLoopExtensions++;
+          maxLoops++;
+        }
+        if (reviewCompletionPrompt && reviewCompletionPrompts < 3 && loopCount < maxLoops) {
+          reviewCompletionPrompts++;
+          currentAgentLogs.push({ type: 'thought', content: 'Review completion gate: review-only work needs broad enough coverage and grounded findings before final response.' });
+          messages.push({ role: 'user', parts: [{ text: reviewCompletionPrompt }] });
+          continue;
+        }
         // In review-only mode, always nudge the model to keep reading files until it explicitly signals completion
         if (reviewOnly && consecutiveNoToolCalls === 1 && workWalkthrough.length > 0 && loopCount < maxLoops) {
           const signalsDone = /\b(that'?s all|in conclusion|to summarize|summary of findings|final(?:ly)?|this concludes|completed (?:my )?(?:review|analysis|scan)|finished reviewing|done reviewing)\b/i.test(String(textVal || ''));
@@ -943,6 +1100,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             messages.push({ role: 'user', parts: [{ text: '[SYSTEM: You described what you were going to do next but did not call any tool. Execute that action now with the appropriate tool call. Do not describe it again.]' }] });
             continue;
           }
+        }
+        const pendingWorkspaceResolutionPrompt = buildPendingWorkspaceResolutionCorrectionPrompt(textVal, workWalkthrough);
+        if (pendingWorkspaceResolutionPrompt && pendingWorkspaceResolutionPrompts < 2 && loopCount < maxLoops) {
+          pendingWorkspaceResolutionPrompts++;
+          currentAgentLogs.push({ type: 'thought', content: 'Directory resolution continuity guard: a later folder listing revealed the missing workspace match.' });
+          messages.push({ role: 'user', parts: [{ text: pendingWorkspaceResolutionPrompt }] });
+          continue;
         }
         const finalAnswerQualityPrompt = buildFinalAnswerQualityGatePrompt(userPrompt, textVal, workWalkthrough);
         if (finalAnswerQualityPrompt && loopCount >= maxLoops && finalAnswerQualityLoopExtensions < 2) {
@@ -986,6 +1150,18 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             break;
           }
         }
+        if (!memoryNudgeSent && !reviewOnly && turnDidSubstantiveInspection(workWalkthrough) &&
+            !turnAlreadyWroteMemory(workWalkthrough) && !isGenericNonAnswer(textVal) && loopCount < maxLoops) {
+          memoryNudgeSent = true;
+          currentAgentLogs.push({ type: 'thought', content: 'Memory gate: substantial workspace inspection happened this turn; nudging Orion to persist any durable facts before finishing.' });
+          messages.push({
+            role: 'user',
+            parts: [{
+              text: '[SYSTEM: You just did substantial workspace inspection. If you discovered a durable architectural fact, API shape, gotcha, or decision that future sessions should know, call append_project_memory, remember_fact, or remember_decision now (1-3 concise entries) before your final answer. If nothing new/durable was learned, skip this and answer normally.]'
+            }]
+          });
+          continue;
+        }
         break;
       } else {
         consecutiveNoToolCalls = 0;
@@ -1020,6 +1196,32 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         )) {
           strategyStatus = await readStrategyStatus(workspacePath);
         }
+        const reviewGate = reviewOnly ? getReviewOnlyToolGate(toolName, args) : { allowed: true, reason: '' };
+        if (!reviewGate.allowed) {
+          const failure = classifyAgentFailure({
+            toolName,
+            args,
+            errorText: reviewGate.reason
+          });
+          const guidance = buildFailureRecoveryGuidance(failure);
+          currentAgentLogs[logIndex].status = 'error';
+          currentAgentLogs[logIndex].result = reviewGate.reason;
+
+          toolResponseParts.push({
+            functionResponse: {
+              name: toolName,
+              response: { error: reviewGate.reason, failureCategory: failure.category, recoveryGuidance: guidance }
+            }
+          });
+          const transition = await recordToolOutcomeInWorkingState(workspacePath, toolName, args, { error: reviewGate.reason, failureCategory: failure.category });
+          if (transition && transition.state) {
+            workingState = transition.state;
+            refreshWorkingStateMessage();
+          }
+          updateWalkthroughItem(walkthroughItem, toolName, args, { error: reviewGate.reason, failureCategory: failure.category }, new Error(reviewGate.reason));
+          persistCurrentAgentLogs({ render: true });
+          continue;
+        }
         const planningGate = getPlanningToolGate(config, canExecuteThisTask(), toolName, args, {
           strategyRequired: !planningBypassedForTask && planningDecision.mode === 'plan',
           strategyStatus,
@@ -1047,6 +1249,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             refreshWorkingStateMessage();
           }
           updateWalkthroughItem(walkthroughItem, toolName, args, { error: planningGate.reason, failureCategory: failure.category }, new Error(planningGate.reason));
+          persistCurrentAgentLogs({ render: true });
           continue;
         }
         if (planningGate.forceYield) {
@@ -1070,6 +1273,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               response: gatedResult
             }
           });
+          persistCurrentAgentLogs({ render: true });
           continue;
         }
         
@@ -1082,6 +1286,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             currentAgentLogs[logIndex].result = blockMsg;
             updateWalkthroughItem(walkthroughItem, toolName, args, { error: blockMsg }, new Error(blockMsg));
             toolResponseParts.push({ functionResponse: { name: toolName, response: { error: blockMsg, blocked: 'read_required' } } });
+            persistCurrentAgentLogs({ render: true });
             continue;
           }
         }
@@ -1117,6 +1322,32 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           result = { error: err.message };
           updateWalkthroughItem(walkthroughItem, toolName, args, result, err);
         }
+
+        const pendingResolutionHint = buildPendingWorkspaceResolutionHint({ toolName, args, result, conversation });
+        if (pendingResolutionHint) {
+          result.localDirectoryResolution = pendingResolutionHint;
+          result.summary = pendingResolutionHint.guidance;
+          if (walkthroughItem) {
+            walkthroughItem.localDirectoryResolution = pendingResolutionHint;
+            walkthroughItem.detail = `Matched pending folder: \`${pendingResolutionHint.matchedPath}\``;
+          }
+          currentAgentLogs.push({
+            type: 'thought',
+            content: `Resolved likely workspace folder: "${pendingResolutionHint.requestedName}" -> ${pendingResolutionHint.matchedPath}`
+          });
+          currentAgentLogs[logIndex].result = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
+        }
+
+        if (toolName === 'change_workspace' && isFailedToolResult(result)) {
+          const failureText = getToolFailureSignal(result);
+          const failure = classifyAgentFailure({ toolName, args, result, errorText: failureText });
+          if (failure.category === 'workspace_path_missing') {
+            rememberPendingWorkspaceResolution(conversation, args.path, userPrompt);
+          }
+        } else if (toolName === 'change_workspace' && result && result.success) {
+          clearPendingWorkspaceResolution(conversation);
+        }
+        persistCurrentAgentLogs({ render: true });
 
         const evidenceEntry = buildToolEvidenceEntry(toolName, args, result);
         toolEvidenceLedger.push(evidenceEntry);
@@ -1166,6 +1397,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               workingState = transition.state;
               refreshWorkingStateMessage();
             }
+            persistCurrentAgentLogs({ render: true });
             forceYield = true;
             break;
           }
@@ -1175,6 +1407,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             if (typeof result === 'object' && result !== null && !Array.isArray(result)) {
               result.repeatedFailureWarning = guidance;
             }
+            persistCurrentAgentLogs({ render: true });
           }
         }
 
@@ -1218,9 +1451,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           }
         });
         
-        // Re-render UI with logs
-        conversation.messages[aiMessageIndex].text = lastTextResponse;
-        window.renderAiMessage(lastTextResponse, currentAgentLogs);
+        // Re-render UI with logs and persist them so reloads keep tool errors/results.
+        persistCurrentAgentLogs({ render: true });
+        if (isStopRequested) {
+          userRequestedStop = true;
+          isStopRequested = false;
+          lastTextResponse = stopRequestMode === 'soft' ? "Task stopped by user after the current tool call." : "Task aborted by user.";
+          currentAgentLogs.push({ type: 'thought', content: stopRequestMode === 'soft' ? "Stop requested by user; stopping after tool completion." : "Task execution stopped by user." });
+          break;
+        }
       }
       
       // Append tool response parts to message history
@@ -1232,6 +1471,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       conversation.messages[aiMessageIndex].text = lastTextResponse;
       conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
       window.saveConversationsToStorage();
+      if (userRequestedStop) {
+        break;
+      }
       
       if (forceYield) {
         // Clarification questions were presented — just yield, the UI will render the question cards.
@@ -1306,7 +1548,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // Fallback: if the agent ran in planning mode but never wrote a new plan (e.g. reviewed
     // an existing one and summarized it), check whether implementation_plan.md exists on disk.
     // If it does, gate on approval now so the next user message is properly routed.
-    if (!forceYield && planningDecision.mode === 'plan' && !conversation.awaitingPlanApproval && !conversation.planApproved) {
+    if (!forceYield && !reviewOnly && planningDecision.mode === 'plan' && !conversation.awaitingPlanApproval && !conversation.planApproved) {
       try {
         const existingPlanText = await readImplementationPlanText(workspacePath);
         if (existingPlanText && existingPlanText.trim()) {
@@ -1316,11 +1558,20 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       } catch (_) {}
     }
   } catch (error) {
-    console.error("Critical error in agent loop:", error);
-    window.appendSystemMessage(`Critical error in agent: ${error.message}`);
-    lastTextResponse = `An error occurred: ${error.message}`;
-    currentAgentLogs.push({ type: 'thought', content: `❌ Critical Error: ${error.message}` });
+    if (isUserStopError(error)) {
+      userRequestedStop = true;
+      isStopRequested = false;
+      lastTextResponse = stopRequestMode === 'soft' ? "Task stopped by user after the current step." : "Task aborted by user.";
+      currentAgentLogs.push({ type: 'thought', content: stopRequestMode === 'soft' ? "Stop requested by user; the run was halted cleanly." : "Task execution stopped by user." });
+    } else {
+      console.error("Critical error in agent loop:", error);
+      window.appendSystemMessage(`Critical error in agent: ${error.message}`);
+      lastTextResponse = `An error occurred: ${error.message}`;
+      currentAgentLogs.push({ type: 'thought', content: `Critical Error: ${error.message}` });
+    }
   } finally {
+    activeRunController = null;
+    stopRequestMode = 'none';
     isAgentRunning = false;
     runningConversationId = null;
     agentExecutionMode = 'idle';
@@ -1377,6 +1628,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         lastTextResponse = 'Completed the next batch of implementation steps. Continuing automatically with the remaining plan…';
       } else if (hasPendingWork && canExecuteAtExit && !forceYield) {
         lastTextResponse = buildRemainingWorkSummary(pendingChecklist, workingState, stoppedShort);
+      } else if ((workWalkthrough || []).some(item => item && item.status === 'done')) {
+        lastTextResponse = 'I inspected the workspace but did not produce the requested answer. This run is not complete; ask me to continue and I should use the gathered context to answer the actual request instead of stopping after file listing.';
       } else {
         lastTextResponse = "Task finished.";
       }
@@ -1489,6 +1742,128 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   }, 500);
 };
 
+const DEFAULT_LIST_FILES_MAX = 250;
+const HIDDEN_DIRECTORY_REASONS = new Map([
+  ['.git', 'version-control internals'],
+  ['node_modules', 'installed dependencies'],
+  ['__pycache__', 'generated Python cache'],
+  ['.pytest_cache', 'test runner cache'],
+  ['.ruff_cache', 'linter cache'],
+  ['.mypy_cache', 'type-checker cache'],
+  ['.next', 'framework build output'],
+  ['dist', 'build output'],
+  ['build', 'build output'],
+  ['coverage', 'test coverage output'],
+  ['target', 'build output'],
+  ['.orion', 'Orion runtime metadata/backups'],
+  ['instance', 'runtime/user data'],
+  ['user_data', 'runtime/user data'],
+  ['chroma', 'vector database files'],
+  ['images', 'conversation/image artifacts']
+]);
+
+function normalizeInventoryPath(pathValue) {
+  return String(pathValue || '').replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/');
+}
+
+function inventoryPathSegments(pathValue) {
+  return normalizeInventoryPath(pathValue).split('/').filter(Boolean);
+}
+
+function hiddenDirectoryForInventory(pathValue) {
+  const segments = inventoryPathSegments(pathValue);
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i].toLowerCase();
+    if (!HIDDEN_DIRECTORY_REASONS.has(segment)) continue;
+    return {
+      path: segments.slice(0, i + 1).join('/'),
+      reason: HIDDEN_DIRECTORY_REASONS.get(segment)
+    };
+  }
+  return null;
+}
+
+function sensitiveFileForInventory(pathValue, isDir = false) {
+  if (isDir) return null;
+  const segments = inventoryPathSegments(pathValue);
+  const basename = (segments[segments.length - 1] || '').toLowerCase();
+  if (!basename) return null;
+  if (basename === '.env' || (/^\.env\./.test(basename) && basename !== '.env.example')) {
+    return { path: normalizeInventoryPath(pathValue), reason: 'environment/secret file' };
+  }
+  if (/^(id_rsa|id_dsa|id_ecdsa|id_ed25519|known_hosts)$/.test(basename)) {
+    return { path: normalizeInventoryPath(pathValue), reason: 'SSH credential file' };
+  }
+  if (/\.(pem|p12|pfx|key)$/.test(basename)) {
+    return { path: normalizeInventoryPath(pathValue), reason: 'key/certificate file' };
+  }
+  if (/(secret|secrets|credential|credentials|token|tokens|password|passwd)/.test(basename)) {
+    return { path: normalizeInventoryPath(pathValue), reason: 'sensitive-looking filename' };
+  }
+  if (basename === 'users.json' || basename === 'user.json') {
+    return { path: normalizeInventoryPath(pathValue), reason: 'user data file' };
+  }
+  return null;
+}
+
+function addOmittedInventoryPath(omittedByPath, omitted) {
+  if (!omitted || !omitted.path) return;
+  const key = omitted.path.toLowerCase();
+  if (!omittedByPath.has(key)) {
+    omittedByPath.set(key, { path: omitted.path, reason: omitted.reason || 'hidden from default inventory', count: 0 });
+  }
+  omittedByPath.get(key).count += 1;
+}
+
+function buildCuratedFileInventory(files, options = {}) {
+  const maxFiles = Math.max(25, Math.min(Number(options.maxFiles) || DEFAULT_LIST_FILES_MAX, 800));
+  const visible = [];
+  const omittedByPath = new Map();
+  const normalizedFiles = (Array.isArray(files) ? files : [])
+    .map(file => ({
+      path: normalizeInventoryPath(file && file.path),
+      isDir: !!(file && file.isDir),
+      size: file && file.size
+    }))
+    .filter(file => file.path);
+
+  for (const file of normalizedFiles) {
+    const hiddenDirectory = hiddenDirectoryForInventory(file.path);
+    if (hiddenDirectory) {
+      addOmittedInventoryPath(omittedByPath, hiddenDirectory);
+      continue;
+    }
+    const sensitiveFile = sensitiveFileForInventory(file.path, file.isDir);
+    if (sensitiveFile) {
+      addOmittedInventoryPath(omittedByPath, sensitiveFile);
+      continue;
+    }
+    visible.push(file);
+  }
+
+  const omitted = [...omittedByPath.values()]
+    .sort((a, b) => a.path.localeCompare(b.path))
+    .slice(0, 40);
+  const hiddenCount = normalizedFiles.length - visible.length;
+  const result = {
+    mode: 'project',
+    files: visible.slice(0, maxFiles),
+    omitted,
+    totals: {
+      returned: Math.min(visible.length, maxFiles),
+      visible: visible.length,
+      hidden: hiddenCount,
+      scanned: normalizedFiles.length
+    },
+    warning: 'Default project inventory hides generated caches, runtime/user data, backups, dependencies, and sensitive-looking files. Use mode="all" only when a raw workspace listing is explicitly needed.'
+  };
+  if (visible.length > maxFiles) {
+    result.truncated = true;
+    result.warning += ` Showing first ${maxFiles} project files out of ${visible.length}. Use maxFiles, search, or a targeted read for more.`;
+  }
+  return result;
+}
+
 // TOOL EXECUTOR HUB
 async function executeTool(name, args, workspace, config, conversation) {
   console.log(`Executing tool ${name} with args:`, args);
@@ -1550,13 +1925,19 @@ async function executeTool(name, args, workspace, config, conversation) {
         throw new Error('list_files returned an unexpected result shape.');
       }
       const mappedFiles = fileList.map(f => ({ path: f.path, isDir: f.isDir, size: f.size }));
+      if (args.mode !== 'all') {
+        return buildCuratedFileInventory(mappedFiles, {
+          maxFiles: Number.isFinite(Number(args.maxFiles)) ? Number(args.maxFiles) : 250
+        });
+      }
       if (mappedFiles.length > 800) {
         return {
+          mode: 'all',
           files: mappedFiles.slice(0, 800),
           warning: `Truncated output. Found ${mappedFiles.length} items, showing first 800. Be more specific or use search/grep tools.`
         };
       }
-      return mappedFiles;
+      return { mode: 'all', files: mappedFiles };
     }
 
     case 'search_embeddings': {
@@ -1695,20 +2076,11 @@ async function executeTool(name, args, workspace, config, conversation) {
     
     case 'change_workspace': {
       if (!args.path) throw new Error("Missing 'path' parameter");
-      // Expand common Windows env var patterns the model tends to emit literally
-      let targetPath = args.path
-        .replace(/\$env:USERPROFILE/gi, resolvedHomeDir)
-        .replace(/\$env:HOMEDRIVE/gi, resolvedHomeDir.slice(0, 2) || 'C:')
-        .replace(/\$env:HOMEPATH/gi, resolvedHomeDir.slice(2) || '\\Users\\Owner')
-        .replace(/^~[/\\]?/, resolvedHomeDir + '\\');
-      try {
-        const files = await window.api.listFiles(targetPath);
-        if (files && files.error) {
-          throw new Error(files.error);
-        }
-      } catch (err) {
-        throw new Error(`Workspace path "${targetPath}" is invalid or does not exist: ${err.message}`);
+      const resolution = await resolveWorkspacePathForChange(args.path);
+      if (!resolution.success) {
+        throw new Error(`Workspace path "${resolution.path}" is invalid or does not exist: ${resolution.error}`);
       }
+      const targetPath = resolution.path;
       conversation.workspace = targetPath;
       conversation.projectPath = targetPath;
       if (typeof window.changeActiveWorkspace === 'function') {
@@ -1716,7 +2088,12 @@ async function executeTool(name, args, workspace, config, conversation) {
       }
       return {
         success: true,
-        message: `Workspace directory changed to: ${targetPath}`
+        message: resolution.fuzzyResolved
+          ? `Workspace directory changed to: ${targetPath} (resolved from "${resolution.resolvedFrom}")`
+          : `Workspace directory changed to: ${targetPath}`,
+        fuzzyResolved: !!resolution.fuzzyResolved,
+        resolvedFrom: resolution.resolvedFrom,
+        matchedName: resolution.matchedName || getLocalPathBaseName(targetPath)
       };
     }
 
@@ -3035,6 +3412,8 @@ ${STRATEGY_REQUIRED_SECTIONS.map(section => `- ${section}`).join('\n')}
 
 CLARIFICATION BEFORE STRATEGY: For games, simulations, apps, or creative tools — if the user's request leaves key design decisions open (visual style/genre, core mechanic, scale/performance strategy, framework choice) — call the "ask_clarifying_questions" tool with 2-3 questions BEFORE writing STRATEGY.md. Do NOT write questions as prose — use the tool so the user gets an interactive card UI with selectable options. Do not proceed to STRATEGY.md until you have the user's answers. Only skip this if the user said "surprise me" or "you decide."
 
+For existing local folders/projects/programs, inspect first and let the discovered files/current behavior answer as many design questions as possible before asking the user.
+
 If STRATEGY.md finds mission-critical ambiguity, ask the user before planning. If ambiguity is minor, record the assumption in STRATEGY.md and operational context, then proceed. Base implementation_plan.md on STRATEGY.md, not just the raw user prompt. Do not add agent roles, automatic replanning, or domain-specific workflows.]`;
 }
 
@@ -3088,6 +3467,41 @@ function getPlanningToolGate(config, canExecute, toolName, args = {}, options = 
     forceYield: false,
     reason: "Refinement/Planning Mode Active: this request needs a grounded STRATEGY.md before implementation_plan.md, and an approved implementation plan before file edits or command execution. Inspect the workspace first, write STRATEGY.md, then create implementation_plan.md and pause for approval."
   };
+}
+
+function getReviewOnlyToolGate(toolName, args = {}) {
+  const reviewReason = 'Review-only task: inspect and report findings. Do not modify source files, create implementation_plan.md, or show an implementation approval gate. STRATEGY.md is allowed only as a private review strategy/report outline.';
+  if (toolName === 'write_file') {
+    if (isStrategyPath(args.path)) {
+      return { allowed: true, forceYield: false, reason: 'Writing STRATEGY.md is allowed as a read-only review strategy artifact.' };
+    }
+    return { allowed: false, forceYield: false, reason: isImplementationPlanPath(args.path) ? reviewReason : reviewReason };
+  }
+  const blockedTools = new Set([
+    'modify_file',
+    'patch_file',
+    'sync_workspace_env',
+    'set_workspace_entrypoint',
+    'start_command',
+    'launch_workspace_app',
+    'preview_app',
+    'git_push',
+    'download_file',
+    'download_from_page',
+    'extract_archive',
+    'set_task_checklist',
+    'update_mission_context',
+    'start_subplan',
+    'update_subplan_context',
+    'complete_subplan',
+    'evaluate_win_conditions',
+    'record_blocker',
+    'resolve_blocker'
+  ]);
+  if (blockedTools.has(toolName)) {
+    return { allowed: false, forceYield: false, reason: reviewReason };
+  }
+  return { allowed: true, forceYield: false, reason: '' };
 }
 
 function summarizeToolStart(toolName, args = {}) {
@@ -3448,41 +3862,134 @@ function sanitizeFinalAnswerText(text) {
 }
 
 function requestNeedsActionableFinalAnswer(prompt) {
-  const text = String(prompt || '').toLowerCase();
-  if (!text.trim()) return false;
-  const actionPatterns = [
-    /\bhow\s+(?:do|can|would|should)\s+(?:we|you|i)\s+(?:improve|fix|build|make|add|repair|change|handle|solve)\b/,
-    /\bwhat\s+(?:can|should|would)\s+(?:we|you|i)\s+(?:improve|fix|build|make|add|change|do)\b/,
-    /\b(?:recommend|recommendation|recommendations|next\s+patch|next\s+action|next\s+step|plan|roadmap)\b/,
-    /\b(?:why\s+did\s+it\s+stop|how\s+do\s+we\s+fix|what\s+was\s+wrong|what\s+went\s+wrong)\b/,
-    /\b(?:bugs?|errors?|issues?)\b.*\b(?:fix|improve|recommend|look\s+through|find|what)\b/
-  ];
-  return actionPatterns.some(pattern => pattern.test(text));
+  // Deprecated compatibility export. Final-answer quality is now based on whether
+  // the agent used tools and then failed to produce a substantive answer, not on
+  // guessing the user's intent from keywords in the prompt.
+  return false;
+}
+
+function isInventoryOnlyTool(item) {
+  const name = item && item.toolName;
+  if ((name === 'run_command' || name === 'start_command') && isInventoryOnlyCommand(item.command || item.label || '')) {
+    return true;
+  }
+  return name === 'list_files' || name === 'get_workspace_info' || name === 'change_workspace' || name === 'read_notes' || name === 'read_operational_context';
+}
+
+function isInventoryOnlyCommand(commandText) {
+  const command = String(commandText || '').trim();
+  if (!command) return false;
+  const lower = command.toLowerCase();
+  const isDirectoryListing =
+    /\bget-childitem\b/.test(lower) ||
+    /\bselect-object\b/.test(lower) ||
+    /\bwhere-object\b/.test(lower) ||
+    /\bdir\b/.test(lower) ||
+    /\bls\b/.test(lower);
+  if (!isDirectoryListing) return false;
+  const discoveryFlags =
+    /-directory\b/.test(lower) ||
+    /-filter\b/.test(lower) ||
+    /select-object\s+-expandproperty\s+fullname/.test(lower) ||
+    /desktop/.test(lower) ||
+    /projects/.test(lower);
+  const readsFileContent =
+    /\bget-content\b/.test(lower) ||
+    /\btype\b/.test(lower) ||
+    /\bcat\b/.test(lower) ||
+    /\bselect-string\b/.test(lower) ||
+    /\brg\b/.test(lower);
+  return discoveryFlags && !readsFileContent;
+}
+
+function hasDeepInspectionEvidence(workWalkthrough = []) {
+  return (workWalkthrough || []).some(item => {
+    if (!item || item.status === 'error') return false;
+    if (isInventoryOnlyTool(item)) return false;
+    return item.toolName === 'read_file' ||
+      item.toolName === 'grep_search' ||
+      item.toolName === 'search_embeddings' ||
+      item.toolName === 'run_command' ||
+      item.toolName === 'start_command' ||
+      item.kind === 'file' ||
+      item.kind === 'command';
+  });
+}
+
+function hasOnlyInventoryEvidence(workWalkthrough = []) {
+  const done = (workWalkthrough || []).filter(item => item && item.status !== 'error');
+  return done.length > 0 && done.every(isInventoryOnlyTool);
 }
 
 function answerHasActionableFinalContent(answerText) {
   const text = sanitizeFinalAnswerText(answerText);
-  const lower = text.toLowerCase();
   if (isGenericNonAnswer(text)) return false;
-  if (lower.length < 80) return false;
-  const actionLine = /^\s*(?:[-*]|\d+\.)\s+(?:make|add|fix|improve|build|change|update|remove|run|test|verify|use|create|implement|patch|prioritize|separate|preserve|launch|rebuild|retry)\b/im;
-  const actionHeading = /^#{1,4}\s*(?:findings|recommendations|plan|changes|next steps|fixes|what i found|what to fix)\b/im;
-  const actionSentence = /\b(?:the best improvements are|i recommend|i would fix|we should|next patch should|the fix is|i changed|i fixed|i added|i updated|next action is)\b/i;
-  const concreteCodeReference = /\b(?:file|function|test|setting|model|ui|api|state|server|launch|verification)\b/i;
-  if (actionLine.test(text) || actionHeading.test(text) || actionSentence.test(text)) return true;
-  return /\b(?:fix|improve|add|update|change|implement|test|verify|recommend|prioritize)\b/i.test(text) && concreteCodeReference.test(text);
+  if (text.length < 120) return false;
+  const nonBlankLines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (nonBlankLines.length >= 3) return true;
+  return /[.!?]\s+\S+.*[.!?]/s.test(text);
+}
+
+function getReviewCoverage(workWalkthrough = []) {
+  const done = (workWalkthrough || []).filter(item => item && item.status !== 'error');
+  const filesRead = new Set();
+  let hasInventory = false;
+  let hasSearchOrCommand = false;
+  done.forEach(item => {
+    if (item.toolName === 'list_files' || item.toolName === 'get_workspace_info') hasInventory = true;
+    if (item.toolName === 'grep_search' || item.toolName === 'search_embeddings' || item.toolName === 'run_command' || item.toolName === 'start_command') hasSearchOrCommand = true;
+    if (item.toolName === 'read_file') {
+      const label = String(item.label || item.path || '');
+      const match = label.match(/`([^`]+)`/);
+      filesRead.add(match ? match[1] : label || 'read_file');
+    }
+  });
+  const fileCount = filesRead.size;
+  const broadEnough = fileCount >= 3 || (fileCount >= 2 && hasSearchOrCommand);
+  return { fileCount, hasInventory, hasSearchOrCommand, broadEnough };
+}
+
+function answerHasGroundedReviewReport(answerText) {
+  const text = sanitizeFinalAnswerText(answerText);
+  if (!answerHasActionableFinalContent(text)) return false;
+  const lower = text.toLowerCase();
+  const asksToContinue = /would you like me to|should i (?:try|run|continue)|do you want me to|to find specific bugs,? i would need|i need to know which program/.test(lower);
+  if (asksToContinue) return false;
+  const concreteLocation = /(?:^|[\s`'"(\[])(?:[\w.-]+[\\/])*[\w.-]+\.(?:js|jsx|ts|tsx|py|json|md|html|css|mjs|cjs|yml|yaml|toml|rs|go|java|cs|cpp|c|h)(?::\d+)?\b/i.test(text)
+    || /\b(?:line|lines)\s+\d+\b/i.test(text)
+    || /\b(?:function|class|method)\s+[`'"]?[A-Za-z_$][\w$]*/.test(text);
+  const hasFindingsShape = /\b(?:finding|issue|bug|error|risk|structural problem|typo|no specific issues|no obvious issues)\b/i.test(text);
+  const speculativeOnly = /\bpotential areas\b/i.test(text) && !/\b(?:finding|issue|bug|error)\s+\d*\b/i.test(text);
+  return concreteLocation && hasFindingsShape && !speculativeOnly;
+}
+
+function buildReviewOnlyCompletionGatePrompt(userPrompt, answerText, workWalkthrough = []) {
+  const inspected = (workWalkthrough || []).some(item => item && item.status !== 'error');
+  if (!inspected) {
+    return '[SYSTEM: Review completion gate. This is a read-only code review of the active workspace. Start with workspace inventory, then inspect relevant source/config/test files. Do not ask which program to inspect when an active workspace exists.]';
+  }
+  const coverage = getReviewCoverage(workWalkthrough);
+  if (!coverage.broadEnough) {
+    return `[SYSTEM: Review completion gate. You have not inspected enough of the program to finish a broad bug/structural review yet. Current coverage: ${coverage.fileCount} source file(s) read${coverage.hasInventory ? ' with inventory context' : ''}. Continue with concrete tools: list files if needed, then read the main entry point, adjacent modules, config/package files, and tests where present. Do not stop after one file with general possibilities.]`;
+  }
+  if (!answerHasGroundedReviewReport(answerText)) {
+    return '[SYSTEM: Review completion gate. Your draft is not a grounded findings report yet. Either continue inspecting files, or produce a concrete report now with specific findings tied to file paths and line/function context, severity/impact, and a clear note if no specific issues were found. Do not ask the user whether to keep inspecting; finish the review from the available evidence or gather the missing evidence with tools.]';
+  }
+  return '';
 }
 
 function buildFinalAnswerQualityGatePrompt(userPrompt, answerText, workWalkthrough = []) {
-  if (!requestNeedsActionableFinalAnswer(userPrompt)) return '';
-  if (answerHasActionableFinalContent(answerText)) return '';
   const inspected = (workWalkthrough || []).some(item => item && item.status !== 'error');
-  const inspectionNote = inspected
-    ? 'You inspected context, but inspection alone is not completion.'
-    : 'You have not produced the actual answer yet.';
-  return `[SYSTEM: Final-response quality gate. The user asked for improvements, fixes, recommendations, a plan, or a next action. ${inspectionNote}
+  if (!inspected) return '';
+  if (hasOnlyInventoryEvidence(workWalkthrough)) {
+    return `[SYSTEM: Final-response quality gate. You only have inventory-level evidence from tools such as list_files/get_workspace_info. File names alone are not enough to give a deep project analysis, quality review, architecture assessment, or improvement roadmap.
 
-Before final response, answer the user's actual question with at least one concrete recommendation, fix plan, implemented change summary, or next action. Do not stop at phrases like "Ah, the path is..." or a file-inspection summary. If more evidence is needed, call the necessary tools now; otherwise produce a direct, actionable answer now.]`;
+Before final response, decide what evidence the user's actual request requires. If they asked for anything beyond a file inventory, read the relevant source files, tests, README/package/config files, or run safe inspection commands before answering. If the user truly requested only an inventory, answer that narrowly and explicitly. Do not produce broad recommendations from filenames alone.]`;
+  }
+  if (answerHasActionableFinalContent(answerText)) return '';
+  return `[SYSTEM: Final-response quality gate. You inspected context, but inspection alone is not completion.
+
+Before final response, answer the user's actual request directly, using the evidence you gathered. If more evidence is needed, call the necessary tools now; otherwise produce a substantive answer now. Do not stop at phrases like "Ah, the path is...", an acknowledgement, a file-inspection summary, or an empty response.]`;
 }
 
 function buildPlanApprovalMessage(planItem, fallbackText) {
@@ -3567,21 +4074,29 @@ ${JSON.stringify(String(userPrompt || ''))}`;
 }
 
 async function classifyPlanningNeed(userPrompt, modelName, apiKey) {
-  const fallback = { mode: 'plan', reason: 'Could not safely classify task complexity.' };
+  const regexFallback = () => ({
+    mode: 'plan',
+    reason: 'Could not safely classify task complexity.',
+    needsLocalInspection: isLocalProjectOrFolderRequest(userPrompt),
+    benefitsFromWorkspaceContext: requestPlausiblyBenefitsFromWorkspaceContext(userPrompt)
+  });
   const prompt = `Classify whether this Orion AI request should require an implementation plan before acting.
 
 Return only compact JSON with:
-{"mode":"plan"|"direct"|"answer","reviewOnly":true|false,"reason":"short reason"}
+{"mode":"plan"|"direct"|"answer","reviewOnly":true|false,"needsLocalInspection":true|false,"benefitsFromWorkspaceContext":true|false,"reason":"short reason"}
 
 Definitions:
-- plan: broad or complex work where the user should review direction first, such as creating a substantial new project, major redesign/refactor, large bug hunt, architecture change, risky migration, security-sensitive change, or ambiguous multi-step coding task.
+- plan: broad or complex work where the user should review direction first, such as creating a substantial new project, major redesign/refactor, architecture change, risky migration, security-sensitive change, or ambiguous multi-step coding task that will modify the workspace.
 - direct: concrete low-risk work that should be executed immediately, such as running/opening a program, running tests, showing a directory, setting an entry point, pushing to Git when explicitly requested, viewing a file, making a narrow edit, fixing a small bug, continuing an already-approved task, OR reading/inspecting local files to answer a question about them.
 - answer: a question or explanation that can be answered in chat without workspace changes or command execution.
 - reviewOnly: true ONLY when the user asked you to FIND/review/audit issues, bugs, typos, or faults WITHOUT being asked to fix them. In that case present findings as a report and do not modify files. Otherwise false.
+- needsLocalInspection: true when the user named or clearly implied a specific local folder/project/program/repo on this machine (e.g. "the game on my desktop called X") and the request asks to inspect, describe, or improve it. Otherwise false.
+- benefitsFromWorkspaceContext: true when the request asks for ideas, suggestions, design direction, or improvements that reference this app/codebase itself (its features, code, or workspace) rather than being a purely generic/abstract question. Otherwise false.
 
 Decision guidance:
 - Prefer direct for read-only local inspection or inventory tasks, including listing installed runtimes, checking versions, checking PATH, finding executables, showing files, or running safe diagnostic commands.
 - Prefer direct for any request to describe, explain, summarize, or understand a local program, project, or file — even if multiple files must be read. Reading files is not risky.
+- Prefer direct for recommendations or improvement ideas about an existing local folder/project/program; inspect the project first, then answer from evidence.
 - Prefer direct for a small number of safe commands that gather facts, even if the answer has several sections.
 - Prefer plan only when the task requires a coordinated implementation, risky changes, many file edits, architecture/design choices, migrations, security-sensitive changes, or user review before modifying the workspace.
 - Prefer answer when no local tools or workspace actions are needed at all.
@@ -3595,6 +4110,7 @@ Examples:
 - "what is this program about" -> direct
 - "can you tell me what llm-call does" -> direct
 - "tell me about the project in my Desktop/projects folder" -> direct
+- "I have a folder on my desktop called rocket sumo, recommend similar games and improvements" -> direct
 - "what does this file do" -> direct
 - "look through my program and find any bugs" -> direct
 - "can you find typos and structural faults in my project" -> direct
@@ -3619,7 +4135,7 @@ ${JSON.stringify(String(userPrompt || ''))}`;
 
   try {
     if (modelName && !modelName.startsWith('gemini-')) {
-      return fallback;
+      return regexFallback();
     }
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName || 'gemini-2.5-flash-lite'}:generateContent?key=${apiKey}`;
     const response = await fetch(url, {
@@ -3633,17 +4149,23 @@ ${JSON.stringify(String(userPrompt || ''))}`;
         }
       })
     });
-    if (!response.ok) return fallback;
+    if (!response.ok) return regexFallback();
     const data = await response.json();
     const text = data.candidates && data.candidates[0] && data.candidates[0].content &&
       data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
       data.candidates[0].content.parts[0].text;
     const parsed = JSON.parse(text || '{}');
     const mode = ['plan', 'direct', 'answer'].includes(parsed.mode) ? parsed.mode : 'plan';
-    return { mode, reviewOnly: !!parsed.reviewOnly, reason: String(parsed.reason || '') };
+    return {
+      mode,
+      reviewOnly: !!parsed.reviewOnly,
+      reason: String(parsed.reason || ''),
+      needsLocalInspection: !!parsed.needsLocalInspection,
+      benefitsFromWorkspaceContext: !!parsed.benefitsFromWorkspaceContext
+    };
   } catch (e) {
     console.error('Planning need classifier failed:', e);
-    return fallback;
+    return regexFallback();
   }
 }
 
@@ -3739,24 +4261,20 @@ async function answerLocalMemoryQuestionFastPath({ userPrompt, workspacePath, co
   }
 }
 
-function shouldHaveUsedToolsButDidNot(text, workWalkthrough, userPrompt = '') {
+function shouldHaveUsedToolsButDidNot(text, workWalkthrough, userPrompt = '', context = {}) {
   if ((workWalkthrough || []).length > 0) return false;
   const response = String(text || '').trim();
   if (!response) return true;
-  if (requestNeedsLocalInspection(userPrompt) && isGenericNonAnswer(response)) return true;
-  if (response.length < 80) return true;
-
-  const promptLower = String(userPrompt || '').toLowerCase();
-  const workspaceKeywords = ['file', 'test', 'code', 'search', 'index', 'run', 'execute', 'directory', 'folder', 'write', 'modify', 'patch', 'git', 'npm'];
-  const hasWorkspaceKeyword = workspaceKeywords.some(kw => promptLower.includes(kw));
-
-  if (hasWorkspaceKeyword) {
-    const claimsRegex = /\b(checked|verified|inspected|updated|created|found|tested|run|executed|deleted|copied|moved|read|wrote)\b/i;
-    if (claimsRegex.test(response)) {
-      return true;
-    }
-  }
-
+  if (context && context.reviewOnly) return true;
+  // context.needsLocalInspection carries the cached classifyPlanningNeed() verdict when the main
+  // loop calls this; direct callers (tests, other call sites) that omit it fall back to the regex
+  // check so this function still works as a standalone classifier.
+  const needsLocalProject = (context && context.needsLocalInspection !== undefined)
+    ? !!context.needsLocalInspection
+    : isLocalProjectOrFolderRequest(userPrompt);
+  const needsLocalInspection = needsLocalProject || isLocalSystemFactRequest(userPrompt);
+  if (needsLocalProject && (isGenericNonAnswer(response) || isLocalAccessDeflection(response))) return true;
+  if (needsLocalInspection && isGenericNonAnswer(response)) return true;
   return false;
 }
 
@@ -3767,7 +4285,85 @@ function isGenericNonAnswer(text) {
 }
 
 function requestNeedsLocalInspection(prompt) {
-  return isLocalSystemFactRequest(prompt);
+  return isLocalSystemFactRequest(prompt) || isLocalProjectOrFolderRequest(prompt);
+}
+
+function requestPlausiblyBenefitsFromWorkspaceContext(prompt) {
+  const tokens = new Set(tokenizeIntentText(prompt));
+  const referencesAppOrCode = hasAnyToken(tokens, [
+    'app', 'game', 'games', 'feature', 'features', 'controller', 'companion',
+    'workspace', 'project', 'codebase', 'code', 'program', 'orion'
+  ]);
+  const isIdeaOrDesignRequest = hasAnyToken(tokens, [
+    'idea', 'ideas', 'suggest', 'suggestions', 'recommend', 'recommendations',
+    'design', 'build', 'add', 'extend', 'improve', 'create', 'implement', 'plan'
+  ]);
+  return referencesAppOrCode && isIdeaOrDesignRequest;
+}
+
+const INSPECTION_TOOLS = new Set(['list_files', 'read_file', 'get_workspace_info', 'grep_search', 'search_embeddings', 'get_symbol_index']);
+const MEMORY_WRITE_TOOLS = new Set(['append_project_memory', 'remember_fact', 'remember_decision']);
+
+function hasPriorWorkspaceInspection(conversation) {
+  const messages = (conversation && Array.isArray(conversation.messages)) ? conversation.messages : [];
+  return messages.some(message => Array.isArray(message && message.logs) && message.logs.some(log => log && INSPECTION_TOOLS.has(log.toolName)));
+}
+
+// Substantive inspection this turn = enough distinct inspection-tool calls that the model
+// likely learned something durable about the workspace worth persisting to project memory.
+function turnDidSubstantiveInspection(workWalkthrough) {
+  const done = (workWalkthrough || []).filter(item => item && item.status !== 'error');
+  const inspectionCalls = done.filter(item => INSPECTION_TOOLS.has(item.toolName));
+  if (inspectionCalls.length >= 2) return true;
+  const toolNames = new Set(inspectionCalls.map(item => item.toolName));
+  return toolNames.has('get_symbol_index') && toolNames.has('read_file');
+}
+
+function turnAlreadyWroteMemory(workWalkthrough) {
+  return (workWalkthrough || []).some(item => item && MEMORY_WRITE_TOOLS.has(item.toolName));
+}
+
+function isLocalProjectOrFolderRequest(prompt) {
+  const text = String(prompt || '').toLowerCase();
+  const tokens = new Set(tokenizeIntentText(prompt));
+  const localAnchor = /\b(on|in)\s+my\s+desktop\b/.test(text) ||
+    /\bdesktop\s+projects?\b/.test(text) ||
+    /\bprojects?\s+folder\b/.test(text) ||
+    hasAnyToken(tokens, ['desktop', 'local']);
+  const namedThing = /\b(folder|project|program|app|game|repo|repository)\s+(called|named)\b/.test(text) ||
+    /\bcalled\s+["']?[a-z0-9][a-z0-9 _-]+["']?/.test(text) ||
+    hasAnyToken(tokens, ['folder', 'project', 'program', 'app', 'game', 'repo', 'repository']);
+  const asksForInspectionOrAdvice = hasAnyToken(tokens, [
+    'recommend', 'recommendations', 'ideas', 'improve', 'better', 'enhance',
+    'similar', 'style', 'styles', 'contains', 'inside', 'look', 'inspect',
+    'find', 'what', 'where', 'list', 'show', 'open', 'run'
+  ]);
+  return localAnchor && namedThing && asksForInspectionOrAdvice;
+}
+
+function isLocalAccessDeflection(text) {
+  const normalized = String(text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  return /only access .*explicitly provided/.test(normalized) ||
+    /within (the )?defined workspace/.test(normalized) ||
+    /do not have .*capability .*explore .*desktop/.test(normalized) ||
+    /cannot .*arbitrarily .*desktop/.test(normalized) ||
+    /need .*exact (location|path)/.test(normalized) ||
+    /provide .*full path/.test(normalized) ||
+    /describe the (games|files|contents|project)/.test(normalized);
+}
+
+function buildLocalInspectionNoToolGuidance(userPrompt, planningDecision) {
+  const needsLocalProject = (planningDecision && planningDecision.needsLocalInspection !== undefined)
+    ? !!planningDecision.needsLocalInspection
+    : isLocalProjectOrFolderRequest(userPrompt);
+  if (needsLocalProject) {
+    return ' The user named a local folder/project/program. Use local filesystem tools now: if the exact absolute path is not already verified, run a bounded PowerShell `Get-ChildItem` directory search/listing of likely parent folders such as Desktop and Desktop\\Projects with `-Directory`, `-Depth 2` or `-Depth 3`, and `-ErrorAction SilentlyContinue`; then call `change_workspace` with the verified real path. Do not ask the user to paste contents, do not claim Desktop access is unavailable, and do not use clarifying questions before inspecting.';
+  }
+  if (isLocalSystemFactRequest(userPrompt)) {
+    return ' The user asked about this local computer. Call local inspection commands now, such as `systeminfo`, CPU/RAM/disk/process commands, or another available local route. Do not answer with acknowledgement only.';
+  }
+  return '';
 }
 
 async function validateRunCommandForAgentUse(command, workspace) {
@@ -3912,6 +4508,8 @@ function classifyAgentFailure({ toolName = '', args = {}, result = null, errorTe
     resolved = 'repeated_tool_failure';
   } else if (toolName === 'patch_file' && /target content block not found|target.*not found|line range|patch.*failed/.test(text)) {
     resolved = 'patch_target_missing';
+  } else if (toolName === 'change_workspace' && /workspace path|invalid or does not exist|directory does not exist|path does not exist|does not exist/.test(text)) {
+    resolved = 'workspace_path_missing';
   } else if (/deny-list|destructive|blocked|planning mode blocks|not approved/.test(text)) {
     resolved = 'command_blocked';
   } else if (toolName === 'run_tests' || /test .*failed|tests failed|regression detected|npm test/.test(text) || (toolName === 'run_command' && /\b(npm|yarn|pnpm|node)\s+test\b/.test(command))) {
@@ -3935,6 +4533,7 @@ function recommendedNatureForFailureCategory(category) {
     auth_missing: 'terminal',
     command_blocked: 'terminal',
     missing_dependency: 'fixable',
+    workspace_path_missing: 'fixable',
     patch_target_missing: 'fixable',
     test_failure: 'fixable',
     interactive_command_needs_input: 'fixable',
@@ -3950,13 +4549,14 @@ function buildFailureRecoveryGuidance(failure) {
   const messages = {
     repeated_tool_failure: 'Do not quit the task. Do not retry it blindly. Pause the repeated call, inspect fresh state and recent output, explain the likely cause, then choose a different strategy before retrying: use a different tool, narrower arguments, or ask for the missing prerequisite.',
     patch_target_missing: 'Re-read the surrounding file lines before editing. Use a narrower exact target, a line-range patch, or adjust the patch to the current file contents instead of repeating the same patch.',
+    workspace_path_missing: 'The workspace path guess failed. Do not call change_workspace again with another guessed path. Resolve the folder first: run a bounded PowerShell Get-ChildItem directory search against the likely parent locations such as C:\\Users\\Owner\\Desktop and C:\\Users\\Owner\\Desktop\\Projects, using name tokens from the user request and the failed path, -Directory, -Depth 2 or -Depth 3, and -ErrorAction SilentlyContinue. Then pick the closest real directory from the local listing and call change_workspace once with that verified absolute path.',
     command_blocked: 'The command was blocked by safety or planning rules. Keep the safety behavior intact; use a safer non-destructive command, an internal executable/args path, or ask for explicit plan approval when required.',
     test_failure: 'Treat this as a regression signal. Read the failing test output, identify the first failing assertion or command, fix the code or test expectation, and rerun the relevant tests before summarizing.',
     missing_dependency: 'Install or configure the missing dependency only after checking the project manifest and existing package manager. If installation is not appropriate, choose a tool that uses available local capabilities.',
     auth_missing: 'Stop retrying credential-gated work. Preserve state, name the missing credential or permission, and ask the user to provide or configure it before continuing.',
     timeout: 'Do not repeat the same long-running action unchanged. Check if the process is a GUI/Pygame app that blocks until closed. If so, add an automated exit flag to the code (e.g. exit after N frames/ticks), run with a short timeout, or use start_command/kill_command instead of waiting for a long timeout.',
     interactive_command_needs_input: 'Do not run an interactive command as a blocking test without stdin. Pipe a short scripted input sequence, redirect an input fixture, or use start_command with a short timeout followed by read_command_output and kill_command.',
-    model_no_tool_use: 'Your response appeared to promise or report workspace work, but no tools were called. If the task requires looking at files, running commands/tests, editing code, creating files, or verifying behavior, call the appropriate tools now. If no tools are needed, answer explicitly that no workspace action was needed and why.',
+    model_no_tool_use: 'Your response appeared to promise or report workspace work, but no tools were called. If the task requires looking at files, running commands/tests, editing code, creating files, saving memory, or verifying behavior, call the appropriate tools now. If the task does not require tools, answer the user naturally and do not mention tools, workspace operations, or this correction.',
     tool_failure: 'Inspect the error and current workspace state before trying again. Change one meaningful variable in the next attempt, such as the target path, command, arguments, or verification step.'
   };
   return messages[category] || messages.tool_failure;
@@ -3964,6 +4564,16 @@ function buildFailureRecoveryGuidance(failure) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function sleepRespectingStop(ms) {
+  const boundedMs = Math.max(Number(ms) || 0, 0);
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < boundedMs) {
+    if (isStopRequested) throw createUserStopError(stopRequestMode);
+    const remainingMs = Math.max(0, boundedMs - (Date.now() - startedAt));
+    await sleep(Math.min(250, remainingMs));
+  }
 }
 
 async function sleepWithModelApiStatus(ms, label, onWarning) {
@@ -3974,7 +4584,7 @@ async function sleepWithModelApiStatus(ms, label, onWarning) {
   }
   while (Date.now() - startedAt < boundedMs) {
     if (isStopRequested) {
-      throw new Error('Model API retry wait cancelled by user stop.');
+      throw createUserStopError(stopRequestMode);
     }
     const remainingMs = Math.max(0, boundedMs - (Date.now() - startedAt));
     await sleep(Math.min(1000, remainingMs));
@@ -3987,21 +4597,363 @@ function stableStringify(value) {
   return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
 }
 
+function resolveConversationWorkspace(conversation) {
+  const conv = conversation && typeof conversation === 'object' ? conversation : {};
+  return conv.workspace || conv.projectPath || (window.getCurrentWorkspace ? window.getCurrentWorkspace() : '');
+}
+
+function expandCommonWindowsPath(rawPath) {
+  return String(rawPath || '')
+    .trim()
+    .replace(/^["']|["']$/g, '')
+    .replace(/\$env:USERPROFILE/gi, resolvedHomeDir)
+    .replace(/\$env:HOMEDRIVE/gi, resolvedHomeDir.slice(0, 2) || 'C:')
+    .replace(/\$env:HOMEPATH/gi, resolvedHomeDir.slice(2) || '\\Users\\Owner')
+    .replace(/^~[/\\]?/, resolvedHomeDir + '\\');
+}
+
+function normalizeLocalPathNameForMatch(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/&/g, 'and')
+    .replace(/[_\-\s.]+/g, '')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function tokenizeLocalPathNameForMatch(value) {
+  return String(value || '').toLowerCase().match(/[a-z0-9]+/g) || [];
+}
+
+function editDistanceWithin(left, right, maxDistance) {
+  const a = String(left || '');
+  const b = String(right || '');
+  const limit = Math.max(0, Number(maxDistance) || 0);
+  if (Math.abs(a.length - b.length) > limit) return false;
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i++) {
+    const current = [i];
+    let rowMin = current[0];
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      current[j] = Math.min(
+        previous[j] + 1,
+        current[j - 1] + 1,
+        previous[j - 1] + cost
+      );
+      rowMin = Math.min(rowMin, current[j]);
+    }
+    if (rowMin > limit) return false;
+    previous = current;
+  }
+  return previous[b.length] <= limit;
+}
+
+function tokenMatchScore(targetToken, candidateToken) {
+  if (!targetToken || !candidateToken) return 0;
+  if (targetToken === candidateToken) return 100;
+  if (targetToken.length >= 3 && candidateToken.length >= 3 && (
+    targetToken.includes(candidateToken) ||
+    candidateToken.includes(targetToken)
+  )) {
+    return 80;
+  }
+  const maxLen = Math.max(targetToken.length, candidateToken.length);
+  const allowedDistance = maxLen >= 4 ? 2 : 1;
+  return editDistanceWithin(targetToken, candidateToken, allowedDistance) ? 65 : 0;
+}
+
+function scoreWorkspaceDirectoryVariant(targetName, candidateName) {
+  const targetNorm = normalizeLocalPathNameForMatch(targetName);
+  const candidateNorm = normalizeLocalPathNameForMatch(candidateName);
+  if (!targetNorm || !candidateNorm) return 0;
+  if (targetNorm === candidateNorm) return 1000;
+  if (targetNorm.length >= 4 && candidateNorm.includes(targetNorm)) {
+    return 700 - Math.abs(candidateNorm.length - targetNorm.length);
+  }
+  if (candidateNorm.length >= 4 && targetNorm.includes(candidateNorm)) {
+    return 650 - Math.abs(candidateNorm.length - targetNorm.length);
+  }
+
+  const targetTokens = tokenizeLocalPathNameForMatch(targetName);
+  const candidateTokens = tokenizeLocalPathNameForMatch(candidateName);
+  if (!targetTokens.length || !candidateTokens.length) return 0;
+  const used = new Set();
+  let total = 0;
+  let matched = 0;
+  for (const targetToken of targetTokens) {
+    let bestIndex = -1;
+    let bestScore = 0;
+    candidateTokens.forEach((candidateToken, index) => {
+      if (used.has(index)) return;
+      const score = tokenMatchScore(targetToken, candidateToken);
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = index;
+      }
+    });
+    if (bestIndex >= 0 && bestScore > 0) {
+      used.add(bestIndex);
+      matched++;
+      total += bestScore;
+    }
+  }
+  if (!matched) return 0;
+  if (matched === targetTokens.length && matched === candidateTokens.length) total += 150;
+  else if (matched === targetTokens.length) total += 75;
+  return total - Math.abs(candidateNorm.length - targetNorm.length);
+}
+
+function chooseWorkspaceDirectoryVariant(targetName, candidates) {
+  const list = Array.isArray(candidates) ? candidates : [];
+  const targetTokens = tokenizeLocalPathNameForMatch(targetName);
+  const threshold = targetTokens.length > 1 ? 150 : 80;
+  let best = null;
+  let bestScore = 0;
+  for (const candidate of list) {
+    const candidateName = typeof candidate === 'string'
+      ? candidate
+      : (candidate && (candidate.name || getLocalPathBaseName(candidate.path))) || '';
+    const score = scoreWorkspaceDirectoryVariant(targetName, candidateName);
+    if (score > bestScore) {
+      best = candidate;
+      bestScore = score;
+    }
+  }
+  return bestScore >= threshold ? best : null;
+}
+
+function trimTrailingLocalPathSeparators(value) {
+  return String(value || '').replace(/[\\/]+$/, '');
+}
+
+function getLocalPathBaseName(value) {
+  const clean = trimTrailingLocalPathSeparators(value);
+  const parts = clean.split(/[\\/]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : clean;
+}
+
+function getLocalPathParent(value) {
+  const clean = trimTrailingLocalPathSeparators(value);
+  const match = clean.match(/^(.*)[\\/][^\\/]+$/);
+  return match ? match[1] : '';
+}
+
+function isAbsoluteLocalPath(value) {
+  return /^[a-zA-Z]:[\\/]/.test(String(value || '')) || /^\\\\/.test(String(value || ''));
+}
+
+function joinLocalPath(parentPath, childPath) {
+  const parent = trimTrailingLocalPathSeparators(parentPath);
+  const child = String(childPath || '').replace(/^[\\/]+/, '');
+  const separator = parent.includes('/') && !parent.includes('\\') ? '/' : '\\';
+  return parent ? `${parent}${separator}${child}` : child;
+}
+
+function uniqueLocalPaths(paths) {
+  const seen = new Set();
+  return paths.filter((candidate) => {
+    const value = trimTrailingLocalPathSeparators(candidate);
+    if (!value) return false;
+    const key = value.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+async function tryListWorkspacePath(pathValue) {
+  try {
+    const files = await window.api.listFiles(pathValue);
+    if (files && files.error) return { exists: false, error: files.error };
+    return { exists: true, files };
+  } catch (error) {
+    return { exists: false, error: error && error.message ? error.message : String(error) };
+  }
+}
+
+async function listWorkspaceDirectoryCandidates(parentPath) {
+  try {
+    const api = window && window.api ? window.api : {};
+    const entries = typeof api.listDirectoryChildren === 'function'
+      ? await api.listDirectoryChildren(parentPath)
+      : await api.listFiles(parentPath);
+    if (entries && entries.error) return { candidates: [], error: entries.error };
+    const candidates = (Array.isArray(entries) ? entries : [])
+      .filter((entry) => entry && entry.isDir)
+      .map((entry) => {
+        const rawPath = String(entry.path || entry.name || '');
+        const name = entry.name || getLocalPathBaseName(rawPath);
+        const resolvedPath = isAbsoluteLocalPath(rawPath) ? rawPath : joinLocalPath(parentPath, rawPath);
+        return { name, path: resolvedPath };
+      });
+    return { candidates, error: '' };
+  } catch (error) {
+    return { candidates: [], error: error && error.message ? error.message : String(error) };
+  }
+}
+
+async function resolveWorkspacePathForChange(rawPath) {
+  const targetPath = expandCommonWindowsPath(rawPath);
+  const direct = await tryListWorkspacePath(targetPath);
+  if (direct.exists) {
+    return { success: true, path: targetPath, resolvedFrom: targetPath, fuzzyResolved: false };
+  }
+
+  const targetName = getLocalPathBaseName(targetPath);
+  const desktopPath = joinLocalPath(resolvedHomeDir, 'Desktop');
+  const searchRoots = uniqueLocalPaths([
+    getLocalPathParent(targetPath),
+    desktopPath,
+    joinLocalPath(desktopPath, 'Projects'),
+    joinLocalPath(desktopPath, 'projects')
+  ]);
+  const errors = [direct.error].filter(Boolean);
+
+  for (const root of searchRoots) {
+    const { candidates, error } = await listWorkspaceDirectoryCandidates(root);
+    if (error) errors.push(`${root}: ${error}`);
+    const match = chooseWorkspaceDirectoryVariant(targetName, candidates);
+    if (!match) continue;
+    const verified = await tryListWorkspacePath(match.path);
+    if (verified.exists) {
+      return {
+        success: true,
+        path: match.path,
+        resolvedFrom: targetPath,
+        fuzzyResolved: true,
+        matchedName: match.name
+      };
+    }
+    if (verified.error) errors.push(`${match.path}: ${verified.error}`);
+  }
+
+  return {
+    success: false,
+    path: targetPath,
+    error: errors[0] || `Directory does not exist: ${targetPath}`
+  };
+}
+
+function rememberPendingWorkspaceResolution(conversation, rawPath, userPrompt = '') {
+  if (!conversation || !rawPath) return null;
+  const requestedPath = expandCommonWindowsPath(rawPath);
+  const pending = {
+    requestedPath,
+    requestedName: getLocalPathBaseName(requestedPath),
+    originalPrompt: String(userPrompt || '').slice(0, 2000),
+    createdAt: Date.now()
+  };
+  conversation.pendingWorkspaceResolution = pending;
+  return pending;
+}
+
+function clearPendingWorkspaceResolution(conversation) {
+  if (conversation && conversation.pendingWorkspaceResolution) {
+    delete conversation.pendingWorkspaceResolution;
+  }
+}
+
+function extractCommandPathArgument(commandText) {
+  const text = String(commandText || '');
+  const match = text.match(/-(?:LiteralPath|Path)\s+(?:"([^"]+)"|'([^']+)'|([^\s|]+))/i);
+  return match ? expandCommonWindowsPath(match[1] || match[2] || match[3] || '') : '';
+}
+
+function parseDirectoryCandidateLine(line, parentPath = '') {
+  const trimmed = String(line || '').trim();
+  if (!trimmed) return null;
+  if (/^(directory:|mode\s+|----)/i.test(trimmed)) return null;
+  if (/^[a-zA-Z]:[\\/]/.test(trimmed)) {
+    return { name: getLocalPathBaseName(trimmed), path: trimmed };
+  }
+
+  const tableMatch = trimmed.match(/^d\S*\s+\d{1,2}\/\d{1,2}\/\d{4}\s+\d{1,2}:\d{2}\s+(?:AM|PM)\s+(.+)$/i);
+  const name = tableMatch ? tableMatch[1].trim() : trimmed;
+  if (!name || /^(name|length|lastwritetime)$/i.test(name)) return null;
+  if (!/[a-z0-9]/i.test(name)) return null;
+  if (/[{}:]/.test(name)) return null;
+  return {
+    name,
+    path: parentPath ? joinLocalPath(parentPath, name) : name
+  };
+}
+
+function extractDirectoryCandidatesFromCommandOutput(stdout, commandText = '') {
+  const parentPath = extractCommandPathArgument(commandText);
+  const seen = new Set();
+  return String(stdout || '')
+    .split(/\r?\n/)
+    .map(line => parseDirectoryCandidateLine(line, parentPath))
+    .filter(Boolean)
+    .filter(candidate => {
+      const key = String(candidate.path || candidate.name || '').toLowerCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function buildPendingWorkspaceResolutionHint({ toolName, args = {}, result = {}, conversation = {} } = {}) {
+  if (toolName !== 'run_command') return null;
+  const pending = conversation && conversation.pendingWorkspaceResolution;
+  if (!pending || !pending.requestedName) return null;
+  if (!result || result.error || result.success === false || Number(result.exitCode || 0) !== 0) return null;
+  const candidates = extractDirectoryCandidatesFromCommandOutput(result.stdout || '', args.command || '');
+  const match = chooseWorkspaceDirectoryVariant(pending.requestedName, candidates);
+  if (!match) return null;
+  return {
+    requestedName: pending.requestedName,
+    requestedPath: pending.requestedPath,
+    matchedName: match.name || getLocalPathBaseName(match.path),
+    matchedPath: match.path,
+    originalPrompt: pending.originalPrompt || '',
+    guidance: `A later directory listing found "${match.name || getLocalPathBaseName(match.path)}", which is the closest real match for "${pending.requestedName}". Use change_workspace with "${match.path}" and continue the original local-project request instead of asking the user to verify the spelling.`
+  };
+}
+
+function buildPendingWorkspaceResolutionCorrectionPrompt(answerText, workWalkthrough = []) {
+  const hintItem = (workWalkthrough || []).find(item => item && item.localDirectoryResolution);
+  if (!hintItem) return '';
+  const hint = hintItem.localDirectoryResolution;
+  const text = String(answerText || '').toLowerCase();
+  const asksUserToVerify = /couldn'?t find|could not find|exact match|verify|double-check|provide the exact|spelling|location/.test(text);
+  const mentionsMatch = hint.matchedName && text.includes(String(hint.matchedName).toLowerCase());
+  const alreadyContinues = /change_workspace|changed workspace|reading|read_file|list_files|inspect/i.test(String(answerText || '')) && mentionsMatch;
+  if (alreadyContinues && !asksUserToVerify) return '';
+  return `[SYSTEM: Directory resolution continuity guard. A later local directory listing found a strong match for the previously failed workspace path.\n\nRequested/dictated name: ${hint.requestedName}\nMatched real folder: ${hint.matchedPath}\nOriginal request: ${hint.originalPrompt || '(not recorded)'}\n\nDo not ask the user to verify the spelling again. Call change_workspace with the matched real folder, then continue the original request from evidence. If the latest user only asked for the folder list as a way to help you recover, explain briefly that you found the match and proceed.]`;
+}
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = MODEL_API_REQUEST_TIMEOUT_MS, label = 'request') {
+  const externalSignal = options.signal;
+  const fetchOptions = { ...options };
+  delete fetchOptions.signal;
   const controller = new AbortController();
+  const abortFromExternalSignal = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      throw createUserStopError(stopRequestMode);
+    }
+    externalSignal.addEventListener('abort', abortFromExternalSignal, { once: true });
+  }
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(url, {
-      ...options,
+      ...fetchOptions,
       signal: controller.signal
     });
   } catch (error) {
     if (error && error.name === 'AbortError') {
+      if (externalSignal && externalSignal.aborted) {
+        throw createUserStopError(stopRequestMode);
+      }
       throw new Error(`${label} timed out after ${Math.ceil(timeoutMs / 1000)} seconds.`);
     }
     throw error;
   } finally {
     clearTimeout(timer);
+    if (externalSignal) {
+      externalSignal.removeEventListener('abort', abortFromExternalSignal);
+    }
   }
 }
 
@@ -4152,7 +5104,7 @@ function convertGeminiToOllamaTools(geminiTools) {
   return ollamaTools;
 }
 
-async function callOllamaAPI(messages, modelName, onWarning, disableTools = false) {
+async function callOllamaAPI(messages, modelName, onWarning, disableTools = false, options = {}) {
   const url = `http://localhost:11434/api/chat`;
   
   // Format standard Orion AI system instruction
@@ -4165,8 +5117,14 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
         ...ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS,
         {
           name: "list_files",
-          description: "Lists all files recursively in the active workspace directory, excluding build folders like node_modules.",
-          parameters: { type: "OBJECT", properties: {} }
+          description: "Returns a curated project file inventory for the active workspace by default. The default hides generated caches, dependencies, runtime/user data, backups, and sensitive-looking files; use mode='all' only when the user explicitly needs a raw workspace listing.",
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              mode: { type: "STRING", enum: ["project", "all"], description: "Use 'project' for the curated default inventory. Use 'all' only for an explicit raw recursive listing." },
+              maxFiles: { type: "NUMBER", description: "Maximum curated project files to return before truncation. Ignored for mode='all'." }
+            }
+          }
         },
         {
           name: "get_workspace_info",
@@ -4175,11 +5133,11 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
         },
         {
           name: "change_workspace",
-          description: "Changes the active workspace directory of this conversation to a new absolute directory path on your computer. Use this when you discover that the user wants to work on or inspect a project located outside the active standalone workspace folder.",
+          description: "Changes the active workspace directory of this conversation to a new absolute directory path on your computer. Use this only after the path is explicit or locally verified. The executor also resolves obvious folder-name variants such as spaces, hyphens, underscores, casing, and minor dictation/autocorrect differences against nearby Desktop/Projects directories before failing. For fuzzy Desktop/project names, first resolve the real folder with a bounded run_command Get-ChildItem search; if this tool fails because the path does not exist, search/list candidate directories before retrying with another path.",
           parameters: {
             type: "OBJECT",
             properties: {
-              path: { type: "STRING", description: "The absolute path to the directory you want to set as the active workspace." }
+              path: { type: "STRING", description: "The verified absolute path to the directory you want to set as the active workspace." }
             },
             required: ["path"]
           }
@@ -4288,7 +5246,7 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
         },
         {
           name: "run_command",
-          description: "Runs a command in powershell in the workspace directory, waits for completion, and returns code, stdout, stderr, and timeout status. For local machine facts, a non-zero exit proves only that this command attempt failed; try a different local route before concluding the task is blocked.",
+          description: "Runs a command in powershell in the workspace directory, waits for completion, and returns code, stdout, stderr, and timeout status. For local machine facts, a non-zero exit proves only that this command attempt failed; try a different local route before concluding the task is blocked. For a top-level Desktop/folder listing, use a non-recursive command such as Get-ChildItem -LiteralPath \"C:\\Users\\Owner\\Desktop\" -Directory | Select-Object -ExpandProperty Name; do not add -Depth/-Recurse unless nested folders are explicitly requested.",
           parameters: {
             type: "OBJECT",
             properties: {
@@ -4452,7 +5410,7 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
         },
         {
           name: "ask_clarifying_questions",
-          description: "Pauses and presents 2-3 structured clarifying questions to the user when key design decisions are unspecified. Use BEFORE writing STRATEGY.md when the request leaves critical choices open (visual style, core mechanic, scale/performance strategy, framework). IMPORTANT: Do NOT say 'Task finished' or any completion text when calling this tool — the task is paused awaiting answers, not done. The user sees an interactive card with radio options, recommended badges, and a free-text 'Other' fallback. Their answers resume the agent automatically.",
+          description: "Pauses and presents 2-3 structured clarifying questions to the user when key design decisions are unspecified. Use BEFORE writing STRATEGY.md when the request leaves critical choices open (visual style, core mechanic, scale/performance strategy, framework). Do not use this as a substitute for inspecting an existing local folder/project/program; if the user named one, call local tools first and ask only for ambiguities that remain after inspection. IMPORTANT: Do NOT say 'Task finished' or any completion text when calling this tool — the task is paused awaiting answers, not done. The user sees an interactive card with radio options, recommended badges, and a free-text 'Other' fallback. Their answers resume the agent automatically.",
           parameters: {
             type: "OBJECT",
             properties: {
@@ -4648,11 +5606,12 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
     requestBody.tools = ollamaTools;
   }
   
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(requestBody)
-  });
+    body: JSON.stringify(requestBody),
+    signal: options.signal
+  }, MODEL_API_REQUEST_TIMEOUT_MS, 'Ollama chat request');
   
   if (!response.ok) {
     const errText = await response.text();
@@ -4867,7 +5826,7 @@ async function inspectScreenshotWithOllama({ imageBase64, path, goal, modelName 
 }
 
 // GEMINI API UTILITIES
-async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTools = false) {
+async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTools = false, options = {}) {
   let activeModelName = modelName;
   
   const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
@@ -4935,8 +5894,14 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
           ...ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS,
           {
             name: "list_files",
-            description: "Lists all files recursively in the active workspace directory, excluding build folders like node_modules.",
-            parameters: { type: "OBJECT", properties: {} }
+            description: "Returns a curated project file inventory for the active workspace by default. The default hides generated caches, dependencies, runtime/user data, backups, and sensitive-looking files; use mode='all' only when the user explicitly needs a raw workspace listing.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                mode: { type: "STRING", enum: ["project", "all"], description: "Use 'project' for the curated default inventory. Use 'all' only for an explicit raw recursive listing." },
+                maxFiles: { type: "NUMBER", description: "Maximum curated project files to return before truncation. Ignored for mode='all'." }
+              }
+            }
           },
           {
             name: "get_workspace_info",
@@ -4945,11 +5910,11 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
           },
           {
             name: "change_workspace",
-            description: "Changes the active workspace directory of this conversation to a new absolute directory path on your computer. Use this when you discover that the user wants to work on or inspect a project located outside the active standalone workspace folder.",
+          description: "Changes the active workspace directory of this conversation to a new absolute directory path on your computer. Use this only after the path is explicit or locally verified. The executor also resolves obvious folder-name variants such as spaces, hyphens, underscores, casing, and minor dictation/autocorrect differences against nearby Desktop/Projects directories before failing. For fuzzy Desktop/project names, first resolve the real folder with a bounded run_command Get-ChildItem search; if this tool fails because the path does not exist, search/list candidate directories before retrying with another path.",
             parameters: {
               type: "OBJECT",
               properties: {
-                path: { type: "STRING", description: "The absolute path to the directory you want to set as the active workspace." }
+                path: { type: "STRING", description: "The verified absolute path to the directory you want to set as the active workspace." }
               },
               required: ["path"]
             }
@@ -5058,7 +6023,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
           },
           {
             name: "run_command",
-            description: "Runs a command in powershell in the workspace directory, waits for completion, and returns code, stdout, stderr, and timeout status. For local machine facts, a non-zero exit proves only that this command attempt failed; try a different local route before concluding the task is blocked.",
+            description: "Runs a command in powershell in the workspace directory, waits for completion, and returns code, stdout, stderr, and timeout status. For local machine facts, a non-zero exit proves only that this command attempt failed; try a different local route before concluding the task is blocked. For a top-level Desktop/folder listing, use a non-recursive command such as Get-ChildItem -LiteralPath \"C:\\Users\\Owner\\Desktop\" -Directory | Select-Object -ExpandProperty Name; do not add -Depth/-Recurse unless nested folders are explicitly requested.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -5223,7 +6188,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
           },
           {
             name: "ask_clarifying_questions",
-            description: "Pauses and presents 2-3 structured clarifying questions to the user when key design decisions are unspecified. Use BEFORE writing STRATEGY.md when the request leaves critical choices open (visual style, core mechanic, scale/performance strategy, framework). IMPORTANT: Do NOT say 'Task finished' or any completion text when calling this tool — the task is paused awaiting answers, not done. The user sees an interactive card with radio options, recommended badges, and a free-text 'Other' fallback. Their answers resume the agent automatically.",
+            description: "Pauses and presents 2-3 structured clarifying questions to the user when key design decisions are unspecified. Use BEFORE writing STRATEGY.md when the request leaves critical choices open (visual style, core mechanic, scale/performance strategy, framework). Do not use this as a substitute for inspecting an existing local folder/project/program; if the user named one, call local tools first and ask only for ambiguities that remain after inspection. IMPORTANT: Do NOT say 'Task finished' or any completion text when calling this tool — the task is paused awaiting answers, not done. The user sees an interactive card with radio options, recommended badges, and a free-text 'Other' fallback. Their answers resume the agent automatically.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -5414,7 +6379,8 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
       const response = await fetchWithTimeout(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody)
+        body: JSON.stringify(requestBody),
+        signal: options.signal
       }, MODEL_API_REQUEST_TIMEOUT_MS, 'Gemini generateContent request');
       
       if (response.ok) {
@@ -5477,7 +6443,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
 }
 
 // TOKEN COUNT ESTIMATOR VIA API
-async function countTokens(messages, modelName, apiKey) {
+async function countTokens(messages, modelName, apiKey, options = {}) {
   if (!modelName.startsWith('gemini-')) {
     return JSON.stringify(messages).length / 4;
   }
@@ -5485,11 +6451,12 @@ async function countTokens(messages, modelName, apiKey) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:countTokens?key=${apiKey}`;
   const requestBody = { contents: messages };
   
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(requestBody)
-  });
+    body: JSON.stringify(requestBody),
+    signal: options.signal
+  }, MODEL_API_REQUEST_TIMEOUT_MS, 'Gemini countTokens request');
   
   if (!response.ok) {
     // Return approximation if API fails
@@ -5611,6 +6578,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     tokenizeIntentText,
     buildLocalMemoryAnswer,
     getPlanningToolGate,
+    getReviewOnlyToolGate,
     buildRemainingWorkSummary,
     normalizeChecklistTasks,
     shouldApplyChecklistUpdate,
@@ -5625,10 +6593,19 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     extractPythonScriptPath,
     commandProvidesInput,
     isLocalSystemFactRequest,
+    isLocalProjectOrFolderRequest,
+    isLocalAccessDeflection,
     requestNeedsLocalInspection,
+    buildLocalInspectionNoToolGuidance,
     isGenericNonAnswer,
     requestNeedsActionableFinalAnswer,
     answerHasActionableFinalContent,
+    getReviewCoverage,
+    answerHasGroundedReviewReport,
+    buildReviewOnlyCompletionGatePrompt,
+    isInventoryOnlyCommand,
+    hasDeepInspectionEvidence,
+    hasOnlyInventoryEvidence,
     buildFinalAnswerQualityGatePrompt,
     shouldHaveUsedToolsButDidNot,
     isFailedToolResult,
@@ -5639,6 +6616,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     classifyAgentFailure,
     recommendedNatureForFailureCategory,
     buildFailureRecoveryGuidance,
+    resolveConversationWorkspace,
     isRealVerificationCommand,
     isVerificationItem,
     hasVerificationAfterLastFileEdit,
@@ -5647,13 +6625,28 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     stripEchoedSystemScaffold,
     sanitizeFinalAnswerText,
     withWorkWalkthrough,
+    hiddenDirectoryForInventory,
+    sensitiveFileForInventory,
+    buildCuratedFileInventory,
     buildDiscoveryFromToolOutcome,
     parseModelJsonObject,
     callGeminiAPI,
     inspectScreenshotWithModel,
     inspectScreenshotWithGemini,
     inspectScreenshotWithOllama,
-    diagnoseModelApiFailure
+    diagnoseModelApiFailure,
+    expandCommonWindowsPath,
+    normalizeLocalPathNameForMatch,
+    tokenizeLocalPathNameForMatch,
+    editDistanceWithin,
+    scoreWorkspaceDirectoryVariant,
+    chooseWorkspaceDirectoryVariant,
+    resolveWorkspacePathForChange,
+    rememberPendingWorkspaceResolution,
+    extractCommandPathArgument,
+    extractDirectoryCandidatesFromCommandOutput,
+    buildPendingWorkspaceResolutionHint,
+    buildPendingWorkspaceResolutionCorrectionPrompt
   };
 }
 

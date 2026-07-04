@@ -88,6 +88,15 @@ test('Windows command shell selection does not require PowerShell for plain comm
   t.end();
 });
 
+test('conversation command matching handles raw and normalized process ids', (t) => {
+  const conversationId = 'conv-123-abc';
+  t.equal(main.normalizeConversationIdForCommandSession(conversationId), 'conv_123_abc', 'normalizes conversation id for command sessions');
+  t.equal(main.commandBelongsToConversation('cmd_conv-123-abc_1700000000000', conversationId), true, 'matches raw conversation ids from run_command');
+  t.equal(main.commandBelongsToConversation('cmd_conv_123_abc_server', conversationId), true, 'matches normalized conversation ids from start_command');
+  t.equal(main.commandBelongsToConversation('cmd_conv_999_other_server', conversationId), false, 'does not match unrelated command sessions');
+  t.end();
+});
+
 test('previewWorkspaceApp guards: missing workspace, no entrypoint, and destructive command', async (t) => {
   const fs = require('fs');
   const os = require('os');
@@ -163,6 +172,37 @@ test('packaged updater includes metadata and preserves source file dates', (t) =
   t.ok(splashHtml.includes('Updating local build'), 'update splash explains the blocking maintenance state');
   t.ok(splashHtml.includes('Relaunching Orion'), 'update splash has relaunching state text');
   t.ok(splashHtml.includes('rgba(130,115,244'), 'update splash uses Orion accent styling');
+  t.end();
+});
+
+test('packaged updater resolves the real source root from packaged resources', (t) => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-real-source-'));
+  fs.mkdirSync(path.join(repo, 'dist', 'OrionAI-win32-x64', 'resources', 'app', 'lib'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'agent.js'), '');
+  fs.writeFileSync(path.join(repo, 'renderer.js'), '');
+  fs.writeFileSync(path.join(repo, 'package.json'), '{}');
+
+  const packagedLib = path.join(repo, 'dist', 'OrionAI-win32-x64', 'resources', 'app', 'lib');
+  t.equal(main.resolveUpdateSourceDir(packagedLib), repo, 'walks from packaged resources/app/lib back to repo root');
+  t.end();
+});
+
+test('packaged updater tracks all runtime modules required by main process', (t) => {
+  const requiredRuntimeFiles = [
+    'lib/ipc-ui.js',
+    'lib/ipc-skill.js',
+    'lib/ipc-memory.js',
+    'lib/memory-manager.js',
+    'lib/skill-loader.js'
+  ];
+
+  for (const file of requiredRuntimeFiles) {
+    t.ok(main.AUTO_UPDATE_FILES.includes(file), `auto-update includes ${file}`);
+  }
   t.end();
 });
 

@@ -2,6 +2,7 @@
 
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
+const fs = require('fs');
 const shared = require('./lib/shared');
 
 // ── Lib modules ────────────────────────────────────────────────────────────────
@@ -13,6 +14,7 @@ const ipcUi = require('./lib/ipc-ui');
 const symbolIndex = require('./lib/symbol-index');
 const ipcSkill = require('./lib/ipc-skill');
 const ipcMemory = require('./lib/ipc-memory');
+let lastConversationWriteRevision = 0;
 
 // ── Window creation ────────────────────────────────────────────────────────────
 
@@ -43,7 +45,7 @@ function createWindow() {
 
 function registerAllHandlers() {
   const { getWorkspaceEntrypoint } = ipcWorkspace;
-  const { readAppConfig } = require('./lib/config');
+  const { readAppConfig, atomicWriteFileSync } = require('./lib/config');
   const { startStaticWorkspaceServer } = ipcServer;
 
   ipcFileTools.registerHandlers(ipcMain);
@@ -54,6 +56,38 @@ function registerAllHandlers() {
   symbolIndex.registerHandlers(ipcMain);
   ipcSkill.registerHandlers(ipcMain);
   ipcMemory.registerHandlers(ipcMain);
+
+  const getConversationsPath = () => path.join(app.getPath('userData'), 'conversations.json');
+  ipcMain.handle('read-conversations', () => {
+    const filePath = getConversationsPath();
+    try {
+      if (!fs.existsSync(filePath)) {
+        return { success: true, conversations: [], path: filePath, missing: true };
+      }
+      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, ''));
+      return { success: true, conversations: Array.isArray(parsed) ? parsed : [], path: filePath };
+    } catch (error) {
+      return { success: false, conversations: [], path: filePath, error: error.message };
+    }
+  });
+  ipcMain.handle('write-conversations', (event, payload) => {
+    const filePath = getConversationsPath();
+    try {
+      const conversations = Array.isArray(payload)
+        ? payload
+        : (payload && Array.isArray(payload.conversations) ? payload.conversations : null);
+      const revision = payload && Number(payload.revision || 0);
+      if (!Array.isArray(conversations)) throw new Error('Conversation payload must be an array');
+      if (revision && revision < lastConversationWriteRevision) {
+        return { success: true, path: filePath, count: conversations.length, stale: true };
+      }
+      atomicWriteFileSync(filePath, `${JSON.stringify(conversations, null, 2)}\n`, 'utf8');
+      if (revision) lastConversationWriteRevision = revision;
+      return { success: true, path: filePath, count: conversations.length };
+    } catch (error) {
+      return { success: false, path: filePath, error: error.message };
+    }
+  });
 }
 
 // ── App lifecycle ──────────────────────────────────────────────────────────────
@@ -101,6 +135,8 @@ if (process.env.NODE_ENV === 'test') {
     escapePowerShellSingle: ipcShell.escapePowerShellSingle || ipcWorkspace.escapePowerShellSingle,
     startCommandSession: ipcShell.startCommandSession,
     killProcessTree: ipcShell.killProcessTree,
+    commandBelongsToConversation: ipcShell.commandBelongsToConversation,
+    normalizeConversationIdForCommandSession: ipcShell.normalizeConversationIdForCommandSession,
     commandLooksPowerShellSpecific: ipcShell.commandLooksPowerShellSpecific,
     getCommandShellSpec: ipcShell.getCommandShellSpec,
     previewWorkspaceApp: ipcShell.previewWorkspaceApp,
@@ -143,6 +179,8 @@ if (process.env.NODE_ENV === 'test') {
     buildUpdateSplashHtml: ipcUi.buildUpdateSplashHtml,
     syncSourceUpdateFiles: ipcUi.syncSourceUpdateFiles,
     isLikelySourceDir: ipcUi.isLikelySourceDir,
+    resolveUpdateSourceDir: ipcUi.resolveUpdateSourceDir,
+    AUTO_UPDATE_FILES: ipcUi.AUTO_UPDATE_FILES,
     // safety / shared
     resolveWorkspacePath,
     classifyCommandRequest,

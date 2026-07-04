@@ -82,6 +82,8 @@ function makeElectronMock(handlers = {}) {
               if (script.includes('revisePhoneCompanionPlan')) return { success: true, queued: true };
               if (script.includes('stopPhoneCompanionTask')) return { success: true, stopped: true };
               if (script.includes('resumePhoneCompanionTask')) return { success: true, queued: true };
+              if (script.includes('discoverPhoneCompanionSkills')) return handlers.skills || { skills: [{ name: 'demo-skill', description: 'demo' }], count: 1 };
+              if (script.includes('runPhoneCompanionSkill')) return handlers.skillRun || { success: true, outputs: { ok: true } };
               return { success: true };
             },
             send: () => {}
@@ -147,6 +149,37 @@ async function startMainWithConfig(port, config, handlers) {
 
 function closeServer(server) {
   return new Promise(resolve => server.close(resolve));
+}
+
+// Reads the first SSE frame from a streaming response, then destroys the socket (the connection
+// is otherwise held open indefinitely by the server's push interval).
+function requestFirstSseFrame(port, path, session) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      method: 'GET',
+      hostname: '127.0.0.1',
+      port,
+      path,
+      headers: session ? { Authorization: `Bearer ${session.secret}`, 'X-Orion-Device-Id': session.deviceId } : {}
+    }, (res) => {
+      let text = '';
+      res.on('data', chunk => {
+        text += chunk;
+        // Skip the initial ": connected" heartbeat comment and wait for a real data frame.
+        if (/^data: /m.test(text) && text.includes('\n\n')) {
+          req.destroy();
+          resolve({ statusCode: res.statusCode, headers: res.headers, text });
+        }
+      });
+      res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, text }));
+    });
+    req.on('error', (err) => {
+      // Destroying the socket to stop reading legitimately raises ECONNRESET/aborted here.
+      if (/ECONNRESET|aborted/i.test(err.message)) return;
+      reject(err);
+    });
+    req.end();
+  });
 }
 
 test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
@@ -269,7 +302,7 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
   const newTask = await request('POST', 1133, '/api/conversations/new', { prompt: 'new task', projectPath: 'C:\\Projects\\OrionTarget' }, session);
   t.equal(newTask.statusCode, 200, 'new task endpoint succeeds');
 
-  const prompt = await request('POST', 1133, '/api/prompt', { prompt: 'hello' }, session);
+  const prompt = await request('POST', 1133, '/api/prompt', { prompt: 'hello', projectPath: 'C:\\Projects\\OrionTarget' }, session);
   t.equal(prompt.statusCode, 200, 'prompt submission succeeds');
 
   const steer = await request('POST', 1133, '/api/steer', { prompt: 'focus here' }, session);
@@ -293,8 +326,73 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
 
   t.ok(!electron.calls.some(call => call.includes('switchPhoneCompanionConversation')), 'desktop bridge no longer switches global active conversation task');
   t.ok(electron.calls.some(call => call.includes('C:\\\\Projects\\\\OrionTarget')), 'new task endpoint forwards selected project path');
+  t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt') && call.includes('C:\\\\Projects\\\\OrionTarget')), 'prompt endpoint forwards selected project path');
   t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt')), 'desktop bridge submitted prompt');
   t.ok(electron.calls.some(call => call.includes('approvePhoneCompanionPlan')), 'desktop bridge approved plan');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion exposes the skill system to paired phones', async (t) => {
+  const { main, electron } = await startMainWithConfig(1144, {}, {
+    skills: { skills: [{ name: 'demo-skill', description: 'demo' }], count: 1 },
+    skillRun: { success: true, outputs: { message: 'done' } }
+  });
+  const pair = await request('POST', 1144, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
+  const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+
+  const unauthorized = await request('GET', 1144, '/api/skills');
+  t.equal(unauthorized.statusCode, 401, 'skills listing requires a paired session like other endpoints');
+
+  const list = await request('GET', 1144, '/api/skills', null, session);
+  t.equal(list.statusCode, 200, 'skills listing succeeds for a paired phone');
+  t.deepEqual(list.json.skills, [{ name: 'demo-skill', description: 'demo' }], 'skills listing forwards discovered skills');
+
+  const missingName = await request('POST', 1144, '/api/skills/run', {}, session);
+  t.equal(missingName.statusCode, 400, 'running a skill without a name is rejected');
+
+  const run = await request('POST', 1144, '/api/skills/run', { name: 'demo-skill', inputs: { x: 1 } }, session);
+  t.equal(run.statusCode, 200, 'running a named skill succeeds');
+  t.deepEqual(run.json.outputs, { message: 'done' }, 'skill run response forwards outputs');
+  t.ok(electron.calls.some(call => call.includes('runPhoneCompanionSkill') && call.includes('demo-skill')), 'desktop bridge received the skill run request');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion pushes state over SSE instead of only polling', async (t) => {
+  const { main } = await startMainWithConfig(1145);
+  try {
+    const pair = await request('POST', 1145, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
+    const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+
+    const unauthorized = await requestFirstSseFrame(1145, '/api/events');
+    t.equal(unauthorized.statusCode, 401, 'event stream requires a paired session');
+
+    const stream = await requestFirstSseFrame(1145, '/api/events', session);
+    t.equal(stream.statusCode, 200, 'event stream opens for a paired phone');
+    t.equal(stream.headers['content-type'], 'text/event-stream; charset=utf-8', 'event stream uses the SSE content type');
+    t.ok(stream.text.includes('data: '), 'event stream pushes a state frame without the phone polling');
+    const dataLine = stream.text.split('\n').find(line => line.startsWith('data: '));
+    const framePayload = JSON.parse(dataLine.slice('data: '.length));
+    t.equal(framePayload.success, true, 'pushed frame carries the same state shape as /api/state');
+  } finally {
+    await closeServer(main.getCompanionServer());
+  }
+});
+
+test('Phone Companion delete requires explicit UI confirmation flag', async (t) => {
+  const { main, electron } = await startMainWithConfig(1143);
+  const pair = await request('POST', 1143, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
+  const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+
+  const missingConfirm = await request('POST', 1143, '/api/conversations/delete', { conversationId: 'conv1' }, session);
+  t.equal(missingConfirm.statusCode, 400, 'delete without confirmation is rejected');
+  t.equal(missingConfirm.json.error, 'Delete confirmation required', 'rejection explains confirmation requirement');
+  t.notOk(electron.calls.some(call => call.includes('deletePhoneCompanionConversation')), 'desktop delete bridge is not called without confirmation');
+
+  const confirmed = await request('POST', 1143, '/api/conversations/delete', { conversationId: 'conv1', confirmed: true }, session);
+  t.equal(confirmed.statusCode, 200, 'confirmed delete succeeds');
+  t.ok(electron.calls.some(call => call.includes('deletePhoneCompanionConversation')), 'confirmed delete reaches desktop bridge');
 
   await closeServer(main.getCompanionServer());
 });

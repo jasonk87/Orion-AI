@@ -2,15 +2,21 @@ const test = require('tape');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const proxyquire = require('proxyquire');
 const safety = require('../safety');
 
 const mainJs = fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8');
 const rendererJs = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8');
 const indexHtml = fs.readFileSync(path.join(__dirname, '../index.html'), 'utf8');
+const preloadJs = fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8');
 const ipcWorkspaceJs = fs.readFileSync(path.join(__dirname, '../lib/ipc-workspace.js'), 'utf8');
 const ipcShellJs = fs.readFileSync(path.join(__dirname, '../lib/ipc-shell.js'), 'utf8');
+const companionHtmlJs = fs.readFileSync(path.join(__dirname, '../lib/companion-html.js'), 'utf8');
 const configJs = fs.readFileSync(path.join(__dirname, '../lib/config.js'), 'utf8');
 const packageJson = require('../package.json');
+const configModule = proxyquire('../lib/config', {
+  electron: { app: { getPath: () => path.join(os.tmpdir(), 'orion-config-test') } }
+});
 
 test('workspace containment rejects lexical and link escapes', (t) => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-safe-workspace-'));
@@ -62,6 +68,9 @@ test('destructive command guard catches audited variants', (t) => {
 test('renderer and package hardening are wired', (t) => {
   t.ok(rendererJs.includes('function sanitizeRenderedMarkdown(container)'), 'renderer sanitizes markdown links');
   t.ok(rendererJs.includes("!/^(https?:|mailto:|orion-file:)/i.test(href)"), 'renderer allowlists markdown protocols');
+  t.ok(companionHtmlJs.includes('function sanitizeMarkdownHref'), 'phone companion sanitizes markdown links');
+  t.ok(companionHtmlJs.includes('/^(https?:|mailto:|orion-file:)/i.test(value)'), 'phone companion allowlists markdown protocols');
+  t.ok(companionHtmlJs.includes('let html = escapeHtml(text).replace'), 'phone companion escapes inline markdown input before formatting');
   t.ok(rendererJs.includes("if (typeof Prism !== 'undefined') Prism.highlightAllUnder(bubble);"), 'renderer tolerates local Prism removal');
   t.notOk(indexHtml.includes('cdnjs.cloudflare.com'), 'desktop renderer no longer loads CDN scripts');
   t.ok(indexHtml.includes('node_modules/prismjs/prism.js'), 'desktop renderer loads local Prism');
@@ -76,10 +85,47 @@ test('renderer and package hardening are wired', (t) => {
 test('config failures and command retention safeguards are wired', (t) => {
   t.ok(configJs.includes("return path.join(base, 'config.json');"), 'config is stored under userData');
   t.ok(configJs.includes('throw e;'), 'config write failures propagate');
+  t.ok(configJs.includes('SECRET_CONFIG_FIELDS'), 'config protects saved credential fields');
+  t.ok(configJs.includes('DEFAULT_CONFIG_VALUES'), 'config restores safe companion defaults when fields are absent');
+  t.ok(configJs.includes("replace(/^\\uFEFF/, '')"), 'config reader tolerates UTF-8 BOMs');
+  t.ok(configJs.includes('mergeConfigWithSource'), 'config merges existing/source secrets before writing');
+  t.ok(mainJs.includes("path.join(app.getPath('userData'), 'conversations.json')"), 'conversation history is stored under userData');
+  t.ok(mainJs.includes("ipcMain.handle('read-conversations'"), 'main process exposes disk conversation reads');
+  t.ok(mainJs.includes("ipcMain.handle('write-conversations'"), 'main process exposes disk conversation writes');
+  t.ok(preloadJs.includes('readConversations'), 'preload exposes disk conversation reads');
+  t.ok(preloadJs.includes('writeConversations'), 'preload exposes disk conversation writes');
+  t.ok(rendererJs.includes('await loadConversationsFromStorage();'), 'startup waits for durable conversation load before selecting a chat');
+  t.ok(rendererJs.includes('mergeConversationSets(disk, local, backup)'), 'renderer merges disk and local conversation stores');
+  t.ok(rendererJs.includes('chooseRicherConversation'), 'renderer preserves richer copies of duplicated conversation records');
+  t.ok(rendererJs.includes('writeConversations({ revision, conversations: snapshot })'), 'conversation saves write to disk before relying on localStorage');
+  t.ok(rendererJs.includes('localStorage; disk persistence remains primary'), 'localStorage quota failures do not block durable history');
   t.ok(ipcShellJs.includes('const MAX_COMMAND_OUTPUT_CHARS = 200000;'), 'command output has a memory cap');
   t.ok(ipcShellJs.includes('const MAX_COMMAND_SESSIONS = 100;'), 'completed command sessions have a retention cap');
   t.ok(ipcShellJs.includes('pruneCommandSessions();'), 'completed sessions are pruned');
   t.ok(ipcShellJs.includes('resolveWindowsShellExecutable'), 'packaged command runner resolves Windows shell by absolute path');
   t.ok(ipcShellJs.includes("'System32', 'WindowsPowerShell'"), 'PowerShell resolver checks the Windows system path');
+  t.end();
+});
+
+test('config merge preserves saved credentials when incoming config has empty defaults', (t) => {
+  const merged = configModule.mergeConfigWithSource(
+    {
+      geminiApiKey: '',
+      googleSearchApiKey: '',
+      defaultModel: 'gemini-2.5-flash-lite',
+      planningMode: true
+    },
+    {
+      geminiApiKey: 'saved-gemini-key',
+      googleSearchApiKey: 'saved-search-key',
+      defaultModel: 'gemini-2.5-flash'
+    }
+  );
+
+  t.equal(merged.geminiApiKey, 'saved-gemini-key', 'Gemini key is preserved from existing/source config');
+  t.equal(merged.googleSearchApiKey, 'saved-search-key', 'Google Search key is preserved from existing/source config');
+  t.equal(merged.defaultModel, 'gemini-2.5-flash-lite', 'non-secret model selection is still allowed to change');
+  t.equal(merged.enablePhoneCompanion, true, 'phone companion stays enabled by default');
+  t.equal(merged.phoneCompanionPort, 5000, 'phone companion falls back to port 5000');
   t.end();
 });

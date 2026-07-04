@@ -42,9 +42,47 @@ test('chat scrolling only sticks when the user is already near the bottom', (t) 
 
 test('empty Thinking placeholders are not rendered as extra chat bubbles', (t) => {
   t.ok(rendererJs.includes('function isEmptyThinkingPlaceholder'), 'history replay can identify empty Thinking placeholders');
-  t.ok(rendererJs.includes('if (isEmptyThinkingPlaceholder(msg.text, msg.logs)) return;'), 'history replay skips empty Thinking placeholders');
+  t.ok(rendererJs.includes('if (isEmptyThinkingPlaceholder(replayMsg.text, replayLogs)) return;'), 'history replay skips empty Thinking placeholders after normalization');
   t.ok(rendererJs.includes('if (!activeAiBubble && isThinkingPlaceholder && !hasLogs)'), 'live rendering suppresses empty Thinking bubbles');
   t.ok(rendererJs.includes("const displayText = isThinkingPlaceholder ? ''"), 'Thinking placeholder text is hidden when logs/status are rendered');
+  t.end();
+});
+
+test('conversation reload normalizes stored assistant message shapes', (t) => {
+  t.ok(rendererJs.includes('function normalizeConversationMessageForReplay'), 'renderer normalizes stored messages before replay');
+  t.ok(rendererJs.includes("role === 'assistant' || role === 'model' || role === 'ai' || role === 'orion'"), 'model/AI/orion roles replay as assistant answers');
+  t.ok(rendererJs.includes('const directFields = [msg.text, msg.content, msg.output, msg.result, msg.message]'), 'replay reads assistant text from common stored fields');
+  t.ok(rendererJs.includes('const arrayFields = [msg.parts, msg.content]'), 'replay reads Gemini/OpenAI-style message parts');
+  t.ok(rendererJs.includes('renderAiMessage(replayMsg.text, replayLogs, activeConversationId, replayMsg)'), 'bulk reload renders normalized assistant text and metadata');
+  t.ok(rendererJs.includes("map(normalizeConversationMessageForReplay).find(msg => msg.role === 'assistant')"), 'phone preview finds normalized assistant messages');
+  t.ok(rendererJs.includes('function extractConversationMessageLogs'), 'replay rebuilds logs when old messages only stored turns');
+  t.ok(rendererJs.includes('turn.toolResponseParts'), 'replay reads saved tool responses from old turns');
+  t.ok(rendererJs.includes('responseLooksFailed'), 'replay preserves error status from saved tool responses');
+  t.ok(agentJs.includes('function persistCurrentAgentLogs'), 'agent has a single persistence helper for live logs');
+  t.ok(agentJs.includes('persistCurrentAgentLogs({ render: true });'), 'agent persists tool logs while rendering live activity');
+  t.ok(
+    /conversation\.messages\.push\(\{ role: 'assistant', text: 'Thinking\.\.\.', logs: \[\], turns: \[\], createdAt: Date\.now\(\) \}\);\s*if \(window\.saveConversationsToStorage\)/.test(agentJs),
+    'agent immediately persists the assistant placeholder so reloads keep the agent side coherent'
+  );
+  const loopStart = agentJs.indexOf('window.runAgentLoop = async function');
+  const placeholderIndex = agentJs.indexOf("conversation.messages.push({ role: 'assistant', text: 'Thinking...'", loopStart);
+  const routingIndex = agentJs.indexOf('if (isInternalPrompt)', loopStart);
+  t.ok(placeholderIndex > loopStart && placeholderIndex < routingIndex, 'assistant placeholder is saved before async routing/classification can fail');
+  t.end();
+});
+
+test('accepted prompts cannot leave one-sided user-only transcripts', (t) => {
+  t.ok(rendererJs.includes('function persistAssistantStatusMessage'), 'renderer has a shared persisted assistant-status helper');
+  t.ok(rendererJs.includes('window.persistAssistantStatusMessage = persistAssistantStatusMessage'), 'agent can persist assistant status through renderer');
+  t.ok(agentJs.includes('agent-start-blocked'), 'runAgentLoop persists an assistant-side status when another task is already running');
+  t.ok(rendererJs.includes('phone-queued-'), 'phone queued prompts persist an assistant-side queue status');
+  t.ok(rendererJs.includes('phone-start-error-'), 'phone run-start failures persist an assistant-side error status');
+  t.ok(rendererJs.includes('function buildMissingAssistantResponseMessage'), 'reload path can recover old user-only transcripts');
+  t.ok(rendererJs.includes('hasMeaningfulAssistantAfterUser'), 'reload recovery requires a meaningful assistant answer');
+  t.ok(rendererJs.includes('!isEmptyThinkingPlaceholder(msg.text, logs)'), 'stale Thinking placeholders do not count as assistant answers');
+  t.ok(rendererJs.includes('MISSING_ASSISTANT_RESPONSE_TEXT'), 'recovery message is explicit instead of blank');
+  t.ok(rendererJs.includes('messages.push(recoveredAssistantMessage)'), 'phone state returns the recovery bubble to mobile clients');
+  t.ok(rendererJs.includes('renderAiMessage(recoveredAssistantMessage.text'), 'desktop reload renders the same recovery bubble');
   t.end();
 });
 
@@ -101,7 +139,7 @@ test('plan approval button shows a persistent started state after it is pressed'
   // The plan bubble is marked so a reload can identify it without text guessing.
   t.ok(agentJs.includes('isPlanApprovalCard = true'), 'the plan-approval bubble is marked on the stored message');
   t.ok(rendererJs.includes('msgMeta'), 'renderAiMessage accepts the message object to identify the plan bubble');
-  t.ok(rendererJs.includes('renderAiMessage(msg.text, msg.logs, activeConversationId, msg)'), 'bulk reload threads the message object so the card persists');
+  t.ok(rendererJs.includes('renderAiMessage(replayMsg.text, replayLogs, activeConversationId, replayMsg)'), 'bulk reload threads the normalized message object so the card persists');
   // After approval the card renders a started state instead of disappearing.
   t.ok(rendererJs.includes('✓ Implementation Started'), 'approved plan renders a persistent "Implementation Started" control');
   t.ok(rendererJs.includes("plan-approval-actions approved"), 'approved card carries the started styling hook');
@@ -158,6 +196,12 @@ test('failure taxonomy classifies common failure modes', (t) => {
   }).category, 'test_failure', 'classifies failed regression tests');
 
   t.equal(agent.classifyAgentFailure({
+    toolName: 'change_workspace',
+    args: { path: 'C:\\Users\\Owner\\Desktop\\rocket Samoa' },
+    errorText: 'Workspace path "C:\\Users\\Owner\\Desktop\\rocket Samoa" is invalid or does not exist: Directory does not exist'
+  }).category, 'workspace_path_missing', 'classifies missing workspace paths as resolvable path problems');
+
+  t.equal(agent.classifyAgentFailure({
     toolName: 'run_command',
     errorText: 'npm: command not found'
   }).category, 'missing_dependency', 'classifies missing dependencies');
@@ -204,6 +248,101 @@ test('failure taxonomy classifies common failure modes', (t) => {
   t.end();
 });
 
+test('workspace path resolver tolerates dictated folder-name variants', (t) => {
+  t.equal(
+    agent.normalizeLocalPathNameForMatch('rocket sumo'),
+    agent.normalizeLocalPathNameForMatch('rocket-sumo'),
+    'spaces and hyphens normalize to the same folder key'
+  );
+  t.equal(
+    agent.chooseWorkspaceDirectoryVariant('rocket sumo', ['Axiom', 'Projects', 'rocket-sumo']),
+    'rocket-sumo',
+    'chooses the real hyphenated folder for a spaced dictated name'
+  );
+  t.equal(
+    agent.chooseWorkspaceDirectoryVariant('rocket Samoa', ['Axiom', 'Projects', 'rocket-sumo']),
+    'rocket-sumo',
+    'chooses the real folder for a minor autocorrect/dictation variant'
+  );
+  t.equal(
+    agent.chooseWorkspaceDirectoryVariant('rocket sumo', ['Axiom', 'Projects', 'rumi']),
+    null,
+    'does not invent a workspace when no plausible folder is present'
+  );
+  t.ok(agentJs.includes('listDirectoryChildren'), 'change_workspace uses a shallow directory lookup before falling back');
+  t.ok(agentJs.includes('fuzzyResolved'), 'change_workspace reports when a folder-name variant was resolved');
+  t.end();
+});
+
+test('workspace path resolver verifies a nearby real folder variant before failing', async (t) => {
+  const originalApi = global.window.api;
+  const realPath = 'C:\\Users\\Owner\\Desktop\\rocket-sumo';
+  global.window.api = {
+    listFiles: async (dirPath) => {
+      if (dirPath === realPath) return [];
+      return { error: `Directory does not exist: ${dirPath}` };
+    },
+    listDirectoryChildren: async (dirPath) => {
+      if (dirPath === 'C:\\Users\\Owner\\Desktop') {
+        return [
+          { name: 'Axiom', path: 'C:\\Users\\Owner\\Desktop\\Axiom', isDir: true },
+          { name: 'rocket-sumo', path: realPath, isDir: true }
+        ];
+      }
+      return [];
+    }
+  };
+  try {
+    const result = await agent.resolveWorkspacePathForChange('C:\\Users\\Owner\\Desktop\\rocket sumo');
+    t.equal(result.success, true, 'fuzzy workspace resolution succeeds');
+    t.equal(result.path, realPath, 'resolves to the real hyphenated folder path');
+    t.equal(result.fuzzyResolved, true, 'marks the result as a fuzzy recovery');
+    t.equal(result.resolvedFrom, 'C:\\Users\\Owner\\Desktop\\rocket sumo', 'preserves the original guessed path for logs');
+  } finally {
+    global.window.api = originalApi;
+  }
+  t.end();
+});
+
+test('workspace resolution carries evidence forward from later desktop listings', (t) => {
+  const conversation = {};
+  agent.rememberPendingWorkspaceResolution(
+    conversation,
+    'C:\\Users\\Owner\\Desktop\\rocket sumo',
+    'I have a folder on my desktop called rocket sumo. Read through it and give me suggestions.'
+  );
+  const desktopListing = [
+    '',
+    '    Directory: C:\\Users\\Owner\\Desktop',
+    '',
+    'Mode                 LastWriteTime         Length Name',
+    '----                 -------------         ------ ----',
+    'd-----          7/3/2026   4:42 AM                rocket-sumo',
+    'd-----         6/28/2026   4:41 PM                Projects'
+  ].join('\r\n');
+  const candidates = agent.extractDirectoryCandidatesFromCommandOutput(
+    desktopListing,
+    'Get-ChildItem -Path C:\\Users\\Owner\\Desktop -Directory -Depth 2 -ErrorAction SilentlyContinue'
+  );
+  t.ok(candidates.some(candidate => candidate.name === 'rocket-sumo'), 'extracts real folder names from PowerShell table output');
+  t.ok(candidates.some(candidate => candidate.path === 'C:\\Users\\Owner\\Desktop\\rocket-sumo'), 'infers full path from the command parent path');
+
+  const hint = agent.buildPendingWorkspaceResolutionHint({
+    toolName: 'run_command',
+    args: { command: 'Get-ChildItem -Path C:\\Users\\Owner\\Desktop -Directory -Depth 2 -ErrorAction SilentlyContinue' },
+    result: { exitCode: 0, stdout: desktopListing },
+    conversation
+  });
+  t.equal(hint.matchedPath, 'C:\\Users\\Owner\\Desktop\\rocket-sumo', 'connects later Desktop evidence to the previously failed workspace name');
+  const correction = agent.buildPendingWorkspaceResolutionCorrectionPrompt(
+    "I couldn't find a folder named rocket sumo. Could you verify the spelling?",
+    [{ toolName: 'run_command', status: 'done', localDirectoryResolution: hint }]
+  );
+  t.ok(correction.includes('Do not ask the user to verify the spelling again'), 'correction blocks the lost verify-spelling answer');
+  t.ok(correction.includes('change_workspace'), 'correction pushes the next concrete workspace action');
+  t.end();
+});
+
 test('local system fact failures do not become fake blockers or web research', (t) => {
   t.equal(agent.isLocalSystemFactRequest('how much memory does my computer have left?'), true, 'recognizes local memory query');
   t.equal(agent.isLocalSystemFactRequest('what do you think about my computer performance wise?'), true, 'recognizes local performance assessment query');
@@ -211,24 +350,205 @@ test('local system fact failures do not become fake blockers or web research', (
   t.equal(agent.isGenericNonAnswer('Understood.'), true, 'recognizes generic acknowledgement as a non-answer');
   t.equal(agent.requestNeedsLocalInspection('what do you think about my computer performance wise?'), true, 'performance assessment requires local inspection');
   t.equal(
+    agent.isLocalProjectOrFolderRequest('I have a folder on my desktop called rocket sumo, recommend similar games and improvements'),
+    true,
+    'local project recommendations require filesystem inspection before advice'
+  );
+  t.equal(
+    agent.requestNeedsLocalInspection('I have a folder on my desktop called rocket sumo, recommend similar games and improvements'),
+    true,
+    'local project recommendations are local inspection requests'
+  );
+  t.equal(
+    agent.isLocalAccessDeflection("I can only access file system locations that are explicitly provided to me or are within the defined workspace."),
+    true,
+    'recognizes false local-access disclaimers'
+  );
+  t.equal(
     agent.shouldHaveUsedToolsButDidNot('Understood.', [], 'what do you think about my computer performance wise?'),
     true,
     'generic acknowledgement cannot satisfy a local performance request without tools'
   );
-  t.equal(agent.requestNeedsActionableFinalAnswer('how do we improve Orion after this run?'), true, 'improvement questions require actionable final answers');
+  t.equal(
+    agent.shouldHaveUsedToolsButDidNot(
+      "I can only access file system locations that are explicitly provided to me or are within the defined workspace. Please provide the full path or describe the games.",
+      [],
+      'I have a folder on my desktop called rocket sumo, recommend similar games and improvements'
+    ),
+    true,
+    'local project recommendations cannot be answered with access disclaimers instead of tools'
+  );
+  const localFolderGuidance = agent.buildLocalInspectionNoToolGuidance('I have a folder on my desktop called rocket sumo, recommend similar games and improvements');
+  t.ok(
+    localFolderGuidance.includes('Get-ChildItem') && localFolderGuidance.includes('change_workspace'),
+    'local project no-tool recovery tells Orion to locate the folder then change workspace'
+  );
+  t.ok(
+    localFolderGuidance.indexOf('Get-ChildItem') < localFolderGuidance.indexOf('change_workspace'),
+    'local project recovery searches before changing workspace when the path is unverified'
+  );
+  t.ok(
+    localFolderGuidance.includes('verified real path'),
+    'local project recovery requires a verified path before workspace change'
+  );
+  t.ok(agentJs.includes('LOCAL PROJECTS BEFORE CLARIFICATION'), 'system prompt requires project inspection before clarification');
+  t.ok(agentJs.includes('TOP-LEVEL FOLDER LISTS'), 'system prompt distinguishes top-level listings from recursive searches');
+  t.ok(agentJs.includes('EVIDENCE CONTINUITY'), 'system prompt tells Orion to connect later filesystem evidence to prior path failures');
+  t.ok(agentJs.includes('do not add -Depth/-Recurse unless nested folders are explicitly requested') || agentJs.includes('Do not add -Depth or -Recurse for a top-level list request'), 'run_command contract blocks recursive top-level folder dumps');
+  t.ok(agentJs.includes('Do not use this as a substitute for inspecting an existing local folder/project/program'), 'clarifying tool contract blocks premature clarification');
+  t.equal(
+    agent.shouldHaveUsedToolsButDidNot('I do not know your name yet.', [], 'do you know my name?'),
+    false,
+    'identity behavior is taught through the memory prompt contract, not a keyword recovery gate'
+  );
+  t.equal(
+    agent.shouldHaveUsedToolsButDidNot(
+      "Okay, I can help with that. Please tell me which program or files you'd like me to inspect.",
+      [],
+      "Let's look through this program and see if we can find any bugs, structural errors or typos",
+      { reviewOnly: true }
+    ),
+    true,
+    'review-only workspace inspections cannot ask the user which files instead of using tools'
+  );
+  t.equal(
+    agent.shouldHaveUsedToolsButDidNot(
+      'I found one issue after reading files.',
+      [{ toolName: 'read_file', label: 'Read agent.js', status: 'done' }],
+      "Let's look through this program and see if we can find any bugs",
+      { reviewOnly: true }
+    ),
+    false,
+    'review-only answers with inspection evidence can proceed'
+  );
+  t.ok(agentJs.includes('Call `list_files` now'), 'review-only no-tool recovery explicitly sends Orion to list files');
+  t.ok(agentJs.includes('Do not ask the user which files or program to inspect'), 'review-only recovery blocks the screenshot deflection');
+  t.ok(agentJs.includes('Own being Orion'), 'system prompt tells Orion to own its identity');
+  t.ok(agentJs.includes("I don't have your name saved yet"), 'system prompt gives a natural unknown-name response');
+  t.ok(agentJs.includes('MEMORY REASONING CONTRACT'), 'system prompt defines durable memory behavior');
+  t.ok(agentJs.includes('MEMORY EXAMPLES'), 'system prompt teaches memory behavior through examples');
+  t.ok(agentJs.includes('Orion should call remember_fact with global scope'), 'memory examples teach fact persistence without code keywords');
+  t.ok(agentJs.includes('Orion should use active chat context or recall_memory'), 'memory examples teach recall without code keyword gates');
+  t.notOk(agentJs.includes('function extractUserNameDisclosure'), 'identity name regex helper is removed');
+  t.notOk(agentJs.includes('function isUserIdentityQuestion'), 'identity question keyword helper is removed');
+  t.notOk(agentJs.includes('function buildMemoryRecallPrompt'), 'identity-specific recovery prompt helper is removed');
+  t.notOk(agentJs.includes('workspaceKeywords'), 'no-tool recovery no longer uses a workspace keyword list');
+  t.equal(agent.requestNeedsActionableFinalAnswer('how do we improve Orion after this run?'), false, 'final answer quality no longer depends on prompt keyword routing');
+  t.equal(
+    agent.requestNeedsActionableFinalAnswer('can you give me some ideas for how to make this program better, more professional, more cutting edge, etc?'),
+    false,
+    'idea/professional/cutting-edge prompts are not special-cased by keyword'
+  );
   t.equal(agent.answerHasActionableFinalContent('Ah! The path is C:\\Projects\\OrionAI.'), false, 'half-thought path discovery is not an actionable answer');
   t.ok(
     agent.buildFinalAnswerQualityGatePrompt(
-      'how do we improve Orion after this run?',
+      'tell me about this workspace',
       'Ah! The path is C:\\Projects\\OrionAI.',
       [{ toolName: 'read_file', label: 'Read agent.js', status: 'done' }]
     ).includes('inspection alone is not completion'),
-    'final quality gate rejects inspection-only non-answers'
+    'final quality gate rejects inspection-only non-answers after tool use'
+  );
+  t.ok(
+    agent.buildFinalAnswerQualityGatePrompt(
+      'any prompt text',
+      '',
+      [{ toolName: 'list_files', label: 'Listed workspace files', status: 'done' }]
+    ).includes('inventory-level evidence'),
+    'final quality gate rejects empty answer after list_files without prompt keywords'
   );
   t.equal(
-    agent.answerHasActionableFinalContent('I reviewed the project. The best improvements are:\n1. Fix task-state resume.\n2. Add regression tests around agent failures.'),
+    agent.hasOnlyInventoryEvidence([{ toolName: 'list_files', label: 'Listed workspace files', status: 'done' }]),
     true,
-    'concrete recommendations satisfy the final quality gate'
+    'list_files alone is only inventory-level evidence'
+  );
+  const rocketDirectorySearch = {
+    toolName: 'run_command',
+    kind: 'command',
+    command: 'Get-ChildItem -Path "C:\\Users\\Owner\\Desktop" -Filter "*rocket*" -Directory -Depth 3 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName',
+    label: 'Ran directory search',
+    status: 'done'
+  };
+  t.equal(agent.isInventoryOnlyCommand(rocketDirectorySearch.command), true, 'bounded directory search is inventory-only evidence');
+  t.equal(
+    agent.hasOnlyInventoryEvidence([
+      rocketDirectorySearch,
+      { toolName: 'change_workspace', label: 'Used `change_workspace`', status: 'done' },
+      { toolName: 'list_files', label: 'Listed workspace files', status: 'done' }
+    ]),
+    true,
+    'path resolution plus list_files is still inventory-only without reading source files'
+  );
+  t.equal(
+    agent.hasDeepInspectionEvidence([
+      rocketDirectorySearch,
+      { toolName: 'list_files', label: 'Listed workspace files', status: 'done' }
+    ]),
+    false,
+    'directory discovery commands do not count as reading through a program'
+  );
+  t.ok(
+    agent.buildFinalAnswerQualityGatePrompt(
+      'Read through the program and tell me what you think about it. Where do we go from here?',
+      'It appears to be a Node.js web application based on package.json, server.js, and public/index.html.',
+      [
+        rocketDirectorySearch,
+        { toolName: 'change_workspace', label: 'Used `change_workspace`', status: 'done' },
+        { toolName: 'list_files', label: 'Listed workspace files', status: 'done' }
+      ]
+    ).includes('File names alone are not enough'),
+    'read-through-program requests cannot be answered from path search and filenames only'
+  );
+  t.ok(agentJs.includes('Active conversation workspace (resolved):'), 'run prompt surfaces the resolved conversation workspace');
+  t.ok(agentJs.includes('Do not re-run change_workspace for an older dictated/autocorrected folder phrase'), 'run prompt prevents repeated guessed workspace changes after resolution');
+  t.ok(
+    agent.buildFinalAnswerQualityGatePrompt(
+      'any prompt text',
+      'Based on the file structure, here are some ideas: add multimodal support, improve memory, add plugins, and polish the UI.',
+      [{ toolName: 'list_files', label: 'Listed workspace files', status: 'done' }]
+    ).includes('File names alone are not enough'),
+    'final quality gate rejects broad analysis from file inventory alone'
+  );
+  t.equal(
+    agent.hasDeepInspectionEvidence([{ toolName: 'read_file', label: 'Read agent.js', status: 'done' }]),
+    true,
+    'read_file counts as deeper inspection evidence'
+  );
+  const oneFileReview = [
+    { toolName: 'list_files', label: 'Listed workspace files', status: 'done' },
+    { toolName: 'read_file', label: 'Read `ai_assistant/communication/cli.py`', status: 'done' }
+  ];
+  t.ok(
+    agent.buildReviewOnlyCompletionGatePrompt(
+      'Can you go through this program and find any bugs, errors or structural problems',
+      'The file `ai_assistant/communication/cli.py` appears to be the main CLI. Potential areas for bugs include command parsing and TUI state. Would you like me to try running commands?',
+      oneFileReview
+    ).includes('not inspected enough'),
+    'review-only gate rejects one-file generic potential-areas reviews'
+  );
+  const broadReview = [
+    { toolName: 'list_files', label: 'Listed workspace files', status: 'done' },
+    { toolName: 'read_file', label: 'Read `ai_assistant/communication/cli.py`', status: 'done' },
+    { toolName: 'read_file', label: 'Read `ai_assistant/core/orchestrator.py`', status: 'done' },
+    { toolName: 'read_file', label: 'Read `pyproject.toml`', status: 'done' }
+  ];
+  t.equal(
+    agent.buildReviewOnlyCompletionGatePrompt(
+      'Can you go through this program and find any bugs, errors or structural problems',
+      'Findings:\n- Major issue in `ai_assistant/communication/cli.py:42`: the command parser splits on whitespace, so paths with spaces are misparsed. Impact: project paths can fail in normal Windows usage.\n- No specific issues found in `pyproject.toml` after checking dependency declarations.',
+      broadReview
+    ),
+    '',
+    'review-only gate accepts broad grounded findings'
+  );
+  t.equal(
+    agent.answerHasGroundedReviewReport('I reviewed `app.py:10` and found one issue. Would you like me to continue inspecting?'),
+    false,
+    'grounded review report cannot ask permission to continue instead of finishing'
+  );
+  t.equal(
+    agent.answerHasActionableFinalContent('I reviewed the project structure and found that the agent loop can gather context without producing a useful final response. The next step is to continue from the gathered files, read the core source modules, and give the user a grounded answer instead of stopping at file inventory. This is a substantive response with enough detail to stand on its own.'),
+    true,
+    'substantive answers satisfy the final quality gate without action keywords'
   );
 
   const failedCommand = {
@@ -286,10 +606,36 @@ test('task routing is decided by the model classifier, not keyword regex', (t) =
   t.end();
 });
 
+test('project conversations provide project path as the agent workspace', (t) => {
+  global.window.getCurrentWorkspace = () => 'C:\\Desktop\\Fallback';
+  t.equal(
+    agent.resolveConversationWorkspace({ workspace: '', projectPath: 'C:\\Projects\\OrionTarget' }),
+    'C:\\Projects\\OrionTarget',
+    'projectPath is a first-class workspace fallback'
+  );
+  t.equal(
+    agent.resolveConversationWorkspace({ workspace: 'C:\\Projects\\Explicit', projectPath: 'C:\\Projects\\OrionTarget' }),
+    'C:\\Projects\\Explicit',
+    'explicit workspace still wins'
+  );
+  t.equal(
+    agent.resolveConversationWorkspace({}),
+    'C:\\Desktop\\Fallback',
+    'desktop workspace is only the final fallback'
+  );
+  t.end();
+});
+
 test('failure taxonomy produces specific recovery guidance', (t) => {
   const patchGuidance = agent.buildFailureRecoveryGuidance({ category: 'patch_target_missing' });
   t.ok(patchGuidance.includes('Re-read the surrounding file lines'), 'patch guidance asks to inspect current file context');
   t.ok(patchGuidance.includes('line-range patch'), 'patch guidance suggests a narrower edit strategy');
+
+  const workspaceGuidance = agent.buildFailureRecoveryGuidance({ category: 'workspace_path_missing' });
+  t.ok(workspaceGuidance.includes('Do not call change_workspace again with another guessed path'), 'workspace guidance blocks blind retry');
+  t.ok(workspaceGuidance.includes('Get-ChildItem'), 'workspace guidance requires local directory search');
+  t.ok(workspaceGuidance.includes('C:\\Users\\Owner\\Desktop'), 'workspace guidance searches Desktop');
+  t.ok(workspaceGuidance.includes('-Depth 2 or -Depth 3'), 'workspace guidance keeps filesystem search bounded');
 
   const commandGuidance = agent.buildFailureRecoveryGuidance({ category: 'command_blocked' });
   t.ok(commandGuidance.includes('blocked by safety or planning rules'), 'blocked command guidance preserves safety posture');
@@ -309,6 +655,8 @@ test('failure taxonomy produces specific recovery guidance', (t) => {
   const noToolGuidance = agent.buildFailureRecoveryGuidance({ category: 'model_no_tool_use' });
   t.ok(noToolGuidance.includes('no tools were called'), 'model no-tool-use guidance explains the failure');
   t.ok(noToolGuidance.includes('call the appropriate tools now'), 'model no-tool-use guidance prompts concrete action');
+  t.ok(noToolGuidance.includes('do not mention tools'), 'model no-tool-use guidance prevents meta tool narration');
+  t.notOk(noToolGuidance.includes('answer explicitly that no workspace action was needed'), 'model no-tool-use guidance no longer asks for meta no-tool answers');
 
   const repeatedGuidance = agent.buildFailureRecoveryGuidance({ category: 'repeated_tool_failure' });
   t.ok(repeatedGuidance.includes('Do not quit the task'), 'repeated guidance preserves adaptive recovery');
@@ -346,6 +694,14 @@ test('model API calls cannot sit indefinitely without visible cooldown status', 
   t.ok(agentJs.includes('MODEL_API_REQUEST_TIMEOUT_MS = 60000'), 'model API requests have a hard timeout');
   t.ok(agentJs.includes('MODEL_API_MAX_ATTEMPTS = 15'), 'Gemini retry attempts support long-running tasks');
   t.ok(agentJs.includes('fetchWithTimeout(url'), 'Gemini generateContent uses timeout-aware fetch');
+  t.ok(agentJs.includes('activeRunController = new AbortController()'), 'each agent run owns a cancellation controller');
+  t.ok(agentJs.includes("window.stopAgentExecution = (options = {})"), 'stop API accepts cancellation options');
+  t.ok(agentJs.includes("requestAgentStop({ mode: options.mode || 'hard' })"), 'default stop path is hard cancellation');
+  t.ok(agentJs.includes('window.softStopAgentExecution'), 'soft stop is available for graceful stop-before-next-turn behavior');
+  t.ok(agentJs.includes('activeRunController.abort()'), 'hard stop aborts the active model request controller');
+  t.ok(agentJs.includes('signal: getActiveRunSignal()'), 'model calls receive the active run cancellation signal');
+  t.ok(agentJs.includes('sleepRespectingStop(modelCallDelayMs)'), 'model-call delay can be cancelled by stop');
+  t.ok(agentJs.includes('Task stopped by user after the current tool call.'), 'soft stop after a tool call is persisted explicitly');
   t.ok(agentJs.includes('sleepWithModelApiStatus'), 'retry backoff is routed through status-aware sleep');
   t.ok(agentJs.includes('isStopRequested'), 'retry wait can react to user stop');
   t.ok(agentJs.includes('agentSubStatus = warningMsg'), 'provider cooldown warnings update visible substatus');
@@ -439,6 +795,30 @@ Responded to the user with the system memory information.] Your computer has app
   t.equal((final.match(/## Work Walkthrough/g) || []).length, 1, 'only one Work Walkthrough is appended');
   t.notOk(final.includes('[SYSTEM:'), 'system scaffold is not shown to the user');
   t.notOk(final.includes('## Final Pre-Submit Summary'), 'read-only command answers skip heavy pre-submit summary');
+  t.end();
+});
+
+test('list_files curated inventory hides noisy and sensitive workspace paths by default', (t) => {
+  const inventory = agent.buildCuratedFileInventory([
+    { path: 'agent.js', isDir: false, size: 10 },
+    { path: 'lib/shared.js', isDir: false, size: 10 },
+    { path: '.env', isDir: false, size: 20 },
+    { path: '.env.example', isDir: false, size: 20 },
+    { path: '.orion/backups/agent.js.bak', isDir: false, size: 10 },
+    { path: 'instance/users.json', isDir: false, size: 20 },
+    { path: 'src/__pycache__/main.cpython-313.pyc', isDir: false, size: 10 },
+    { path: 'node_modules/pkg/index.js', isDir: false, size: 10 },
+    { path: 'secrets/token.json', isDir: false, size: 20 }
+  ]);
+
+  const returnedPaths = inventory.files.map(file => file.path);
+  t.deepEqual(returnedPaths, ['agent.js', 'lib/shared.js', '.env.example'], 'default inventory keeps source files and safe examples only');
+  t.equal(inventory.mode, 'project', 'default mode is project inventory');
+  t.equal(inventory.totals.hidden, 6, 'hidden count includes runtime, cache, dependency, and sensitive paths');
+  t.ok(inventory.omitted.some(item => item.path === '.orion'), 'collapses Orion runtime metadata');
+  t.ok(inventory.omitted.some(item => item.path === 'instance'), 'collapses instance/user data');
+  t.ok(inventory.omitted.some(item => item.path === '.env'), 'omits actual env files');
+  t.ok(inventory.warning.includes('mode="all"'), 'warning points to explicit raw listing escape hatch');
   t.end();
 });
 

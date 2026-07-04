@@ -20,13 +20,20 @@ global.fetch = async (url, options) => {
   }
 
   if (text.includes("Classify whether this Orion AI request should require an implementation plan")) {
-    if (text.includes('"run tests"')) {
+    const userMessage = text.slice(text.lastIndexOf('User message:') + 'User message:'.length).trim();
+    if (userMessage === '"run tests"') {
       return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":""}' }] } }] }) };
     }
-    if (text.includes('"what all python environments do i have installed on this computer"')) {
+    if (userMessage === '"what all python environments do i have installed on this computer"') {
       return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"Read-only local environment inventory."}' }] } }] }) };
     }
-    if (text.includes('"explain"')) {
+    if (userMessage === '"I have a folder on my desktop called rocket sumo, recommend similar games and improvements"') {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"Read existing local project before recommending."}' }] } }] }) };
+    }
+    if (userMessage === '"look through my program and find any bugs"') {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reviewOnly":true,"reason":"Read-only code review."}' }] } }] }) };
+    }
+    if (userMessage === '"explain"') {
       return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"answer","reason":""}' }] } }] }) };
     }
     return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"plan","reason":""}' }] } }] }) };
@@ -85,12 +92,39 @@ test('classifyPlanningNeed returns correct modes', async (t) => {
   const envRes = await agent.classifyPlanningNeed('what all python environments do i have installed on this computer', 'gemini-1', 'key');
   t.equal(envRes.mode, 'direct', 'Recognizes local Python environment inventory as direct mode');
 
+  const localProjectAdviceRes = await agent.classifyPlanningNeed('I have a folder on my desktop called rocket sumo, recommend similar games and improvements', 'gemini-1', 'key');
+  t.equal(localProjectAdviceRes.mode, 'direct', 'Recognizes local project recommendation as direct inspection mode');
+
   const planRes = await agent.classifyPlanningNeed('build a whole app', 'gemini-1', 'key');
   t.equal(planRes.mode, 'plan', 'Recognizes plan mode');
+
+  const reviewRes = await agent.classifyPlanningNeed('look through my program and find any bugs', 'gemini-1', 'key');
+  t.equal(reviewRes.mode, 'direct', 'Recognizes read-only bug hunts as direct mode');
+  t.equal(reviewRes.reviewOnly, true, 'Carries review-only flag for bug hunts');
 
   const answerRes = await agent.classifyPlanningNeed('explain', 'gemini-1', 'key');
   t.equal(answerRes.mode, 'answer', 'Recognizes answer mode');
 
+  t.end();
+});
+
+test('review-only gate allows strategy but blocks implementation artifacts and edits', (t) => {
+  const readGate = agent.getReviewOnlyToolGate('read_file', { path: 'agent.js' });
+  t.equal(readGate.allowed, true, 'allows file reading during review');
+
+  const strategyGate = agent.getReviewOnlyToolGate('write_file', { path: 'STRATEGY.md' });
+  t.equal(strategyGate.allowed, true, 'allows STRATEGY.md as review strategy');
+
+  const planGate = agent.getReviewOnlyToolGate('write_file', { path: 'implementation_plan.md' });
+  t.equal(planGate.allowed, false, 'blocks implementation_plan.md during review-only tasks');
+  t.ok(planGate.reason.includes('Review-only task'), 'blocked plan explains review-only mode');
+
+  const editGate = agent.getReviewOnlyToolGate('patch_file', { path: 'src/app.js' });
+  t.equal(editGate.allowed, false, 'blocks source edits during review-only tasks');
+
+  const source = require('fs').readFileSync(require('path').join(__dirname, '../agent.js'), 'utf8');
+  t.ok(source.includes("if (reviewOnly && planningDecision.mode === 'plan')"), 'runtime forces plan-classified reviews back to direct mode');
+  t.ok(source.includes('!reviewOnly && planningDecision.mode === \'plan\''), 'fallback approval gate ignores review-only tasks');
   t.end();
 });
 
