@@ -88,6 +88,33 @@ test('Windows command shell selection does not require PowerShell for plain comm
   t.end();
 });
 
+// Regression: cmd.exe does not treat `;` as a statement separator — `set PYTHONPATH=%PYTHONPATH%;.
+// ; python foo.py` gets swallowed whole into the `set` command's value under cmd.exe, so `python
+// foo.py` never runs at all, and cmd.exe reports this as a silent success (exit 0, empty output)
+// with no indication anything went wrong. A transcript showed Orion run exactly this command twice
+// and move on as if it had worked. Unquoted `;` must route to PowerShell instead, where it either
+// executes as intended or fails with a real, diagnosable parse error.
+test('commands with a real unquoted semicolon route to PowerShell instead of silently no-opping under cmd.exe', (t) => {
+  if (process.platform !== 'win32') {
+    t.pass('Windows-only shell selection skipped on non-Windows');
+    t.end();
+    return;
+  }
+
+  t.equal(main.hasUnquotedSemicolon('echo first; echo second'), true, 'a bare semicolon between statements is detected');
+  t.equal(main.hasUnquotedSemicolon('set PYTHONPATH=%PYTHONPATH%;. ; python foo.py'), true, 'the exact command from the transcript is detected');
+  t.equal(main.hasUnquotedSemicolon(`python -c "from x import y; print(y('literal'))"`), false, 'a semicolon inside a double-quoted argument is not a statement separator');
+  t.equal(main.hasUnquotedSemicolon(`echo 'a;b'`), false, 'a semicolon inside a single-quoted argument is not a statement separator');
+  t.equal(main.hasUnquotedSemicolon('echo hello'), false, 'a command with no semicolon at all is unaffected');
+
+  const chained = main.getCommandShellSpec('set PYTHONPATH=%PYTHONPATH%;. ; python foo.py');
+  t.ok(chained.executable.toLowerCase().endsWith('powershell.exe'), 'a semicolon-chained command now routes to PowerShell instead of cmd.exe');
+
+  const pythonDashC = main.getCommandShellSpec(`python -c "from x import y; print(y('literal'))"`);
+  t.ok(pythonDashC.executable.toLowerCase().endsWith('cmd.exe'), 'a quoted semicolon inside python -c still stays on cmd.exe, unaffected by this change');
+  t.end();
+});
+
 test('conversation command matching handles raw and normalized process ids', (t) => {
   const conversationId = 'conv-123-abc';
   t.equal(main.normalizeConversationIdForCommandSession(conversationId), 'conv_123_abc', 'normalizes conversation id for command sessions');
