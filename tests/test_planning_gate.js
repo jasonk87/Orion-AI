@@ -1046,6 +1046,25 @@ test('a real detected regression stops the run with a specific message, not a ge
   t.end();
 });
 
+// Regression: `npx jest --init` failed with stderr that already named the exact fix ("Option
+// \"init\" has been deprecated. Please use \"create-jest\" package..."), but Orion still burned
+// two web searches re-discovering that same replacement command instead of just running it. The
+// answer was already in the tool output it had just received.
+test('a CLI error that names its own replacement command is classified so Orion runs it instead of researching it', (t) => {
+  const errorText = 'Command exited with code 1. stderr:  init:\n\n  Option "init" has been deprecated. Please use "create-jest" package as shown in the documentation: https://jestjs.io/docs/getting-started\n';
+  const failure = agent.classifyAgentFailure({ toolName: 'run_command', args: { command: 'npx jest --init' }, errorText });
+  t.equal(failure.category, 'deprecated_command_with_replacement', 'the deprecation + named replacement is recognized as its own category');
+  t.equal(failure.replacementHint, 'create-jest', 'the exact replacement command is extracted from the error text');
+
+  const guidance = agent.buildFailureRecoveryGuidance(failure);
+  t.ok(guidance.includes('create-jest'), 'the recovery guidance names the replacement command directly');
+  t.ok(/do not search the web/i.test(guidance), 'the guidance explicitly discourages re-researching information already in the tool output');
+
+  const genericFailure = agent.classifyAgentFailure({ toolName: 'run_command', args: { command: 'npm run build' }, errorText: 'Command exited with code 1. stderr: some unrelated build error' });
+  t.notEqual(genericFailure.category, 'deprecated_command_with_replacement', 'an unrelated failure is not misclassified as a deprecation hint');
+  t.end();
+});
+
 // Regression: a real transcript showed Orion break src/game/buildings/Barracks.js with a syntax
 // error, then move on and ALSO break ArcheryRange.js and Spearman.js instead of going back to fix
 // Barracks.js first — three broken files accumulated because the finish-time

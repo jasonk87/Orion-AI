@@ -4800,15 +4800,29 @@ function buildEpistemicCorrectionPrompt({ userPrompt, answerText, toolEvidenceLe
   return `[SYSTEM: Self-correction required. The user asked for a local machine fact. Your previous answer appears to turn failed tool attempts into a world-state conclusion.\n\nFailed tool attempts are evidence about the tool path, not proof that the user's objective is blocked or that Google is needed.\n\nRecent failed evidence:\n${failures}\n\nCorrect your reasoning. Do not use web search for local machine facts. Do not record a blocker unless there is evidence the objective itself is impossible. Try another local inspection route if available; otherwise answer honestly that the local command runner/attempts failed and name what proof is missing.]`;
 }
 
+// A CLI's own error output sometimes names the exact fix (e.g. "Option \"init\" has been
+// deprecated. Please use \"create-jest\" package"). A run showed Orion burning two web searches
+// re-discovering that same replacement command instead of just running it — the answer was
+// already in the tool output it had just received.
+function extractDeprecationReplacementHint(errorText) {
+  const text = String(errorText || '');
+  const match = text.match(/deprecated[^.]*\.?\s*(?:please\s+)?use\s+["'`]?([a-z0-9@/_.\-]+)["'`]?\s*(?:package|command|instead)?/i)
+    || text.match(/use\s+["'`]?([a-z0-9@/_.\-]+)["'`]?\s+instead/i);
+  return match ? match[1] : '';
+}
+
 function classifyAgentFailure({ toolName = '', args = {}, result = null, errorText = '', failureCount = 1, category = '' } = {}) {
   if (category) return { category, recommendedNature: recommendedNatureForFailureCategory(category), toolName, args, errorText: String(errorText || ''), failureCount };
 
   const text = String(errorText || '').toLowerCase();
   const command = String((args && args.command) || '');
+  const replacementHint = extractDeprecationReplacementHint(errorText);
 
   let resolved = 'tool_failure';
   if (failureCount >= 3) {
     resolved = 'repeated_tool_failure';
+  } else if (replacementHint && /deprecated/.test(text)) {
+    resolved = 'deprecated_command_with_replacement';
   } else if (toolName === 'patch_file' && /target content block not found|target.*not found|line range|patch.*failed/.test(text)) {
     resolved = 'patch_target_missing';
   } else if (toolName === 'change_workspace' && /workspace path|invalid or does not exist|directory does not exist|path does not exist|does not exist/.test(text)) {
@@ -4827,7 +4841,7 @@ function classifyAgentFailure({ toolName = '', args = {}, result = null, errorTe
     resolved = 'interactive_command_needs_input';
   }
 
-  return { category: resolved, recommendedNature: recommendedNatureForFailureCategory(resolved), toolName, args, errorText: String(errorText || ''), failureCount };
+  return { category: resolved, recommendedNature: recommendedNatureForFailureCategory(resolved), toolName, args, errorText: String(errorText || ''), failureCount, replacementHint };
 }
 
 function recommendedNatureForFailureCategory(category) {
@@ -4838,6 +4852,7 @@ function recommendedNatureForFailureCategory(category) {
     missing_dependency: 'fixable',
     workspace_path_missing: 'fixable',
     patch_target_missing: 'fixable',
+    deprecated_command_with_replacement: 'fixable',
     test_failure: 'fixable',
     interactive_command_needs_input: 'fixable',
     repeated_tool_failure: 'fixable',
@@ -4849,6 +4864,9 @@ function recommendedNatureForFailureCategory(category) {
 
 function buildFailureRecoveryGuidance(failure) {
   const category = failure && failure.category ? failure.category : 'tool_failure';
+  if (category === 'deprecated_command_with_replacement' && failure && failure.replacementHint) {
+    return `The command's own output already named the fix: it says to use \`${failure.replacementHint}\`. Run that directly. Do not search the web for documentation that repeats information already in the tool output you just received.`;
+  }
   const messages = {
     repeated_tool_failure: 'Do not quit the task. Do not retry it blindly. Pause the repeated call, inspect fresh state and recent output, explain the likely cause, then choose a different strategy before retrying: use a different tool, narrower arguments, or ask for the missing prerequisite.',
     patch_target_missing: 'Re-read the surrounding file lines before editing. Use a narrower exact target, a line-range patch, or adjust the patch to the current file contents instead of repeating the same patch.',
