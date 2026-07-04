@@ -195,11 +195,48 @@ test('Planning Gate behavior requires STRATEGY.md before implementation_plan.md'
 test('STRATEGY.md validation requires all refinement sections', (t) => {
   const content = validStrategy();
   t.equal(agent.hasRequiredStrategySections(content), true, 'valid strategy contains all required sections');
-  const missing = content.replace(/## Relevant Files[\s\S]*?(?=\n\n## )/, '');
+  // Required-section matching is keyword-based (a model that writes "Leveraging Existing
+  // Architecture" instead of the literal "Relevant Files" heading still satisfies the
+  // requirement), so the fixture's near-duplicate "Relevant Files / Subsystems" heading must also
+  // be removed here to genuinely test the "no heading covers this concept at all" case.
+  const missing = content
+    .replace(/## Relevant Files[\s\S]*?(?=\n\n## )/, '')
+    .replace(/## Relevant Files \/ Subsystems[\s\S]*?(?=\n\n## )/, '');
   t.equal(agent.hasRequiredStrategySections(missing), false, 'missing required section is invalid');
   const validation = agent.validateStrategyContent(missing);
   t.equal(validation.valid, false, 'validation rejects incomplete strategy');
   t.ok(validation.missingSections.includes('Relevant Files'), 'validation reports missing section');
+  t.end();
+});
+
+// Regression: a real STRATEGY.md used reasonable-but-different headings than the exact literal
+// phrases models are instructed to use ("Core Concept" instead of "Objective", "Scope Management"
+// instead of "Ambiguity Resolution", etc.). Requiring an exact phrase match caused this real,
+// otherwise-complete strategy doc to silently fail validation, which meant Mission Control never
+// got populated with no indication why. Section matching must tolerate this kind of variation.
+test('STRATEGY.md validation accepts equivalent headings, not just the exact literal phrase', (t) => {
+  const realWorldPhrasing = `# Strategy: Army and Defense System
+
+## Core Concept
+
+Add a military and defense system to the game.
+
+## Leveraging Existing Architecture
+
+Reuse the Worker class state machine and Bodyguard AI.
+
+## Player Control & UI
+
+Command interface for selecting and directing units.
+
+## Scope Management
+
+Focused on defensive play; invasions are a stretch goal.
+`;
+  t.equal(agent.hasRequiredStrategySections(realWorldPhrasing), true, 'accepts differently-worded headings that cover the same required concepts');
+  const validation = agent.validateStrategyContent(realWorldPhrasing);
+  t.equal(validation.valid, true, 'validateStrategyContent agrees this strategy is valid');
+  t.equal(validation.missingSections.length, 0, 'no sections are reported missing');
   t.end();
 });
 

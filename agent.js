@@ -3399,16 +3399,36 @@ function normalizeHeadingText(value) {
   return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 }
 
+// A model told to use an exact heading like "Ambiguity Resolution" will often instead write a
+// heading that covers the same concept in its own words (e.g. "Scope Management"). Requiring the
+// literal phrase caused a real, otherwise-reasonable STRATEGY.md to silently fail validation,
+// which in turn meant applyStrategyToOperationalContext() never ran at all — mission/win
+// conditions never got derived, and Mission Control stayed empty with no indication why. Match
+// each required section by concept keywords instead of the exact phrase, the same way
+// hasRequiredTestingPlanSection accepts "Test Plan"/"Validation Plan" as equivalents of "Testing
+// Plan" rather than requiring that literal string.
+const STRATEGY_SECTION_KEYWORDS = {
+  'Objective': ['objective', 'goal', 'concept', 'mission', 'purpose', 'overview'],
+  'Relevant Files': ['relevant', 'file', 'subsystem', 'architecture', 'component', 'codebase'],
+  'Design & Polish': ['design', 'polish', 'visual', 'ui', 'ux', 'style', 'aesthetic'],
+  'Ambiguity Resolution': ['ambiguit', 'assumption', 'clarif', 'scope', 'open question']
+};
+
+function headingMatchesStrategySection(normalizedHeading, section) {
+  const keywords = STRATEGY_SECTION_KEYWORDS[section] || [normalizeHeadingText(section)];
+  return keywords.some(keyword => normalizedHeading.includes(keyword));
+}
+
 function hasRequiredStrategySections(content) {
   const text = String(content || '');
   if (!text.trim()) return false;
-  const headings = new Set();
+  const headings = [];
   const headingRegex = /^#{1,4}\s+(.+)$/gm;
   let match;
   while ((match = headingRegex.exec(text))) {
-    headings.add(normalizeHeadingText(match[1]));
+    headings.push(normalizeHeadingText(match[1]));
   }
-  return STRATEGY_REQUIRED_SECTIONS.every(section => headings.has(normalizeHeadingText(section)));
+  return STRATEGY_REQUIRED_SECTIONS.every(section => headings.some(heading => headingMatchesStrategySection(heading, section)));
 }
 
 function extractMarkdownSection(content, heading) {
@@ -3443,13 +3463,11 @@ function strategyRequiresClarification(content) {
 }
 
 function validateStrategyContent(content) {
-  const missingSections = STRATEGY_REQUIRED_SECTIONS.filter(section => {
-    const headings = [];
-    const headingRegex = /^#{1,4}\s+(.+)$/gm;
-    let match;
-    while ((match = headingRegex.exec(String(content || '')))) headings.push(normalizeHeadingText(match[1]));
-    return !headings.includes(normalizeHeadingText(section));
-  });
+  const headings = [];
+  const headingRegex = /^#{1,4}\s+(.+)$/gm;
+  let match;
+  while ((match = headingRegex.exec(String(content || '')))) headings.push(normalizeHeadingText(match[1]));
+  const missingSections = STRATEGY_REQUIRED_SECTIONS.filter(section => !headings.some(heading => headingMatchesStrategySection(heading, section)));
   const valid = missingSections.length === 0;
   return {
     valid,
