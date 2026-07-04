@@ -143,6 +143,19 @@ test('Planning Gate behavior requires STRATEGY.md before implementation_plan.md'
   });
   t.equal(missingStrategyGate.allowed, false, 'blocks implementation_plan.md until STRATEGY.md exists');
 
+  // Regression: a real run had STRATEGY.md fail to write twice (a separate bug, since fixed),
+  // then went ahead and got an implementation_plan.md approved anyway without ever creating a
+  // valid STRATEGY.md. That happened because this validity check used to be conditioned on
+  // options.strategyRequired (true only when the routing classifier called the turn 'plan') — so
+  // when routing mislabeled the turn 'direct', the check was skipped entirely regardless of
+  // whether STRATEGY.md existed. The check must be unconditional: writing implementation_plan.md
+  // at all is itself the signal a plan is needed, independent of how routing classified the turn.
+  const directRoutedMissingStrategyGate = agent.getPlanningToolGate(config, false, 'write_file', { path: 'implementation_plan.md' }, {
+    strategyStatus: { exists: false, valid: false },
+    agentExecutionMode: 'direct'
+  });
+  t.equal(directRoutedMissingStrategyGate.allowed, false, 'blocks implementation_plan.md without a valid STRATEGY.md even when routing called the turn direct');
+
   const planGate = agent.getPlanningToolGate(config, false, 'write_file', { path: 'plans/implementation_plan.md' }, {
     strategyStatus: { exists: true, valid: true, needsClarification: false }
   });

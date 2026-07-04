@@ -1243,7 +1243,6 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           continue;
         }
         const planningGate = getPlanningToolGate(config, canExecuteThisTask(), toolName, args, {
-          strategyRequired: !planningBypassedForTask && planningDecision.mode === 'plan',
           strategyStatus,
           agentExecutionMode
         });
@@ -3510,7 +3509,6 @@ function getPlanningToolGate(config, canExecute, toolName, args = {}, options = 
   }
   const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'start_command', 'run_tests', 'sync_workspace_env', 'launch_workspace_app', 'preview_app', 'git_push', 'download_file', 'download_from_page', 'extract_archive', 'take_screenshot'];
   const completionTools = ['complete_subplan', 'evaluate_win_conditions'];
-  const strategyRequired = options.strategyRequired !== false;
   const strategyStatus = options.strategyStatus || {};
   const executionMode = options.agentExecutionMode || '';
   // Allow completion tools for read-only/answer tasks — no plan approval needed to close them
@@ -3529,25 +3527,31 @@ function getPlanningToolGate(config, canExecute, toolName, args = {}, options = 
   }
   // Writing STRATEGY.md is never risky (it's a planning doc, not source/destructive), so it must
   // always be allowed — regardless of whether the routing classifier called this turn 'plan' or
-  // 'direct'. Gating it on strategyRequired caused the write to be rejected whenever routing said
-  // 'direct' even though the system prompt separately tells Orion to write STRATEGY.md first for
-  // any game/app request with open design decisions, and then let implementation_plan.md through
-  // immediately afterward without ever validating a strategy (see isPlanWrite below), silently
-  // skipping the grounding the ritual was supposed to enforce.
+  // 'direct'. Gating it on the routing classification caused the write to be rejected whenever
+  // routing said 'direct' even though the system prompt separately tells Orion to write
+  // STRATEGY.md first for any game/app request with open design decisions, and then let
+  // implementation_plan.md through immediately afterward without ever validating a strategy (see
+  // isPlanWrite below), silently skipping the grounding the ritual was supposed to enforce.
   const isStrategyWrite = toolName === 'write_file' && isStrategyPath(args.path);
   if (isStrategyWrite) {
     return { allowed: true, forceYield: false, reason: 'Writing STRATEGY.md is allowed during refinement.' };
   }
   const isPlanWrite = toolName === 'write_file' && isImplementationPlanPath(args.path);
   if (isPlanWrite) {
-    if (strategyRequired && !strategyStatus.valid) {
+    // This must NOT be conditioned on strategyRequired (i.e. on the routing classifier having
+    // called this turn 'plan'). The system prompt's own rule is unconditional: STRATEGY.md always
+    // precedes implementation_plan.md. Writing implementation_plan.md at all is itself the signal
+    // that a plan is needed — if routing mislabeled the turn 'direct' (the exact bug that caused
+    // this file to be skipped once already), gating validation on that same mislabeling would
+    // silently let implementation_plan.md through ungrounded again.
+    if (!strategyStatus.valid) {
       return {
         allowed: false,
         forceYield: false,
         reason: `Refinement required: create a valid STRATEGY.md before implementation_plan.md. STRATEGY.md must include: ${STRATEGY_REQUIRED_SECTIONS.join(', ')}.`
       };
     }
-    if (strategyRequired && strategyStatus.needsClarification) {
+    if (strategyStatus.needsClarification) {
       return {
         allowed: false,
         forceYield: false,
