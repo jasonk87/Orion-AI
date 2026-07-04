@@ -55,6 +55,7 @@ let appConfig = {
 };
 
 let currentWorkspace = '';
+let currentWorkspaceTestCommand = null; // { command, autoDetected, updatedAt } | null — per-workspace override
 let cachedUserDataPath = '';
 let activeConversationId = null;
 let conversations = []; // { id, title, messages, tasks, testResults }
@@ -546,11 +547,12 @@ async function syncWorkspaceFiles() {
   if (el.workspaceFilesPanel) el.workspaceFilesPanel.classList.remove('contextual-panel-hidden');
   el.fileTree.innerHTML = '<p class="empty-state">Scanning directory...</p>';
   loadWorkspaceEntrypoint();
-  
+  await loadWorkspaceTestCommand();
+
   if (window.api && typeof window.api.indexWorkspace === 'function') {
     window.api.indexWorkspace(currentWorkspace).catch(() => {});
   }
-  
+
   const files = await window.api.listFiles(currentWorkspace);
   el.fileCountBadge.textContent = files.length;
   
@@ -689,6 +691,28 @@ async function loadWorkspaceEntrypoint() {
   } else {
     el.workspaceEntrypointInput.value = '';
   }
+}
+
+// Loads this workspace's own regression test command override, if any was set (manually or via
+// autoDetectTestCommand) for THIS workspace path specifically. See getEffectiveTestCommand() for
+// how this combines with the global Settings default.
+async function loadWorkspaceTestCommand() {
+  currentWorkspaceTestCommand = null;
+  if (!currentWorkspace || !window.api.getWorkspaceTestCommand) {
+    if (el.lblTestCmd) el.lblTestCmd.textContent = appConfig.regressionTestCommand || 'npm test';
+    return;
+  }
+  const result = await window.api.getWorkspaceTestCommand(currentWorkspace);
+  if (result && result.success && result.testCommand) {
+    currentWorkspaceTestCommand = result.testCommand;
+  }
+  if (el.lblTestCmd) el.lblTestCmd.textContent = getEffectiveTestCommand();
+}
+
+// The regression test command to actually run: this workspace's own override if one has been
+// set (manually or auto-detected for THIS project), otherwise the global Settings default.
+function getEffectiveTestCommand() {
+  return (currentWorkspaceTestCommand && currentWorkspaceTestCommand.command) || appConfig.regressionTestCommand || 'npm test';
 }
 
 async function saveWorkspaceEntrypointFromInput() {
@@ -1031,19 +1055,25 @@ async function autoDetectTestCommand(files) {
       }
     }
     
-    if (detectedCmd && appConfig.regressionTestCommand !== detectedCmd) {
-      const isDefault = appConfig.regressionTestCommand === 'npm test' || !appConfig.regressionTestCommand;
+    const existingCommand = currentWorkspaceTestCommand ? currentWorkspaceTestCommand.command : '';
+    if (detectedCmd && existingCommand !== detectedCmd) {
+      // Only overwrite if there's no per-workspace override yet, or the existing one was itself
+      // auto-detected (not something the user manually customized for this workspace) — a
+      // stronger explicit test file signal can still override a weaker auto-detected guess.
+      const noOverrideYet = !currentWorkspaceTestCommand;
+      const previouslyAutoDetected = !!(currentWorkspaceTestCommand && currentWorkspaceTestCommand.autoDetected);
       const foundExplicitTestFile = (testJsFile || testPyFile || testGoFile) && !hasPackageJson;
-      
-      if (isDefault || foundExplicitTestFile) {
-        appConfig.regressionTestCommand = detectedCmd;
-        if (el.lblTestCmd) el.lblTestCmd.textContent = detectedCmd;
-        if (el.settingTestCmd) el.settingTestCmd.value = detectedCmd;
-        await window.api.writeConfig(appConfig);
-        appendSystemMessage(`Detected workspace test suite. Regression test command updated to: "${detectedCmd}"`, {
-          dedupeKey: `detected-test-command:${currentWorkspace}:${detectedCmd}`,
-          windowMs: 60000
-        });
+
+      if (noOverrideYet || previouslyAutoDetected || foundExplicitTestFile) {
+        const result = await window.api.setWorkspaceTestCommand(currentWorkspace, { command: detectedCmd, autoDetected: true });
+        if (result && result.success) {
+          currentWorkspaceTestCommand = result.testCommand;
+          if (el.lblTestCmd) el.lblTestCmd.textContent = detectedCmd;
+          appendSystemMessage(`Detected workspace test suite. Regression test command for this workspace set to: "${detectedCmd}"`, {
+            dedupeKey: `detected-test-command:${currentWorkspace}:${detectedCmd}`,
+            windowMs: 60000
+          });
+        }
       }
     }
   } catch (e) {
@@ -3035,7 +3065,7 @@ async function runRegressionTests() {
     }
   });
   
-  const result = await window.api.runCommand(appConfig.regressionTestCommand, currentWorkspace, processId, appConfig.commandTimeoutMs || 120000);
+  const result = await window.api.runCommand(getEffectiveTestCommand(), currentWorkspace, processId, appConfig.commandTimeoutMs || 120000);
   cleanListener();
   
   const success = result.code === 0;

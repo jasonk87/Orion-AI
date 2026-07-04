@@ -250,3 +250,56 @@ test('run-command sessions retain captured stdout in main process', (t) => {
     }
   }, 100);
 });
+
+// Regression: the regression test command used to be a single global appConfig field
+// (regressionTestCommand), so a command detected/set for one project (e.g. a Python project's
+// "python get_models_test.py") silently applied to every other workspace too — including a real
+// traced case where it leaked into an unrelated JS/React/Vite project and broke its test run.
+// Scoped per workspace path now, the same way the entry point already is.
+test('regression test command is scoped per workspace, not a single global value', (t) => {
+  const proxyquire = require('proxyquire').noPreserveCache();
+  let savedConfig = {};
+  const ipcWorkspace = proxyquire('../lib/ipc-workspace.js', {
+    electron: { app: { getPath: () => __dirname }, BrowserWindow: class {} },
+    './config': {
+      readAppConfig: () => savedConfig,
+      writeAppConfig: (cfg) => { savedConfig = cfg; },
+      atomicWriteFileSync: () => {},
+      '@global': true,
+      '@noCallThru': true
+    }
+  });
+
+  const pythonProject = 'C:\\Users\\Owner\\Desktop\\projects\\some-python-project';
+  const jsProject = 'C:\\Users\\Owner\\Desktop\\projects\\Mayor-Life';
+
+  t.equal(ipcWorkspace.getWorkspaceTestCommand(savedConfig, jsProject), null, 'no override exists yet for a fresh workspace');
+
+  ipcWorkspace.setWorkspaceTestCommand(savedConfig, pythonProject, { command: 'python get_models_test.py', autoDetected: true });
+  t.equal(
+    ipcWorkspace.getWorkspaceTestCommand(savedConfig, jsProject),
+    null,
+    'setting a test command for one workspace does not leak into an unrelated workspace'
+  );
+
+  ipcWorkspace.setWorkspaceTestCommand(savedConfig, jsProject, { command: 'npm test', autoDetected: true });
+  t.equal(
+    ipcWorkspace.getWorkspaceTestCommand(savedConfig, jsProject).command,
+    'npm test',
+    'each workspace keeps its own independently-detected test command'
+  );
+  t.equal(
+    ipcWorkspace.getWorkspaceTestCommand(savedConfig, pythonProject).command,
+    'python get_models_test.py',
+    'the other workspace\'s command is unaffected by the second workspace being configured'
+  );
+
+  // Path casing/trailing-slash differences must resolve to the same workspace key.
+  t.equal(
+    ipcWorkspace.getWorkspaceTestCommand(savedConfig, jsProject.toUpperCase()).command,
+    'npm test',
+    'workspace key normalization is case-insensitive, same as the entry point store'
+  );
+
+  t.end();
+});

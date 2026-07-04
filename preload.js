@@ -12,6 +12,8 @@ contextBridge.exposeInMainWorld('api', {
   launchWorkspaceApp: (workspacePath) => ipcRenderer.invoke('launch-workspace-app', workspacePath),
   getWorkspaceEntrypoint: (workspacePath) => ipcRenderer.invoke('get-workspace-entrypoint', workspacePath),
   setWorkspaceEntrypoint: (workspacePath, entrypoint) => ipcRenderer.invoke('set-workspace-entrypoint', { workspacePath, entrypoint }),
+  getWorkspaceTestCommand: (workspacePath) => ipcRenderer.invoke('get-workspace-test-command', workspacePath),
+  setWorkspaceTestCommand: (workspacePath, testCommand) => ipcRenderer.invoke('set-workspace-test-command', { workspacePath, testCommand }),
   openWorkspaceFolder: (workspacePath) => ipcRenderer.invoke('open-workspace-folder', workspacePath),
   gitPush: (workspacePath, remote, branch, setUpstream) => ipcRenderer.invoke('git-push', { workspacePath, remote, branch, setUpstream }),
   listDirectoryChildren: (dirPath) => ipcRenderer.invoke('list-directory-children', dirPath),
