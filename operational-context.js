@@ -456,10 +456,23 @@
   // operational context above is the canonical source for that. A substantive answer to the
   // user's actual question (e.g. a list of suggestions) is not self-diagnosis and is safe to
   // replay so later turns can resolve references like "number 1" or "that idea" back to it.
+  //
+  // This also covers agent.js's own canned run-status fallback templates (e.g. "I inspected the
+  // workspace but did not produce the requested answer", "Task finished.", the completion-gate
+  // "blocked" message). Those are scaffolding narration about the run itself, not an answer —
+  // replaying one back to the model caused it to literally continue/echo its own prior status
+  // line instead of treating the next turn as fresh, once assistant messages started being kept
+  // in the chat view for conversational continuity.
   function looksLikeSelfDiagnosisOrPromise(text) {
     const normalized = String(text || '').toLowerCase();
     return /\bi (?:encountered|previously|will now|cannot|can't|couldn't|could not|am unable|was unable)\b/.test(normalized) ||
-      /\b(prevents? me from|blocked me from|api (?:key|authentication) error|access (?:is|was) denied)\b/.test(normalized);
+      /\b(prevents? me from|blocked me from|api (?:key|authentication) error|access (?:is|was) denied)\b/.test(normalized) ||
+      /did not produce the requested answer/.test(normalized) ||
+      /cannot honestly mark this complete yet/.test(normalized) ||
+      /completed the next batch of implementation steps/.test(normalized) ||
+      /i paused after several automatic continuation passes/.test(normalized) ||
+      /i made progress but the plan is not finished yet/.test(normalized) ||
+      normalized.trim().startsWith('task finished.');
   }
 
   function buildRecentChatView(messages, currentInput = '', limit = MAX_CHAT_VIEW_MESSAGES) {

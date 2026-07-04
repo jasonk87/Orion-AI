@@ -960,12 +960,16 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       let currentTurn = { modelParts: parts, toolResponseParts: null };
       conversation.messages[aiMessageIndex].turns.push(currentTurn);
       
-      // Process text and thoughts
+      // Process text and thoughts. Gemini's thinking mode can return an internal "thought"
+      // segment as its own part alongside the real answer; naively concatenating every part.text
+      // together (with no separator) produced a visible answer that ran two near-duplicate drafts
+      // of the same content directly into each other with no paragraph break. Thought parts are
+      // draft reasoning, not the answer, so they must not contribute to the visible text at all.
       let textVal = '';
       let functionCalls = [];
-      
+
       parts.forEach(part => {
-        if (part.text) {
+        if (part.text && !part.thought) {
           textVal += part.text;
         }
         if (part.functionCall) {
@@ -4082,7 +4086,12 @@ function formatPlanContentForChat(content) {
 }
 
 function hasRequiredTestingPlanSection(content) {
-  return /^#{2,3}\s+.*?(testing plan|test plan|validation plan)\b/im.test(String(content || ''));
+  const text = String(content || '');
+  if (/^#{1,4}\s+.*?(testing plan|test plan|validation plan)\b/im.test(text)) return true;
+  // Models sometimes write a section title as a full bold line ("**Testing Plan**") instead of a
+  // real markdown heading. Treat that as an equally valid section marker rather than rejecting a
+  // plan that clearly has the section, just not in strict "## " form.
+  return /^\*\*[^*\n]*?(testing plan|test plan|validation plan)[^*\n]*?\*\*\s*$/im.test(text);
 }
 
 async function readImplementationPlanText(workspacePath) {

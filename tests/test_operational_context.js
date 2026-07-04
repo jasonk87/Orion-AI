@@ -435,6 +435,27 @@ test('recent chat view retains substantive assistant answers so later turns can 
   t.end();
 });
 
+// Regression: once assistant messages started being kept in the chat view (the fix above), the
+// agent's own canned run-status fallback text (e.g. "I inspected the workspace but did not
+// produce the requested answer") started getting replayed back to the model as if it were a real
+// prior reply. The model then literally continued from its own stale status line in the next
+// turn instead of starting fresh, producing a visible answer that opened with leftover process
+// narration glued onto the real response. These canned templates are scaffolding about the run
+// itself, not an answer, and must be filtered the same way self-diagnosis text already is.
+test('recent chat view filters out the agent\'s own canned run-status fallback text', (t) => {
+  const priorChat = [
+    { role: 'user', text: 'add an army to the game' },
+    { role: 'assistant', text: 'I inspected the workspace but did not produce the requested answer. This run is not complete; ask me to continue and I should use the gathered context to answer the actual request instead of stopping after file listing.' },
+    { role: 'assistant', text: 'Task finished.\n\n## Work Walkthrough\n- Done: Read file' },
+    { role: 'assistant', text: 'I cannot honestly mark this complete yet because the operational state is blocked.\n\nCompletion gate status: blocked.' },
+    { role: 'assistant', text: 'Completed the next batch of implementation steps. Continuing automatically with the remaining plan…' },
+    { role: 'user', text: 'ok continue' }
+  ];
+  const view = operational.buildRecentChatView(priorChat, 'go on');
+  t.deepEqual(view.map(item => item.role), ['user', 'user'], 'all four canned run-status assistant messages are filtered out');
+  t.end();
+});
+
 test('orphan blockers are not injected as canonical task state', (t) => {
   let state = operational.createEmptyContext(T0);
   state = operational.applyAction(state, 'record_blocker', {

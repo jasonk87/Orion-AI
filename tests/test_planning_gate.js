@@ -238,6 +238,11 @@ test('plan approval validation requires a testing plan section', (t) => {
   t.equal(agent.hasRequiredTestingPlanSection('# Plan\n\n### Section B: Test Plan\n\nRun it.'), true, 'accepts prefixed Test Plan heading');
   t.equal(agent.hasRequiredTestingPlanSection('# Plan\n\n## Implementation\n\nDo the work.'), false, 'rejects plans without a testing section');
   t.equal(agent.hasRequiredTestingPlanSection(''), false, 'rejects missing or unreadable plan content');
+  // Regression: a real plan with a clear "Testing Plan" section written as a full bold line
+  // instead of a "## " markdown heading was rejected as missing the section entirely, blocking
+  // plan approval on a plan that plainly had the content the check was looking for.
+  t.equal(agent.hasRequiredTestingPlanSection('# Plan\n\n**Testing Plan**\n\nUnit Behavior: test movement.\nRecruitment: verify costs.'), true, 'accepts a bold pseudo-heading as a valid Testing Plan section');
+  t.equal(agent.hasRequiredTestingPlanSection('# Plan\n\nThis has nothing to do with **bold text** elsewhere.'), false, 'a bold phrase unrelated to testing is still rejected');
   t.end();
 });
 
@@ -614,6 +619,76 @@ test('edit-blocked guard reminds the model to retry the edit after it re-reads t
     t.ok(readFileResponseSeen, 'the read_file call after being blocked produced a visible tool response');
     t.ok(readFileResponseSeen && readFileResponseSeen.editRetryReminder, 'the read_file response includes a reminder to retry the blocked edit');
     t.ok(readFileResponseSeen && readFileResponseSeen.editRetryReminder.includes('a.js'), 'the reminder names the file that was blocked');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+
+  t.end();
+});
+
+// Regression: Gemini's thinking mode can return an internal "thought" segment as its own part
+// alongside the real answer. The loop concatenated every part.text together with no separator,
+// so a response with both a thought part and a real answer part rendered as two near-duplicate
+// paragraphs of content run directly into each other. Thought parts must not contribute to the
+// visible text at all.
+test('thought parts do not leak into the visible answer text', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0 });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    readFile: async () => '',
+    listFiles: async () => ([{ path: 'test.txt', isDir: false, size: 100 }]),
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+  };
+
+  const conversation = { id: 'test-thought-leak', messages: [], awaitingPlanApproval: false, planApproved: false };
+
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"answer","reason":"question"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    return {
+      ok: true,
+      json: async () => ({
+        candidates: [{
+          finishReason: 'STOP',
+          content: {
+            parts: [
+              { text: 'Draft reasoning about the project that looks like a complete answer.', thought: true },
+              { text: 'This is the real answer to the question.' }
+            ]
+          }
+        }]
+      })
+    };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => {
+      if (delay !== 500) return originalSetTimeout(fn, delay);
+      return null;
+    };
+
+    await window.runAgentLoop('what do you think of this project?', 'gemini-1', conversation);
+
+    const aiMessage = conversation.messages.find(m => m.role === 'assistant');
+    t.ok(aiMessage, 'assistant message was created');
+    t.notOk(aiMessage.text.includes('Draft reasoning about the project'), 'thought-part text is not included in the visible answer');
+    t.ok(aiMessage.text.includes('This is the real answer'), 'the real answer part is still shown');
   } finally {
     global.window.runAgentLoop = originalRunAgentLoop;
     global.fetch = originalFetch;
