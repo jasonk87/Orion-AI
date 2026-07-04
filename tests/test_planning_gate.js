@@ -934,6 +934,39 @@ test('a run_tests call against a placeholder test script does not count as verif
   t.end();
 });
 
+// The work-walkthrough UI showed "Updated `file.js`" for both modify_file and patch_file calls,
+// and "Read `file.js`" whether the model read the whole file or a five-line slice — giving the
+// user no way to tell what Orion actually did without opening the raw tool-call log.
+test('work-walkthrough labels distinguish read/modify/patch calls instead of using generic text', (t) => {
+  t.equal(agent.summarizeToolStart('read_file', { path: 'a.js' }).label, 'Read `a.js`', 'a whole-file read has no range suffix');
+  t.equal(
+    agent.summarizeToolStart('read_file', { path: 'a.js', startLine: 10, endLine: 25 }).label,
+    'Read `a.js` (lines 10-25)',
+    'a ranged read shows the line range'
+  );
+  t.equal(
+    agent.summarizeToolStart('read_file', { path: 'a.js', startLine: 10 }).label,
+    'Read `a.js` (lines 10+)',
+    'an open-ended range (no endLine) is still distinguishable from a whole-file read'
+  );
+
+  t.equal(agent.summarizeToolStart('modify_file', { path: 'a.js' }).label, 'Modified `a.js`');
+  t.equal(
+    agent.summarizeToolStart('patch_file', { path: 'a.js', operation: { type: 'insert', position: 'after' } }).label,
+    'Patched `a.js` (insert after anchor)'
+  );
+  t.equal(
+    agent.summarizeToolStart('patch_file', { path: 'a.js', operation: { type: 'replace_range', startLine: 12, endLine: 14 } }).label,
+    'Patched `a.js` (lines 12-14)'
+  );
+  t.notEqual(
+    agent.summarizeToolStart('modify_file', { path: 'a.js' }).label,
+    agent.summarizeToolStart('patch_file', { path: 'a.js', operation: { type: 'replace', target: 'x', replacement: 'y' } }).label,
+    'modify_file and patch_file no longer share the same generic label'
+  );
+  t.end();
+});
+
 test('a real detected regression stops the run with a specific message, not a generic "unverified" one', async (t) => {
   const originalRunAgentLoop = global.window.runAgentLoop;
   const originalSetTimeout = global.setTimeout;

@@ -3637,7 +3637,13 @@ function getReviewOnlyToolGate(toolName, args = {}) {
 }
 
 function summarizeToolStart(toolName, args = {}) {
-  if (toolName === 'read_file') return { toolName, status: 'running', label: `Read \`${args.path || 'file'}\`` };
+  if (toolName === 'read_file') {
+    const hasRange = args.startLine !== undefined && args.startLine !== null;
+    const rangeLabel = hasRange
+      ? ` (lines ${args.startLine}${args.endLine !== undefined && args.endLine !== null ? `-${args.endLine}` : '+'})`
+      : '';
+    return { toolName, status: 'running', label: `Read \`${args.path || 'file'}\`${rangeLabel}` };
+  }
   if (toolName === 'list_files') return { toolName, status: 'running', label: 'Listed workspace files' };
   if (toolName === 'get_workspace_info') return { toolName, status: 'running', label: 'Checked active workspace directory' };
   if (toolName === 'open_workspace_folder') return { toolName, status: 'running', label: 'Opened workspace folder' };
@@ -3674,8 +3680,19 @@ function summarizeToolStart(toolName, args = {}) {
       label: isPlan ? 'Created implementation plan' : (isStrategy ? 'Created mission strategy' : `Write \`${args.path || 'file'}\``)
     };
   }
-  if (toolName === 'modify_file' || toolName === 'patch_file') {
-    return { toolName, kind: 'file', status: 'running', path: args.path, label: `Updated \`${args.path || 'file'}\`` };
+  if (toolName === 'modify_file') {
+    return { toolName, kind: 'file', status: 'running', path: args.path, label: `Modified \`${args.path || 'file'}\`` };
+  }
+  if (toolName === 'patch_file') {
+    const op = args.operation || {};
+    const opLabels = {
+      replace: 'replace',
+      replace_regex: 'regex replace',
+      insert: op.position === 'before' ? 'insert before anchor' : 'insert after anchor',
+      replace_range: `lines ${op.startLine || '?'}-${op.endLine || '?'}`
+    };
+    const opDetail = op.type && opLabels[op.type] ? ` (${opLabels[op.type]})` : '';
+    return { toolName, kind: 'file', status: 'running', path: args.path, operationType: op.type, label: `Patched \`${args.path || 'file'}\`${opDetail}` };
   }
   if (toolName === 'run_command' || toolName === 'start_command') {
     return { toolName, kind: 'command', status: 'running', command: args.command, label: `${toolName === 'start_command' ? 'Started' : 'Ran'} \`${args.command || 'command'}\`` };
@@ -6861,6 +6878,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     hasUnresolvedRegressionWarning,
     looksLikePlaceholderTestOutput,
     checkJsSyntaxAfterEdit,
+    summarizeToolStart,
     updateWalkthroughItem,
     buildPostEditEvidencePrompt,
     buildFinalVerificationSummary,
