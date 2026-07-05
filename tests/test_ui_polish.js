@@ -223,3 +223,25 @@ test('the Workspace Files panel fills available sidebar height instead of being 
     'the base rule still caps the small fixed-size panels at 250px');
   t.end();
 });
+
+// Regression: initModelDropdown() in renderer.js wipes and fully rebuilds #model-select
+// (modelSelect.innerHTML = '') on startup, populating it only from its own hardcoded Gemini list
+// plus a dynamic Ollama probe. Adding Claude/DeepSeek <option> tags directly to index.html's static
+// markup was dead on arrival — those options never survive to be seen, regardless of whether an
+// API key is configured, because this function erases and replaces them before the page is ever
+// shown. Claude and DeepSeek must be built into this same JS-generated list, not just added to the
+// static HTML (which would recreate the identical invisible-option bug).
+test('the model dropdown is rebuilt from a single JS source that includes Claude and DeepSeek', (t) => {
+  t.ok(renderer.includes("modelSelect.innerHTML = ''"), 'initModelDropdown fully rebuilds the dropdown from scratch');
+  t.ok(renderer.includes("claudeGroup.label = 'Claude'"), 'a Claude optgroup is built in JS, not left to static HTML');
+  t.ok(renderer.includes("value: 'claude-opus-4-8'") && renderer.includes("value: 'claude-sonnet-5'"),
+    'the JS-built Claude list includes the models offered in the model picker');
+  t.ok(renderer.includes("deepseekGroup.label = 'DeepSeek'"), 'a DeepSeek optgroup is built in JS, not left to static HTML');
+  t.ok(renderer.includes("value: 'deepseek-v4-flash'") && renderer.includes("value: 'deepseek-v4-pro'"),
+    'the JS-built DeepSeek list includes both V4 tiers');
+  // The static HTML list should not carry Claude/DeepSeek options that initModelDropdown() would
+  // just erase anyway — that duplication is exactly what caused them to silently never appear.
+  t.notOk(html.includes('value="claude-opus-4-8"'), 'index.html no longer has a dead duplicate Claude option');
+  t.notOk(html.includes('value="deepseek-v4-flash"'), 'index.html no longer has a dead duplicate DeepSeek option');
+  t.end();
+});

@@ -337,7 +337,41 @@ async function initModelDropdown() {
     geminiGroup.appendChild(opt);
   });
   modelSelect.appendChild(geminiGroup);
-  
+
+  // Static Claude list — listed unconditionally, same as Gemini above (selecting one without a
+  // configured Anthropic key simply errors clearly when a call is attempted, matching how an
+  // unconfigured Gemini key already behaves).
+  const claudeModels = [
+    { value: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
+    { value: 'claude-sonnet-5', name: 'Claude Sonnet 5' },
+    { value: 'claude-fable-5', name: 'Claude Fable 5' },
+    { value: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' }
+  ];
+  const claudeGroup = document.createElement('optgroup');
+  claudeGroup.label = 'Claude';
+  claudeModels.forEach(m => {
+    const opt = document.createElement('option');
+    opt.value = m.value;
+    opt.textContent = m.name;
+    claudeGroup.appendChild(opt);
+  });
+  modelSelect.appendChild(claudeGroup);
+
+  // Static DeepSeek list
+  const deepseekModels = [
+    { value: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+    { value: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' }
+  ];
+  const deepseekGroup = document.createElement('optgroup');
+  deepseekGroup.label = 'DeepSeek';
+  deepseekModels.forEach(m => {
+    const opt = document.createElement('option');
+    opt.value = m.value;
+    opt.textContent = m.name;
+    deepseekGroup.appendChild(opt);
+  });
+  modelSelect.appendChild(deepseekGroup);
+
   // Try to load saved model from localStorage or config
   let defaultModel = localStorage.getItem('ag2_default_model') || appConfig.defaultModel || 'gemini-2.5-flash-lite';
   
