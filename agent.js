@@ -427,6 +427,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const promptSource = options.source || 'user';
   const isInternalPrompt = !!options.internalPrompt || promptSource === 'followup' || promptSource === 'system' || promptSource === 'plan-approval';
   let lastTextResponse = "Thinking...";
+  let bestVisibleAnswer = "";
   let aiMessageIndex = Array.isArray(conversation.messages) ? conversation.messages.length : 0;
   let workWalkthrough = [];
   const persistedVisualArtifactKeys = new Set();
@@ -797,6 +798,21 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       window.renderAiMessage(lastTextResponse, currentAgentLogs, conversation.id, msg);
     }
   }
+
+  function rememberBestVisibleAnswer(text) {
+    if (isSubstantiveVisibleAnswer(text)) {
+      bestVisibleAnswer = String(text || '');
+    }
+  }
+
+  function useBestVisibleAnswerIfGateEcho(text) {
+    if (bestVisibleAnswer && looksLikeLeakedNoToolCorrection(text)) {
+      lastTextResponse = bestVisibleAnswer;
+      conversation.messages[aiMessageIndex].text = lastTextResponse;
+      return true;
+    }
+    return false;
+  }
   
   try {
     if (approvalIntent && approvalIntent.intent === 'deny') {
@@ -1094,7 +1110,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       });
       
       if (textVal) {
-        lastTextResponse = textVal;
+        if (!useBestVisibleAnswerIfGateEcho(textVal)) {
+          lastTextResponse = textVal;
+          rememberBestVisibleAnswer(textVal);
+        }
       }
       
       // Update live chat bubbles — skip render when there are no tool calls so the
@@ -1109,6 +1128,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // If no tool calls, the agent is done, unless there are pending tasks in the checklist
       if (functionCalls.length === 0) {
         consecutiveNoToolCalls++;
+        if (bestVisibleAnswer && looksLikeLeakedNoToolCorrection(textVal)) {
+          currentAgentLogs.push({ type: 'thought', content: 'Answer continuity guard: a later gate response referred to an earlier answer instead of being the answer, so Orion kept the substantive visible answer.' });
+          break;
+        }
         // A model can do a batch of real tool work (reads/searches) and then, on the very next
         // turn, return truly nothing at all — no tool call, no text. Every other recovery gate
         // below shares a small per-run budget (finalAnswerQualityPrompts, evidencePrompts, etc.),
@@ -1130,11 +1153,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           continue;
         }
         const pendingTasks = conversation.tasks ? conversation.tasks.filter(t => t.status !== 'completed' && t.status !== 'x') : [];
-        if (config.planningMode && !canExecuteThisTask() && !hasAnyChecklist(conversation) && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
+        if (config.planningMode && !canExecuteThisTask() && !hasAnyChecklist(conversation) &&
+            !isSubstantiveVisibleAnswer(textVal) && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
           messages.push({
             role: 'user',
             parts: [{
-              text: '[SYSTEM: Planning Mode is active and no checklist or implementation plan has been created for this request. Either create the implementation plan and checklist with tools now, or give a complete non-workspace answer that does not promise later action.]'
+              text: '[SYSTEM: Planning Mode is active and no checklist or implementation plan has been created for this request. Either create the implementation plan and checklist with tools now, or give a complete direct answer that does not promise later action.]'
             }]
           });
           continue;
@@ -1959,6 +1983,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       } else {
         lastTextResponse = "Task finished.";
       }
+    }
+    if (bestVisibleAnswer && looksLikeLeakedNoToolCorrection(lastTextResponse)) {
+      lastTextResponse = bestVisibleAnswer;
     }
     lastTextResponse = withWorkWalkthrough(lastTextResponse, workWalkthrough, true);
 
@@ -4657,10 +4684,15 @@ function hasOnlyInventoryEvidence(workWalkthrough = []) {
 function answerHasActionableFinalContent(answerText) {
   const text = sanitizeFinalAnswerText(answerText);
   if (isGenericNonAnswer(text)) return false;
+  if (looksLikeLeakedNoToolCorrection(text)) return false;
   if (text.length < 120) return false;
   const nonBlankLines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
   if (nonBlankLines.length >= 3) return true;
   return /[.!?]\s+\S+.*[.!?]/s.test(text);
+}
+
+function isSubstantiveVisibleAnswer(text) {
+  return answerHasActionableFinalContent(text) && !looksLikeLeakedNoToolCorrection(text);
 }
 
 function getInspectedEvidenceAnchors(workWalkthrough = []) {
@@ -4731,7 +4763,7 @@ function buildReviewOnlyCompletionGatePrompt(userPrompt, answerText, workWalkthr
     return `[SYSTEM: Review completion gate. You have not inspected enough of the program to finish a broad bug/structural review yet. Current coverage: ${coverage.fileCount} source file(s) read${coverage.hasInventory ? ' with inventory context' : ''}. Continue with concrete tools: list files if needed, then read the main entry point, adjacent modules, config/package files, and tests where present. Do not stop after one file with general possibilities.]`;
   }
   if (!answerHasGroundedReviewReport(answerText)) {
-    return '[SYSTEM: Review completion gate. Your draft is not a grounded findings report yet. Either continue inspecting files, or produce a concrete report now with specific findings tied to file paths and line/function context, severity/impact, and a clear note if no specific issues were found. Do not ask the user whether to keep inspecting; finish the review from the available evidence or gather the missing evidence with tools. Note: your prior draft above was never shown to the user — only your next response will be. Write a complete, standalone report, not a continuation, correction, or shorter follow-up to that draft.]';
+    return '[SYSTEM: Review completion gate. Your draft is not a grounded findings report yet. Either continue inspecting files, or produce a concrete report now with specific findings tied to file paths and line/function context, severity/impact, and a clear note if no specific issues were found. Do not ask the user whether to keep inspecting; finish the review from the available evidence or gather the missing evidence with tools. Only the final saved assistant response counts. Write a complete, standalone report, not a continuation, correction, or shorter follow-up to earlier text.]';
   }
   return '';
 }
@@ -4753,7 +4785,7 @@ Before final response, answer the user's actual request directly using the files
   if (answerHasActionableFinalContent(answerText)) return '';
   return `[SYSTEM: Final-response quality gate. You inspected context, but inspection alone is not completion.
 
-Before final response, answer the user's actual request directly, using the evidence you gathered. If more evidence is needed, call the necessary tools now; otherwise produce a substantive answer now. Do not stop at phrases like "Ah, the path is...", an acknowledgement, a file-inspection summary, or an empty response. Note: your prior draft above was never shown to the user — only your next response will be. Write a complete, standalone answer, not a continuation, correction, or shorter follow-up to that draft.]`;
+Before final response, answer the user's actual request directly, using the evidence you gathered. If more evidence is needed, call the necessary tools now; otherwise produce a substantive answer now. Do not stop at phrases like "Ah, the path is...", an acknowledgement, a file-inspection summary, or an empty response. Only the final saved assistant response counts. Write a complete, standalone answer, not a continuation, correction, or shorter follow-up to earlier text.]`;
 }
 
 function buildPlanApprovalMessage(planItem, fallbackText) {
@@ -5103,7 +5135,10 @@ function shouldHaveUsedToolsButDidNot(text, workWalkthrough, userPrompt = '', co
 // with the topic at all.
 function looksLikeLeakedNoToolCorrection(text) {
   const normalized = String(text || '').toLowerCase();
-  return /\b(did not require (workspace|tools?|an implementation plan)|no workspace interaction|ready for (your )?next instruction|mention(ed)? (this|the) correction|previous response (was|did not)|does not require (tools?|workspace)|not require workspace interaction)\b/.test(normalized);
+  return /\b(did not require (workspace|tools?|an implementation plan)|no workspace interaction|ready for (your )?next instruction|mention(ed)? (this|the) correction|previous response (was|did not)|does not require (tools?|workspace)|not require workspace interaction)\b/.test(normalized) ||
+    /\b(?:my|the)\s+(?:answer|response|reply)\s+above\b/.test(normalized) ||
+    /\balready\s+(?:a\s+)?complete\s+(?:non[-\s]?workspace\s+)?answer\b/.test(normalized) ||
+    /\bi\s+gave\s+you\s+the\s+full\b/.test(normalized);
 }
 
 function isGenericNonAnswer(text) {
@@ -7458,6 +7493,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     looksLikeLeakedNoToolCorrection,
     requestNeedsActionableFinalAnswer,
     answerHasActionableFinalContent,
+    isSubstantiveVisibleAnswer,
     answerHasInspectionGrounding,
     getReviewCoverage,
     answerHasGroundedReviewReport,

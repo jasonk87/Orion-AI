@@ -1758,7 +1758,10 @@ test('a real detected regression stops the run with a specific message, not a ge
 // looksLikeLeakedNoToolCorrection() detects this specific failure mode so a stronger retry can fire.
 test('looksLikeLeakedNoToolCorrection detects a model describing its own internal correction instead of answering', (t) => {
   const leaked = 'Understood. My previous response was a discussion about game features and did not require workspace interaction or an implementation plan. I am ready for your next instruction.';
+  const answerAboveLeak = 'My answer above is already a complete non-workspace answer — I gave you the full architectural design and build-starting roadmap. It is your move from here.';
   t.equal(agent.looksLikeLeakedNoToolCorrection(leaked), true, 'the exact leaked phrasing from the transcript is detected');
+  t.equal(agent.looksLikeLeakedNoToolCorrection(answerAboveLeak), true, 'a final gate answer that points at an answer above is detected');
+  t.equal(agent.answerHasActionableFinalContent(answerAboveLeak), false, 'meta references to an answer above are not accepted as substantive final content');
   t.equal(
     agent.looksLikeLeakedNoToolCorrection("Sure! Let's dig into Assetto Corsa's tire model and how that could inspire Apex Velocity's pit-stop mechanic."),
     false,
@@ -1812,6 +1815,59 @@ test('a leaked no-tool-use correction triggers a stronger retry instead of being
     t.ok(aiMessage.text.includes('Assetto Corsa'), 'the eventual real, on-topic answer is what gets shown');
   } finally {
     global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+
+  t.end();
+});
+
+test('planning mode accepts a complete direct answer instead of forcing an answer-above rewrite', async (t) => {
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0 });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = { readFile: async () => '', listFiles: async () => ([]) };
+
+  const conversation = { id: 'test-complete-direct-answer', messages: [], awaitingPlanApproval: false, planApproved: false };
+  const fullAnswer = [
+    'A grittier modern BitLife should be built around pressure, not just menus.',
+    'The core loop would track needs, money, reputation, relationships, risk, and consequences so every choice changes future options.',
+    'I would prototype it as a narrative simulation first, then add jobs, crime, health, social status, housing, and event chains once the state model feels good.'
+  ].join('\n\n');
+
+  let modelTurnCount = 0;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"plan","reason":"Could become a build, but a design answer is allowed."}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    modelTurnCount++;
+    const text = modelTurnCount === 1
+      ? fullAnswer
+      : 'My answer above is already a complete non-workspace answer — I gave you the full architectural design and build-starting roadmap.';
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text }] } }] }) };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
+    await window.runAgentLoop('How could we create a more modern version of BitLife with grit and simulation?', 'gemini-1', conversation);
+
+    const aiMessage = conversation.messages.find(m => m.role === 'assistant');
+    t.ok(aiMessage, 'assistant message was created');
+    t.equal(modelTurnCount, 1, 'a complete direct answer does not get a planning-mode retry');
+    t.equal(aiMessage.text, fullAnswer, 'the complete answer is preserved as the final text');
+    t.notOk(/my answer above|complete non-workspace answer/i.test(aiMessage.text), 'the answer-above rewrite is not shown');
+  } finally {
     global.fetch = originalFetch;
     global.setTimeout = originalSetTimeout;
   }
