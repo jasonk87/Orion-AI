@@ -4722,7 +4722,7 @@ function buildReviewOnlyCompletionGatePrompt(userPrompt, answerText, workWalkthr
     return `[SYSTEM: Review completion gate. You have not inspected enough of the program to finish a broad bug/structural review yet. Current coverage: ${coverage.fileCount} source file(s) read${coverage.hasInventory ? ' with inventory context' : ''}. Continue with concrete tools: list files if needed, then read the main entry point, adjacent modules, config/package files, and tests where present. Do not stop after one file with general possibilities.]`;
   }
   if (!answerHasGroundedReviewReport(answerText)) {
-    return '[SYSTEM: Review completion gate. Your draft is not a grounded findings report yet. Either continue inspecting files, or produce a concrete report now with specific findings tied to file paths and line/function context, severity/impact, and a clear note if no specific issues were found. Do not ask the user whether to keep inspecting; finish the review from the available evidence or gather the missing evidence with tools.]';
+    return '[SYSTEM: Review completion gate. Your draft is not a grounded findings report yet. Either continue inspecting files, or produce a concrete report now with specific findings tied to file paths and line/function context, severity/impact, and a clear note if no specific issues were found. Do not ask the user whether to keep inspecting; finish the review from the available evidence or gather the missing evidence with tools. Note: your prior draft above was never shown to the user — only your next response will be. Write a complete, standalone report, not a continuation, correction, or shorter follow-up to that draft.]';
   }
   return '';
 }
@@ -4744,7 +4744,7 @@ Before final response, answer the user's actual request directly using the files
   if (answerHasActionableFinalContent(answerText)) return '';
   return `[SYSTEM: Final-response quality gate. You inspected context, but inspection alone is not completion.
 
-Before final response, answer the user's actual request directly, using the evidence you gathered. If more evidence is needed, call the necessary tools now; otherwise produce a substantive answer now. Do not stop at phrases like "Ah, the path is...", an acknowledgement, a file-inspection summary, or an empty response.]`;
+Before final response, answer the user's actual request directly, using the evidence you gathered. If more evidence is needed, call the necessary tools now; otherwise produce a substantive answer now. Do not stop at phrases like "Ah, the path is...", an acknowledgement, a file-inspection summary, or an empty response. Note: your prior draft above was never shown to the user — only your next response will be. Write a complete, standalone answer, not a continuation, correction, or shorter follow-up to that draft.]`;
 }
 
 function buildPlanApprovalMessage(planItem, fallbackText) {

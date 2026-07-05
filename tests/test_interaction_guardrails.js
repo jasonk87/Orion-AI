@@ -580,6 +580,30 @@ test('local system fact failures do not become fake blockers or web research', (
     'substantive answers satisfy the final quality gate without action keywords'
   );
 
+  // A user reported a real UX problem: the model writes a long, detailed narrative answer, a gate
+  // catches it as not-yet-grounded/not-actionable and forces a redo, and the redo produces a
+  // shorter, different summary — but the model still has its original draft in its own turn
+  // history and can treat the corrected response as a continuation of a draft the user never
+  // actually saw (only the final response is ever rendered). Every gate message that can trigger
+  // a full redo of an already-written draft must tell the model the draft was never shown, so its
+  // next response is a complete, standalone answer rather than an addendum.
+  t.ok(
+    agent.buildReviewOnlyCompletionGatePrompt(
+      'Can you go through this program and find any bugs, errors or structural problems',
+      'I reviewed `app.py:10` and found one issue. Would you like me to continue inspecting?',
+      broadReview
+    ).includes('your prior draft above was never shown to the user'),
+    'review-only completion gate warns the model its ungrounded draft was never shown to the user'
+  );
+  t.ok(
+    agent.buildFinalAnswerQualityGatePrompt(
+      'tell me about this workspace',
+      'Ah! The path is C:\\Projects\\OrionAI.',
+      [{ toolName: 'read_file', label: 'Read agent.js', status: 'done' }]
+    ).includes('your prior draft above was never shown to the user'),
+    'final-answer quality gate warns the model its non-answer draft was never shown to the user'
+  );
+
   const failedCommand = {
     exitCode: -4058,
     stdout: '',
