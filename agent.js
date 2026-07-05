@@ -436,6 +436,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let userRequestedStop = false;
   let finalAnswerQualityPrompts = 0;
   let finalAnswerQualityLoopExtensions = 0;
+  // Set right after the main while loop exits, in the outer function scope so the `finally` block
+  // below (which runs in a separate block from the `try` that declares loopCount/maxLoops) can see
+  // whether the loop stopped because it hit its raw per-turn ceiling rather than because the model
+  // reached a deliberate conclusion. A run that thrashes through many legitimate-but-circuitous
+  // tool calls (e.g. repeatedly retrying broken shell escaping) exhausts this ceiling while
+  // lastTextResponse is still whatever stale mid-task sentence was set before the thrashing began
+  // — with no checklist yet established (this can happen before plan approval), nothing else
+  // catches that and the stale sentence silently becomes the "final" answer.
+  let ranOutOfLoopBudget = false;
 
   if (!Array.isArray(conversation.messages)) {
     conversation.messages = [];
@@ -1896,6 +1905,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       }
     }
 
+    ranOutOfLoopBudget = loopCount >= maxLoops;
+
     // Plan approval is conversation state. A workspace-level implementation_plan.md may be an
     // artifact from another conversation or an older task, so its mere presence must not reactivate
     // approval mode for this run.
@@ -1986,6 +1997,16 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     }
     if (bestVisibleAnswer && looksLikeLeakedNoToolCorrection(lastTextResponse)) {
       lastTextResponse = bestVisibleAnswer;
+    }
+    // A run that exhausted its raw per-turn ceiling while thrashing on legitimate-but-circuitous
+    // tool calls (e.g. repeatedly retrying broken shell escaping) and never reached a checklist —
+    // so autoContinueExecution never engaged — otherwise leaves whatever stale mid-task sentence
+    // was set before the thrashing began as the silent "final" answer, with the tool log the only
+    // hint anything went wrong. Append an explicit, honest note so the user knows to ask Orion to
+    // continue instead of assuming the task finished or is simply taking a while.
+    if (ranOutOfLoopBudget && !autoContinueExecution && madeProgressThisRun &&
+        !/ask me to continue/i.test(lastTextResponse)) {
+      lastTextResponse += '\n\n[Note: this run hit its per-turn action limit before the task was confirmed complete — the message above may be from partway through, not a final result. Ask me to continue and I will pick up from the current state.]';
     }
     lastTextResponse = withWorkWalkthrough(lastTextResponse, workWalkthrough, true);
 

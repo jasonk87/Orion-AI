@@ -2638,6 +2638,70 @@ test('the running-indicator placeholder is rendered immediately at the start of 
   t.end();
 });
 
+// A transcript showed a run silently die mid-task: the model set an intro sentence ("Let me now
+// write the strategy doc..."), then thrashed for many turns retrying broken shell-escaping via
+// run_command, without a checklist ever being created (this was pre-plan-approval), until the raw
+// per-turn loop ceiling was hit. Because lastTextResponse was never "Thinking..." (it held that
+// stale intro sentence) and no checklist existed to trigger auto-continue, nothing flagged the run
+// as incomplete — the stale sentence just silently became the "final" answer with the tool log as
+// the only hint anything went wrong.
+test('a run that exhausts its per-turn ceiling while thrashing on tool calls gets an explicit incomplete-run note, not a silently stale answer', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: false });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    listFiles: async () => ([]),
+    readFile: async () => '',
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+    runCommand: async () => ({ success: true, code: 0, stdout: '', stderr: '' }),
+  };
+
+  const conversation = { id: 'test-loop-ceiling', messages: [], awaitingPlanApproval: false, planApproved: false };
+
+  let turnCount = 0;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"writing a file"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    turnCount++;
+    // First turn: a real intro sentence alongside the tool call, exactly like the transcript.
+    // Every turn after that: only a tool call, no text at all — the model never updates
+    // lastTextResponse again, so it stays stuck on that first sentence for the rest of the run.
+    const parts = turnCount === 1
+      ? [{ text: 'Good — the workspace is live. Let me now write the strategy doc.' }, { functionCall: { name: 'run_command', args: { command: 'echo hi' } } }]
+      : [{ functionCall: { name: 'run_command', args: { command: 'echo hi' } } }];
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts } }] }) };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
+    await window.runAgentLoop('build me a strategy doc', 'gemini-1', conversation);
+
+    const aiMessage = conversation.messages.find(m => m.role === 'assistant');
+    t.ok(aiMessage, 'assistant message was created');
+    t.ok(/hit its per-turn action limit/i.test(aiMessage.text || ''), 'the final message explicitly flags that the run hit its loop ceiling');
+    t.ok(/ask me to continue/i.test(aiMessage.text || ''), 'the final message tells the user how to recover');
+    t.ok(/Good — the workspace is live/.test(aiMessage.text || ''), 'the original stale sentence is preserved, not silently discarded');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+  t.end();
+});
+
 // grep_search closes a real gap: the system prompt referenced a "grep_search" tool for years
 // (as an example local tool) but it was never declared in the tool schema and had no executor —
 // the model could never actually call it. This wires it up for real: a literal/regex content
