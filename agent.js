@@ -600,7 +600,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   }
   const taskComplexity = planningDecision.taskComplexity || (planningDecision.mode === 'plan' ? 'deep' : 'standard');
   if (taskComplexity === 'deep') {
-    const upgraded = getNextGeminiModelForHighDemand(userSelectedModelName);
+    const upgraded = getNextModelForHighDemand(userSelectedModelName);
     if (upgraded) {
       activeRunModelName = upgraded;
       config.activeRunModelName = activeRunModelName;
@@ -896,7 +896,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // Call API (Gemini or Ollama) with automatic transient error retry and warnings
       let response;
       try {
-        agentSubStatus = `Calling ${activeRunModelName.startsWith('gemini-') ? 'Gemini' : (activeRunModelName.startsWith('claude') ? 'Claude (' + activeRunModelName + ')' : 'Ollama (' + activeRunModelName + ')')} API...`;
+        agentSubStatus = `Calling ${activeRunModelName.startsWith('gemini-') ? 'Gemini' : (activeRunModelName.startsWith('claude') ? 'Claude (' + activeRunModelName + ')' : (activeRunModelName.startsWith('deepseek') ? 'DeepSeek (' + activeRunModelName + ')' : 'Ollama (' + activeRunModelName + ')'))} API...`;
         persistCurrentAgentLogs({ render: true });
         const modelCallDelayMs = Math.min(Math.max(parseInt(config.modelCallDelayMs, 10) || 0, 0), 60000);
         if (modelCallDelayMs > 0) {
@@ -917,6 +917,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           response = await callGeminiAPI(messagesForApiCall, activeRunModelName, config.geminiApiKey, onApiWarning, false, { signal: getActiveRunSignal() });
         } else if (activeRunModelName.startsWith('claude')) {
           response = await callAnthropicAPI(messagesForApiCall, activeRunModelName, config.anthropicApiKey, onApiWarning, false, { signal: getActiveRunSignal() });
+        } else if (activeRunModelName.startsWith('deepseek')) {
+          response = await callDeepSeekAPI(messagesForApiCall, activeRunModelName, config.deepseekApiKey, onApiWarning, false, { signal: getActiveRunSignal() });
         } else {
           response = await callOllamaAPI(messagesForApiCall, activeRunModelName, onApiWarning, false, { signal: getActiveRunSignal() });
         }
@@ -1653,7 +1655,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               // revert once this file gets a clean edit so the rest of the run doesn't silently
               // stay on the more expensive model.
               if (!modelEscalatedForEditKey) {
-                const strongerModel = activeRunModelName.startsWith('gemini-') ? getNextGeminiModelForHighDemand(activeRunModelName) : null;
+                const strongerModel = getNextModelForHighDemand(activeRunModelName);
                 if (strongerModel) {
                   modelEscalatedForEditKey = editKey;
                   activeRunModelName = strongerModel;
@@ -5713,6 +5715,18 @@ function getNextGeminiModelForHighDemand(modelName) {
   return fallbackChain[modelName] || null;
 }
 
+// Provider-aware version of the escalation chain above, used by both the proactive deep-task
+// upgrade and the reactive repeated-edit-failure escalation. DeepSeek's lineup is a flat two-tier
+// flash->pro chain (unlike Gemini's multi-family ladder), so it doesn't need its own model-tier
+// classification logic — it escalates to "the pro version of itself," exactly as requested. Claude
+// and Ollama models have no defined next tier and return null, same as before this generalization.
+function getNextModelForHighDemand(modelName) {
+  const name = String(modelName || '');
+  if (name.startsWith('gemini-')) return getNextGeminiModelForHighDemand(name);
+  const deepseekChain = { 'deepseek-v4-flash': 'deepseek-v4-pro' };
+  return deepseekChain[name] || null;
+}
+
 // classifyPlanningNeed/classifyPlanApprovalIntent/countTokens/compactHistory are all small,
 // single-purpose utility calls (a JSON classification, a token count, a summary) that a cheap
 // model handles identically well — but previously received the user's full modelName, so
@@ -5727,6 +5741,9 @@ function resolveUtilityModelName(modelName) {
   // This is the ideal cost split: Claude does the hard reasoning, flash-lite does the plumbing. Falls
   // back gracefully (regexFallback in the classifiers) if no Gemini key is configured.
   if (name.startsWith('claude')) return 'gemini-2.5-flash-lite';
+  // DeepSeek routes utility calls to its own cheap flash tier instead of Gemini — unlike Claude,
+  // a DeepSeek-only setup shouldn't need a Gemini key just for classification/token-counting.
+  if (name.startsWith('deepseek')) return 'deepseek-v4-flash';
   if (!name.startsWith('gemini-')) return name;
   if (name.startsWith('gemini-3')) return 'gemini-3.1-flash-lite';
   if (name.startsWith('gemini-2.5')) return 'gemini-2.5-flash-lite';
@@ -6566,6 +6583,136 @@ async function callAnthropicAPI(messages, modelName, apiKey, onWarning, disableT
   throw new Error('Anthropic API: exhausted retries.');
 }
 
+// ── DEEPSEEK PROVIDER ───────────────────────────────────────────────────────────
+// DeepSeek's API is OpenAI-compatible chat completions: POST https://api.deepseek.com/chat/completions
+// with Authorization: Bearer <key>, an OpenAI-shaped tools array, and tool_calls/tool_call_id
+// threading in the message history (flatter than Anthropic's nested content blocks — one
+// {role:'tool', tool_call_id, content} message per tool call, not a content-block array).
+
+function convertGeminiToDeepSeekTools(declarations) {
+  return (declarations || []).map(fd => ({
+    type: 'function',
+    function: {
+      name: fd.name,
+      description: fd.description,
+      parameters: lowercaseJsonSchemaTypes(JSON.parse(JSON.stringify(fd.parameters || { type: 'OBJECT', properties: {} })))
+    }
+  }));
+}
+
+function convertGeminiToDeepSeekMessages(geminiMessages) {
+  const out = [];
+  let toolCallCounter = 0;
+  let lastToolCallIds = [];
+
+  (geminiMessages || []).forEach(msg => {
+    if (msg.role === 'user') {
+      const text = (msg.parts || []).map(p => p.text).filter(Boolean).join('');
+      out.push({ role: 'user', content: text || '(no content)' });
+    } else if (msg.role === 'model') {
+      const textParts = (msg.parts || []).filter(p => p.text).map(p => p.text);
+      const toolCalls = [];
+      lastToolCallIds = [];
+      (msg.parts || []).forEach(p => {
+        if (p.functionCall) {
+          const id = `call_orion_${toolCallCounter++}`;
+          lastToolCallIds.push(id);
+          toolCalls.push({ id, type: 'function', function: { name: p.functionCall.name, arguments: JSON.stringify(p.functionCall.args || {}) } });
+        }
+      });
+      const assistantMsg = { role: 'assistant', content: textParts.join('') || null };
+      if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
+      out.push(assistantMsg);
+    } else if (msg.role === 'tool') {
+      let idx = 0;
+      (msg.parts || []).forEach(p => {
+        if (p.functionResponse) {
+          const responseObj = p.functionResponse.response || {};
+          const content = typeof responseObj === 'object' ? JSON.stringify(responseObj) : String(responseObj);
+          const toolCallId = lastToolCallIds[idx] || `call_orion_orphan_${toolCallCounter++}`;
+          idx++;
+          out.push({ role: 'tool', tool_call_id: toolCallId, content });
+        }
+      });
+    }
+  });
+  return out;
+}
+
+async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTools = false, options = {}) {
+  if (!apiKey) throw createNonRetryableModelError('DeepSeek API key is not configured. Add it in Settings to use DeepSeek models.');
+  const url = 'https://api.deepseek.com/chat/completions';
+
+  const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
+  const systemText = disableTools
+    ? (SYSTEM_INSTRUCTION.split('Tools available:')[0] + '\n\nCRITICAL: You are in an analysis phase. DO NOT request any tool use. Provide your analysis in plain text only.')
+    : SYSTEM_INSTRUCTION;
+  const deepseekMessages = [{ role: 'system', content: systemText }, ...convertGeminiToDeepSeekMessages(processedMessages)];
+
+  const requestBody = {
+    model: modelName,
+    messages: deepseekMessages,
+    temperature: 0
+  };
+  if (!disableTools) {
+    requestBody.tools = convertGeminiToDeepSeekTools(buildAgentToolDeclarations());
+  }
+
+  const attempts = MODEL_API_MAX_ATTEMPTS;
+  let delay = 1500;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const response = await fetchWithTimeout(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify(requestBody),
+        signal: options.signal
+      }, MODEL_API_REQUEST_TIMEOUT_MS, 'DeepSeek chat completions request');
+
+      if (response.ok) {
+        const data = await response.json();
+        const message = (data.choices && data.choices[0] && data.choices[0].message) || {};
+        const parts = [];
+        if (message.content) parts.push({ text: message.content });
+        (message.tool_calls || []).forEach(tc => {
+          let args = tc.function && tc.function.arguments;
+          if (typeof args === 'string') {
+            try { args = JSON.parse(args); } catch (_) { args = {}; }
+          }
+          parts.push({ functionCall: { name: tc.function.name, args: args || {} } });
+        });
+        return { _orionActiveModelName: modelName, candidates: [{ content: { parts } }] };
+      }
+
+      const errorText = await response.text();
+      const status = response.status;
+      const apiError = describeModelApiError(status, errorText);
+      const retryDelayMs = Math.min(apiError.retryDelayMs || delay, MODEL_API_MAX_RETRY_WAIT_MS);
+
+      if (status === 401 || status === 403 || status === 400) {
+        throw createNonRetryableModelError(`DeepSeek API HTTP ${status}: ${apiError.message}`);
+      }
+      if (i === attempts) {
+        throw new Error(`DeepSeek API HTTP ${status} after ${attempts} attempts: ${apiError.message}`);
+      }
+      if (onWarning) onWarning(`DeepSeek API HTTP ${status} for ${modelName}; retrying in ${Math.ceil(retryDelayMs / 1000)}s (attempt ${i}/${attempts}).`);
+      await sleepRespectingStop(retryDelayMs);
+      delay = Math.min(delay * 2, MODEL_API_MAX_RETRY_WAIT_MS);
+    } catch (err) {
+      if (err && err.nonRetryable) throw err;
+      if (isUserStopError && isUserStopError(err)) throw err;
+      if (i === attempts) throw err;
+      if (onWarning) onWarning(`DeepSeek API request failed (${err.message}); retrying (attempt ${i}/${attempts}).`);
+      await sleepRespectingStop(delay);
+      delay = Math.min(delay * 2, MODEL_API_MAX_RETRY_WAIT_MS);
+    }
+  }
+  throw new Error('DeepSeek API: exhausted retries.');
+}
+
 // Lightweight per-turn token savings, distinct from compactHistory's heavyweight summarization
 // (which only triggers near the context-window threshold). Old, large, read-only tool outputs
 // (a full directory listing, a large file read, a search result) are still resent on every
@@ -7130,6 +7277,10 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     convertGeminiToAnthropicTools,
     convertGeminiToAnthropicMessages,
     callAnthropicAPI,
+    convertGeminiToDeepSeekTools,
+    convertGeminiToDeepSeekMessages,
+    callDeepSeekAPI,
+    getNextModelForHighDemand,
     summarizeToolStart,
     buildRepeatedFailureKey,
     updateWalkthroughItem,

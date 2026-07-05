@@ -33,6 +33,7 @@ function sanitizeRenderedMarkdown(container) {
 let appConfig = {
   geminiApiKey: '',
   anthropicApiKey: '',
+  deepseekApiKey: '',
   googleSearchEngineId: '3354e92e98ab54b31',
   googleSearchApiKey: '',
   defaultModel: 'gemini-2.5-flash-lite',
@@ -102,6 +103,7 @@ const el = {
   btnSettingsSave: document.getElementById('btn-settings-save'),
   settingApiKey: document.getElementById('setting-api-key'),
   settingAnthropicApiKey: document.getElementById('setting-anthropic-api-key'),
+  settingDeepseekApiKey: document.getElementById('setting-deepseek-api-key'),
   settingGoogleSearchEngineId: document.getElementById('setting-google-search-engine-id'),
   settingGoogleSearchApiKey: document.getElementById('setting-google-search-api-key'),
   settingWorkspacePath: document.getElementById('setting-workspace-path'),
@@ -285,6 +287,7 @@ async function loadSettings() {
   // Apply settings to form fields
   el.settingApiKey.value = appConfig.geminiApiKey || '';
   if (el.settingAnthropicApiKey) el.settingAnthropicApiKey.value = appConfig.anthropicApiKey || '';
+  if (el.settingDeepseekApiKey) el.settingDeepseekApiKey.value = appConfig.deepseekApiKey || '';
   el.settingGoogleSearchEngineId.value = appConfig.googleSearchEngineId || '';
   el.settingGoogleSearchApiKey.value = appConfig.googleSearchApiKey || '';
   el.settingWorkspacePath.value = appConfig.defaultWorkspacePath || '';
@@ -395,6 +398,7 @@ function setupSettingsModal() {
   el.btnSettingsSave.addEventListener('click', async () => {
     appConfig.geminiApiKey = el.settingApiKey.value.trim();
     if (el.settingAnthropicApiKey) appConfig.anthropicApiKey = el.settingAnthropicApiKey.value.trim();
+    if (el.settingDeepseekApiKey) appConfig.deepseekApiKey = el.settingDeepseekApiKey.value.trim();
     appConfig.googleSearchEngineId = el.settingGoogleSearchEngineId.value.trim();
     appConfig.googleSearchApiKey = el.settingGoogleSearchApiKey.value.trim();
     appConfig.defaultWorkspacePath = el.settingWorkspacePath.value.trim();
