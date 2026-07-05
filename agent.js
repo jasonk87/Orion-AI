@@ -3306,17 +3306,29 @@ async function mutateOperationalContext(workspace, action, args = {}) {
   const current = await readOperationalContext(workspace);
   if (!current.success) throw new Error(current.error);
   const transition = OperationalContext.applyAction(current.state, action, args);
-  if (action === 'evaluate_win_conditions' && transition.state.winConditions.length > 0 && transition.state.winConditions.every(condition => condition.status === 'satisfied') && agentExecutionMode !== 'direct' && agentExecutionMode !== 'answer') {
-    const completionGate = OperationalContext.evaluateCompletionGate(transition.state, { explicitRequirements: [] });
-    if (completionGate.status !== 'ready_for_final') {
-      throw new Error(`Completion gate rejected final win-condition satisfaction: ${buildCompletionGateMessage(completionGate)}`);
-    }
-  }
+  // OperationalContext.applyAction already enforces the real evidence gate per-condition (a
+  // condition cannot be marked 'satisfied' without a concrete evidence entry) — that is the
+  // legitimate check. This function used to ALSO run the broader, stricter evaluateCompletionGate
+  // (checklist items, blockers, verification-evidence text matching, mission statement) whenever
+  // every win condition would end up satisfied, and if that separate, unrelated check wasn't happy
+  // it threw before ever writing state — silently discarding the model's evidenced win-condition
+  // satisfaction entirely. That meant a genuinely-completed condition (e.g. a screenshot proving a
+  // UI fix worked) never got persisted, winPending stayed true forever, and the run kept
+  // auto-continuing even after the user-visible task was truly done. Persist the state
+  // unconditionally now; the broader gate is only used to attach informational feedback about
+  // what else (if anything) is needed before the whole mission can be considered finished.
   const writeResult = await window.api.writeFile(workspace, OPERATIONAL_CONTEXT_PATH, `${JSON.stringify(transition.state, null, 2)}\n`);
   if (writeResult && writeResult.error) throw new Error(writeResult.error);
   await appendOperationalJournal(workspace, transition.event, transition.state.revision);
   if (window.updateOperationalContext) window.updateOperationalContext(transition.state);
-  return { success: true, action, event: transition.event, state: transition.state, path: OPERATIONAL_CONTEXT_PATH };
+  let completionGateInfo = null;
+  if (action === 'evaluate_win_conditions' && transition.state.winConditions.length > 0 && transition.state.winConditions.every(condition => condition.status === 'satisfied') && agentExecutionMode !== 'direct' && agentExecutionMode !== 'answer') {
+    const completionGate = OperationalContext.evaluateCompletionGate(transition.state, { explicitRequirements: [] });
+    if (completionGate.status !== 'ready_for_final') {
+      completionGateInfo = `All win conditions are now satisfied, but the mission is not yet ready to finish: ${buildCompletionGateMessage(completionGate)}`;
+    }
+  }
+  return { success: true, action, event: transition.event, state: transition.state, path: OPERATIONAL_CONTEXT_PATH, completionGateInfo };
 }
 
 async function checkpointOperationalContext(workspace, reason, summary, nextAction = '') {
@@ -3409,9 +3421,14 @@ function buildOperationalContextFromStrategy(content) {
   const whatNotToTouch = extractMarkdownSection(content, 'What Not To Touch');
   const mission = firstMeaningfulLine(trueObjective, 'Execute the strategy in STRATEGY.md.');
   const evidenceLines = bulletLines(evidenceRequired, 12);
+  // Fallback used only when the strategy itself never named concrete evidence bullets. The old
+  // text ("Evidence satisfies strategy objective: {mission}") was circular — it named no concrete
+  // check, so it could never be honestly marked satisfied and a run could loop forever even after
+  // the real objective was verifiably done. Name an actual verification artifact instead so a
+  // screenshot, test run, or manual check has something concrete to attach as evidence.
   const winConditions = evidenceLines.length
     ? evidenceLines.map(line => ({ title: line, status: 'pending', evidence: [] }))
-    : [{ title: `Evidence satisfies strategy objective: ${mission}`, status: 'pending', evidence: [] }];
+    : [{ title: `A concrete check (test run, screenshot, or manual verification) confirms: ${mission}`, status: 'pending', evidence: [] }];
   const discoveries = [
     summarizeSectionForDiscovery('Current repo reality', currentReality),
     summarizeSectionForDiscovery('Relevant files/subsystems', relevantFiles),
@@ -7063,6 +7080,8 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     strategyRequiresClarification,
     buildRefinementPrompt,
     buildOperationalContextFromStrategy,
+    mutateOperationalContext,
+    readOperationalContext,
     validateRunCommandForAgentUse,
     extractPythonScriptPath,
     commandProvidesInput,

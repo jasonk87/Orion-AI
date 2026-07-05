@@ -280,6 +280,65 @@ test('strategy derives operational context mission and win conditions', (t) => {
   t.end();
 });
 
+// Regression: when a STRATEGY.md has no "## Evidence Required for Success" bullets, the fallback
+// win condition used to read "Evidence satisfies strategy objective: {mission}" — circular and
+// unsatisfiable, since it names no concrete check. Combined with the (now-fixed) discard bug below,
+// a task with no evidence bullets could never honestly close out, even after being genuinely done.
+test('the fallback win condition (no Evidence Required bullets) names a concrete, satisfiable check', (t) => {
+  const derived = agent.buildOperationalContextFromStrategy(validStrategy({
+    'True Objective': 'Fix the missing start button on the game selection screen.',
+    'Evidence Required for Success': ''
+  }));
+  t.equal(derived.winConditions.length, 1, 'falls back to exactly one win condition');
+  const title = derived.winConditions[0].title;
+  t.ok(/test run|screenshot|manual verification/i.test(title), 'the fallback names a concrete verification artifact');
+  t.ok(title.includes('Fix the missing start button on the game selection screen.'), 'the fallback still references the actual mission');
+  t.notOk(/^Evidence satisfies strategy objective/.test(title), 'no longer uses the old circular phrasing');
+  t.end();
+});
+
+// Regression: mutateOperationalContext used to run a SECOND, much stricter completion-gate check
+// whenever evaluate_win_conditions would satisfy every win condition, and if that broader check
+// (blockers, checklist items, verification-evidence text matching) wasn't happy, it threw BEFORE
+// ever writing state — silently discarding the model's already-validated, evidenced win-condition
+// satisfaction. This is exactly what caused a real run to auto-continue forever even after the
+// screenshot-verified UI fix was genuinely done: the win condition never actually got persisted as
+// satisfied, so winPending stayed true on every subsequent pass.
+test('evaluate_win_conditions persists evidenced satisfaction even when the broader mission is not ready to finish', async (t) => {
+  const store = {};
+  global.window.api = {
+    readFile: async (workspace, relPath) => (store[relPath] !== undefined ? store[relPath] : { error: 'not found' }),
+    writeFile: async (workspace, relPath, content) => { store[relPath] = content; return { success: true }; }
+  };
+
+  // Seed a mission with one win condition and no other blocking state.
+  await agent.mutateOperationalContext('/ws', 'update_mission_context', {
+    mission: 'Fix the missing start button on the game selection screen.',
+    winConditions: [{ id: 'start-btn', title: 'A concrete check confirms the start button is visible.' }]
+  });
+
+  // Mark it satisfied with real evidence (a screenshot + vision-model confirmation) — exactly what
+  // the model did in the live transcript this bug came from.
+  const result = await agent.mutateOperationalContext('/ws', 'evaluate_win_conditions', {
+    evaluations: [{
+      id: 'start-btn',
+      status: 'satisfied',
+      evidence: ['game_selection_screen_fixed.png: vision model judged appears_satisfied, confidence 1.00']
+    }]
+  });
+
+  t.equal(result.success, true, 'the mutation succeeds instead of throwing');
+  t.equal(result.state.winConditions[0].status, 'satisfied', 'the win condition state reflects satisfaction in the returned result');
+
+  // The critical assertion: re-reading from disk must show the win condition as satisfied. Before
+  // the fix, the broader completion gate (no verification-evidence regex match on this exact text
+  // in some paths, or other unrelated criteria) could throw and the write above would never happen.
+  const reread = await agent.readOperationalContext('/ws');
+  t.equal(reread.state.winConditions[0].status, 'satisfied', 'the satisfied state is actually persisted to disk, not silently discarded');
+  t.equal(reread.state.winConditions[0].evidence.length, 1, 'the evidence is persisted alongside the satisfied status');
+  t.end();
+});
+
 test('plan approval validation requires a testing plan section', (t) => {
   t.equal(agent.hasRequiredTestingPlanSection('# Plan\n\n## Testing Plan\n\nRun npm test.'), true, 'accepts required Testing Plan heading');
   t.equal(agent.hasRequiredTestingPlanSection('# Plan\n\n### Test Plan\n\nRun npm test.'), true, 'accepts Test Plan subheading');
