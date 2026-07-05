@@ -2523,6 +2523,65 @@ test('a blank final response after real tool work is nudged to produce an actual
   t.end();
 });
 
+// A user reported the "thinking" UI vanished — the chat area showed nothing at all between
+// hitting send and the final answer appearing, leaving no way to tell the run wasn't stuck.
+// Root cause: renderAiMessage's placeholder guard (renderer.js) unconditionally no-op'd on the
+// very first call of a run (text === 'Thinking...', no bubble yet, no logs yet) so the
+// agent-running-indicator spinner never appeared until either a tool call fired or the whole run
+// finished — for a plain conversational answer with no tool calls, that meant the entire
+// duration of the model's response with zero visible feedback. Fixed by calling renderAiMessage
+// immediately when the placeholder message is created (agent.js), and by only suppressing that
+// placeholder in the renderer when no run is actually in progress (so stale placeholders from a
+// dead run still don't reappear on reload/replay).
+test('the running-indicator placeholder is rendered immediately at the start of a run, not only after the first tool call', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  const renderCalls = [];
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = (text, logs, conversationId) => { renderCalls.push({ text, logs, conversationId }); };
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: false });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    listFiles: async () => ([]),
+    readFile: async () => '',
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+  };
+
+  const conversation = { id: 'test-thinking-placeholder', messages: [], awaitingPlanApproval: false, planApproved: false };
+
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"answer","reason":"plain question"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+    // A plain conversational answer — no tool calls at all — is exactly the case where nothing
+    // used to render at all until this final response came back.
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'The sky looks blue because of Rayleigh scattering.' }] } }] }) };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
+    await window.runAgentLoop('why is the sky blue', 'gemini-1', conversation);
+
+    t.ok(renderCalls.length >= 2, 'renderAiMessage was called at least twice — once as the immediate placeholder, once with the real answer');
+    t.equal(renderCalls[0].text, 'Thinking...', 'the very first render call is the immediate placeholder, shown before any model response arrives');
+    const finalCall = renderCalls[renderCalls.length - 1];
+    t.ok(/Rayleigh scattering/.test(finalCall.text || ''), 'a later render call carries the real answer');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+  t.end();
+});
+
 // grep_search closes a real gap: the system prompt referenced a "grep_search" tool for years
 // (as an example local tool) but it was never declared in the tool schema and had no executor —
 // the model could never actually call it. This wires it up for real: a literal/regex content

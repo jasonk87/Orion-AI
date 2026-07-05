@@ -443,6 +443,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   if (window.saveConversationsToStorage) {
     window.saveConversationsToStorage();
   }
+  // Show the running-indicator spinner immediately instead of leaving the chat area blank until
+  // the first tool call (or the whole run finishing) — the model's first response can take a
+  // while, and without this the user has no visible sign the run is even happening.
+  if (window.renderAiMessage) {
+    window.renderAiMessage('Thinking...', [], conversation.id, conversation.messages[aiMessageIndex]);
+  }
 
   // ── INTENT ROUTING — driven by structural state, never by parsing the user's words ──
   // The dangerous flows (approval, continuation, execution) are decided entirely from
@@ -832,6 +838,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         aiMessageIndex = conversation.messages.length;
         conversation.messages.push({ role: 'assistant', text: 'Thinking...', logs: [], turns: [] });
         window.saveConversationsToStorage();
+        if (window.renderAiMessage) {
+          window.renderAiMessage('Thinking...', [], conversation.id, conversation.messages[aiMessageIndex]);
+        }
       }
     } catch (e) {
       if (isUserStopError(e)) throw e;

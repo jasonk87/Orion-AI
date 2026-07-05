@@ -257,3 +257,19 @@ test('the model dropdown is rebuilt from a single JS source that includes Claude
   t.notOk(html.includes('value="deepseek-v4-flash"'), 'index.html no longer has a dead duplicate DeepSeek option');
   t.end();
 });
+
+// The chat area used to show nothing at all — no bubble, no spinner — between the user sending a
+// message and the model's first response arriving, because renderAiMessage's placeholder guard
+// unconditionally skipped the very first "Thinking..." call of a run. Fixed to only skip it when
+// no run is actually in progress, so a live run's running-indicator spinner shows immediately.
+test('the AI thinking placeholder only suppresses stale renders, not an actively running turn', (t) => {
+  t.ok(renderer.includes('const runningNow = window.isAgentRunning && window.isAgentRunning()'),
+    'renderAiMessage checks whether a run is actively in progress before suppressing the placeholder');
+  t.ok(renderer.includes('if (!runningNow) return;'),
+    'the placeholder is only suppressed when nothing is actually running');
+  const agentJsSource = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8').replace(/\r\n/g, '\n');
+  const placeholderRenderCalls = agentJsSource.match(/window\.renderAiMessage\('Thinking\.\.\.', \[\]/g) || [];
+  t.ok(placeholderRenderCalls.length >= 2,
+    'agent.js renders the placeholder immediately at both points a fresh "Thinking..." message is created');
+  t.end();
+});

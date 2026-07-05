@@ -2716,7 +2716,16 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   const hasLogs = Array.isArray(logs) && logs.length > 0;
   const isThinkingPlaceholder = String(text || '').trim() === 'Thinking...';
   if (!activeAiBubble && isThinkingPlaceholder && !hasLogs) {
-    return;
+    // A stale "Thinking..." placeholder from a run that ended without ever producing real text
+    // must not reappear on conversation load/replay. But while a run is actively in progress for
+    // this conversation, this is the very first call for the turn — before any tool call has
+    // happened — and skipping it left the chat area completely blank (no bubble, no spinner)
+    // until either a tool call fired or the whole run finished, which could be the entire
+    // duration of the model's first response. Let it through so the running-indicator spinner
+    // below shows immediately instead of leaving the user with no feedback at all.
+    const runningNow = window.isAgentRunning && window.isAgentRunning() &&
+      (window.getRunningConversationId ? window.getRunningConversationId() === targetId : true);
+    if (!runningNow) return;
   }
   const stickToBottom = shouldAutoScrollChat();
   let bubble;
