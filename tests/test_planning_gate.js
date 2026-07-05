@@ -2457,6 +2457,72 @@ test('compactHistory still trims to a short tail when the boundary already falls
   }
 });
 
+// A transcript showed a model do a long batch of read-only investigation (grep_search/read_file)
+// on a plain "look through the code and tell me X" request, then return a completely blank final
+// turn (no text, no tool call). None of the checklist/win-condition/auto-continue machinery
+// applies to a read-only ask, so the run fell straight through to the generic "I inspected the
+// workspace but did not produce the requested answer" bailout, leaving the user with no real
+// answer. The fix: a blank response after real tool work gets one dedicated, budget-exempt nudge
+// to actually answer, ahead of every other recovery gate.
+test('a blank final response after real tool work is nudged to produce an actual answer instead of bailing out', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: false });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    readFile: async () => 'def main():\n    pass\n',
+    listFiles: async () => ([{ path: 'main.py', isDir: false, size: 100 }]),
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+  };
+
+  const conversation = { id: 'test-blank-final-response', messages: [], awaitingPlanApproval: false, planApproved: false };
+
+  let turnCount = 0;
+  let sawBlankRecoveryNudge = false;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"answer","reason":"read-only investigation"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+    if (/no text and no tool call/i.test(lastText)) sawBlankRecoveryNudge = true;
+
+    turnCount++;
+    if (turnCount === 1) {
+      return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'read_file', args: { path: 'main.py' } } }] } }] }) };
+    }
+    if (turnCount === 2) {
+      // Truly blank turn: no text, no functionCall — the exact failure from the transcript.
+      return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [] } }] }) };
+    }
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'The game starts in main.py, which currently just calls pass.' }] } }] }) };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
+    await window.runAgentLoop('look through the game and see where we start', 'gemini-1', conversation);
+
+    t.ok(sawBlankRecoveryNudge, 'the blank-response recovery nudge was sent after the empty turn');
+    const aiMessage = conversation.messages.find(m => m.role === 'assistant');
+    t.ok(aiMessage, 'assistant message was created');
+    t.ok(/main\.py/.test(aiMessage.text || ''), 'the run recovered and produced the real answer, not the generic bailout');
+    t.notOk(/did not produce the requested answer/i.test(aiMessage.text || ''), 'the generic no-answer bailout message is not shown once recovery succeeds');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+  t.end();
+});
+
 // grep_search closes a real gap: the system prompt referenced a "grep_search" tool for years
 // (as an example local tool) but it was never declared in the tool schema and had no executor —
 // the model could never actually call it. This wires it up for real: a literal/regex content

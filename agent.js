@@ -859,6 +859,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     let reviewCompletionLoopExtensions = 0;
     let pendingWorkspaceResolutionPrompts = 0;
     let memoryNudgeSent = false;
+    let blankFinalAnswerNudgeSent = false;
     const repeatedToolFailures = new Map();
     const fileEditCounts = new Map();
     const fileNeedsReadBeforeEdit = new Set(); // files that must be read before the next edit
@@ -1099,6 +1100,26 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // If no tool calls, the agent is done, unless there are pending tasks in the checklist
       if (functionCalls.length === 0) {
         consecutiveNoToolCalls++;
+        // A model can do a batch of real tool work (reads/searches) and then, on the very next
+        // turn, return truly nothing at all — no tool call, no text. Every other recovery gate
+        // below shares a small per-run budget (finalAnswerQualityPrompts, evidencePrompts, etc.),
+        // and a long investigative turn can exhaust that budget on earlier nudges before ever
+        // reaching this specific case, letting a blank response fall straight through to the
+        // generic "did not produce an answer" bailout at the end of the run. A blank response
+        // after real work is the clearest possible signal the model just stopped mid-task, so it
+        // gets one dedicated, budget-exempt retry here, ahead of every other gate.
+        if (!textVal.trim() && !blankFinalAnswerNudgeSent && workWalkthrough.some(item => item && item.status !== 'error')) {
+          blankFinalAnswerNudgeSent = true;
+          if (loopCount >= maxLoops) maxLoops++;
+          currentAgentLogs.push({ type: 'thought', content: 'Blank-response guard: the model gathered evidence but returned nothing at all. Forcing one more turn to write the actual answer.' });
+          messages.push({
+            role: 'user',
+            parts: [{
+              text: `[SYSTEM: Your last response contained no text and no tool call, even though you already gathered evidence this run (file reads, searches, etc.). Do not stop mid-task. Write your complete, direct answer to the user's original request now, using everything you found. The user's original message was: "${String(userPrompt || '').replace(/"/g, "'").slice(0, 500)}"]`
+            }]
+          });
+          continue;
+        }
         const pendingTasks = conversation.tasks ? conversation.tasks.filter(t => t.status !== 'completed' && t.status !== 'x') : [];
         if (config.planningMode && !canExecuteThisTask() && !hasAnyChecklist(conversation) && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
           messages.push({
