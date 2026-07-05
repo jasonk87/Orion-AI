@@ -978,9 +978,9 @@ test('legacy phone companion token announcements are scrubbed and blocked', (t) 
   t.end();
 });
 
-test('checklist updates are milestone-only to avoid progress churn', (t) => {
-  t.ok(agentJs.includes('Use only for milestone changes'), 'tool description warns against routine checklist churn');
-  t.ok(agentJs.includes('Do not call it just to mark an item "in-progress"'), 'system prompt blocks in-progress-only updates');
+test('checklist updates allow marking a milestone in-progress but block repeated no-op refreshes', (t) => {
+  t.ok(agentJs.includes("Do not call repeatedly for the same state"), 'tool description warns against repeated no-op refreshes');
+  t.ok(agentJs.includes('Do not call it repeatedly just to refresh the same in-progress state'), 'system prompt blocks repeated in-progress refreshes');
 
   const initial = agent.shouldApplyChecklistUpdate([], [
     { title: 'Explore the codebase', status: 'pending' },
@@ -988,14 +988,23 @@ test('checklist updates are milestone-only to avoid progress churn', (t) => {
   ]);
   t.equal(initial.allowed, true, 'initial checklist creation is allowed');
 
-  const churn = agent.shouldApplyChecklistUpdate([
+  const startingWork = agent.shouldApplyChecklistUpdate([
     { title: 'Explore the codebase', status: 'pending' },
     { title: 'Implement fix', status: 'pending' },
   ], [
     { title: 'Explore the codebase', status: 'in-progress' },
     { title: 'Implement fix', status: 'pending' },
   ]);
-  t.equal(churn.allowed, false, 'pending to in-progress only is skipped');
+  t.equal(startingWork.allowed, true, 'pending to in-progress is allowed when starting a milestone');
+
+  const churn = agent.shouldApplyChecklistUpdate([
+    { title: 'Explore the codebase', status: 'in-progress' },
+    { title: 'Implement fix', status: 'pending' },
+  ], [
+    { title: 'Explore the codebase', status: 'in-progress' },
+    { title: 'Implement fix', status: 'pending' },
+  ]);
+  t.equal(churn.allowed, false, 'resending the exact same in-progress state is skipped as a no-op');
 
   const completed = agent.shouldApplyChecklistUpdate([
     { title: 'Explore the codebase', status: 'in-progress' },

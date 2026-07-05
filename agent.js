@@ -52,7 +52,7 @@ CRITICAL RULES:
 7A. ADAPT INSTEAD OF QUITTING: Do not abandon a task after ordinary errors. If an edit, command, test, or route check fails, inspect fresh state, group repeated failures, look up official/current docs when needed, and try a different strategy. A failed tool path is evidence about that tool attempt, not proof that the user's objective is impossible. Stop only for hard blockers such as missing credentials, unavailable model access, explicit user stop, or a hard-destructive command block; when stopping, preserve state and explain the exact next recovery step.
 8. BE CONCISE: Explain your technical decisions briefly. The user can see your tools running and thoughts.
 9. AUTONOMOUS WORKFLOW: Once the user approves your plan, execute all required file creations, edits, and test runs consecutively in a single session without yielding or waiting for further conversational input. For direct tasks that do not need a plan, execute them immediately and report the result. Keep calling tools until the entire task is fully complete.
-10. TASK COMPLETION: Create a checklist during planning when a task has meaningful milestones. During execution, use "set_task_checklist" sparingly: update it only when a milestone is completed, blocked, added, removed, or materially revised. Do not call it just to mark an item "in-progress" after reading/searching files or to refresh the same state. If exploration gives enough evidence, move to the next action instead of repeating checklist updates. Once all tasks are complete, update the checklist to show all tasks are 'completed', and then present your final summary.
+10. TASK COMPLETION: Create a checklist during planning when a task has meaningful milestones. When you begin working on a milestone, use "set_task_checklist" to mark it as 'in-progress'. Once finished, update it to 'completed'. Do not call it repeatedly just to refresh the same in-progress state. Once all tasks are complete, update the checklist to show all tasks are 'completed', and then present your final summary.
 11. RESPONSE FORMAT: Use clean GitHub-flavored Markdown. Prefer short sections with level-2 headings like "Summary", "Findings", "Plan", "Changes", "Tests", and "Next Steps". Use bullets for scan-friendly details, numbered lists only for ordered steps, and fenced code blocks for code. Do not write giant unbroken paragraphs. For code reviews or "look through the code" requests, lead with a brief summary, then specific findings with file/function references, then prioritized recommendations. When creating an implementation plan, put the detailed plan in implementation_plan.md and also show a readable approval summary in chat. At the end of any task that used tools, include a "Work Walkthrough" explaining what you actually did: files touched, commands/tests run, results, and remaining follow-up. NEVER write the same information twice in one response — do not write a narrative paragraph summary and then a bullet-point summary of the same content. Pick one format and write it once.
 12. SECRETS AND ENVIRONMENT: When a project needs the user's Gemini API key, Google API key, or Google Search Engine ID, use "sync_workspace_env" to create or update workspace environment files. Do not hardcode secrets into source files, do not print secret values, and do not ask the user to paste keys you can sync from settings. Make code read secrets from environment variables such as GEMINI_API_KEY, GOOGLE_API_KEY, GOOGLE_SEARCH_API_KEY, GOOGLE_SEARCH_ENGINE_ID, and GOOGLE_CSE_ID. For browser-only/static apps, do not expose private API keys in client-side code; add a small local/server API layer instead.
 13. GEMINI APP DEFAULTS: For new Gemini Python projects, prefer the current "google-genai" package and "from google import genai" unless local files already use a different SDK. The model "gemini-2.5-flash-lite" is valid; do not downgrade it to older model names unless official docs or an API error proves it is unavailable.
@@ -66,6 +66,7 @@ CRITICAL RULES:
    WORKSPACE SELF-REFERENCE: When the user says "this code", "the code", "this program", "this project", "these files", "my code", "the app", "the whole program", or any similar self-referential phrase, they ALWAYS mean the code already in the active workspace. NEVER ask the user to provide or paste code. NEVER ask "which file?" or "which program?" when a workspace is active — read the workspace and figure it out. Call list_files immediately, then read ALL non-boilerplate source files you find (.py, .js, .ts, .html, .css, etc.) in one pass. If the root contains only cache/config files (.env, .gitignore, __pycache__, .ruff_cache, .orion, etc.), look one level deeper into subdirectories. Read first, ask never.
 18. FIND VS FIX: When the user asks you to "find", "look for", "check for", "review", "audit", or "identify" bugs/typos/issues/faults — your job is ONLY to inspect and report what you found. For a broad read-only review, you may use STRATEGY.md as a private review strategy/report outline, but never create implementation_plan.md, never show an approval gate, and never start fixing things. Do NOT modify source files or propose a fix implementation plan. Present your findings clearly and ask the user which issues they want you to address. Only make changes when the user explicitly asks you to fix, patch, implement, or update something.
 16. OPERATING SYSTEM AWARENESS: You are currently running on a Windows system. When guessing or constructing file paths outside the current workspace, ALWAYS use Windows path conventions (e.g., C:\\Users\\owner\\Desktop) with the literal resolved path — do NOT pass unexpanded PowerShell variables like $env:USERPROFILE as a path argument to any tool; resolve the path to a literal string first (e.g., C:\\Users\\owner). If you are unsure of the username, run 'echo $env:USERPROFILE' first. When searching for files on the Desktop or broad directories, ALWAYS limit recursive searches with '-Depth 2' or '-Depth 3' and add '-ErrorAction SilentlyContinue' to avoid timeouts from permission-denied folders. Never run an unbounded 'Get-ChildItem -Recurse' on C:\\ or the Desktop without a depth limit.
+19. PLANNING MODE: Exercise judgement on whether a request warrants a formal plan before taking action. Stop and create an implementation plan (using STRATEGY.md or implementation_plan.md) if the request requires major architectural changes, extensive research, or significant decision making. If you decide that a request does NOT warrant a plan (for example: one-off investigatory questions, trivial tweaks, minor bug fixes, or minor follow-ups to an existing plan), then continue your work WITHOUT making a plan or requesting user review. You have the authority to make small fixes and adjustments instantly without drafting a full blown-out plan.
 
 Tools available:
 - list_files: List a curated project inventory by default. Generated caches, dependencies, runtime/user data, backups, and sensitive-looking files are hidden unless mode="all" is explicitly needed.
@@ -83,6 +84,8 @@ Tools available:
 - patch_file: Targeted file update using line ranges, anchors, exact replacement, or regex. Prefer this over rewriting large files.
 - run_command: Run a command line in Powershell.
 - run_tests: Execute the workspace regression tests.
+- run_linter: Execute a structured linter (eslint, tsc, ruff) over the workspace to proactively catch syntax and logic errors. The output is cleanly parsed.
+- find_references: Find exact usages of a function or variable. For JS/TS, it parses the AST to ensure matches are actual code identifiers, skipping strings and comments. Use this to safely trace how an API is used before modifying it.
 - start_command: Start a shell command asynchronously with a timeout and return immediately.
 - get_command_status: Check whether a started command is running, completed, failed, timed out, or was killed.
 - read_command_output: Read accumulated stdout/stderr from a started command.
@@ -103,7 +106,7 @@ Tools available:
 - capture_screen: Takes another OS-level desktop screenshot — for NATIVE apps (pygame, tkinter) previously launched with preview_app. Do NOT use for web apps; use open_url + take_screenshot instead.
 - inspect_screenshot_with_model: Sends a workspace screenshot to the active chat LLM's multimodal vision for semantic visual inspection against a goal.
 - sync_workspace_env: Safely write configured API keys/search IDs into .env-style files without exposing the secret values in chat or tool output.
-- set_task_checklist: Set the UI checklist of tasks (array of {title, status}). Status can be 'pending', 'in-progress', 'completed'. Use only for milestone changes, not routine progress churn.
+- set_task_checklist: Set the UI checklist of tasks (array of {title, status}). Status can be 'pending', 'in-progress', 'completed'. Call this to mark tasks as 'in-progress' when starting them, and 'completed' when finished. Do not call repeatedly for the same state.
 - step_complete: Emit after completing each step of an approved implementation plan. Orion auto-runs tests and injects a [POST-STEP VERIFICATION: ...] message. If tests fail you must fix them before the next step.
 - read_project_memory: Reads the persistent per-workspace project memory: architectural decisions, API shapes, gotchas, and preferences saved from prior sessions.
 - append_project_memory: Appends a durable fact to the workspace project memory. Use whenever you discover a decision, pattern, API shape, or constraint that future sessions should know.
@@ -487,7 +490,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     agentExecutionMode = 'executing';
   } else if (conversation.awaitingPlanApproval && !conversation.planApproved) {
     // The user is replying to a pending plan. The model classifies their reply.
-    approvalIntent = await classifyPlanApprovalIntent(userPrompt, resolveUtilityModelName(modelName), config.geminiApiKey);
+    approvalIntent = await classifyPlanApprovalIntent(userPrompt, resolveUtilityModelName(modelName), config);
     if (approvalIntent.intent === 'approve') {
       const planText = await readImplementationPlanText(workspacePath, conversation);
       if (hasRequiredTestingPlanSection(planText)) {
@@ -512,7 +515,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       suppressPlanApprovalCardThisTurn = true;
       const decision = config.planningMode === false
         ? { mode: 'direct', reason: 'Planning mode disabled.' }
-        : await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config.geminiApiKey);
+        : await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config);
       planningDecision = decision;
       reviewOnly = !!decision.reviewOnly;
       if (reviewOnly && planningDecision.mode === 'plan') {
@@ -539,7 +542,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // unless the model judges it a genuinely new plan-worthy task.
     const decision = config.planningMode === false
       ? { mode: 'direct', reason: 'Planning mode disabled.' }
-      : await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config.geminiApiKey);
+      : await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config);
     // A mission is genuinely in progress when an active subplan still has work or any win
     // condition is unsatisfied. While that is true we must NEVER downgrade to a re-plan: doing
     // so clears planApproved and wipes the operational context (mission/subplan/win conditions),
@@ -565,7 +568,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     agentExecutionMode = 'direct';
   } else {
     // Fresh task, nothing pending or approved. The model decides plan / direct / answer.
-    const decision = await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config.geminiApiKey);
+    const decision = await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config);
     planningDecision = decision;
     reviewOnly = !!decision.reviewOnly;
     resetMissionState = true; // a fresh task should not inherit a previous mission's state
@@ -803,12 +806,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
     // Check if we need to compact context
     try {
-      const tokenCount = await countTokens(messages, resolveUtilityModelName(modelName), config.geminiApiKey, { signal: getActiveRunSignal() });
+      const tokenCount = await countTokens(messages, resolveUtilityModelName(modelName), config, { signal: getActiveRunSignal() });
       console.log("Current conversation tokens:", tokenCount);
       const compactThreshold = getCompactionThreshold(modelName, config);
       if (config.autoCompact !== false && tokenCount > compactThreshold) {
         window.appendSystemMessage(`Context reached ${tokenCount} tokens; compacting for ${modelName} at threshold ${compactThreshold}.`);
-        const compactResult = await compactHistory(messages, resolveUtilityModelName(modelName), config.geminiApiKey);
+        const compactResult = await compactHistory(messages, resolveUtilityModelName(modelName), config);
         persistCompactedConversation(conversation, compactResult.summary);
         await appendScopedNotes(workspacePath, conversation, `\n\n## Context Compaction ${new Date().toISOString()}\n${compactResult.summary}\n`);
         const checkpoint = await checkpointOperationalContext(workspacePath, 'context_compaction', 'Conversation context was compacted; canonical mission state was preserved.', 'Continue the active subplan from operational context.');
@@ -1164,7 +1167,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           console.log(`No tool calls, but there are ${pendingTasks.length} pending tasks. Continuing loop automatically.`);
           
           // Append a system message instructing the model to continue
-          const prompt = `[SYSTEM: You returned a response without calling any tools, but there are still pending tasks in the checklist: ${pendingTasks.map(t => `"${t.title}"`).join(', ')}. Continue with the next concrete tool action if one is needed. Do not call set_task_checklist merely to mark in-progress work. If the pending task is already complete, mark it completed; if you are blocked, explain the blocker and the next recovery step. When everything is fully complete and verified, output your final summary.]`;
+          const prompt = `[SYSTEM: You returned a response without calling any tools, but there are still pending tasks in the checklist: ${pendingTasks.map(t => `"${t.title}"`).join(', ')}. Continue with the next concrete tool action if one is needed. Be sure to mark tasks as 'in-progress' when starting them and 'completed' when done. If you are blocked, explain the blocker and the next recovery step. When everything is fully complete and verified, output your final summary.]`;
           
           messages.push({ role: 'user', parts: [{ text: prompt }] });
           continue;
@@ -1888,7 +1891,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // model can forget to do — it must not be the only signal stall detection trusts, or a pass
     // that made real file edits (but no checklist update) looks identical to a pass that thrashed
     // on nothing but failed tool calls, and both get stopped prematurely as "stalled."
-    const EDIT_OR_COMMAND_TOOLS = new Set(['write_file', 'modify_file', 'patch_file', 'run_command', 'start_command', 'run_tests']);
+    const EDIT_OR_COMMAND_TOOLS = new Set(['write_file', 'modify_file', 'patch_file', 'run_command', 'start_command', 'run_tests', 'run_linter']);
     const hadSuccessfulEditOrCommandThisPass = (workWalkthrough || []).some(item => item && item.status !== 'error' && EDIT_OR_COMMAND_TOOLS.has(item.toolName));
 
     conversation._planExecAutoContinues = conversation._planExecAutoContinues || 0;
@@ -2293,6 +2296,20 @@ async function executeTool(name, args, workspace, config, conversation) {
       return result;
     }
 
+    case 'get_file_symbols': {
+      if (!args.path) throw new Error("Missing 'path' parameter");
+      const result = await window.api.getFileSymbols(workspace, args.path);
+      if (!result.success) throw new Error(result.error || 'Failed to extract file symbols');
+      return result.symbols;
+    }
+
+    case 'semantic_search': {
+      if (!args.query) throw new Error("Missing 'query' parameter");
+      const result = await window.api.semanticSearch(args.query, workspace, config, 10);
+      if (!result.success) throw new Error(result.error || 'Semantic search failed');
+      return result.results;
+    }
+
     case 'read_file': {
       if (!args.path) throw new Error("Missing 'path' parameter");
       const content = isOrionGovernanceArtifactPath(args.path)
@@ -2624,6 +2641,20 @@ async function executeTool(name, args, workspace, config, conversation) {
         success: testRes.success,
         output: testRes.output
       };
+    }
+    
+    case 'run_linter': {
+      if (!args.linterType) throw new Error("Missing 'linterType' parameter");
+      const res = await window.api.runLinter(workspace, args.linterType, args.targetPath || '.');
+      if (!res.success) throw new Error(res.error || 'Failed to run linter');
+      return { success: true, results: res.results };
+    }
+    
+    case 'find_references': {
+      if (!args.symbolName) throw new Error("Missing 'symbolName' parameter");
+      const res = await window.api.findReferences(workspace, args.symbolName, args.targetPath || '.');
+      if (!res.success) throw new Error(res.error || 'Failed to find references');
+      return { success: true, results: res.results };
     }
 
     case 'google_search': {
@@ -3212,6 +3243,9 @@ function shouldApplyChecklistUpdate(previousTasks = [], nextTasks = []) {
         meaningful = true;
       }
       if (previousTask.status === 'in-progress' && task.status === 'pending') {
+        meaningful = true;
+      }
+      if (previousTask.status === 'pending' && task.status === 'in-progress') {
         meaningful = true;
       }
     }
@@ -3898,7 +3932,7 @@ function getPlanningToolGate(config, canExecute, toolName, args = {}, options = 
   if (!config || !config.planningMode || canExecute) {
     return { allowed: true, forceYield: false, reason: '' };
   }
-  const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'start_command', 'run_tests', 'sync_workspace_env', 'launch_workspace_app', 'preview_app', 'git_push', 'download_file', 'download_from_page', 'extract_archive', 'take_screenshot'];
+  const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'start_command', 'run_tests', 'run_linter', 'sync_workspace_env', 'launch_workspace_app', 'preview_app', 'git_push', 'download_file', 'download_from_page', 'extract_archive', 'take_screenshot'];
   const completionTools = ['complete_subplan', 'evaluate_win_conditions'];
   const strategyStatus = options.strategyStatus || {};
   const executionMode = options.agentExecutionMode || '';
@@ -4051,10 +4085,12 @@ function summarizeToolStart(toolName, args = {}) {
     const opDetail = op.type && opLabels[op.type] ? ` (${opLabels[op.type]})` : '';
     return { toolName, kind: 'file', status: 'running', path: args.path, operationType: op.type, label: `Patched \`${args.path || 'file'}\`${opDetail}` };
   }
+  if (toolName === 'run_tests') return { toolName, kind: 'test', status: 'running', label: 'Ran regression tests' };
+  if (toolName === 'run_linter') return { toolName, kind: 'test', status: 'running', label: `Ran ${args.linterType || 'linter'} on ${args.targetPath || 'workspace'}` };
+  if (toolName === 'find_references') return { toolName, status: 'running', label: `Found references for \`${args.symbolName || ''}\`` };
   if (toolName === 'run_command' || toolName === 'start_command') {
     return { toolName, kind: 'command', status: 'running', command: args.command, label: `${toolName === 'start_command' ? 'Started' : 'Ran'} \`${args.command || 'command'}\`` };
   }
-  if (toolName === 'run_tests') return { toolName, kind: 'test', status: 'running', label: 'Ran regression tests' };
   if (toolName === 'set_task_checklist') {
     const count = Array.isArray(args.tasks) ? args.tasks.length : 0;
     return { toolName, kind: 'checklist', status: 'running', label: `Requested checklist update${count ? ` (${count} items)` : ''}` };
@@ -4291,6 +4327,7 @@ function isVerificationItem(item) {
   if (item.status === 'error') return false;
   if (looksLikePlaceholderTestOutput(item.output)) return false;
   if (item.toolName === 'run_tests' || item.kind === 'test') return true;
+  if (item.toolName === 'evaluate_win_conditions') return true;
   if (item.toolName === 'run_command') return isRealVerificationCommand(item.command);
   if (item.toolName === 'start_command') return isRealVerificationCommand(item.command);
   // A bounded GUI preview that actually captured a screenshot is real evidence the app rendered.
@@ -4727,7 +4764,81 @@ function hasAnyChecklist(conversation) {
   return !!(conversation && Array.isArray(conversation.tasks) && conversation.tasks.length > 0);
 }
 
-async function classifyPlanApprovalIntent(userPrompt, modelName, apiKey) {
+async function callUtilityModel(prompt, modelName, config, requireJson = true) {
+  if (modelName.startsWith('deepseek')) {
+    if (!config.deepseekApiKey) return null;
+    try {
+      const response = await fetch('https://api.deepseek.com/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.deepseekApiKey}` },
+        body: JSON.stringify({
+          model: modelName,
+          messages: [{ role: 'user', content: prompt }],
+          temperature: 0,
+          ...(requireJson ? { response_format: { type: 'json_object' } } : {})
+        })
+      });
+      if (!response.ok) return null;
+      const data = await response.json();
+      return (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || null;
+    } catch (e) {
+      console.error('DeepSeek utility call failed:', e);
+      return null;
+    }
+  } else if (modelName.startsWith('gemini-')) {
+    if (!config.geminiApiKey) return null;
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${config.geminiApiKey}`;
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0,
+            ...(requireJson ? { responseMimeType: 'application/json' } : {})
+          }
+        })
+      });
+      if (!response.ok) return null;
+      const data = await response.json();
+      return (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0].text) || null;
+    } catch (e) {
+      console.error('Gemini utility call failed:', e);
+      return null;
+    }
+  } else {
+    // Assume Ollama local for anything else
+    try {
+      const response = await fetch(`http://localhost:11434/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: modelName,
+          messages: [
+            { role: 'system', content: "You are a concise, technical summarizer utility." },
+            { role: 'user', content: prompt }
+          ],
+          stream: false,
+          options: { temperature: 0 }
+        })
+      });
+      if (!response.ok) return null;
+      const resData = await response.json();
+      let text = resData.message && resData.message.content;
+      // Some Ollama models don't support JSON mode reliably, but we try to parse it if required
+      if (requireJson && text) {
+        // Just return the raw text, the caller uses JSON.parse which will handle it
+      }
+      return text || null;
+    } catch (e) {
+      console.error('Ollama utility call failed:', e);
+      return null;
+    }
+  }
+}
+
+async function classifyPlanApprovalIntent(userPrompt, modelName, config) {
   const fallback = { intent: 'unclear', reason: 'Could not classify plan approval intent.' };
   const prompt = `Classify the user's latest message about a pending implementation plan.
 
@@ -4745,27 +4856,9 @@ User message:
 ${JSON.stringify(String(userPrompt || ''))}`;
 
   try {
-    if (modelName && !modelName.startsWith('gemini-')) {
-      return fallback;
-    }
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName || 'gemini-2.5-flash-lite'}:generateContent?key=${apiKey}`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0,
-          responseMimeType: 'application/json'
-        }
-      })
-    });
-    if (!response.ok) return fallback;
-    const data = await response.json();
-    const text = data.candidates && data.candidates[0] && data.candidates[0].content &&
-      data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
-      data.candidates[0].content.parts[0].text;
-    const parsed = JSON.parse(text || '{}');
+    const text = await callUtilityModel(prompt, modelName, config, true);
+    if (!text) return fallback;
+    const parsed = JSON.parse(text);
     const intent = ['approve', 'deny', 'revise', 'other', 'unclear'].includes(parsed.intent) ? parsed.intent : 'unclear';
     return { intent, reason: String(parsed.reason || '') };
   } catch (e) {
@@ -4774,7 +4867,7 @@ ${JSON.stringify(String(userPrompt || ''))}`;
   }
 }
 
-async function classifyPlanningNeed(userPrompt, modelName, apiKey) {
+async function classifyPlanningNeed(userPrompt, modelName, config) {
   const regexFallback = () => ({
     mode: 'plan',
     reason: 'Could not safely classify task complexity.',
@@ -4843,27 +4936,9 @@ User message:
 ${JSON.stringify(String(userPrompt || ''))}`;
 
   try {
-    if (modelName && !modelName.startsWith('gemini-')) {
-      return regexFallback();
-    }
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName || 'gemini-2.5-flash-lite'}:generateContent?key=${apiKey}`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0,
-          responseMimeType: 'application/json'
-        }
-      })
-    });
-    if (!response.ok) return regexFallback();
-    const data = await response.json();
-    const text = data.candidates && data.candidates[0] && data.candidates[0].content &&
-      data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
-      data.candidates[0].content.parts[0].text;
-    const parsed = JSON.parse(text || '{}');
+    const text = await callUtilityModel(prompt, modelName, config, true);
+    if (!text) return regexFallback();
+    const parsed = JSON.parse(text);
     const mode = ['plan', 'direct', 'answer'].includes(parsed.mode) ? parsed.mode : 'plan';
     const taskComplexity = ['light', 'standard', 'deep'].includes(parsed.taskComplexity) ? parsed.taskComplexity : 'standard';
     return {
@@ -6060,6 +6135,28 @@ function buildAgentToolDeclarations() {
             }
           },
           {
+            name: "get_file_symbols",
+            description: "Uses an AST parser to return the signatures of all classes, methods, and functions in a file.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                path: { type: "STRING", description: "The path to the file." }
+              },
+              required: ["path"]
+            }
+          },
+          {
+            name: "semantic_search",
+            description: "Performs a vector-based semantic search across the workspace to find code by meaning rather than exact string matching.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                query: { type: "STRING", description: "The semantic query to search for (e.g. 'where does user authentication happen')." }
+              },
+              required: ["query"]
+            }
+          },
+          {
             name: "get_command_status",
             description: "Checks status for a command started with start_command.",
             parameters: {
@@ -6129,6 +6226,30 @@ function buildAgentToolDeclarations() {
             parameters: { type: "OBJECT", properties: {} }
           },
           {
+            name: "run_linter",
+            description: "Runs a proactive structured linter (eslint, tsc, or ruff) and returns a clean array of errors.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                linterType: { type: "STRING", description: "The type of linter to run: 'eslint', 'tsc', or 'ruff'." },
+                targetPath: { type: "STRING", description: "The path to lint (default is '.')." }
+              },
+              required: ["linterType"]
+            }
+          },
+          {
+            name: "find_references",
+            description: "Finds usages of a function or variable across the workspace, using AST validation for JS/TS to skip noise.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                symbolName: { type: "STRING", description: "The literal string name of the symbol to find references for." },
+                targetPath: { type: "STRING", description: "Optional path restriction (default is '.')." }
+              },
+              required: ["symbolName"]
+            }
+          },
+          {
             name: "google_search",
             description: "Searches Google for current documentation, API references, examples, and troubleshooting. Do not use for facts about this local machine, workspace state, installed tools, paths, memory, disk, processes, or environment variables; inspect local state instead.",
             parameters: {
@@ -6168,7 +6289,7 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "set_task_checklist",
-            description: "Sets the task checklist in the side panel for meaningful milestones only. Pass an array of items with a status ('pending', 'in-progress', 'completed'); do not call this just to refresh in-progress state.",
+            description: "Sets the task checklist in the side panel. Pass an array of items with a status ('pending', 'in-progress', 'completed'). Use this to mark tasks as 'in-progress' when you start them and 'completed' when done.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -6705,7 +6826,7 @@ function convertGeminiToDeepSeekMessages(geminiMessages) {
     } else if (msg.role === 'model') {
       const textParts = (msg.parts || []).filter(p => p.text && !p.thought && !p._deepseekReasoningContent).map(p => p.text);
       const reasoningContent = (msg.parts || [])
-        .filter(p => p._deepseekReasoningContent && p.text)
+        .filter(p => (p._deepseekReasoningContent || p.thought) && p.text)
         .map(p => p.text)
         .join('');
       const toolCalls = [];
@@ -6717,7 +6838,8 @@ function convertGeminiToDeepSeekMessages(geminiMessages) {
           toolCalls.push({ id, type: 'function', function: { name: p.functionCall.name, arguments: JSON.stringify(p.functionCall.args || {}) } });
         }
       });
-      const assistantMsg = { role: 'assistant', content: textParts.join('') || null };
+      const joinedText = textParts.join('');
+      const assistantMsg = { role: 'assistant', content: joinedText || (reasoningContent ? "" : null) };
       if (reasoningContent) assistantMsg.reasoning_content = reasoningContent;
       if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
       out.push(assistantMsg);
@@ -6967,6 +7089,9 @@ async function inspectScreenshotWithModel({ imageBase64, mimeType, path, goal, m
   if (modelName.startsWith('gemini-')) {
     return await inspectScreenshotWithGemini({ imageBase64, mimeType, path, goal, modelName, apiKey });
   }
+  if (apiKey) {
+    return await inspectScreenshotWithGemini({ imageBase64, mimeType, path, goal, modelName: 'gemini-2.5-flash', apiKey });
+  }
   return await inspectScreenshotWithOllama({ imageBase64, path, goal, modelName });
 }
 
@@ -7023,7 +7148,9 @@ async function inspectScreenshotWithOllama({ imageBase64, path, goal, modelName 
         temperature: 0
       }
     })
-  }, MODEL_API_REQUEST_TIMEOUT_MS, 'Ollama vision screenshot inspection');
+  }, MODEL_API_REQUEST_TIMEOUT_MS, 'Ollama vision screenshot inspection').catch(err => {
+    throw new Error(`Could not connect to Ollama at localhost:11434 (${err.message}). Is Ollama running?`);
+  });
 
   if (!response.ok) {
     const errText = await response.text();
@@ -7182,12 +7309,12 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
 }
 
 // TOKEN COUNT ESTIMATOR VIA API
-async function countTokens(messages, modelName, apiKey, options = {}) {
+async function countTokens(messages, modelName, config, options = {}) {
   if (!modelName.startsWith('gemini-')) {
     return JSON.stringify(messages).length / 4;
   }
   
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:countTokens?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:countTokens?key=${config.geminiApiKey}`;
   const requestBody = { contents: messages };
   
   const response = await fetchWithTimeout(url, {
@@ -7206,9 +7333,7 @@ async function countTokens(messages, modelName, apiKey, options = {}) {
 }
 
 // CONTEXT COMPACTOR (Summarizer)
-async function compactHistory(messages, modelName, apiKey) {
-  const isOllama = !modelName.startsWith('gemini-');
-  
+async function compactHistory(messages, modelName, config) {
   // Format history for the summarizer prompt
   let conversationLogsText = "";
   messages.forEach(m => {
@@ -7234,59 +7359,20 @@ Keep the summary highly technical, extremely brief, and complete.
 CONVERSATION HISTORY:
 ${conversationLogsText}`;
 
-  let compactedSummary = "History compacted.";
-  
-  if (isOllama) {
-    try {
-      const response = await fetch(`http://localhost:11434/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: modelName,
-          messages: [
-            { role: 'system', content: "You are a concise, technical summarizer utility." },
-            { role: 'user', content: summaryPrompt }
-          ],
-          stream: false
-        })
-      });
-      if (response.ok) {
-        const resData = await response.json();
-        compactedSummary = resData.message.content;
-      }
-    } catch (e) {
-      console.error("Local Ollama compaction error:", e);
-    }
-  } else {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
-    const requestBody = {
-      contents: [{ role: 'user', parts: [{ text: summaryPrompt }] }],
-      systemInstruction: {
-        parts: [{ text: "You are a concise, technical summarizer utility." }]
-      },
-      generationConfig: {
-        thinkingConfig: {
-          thinkingBudget: GEMINI_THINKING_BUDGET
-        }
-      }
-    };
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody)
-      });
-      if (response.ok) {
-        const resData = await response.json();
-        compactedSummary = resData.candidates[0].content.parts[0].text;
-      }
-    } catch (e) {
-      console.error("Gemini compaction error:", e);
-    }
+  const text = await callUtilityModel(summaryPrompt, modelName, config, false);
+  let compactedSummary = text || "History compacted.";
+
+  // Retain only the last 3 messages + the summary. A 'tool' message is always
+  // preceded by the 'model' message whose tool_calls it answers (agent.js pushes
+  // them as a pair) — if a plain count-based slice cut started on that 'tool'
+  // message, its issuing 'model' message (and any reasoning_content on it) would
+  // be dropped, leaving an orphaned tool result that providers requiring
+  // reasoning continuity (e.g. DeepSeek thinking mode) reject with a 400.
+  let retainStart = Math.max(0, messages.length - 3);
+  while (retainStart > 0 && messages[retainStart] && messages[retainStart].role === 'tool') {
+    retainStart--;
   }
-  
-  // Retain only the last 3 messages + the summary
-  const lastMessages = messages.slice(-3);
+  const lastMessages = messages.slice(retainStart);
   
   const newHistory = [
     {
@@ -7383,6 +7469,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     convertGeminiToDeepSeekMessages,
     callDeepSeekAPI,
     getNextModelForHighDemand,
+    compactHistory,
     summarizeToolStart,
     buildRepeatedFailureKey,
     updateWalkthroughItem,

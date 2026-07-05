@@ -2040,6 +2040,10 @@ function saveConversationsToStorage() {
   } catch (e) {
     console.error("Failed to save conversations to localStorage; disk persistence remains primary", e);
   }
+
+  if (window.api && typeof window.api.syncPhoneCompanion === 'function') {
+    window.api.syncPhoneCompanion();
+  }
 }
 
 function showOrionConfirmDialog({ title = 'Confirm action', message = '', confirmLabel = 'Confirm', danger = false } = {}) {
@@ -3327,9 +3331,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   });
   const messages = normalizedPhoneMessages.map(replayMsg => {
     const replayLogs = Array.isArray(replayMsg.logs) ? replayMsg.logs : [];
-    const text = replayMsg.role === 'assistant' && replayMsg.text === 'Thinking...' && replayLogs.length
-      ? replayLogs.map(log => log.content || log.result || '').filter(Boolean).join('\n')
-      : replayMsg.text;
+    const text = replayMsg.text;
     return {
       role: replayMsg.role,
       content: text,
@@ -3634,6 +3636,23 @@ window.approvePhoneCompanionPlan = async (targetId) => {
   conv.planApproved = true;
   conv.awaitingPlanApproval = false;
 
+  if (resolvedId === activeConversationId) {
+    const buttons = document.querySelectorAll('.btn-approve-plan:not(.approved)');
+    buttons.forEach(button => {
+      button.classList.add('approved');
+      button.disabled = true;
+      button.textContent = '✓ Implementation Started';
+      const card = button.closest('.plan-approval-actions');
+      if (card) {
+        card.classList.add('approved');
+        const title = card.querySelector('.plan-approval-title');
+        if (title) title.textContent = 'Implementation started';
+        const subtitle = card.querySelector('.plan-approval-subtitle');
+        if (subtitle) subtitle.textContent = 'Orion is building from this approved plan.';
+      }
+    });
+  }
+
   const approvalText = "Plan approved via Phone Companion. Continuing implementation.";
   appendSystemMessage(approvalText, { conversationId: resolvedId, source: 'plan-approval' });
 
@@ -3660,6 +3679,8 @@ window.denyPhoneCompanionPlan = async (targetId) => {
   conv.awaitingPlanApproval = false;
   conv.planApproved = false;
   if (resolvedId === activeConversationId) {
+    const cards = document.querySelectorAll('.plan-approval-actions');
+    cards.forEach(card => card.remove());
     appendSystemMessage("Phone companion denied the pending plan.");
   }
   saveConversationsToStorage();

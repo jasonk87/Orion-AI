@@ -2,6 +2,7 @@ node_modules/
 dist/
 standalone-workspaces/
 .orion/
+.codex-remote-attachments/
 
 config.json
 .env

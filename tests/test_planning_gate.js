@@ -73,42 +73,42 @@ function validStrategy(overrides = {}) {
 }
 
 test('classifyPlanApprovalIntent returns correct intents', async (t) => {
-  const approveRes = await agent.classifyPlanApprovalIntent('good to go', 'gemini-1', 'key');
+  const approveRes = await agent.classifyPlanApprovalIntent('good to go', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(approveRes.intent, 'approve', 'Recognizes approve intent');
 
-  const denyRes = await agent.classifyPlanApprovalIntent('stop', 'gemini-1', 'key');
+  const denyRes = await agent.classifyPlanApprovalIntent('stop', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(denyRes.intent, 'deny', 'Recognizes deny intent');
 
-  const reviseRes = await agent.classifyPlanApprovalIntent('no wait', 'gemini-1', 'key');
+  const reviseRes = await agent.classifyPlanApprovalIntent('no wait', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(reviseRes.intent, 'revise', 'Recognizes revise intent');
 
-  const unclearRes = await agent.classifyPlanApprovalIntent('what', 'gemini-1', 'key');
+  const unclearRes = await agent.classifyPlanApprovalIntent('what', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(unclearRes.intent, 'unclear', 'Recognizes unclear intent');
 
-  const otherRes = await agent.classifyPlanApprovalIntent('you never answered', 'gemini-1', 'key');
+  const otherRes = await agent.classifyPlanApprovalIntent('you never answered', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(otherRes.intent, 'other', 'Recognizes a separate follow-up as outside pending-plan approval');
 
   t.end();
 });
 
 test('classifyPlanningNeed returns correct modes', async (t) => {
-  const directRes = await agent.classifyPlanningNeed('run tests', 'gemini-1', 'key');
+  const directRes = await agent.classifyPlanningNeed('run tests', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(directRes.mode, 'direct', 'Recognizes direct mode');
 
-  const envRes = await agent.classifyPlanningNeed('what all python environments do i have installed on this computer', 'gemini-1', 'key');
+  const envRes = await agent.classifyPlanningNeed('what all python environments do i have installed on this computer', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(envRes.mode, 'direct', 'Recognizes local Python environment inventory as direct mode');
 
-  const localProjectAdviceRes = await agent.classifyPlanningNeed('I have a folder on my desktop called rocket sumo, recommend similar games and improvements', 'gemini-1', 'key');
+  const localProjectAdviceRes = await agent.classifyPlanningNeed('I have a folder on my desktop called rocket sumo, recommend similar games and improvements', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(localProjectAdviceRes.mode, 'direct', 'Recognizes local project recommendation as direct inspection mode');
 
-  const planRes = await agent.classifyPlanningNeed('build a whole app', 'gemini-1', 'key');
+  const planRes = await agent.classifyPlanningNeed('build a whole app', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(planRes.mode, 'plan', 'Recognizes plan mode');
 
-  const reviewRes = await agent.classifyPlanningNeed('look through my program and find any bugs', 'gemini-1', 'key');
+  const reviewRes = await agent.classifyPlanningNeed('look through my program and find any bugs', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(reviewRes.mode, 'direct', 'Recognizes read-only bug hunts as direct mode');
   t.equal(reviewRes.reviewOnly, true, 'Carries review-only flag for bug hunts');
 
-  const answerRes = await agent.classifyPlanningNeed('explain', 'gemini-1', 'key');
+  const answerRes = await agent.classifyPlanningNeed('explain', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(answerRes.mode, 'answer', 'Recognizes answer mode');
 
   t.end();
@@ -2395,15 +2395,66 @@ test('utility/classifier call sites are wrapped with resolveUtilityModelName ins
   const path = require('path');
   const agentSource = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
 
-  t.ok(agentSource.includes('classifyPlanApprovalIntent(userPrompt, resolveUtilityModelName(modelName), config.geminiApiKey)'),
+  t.ok(agentSource.includes('classifyPlanApprovalIntent(userPrompt, resolveUtilityModelName(modelName), config)'),
     'classifyPlanApprovalIntent call site uses the resolved cheap model');
-  const planningNeedMatches = agentSource.match(/classifyPlanningNeed\(userPrompt, resolveUtilityModelName\(modelName\), config\.geminiApiKey\)/g) || [];
+  const planningNeedMatches = agentSource.match(/classifyPlanningNeed\(userPrompt, resolveUtilityModelName\(modelName\), config\)/g) || [];
   t.ok(planningNeedMatches.length >= 3, 'all classifyPlanningNeed call sites use the resolved cheap model');
-  t.ok(agentSource.includes('countTokens(messages, resolveUtilityModelName(modelName), config.geminiApiKey'),
+  t.ok(agentSource.includes('countTokens(messages, resolveUtilityModelName(modelName), config'),
     'countTokens call site uses the resolved cheap model');
-  t.ok(agentSource.includes('compactHistory(messages, resolveUtilityModelName(modelName), config.geminiApiKey)'),
+  t.ok(agentSource.includes('compactHistory(messages, resolveUtilityModelName(modelName), config)'),
     'compactHistory call site uses the resolved cheap model');
   t.end();
+});
+
+// A user reported DeepSeek rejecting a request mid-run with "reasoning_content in the thinking
+// mode must be passed back to the API". Root cause: compactHistory's `messages.slice(-3)` is a
+// plain count-based cut, and a 'tool' message is always immediately preceded by the 'model'
+// message whose tool_calls it answers (agent.js pushes them as a pair). If the -3 cut landed on
+// the 'tool' message, its issuing 'model' message (and any reasoning_content on it) was dropped,
+// leaving an orphaned tool result with no matching assistant tool_calls/reasoning for DeepSeek's
+// thinking mode to echo back.
+test('compactHistory never retains a tool message without its issuing model message', async (t) => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({ ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: 'Summary.' }] } }] }) });
+  try {
+    const messages = [
+      { role: 'user', parts: [{ text: 'do the first thing' }] },
+      { role: 'model', parts: [{ text: 'thinking', thought: true }, { functionCall: { name: 'read_file', args: { path: 'a.js' } } }] },
+      { role: 'tool', parts: [{ functionResponse: { name: 'read_file', response: { content: 'a' } } }] },
+      { role: 'model', parts: [{ text: 'now the second thing' }] },
+    ];
+    const result = await agent.compactHistory(messages, 'gemini-2.5-flash-lite', { geminiApiKey: 'k' });
+    const retained = result.messages.slice(2); // after the synthetic summary user/model pair
+    if (retained.length && retained[0].role === 'tool') {
+      t.fail('retained slice must not start with an orphaned tool message');
+    } else {
+      t.pass('retained slice does not start with an orphaned tool message');
+    }
+    t.end();
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('compactHistory still trims to a short tail when the boundary already falls on a non-tool message', async (t) => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({ ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: 'Summary.' }] } }] }) });
+  try {
+    const messages = [
+      { role: 'user', parts: [{ text: 'turn 1' }] },
+      { role: 'model', parts: [{ text: 'reply 1' }] },
+      { role: 'user', parts: [{ text: 'turn 2' }] },
+      { role: 'model', parts: [{ text: 'reply 2' }] },
+      { role: 'user', parts: [{ text: 'turn 3' }] },
+    ];
+    const result = await agent.compactHistory(messages, 'gemini-2.5-flash-lite', { geminiApiKey: 'k' });
+    const retained = result.messages.slice(2);
+    t.equal(retained.length, 3, 'retains exactly the last 3 messages when no tool boundary is crossed');
+    t.equal(retained[0].parts[0].text, 'turn 2', 'retained slice still starts at the expected message');
+    t.end();
+  } finally {
+    global.fetch = originalFetch;
+  }
 });
 
 // grep_search closes a real gap: the system prompt referenced a "grep_search" tool for years

@@ -57,6 +57,17 @@ function registerAllHandlers() {
   ipcSkill.registerHandlers(ipcMain);
   ipcMemory.registerHandlers(ipcMain);
 
+  const { runLinter } = require('./lib/run-linter');
+  const { findReferences } = require('./lib/find-references');
+
+  ipcMain.handle('orion:run-linter', async (event, args) => {
+    return await runLinter(args.workspacePath, args.linterType, args.targetPath);
+  });
+  
+  ipcMain.handle('orion:find-references', async (event, args) => {
+    return await findReferences(args.workspacePath, args.symbolName, args.targetPath);
+  });
+
   const getConversationsPath = () => path.join(app.getPath('userData'), 'conversations.json');
   ipcMain.handle('read-conversations', () => {
     const filePath = getConversationsPath();

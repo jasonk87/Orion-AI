@@ -199,6 +199,10 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
   const manifest = await request('GET', 1131, '/manifest.webmanifest');
   t.equal(manifest.statusCode, 200, 'manifest is available without token query string');
 
+  const marked = await request('GET', 1131, '/marked.min.js');
+  t.equal(marked.statusCode, 200, 'Markdown parser asset is available before phone auth');
+  t.ok(/marked/i.test(marked.text), 'Markdown parser asset returns JavaScript content');
+
   const state = await request('GET', 1131, '/api/state');
   t.equal(state.statusCode, 401, 'state API rejects unpaired phones');
 
