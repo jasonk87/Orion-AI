@@ -727,14 +727,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   }
 
   // Inject resolved system facts so the model never needs to probe for the home directory
+  const webSearchStatus = (config.googleSearchApiKey && config.googleSearchEngineId)
+    ? 'AVAILABLE — google_search and fetch_web_page are ready to use.'
+    : 'UNAVAILABLE — googleSearchApiKey or googleSearchEngineId not configured. Do not attempt google_search; use fetch_web_page with a known URL if you must retrieve a specific doc.';
   messages.splice(2, 0,
     {
       role: 'user',
-      parts: [{ text: `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.` }]
+      parts: [{ text: `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nWeb search: ${webSearchStatus}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.` }]
     },
     {
       role: 'model',
-      parts: [{ text: `Understood. Home directory is ${resolvedHomeDir}. I will use this directly without probing.` }]
+      parts: [{ text: `Understood. Home directory is ${resolvedHomeDir}. Web search: ${webSearchStatus.split(' —')[0]}. I will use these directly without probing.` }]
     }
   );
 
@@ -1369,6 +1372,20 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             role: 'user',
             parts: [{
               text: '[SYSTEM: You just did substantial workspace inspection. If you discovered a durable architectural fact, API shape, gotcha, or decision that future sessions should know, call append_project_memory, remember_fact, or remember_decision now (1-3 concise entries) before your final answer. If nothing new/durable was learned, skip this and answer normally.]'
+            }]
+          });
+          continue;
+        }
+        // Skill creation nudge: after a multi-step task (5+ tool calls) that didn't already
+        // create a skill, prompt Orion to consider whether any reusable capability emerged.
+        const didMultiStepWork = !reviewOnly && workWalkthrough.filter(i => i && i.status !== 'error').length >= 5;
+        const alreadyCreatedSkill = workWalkthrough.some(i => i && i.toolName === 'create_skill');
+        if (didMultiStepWork && !alreadyCreatedSkill && !isGenericNonAnswer(textVal) && loopCount < maxLoops) {
+          currentAgentLogs.push({ type: 'thought', content: 'Skill gate: multi-step task completed; nudging Orion to consider packaging a reusable skill.' });
+          messages.push({
+            role: 'user',
+            parts: [{
+              text: '[SYSTEM: You just completed a multi-step task. Briefly consider: is there a reusable, testable capability here that would save effort on future tasks? If yes, call create_skill now. If not, skip this and give your final answer.]'
             }]
           });
           continue;
