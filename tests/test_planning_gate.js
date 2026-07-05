@@ -16,6 +16,9 @@ global.fetch = async (url, options) => {
     if (text.includes('"what"')) {
       return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"intent":"unclear","reason":""}' }] } }] }) };
     }
+    if (text.includes('"you never answered"')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"intent":"other","reason":"Separate follow-up question, not a plan verdict."}' }] } }] }) };
+    }
     return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"intent":"deny","reason":""}' }] } }] }) };
   }
 
@@ -82,6 +85,9 @@ test('classifyPlanApprovalIntent returns correct intents', async (t) => {
   const unclearRes = await agent.classifyPlanApprovalIntent('what', 'gemini-1', 'key');
   t.equal(unclearRes.intent, 'unclear', 'Recognizes unclear intent');
 
+  const otherRes = await agent.classifyPlanApprovalIntent('you never answered', 'gemini-1', 'key');
+  t.equal(otherRes.intent, 'other', 'Recognizes a separate follow-up as outside pending-plan approval');
+
   t.end();
 });
 
@@ -124,7 +130,7 @@ test('review-only gate allows strategy but blocks implementation artifacts and e
 
   const source = require('fs').readFileSync(require('path').join(__dirname, '../agent.js'), 'utf8');
   t.ok(source.includes("if (reviewOnly && planningDecision.mode === 'plan')"), 'runtime forces plan-classified reviews back to direct mode');
-  t.ok(source.includes('!reviewOnly && planningDecision.mode === \'plan\''), 'fallback approval gate ignores review-only tasks');
+  t.ok(source.includes('Plan approval is conversation state'), 'project-level implementation_plan.md files do not reactivate approval mode');
   t.end();
 });
 
@@ -2382,7 +2388,7 @@ test('trimAgedToolResultsFromMessages is a no-op for short conversations and ret
   t.end();
 });
 
-// The four call sites (classifyPlanApprovalIntent, classifyPlanningNeed x2, countTokens,
+// The utility/classifier call sites (classifyPlanApprovalIntent, classifyPlanningNeed, countTokens,
 // compactHistory) must actually use the resolved cheap model, not the raw modelName.
 test('utility/classifier call sites are wrapped with resolveUtilityModelName instead of using the raw modelName', (t) => {
   const fs = require('fs');
@@ -2392,7 +2398,7 @@ test('utility/classifier call sites are wrapped with resolveUtilityModelName ins
   t.ok(agentSource.includes('classifyPlanApprovalIntent(userPrompt, resolveUtilityModelName(modelName), config.geminiApiKey)'),
     'classifyPlanApprovalIntent call site uses the resolved cheap model');
   const planningNeedMatches = agentSource.match(/classifyPlanningNeed\(userPrompt, resolveUtilityModelName\(modelName\), config\.geminiApiKey\)/g) || [];
-  t.equal(planningNeedMatches.length, 2, 'both classifyPlanningNeed call sites use the resolved cheap model');
+  t.ok(planningNeedMatches.length >= 3, 'all classifyPlanningNeed call sites use the resolved cheap model');
   t.ok(agentSource.includes('countTokens(messages, resolveUtilityModelName(modelName), config.geminiApiKey'),
     'countTokens call site uses the resolved cheap model');
   t.ok(agentSource.includes('compactHistory(messages, resolveUtilityModelName(modelName), config.geminiApiKey)'),
@@ -2483,4 +2489,3 @@ test('grep_search is declared in the shared tool-declaration source consumed by 
   t.ok(agentSource.includes("case 'grep_search'"), 'the executor has a grep_search case');
   t.end();
 });
-

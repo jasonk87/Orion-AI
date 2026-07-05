@@ -477,6 +477,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let planNeedsTestingSection = false;
   let strategyStatus = { exists: false, valid: false, missingSections: STRATEGY_REQUIRED_SECTIONS, needsClarification: false };
   let resetMissionState = false;
+  let suppressPlanApprovalCardThisTurn = false;
 
   if (isInternalPrompt) {
     // System-driven continuation (approved-plan execution, queued follow-up): just build.
@@ -488,7 +489,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // The user is replying to a pending plan. The model classifies their reply.
     approvalIntent = await classifyPlanApprovalIntent(userPrompt, resolveUtilityModelName(modelName), config.geminiApiKey);
     if (approvalIntent.intent === 'approve') {
-      const planText = await readImplementationPlanText(workspacePath);
+      const planText = await readImplementationPlanText(workspacePath, conversation);
       if (hasRequiredTestingPlanSection(planText)) {
         conversation.planApproved = true;
         conversation.awaitingPlanApproval = false;
@@ -507,6 +508,26 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       if (window.saveConversationsToStorage) window.saveConversationsToStorage();
       planningDecision = { mode: 'answer', reason: 'User declined the pending plan.' };
       agentExecutionMode = 'answer';
+    } else if (approvalIntent.intent === 'other') {
+      suppressPlanApprovalCardThisTurn = true;
+      const decision = config.planningMode === false
+        ? { mode: 'direct', reason: 'Planning mode disabled.' }
+        : await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config.geminiApiKey);
+      planningDecision = decision;
+      reviewOnly = !!decision.reviewOnly;
+      if (reviewOnly && planningDecision.mode === 'plan') {
+        planningDecision = {
+          ...planningDecision,
+          mode: 'direct',
+          reason: `${planningDecision.reason || ''} Separate read-only request while a plan is pending; answer directly without plan approval.`.trim()
+        };
+      }
+      if (reviewOnly || planningDecision.mode === 'direct') {
+        planningBypassedForTask = true;
+        agentExecutionMode = 'direct';
+      } else if (planningDecision.mode === 'answer') {
+        agentExecutionMode = 'answer';
+      }
     } else {
       // revise or unclear: address the user without executing destructive tools
       planningDecision = { mode: 'direct', reason: approvalIntent.intent === 'revise' ? 'User asked to revise the pending plan.' : 'Ambiguous reply to a pending plan.' };
@@ -700,7 +721,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
   // Strategy gate prep: only a fresh plan-worthy task that has not been approved needs it.
   if (!planningBypassedForTask && planningDecision.mode === 'plan' && config.planningMode !== false && !conversation.planApproved && !isInternalPrompt) {
-    strategyStatus = await readStrategyStatus(workspacePath);
+        strategyStatus = await readStrategyStatus(workspacePath, conversation);
   }
 
   // Approval-reply system notes (revise / unclear / approved-but-invalid).
@@ -1318,7 +1339,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           (toolName === 'write_file' && (isImplementationPlanPath(args.path) || isStrategyPath(args.path))) ||
           toolName === 'modify_file' || toolName === 'patch_file' || toolName === 'run_command' || toolName === 'start_command' || toolName === 'run_tests'
         )) {
-          strategyStatus = await readStrategyStatus(workspacePath);
+          strategyStatus = await readStrategyStatus(workspacePath, conversation);
         }
         const reviewGate = reviewOnly ? getReviewOnlyToolGate(toolName, args) : { allowed: true, reason: '' };
         if (!reviewGate.allowed) {
@@ -1772,10 +1793,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         // Structural Validation: Check for Testing Plan section before presenting plan for approval
         let planIsValid = false;
         try {
-          const planContent = await window.api.readFile(workspacePath, 'implementation_plan.md', { maxChars: 100000 });
-          const planText = typeof planContent === 'string'
-            ? planContent
-            : (planContent && !planContent.error && typeof planContent.content === 'string' ? planContent.content : '');
+          const planText = await readImplementationPlanText(workspacePath, conversation);
           planIsValid = hasRequiredTestingPlanSection(planText);
         } catch (err) {
           console.error('Error checking implementation_plan.md for testing section:', err);
@@ -1821,18 +1839,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       }
     }
 
-    // Fallback: if the agent ran in planning mode but never wrote a new plan (e.g. reviewed
-    // an existing one and summarized it), check whether implementation_plan.md exists on disk.
-    // If it does, gate on approval now so the next user message is properly routed.
-    if (!forceYield && !reviewOnly && planningDecision.mode === 'plan' && !conversation.awaitingPlanApproval && !conversation.planApproved) {
-      try {
-        const existingPlanText = await readImplementationPlanText(workspacePath);
-        if (existingPlanText && existingPlanText.trim()) {
-          conversation.awaitingPlanApproval = true;
-          console.log('Planning turn ended without forceYield; existing implementation_plan.md found — gating on approval.');
-        }
-      } catch (_) {}
-    }
+    // Plan approval is conversation state. A workspace-level implementation_plan.md may be an
+    // artifact from another conversation or an older task, so its mere presence must not reactivate
+    // approval mode for this run.
   } catch (error) {
     if (isUserStopError(error)) {
       userRequestedStop = true;
@@ -1924,7 +1933,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     if (workWalkthrough.length > 0 && workspacePath) {
       try {
         const walkthroughMd = buildWorkWalkthroughMarkdown(workWalkthrough, lastTextResponse);
-        await window.api.writeFile(workspacePath, 'work_walkthrough.md', walkthroughMd);
+        await writeOrionGovernanceArtifactText(workspacePath, conversation, 'work_walkthrough.md', walkthroughMd);
       } catch (_) {}
     }
 
@@ -1934,7 +1943,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // Permanently mark the bubble that carries the plan-approval card so it can be re-rendered
     // with a persistent "Implementation started" state after approval, instead of vanishing on
     // the next reload and looking like the button was never pressed.
-    if (conversation.awaitingPlanApproval) {
+    if (conversation.awaitingPlanApproval && !suppressPlanApprovalCardThisTurn) {
       conversation.messages[aiMessageIndex].isPlanApprovalCard = true;
     }
     if (conversation.awaitingClarification) {
@@ -2286,7 +2295,13 @@ async function executeTool(name, args, workspace, config, conversation) {
 
     case 'read_file': {
       if (!args.path) throw new Error("Missing 'path' parameter");
-      const content = await window.api.readFile(workspace, args.path, {
+      const content = isOrionGovernanceArtifactPath(args.path)
+        ? await readOrionGovernanceArtifactText(workspace, conversation, args.path, {
+          startLine: args.startLine,
+          endLine: args.endLine,
+          maxChars: args.maxChars
+        })
+        : await window.api.readFile(workspace, args.path, {
         startLine: args.startLine,
         endLine: args.endLine,
         maxChars: args.maxChars
@@ -2300,8 +2315,11 @@ async function executeTool(name, args, workspace, config, conversation) {
       if (args.content === undefined) throw new Error("Missing 'content' parameter");
       const isPlanFile = isImplementationPlanPath(args.path);
       const isStrategyFile = isStrategyPath(args.path);
-      const existingContent = await window.api.readFile(workspace, args.path, { maxChars: 200000 });
-      if (!isPlanFile && !isStrategyFile && existingContent && !existingContent.error && args.allowOverwrite !== true) {
+      const isGovernanceArtifact = isOrionGovernanceArtifactPath(args.path);
+      const existingContent = isGovernanceArtifact
+        ? await readOrionGovernanceArtifactText(workspace, conversation, args.path, { maxChars: 200000 }).catch(error => ({ error: error.message }))
+        : await window.api.readFile(workspace, args.path, { maxChars: 200000 });
+      if (!isGovernanceArtifact && !isPlanFile && !isStrategyFile && existingContent && !existingContent.error && args.allowOverwrite !== true) {
         throw new Error("write_file refused to overwrite an existing file. Use patch_file for surgical edits, or set allowOverwrite=true with overwriteReason when a full rewrite is explicitly required.");
       }
       if (args.allowOverwrite === true && !String(args.overwriteReason || '').trim()) {
@@ -2315,16 +2333,20 @@ async function executeTool(name, args, workspace, config, conversation) {
         beforePass = testRes.success;
       }
       
-      const writeRes = await window.api.writeFile(workspace, args.path, args.content);
+      const writeRes = isGovernanceArtifact
+        ? await writeOrionGovernanceArtifactText(workspace, conversation, args.path, args.content)
+        : await window.api.writeFile(workspace, args.path, args.content);
       if (writeRes.error) throw new Error(writeRes.error);
       
       // Refresh directory UI
-      if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
+      if (!isGovernanceArtifact && window.syncWorkspaceFiles) window.syncWorkspaceFiles();
       
       let testFeedback = "";
-      const writeSyntaxCheck = await checkJsSyntaxAfterEdit(workspace, args.path);
-      if (!writeSyntaxCheck.ok) {
-        testFeedback += `\n[WARNING] SYNTAX ERROR DETECTED: node --check failed for ${args.path}:\n${writeSyntaxCheck.error}`;
+      if (!isGovernanceArtifact) {
+        const writeSyntaxCheck = await checkJsSyntaxAfterEdit(workspace, args.path);
+        if (!writeSyntaxCheck.ok) {
+          testFeedback += `\n[WARNING] SYNTAX ERROR DETECTED: node --check failed for ${args.path}:\n${writeSyntaxCheck.error}`;
+        }
       }
       if (config.autoTest) {
         const testRes = await window.runRegressionTests();
@@ -2332,7 +2354,7 @@ async function executeTool(name, args, workspace, config, conversation) {
           testFeedback += "\n[WARNING] REGRESSION DETECTED: Regression tests failed after this write. Please review your modifications.";
         }
       }
-      const missingHtmlRefs = await findMissingHtmlLocalReferences(workspace, args.path, args.content);
+      const missingHtmlRefs = isGovernanceArtifact ? [] : await findMissingHtmlLocalReferences(workspace, args.path, args.content);
       if (missingHtmlRefs.length) {
         testFeedback += `\n[WARNING] Missing local HTML references from ${args.path}: ${missingHtmlRefs.map(ref => `\`${ref}\``).join(', ')}. Create these files or remove the references before considering the UI verified.`;
       }
@@ -2723,9 +2745,8 @@ async function executeTool(name, args, workspace, config, conversation) {
     }
 
     case 'take_screenshot': {
-      const result = await window.api.takeScreenshot(workspace, args.destination || '');
+      const result = await window.api.takeScreenshot(workspace, args.destination || '', conversation.id);
       if (!result.success) throw new Error(result.error || 'Screenshot failed');
-      if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
       return result;
     }
 
@@ -2751,7 +2772,8 @@ async function executeTool(name, args, workspace, config, conversation) {
         warmupMs: args.warmupMs,
         timeoutMs: args.timeoutMs,
         processId,
-        destination: args.destination || ''
+        destination: args.destination || '',
+        conversationId: conversation.id
       });
       // Track the processId so we can auto-kill it next time
       if (result && result.success) {
@@ -2762,17 +2784,16 @@ async function executeTool(name, args, workspace, config, conversation) {
       // A crash before render is a real, reportable failure the model must act on — surface it as
       // a failed result (not a thrown error) so the recovery guidance and stderr reach the model.
       if (!result.success && !result.crashed) throw new Error(result.error || 'App preview failed');
-      if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
       return result;
     }
 
     case 'capture_screen': {
       const result = await window.api.captureScreen(workspace, {
         delayMs: args.delayMs,
-        destination: args.destination || ''
+        destination: args.destination || '',
+        conversationId: conversation.id
       });
       if (!result.success) throw new Error(result.error || 'Screen capture failed');
-      if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
       return result;
     }
 
@@ -3790,15 +3811,53 @@ function validateStrategyContent(content) {
   };
 }
 
-async function readStrategyStatus(workspacePath) {
+function isWorkWalkthroughPath(pathValue) {
+  return normalizeInventoryPath(pathValue).toLowerCase() === 'work_walkthrough.md';
+}
+
+function isOrionGovernanceArtifactPath(pathValue) {
+  return isImplementationPlanPath(pathValue) || isStrategyPath(pathValue) || isWorkWalkthroughPath(pathValue);
+}
+
+function applyTextReadOptions(content, options = {}, label = 'Artifact') {
+  const text = String(content || '');
+  const startLine = parseInt(options.startLine, 10);
+  const endLine = parseInt(options.endLine, 10);
+  if (Number.isInteger(startLine) && Number.isInteger(endLine) && startLine > 0 && endLine >= startLine) {
+    const lines = text.split(/\r?\n/);
+    return lines.slice(startLine - 1, endLine).map((line, index) => `${startLine + index}: ${line}`).join('\n');
+  }
+  const maxChars = parseInt(options.maxChars, 10);
+  if (Number.isInteger(maxChars) && maxChars > 0 && text.length > maxChars) {
+    return text.slice(0, maxChars) + `\n\n[Orion] ${label} truncated at ${maxChars} characters. Use startLine/endLine to inspect targeted sections.`;
+  }
+  return text;
+}
+
+async function readOrionGovernanceArtifactText(workspacePath, conversation, relativePath, options = {}) {
+  if (conversation && conversation.id && window.api && typeof window.api.readConversationArtifact === 'function') {
+    const artifact = await window.api.readConversationArtifact(conversation.id, relativePath, options || {});
+    if (artifact && artifact.success) return applyTextReadOptions(artifact.content || '', options, 'Conversation artifact');
+  }
+  const result = await window.api.readFile(workspacePath, relativePath, options || {});
+  if (typeof result === 'string') return result;
+  if (result && !result.error && typeof result.content === 'string') return result.content;
+  throw new Error((result && result.error) || 'Artifact does not exist');
+}
+
+async function writeOrionGovernanceArtifactText(workspacePath, conversation, relativePath, content) {
+  if (conversation && conversation.id && window.api && typeof window.api.writeConversationArtifact === 'function') {
+    return await window.api.writeConversationArtifact(conversation.id, relativePath, content);
+  }
+  return await window.api.writeFile(workspacePath, relativePath, content);
+}
+
+async function readStrategyStatus(workspacePath, conversation) {
   try {
     if (!window.api || typeof window.api.readFile !== 'function') {
       return { exists: false, valid: false, missingSections: STRATEGY_REQUIRED_SECTIONS, needsClarification: false, content: '' };
     }
-    const result = await window.api.readFile(workspacePath, 'STRATEGY.md', { maxChars: 120000 });
-    const content = typeof result === 'string'
-      ? result
-      : (result && !result.error && typeof result.content === 'string' ? result.content : '');
+    const content = await readOrionGovernanceArtifactText(workspacePath, conversation, 'STRATEGY.md', { maxChars: 120000 });
     if (!content) return { exists: false, valid: false, missingSections: STRATEGY_REQUIRED_SECTIONS, needsClarification: false, content: '' };
     return { exists: true, content, ...validateStrategyContent(content) };
   } catch (err) {
@@ -4537,6 +4596,31 @@ function answerHasActionableFinalContent(answerText) {
   return /[.!?]\s+\S+.*[.!?]/s.test(text);
 }
 
+function getInspectedEvidenceAnchors(workWalkthrough = []) {
+  const anchors = new Set();
+  (workWalkthrough || []).forEach(item => {
+    if (!item || item.status === 'error') return;
+    if (item.toolName !== 'read_file' && item.kind !== 'file') return;
+    const raw = String(item.path || item.label || '');
+    const backtickMatch = raw.match(/`([^`]+)`/);
+    const filePath = (backtickMatch ? backtickMatch[1] : raw).trim();
+    if (!filePath) return;
+    anchors.add(filePath.toLowerCase());
+    const parts = filePath.split(/[\\/]/).filter(Boolean);
+    if (parts.length) anchors.add(parts[parts.length - 1].toLowerCase());
+  });
+  return [...anchors].filter(anchor => anchor.length >= 4);
+}
+
+function answerHasInspectionGrounding(answerText, workWalkthrough = []) {
+  const text = sanitizeFinalAnswerText(answerText);
+  const lower = text.toLowerCase();
+  if (/(?:^|[\s`'"(\[])(?:[\w.-]+[\\/])*[\w.-]+\.(?:js|jsx|ts|tsx|py|json|md|html|css|mjs|cjs|yml|yaml|toml|rs|go|java|cs|cpp|c|h)(?::\d+)?\b/i.test(text)) {
+    return true;
+  }
+  return getInspectedEvidenceAnchors(workWalkthrough).some(anchor => lower.includes(anchor));
+}
+
 function getReviewCoverage(workWalkthrough = []) {
   const done = (workWalkthrough || []).filter(item => item && item.status !== 'error');
   const filesRead = new Set();
@@ -4593,6 +4677,12 @@ function buildFinalAnswerQualityGatePrompt(userPrompt, answerText, workWalkthrou
 
 Before final response, decide what evidence the user's actual request requires. If they asked for anything beyond a file inventory, read the relevant source files, tests, README/package/config files, or run safe inspection commands before answering. If the user truly requested only an inventory, answer that narrowly and explicitly. Do not produce broad recommendations from filenames alone.]`;
   }
+  if (turnAlreadyWroteMemory(workWalkthrough) && turnDidSubstantiveInspection(workWalkthrough) &&
+      !answerHasInspectionGrounding(answerText, workWalkthrough)) {
+    return `[SYSTEM: Final-response quality gate. You inspected source files and stored durable memory, but the visible final answer is not self-contained or grounded in the inspected evidence.
+
+Before final response, answer the user's actual request directly using the files, functions, behaviors, and facts you inspected. Do not rely on any earlier draft answer being visible to the user; restate the substantive answer now.]`;
+  }
   if (answerHasActionableFinalContent(answerText)) return '';
   return `[SYSTEM: Final-response quality gate. You inspected context, but inspection alone is not completion.
 
@@ -4623,12 +4713,10 @@ function hasRequiredTestingPlanSection(content) {
   return /^\*\*[^*\n]*?(testing plan|test plan|validation plan)[^*\n]*?\*\*\s*$/im.test(text);
 }
 
-async function readImplementationPlanText(workspacePath) {
+async function readImplementationPlanText(workspacePath, conversation) {
   if (!workspacePath) return '';
   try {
-    const planContent = await window.api.readFile(workspacePath, 'implementation_plan.md', { maxChars: 100000 });
-    if (typeof planContent === 'string') return planContent;
-    if (planContent && !planContent.error && typeof planContent.content === 'string') return planContent.content;
+    return await readOrionGovernanceArtifactText(workspacePath, conversation, 'implementation_plan.md', { maxChars: 100000 });
   } catch (err) {
     console.error('Error reading implementation_plan.md:', err);
   }
@@ -4644,12 +4732,13 @@ async function classifyPlanApprovalIntent(userPrompt, modelName, apiKey) {
   const prompt = `Classify the user's latest message about a pending implementation plan.
 
 Return only compact JSON with:
-{"intent":"approve"|"deny"|"revise"|"unclear","reason":"short reason"}
+{"intent":"approve"|"deny"|"revise"|"other"|"unclear","reason":"short reason"}
 
 Definitions:
 - approve: the user clearly wants execution of the existing pending plan to begin.
 - deny: the user clearly rejects, cancels, or stops the pending plan.
 - revise: the user asks for more review, a different plan, changes, additions, or clarification before execution.
+- other: the user is asking a separate question or reporting that the previous answer did not satisfy their request, rather than giving a verdict on the pending plan.
 - unclear: the user intent is ambiguous.
 
 User message:
@@ -4677,7 +4766,7 @@ ${JSON.stringify(String(userPrompt || ''))}`;
       data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
       data.candidates[0].content.parts[0].text;
     const parsed = JSON.parse(text || '{}');
-    const intent = ['approve', 'deny', 'revise', 'unclear'].includes(parsed.intent) ? parsed.intent : 'unclear';
+    const intent = ['approve', 'deny', 'revise', 'other', 'unclear'].includes(parsed.intent) ? parsed.intent : 'unclear';
     return { intent, reason: String(parsed.reason || '') };
   } catch (e) {
     console.error('Plan approval classifier failed:', e);
@@ -5699,6 +5788,10 @@ function isGeminiHardQuotaError(status, message) {
   return /monthly spending cap|project spend cap|ai\.studio\/spend|billing/i.test(String(message || ''));
 }
 
+function isNonRetryableModelHttpStatus(status) {
+  return status === 400 || status === 401 || status === 402 || status === 403;
+}
+
 function createNonRetryableModelError(message) {
   const error = new Error(message);
   error.nonRetryable = true;
@@ -6561,8 +6654,8 @@ async function callAnthropicAPI(messages, modelName, apiKey, onWarning, disableT
       const apiError = describeModelApiError(status, errorText);
       const retryDelayMs = Math.min(apiError.retryDelayMs || delay, MODEL_API_MAX_RETRY_WAIT_MS);
 
-      // 401/403 (bad key) and 400 (malformed request) are not worth retrying.
-      if (status === 401 || status === 403 || status === 400) {
+      // Auth, billing, and malformed-request failures are not worth retrying.
+      if (isNonRetryableModelHttpStatus(status)) {
         throw createNonRetryableModelError(`Anthropic API HTTP ${status}: ${apiError.message}`);
       }
       if (i === attempts) {
@@ -6610,7 +6703,11 @@ function convertGeminiToDeepSeekMessages(geminiMessages) {
       const text = (msg.parts || []).map(p => p.text).filter(Boolean).join('');
       out.push({ role: 'user', content: text || '(no content)' });
     } else if (msg.role === 'model') {
-      const textParts = (msg.parts || []).filter(p => p.text).map(p => p.text);
+      const textParts = (msg.parts || []).filter(p => p.text && !p.thought && !p._deepseekReasoningContent).map(p => p.text);
+      const reasoningContent = (msg.parts || [])
+        .filter(p => p._deepseekReasoningContent && p.text)
+        .map(p => p.text)
+        .join('');
       const toolCalls = [];
       lastToolCallIds = [];
       (msg.parts || []).forEach(p => {
@@ -6621,6 +6718,7 @@ function convertGeminiToDeepSeekMessages(geminiMessages) {
         }
       });
       const assistantMsg = { role: 'assistant', content: textParts.join('') || null };
+      if (reasoningContent) assistantMsg.reasoning_content = reasoningContent;
       if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
       out.push(assistantMsg);
     } else if (msg.role === 'tool') {
@@ -6652,6 +6750,8 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
   const requestBody = {
     model: modelName,
     messages: deepseekMessages,
+    thinking: { type: 'enabled' },
+    reasoning_effort: modelName === 'deepseek-v4-pro' ? 'max' : 'high',
     temperature: 0
   };
   if (!disableTools) {
@@ -6676,6 +6776,7 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
         const data = await response.json();
         const message = (data.choices && data.choices[0] && data.choices[0].message) || {};
         const parts = [];
+        if (message.reasoning_content) parts.push({ text: message.reasoning_content, thought: true, _deepseekReasoningContent: true });
         if (message.content) parts.push({ text: message.content });
         (message.tool_calls || []).forEach(tc => {
           let args = tc.function && tc.function.arguments;
@@ -6692,7 +6793,7 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
       const apiError = describeModelApiError(status, errorText);
       const retryDelayMs = Math.min(apiError.retryDelayMs || delay, MODEL_API_MAX_RETRY_WAIT_MS);
 
-      if (status === 401 || status === 403 || status === 400) {
+      if (isNonRetryableModelHttpStatus(status)) {
         throw createNonRetryableModelError(`DeepSeek API HTTP ${status}: ${apiError.message}`);
       }
       if (i === attempts) {
@@ -7241,6 +7342,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     looksLikeLeakedNoToolCorrection,
     requestNeedsActionableFinalAnswer,
     answerHasActionableFinalContent,
+    answerHasInspectionGrounding,
     getReviewCoverage,
     answerHasGroundedReviewReport,
     buildReviewOnlyCompletionGatePrompt,

@@ -4,6 +4,7 @@ const path = require('path');
 
 const rendererJs = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8');
 const agentJs = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
+const preloadJs = fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8');
 global.window = {};
 global.fetch = async () => ({ ok: false });
 const agent = require('../agent.js');
@@ -519,6 +520,28 @@ test('local system fact failures do not become fake blockers or web research', (
     true,
     'read_file counts as deeper inspection evidence'
   );
+  const inspectedThenRemembered = [
+    { toolName: 'read_file', label: 'Read `server.js`', status: 'done' },
+    { toolName: 'read_file', label: 'Read `public/controller.html`', status: 'done' },
+    { toolName: 'remember_fact', label: 'Used remember_fact', status: 'done' }
+  ];
+  t.ok(
+    agent.buildFinalAnswerQualityGatePrompt(
+      'what do you think about this program?',
+      "We're all set here! My review above is the complete answer. Enjoy your arcade hub.",
+      inspectedThenRemembered
+    ).includes('not self-contained'),
+    'final quality gate rejects a memory-follow-up answer that is not grounded in inspected evidence'
+  );
+  t.equal(
+    agent.buildFinalAnswerQualityGatePrompt(
+      'what do you think about this program?',
+      'The strongest part is the playful arcade scope, but server.js is carrying too many modes and public/controller.html has grown into a dense controller surface. I would split game-mode logic out of the server first, then tighten the controller panels around the active mode.',
+      inspectedThenRemembered
+    ),
+    '',
+    'final quality gate accepts a self-contained answer grounded in inspected files after memory persistence'
+  );
   const oneFileReview = [
     { toolName: 'list_files', label: 'Listed workspace files', status: 'done' },
     { toolName: 'read_file', label: 'Read `ai_assistant/communication/cli.py`', status: 'done' }
@@ -884,8 +907,12 @@ test('workspace artifacts and file explorer controls are wired', (t) => {
   t.ok(agentJs.includes('persistVisualArtifactForTool'), 'agent writes screenshot artifacts as soon as they are captured');
   t.ok(agentJs.includes("type: 'orion-visual-artifact'"), 'screenshot artifacts have a dedicated artifact type');
   t.ok(agentJs.includes('collectVisualArtifacts'), 'final run artifacts retain visual artifact metadata');
-  t.ok(rendererJs.includes('mergeRunAndWorkspaceScreenshotArtifacts'), 'renderer merges run artifacts with workspace screenshots');
+  t.ok(preloadJs.includes('readConversationArtifact'), 'preload exposes conversation-scoped artifact reads');
+  t.ok(preloadJs.includes('deleteConversationArtifacts'), 'preload exposes conversation artifact cleanup');
+  t.ok(rendererJs.includes('Artifacts are saved outside the project after runs'), 'artifact panel explains project-isolated storage');
+  t.ok(rendererJs.includes('cleanupConversationArtifacts'), 'conversation deletion cleans up external artifacts');
   t.ok(rendererJs.includes('openImageArtifact'), 'renderer can open screenshot artifacts');
+  t.ok(rendererJs.includes('readWorkspaceFileBase64'), 'renderer loads screenshot and PNG files through the image viewer');
   t.ok(rendererJs.includes('window.loadRunArtifacts = loadRunArtifacts'), 'agent can refresh the artifact panel after saving screenshot artifacts');
   t.ok(rendererJs.includes('deleteWorkspacePath'), 'file explorer delete handler exists');
   t.ok(rendererJs.includes('moveWorkspacePath'), 'file explorer move handler exists');

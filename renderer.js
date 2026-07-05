@@ -1006,18 +1006,34 @@ async function loadRunArtifacts() {
 }
 
 function mergeRunAndWorkspaceScreenshotArtifacts(runArtifacts = []) {
-  const merged = Array.isArray(runArtifacts) ? [...runArtifacts] : [];
-  const existingScreenshots = new Set(merged
-    .filter(item => item && item.artifactType === 'screenshot')
-    .map(item => `${item.workspacePath || currentWorkspace}|${item.screenshotPath}`));
-  getWorkspaceScreenshotArtifacts().forEach(item => {
-    const key = `${item.workspacePath}|${item.screenshotPath}`;
-    if (!existingScreenshots.has(key)) {
-      existingScreenshots.add(key);
-      merged.push(item);
-    }
-  });
-  return merged.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+  return (Array.isArray(runArtifacts) ? [...runArtifacts] : [])
+    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+}
+
+function normalizeViewerPath(pathValue) {
+  return String(pathValue || '').replace(/\\/g, '/').replace(/^\/+/, '').trim().toLowerCase();
+}
+
+function isViewerGovernanceArtifactPath(pathValue) {
+  const normalized = normalizeViewerPath(pathValue);
+  return normalized === 'implementation_plan.md' || normalized === 'strategy.md' || normalized === 'work_walkthrough.md';
+}
+
+function extractTextReadContent(result) {
+  if (typeof result === 'string') return result;
+  if (result && !result.error && typeof result.content === 'string') return result.content;
+  if (result && result.error) throw new Error(result.error);
+  return '';
+}
+
+async function readConversationTextArtifact(conv, relativePath, options = {}) {
+  if (conv && conv.id && isViewerGovernanceArtifactPath(relativePath) && window.api.readConversationArtifact) {
+    const artifact = await window.api.readConversationArtifact(conv.id, relativePath, options);
+    if (artifact && artifact.success) return artifact.content || '';
+  }
+  const workspace = (conv && conv.workspace) || currentWorkspace;
+  const result = await window.api.readFile(workspace, relativePath, options);
+  return extractTextReadContent(result);
 }
 
 function getWorkspaceScreenshotArtifacts() {
@@ -1143,6 +1159,16 @@ function setupFileViewerModal() {
 
 async function openFileViewer(relPath) {
   if (!currentWorkspace || !relPath) return;
+  if (/\.(png|jpe?g|webp|gif)$/i.test(relPath)) {
+    await openImageArtifact({
+      artifactType: 'screenshot',
+      displayName: relPath.split(/[\\/]/).pop(),
+      workspacePath: currentWorkspace,
+      screenshotPath: relPath,
+      toolName: 'workspace image'
+    });
+    return;
+  }
   viewedFilePath = relPath;
   el.fileViewerTitle.textContent = relPath;
   const isMarkdown = /\.(md|markdown)$/i.test(relPath);
@@ -1154,9 +1180,16 @@ async function openFileViewer(relPath) {
   }
   el.fileViewerModal.classList.add('active');
 
-  const content = await window.api.readFile(currentWorkspace, relPath, { maxChars: 200000 });
-  if (content && content.error) {
-    const errorText = `Error loading file: ${content.error}`;
+  let content = '';
+  let readError = '';
+  try {
+    const conv = conversations.find(c => c.id === activeConversationId);
+    content = await readConversationTextArtifact(conv, relPath, { maxChars: 200000 });
+  } catch (err) {
+    readError = err && err.message ? err.message : 'unknown error';
+  }
+  if (readError) {
+    const errorText = `Error loading file: ${readError}`;
     if (isMarkdown && el.fileViewerMarkdown) {
       el.fileViewerMarkdown.textContent = errorText;
     } else {
@@ -1175,7 +1208,8 @@ async function openFileViewer(relPath) {
 async function openImageArtifact(item) {
   const workspacePath = item.workspacePath || currentWorkspace;
   const relPath = item.screenshotPath || item.path;
-  if (!workspacePath || !relPath || !window.api.readWorkspaceFileBase64) {
+  const isArtifactRef = /^orion-artifact:\/\//i.test(String(relPath || ''));
+  if ((!workspacePath && !isArtifactRef) || !relPath || !window.api.readWorkspaceFileBase64) {
     showToast('Screenshot artifact is missing its workspace path.', 'attention');
     return;
   }
@@ -3587,11 +3621,7 @@ window.approvePhoneCompanionPlan = async (targetId) => {
   // Re-validate the testing plan section in implementation_plan.md
   let planIsValid = false;
   try {
-    const workspace = conv.workspace || currentWorkspace;
-    const planContent = await window.api.readFile(workspace, 'implementation_plan.md', { maxChars: 100000 });
-    const planText = typeof planContent === 'string'
-      ? planContent
-      : (planContent && !planContent.error && typeof planContent.content === 'string' ? planContent.content : '');
+    const planText = await readConversationTextArtifact(conv, 'implementation_plan.md', { maxChars: 100000 });
     planIsValid = hasRequiredTestingPlanSection(planText);
   } catch (err) {
     console.error('Error validating plan during phone approval:', err);
@@ -3870,11 +3900,7 @@ async function approveCurrentPlanAndContinue(options = {}) {
   // Re-validate the testing plan section in implementation_plan.md
   let planIsValid = false;
   try {
-    const workspace = conv.workspace || currentWorkspace;
-    const planContent = await window.api.readFile(workspace, 'implementation_plan.md', { maxChars: 100000 });
-    const planText = typeof planContent === 'string'
-      ? planContent
-      : (planContent && !planContent.error && typeof planContent.content === 'string' ? planContent.content : '');
+    const planText = await readConversationTextArtifact(conv, 'implementation_plan.md', { maxChars: 100000 });
     planIsValid = hasRequiredTestingPlanSection(planText);
   } catch (err) {
     console.error('Error validating plan during approval:', err);
@@ -3924,6 +3950,7 @@ async function approveCurrentPlanAndContinue(options = {}) {
 function deleteConversation(id) {
   const convToDelete = conversations.find(c => c.id === id);
   const parentProj = convToDelete ? convToDelete.projectPath : '';
+  cleanupConversationArtifacts(id);
   
   conversations = conversations.filter(c => c.id !== id);
   saveConversationsToStorage();
@@ -3946,6 +3973,8 @@ function deleteConversation(id) {
 }
 
 function removeProject(path) {
+  const removedConversationIds = conversations.filter(c => c.projectPath === path).map(c => c.id);
+  removedConversationIds.forEach(cleanupConversationArtifacts);
   projects = projects.filter(p => p !== path);
   saveProjectsToStorage();
   
@@ -3960,6 +3989,13 @@ function removeProject(path) {
     renderConversationList();
     renderProjectsList();
   }
+}
+
+function cleanupConversationArtifacts(id) {
+  if (!id || !window.api || typeof window.api.deleteConversationArtifacts !== 'function') return;
+  window.api.deleteConversationArtifacts(id).catch(err => {
+    console.warn('Failed to delete conversation artifacts:', err);
+  });
 }
 
 // Shared helper — builds one project card and appends it to el.projectList

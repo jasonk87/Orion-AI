@@ -49,6 +49,24 @@ test('convertGeminiToDeepSeekMessages threads tool_call_id through to the matchi
   t.end();
 });
 
+test('convertGeminiToDeepSeekMessages preserves hidden reasoning_content without mixing it into content', (t) => {
+  const messages = [
+    {
+      role: 'model',
+      parts: [
+        { text: 'private chain of thought', thought: true, _deepseekReasoningContent: true },
+        { text: 'Visible answer.' },
+        { functionCall: { name: 'read_file', args: { path: 'agent.js' } } }
+      ]
+    }
+  ];
+  const [out] = agent.convertGeminiToDeepSeekMessages(messages);
+  t.equal(out.content, 'Visible answer.', 'assistant content contains only the visible answer');
+  t.equal(out.reasoning_content, 'private chain of thought', 'hidden reasoning is retained for DeepSeek continuity');
+  t.equal(out.tool_calls[0].function.name, 'read_file', 'tool calls are still preserved');
+  t.end();
+});
+
 test('callDeepSeekAPI posts to the DeepSeek endpoint with Bearer auth and normalizes the reply to Gemini shape', async (t) => {
   const originalFetch = global.fetch;
   let captured = null;
@@ -59,6 +77,7 @@ test('callDeepSeekAPI posts to the DeepSeek endpoint with Bearer auth and normal
       json: async () => ({
         choices: [{
           message: {
+            reasoning_content: 'I should inspect the file before editing.',
             content: "I'll read the file first.",
             tool_calls: [{ id: 'call_x', type: 'function', function: { name: 'read_file', arguments: '{"path":"server.js"}' } }]
           }
@@ -75,13 +94,17 @@ test('callDeepSeekAPI posts to the DeepSeek endpoint with Bearer auth and normal
 
     const body = JSON.parse(captured.opts.body);
     t.equal(body.model, 'deepseek-v4-pro', 'requests the selected deepseek model');
+    t.deepEqual(body.thinking, { type: 'enabled' }, 'explicitly enables DeepSeek thinking mode');
+    t.equal(body.reasoning_effort, 'max', 'uses max reasoning effort for DeepSeek pro');
     t.equal(body.messages[0].role, 'system', 'the system instruction is the first message (OpenAI convention)');
     t.ok(Array.isArray(body.tools) && body.tools.length > 0, 'includes the tool schema when tools are enabled');
 
     const parts = result.candidates[0].content.parts;
-    t.equal(parts[0].text, "I'll read the file first.", 'content normalizes to a Gemini text part');
-    t.equal(parts[1].functionCall.name, 'read_file', 'tool_calls normalize to a Gemini functionCall');
-    t.deepEqual(parts[1].functionCall.args, { path: 'server.js' }, 'stringified arguments are parsed back into functionCall args');
+    t.equal(parts[0].text, 'I should inspect the file before editing.', 'reasoning_content is preserved as a hidden thought part');
+    t.equal(parts[0].thought, true, 'reasoning_content is marked as a thought so it is not shown as answer text');
+    t.equal(parts[1].text, "I'll read the file first.", 'content normalizes to a Gemini text part');
+    t.equal(parts[2].functionCall.name, 'read_file', 'tool_calls normalize to a Gemini functionCall');
+    t.deepEqual(parts[2].functionCall.args, { path: 'server.js' }, 'stringified arguments are parsed back into functionCall args');
     t.equal(result._orionActiveModelName, 'deepseek-v4-pro', 'reports the active model back to the loop');
   } finally {
     global.fetch = originalFetch;
@@ -96,6 +119,30 @@ test('callDeepSeekAPI throws a clear non-retryable error when no api key is conf
   } catch (e) {
     t.ok(/api key/i.test(e.message), 'error explains the missing DeepSeek key');
     t.ok(e.nonRetryable, 'the missing-key error is marked non-retryable');
+  }
+  t.end();
+});
+
+test('callDeepSeekAPI treats HTTP 402 billing failures as non-retryable', async (t) => {
+  const originalFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    calls++;
+    return {
+      ok: false,
+      status: 402,
+      text: async () => JSON.stringify({ error: { message: 'Insufficient balance. Please top up.' } })
+    };
+  };
+  try {
+    await agent.callDeepSeekAPI([{ role: 'user', parts: [{ text: 'hi' }] }], 'deepseek-v4-flash', 'sk-test', () => {}, false, {});
+    t.fail('should have thrown on 402');
+  } catch (e) {
+    t.equal(calls, 1, 'does not retry a payment-required response');
+    t.ok(e.nonRetryable, '402 is marked non-retryable');
+    t.ok(/402/.test(e.message) && /Insufficient balance/.test(e.message), 'error explains the billing failure');
+  } finally {
+    global.fetch = originalFetch;
   }
   t.end();
 });
