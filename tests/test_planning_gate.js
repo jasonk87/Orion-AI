@@ -628,7 +628,7 @@ test('edit-blocked guard reminds the model to retry the edit after it re-reads t
 
     // The routing classifier and the per-turn countTokens preflight each make their own fetch
     // call before the actual model turn; neither may consume a slot in the turnCount sequence
-    // below, or every branch shifts and the intended modify/modify/modify(blocked)/read_file
+    // below, or every branch shifts and the intended read/modify/modify/modify(blocked)/read_file
     // sequence never actually happens.
     if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
       return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
@@ -650,11 +650,13 @@ test('edit-blocked guard reminds the model to retry the edit after it re-reads t
       json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall }] } }] })
     });
 
-    if (turnCount === 1) return respondWith({ name: 'modify_file', args: { path: 'a.js', target: 'const x = 1;', replacement: 'const x = 10;' } });
-    if (turnCount === 2) return respondWith({ name: 'modify_file', args: { path: 'a.js', target: 'const y = 2;', replacement: 'const y = 20;' } });
-    // Third edit to the same file without an intervening read should be blocked by the thrash guard.
-    if (turnCount === 3) return respondWith({ name: 'modify_file', args: { path: 'a.js', target: 'const z = 3;', replacement: 'const z = 30;' } });
-    if (turnCount === 4) return respondWith({ name: 'read_file', args: { path: 'a.js' } });
+    // Read the file first (read-before-edit gate), then edit it twice; the third edit without an
+    // intervening read is blocked by the thrash guard, and the read that follows carries the retry reminder.
+    if (turnCount === 1) return respondWith({ name: 'read_file', args: { path: 'a.js' } });
+    if (turnCount === 2) return respondWith({ name: 'modify_file', args: { path: 'a.js', target: 'const x = 1;', replacement: 'const x = 10;' } });
+    if (turnCount === 3) return respondWith({ name: 'modify_file', args: { path: 'a.js', target: 'const y = 2;', replacement: 'const y = 20;' } });
+    if (turnCount === 4) return respondWith({ name: 'modify_file', args: { path: 'a.js', target: 'const z = 3;', replacement: 'const z = 30;' } });
+    if (turnCount === 5) return respondWith({ name: 'read_file', args: { path: 'a.js' } });
     return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'All edits are complete now.' }] } }] }) };
   };
 
@@ -675,6 +677,69 @@ test('edit-blocked guard reminds the model to retry the edit after it re-reads t
     global.setTimeout = originalSetTimeout;
   }
 
+  t.end();
+});
+
+// Slice 3 (harness reliability): the read-before-edit gate. A surgical edit to a file the model
+// has NOT read this run is a blind edit against guessed content — the top cause of drift
+// corruption. The gate blocks the first modify_file/patch_file to an unread file and tells the
+// model to read it first; once read, edits proceed normally.
+test('a blind first edit to an unread file is blocked until the model reads it', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: false });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  let patchCalls = 0;
+  global.window.api = {
+    readFile: async () => 'const original = true;\n',
+    patchFile: async (workspace, path) => { patchCalls++; return { success: true, changed: true, message: `Patched ${path} successfully.` }; },
+    listFiles: async () => ([{ path: 'server.js', isDir: false, size: 100 }]),
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+  };
+
+  const conversation = { id: 'test-read-before-edit', messages: [], awaitingPlanApproval: false, planApproved: true };
+
+  let turnCount = 0;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    turnCount++;
+    // Turn 1: patch a file the model has never read — must be blocked. Turn 2: read it.
+    // Turn 3: patch again — now allowed.
+    if (turnCount === 1) return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'patch_file', args: { path: 'server.js', operation: { type: 'replace', target: 'original', replacement: 'changed' } } } }] } }] }) };
+    if (turnCount === 2) return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'read_file', args: { path: 'server.js' } } }] } }] }) };
+    if (turnCount === 3) return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'patch_file', args: { path: 'server.js', operation: { type: 'replace', target: 'original', replacement: 'changed' } } } }] } }] }) };
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'Done editing server.js.' }] } }] }) };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
+    await window.runAgentLoop('change original to changed in server.js', 'gemini-1', conversation);
+
+    const toolCalls = (conversation.messages[conversation.messages.length - 1]?.logs || []).filter(l => l.type === 'tool_call');
+    const patchAttempts = toolCalls.filter(c => c.tool === 'patch_file');
+    t.equal(patchAttempts.length, 2, 'the model attempted patch_file twice (blocked, then allowed after reading)');
+    t.equal(patchAttempts[0].status, 'error', 'the blind first patch (before any read) was blocked');
+    t.ok(/have not read|read_file/i.test(String(patchAttempts[0].result)), 'the block tells the model to read the file first');
+    t.equal(patchAttempts[1].status, 'success', 'the patch succeeded once the file had been read');
+    t.equal(patchCalls, 1, 'only the post-read patch actually reached the file — the blind one never executed');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
   t.end();
 });
 
@@ -786,7 +851,14 @@ test('direct-mode edits without any mission state still require verification evi
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
     turnCount++;
+    // Read the file first (read-before-edit gate), then make the edit.
     if (turnCount === 1) {
+      return {
+        ok: true,
+        json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'read_file', args: { path: 'math.js' } } }] } }] })
+      };
+    }
+    if (turnCount === 2) {
       return {
         ok: true,
         json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'modify_file', args: { path: 'math.js', target: 'a + b', replacement: 'a + b + 0' } } }] } }] })
@@ -1243,13 +1315,12 @@ test('three consecutive syntax-error-introducing patches to the same file trigge
       ok: true,
       json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'patch_file', args: { path: 'server.js', operation: { type: 'replace', target, replacement: 'y' } } } }] } }] })
     });
-    if (turnCount === 1) return patchCall('a'); // 1st edit
-    if (turnCount === 2) return patchCall('c'); // 2nd edit -> next edit to this file now requires a read first
-    if (turnCount === 3) {
-      // read_file to satisfy the edit-thrash guard before the 3rd edit
-      return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'read_file', args: { path: 'server.js' } } }] } }] }) };
-    }
-    if (turnCount === 4) return patchCall('e'); // 3rd consecutive syntax-error-introducing edit -> escalation fires
+    const readCall = () => ({ ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'read_file', args: { path: 'server.js' } } }] } }] }) });
+    if (turnCount === 1) return readCall();     // read first (read-before-edit gate)
+    if (turnCount === 2) return patchCall('a'); // 1st edit
+    if (turnCount === 3) return patchCall('c'); // 2nd edit -> next edit to this file now requires a read first
+    if (turnCount === 4) return readCall();     // read_file to satisfy the edit-thrash guard before the 3rd edit
+    if (turnCount === 5) return patchCall('e'); // 3rd consecutive syntax-error-introducing edit -> escalation fires
     return {
       ok: true,
       json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'Stopping to reconsider the approach for server.js.' }] } }] })
@@ -1424,12 +1495,13 @@ test('repeated edit failures escalate to a stronger model, then revert once the 
       ok: true,
       json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'read_file', args: { path: 'server.js' } } }] } }] })
     });
-    if (turnCount === 1) return patchCall('a'); // 1st edit, streak=1, still original model
-    if (turnCount === 2) return patchCall('c'); // 2nd edit, streak=2, still original model, needs-read set
-    if (turnCount === 3) return readCall();      // satisfy edit-thrash guard
-    if (turnCount === 4) return patchCall('e'); // 3rd edit, streak=3 -> escalation triggers after this
-    if (turnCount === 5) return readCall();      // satisfy edit-thrash guard again (request still uses escalated model)
-    if (turnCount === 6) return patchCall('g'); // 4th edit, this one is clean -> reverts after this
+    if (turnCount === 1) return readCall();      // read first (read-before-edit gate)
+    if (turnCount === 2) return patchCall('a'); // 1st edit, streak=1, still original model
+    if (turnCount === 3) return patchCall('c'); // 2nd edit, streak=2, still original model, needs-read set
+    if (turnCount === 4) return readCall();      // satisfy edit-thrash guard
+    if (turnCount === 5) return patchCall('e'); // 3rd edit, streak=3 -> escalation triggers after this
+    if (turnCount === 6) return readCall();      // satisfy edit-thrash guard again (request now uses escalated model)
+    if (turnCount === 7) return patchCall('g'); // 4th edit, this one is clean -> reverts after this
     return {
       ok: true,
       json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'server.js is fixed now.' }] } }] })
@@ -1440,11 +1512,11 @@ test('repeated edit failures escalate to a stronger model, then revert once the 
     global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
     await window.runAgentLoop('fix the syntax error in server.js', 'gemini-2.5-flash-lite', conversation);
 
-    t.equal(modelsRequested[0], 'gemini-2.5-flash-lite', 'turn 1 uses the originally selected model');
-    t.equal(modelsRequested[3], 'gemini-2.5-flash-lite', 'turn 4 (the request that triggers escalation) still uses the original model — escalation applies to the NEXT call');
-    t.equal(modelsRequested[4], 'gemini-2.5-flash', 'turn 5 (right after the 3rd consecutive failure) is escalated to the stronger model');
-    t.equal(modelsRequested[5], 'gemini-2.5-flash', 'turn 6 (the clean fix attempt) still runs on the escalated model');
-    t.equal(modelsRequested[6], 'gemini-2.5-flash-lite', 'turn 7 (after the clean edit) reverts back to the originally selected model');
+    t.equal(modelsRequested[0], 'gemini-2.5-flash-lite', 'the first turn (read) uses the originally selected model');
+    t.equal(modelsRequested[4], 'gemini-2.5-flash-lite', 'the request that triggers escalation (3rd failing patch) still uses the original model — escalation applies to the NEXT call');
+    t.equal(modelsRequested[5], 'gemini-2.5-flash', 'right after the 3rd consecutive failure the loop is escalated to the stronger model');
+    t.equal(modelsRequested[6], 'gemini-2.5-flash', 'the clean fix attempt still runs on the escalated model');
+    t.equal(modelsRequested[7], 'gemini-2.5-flash-lite', 'after the clean edit the loop reverts to the originally selected model');
   } finally {
     global.window.runAgentLoop = originalRunAgentLoop;
     global.fetch = originalFetch;
@@ -1493,7 +1565,14 @@ test('a real detected regression stops the run with a specific message, not a ge
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
     turnCount++;
+    // Read the file first (read-before-edit gate), then make the edit that triggers the regression.
     if (turnCount === 1) {
+      return {
+        ok: true,
+        json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'read_file', args: { path: 'src/game/units/MilitaryUnit.js' } } }] } }] })
+      };
+    }
+    if (turnCount === 2) {
       return {
         ok: true,
         json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'patch_file', args: { path: 'src/game/units/MilitaryUnit.js', operation: { type: 'insert', anchor: 'x', content: 'y', position: 'before' } } } }] } }] })
@@ -1708,10 +1787,18 @@ test('editing a different file while an earlier one has an unresolved syntax err
       ok: true,
       json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'patch_file', args: { path, operation: { type: 'replace', target: 'x', replacement: 'y' } } } }] } }] })
     });
-    if (turnCount === 1) return patchCall('src/fileA.js');       // breaks fileA.js
-    if (turnCount === 2) return patchCall('src/fileB.js');       // should be blocked: fileA.js still broken
-    if (turnCount === 3) return patchCall('src/fileA.js');       // fixes fileA.js
-    if (turnCount === 4) return patchCall('src/fileB.js');       // now allowed
+    const readCall = (path) => ({
+      ok: true,
+      json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'read_file', args: { path } } }] } }] })
+    });
+    // Read both files first (read-before-edit gate) so the cross-file breakage guard — not the
+    // read gate — is what blocks the fileB.js edit while fileA.js is broken.
+    if (turnCount === 1) return readCall('src/fileA.js');
+    if (turnCount === 2) return readCall('src/fileB.js');
+    if (turnCount === 3) return patchCall('src/fileA.js');       // breaks fileA.js
+    if (turnCount === 4) return patchCall('src/fileB.js');       // should be blocked: fileA.js still broken
+    if (turnCount === 5) return patchCall('src/fileA.js');       // fixes fileA.js
+    if (turnCount === 6) return patchCall('src/fileB.js');       // now allowed
     return {
       ok: true,
       json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'Finished editing both files.' }] } }] })

@@ -829,6 +829,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const repeatedToolFailures = new Map();
     const fileEditCounts = new Map();
     const fileNeedsReadBeforeEdit = new Set(); // files that must be read before the next edit
+    // Files whose current content the model has actually seen this run — populated by a successful
+    // read_file (it saw the content) or write_file (it authored the content). A surgical edit
+    // (modify_file/patch_file) to a file NOT in this set is a blind edit against content the model
+    // is only guessing at, which is the single biggest source of drift corruption. The gate below
+    // requires the file to be here first. (This is the "read before you edit" rule that keeps even
+    // a weak model from mangling a file it never looked at.)
+    const filesSeenThisRun = new Set();
     // Files whose most recent write/modify/patch embedded a SYNTAX ERROR/REGRESSION DETECTED
     // warning and haven't been fixed since. Without this, a run can break file A, move on and
     // break file B and C too, leaving three broken files instead of fixing A before continuing —
@@ -1394,6 +1401,24 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           continue;
         }
 
+        // Read-before-edit gate: a surgical edit (modify_file/patch_file) to a file whose content
+        // the model has not seen this run — never read it, never wrote it — is a blind edit against
+        // guessed content. That is the primary way line-range/anchor edits drift and corrupt a file.
+        // Require a read first. write_file is exempt (it replaces wholesale and has its own
+        // allowOverwrite gate). A file already read or authored this run is fine.
+        if ((toolName === 'modify_file' || toolName === 'patch_file') && args.path) {
+          const editKey = String(args.path).toLowerCase();
+          if (!filesSeenThisRun.has(editKey)) {
+            const blockMsg = `EDIT BLOCKED: You have not read ${args.path} this session, so you would be editing content you haven't seen. Call read_file on ${args.path} first (for a large file, get_symbol_index then a targeted read_file of the relevant range), then make your edit against its actual current content. Editing a file blind is the top cause of corruption.`;
+            currentAgentLogs[logIndex].status = 'error';
+            currentAgentLogs[logIndex].result = blockMsg;
+            updateWalkthroughItem(walkthroughItem, toolName, args, { error: blockMsg }, new Error(blockMsg));
+            toolResponseParts.push({ functionResponse: { name: toolName, response: { error: blockMsg, blocked: 'read_before_edit' } } });
+            persistCurrentAgentLogs({ render: true });
+            continue;
+          }
+        }
+
         // Hard thrash guard: block repeated edits to the same file without an intervening read
         if ((toolName === 'write_file' || toolName === 'modify_file' || toolName === 'patch_file') && args.path) {
           const editKey = String(args.path).toLowerCase();
@@ -1572,6 +1597,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         // The pre-execution block above enforces this — here we update the tracking state.
         if ((toolName === 'write_file' || toolName === 'modify_file' || toolName === 'patch_file') && args.path && !isFailedToolResult(result)) {
           const editKey = String(args.path).toLowerCase();
+          // write_file authored the file's full content, so the model has "seen" it for the
+          // read-before-edit gate (it can safely modify/patch it next without a separate read).
+          if (toolName === 'write_file') filesSeenThisRun.add(editKey);
           const editCount = (fileEditCounts.get(editKey) || 0) + 1;
           fileEditCounts.set(editKey, editCount);
           if (editCount >= 2) {
@@ -1641,6 +1669,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         // the same file repeatedly without ever producing the corrected edit the guard was for.
         if (toolName === 'read_file' && args.path && !isFailedToolResult(result)) {
           const readKey = String(args.path).toLowerCase();
+          filesSeenThisRun.add(readKey); // the model has now seen this file's content — edits allowed
           const wasBlocked = fileNeedsReadBeforeEdit.has(readKey);
           fileNeedsReadBeforeEdit.delete(readKey);
           if (wasBlocked && result && typeof result === 'object' && !Array.isArray(result)) {
