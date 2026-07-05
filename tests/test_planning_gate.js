@@ -743,6 +743,79 @@ test('a blind first edit to an unread file is blocked until the model reads it',
   t.end();
 });
 
+// Slice 3 (harness reliability): redundant-read guard. A full re-read of a file already read this
+// run and not edited since returns bytes the model already has (a transcript showed a 2600-line
+// file re-read six times). The content is still delivered, but a note flags the waste so the model
+// stops re-reading and acts. An edit to the file clears the flag (a re-read then is legitimate).
+test('a full re-read of an unchanged already-read file is flagged as redundant, but an edited file re-reads cleanly', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: false });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    readFile: async () => 'const value = 1;\n',
+    writeFile: async () => ({ success: true, backupPath: null }),
+    listFiles: async () => ([{ path: 'big.js', isDir: false, size: 100 }]),
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+  };
+
+  const conversation = { id: 'test-redundant-read', messages: [], awaitingPlanApproval: false, planApproved: true };
+
+  const readResponsesSeen = [];
+  let turnCount = 0;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    // Capture each read_file tool response as it appears in the resent history.
+    for (const message of contents) {
+      const rr = (message.parts || []).find(p => p.functionResponse && p.functionResponse.name === 'read_file');
+      if (rr) readResponsesSeen.push(rr.functionResponse.response);
+    }
+
+    turnCount++;
+    const readCall = () => ({ ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'read_file', args: { path: 'big.js' } } }] } }] }) });
+    if (turnCount === 1) return readCall(); // first read — not redundant
+    if (turnCount === 2) return readCall(); // redundant full re-read of unchanged file -> flagged
+    if (turnCount === 3) return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'modify_file', args: { path: 'big.js', target: 'const value = 1;', replacement: 'const value = 2;' } } }] } }] }) }; // edit clears the flag
+    if (turnCount === 4) return readCall(); // re-read AFTER an edit — legitimate, not flagged
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'Done.' }] } }] }) };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
+    await window.runAgentLoop('inspect big.js', 'gemini-1', conversation);
+
+    // Dedupe by identity — the same response object is re-sent across turns as history.
+    const uniqueReads = [...new Set(readResponsesSeen)];
+    const flagged = uniqueReads.filter(r => r && r.redundantReadNote);
+    const unflagged = uniqueReads.filter(r => r && !r.redundantReadNote);
+    t.ok(uniqueReads.length >= 2, 'multiple reads occurred');
+    t.notOk(uniqueReads[0].redundantReadNote, 'the very first read of the file is never flagged as redundant');
+    t.ok(flagged.length >= 1, 'a redundant unchanged re-read is flagged');
+    t.ok(flagged.every(r => /already read|re-reading|wastes context/i.test(r.redundantReadNote)), 'the redundant-read note explains the waste');
+    // Not every read is flagged — the first read and reads that follow an edit (content changed)
+    // stay unflagged, proving the guard fires only on genuinely redundant unchanged re-reads.
+    t.ok(unflagged.length >= 1, 'reads that are not redundant (first read, and reads after an edit) are left unflagged');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+  t.end();
+});
+
 // Regression: Gemini's thinking mode can return an internal "thought" segment as its own part
 // alongside the real answer. The loop concatenated every part.text together with no separator,
 // so a response with both a thought part and a real answer part rendered as two near-duplicate

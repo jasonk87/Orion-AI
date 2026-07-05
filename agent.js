@@ -845,6 +845,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // requires the file to be here first. (This is the "read before you edit" rule that keeps even
     // a weak model from mangling a file it never looked at.)
     const filesSeenThisRun = new Set();
+    // Files that have been fully read this run and NOT edited since — a subsequent full re-read of
+    // one of these returns the same bytes the model already has, which is pure waste (a transcript
+    // showed a 2600-line file re-read six times in one run). We still deliver the content (safe —
+    // never risk hiding something the model needs), but attach a note nudging it to stop re-reading
+    // and act. Cleared on any edit to the file, since a re-read after an edit is legitimate.
+    const filesFullyReadUnchanged = new Set();
     // Files whose most recent write/modify/patch embedded a SYNTAX ERROR/REGRESSION DETECTED
     // warning and haven't been fixed since. Without this, a run can break file A, move on and
     // break file B and C too, leaving three broken files instead of fixing A before continuing —
@@ -1609,6 +1615,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           // write_file authored the file's full content, so the model has "seen" it for the
           // read-before-edit gate (it can safely modify/patch it next without a separate read).
           if (toolName === 'write_file') filesSeenThisRun.add(editKey);
+          // The file's content just changed, so a subsequent re-read is legitimate (not redundant).
+          filesFullyReadUnchanged.delete(editKey);
           const editCount = (fileEditCounts.get(editKey) || 0) + 1;
           fileEditCounts.set(editKey, editCount);
           if (editCount >= 2) {
@@ -1683,6 +1691,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           fileNeedsReadBeforeEdit.delete(readKey);
           if (wasBlocked && result && typeof result === 'object' && !Array.isArray(result)) {
             result.editRetryReminder = `You previously had an edit to ${args.path} blocked until you re-read it. You have now read its current content above. Retry the edit you were making now, using this fresh content, instead of reading this file again or stopping without editing.`;
+          }
+          // Redundant-read guard: a FULL re-read (no startLine/endLine range) of a file already
+          // fully read this run and not edited since returns bytes the model already has. We still
+          // deliver the content — never hide something it might need — but flag the waste so it
+          // stops re-reading the same large file and acts on what it already has.
+          const isFullRead = !(Number.isInteger(parseInt(args.startLine, 10)) && Number.isInteger(parseInt(args.endLine, 10)));
+          if (isFullRead) {
+            if (filesFullyReadUnchanged.has(readKey) && result && typeof result === 'object' && !Array.isArray(result) && !wasBlocked) {
+              result.redundantReadNote = `You already read ${args.path} earlier this run and it has not changed since — this is the same content. Re-reading files you already have (especially large ones) wastes context; rely on your earlier read and proceed to the next concrete action instead of reading this file again.`;
+            }
+            filesFullyReadUnchanged.add(readKey);
           }
         }
         // A genuine passing verification (not a placeholder script) proves the workspace is
