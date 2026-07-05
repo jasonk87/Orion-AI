@@ -133,6 +133,15 @@ let agentSubStatus = '';
 let agentExecutionMode = 'idle';
 let resolvedHomeDir = 'C:\\Users\\Owner';
 let currentAgentLogs = [];
+// Signature of the last observed browser page state (url/title/content), used to detect when a
+// click_element produced no observable effect — a click "succeeding" only means the DOM element was
+// found and clicked, not that the app actually reacted (e.g. a button with no handler wired up).
+let lastBrowserPageSignature = null;
+function computeBrowserPageSignature(result) {
+  if (!result || typeof result !== 'object') return null;
+  const text = typeof result.text === 'string' ? result.text : '';
+  return [result.url || '', result.title || '', text.length, text.slice(0, 160)].join('¦');
+}
 let isStopRequested = false;
 let activeRunController = null;
 let stopRequestMode = 'none';
@@ -2635,6 +2644,7 @@ async function executeTool(name, args, workspace, config, conversation) {
       if (!args.url) throw new Error("Missing 'url' parameter");
       const result = await window.api.browserOpenUrl(args.url);
       if (!result.success) throw new Error(result.error || 'Browser open failed');
+      lastBrowserPageSignature = computeBrowserPageSignature(result);
       return result;
     }
 
@@ -2646,9 +2656,23 @@ async function executeTool(name, args, workspace, config, conversation) {
     }
 
     case 'click_element': {
+      const before = lastBrowserPageSignature;
       const result = await window.api.browserClickElement(args.selector || '', args.text || '');
       if (!result.success) throw new Error(result.error || 'Click failed');
-      return result;
+      const after = computeBrowserPageSignature(result);
+      lastBrowserPageSignature = after;
+      // A click "succeeding" only means the DOM element was found and clicked. If the page looks
+      // identical afterward — same URL, title, and visible content — the click very likely did not
+      // trigger the intended behavior (a common cause: the element has no event handler wired up).
+      // Surface that so the model verifies the real effect instead of assuming success.
+      if (before && after && before === after) {
+        return {
+          ...result,
+          observedEffect: false,
+          verificationNote: `The click succeeded (the element was found and clicked), but the page did NOT visibly change — same URL, title, and content as before the click. A successful click confirms only that a DOM element was clicked, not that it did anything. If you expected a panel to open, a navigation, new content, or a server action, it likely did not happen — a frequent cause is that the clicked element has no event handler wired up (grep_search the page's script for how similar elements bind their handlers). Verify the actual effect (take_screenshot, re-read the page text, or check server/console output) before assuming this worked.`
+        };
+      }
+      return { ...result, observedEffect: true };
     }
 
     case 'fill_input': {
