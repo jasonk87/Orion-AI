@@ -201,3 +201,25 @@ test('responsive app chrome preserves the agent canvas', (t) => {
   t.ok(styles.includes('#right-sidebar:not(.collapsed)'), 'uses an overlay Agent Panel when narrow');
   t.end();
 });
+
+// Regression: the Workspace Files panel is the sidebar's one flex-grow section (meant to fill
+// whatever vertical space is available), but the shared .panel-content.scrollable rule hardcoded a
+// 250px max-height meant for the small fixed-size panels (checklist, artifacts). That cap silently
+// overrode the flex-grow intent, cramming the entire file tree into a tiny scroll box regardless of
+// how much sidebar room existed — visually indistinguishable from "most files are missing/cut off"
+// even though the underlying file list (and its count badge) were complete.
+test('the Workspace Files panel fills available sidebar height instead of being capped at 250px', (t) => {
+  t.ok(html.includes('class="panel-section flex-grow" id="workspace-files-panel"'),
+    'the Workspace Files panel is the sidebar\'s flex-grow section');
+  t.ok(styles.includes('#workspace-files-panel .panel-content.scrollable'),
+    'a scoped override targets the Workspace Files panel\'s scrollable content area');
+  const overrideMatch = styles.match(/#workspace-files-panel \.panel-content\.scrollable\s*\{([^}]*)\}/);
+  t.ok(overrideMatch && /max-height:\s*none/.test(overrideMatch[1]),
+    'the override removes the 250px cap so the panel can use its flex:1 to fill available space');
+  // The base rule (and therefore the other fixed-size panels like the checklist/artifacts, which
+  // are NOT flex-grow) must keep the 250px cap — this should not be a blanket removal.
+  const baseMatch = styles.match(/\.panel-content\.scrollable\s*\{([^}]*)\}/);
+  t.ok(baseMatch && /max-height:\s*250px/.test(baseMatch[1]),
+    'the base rule still caps the small fixed-size panels at 250px');
+  t.end();
+});

@@ -1092,6 +1092,15 @@ code {
   max-height: 250px;
 }
 
+/* The Workspace Files panel is the sidebar's one flex-grow section — it should fill whatever
+   vertical space is actually available, not the 250px cap meant for the small fixed-size panels
+   (checklist, artifacts) above/below it. Without this override the file tree was crammed into a
+   tiny scroll box regardless of how much room the sidebar had, making it look like only a handful
+   of files existed even when the full list was present underneath. */
+#workspace-files-panel .panel-content.scrollable {
+  max-height: none;
+}
+
 .badge {
   background-color: var(--bg-tertiary);
   border: 1px solid var(--border-color);
