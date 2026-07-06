@@ -824,6 +824,8 @@ function setLeftSidebarCollapsed(collapsed, persist = true) {
 
 function setAppMode(mode, persist = true) {
   appMode = mode;
+  document.body.setAttribute('data-mode', mode);
+
   const orionBtn = document.getElementById('btn-mode-orion');
   const coderBtn = document.getElementById('btn-mode-coder');
   const orionContent = document.getElementById('sidebar-orion-content');
@@ -832,7 +834,43 @@ function setAppMode(mode, persist = true) {
   if (coderBtn) coderBtn.classList.toggle('active', mode === 'coder');
   if (orionContent) orionContent.classList.toggle('active', mode === 'orion');
   if (coderContent) coderContent.classList.toggle('active', mode === 'coder');
+
+  // Adapt main workspace for mode
+  const chatInput = document.getElementById('chat-input');
+  const orionSplash = document.getElementById('orion-welcome-splash');
+
+  if (mode === 'orion') {
+    if (chatInput) chatInput.placeholder = 'Ask Orion anything…';
+    // Show Orion greeting splash if no active conversation with messages
+    const conv = conversations.find(c => c.id === activeConversationId);
+    const hasMessages = conv && conv.messages && conv.messages.length > 0;
+    if (!hasMessages) {
+      if (el.welcomeSplash) el.welcomeSplash.style.display = 'none';
+      if (orionSplash) orionSplash.style.display = 'flex';
+      if (el.messagesContainer) el.messagesContainer.style.display = 'none';
+    }
+    // Update greeting time
+    updateOrionGreeting();
+  } else {
+    if (chatInput) chatInput.placeholder = 'Ask Orion to build, fix, or investigate…';
+    if (orionSplash) orionSplash.style.display = 'none';
+    // Restore coder splash if no messages
+    const conv = conversations.find(c => c.id === activeConversationId);
+    const hasMessages = conv && conv.messages && conv.messages.length > 0;
+    if (!hasMessages) {
+      if (el.welcomeSplash) el.welcomeSplash.style.display = 'flex';
+    }
+  }
+
   if (persist) localStorage.setItem('appMode', mode);
+}
+
+function updateOrionGreeting() {
+  const nameEl = document.getElementById('orion-greeting-name');
+  if (!nameEl) return;
+  const hour = new Date().getHours();
+  const tod = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
+  nameEl.textContent = `${tod}, Jason.`;
 }
 
 function runCommandPaletteAction(command) {
@@ -4098,44 +4136,4 @@ function buildClarificationCardHtml(clarData) {
 
     return `
       <div class="clarification-question-block" data-qi="${qi}">
-        <div class="clarification-question-header">
-          <span class="clarification-chip">${escapedHeader}</span>
-          <span class="clarification-question-text">${escapedQuestion}</span>
-        </div>
-        <div class="clarification-options">
-          ${optionsHtml}
-          <label class="clarification-other-row">
-            <input type="radio" name="clarq_${qi}" value="__other__" />
-            <input class="clarification-other-input" type="text" placeholder="Other — type your answer…" data-qi="${qi}" />
-          </label>
-        </div>
-      </div>`;
-  }).join('');
-
-  return `
-    <div class="clarification-card">
-      ${escapedIntro ? `<div class="clarification-intro">${escapedIntro}</div>` : ''}
-      ${questionsHtml}
-      <div class="clarification-actions">
-        <button class="btn-clarification-submit" type="button">Submit</button>
-      </div>
-    </div>`;
-}
-
-async function submitClarificationAnswers({ button, bubble } = {}) {
-  const conv = conversations.find(c => c.id === activeConversationId);
-  if (!conv || !conv.awaitingClarification) return;
-
-  const clarData = conv.awaitingClarification;
-  const questions = clarData.questions || [];
-
-  // Collect answers from the bubble's form controls
-  const answers = [];
-  let allAnswered = true;
-  questions.forEach((q, qi) => {
-    const block = bubble ? bubble.querySelector(`.clarification-question-block[data-qi="${qi}"]`) : null;
-    let answer = null;
-    if (block) {
-      const checked = block.querySelector(`input[type="radio"][name="clarq_${qi}"]:checked`);
-      if (checked) {
-        if (c
+        <div class="clarificatio

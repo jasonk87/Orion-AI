@@ -122,7 +122,14 @@
 
       <!-- CHAT CONTENT FEED -->
       <div id="chat-feed">
-        <!-- Welcoming splash or history messages -->
+        <!-- Orion (Dispatcher) Welcome Splash -->
+        <div class="orion-welcome-splash" id="orion-welcome-splash" style="display:none;">
+          <div class="orion-welcome-icon">&#10022;</div>
+          <h1 id="orion-greeting-name">Good evening, Jason.</h1>
+          <p class="orion-welcome-sub">What are we working on?</p>
+        </div>
+
+        <!-- Coder Welcome Splash -->
         <div class="welcome-splash" id="welcome-splash">
           <h1>Orion AI</h1>
           <p>Describe the outcome. Orion will plan, act, verify, and keep going.</p>
@@ -368,10 +375,4 @@
         <div class="form-group">
           <label for="setting-google-search-engine-id">Google Search Engine ID:</label>
           <input type="text" id="setting-google-search-engine-id" placeholder="3354e92e98ab54b31">
-          <small class="form-help">Used by the web search tool for API docs and technical references.</small>
-        </div>
-
-        <div class="form-group">
-          <label for="setting-google-search-api-key">Google Search API Key:</label>
-          <input type="password" id="setting-google-search-api-key" placeholder="Leave blank to use Gemini key">
-          <small class="form-help">Requires Google Programm
+          <small class="form-help">Used by the web search tool for API docs and tec
