@@ -1910,6 +1910,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             }
             const planItem = workWalkthrough.find(item => item.kind === 'plan');
             lastTextResponse = buildPlanApprovalMessage(planItem, lastTextResponse);
+            forceYield = true;  // prevent auto-continue from bypassing plan approval gate
             break;
           }
         }
@@ -1918,6 +1919,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         conversation.awaitingPlanApproval = true;
         const planItem = workWalkthrough.find(item => item.kind === 'plan');
         lastTextResponse = buildPlanApprovalMessage(planItem, lastTextResponse);
+        forceYield = true;  // prevent auto-continue from bypassing plan approval gate
         break;
       }
     }
@@ -1995,7 +1997,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // fallback keeps long work going even if operational mission state is unexpectedly absent.
     const hasResumableWork = hasOperationalMissionState(workingState) || pendingChecklist.length > 0;
     if (!forceYield && !userRequestedStop && canExecuteAtExit && hasPendingWork && madeProgressThisRun && !blockersActive && !stalled
-        && hasResumableWork && conversation._planExecAutoContinues < AUTO_CONTINUE_BUDGET) {
+        && hasResumableWork && conversation._planExecAutoContinues < AUTO_CONTINUE_BUDGET
+        && !conversation.awaitingPlanApproval) {
       autoContinueExecution = true;
       conversation._planExecAutoContinues++;
     }
@@ -2083,7 +2086,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   // If the run stopped mid-plan with real progress and pending work, queue an internal
   // continuation so a multi-phase build keeps going instead of falsely ending. Real user
   // queue items take priority, so only enqueue when nothing else is waiting.
-  if (autoContinueExecution && window.promptQueue && window.promptQueue.length === 0) {
+  if (autoContinueExecution && window.promptQueue && window.promptQueue.length === 0 && !conversation.awaitingPlanApproval) {
     window.promptQueue.push({
       prompt: '[ORION INTERNAL CONTINUATION - not a user message] The approved plan is still in progress. Continue executing the remaining checklist items and subplan steps now: write and edit the actual source files for the next pending tasks, then verify. Do not restate the plan or stop until the work is genuinely complete or you hit a real blocker. Do not quote this as something the user said.',
       modelSelectValue: modelName,
