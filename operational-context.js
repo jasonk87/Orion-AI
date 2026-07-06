@@ -392,7 +392,17 @@
               : 'none — call update_mission_context first to define win conditions';
             throw new Error(`Win condition not found: "${identity}". Available win conditions: ${available}`);
           }
-          const status = normalizeStatus(evaluation.status, ['pending', 'in_progress', 'satisfied'], condition.status);
+          // Normalize status: accept "completed" as an alias for "satisfied" since the model
+          // naturally uses "completed" when marking work done. If the value is unrecognized,
+          // throw a clear error instead of silently falling back to the existing status (which
+          // would cause the condition to stay "pending" forever with no feedback to the model).
+          const rawStatus = cleanText(evaluation.status, 40).toLowerCase().replace(/\s+/g, '_').replace(/-/g, '_');
+          const normalizedStatus = rawStatus === 'completed' ? 'satisfied' : rawStatus;
+          const VALID_WIN_STATUSES = ['pending', 'in_progress', 'satisfied'];
+          if (!VALID_WIN_STATUSES.includes(normalizedStatus)) {
+            throw new Error(`Invalid win condition status "${evaluation.status}" for "${condition.title}". Valid values: ${VALID_WIN_STATUSES.join(', ')} (or "completed" as alias for "satisfied").`);
+          }
+          const status = normalizedStatus;
           const evidence = Array.isArray(evaluation.evidence) ? evaluation.evidence.map(value => cleanText(value, 1000)).filter(Boolean) : [];
           if (status === 'satisfied' && evidence.length === 0 && condition.evidence.length === 0) throw new Error(`Win condition '${condition.title}' requires evidence before it can be satisfied`);
           condition.status = status;

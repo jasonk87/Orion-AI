@@ -733,11 +733,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   messages.splice(2, 0,
     {
       role: 'user',
-      parts: [{ text: `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nWeb search: ${webSearchStatus}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.` }]
+      parts: [{ text: `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nWeb search: ${webSearchStatus}\nClient: ${promptSource === 'phone' ? 'PHONE COMPANION — the user is on their phone. Prefer descriptions, text output, and copy-pasteable results over actions that require the desktop (launching GUI apps, opening windows, running interactive commands). If you need to show output, describe it clearly rather than suggesting they look at the screen.' : 'DESKTOP — the user is at their computer. You can launch apps, reference screen elements, and run interactive commands normally.'}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.` }]
     },
     {
       role: 'model',
-      parts: [{ text: `Understood. Home directory is ${resolvedHomeDir}. Web search: ${webSearchStatus.split(' —')[0]}. I will use these directly without probing.` }]
+      parts: [{ text: `Understood. Home directory is ${resolvedHomeDir}. Web search: ${webSearchStatus.split(' —')[0]}. Client: ${promptSource === 'phone' ? 'phone companion' : 'desktop'}. I will use these directly without probing.` }]
     }
   );
 
