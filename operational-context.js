@@ -498,7 +498,7 @@
     return view.slice(-Math.max(0, Number(limit) || MAX_CHAT_VIEW_MESSAGES));
   }
 
-  function buildReasoningMessages(input, conversationMessages, currentInput) {
+  function buildReasoningMessages(input, conversationMessages, currentInput, images = []) {
     const state = normalizeContext(input);
     const statePrompt = formatForPrompt(state) || [
       '[ORION OPERATIONAL CONTEXT - canonical working state]',
@@ -515,7 +515,17 @@
       messages.push({ role: 'user', parts: [{ text: `[RECENT USER CHAT VIEW - non-canonical]\nThis carries the user's recent intent plus your own recent substantive replies, so you can resolve references like "number 1" or "that idea" back to what you actually said. Self-diagnosis of your own past errors/blockers and "I will now..." promises are deliberately excluded from this view — those are not replayed, so use operational context, notes, files, and tool results for task facts, blockers, and completion evidence, not this chat view.\n\n${chatView.map(item => `${item.role}: ${item.text}`).join('\n\n')}` }] });
       messages.push({ role: 'model', parts: [{ text: 'Recent chat (including my own prior replies, excluding self-diagnosis/promises) received as non-canonical context.' }] });
     }
-    messages.push({ role: 'user', parts: [{ text: cleanText(currentInput, 12000) }] });
+    // Build the final user message, including any attached images as inline_data parts
+    const userParts = [];
+    if (Array.isArray(images) && images.length > 0) {
+      images.forEach(img => {
+        if (img && img.data && img.mimeType) {
+          userParts.push({ inline_data: { mime_type: img.mimeType, data: img.data } });
+        }
+      });
+    }
+    userParts.push({ text: cleanText(currentInput, 12000) });
+    messages.push({ role: 'user', parts: userParts });
     return messages;
   }
 
@@ -634,21 +644,4 @@
       reasons.push('No test/smoke/manual verification evidence is recorded.');
     }
 
-    if (reasons.length || missingEvidence.length || pendingWinConditions.length || pendingRequirements.length) {
-      return makeGate('continue_work', reasons, { missingEvidence, pendingWinConditions, pendingRequirements });
-    }
-
-    return makeGate('ready_for_final', [
-      remainingMinorBlockers.length
-        ? 'Mission has evidence-backed satisfied win conditions and only minor non-terminal blockers remain as backlog candidates.'
-        : 'Mission has evidence-backed satisfied win conditions, no active completion-blocking blockers, and verification evidence.'
-    ], {
-      remainingMinorBlockers: remainingMinorBlockers.map(item => ({ id: item.id, title: item.title, details: item.details, severity: item.severity, nature: item.nature })),
-      backlogCandidates: remainingMinorBlockers.map(item => ({ id: item.id, title: item.title, details: item.details, severity: item.severity, nature: item.nature }))
-    });
-  }
-
-  const api = { VERSION, createEmptyContext, normalizeContext, applyAction, formatForPrompt, buildRecentChatView, buildReasoningMessages, evaluateCompletionGate, normalizeSeverity, normalizeNature, compareBlockers };
-  if (typeof module !== 'undefined' && module.exports) module.exports = api;
-  if (globalScope) globalScope.OrionOperationalContext = api;
-})(typeof window !== 'undefined' ? window : globalThis);
+    if (reasons.length || missingEvidence.length || pendingWinConditions.length || pe

@@ -426,6 +426,24 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let workspacePath = resolveConversationWorkspace(conversation);
   const promptSource = options.source || 'user';
   const isInternalPrompt = !!options.internalPrompt || promptSource === 'followup' || promptSource === 'system' || promptSource === 'plan-approval';
+
+  // Image data attached to this prompt (e.g. from desktop paste or phone file upload)
+  const promptImages = Array.isArray(options.images) ? options.images.filter(img => img && img.data && img.mimeType) : [];
+  const hasPromptImages = promptImages.length > 0;
+
+  // Route to Gemini 2.5 Flash if images are present and current model doesn't support vision
+  if (hasPromptImages && !activeRunModelName.startsWith('gemini-')) {
+    const visionModel = 'gemini-2.5-flash';
+    if (window.appendSystemMessage) {
+      window.appendSystemMessage(
+        `Image attached — switching to ${visionModel} for this message (${activeRunModelName} doesn't support vision).`,
+        { conversationId: conversation.id }
+      );
+    }
+    activeRunModelName = visionModel;
+    config.activeRunModelName = activeRunModelName;
+  }
+
   let lastTextResponse = "Thinking...";
   let bestVisibleAnswer = "";
   let aiMessageIndex = Array.isArray(conversation.messages) ? conversation.messages.length : 0;
@@ -682,7 +700,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
   // Canonical operational state seeds reasoning. Conversation remains a bounded UI/input view;
   // old model and tool turns are deliberately not replayed as task truth.
-  let messages = OperationalContext.buildReasoningMessages(workingState, conversation.messages, promptForModel);
+  let messages = OperationalContext.buildReasoningMessages(workingState, conversation.messages, promptForModel, promptImages);
 
   // OC injection optimization: subsequent turns inject a short header instead of full OC state
   const OC_SHORT_HEADER = '[Operational context on file — request specific sections if needed: goals, current_task, do_not_touch, notes]';
@@ -850,7 +868,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         await appendScopedNotes(workspacePath, conversation, `\n\n## Context Compaction ${new Date().toISOString()}\n${compactResult.summary}\n`);
         const checkpoint = await checkpointOperationalContext(workspacePath, 'context_compaction', 'Conversation context was compacted; canonical mission state was preserved.', 'Continue the active subplan from operational context.');
         if (checkpoint && checkpoint.state) workingState = checkpoint.state;
-        messages = OperationalContext.buildReasoningMessages(workingState, conversation.messages, promptForModel);
+        messages = OperationalContext.buildReasoningMessages(workingState, conversation.messages, promptForModel, promptImages);
         if (scopedNotes.content && scopedNotes.content.trim()) {
           messages.splice(2, 0,
             {
@@ -7564,71 +7582,4 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     checkJsSyntaxAfterEdit,
     buildRepeatedEditFailureEscalation,
     buildMalformedFunctionCallGuidance,
-    looksLikeLaunchOnlyRequest,
-    hasFailedLaunchAttemptThisRun,
-    getNextGeminiModelForHighDemand,
-    resolveUtilityModelName,
-    trimAgedToolResultsFromMessages,
-    convertGeminiToAnthropicTools,
-    convertGeminiToAnthropicMessages,
-    callAnthropicAPI,
-    convertGeminiToDeepSeekTools,
-    convertGeminiToDeepSeekMessages,
-    callDeepSeekAPI,
-    getNextModelForHighDemand,
-    compactHistory,
-    summarizeToolStart,
-    buildRepeatedFailureKey,
-    updateWalkthroughItem,
-    buildPostEditEvidencePrompt,
-    buildFinalVerificationSummary,
-    stripEchoedSystemScaffold,
-    sanitizeFinalAnswerText,
-    withWorkWalkthrough,
-    hiddenDirectoryForInventory,
-    sensitiveFileForInventory,
-    buildCuratedFileInventory,
-    buildDiscoveryFromToolOutcome,
-    parseModelJsonObject,
-    callGeminiAPI,
-    inspectScreenshotWithModel,
-    inspectScreenshotWithGemini,
-    inspectScreenshotWithOllama,
-    diagnoseModelApiFailure,
-    expandCommonWindowsPath,
-    normalizeLocalPathNameForMatch,
-    tokenizeLocalPathNameForMatch,
-    editDistanceWithin,
-    scoreWorkspaceDirectoryVariant,
-    chooseWorkspaceDirectoryVariant,
-    resolveWorkspacePathForChange,
-    rememberPendingWorkspaceResolution,
-    extractCommandPathArgument,
-    extractDirectoryCandidatesFromCommandOutput,
-    buildPendingWorkspaceResolutionHint,
-    buildPendingWorkspaceResolutionCorrectionPrompt
-  };
-}
-
-function diagnoseModelApiFailure(errorText) {
-  const text = String(errorText || '').toLowerCase();
-  if (!text) return '';
-  if (text.includes('monthly spending cap') || text.includes('project spend cap') || text.includes('ai.studio/spend')) {
-    return 'Diagnosis: the Gemini project has hit a monthly spend cap. This is a hard billing limit, not a temporary model rate limit; retries or model escalation will not continue until the AI Studio spend cap or billing configuration is changed.';
-  }
-  if (text.includes('429') || text.includes('quota') || text.includes('resource has been exhausted')) {
-    return 'Diagnosis: the model provider is rate-limiting or quota-limiting requests. Orion should pause the request loop, preserve state, and resume after cooldown.';
-  }
-  if (text.includes('401') || text.includes('403') || text.includes('api key')) {
-    return 'Diagnosis: the model request looks unauthorized. This is a hard blocker until credentials/config are fixed; Orion should preserve state and explain the exact config to check.';
-  }
-  if (text.includes('fetch') || text.includes('network') || text.includes('econn') || text.includes('timeout')) {
-    return 'Diagnosis: this looks like a network/service availability problem. Orion should stop the repeated request loop, verify connectivity/provider status, then resume from saved state.';
-  }
-  return 'Diagnosis: Orion paused after the model API failed. Preserve the task state, inspect the error, change strategy, and avoid repeating the same request blindly.';
-}
-
-if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
-  module.exports.executeTool = executeTool; // So we can test it specifically
-  module.exports.runAgentLoop = window.runAgentLoop;
-}
+    looksLikeLaunch

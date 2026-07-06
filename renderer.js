@@ -188,7 +188,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupProgressiveDisclosure();
   setupRightSidebarToggle();
   setupChatHandlers();
-  
+  initUpdateChecker();
+  initImageAttach();
+
   // Bind manual task checklist add button
   const btnAddTaskManual = document.getElementById('btn-add-task-manual');
   if (btnAddTaskManual) {
@@ -275,6 +277,165 @@ async function refreshAppRuntimeInfo() {
     el.appVersionMeta.textContent = '';
     el.appVersionMeta.style.display = 'none';
   }
+}
+
+// ── Auto-update checker ────────────────────────────────────────────────────────
+
+function showUpdateBadge({ commitsBehind, remoteHash } = {}) {
+  const btn = document.getElementById('btn-update-available');
+  if (!btn) return;
+  const count = commitsBehind || '';
+  btn.textContent = `⬆ Update${count ? ` (${count})` : ''}`;
+  btn.title = `${count ? count + ' new commit' + (count !== 1 ? 's' : '') + ' available' : 'Update available'}${remoteHash ? ' (' + remoteHash + ')' : ''} — click to pull and restart`;
+  btn.style.display = '';
+}
+
+function hideUpdateBadge() {
+  const btn = document.getElementById('btn-update-available');
+  if (btn) btn.style.display = 'none';
+}
+
+async function checkForGitUpdates() {
+  if (!window.api || !window.api.checkGitUpdate) return;
+  try {
+    const result = await window.api.checkGitUpdate();
+    if (result && result.hasUpdate) {
+      showUpdateBadge(result);
+    } else {
+      hideUpdateBadge();
+    }
+  } catch (_) { /* silent */ }
+}
+
+function initUpdateChecker() {
+  const btn = document.getElementById('btn-update-available');
+  if (btn) {
+    btn.addEventListener('click', async () => {
+      if (btn.disabled) return;
+      const orig = btn.textContent;
+      btn.textContent = 'Pulling...';
+      btn.disabled = true;
+      try {
+        await window.api.applyGitUpdate();
+        btn.textContent = 'Restarting...';
+      } catch (e) {
+        btn.textContent = orig;
+        btn.disabled = false;
+        appendSystemMessage(`Update failed: ${e.message}`);
+      }
+    });
+  }
+  // First check after 15 seconds on startup, then every 30 minutes
+  setTimeout(checkForGitUpdates, 15000);
+  setInterval(checkForGitUpdates, 30 * 60 * 1000);
+}
+
+// Phone companion bridge functions for update
+window.checkPhoneCompanionUpdate = async () => {
+  if (!window.api || !window.api.checkGitUpdate) return { hasUpdate: false };
+  try { return await window.api.checkGitUpdate(); } catch (_) { return { hasUpdate: false }; }
+};
+window.applyPhoneCompanionUpdate = async () => {
+  if (!window.api || !window.api.applyGitUpdate) return { success: false, error: 'Not available' };
+  try { return await window.api.applyGitUpdate(); } catch (e) { return { success: false, error: e.message }; }
+};
+
+// ── Image attach (desktop) ─────────────────────────────────────────────────────
+
+let pendingImages = []; // Array of { data: base64string, mimeType: string, previewUrl: string, name: string }
+
+function addPendingImage(img) {
+  if (pendingImages.length >= 4) {
+    appendSystemMessage('Maximum 4 images per message.');
+    return;
+  }
+  pendingImages.push(img);
+  renderImagePreviews();
+}
+
+function clearPendingImages() {
+  pendingImages = [];
+  renderImagePreviews();
+}
+
+function renderImagePreviews() {
+  const container = document.getElementById('image-preview-container');
+  const thumbnails = document.getElementById('image-preview-thumbnails');
+  if (!container || !thumbnails) return;
+  if (pendingImages.length === 0) {
+    container.style.display = 'none';
+    thumbnails.innerHTML = '';
+    return;
+  }
+  container.style.display = '';
+  thumbnails.innerHTML = pendingImages.map((img, i) =>
+    `<div class="img-preview-thumb" data-idx="${i}">` +
+    `<img src="${img.previewUrl}" alt="${escapeHtml(img.name || 'image')}" title="${escapeHtml(img.name || 'image')}">` +
+    `<button class="img-preview-remove" data-idx="${i}" title="Remove image" aria-label="Remove image">&times;</button>` +
+    `</div>`
+  ).join('');
+  thumbnails.querySelectorAll('.img-preview-remove').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const idx = parseInt(btn.dataset.idx, 10);
+      if (!isNaN(idx)) {
+        pendingImages.splice(idx, 1);
+        renderImagePreviews();
+      }
+    });
+  });
+}
+
+function attachImageFile(file) {
+  if (!file) return;
+  if (!file.type.startsWith('image/')) {
+    appendSystemMessage('Only image files can be attached to messages.');
+    return;
+  }
+  if (file.size > 15 * 1024 * 1024) {
+    appendSystemMessage('Image too large — maximum size is 15 MB.');
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const dataUrl = e.target.result;
+    const base64 = dataUrl.split(',')[1];
+    addPendingImage({ data: base64, mimeType: file.type, previewUrl: dataUrl, name: file.name });
+  };
+  reader.readAsDataURL(file);
+}
+
+function initImageAttach() {
+  // Image attach button opens file picker
+  const btnAttach = document.getElementById('btn-attach-image');
+  const fileInput = document.getElementById('image-file-input');
+  if (btnAttach && fileInput) {
+    btnAttach.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files && fileInput.files.length > 0) {
+        for (const file of fileInput.files) {
+          attachImageFile(file);
+        }
+        fileInput.value = '';
+      }
+    });
+  }
+
+  // Paste image from clipboard (Ctrl+V into chat area or globally when chat is focused)
+  document.addEventListener('paste', (e) => {
+    const active = document.activeElement;
+    const isChatFocused = active && (active.id === 'chat-input' || active.closest('#chat-input-wrapper'));
+    if (!isChatFocused && active && active.id !== 'chat-input') return;
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    for (const item of items) {
+      if (item.type.startsWith('image/')) {
+        e.preventDefault();
+        const file = item.getAsFile();
+        if (file) attachImageFile(file);
+        break;
+      }
+    }
+  });
 }
 
 // --- SETTINGS CONFIGURATION ---
@@ -1622,15 +1783,17 @@ function sendQueuedPromptNow(queueId, conversationId) {
   }
 
   setQueuedPromptMessageState(queueId, conversationId, 'sent');
+  const queuedImages = Array.isArray(item.images) ? item.images : [];
   if (!item.alreadyRendered && conv.messages) {
-    conv.messages.push({ role: 'user', source: item.source || 'queue', text: item.prompt, createdAt: Date.now() });
+    conv.messages.push({ role: 'user', source: item.source || 'queue', text: item.prompt, createdAt: Date.now(), ...(queuedImages.length ? { images: queuedImages } : {}) });
     saveConversationsToStorage();
   }
   if (conversationId === activeConversationId && !item.alreadyRendered) {
-    renderUserMessage(item.prompt);
+    renderUserMessage(item.prompt, queuedImages);
   }
   window.runAgentLoop(item.prompt, item.modelSelectValue || (el.modelSelect && el.modelSelect.value), conv, {
-    source: item.source || 'queue'
+    source: item.source || 'queue',
+    ...(queuedImages.length ? { images: queuedImages } : {})
   }).catch(error => {
     console.error('Queued prompt send-now run failed:', error);
     appendSystemMessage(`Queued prompt failed to start: ${error.message}`, { conversationId });
@@ -2220,7 +2383,7 @@ function selectConversation(id) {
       const replayLogs = Array.isArray(replayMsg.logs) ? replayMsg.logs : [];
       window.clearActiveAiBubble();
       if (replayMsg.role === 'user') {
-        renderUserMessage(replayMsg.text);
+        renderUserMessage(replayMsg.text, Array.isArray(replayMsg.images) ? replayMsg.images : []);
       } else if (replayMsg.role === 'assistant') {
         if (isEmptyThinkingPlaceholder(replayMsg.text, replayLogs)) return;
         renderAiMessage(replayMsg.text, replayLogs, activeConversationId, replayMsg);
@@ -2289,9 +2452,13 @@ async function submitMessage() {
   // Hide splash
   el.welcomeSplash.style.display = 'none';
   el.messagesContainer.style.display = 'flex';
-  
-  // Render user prompt
-  renderUserMessage(prompt);
+
+  // Capture and clear pending images before rendering
+  const imagesToSend = pendingImages.length > 0 ? [...pendingImages] : [];
+  clearPendingImages();
+
+  // Render user prompt (with any attached images)
+  renderUserMessage(prompt, imagesToSend);
   el.chatInput.value = '';
   
   // Rename the conversation from its first message. Gated on message count/title rather than
@@ -2321,27 +2488,29 @@ async function submitMessage() {
   el.workspaceLabel.textContent = currentWorkspace.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || currentWorkspace;
   syncWorkspaceFiles();
   
-  // Update messages history
-  conv.messages.push({ role: 'user', text: prompt });
+  // Update messages history (store compact image refs for replay)
+  const msgImages = imagesToSend.map(i => ({ data: i.data, mimeType: i.mimeType }));
+  conv.messages.push({ role: 'user', text: prompt, ...(msgImages.length ? { images: msgImages } : {}) });
   saveConversationsToStorage();
-  
+
   renderConversationList();
   renderProjectsList();
-  
+
   // Scroll to bottom for the local send action.
   scrollChatToBottom();
-  
+
   // Trigger local Agent loop
   if (window.runAgentLoop) {
     const selectedModel = el.modelSelect.value;
+    const runOptions = imagesToSend.length ? { images: imagesToSend } : {};
     if (window.isAgentRunning && window.isAgentRunning()) {
-      window.promptQueue.push({ prompt, modelSelectValue: selectedModel, conversationId: conv.id, alreadyRendered: true });
+      window.promptQueue.push({ prompt, modelSelectValue: selectedModel, conversationId: conv.id, alreadyRendered: true, images: imagesToSend });
       persistAssistantStatusMessage(conv.id, "Queued. Orion will start this after the current task finishes.", {
         source: 'queue-status',
         dedupeKey: `queued-${conv.id}-${prompt}`
       });
     } else {
-      await window.runAgentLoop(prompt, selectedModel, conv);
+      await window.runAgentLoop(prompt, selectedModel, conv, runOptions);
       loadRunArtifacts();
     }
   } else {
@@ -2443,13 +2612,19 @@ function normalizeConversationWorkspace(conv) {
 }
 
 // RENDER HELPER FUNCTIONS
-function renderUserMessage(text) {
+function renderUserMessage(text, images = []) {
   const stickToBottom = shouldAutoScrollChat();
   const bubble = document.createElement('div');
   bubble.className = 'message-bubble';
+  const imgsHtml = (images && images.length)
+    ? images.map(img =>
+        `<img src="data:${escapeHtml(img.mimeType)};base64,${img.data}" alt="attached image" ` +
+        `style="max-width:100%;max-height:280px;border-radius:8px;margin-top:8px;display:block;border:1px solid rgba(151,164,196,.15);">`
+      ).join('')
+    : '';
   bubble.innerHTML = `
     <div class="message-header user">🧑 User</div>
-    <div class="message-body">${escapeHtml(text).replace(/\n/g, '<br>')}</div>
+    <div class="message-body">${escapeHtml(text).replace(/\n/g, '<br>')}${imgsHtml}</div>
   `;
   sanitizeRenderedMarkdown(bubble);
   el.messagesContainer.appendChild(bubble);
@@ -3532,6 +3707,10 @@ window.submitPhoneCompanionPrompt = async (options) => {
   // Can be called with either a string or an options object
   const text = typeof options === 'string' ? options.trim() : String(options.prompt || '').trim();
   let targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
+  // Image data from phone companion (optional)
+  const phoneImageData = typeof options === 'object' && options.imageData ? options.imageData : null;
+  const phoneImageMime = typeof options === 'object' && options.imageMimeType ? options.imageMimeType : 'image/jpeg';
+  const phoneImages = phoneImageData ? [{ data: phoneImageData, mimeType: phoneImageMime }] : [];
 
   if (!text) return { success: false, error: 'Missing prompt' };
 
@@ -3564,9 +3743,9 @@ window.submitPhoneCompanionPrompt = async (options) => {
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
 
   if (isGlobalRunning) {
-    window.promptQueue.push({ prompt: text, modelSelectValue: window.getSelectedModel(), conversationId: targetId, source: 'phone' });
+    window.promptQueue.push({ prompt: text, modelSelectValue: window.getSelectedModel(), conversationId: targetId, source: 'phone', images: phoneImages });
     if (conv.messages) {
-      conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now() });
+      conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
       saveConversationsToStorage();
     }
     persistAssistantStatusMessage(targetId, "Queued. Orion will start this after the current task finishes.", {
@@ -3574,20 +3753,20 @@ window.submitPhoneCompanionPrompt = async (options) => {
       dedupeKey: `phone-queued-${targetId}-${text}`
     });
     if (targetId === activeConversationId) {
-      renderUserMessage(text);
+      renderUserMessage(text, phoneImages);
     }
     return { success: true, queued: true, conversationId: targetId, title: conv.title || 'New Conversation' };
   }
 
   // Directly run agent loop on the target conversation (without forcing desktop UI switch)
   if (conv.messages) {
-    conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now() });
+    conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
     saveConversationsToStorage();
   }
   if (targetId === activeConversationId) {
-    renderUserMessage(text);
+    renderUserMessage(text, phoneImages);
   }
-  window.runAgentLoop(text, window.getSelectedModel(), conv, { source: 'phone' })
+  window.runAgentLoop(text, window.getSelectedModel(), conv, { source: 'phone', images: phoneImages })
     .catch(err => {
       console.error("Phone-started agent loop failed:", err);
       persistAssistantStatusMessage(targetId, `Orion could not start this phone request: ${err.message}`, {
@@ -3992,229 +4171,4 @@ async function approveCurrentPlanAndContinue(options = {}) {
   const approvalText = "Plan approved. Continuing implementation.";
   appendSystemMessage(approvalText, { conversationId: activeConversationId, source: 'plan-approval' });
 
-  const prompt = 'PLAN APPROVED — EXECUTE NOW. Do not summarize, describe, or restate the plan. Do not rewrite STRATEGY.md or implementation_plan.md — they are already approved. Read implementation_plan.md once to understand the tasks, then immediately start creating and editing the actual source code files. Work through every task. Update the checklist only for completed milestones. Run the test suite when done. Provide a Work Walkthrough.';
-
-  if (window.runAgentLoop) {
-    if (window.isAgentRunning && window.isAgentRunning()) {
-      window.promptQueue.push({ prompt, modelSelectValue: el.modelSelect.value, conversationId: conv.id, alreadyRendered: true, source: 'plan-approval' });
-      appendSystemMessage("Another task is currently running. Approved plan execution was queued.");
-      return { success: true, queued: true };
-    }
-    window.runAgentLoop(prompt, el.modelSelect.value, conv, { source: 'plan-approval', internalPrompt: true })
-      .catch(err => console.error("Desktop-started agent loop failed:", err));
-    return { success: true, queued: false };
-  }
-  return { success: false, error: 'Agent engine is not ready' };
-}
-
-function deleteConversation(id) {
-  const convToDelete = conversations.find(c => c.id === id);
-  const parentProj = convToDelete ? convToDelete.projectPath : '';
-  cleanupConversationArtifacts(id);
-  
-  conversations = conversations.filter(c => c.id !== id);
-  saveConversationsToStorage();
-  
-  if (activeConversationId === id) {
-    const siblingConversations = conversations.filter(c => c.projectPath === parentProj);
-    if (siblingConversations.length > 0) {
-      selectConversation(siblingConversations[0].id);
-    } else {
-      if (parentProj) {
-        createNewConversationUnderProject(parentProj);
-      } else {
-        createNewConversation();
-      }
-    }
-  } else {
-    renderConversationList();
-    renderProjectsList();
-  }
-}
-
-function removeProject(path) {
-  const removedConversationIds = conversations.filter(c => c.projectPath === path).map(c => c.id);
-  removedConversationIds.forEach(cleanupConversationArtifacts);
-  projects = projects.filter(p => p !== path);
-  saveProjectsToStorage();
-  
-  // Cascade delete all conversations belonging to this project
-  conversations = conversations.filter(c => c.projectPath !== path);
-  saveConversationsToStorage();
-  
-  const activeConv = conversations.find(c => c.id === activeConversationId);
-  if (!activeConv) {
-    createNewConversation();
-  } else {
-    renderConversationList();
-    renderProjectsList();
-  }
-}
-
-function cleanupConversationArtifacts(id) {
-  if (!id || !window.api || typeof window.api.deleteConversationArtifacts !== 'function') return;
-  window.api.deleteConversationArtifacts(id).catch(err => {
-    console.warn('Failed to delete conversation artifacts:', err);
-  });
-}
-
-// Shared helper — builds one project card and appends it to el.projectList
-function buildProjectCard(path) {
-  const activeConv = conversations.find(c => c.id === activeConversationId);
-  const isCurrent = path === currentWorkspace || (activeConv && activeConv.projectPath === path);
-  const rawName = path.substring(path.lastIndexOf('\\') + 1) || path;
-  const name = toTitleCase(rawName);
-
-  const projectContainer = document.createElement('div');
-  projectContainer.className = 'project-container';
-  projectContainer.style.display = 'flex';
-  projectContainer.style.flexDirection = 'column';
-  projectContainer.style.marginBottom = '8px';
-
-  const projectHeader = document.createElement('div');
-  projectHeader.className = `project-item ${isCurrent ? 'active' : ''}`;
-  projectHeader.style.display = 'flex';
-  projectHeader.style.alignItems = 'center';
-
-  projectHeader.innerHTML = `
-    <span class="folder-icon">📁</span>
-    <div class="project-details row-details-flex">
-      <span class="project-name" style="font-weight:600;">${escapeHtml(name)}</span>
-      <span class="project-subtext" title="${escapeHtml(path)}" style="font-size: 0.65rem;">${escapeHtml(path)}</span>
-    </div>
-    <button class="add-conv-btn icon-btn-ghost icon-btn-spaced" title="New Conversation in Project">+</button>
-    <button class="delete-btn icon-btn-ghost" title="Remove project">&times;</button>
-  `;
-
-  projectHeader.querySelector('.project-details').addEventListener('click', () => {
-    setWorkspace(path);
-  });
-
-  projectHeader.querySelector('.add-conv-btn').addEventListener('click', (e) => {
-    e.stopPropagation();
-    setWorkspace(path);
-    createNewConversationUnderProject(path);
-  });
-
-  projectHeader.querySelector('.delete-btn').addEventListener('click', async (e) => {
-    e.stopPropagation();
-    const approved = await showOrionConfirmDialog({
-      title: 'Remove project?',
-      message: `Remove "${name}" and delete its conversations from Orion? This cannot be undone.`,
-      confirmLabel: 'Remove',
-      danger: true
-    });
-    if (approved?.confirmed) {
-      removeProject(path);
-    }
-  });
-
-  projectContainer.appendChild(projectHeader);
-
-  // Indented child conversations
-  const convsList = document.createElement('div');
-  convsList.className = 'project-conversations-list';
-  convsList.style.paddingLeft = '20px';
-  convsList.style.display = 'flex';
-  convsList.style.flexDirection = 'column';
-  convsList.style.gap = '2px';
-  convsList.style.marginTop = '2px';
-
-  const projectConversations = conversations.filter(c => c.projectPath === path);
-  if (projectConversations.length === 0) {
-    convsList.innerHTML = `<div class="empty-state" style="padding: 4px; text-align: left; font-size: 0.75rem; font-style: italic; color: var(--text-muted);">No conversations yet</div>`;
-  } else {
-    projectConversations.forEach(conv => {
-      const isConvActive = conv.id === activeConversationId;
-      const convItem = document.createElement('div');
-      convItem.className = `conversation-item ${isConvActive ? 'active' : ''}`;
-      convItem.style.padding = '4px 8px';
-      convItem.style.borderRadius = '4px';
-      convItem.style.display = 'flex';
-      convItem.style.alignItems = 'center';
-
-      convItem.innerHTML = `
-        <div class="conversation-details row-details-flex" style="display: flex; flex-direction: column;">
-          <span class="conversation-name" style="font-size: 0.8rem; color: ${isConvActive ? 'var(--text-primary)' : 'var(--text-secondary)'}; font-weight: ${isConvActive ? '500' : 'normal'};">${escapeHtml(conv.title)}</span>
-        </div>
-        <button class="delete-btn icon-btn-ghost" title="Delete conversation">&times;</button>
-      `;
-
-      convItem.querySelector('.conversation-details').addEventListener('click', () => {
-        selectConversation(conv.id);
-      });
-
-      convItem.querySelector('.delete-btn').addEventListener('click', async (e) => {
-        e.stopPropagation();
-        const approved = await confirmConversationDelete(conv.title);
-        if (approved?.confirmed) {
-          deleteConversation(conv.id);
-        }
-      });
-
-      convsList.appendChild(convItem);
-    });
-  }
-
-  projectContainer.appendChild(convsList);
-  el.projectList.appendChild(projectContainer);
-}
-
-function renderProjectsList() {
-  el.projectList.innerHTML = '';
-
-  if (projects.length === 0) {
-    el.projectList.innerHTML = `
-      <div class="project-item active" id="default-proj-item">
-        <span class="folder-icon">📁</span>
-        <div class="project-details">
-          <span class="project-name">Default Workspace</span>
-          <span class="project-subtext">Select folder to start</span>
-        </div>
-      </div>
-    `;
-    return;
-  }
-
-  projects.forEach(path => buildProjectCard(path));
-}
-
-function filterProjects(query) {
-  if (!query) {
-    renderProjectsList();
-    return;
-  }
-
-  el.projectList.innerHTML = '';
-
-  projects.forEach(path => {
-    const rawName = path.substring(path.lastIndexOf('\\') + 1) || path;
-    const name = toTitleCase(rawName);
-    if (!name.toLowerCase().includes(query.toLowerCase())) return;
-    buildProjectCard(path);
-  });
-}
-
-window.renderConversationList = renderConversationList;
-window.renderProjectsList = renderProjectsList;
-
-window.onRagStatusChange = (statusText) => {
-  const badge = document.getElementById('rag-index-status');
-  if (!badge) return;
-  badge.textContent = statusText;
-  badge.style.display = statusText ? 'inline-block' : 'none';
-  
-  if (statusText.startsWith('Indexing')) {
-    badge.textContent = 'Indexing…';
-    badge.className = 'badge warning pulse';
-  } else if (statusText === 'Semantic Ready') {
-    badge.textContent = 'Indexed';
-    badge.className = 'badge success';
-  } else if (statusText === 'Awaiting API Key') {
-    badge.className = 'badge danger';
-  } else {
-    badge.className = 'badge muted';
-  }
-};
-
-window.getCurrentProject = () => currentWorkspace;
+  const prompt = 'PLAN APPROVED — EXECUTE NOW. Do not summarize, describe, or restate the plan. Do not rewrite STRATEGY.md or implementation_plan.md — they are 

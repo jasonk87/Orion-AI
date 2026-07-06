@@ -67,6 +67,10 @@ contextBridge.exposeInMainWorld('api', {
   writeProjectMemory: (workspacePath, memory) => ipcRenderer.invoke('orion:write-project-memory', { workspacePath, memory }),
   appendProjectMemory: (workspacePath, fact) => ipcRenderer.invoke('orion:append-project-memory', { workspacePath, fact }),
   
+  // Update checker
+  checkGitUpdate: () => ipcRenderer.invoke('check-git-update'),
+  applyGitUpdate: () => ipcRenderer.invoke('apply-git-update'),
+
   // Config Controls
   readConfig: () => ipcRenderer.invoke('read-config'),
   getAppRuntimeInfo: () => ipcRenderer.invoke('get-app-runtime-info'),
@@ -113,6 +117,4 @@ contextBridge.exposeInMainWorld('api', {
 
   // Session Memory
   saveSession: (workspacePath, sessionData) => ipcRenderer.invoke('orion:save-session', { workspacePath, sessionData }),
-  listSessions: (workspacePath, limit) => ipcRenderer.invoke('orion:list-sessions', { workspacePath, limit }),
-  readSession: (workspacePath, sessionId) => ipcRenderer.invoke('orion:read-session', { workspacePath, sessionId })
-});
+  listSessions: (workspacePath, limit) => ipcRenderer.invoke('orion:list-sessions

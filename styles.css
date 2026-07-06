@@ -2397,6 +2397,76 @@ select:focus-visible,
   white-space: nowrap;
 }
 
+/* ── Update available badge ── */
+.update-available-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 10px;
+  margin-right: 6px;
+  border: 1px solid rgba(70, 213, 155, 0.45);
+  border-radius: 999px;
+  background: rgba(70, 213, 155, 0.12);
+  color: #46d59b;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+  -webkit-app-region: no-drag;
+  white-space: nowrap;
+}
+.update-available-btn:hover {
+  background: rgba(70, 213, 155, 0.22);
+  transform: scale(1.03);
+}
+.update-available-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+  transform: none;
+}
+
+/* ── Image attach preview ── */
+.image-preview-container {
+  padding: 6px 12px 0;
+}
+.image-preview-thumbnails {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.img-preview-thumb {
+  position: relative;
+  display: inline-flex;
+}
+.img-preview-thumb img {
+  height: 56px;
+  max-width: 120px;
+  border-radius: 6px;
+  object-fit: cover;
+  border: 1px solid rgba(151,164,196,.18);
+}
+.img-preview-remove {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: rgba(239, 68, 68, 0.9);
+  color: #fff;
+  border: none;
+  font-size: 0.72rem;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+}
+
 .menu-item { color: var(--text-muted); padding: 5px 7px; }
 .workspace-indicator { border-style: solid; border-color: transparent; border-radius: 6px; }
 .workspace-indicator:hover { background: rgba(130, 115, 244, 0.08); }
@@ -2834,52 +2904,4 @@ kbd {
 }
 
 .orion-toast {
-  max-width: 340px;
-  padding: 10px 13px;
-  transform: translateY(8px);
-  border: 1px solid var(--border-color);
-  border-radius: 9px;
-  background: rgba(17,23,36,.96);
-  box-shadow: 0 18px 45px rgba(0,0,0,.34);
-  color: var(--text-secondary);
-  font-size: .72rem;
-  opacity: 0;
-  transition: opacity var(--transition-normal), transform var(--transition-normal);
-}
-
-.orion-toast.visible { transform: translateY(0); opacity: 1; }
-.orion-toast.success { border-color: rgba(70,213,155,.28); color: #a8f1d2; }
-.orion-toast.attention { border-color: rgba(241,104,118,.28); color: #ffc2c8; }
-
-@media (max-width: 980px) {
-  .app-version-meta { display: none !important; }
-  #left-sidebar:not(.collapsed) {
-    position: absolute;
-    z-index: 80;
-    top: 0;
-    bottom: 0;
-    left: 0;
-    width: min(280px, 84vw);
-    box-shadow: 24px 0 60px rgba(0,0,0,.42);
-  }
-  #right-sidebar { width: min(310px, 42vw); }
-  #btn-phone-companion { display: none; }
-}
-
-@media (max-width: 760px) {
-  #right-sidebar:not(.collapsed) {
-    position: absolute;
-    z-index: 75;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    width: min(330px, 90vw);
-    box-shadow: -24px 0 60px rgba(0,0,0,.44);
-  }
-  #btn-launch-app { display: none; }
-  #conversation-header { padding-inline: 12px; }
-  .messages-container { padding-inline: 16px; }
-  .queued-prompt-footer { align-items: flex-start; }
-  .queued-prompt-actions { width: 100%; justify-content: flex-end; }
-  .model-select-wrapper { max-width: 150px; }
-}
+  max-width:
