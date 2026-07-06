@@ -129,6 +129,56 @@ MEMORY PROTOCOL:
 - SESSION END: When the user indicates they are wrapping up, switching tasks, or says they are done, call save_session_summary with what was accomplished, what was decided, and what remains open.
 - SCOPE: Global memory is for things true across all projects (user identity, habits, people, cross-project preferences). Project memory is for things specific to the current workspace.`;
 
+// ── Dispatcher (Orion Chat) System Instruction ────────────────────────────────
+const DISPATCHER_INSTRUCTION = `You are Orion — Jason's personal AI assistant.
+
+You are the front door to everything Jason needs. You handle what you can directly, route what needs a specialist, and always think before you act. The goal is the correct answer, not the fastest one.
+
+WHO YOU'RE TALKING TO:
+Jason. Solo developer. Casual, direct — he wants the answer, not the explanation. He'll give you context as it comes up. Don't ask for everything upfront.
+
+HOW YOU WORK:
+Handle directly: conversation, strategy, planning, research, reading and discussing code or docs, answering questions, web searches.
+Route to the coder: anything requiring file changes, writing or debugging code, running tests, building or fixing features. Before routing, make sure you understand the task well enough to hand it off clearly — ask Jason to clarify if you don't. When you route something, tell him. Don't go quiet. Report back with a clean summary when it's done.
+
+HOW YOU THINK:
+Don't snap-route. Ask yourself first: can I handle this directly? Do I have enough context to give the coder a clear task? Is this a coding problem or a planning conversation first? Think it through, then act.
+
+HOW YOU COMMUNICATE:
+Casual and direct. Short when simple, fuller when it isn't. Greet Jason by name when starting fresh. If you don't know something about his projects or context, ask — don't assume or pretend.
+
+MEMORY:
+At the start of a conversation, call recall_memory with scope="global" to orient yourself. When you learn something new — a project, a preference, a decision — use remember_fact or remember_preference immediately. When past context is relevant, surface it naturally.
+
+{{user_memory}}
+
+Tools available:
+- recall_memory: Read memory for the given scope ("global", "project", or "all"). Call this at the start of conversations.
+- remember_fact: Store a durable fact in global memory.
+- remember_preference: Store a user preference at global level.
+- google_search: Search Google for current information.
+- fetch_web_page: Fetch the text content of a web page.
+- read_file: Read a file's content.
+- list_files: List files in the workspace.
+- get_workspace_info: Return the active workspace directory.`;
+
+// Returns the right system instruction for the current mode.
+// Pass cachedMemory (string) to inject into the dispatcher instruction.
+function getSystemInstruction(disableTools = false, cachedMemory = '') {
+  const isOrion = (typeof appMode !== 'undefined' && appMode === 'orion');
+  let base;
+  if (isOrion) {
+    const memBlock = cachedMemory ? `\n\nKnown context about Jason:\n${cachedMemory}` : '';
+    base = DISPATCHER_INSTRUCTION.replace('{{user_memory}}', memBlock);
+  } else {
+    base = SYSTEM_INSTRUCTION;
+  }
+  if (disableTools) {
+    return base.split('Tools available:')[0] + '\n\nCRITICAL: You are in an analysis phase. DO NOT request any tool use. Provide your analysis in plain text only.';
+  }
+  return base;
+}
+
 // Keep track of active agent running state
 let isAgentRunning = false;
 let runningConversationId = null;
@@ -6974,9 +7024,7 @@ async function callAnthropicAPI(messages, modelName, apiKey, onWarning, disableT
   const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
   const anthropicMessages = convertGeminiToAnthropicMessages(processedMessages);
 
-  const systemText = disableTools
-    ? (SYSTEM_INSTRUCTION.split('Tools available:')[0] + '\n\nCRITICAL: You are in an analysis phase. DO NOT request any tool use. Provide your analysis in plain text only.')
-    : SYSTEM_INSTRUCTION;
+  const systemText = getSystemInstruction(disableTools);
 
   const requestBody = {
     model: modelName,
@@ -7109,9 +7157,7 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
   const url = 'https://api.deepseek.com/chat/completions';
 
   const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
-  const systemText = disableTools
-    ? (SYSTEM_INSTRUCTION.split('Tools available:')[0] + '\n\nCRITICAL: You are in an analysis phase. DO NOT request any tool use. Provide your analysis in plain text only.')
-    : SYSTEM_INSTRUCTION;
+  const systemText = getSystemInstruction(disableTools);
   const deepseekMessages = [{ role: 'system', content: systemText }, ...convertGeminiToDeepSeekMessages(processedMessages)];
 
   const requestBody = {
@@ -7440,7 +7486,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
   const requestBody = {
     contents: mergedContents,
     systemInstruction: {
-      parts: [{ text: disableTools ? (SYSTEM_INSTRUCTION.split('Tools available:')[0] + '\n\nCRITICAL: You are in an analysis phase. DO NOT output any function calls. Provide your analysis in markdown text only.') : SYSTEM_INSTRUCTION }]
+      parts: [{ text: getSystemInstruction(disableTools) }]
     },
     generationConfig: {
       ...(modelName.includes('thinking') || modelName.includes('2.5') ? {
@@ -7449,80 +7495,4 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
         }
       } : {
         temperature: 0
-      })
-    },
-    safetySettings: [
-      {
-        category: "HARM_CATEGORY_HARASSMENT",
-        threshold: "BLOCK_NONE"
-      },
-      {
-        category: "HARM_CATEGORY_HATE_SPEECH",
-        threshold: "BLOCK_NONE"
-      },
-      {
-        category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-        threshold: "BLOCK_NONE"
-      },
-      {
-        category: "HARM_CATEGORY_DANGEROUS_CONTENT",
-        threshold: "BLOCK_NONE"
-      }
-    ],
-    tools: [
-      {
-        functionDeclarations: buildAgentToolDeclarations()
-      }
-    ]
-  };
-
-  if (disableTools) {
-    delete requestBody.tools;
-    delete requestBody.toolConfig;
-  }
-
-  const attempts = MODEL_API_MAX_ATTEMPTS;
-  let delay = 1500; // Start with 1.5s
-  
-  for (let i = 1; i <= attempts; i++) {
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${activeModelName}:generateContent?key=${apiKey}`;
-      const response = await fetchWithTimeout(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody),
-        signal: options.signal
-      }, MODEL_API_REQUEST_TIMEOUT_MS, 'Gemini generateContent request');
-      
-      if (response.ok) {
-        const responseData = await response.json();
-        responseData._orionActiveModelName = activeModelName;
-        return responseData;
-      }
-      
-      const errorText = await response.text();
-      const status = response.status;
-      const apiError = describeModelApiError(status, errorText);
-      const retryDelayMs = Math.min(apiError.retryDelayMs || delay, MODEL_API_MAX_RETRY_WAIT_MS);
-
-      if (isGeminiHardQuotaError(status, apiError.message)) {
-        if (onWarning) {
-          onWarning(`Gemini API returned HTTP ${status} (monthly spend cap). This is a billing limit, not a temporary model rate limit, so Orion is stopping retries.`);
-        }
-        throw createNonRetryableModelError(`HTTP ${status}: ${apiError.message}`);
-      }
-
-      if (isGeminiHighDemandError(status, apiError.message)) {
-        const fallbackModelName = getNextGeminiModelForHighDemand(activeModelName);
-        if (fallbackModelName) {
-          if (onWarning) {
-            onWarning(`Gemini API returned HTTP ${status} (High Demand) for ${activeModelName}. Temporarily switching this request to ${fallbackModelName}; your selected default model is unchanged.`);
-          }
-          activeModelName = fallbackModelName;
-          delay = 1500;
-          i -= 1;
-          continue;
-        }
-      }
-      
-      const 
+     
