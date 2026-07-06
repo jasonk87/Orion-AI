@@ -45,6 +45,7 @@ contextBridge.exposeInMainWorld('api', {
   getPhoneCompanionDevices: () => ipcRenderer.invoke('get-phone-companion-devices'),
   revokePhoneCompanionDevice: (deviceId) => ipcRenderer.invoke('revoke-phone-companion-device', deviceId),
   revokeAllPhoneCompanionDevices: () => ipcRenderer.invoke('revoke-all-phone-companion-devices'),
+  notifyPhone: (title, body) => ipcRenderer.invoke('notify-phone', { title, body }),
   syncPhoneCompanion: () => ipcRenderer.send('orion:phone-companion-sync'),
   browserOpenUrl: (url) => ipcRenderer.invoke('browser-open-url', { url }),
   browserSearchWeb: (query) => ipcRenderer.invoke('browser-search-web', { query }),
@@ -117,4 +118,4 @@ contextBridge.exposeInMainWorld('api', {
   appendSkillPattern: (pattern) => ipcRenderer.invoke('orion:append-skill-pattern', { pattern }),
 
   // Session Memory
-  saveSession: (workspacePath, sessionData) => ipcRenderer.invoke('orion:save-session', { workspacePath,
+  saveSession: (wo

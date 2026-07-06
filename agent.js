@@ -2195,7 +2195,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     
     // Clear the active bubble tracking ONLY after the final render has updated it (removing the spinner)
     window.clearActiveAiBubble();
-    
+
+    // Notify phone companion when a task genuinely finishes (not mid-plan auto-continue)
+    if (!autoContinueExecution && window.api && typeof window.api.notifyPhone === 'function') {
+      const notifTitle = 'Orion AI';
+      const shortResponse = String(lastTextResponse || '').replace(/\s+/g, ' ').slice(0, 120);
+      const notifBody = shortResponse || 'Task complete';
+      window.api.notifyPhone(notifTitle, notifBody).catch(() => {});
+    }
+
     window.saveConversationsToStorage();
     if (window.renderConversationList) window.renderConversationList();
     if (window.renderProjectsList) window.renderProjectsList();
@@ -7512,10 +7520,4 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
         throw new Error(errorMessage);
       }
       
-      if (onWarning) {
-        const kind = status === 429 ? 'Quota/rate limit' : (status === 503 ? 'High Demand' : 'Transient Error');
-        onWarning(`Gemini API returned HTTP ${status} (${kind}). Provider wait/cooldown active (Attempt ${i}/${attempts}).`);
-      }
-      
-      await sleepWithModelApiStatus(retryDelayMs, `Gemini API retry ${i}/${attempts}.`, onWarning);
-      delay = Math.max(delay * 2 + Math.random() * 500, retryDelayMs); // E
+  
