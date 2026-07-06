@@ -902,6 +902,22 @@ function setupProgressiveDisclosure() {
   document.getElementById('btn-mode-coder')?.addEventListener('click', () => setAppMode('coder'));
   setAppMode(appMode, false); // Initialize from stored preference
 
+  // Orion prompt chips — populate input (with focus) so Jason can review/edit before sending
+  document.getElementById('orion-welcome-splash')?.addEventListener('click', (e) => {
+    const chip = e.target.closest('.orion-prompt-chip');
+    if (!chip) return;
+    const prompt = chip.dataset.prompt || '';
+    if (!prompt) return;
+    const input = el.chatInput;
+    if (!input) return;
+    input.value = prompt;
+    input.focus();
+    // Put cursor at end
+    input.setSelectionRange(prompt.length, prompt.length);
+    // Trigger resize in case the input uses auto-height
+    input.dispatchEvent(new Event('input'));
+  });
+
   const closePalette = () => el.commandPaletteModal && el.commandPaletteModal.classList.remove('active');
   const openPalette = () => {
     if (!el.commandPaletteModal) return;
@@ -1850,7 +1866,7 @@ function sendQueuedPromptNow(queueId, conversationId) {
     saveConversationsToStorage();
   }
   if (conversationId === activeConversationId && !item.alreadyRendered) {
-    renderUserMessage(item.prompt, queuedImages);
+    renderUserMessage(item.prompt, queuedImages, Date.now());
   }
   window.runAgentLoop(item.prompt, item.modelSelectValue || (el.modelSelect && el.modelSelect.value), conv, {
     source: item.source || 'queue',
@@ -2444,7 +2460,7 @@ function selectConversation(id) {
       const replayLogs = Array.isArray(replayMsg.logs) ? replayMsg.logs : [];
       window.clearActiveAiBubble();
       if (replayMsg.role === 'user') {
-        renderUserMessage(replayMsg.text, Array.isArray(replayMsg.images) ? replayMsg.images : []);
+        renderUserMessage(replayMsg.text, Array.isArray(replayMsg.images) ? replayMsg.images : [], replayMsg.createdAt || null);
       } else if (replayMsg.role === 'assistant') {
         if (isEmptyThinkingPlaceholder(replayMsg.text, replayLogs)) return;
         renderAiMessage(replayMsg.text, replayLogs, activeConversationId, replayMsg);
@@ -2519,7 +2535,8 @@ async function submitMessage() {
   clearPendingImages();
 
   // Render user prompt (with any attached images)
-  renderUserMessage(prompt, imagesToSend);
+  const userMsgTs = Date.now();
+  renderUserMessage(prompt, imagesToSend, userMsgTs);
   el.chatInput.value = '';
   
   // Rename the conversation from its first message. Gated on message count/title rather than
@@ -2673,10 +2690,17 @@ function normalizeConversationWorkspace(conv) {
 }
 
 // RENDER HELPER FUNCTIONS
-function renderUserMessage(text, images = []) {
+
+function formatMsgTime(ts) {
+  if (!ts) return '';
+  return new Date(ts).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+}
+
+function renderUserMessage(text, images = [], timestamp = null) {
   const stickToBottom = shouldAutoScrollChat();
   const bubble = document.createElement('div');
   bubble.className = 'message-bubble';
+  const timeStr = formatMsgTime(timestamp || Date.now());
   const imgsHtml = (images && images.length)
     ? images.map(img =>
         `<img src="data:${escapeHtml(img.mimeType)};base64,${img.data}" alt="attached image" ` +
@@ -2684,7 +2708,10 @@ function renderUserMessage(text, images = []) {
       ).join('')
     : '';
   bubble.innerHTML = `
-    <div class="message-header user">🧑 User</div>
+    <div class="message-header user">
+      <span>🧑 You</span>
+      <span class="msg-timestamp">${timeStr}</span>
+    </div>
     <div class="message-body">${escapeHtml(text).replace(/\n/g, '<br>')}${imgsHtml}</div>
   `;
   sanitizeRenderedMarkdown(bubble);
@@ -3018,7 +3045,8 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   const stickToBottom = shouldAutoScrollChat();
   let bubble;
   const isNew = !activeAiBubble;
-  
+  if (isNew) hideOrionTyping(); // remove typing indicator when real bubble appears
+
   if (!isNew) {
     bubble = activeAiBubble;
   } else {
@@ -3149,8 +3177,12 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     `;
   }
   
+  const aiMsgTime = isNew ? formatMsgTime(Date.now()) : '';
   bubble.innerHTML = `
-    <div class="message-header ai">✦ Orion AI</div>
+    <div class="message-header ai">
+      <span>✦ Orion AI</span>
+      ${aiMsgTime ? `<span class="msg-timestamp">${aiMsgTime}</span>` : ''}
+    </div>
     ${logsHtml}
     <div class="message-body">
       ${renderedMarkdown}
@@ -3574,12 +3606,36 @@ function showToast(message, tone = 'default') {
   }, 3200);
 }
 
+// Typing indicator for Orion mode
+let orionTypingEl = null;
+function showOrionTyping() {
+  if (typeof appMode === 'undefined' || appMode !== 'orion') return;
+  if (orionTypingEl) return;
+  orionTypingEl = document.createElement('div');
+  orionTypingEl.className = 'orion-typing-indicator';
+  orionTypingEl.innerHTML = `
+    <span class="orion-typing-dot"></span>
+    <span class="orion-typing-dot"></span>
+    <span class="orion-typing-dot"></span>
+    <span class="orion-typing-label">Orion is thinking…</span>
+  `;
+  el.messagesContainer.appendChild(orionTypingEl);
+  el.messagesContainer.scrollTop = el.messagesContainer.scrollHeight;
+}
+function hideOrionTyping() {
+  if (orionTypingEl) {
+    orionTypingEl.remove();
+    orionTypingEl = null;
+  }
+}
+
 window.onAgentStatusChange = (running) => {
   const submitBtn = el.btnSubmit;
   const steerBtn = document.getElementById('btn-steer');
   const queueBtn = document.getElementById('btn-queue');
-  
+
   if (running) {
+    showOrionTyping();
     submitBtn.innerHTML = '&#10022;';
     submitBtn.title = 'Send or queue message';
     if (el.btnStopAgent) {
@@ -3591,6 +3647,7 @@ window.onAgentStatusChange = (running) => {
     clearInterval(agentPresenceTimer);
     agentPresenceTimer = setInterval(refreshAgentPresence, 250);
   } else {
+    hideOrionTyping();
     clearInterval(agentPresenceTimer);
     agentPresenceTimer = null;
     submitBtn.innerHTML = '&#10022;';
@@ -3870,7 +3927,7 @@ window.submitPhoneCompanionPrompt = async (options) => {
       dedupeKey: `phone-queued-${targetId}-${text}`
     });
     if (targetId === activeConversationId) {
-      renderUserMessage(text, phoneImages);
+      renderUserMessage(text, phoneImages, Date.now());
     }
     return { success: true, queued: true, conversationId: targetId, title: conv.title || 'New Conversation' };
   }
@@ -3881,7 +3938,7 @@ window.submitPhoneCompanionPrompt = async (options) => {
     saveConversationsToStorage();
   }
   if (targetId === activeConversationId) {
-    renderUserMessage(text, phoneImages);
+    renderUserMessage(text, phoneImages, Date.now());
   }
   window.runAgentLoop(text, window.getSelectedModel(), conv, { source: 'phone', images: phoneImages })
     .catch(err => {
@@ -4018,7 +4075,7 @@ window.submitPhoneCompanionClarification = async ({ conversationId, answers } = 
 
   conv.awaitingClarification = null;
   if (resolvedId === activeConversationId) {
-    renderUserMessage(userMessage);
+    renderUserMessage(userMessage, [], Date.now());
   }
   conv.messages.push({ role: 'user', text: userMessage, source: 'clarification-answers' });
   saveConversationsToStorage();
@@ -4136,4 +4193,381 @@ function buildClarificationCardHtml(clarData) {
 
     return `
       <div class="clarification-question-block" data-qi="${qi}">
-        <div class="clarificatio
+        <div class="clarification-question-header">
+          <span class="clarification-chip">${escapedHeader}</span>
+          <span class="clarification-question-text">${escapedQuestion}</span>
+        </div>
+        <div class="clarification-options">
+          ${optionsHtml}
+          <label class="clarification-other-row">
+            <input type="radio" name="clarq_${qi}" value="__other__" />
+            <input class="clarification-other-input" type="text" placeholder="Other — type your answer…" data-qi="${qi}" />
+          </label>
+        </div>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="clarification-card">
+      ${escapedIntro ? `<div class="clarification-intro">${escapedIntro}</div>` : ''}
+      ${questionsHtml}
+      <div class="clarification-actions">
+        <button class="btn-clarification-submit" type="button">Submit</button>
+      </div>
+    </div>`;
+}
+
+async function submitClarificationAnswers({ button, bubble } = {}) {
+  const conv = conversations.find(c => c.id === activeConversationId);
+  if (!conv || !conv.awaitingClarification) return;
+
+  const clarData = conv.awaitingClarification;
+  const questions = clarData.questions || [];
+
+  // Collect answers from the bubble's form controls
+  const answers = [];
+  let allAnswered = true;
+  questions.forEach((q, qi) => {
+    const block = bubble ? bubble.querySelector(`.clarification-question-block[data-qi="${qi}"]`) : null;
+    let answer = null;
+    if (block) {
+      const checked = block.querySelector(`input[type="radio"][name="clarq_${qi}"]:checked`);
+      if (checked) {
+        if (checked.value === '__other__') {
+          const otherInput = block.querySelector(`.clarification-other-input[data-qi="${qi}"]`);
+          answer = otherInput ? otherInput.value.trim() : '';
+        } else {
+          const optIdx = parseInt(checked.value, 10);
+          answer = (q.options[optIdx] && q.options[optIdx].label) || '';
+        }
+      }
+    }
+    if (!answer) allAnswered = false;
+    answers.push({ header: q.header, question: q.question, answer: answer || '(no answer)' });
+  });
+
+  if (!allAnswered) {
+    // Briefly flash the submit button to signal something is missing
+    if (button) {
+      button.textContent = 'Answer all questions first';
+      setTimeout(() => { button.textContent = 'Submit'; }, 1800);
+    }
+    return;
+  }
+
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Submitting…';
+  }
+  if (bubble) {
+    const card = bubble.querySelector('.clarification-card');
+    if (card) card.classList.add('answered');
+  }
+
+  // Format answers as a readable user message
+  const formattedAnswers = answers.map(a => `${a.header}: ${a.answer}`).join('\n');
+  const userMessage = `Here are my answers:\n${formattedAnswers}`;
+
+  // Clear the awaiting state
+  conv.awaitingClarification = null;
+
+  // Render answers as a visible user message and persist to history
+  renderUserMessage(userMessage, [], Date.now());
+  conv.messages.push({ role: 'user', text: userMessage, source: 'clarification-answers' });
+  saveConversationsToStorage();
+
+  if (!appConfig.geminiApiKey) {
+    el.settingsModal.classList.add('active');
+    appendSystemMessage("Please enter and save your Gemini API Key first.");
+    return;
+  }
+
+  window.runAgentLoop(userMessage, el.modelSelect.value, conv, { source: 'clarification-answers' })
+    .catch(err => console.error('Clarification resume failed:', err));
+}
+
+async function approveCurrentPlanAndContinue(options = {}) {
+  const button = options.button || null;
+  const originalLabel = button ? button.textContent : '';
+  const restoreButton = () => {
+    if (!button) return;
+    button.disabled = false;
+    button.classList.remove('approved');
+    button.textContent = originalLabel || 'Start Implementation';
+  };
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Starting…';
+  }
+
+  const conv = conversations.find(c => c.id === activeConversationId);
+  if (!conv) { restoreButton(); return { success: false, error: 'No active conversation' }; }
+  if (!conv.awaitingPlanApproval) { restoreButton(); return { success: false, error: 'No plan is awaiting approval' }; }
+  if (!appConfig.geminiApiKey) {
+    el.settingsModal.classList.add('active');
+    appendSystemMessage("Please enter and save your Gemini API Key first.");
+    restoreButton();
+    return { success: false, error: 'Missing Gemini API key' };
+  }
+
+  // Re-validate the testing plan section in implementation_plan.md
+  let planIsValid = false;
+  try {
+    const planText = await readConversationTextArtifact(conv, 'implementation_plan.md', { maxChars: 100000 });
+    planIsValid = hasRequiredTestingPlanSection(planText);
+  } catch (err) {
+    console.error('Error validating plan during approval:', err);
+  }
+
+  if (!planIsValid) {
+    appendSystemMessage("Approval rejected: The implementation plan is missing a valid '## Testing Plan' section. Please ask the agent to revise the plan.");
+    restoreButton();
+    return { success: false, error: "Missing or invalid '## Testing Plan' section in implementation_plan.md" };
+  }
+
+  if (button) {
+    button.classList.add('approved');
+    button.disabled = true;
+    button.textContent = '✓ Implementation Started';
+    // Update the surrounding card immediately so it matches the persistent "started" state
+    // rendered on reload — no flicker, and it clearly reflects that the button was pressed.
+    const card = button.closest('.plan-approval-actions');
+    if (card) card.classList.add('approved');
+    const title = card && card.querySelector('.plan-approval-title');
+    if (title) title.textContent = 'Implementation started';
+    const subtitle = card && card.querySelector('.plan-approval-subtitle');
+    if (subtitle) subtitle.textContent = 'Orion is building from this approved plan.';
+  }
+
+  conv.planApproved = true;
+  conv.awaitingPlanApproval = false;
+
+  const approvalText = "Plan approved. Continuing implementation.";
+  appendSystemMessage(approvalText, { conversationId: activeConversationId, source: 'plan-approval' });
+
+  const prompt = 'PLAN APPROVED — EXECUTE NOW. Do not summarize, describe, or restate the plan. Do not rewrite STRATEGY.md or implementation_plan.md — they are already approved. Read implementation_plan.md once to understand the tasks, then immediately start creating and editing the actual source code files. Work through every task. Update the checklist only for completed milestones. Run the test suite when done. Provide a Work Walkthrough.';
+
+  if (window.runAgentLoop) {
+    if (window.isAgentRunning && window.isAgentRunning()) {
+      window.promptQueue.push({ prompt, modelSelectValue: el.modelSelect.value, conversationId: conv.id, alreadyRendered: true, source: 'plan-approval' });
+      appendSystemMessage("Another task is currently running. Approved plan execution was queued.");
+      return { success: true, queued: true };
+    }
+    window.runAgentLoop(prompt, el.modelSelect.value, conv, { source: 'plan-approval', internalPrompt: true })
+      .catch(err => console.error("Desktop-started agent loop failed:", err));
+    return { success: true, queued: false };
+  }
+  return { success: false, error: 'Agent engine is not ready' };
+}
+
+function deleteConversation(id) {
+  const convToDelete = conversations.find(c => c.id === id);
+  const parentProj = convToDelete ? convToDelete.projectPath : '';
+  cleanupConversationArtifacts(id);
+  
+  conversations = conversations.filter(c => c.id !== id);
+  saveConversationsToStorage();
+  
+  if (activeConversationId === id) {
+    const siblingConversations = conversations.filter(c => c.projectPath === parentProj);
+    if (siblingConversations.length > 0) {
+      selectConversation(siblingConversations[0].id);
+    } else {
+      if (parentProj) {
+        createNewConversationUnderProject(parentProj);
+      } else {
+        createNewConversation();
+      }
+    }
+  } else {
+    renderConversationList();
+    renderProjectsList();
+  }
+}
+
+function removeProject(path) {
+  const removedConversationIds = conversations.filter(c => c.projectPath === path).map(c => c.id);
+  removedConversationIds.forEach(cleanupConversationArtifacts);
+  projects = projects.filter(p => p !== path);
+  saveProjectsToStorage();
+  
+  // Cascade delete all conversations belonging to this project
+  conversations = conversations.filter(c => c.projectPath !== path);
+  saveConversationsToStorage();
+  
+  const activeConv = conversations.find(c => c.id === activeConversationId);
+  if (!activeConv) {
+    createNewConversation();
+  } else {
+    renderConversationList();
+    renderProjectsList();
+  }
+}
+
+function cleanupConversationArtifacts(id) {
+  if (!id || !window.api || typeof window.api.deleteConversationArtifacts !== 'function') return;
+  window.api.deleteConversationArtifacts(id).catch(err => {
+    console.warn('Failed to delete conversation artifacts:', err);
+  });
+}
+
+// Shared helper — builds one project card and appends it to el.projectList
+function buildProjectCard(path) {
+  const activeConv = conversations.find(c => c.id === activeConversationId);
+  const isCurrent = path === currentWorkspace || (activeConv && activeConv.projectPath === path);
+  const rawName = path.substring(path.lastIndexOf('\\') + 1) || path;
+  const name = toTitleCase(rawName);
+
+  const projectContainer = document.createElement('div');
+  projectContainer.className = 'project-container';
+  projectContainer.style.display = 'flex';
+  projectContainer.style.flexDirection = 'column';
+  projectContainer.style.marginBottom = '8px';
+
+  const projectHeader = document.createElement('div');
+  projectHeader.className = `project-item ${isCurrent ? 'active' : ''}`;
+  projectHeader.style.display = 'flex';
+  projectHeader.style.alignItems = 'center';
+
+  projectHeader.innerHTML = `
+    <span class="folder-icon">📁</span>
+    <div class="project-details row-details-flex">
+      <span class="project-name" style="font-weight:600;">${escapeHtml(name)}</span>
+      <span class="project-subtext" title="${escapeHtml(path)}" style="font-size: 0.65rem;">${escapeHtml(path)}</span>
+    </div>
+    <button class="add-conv-btn icon-btn-ghost icon-btn-spaced" title="New Conversation in Project">+</button>
+    <button class="delete-btn icon-btn-ghost" title="Remove project">&times;</button>
+  `;
+
+  projectHeader.querySelector('.project-details').addEventListener('click', () => {
+    setWorkspace(path);
+  });
+
+  projectHeader.querySelector('.add-conv-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    setWorkspace(path);
+    createNewConversationUnderProject(path);
+  });
+
+  projectHeader.querySelector('.delete-btn').addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const approved = await showOrionConfirmDialog({
+      title: 'Remove project?',
+      message: `Remove "${name}" and delete its conversations from Orion? This cannot be undone.`,
+      confirmLabel: 'Remove',
+      danger: true
+    });
+    if (approved?.confirmed) {
+      removeProject(path);
+    }
+  });
+
+  projectContainer.appendChild(projectHeader);
+
+  // Indented child conversations
+  const convsList = document.createElement('div');
+  convsList.className = 'project-conversations-list';
+  convsList.style.paddingLeft = '20px';
+  convsList.style.display = 'flex';
+  convsList.style.flexDirection = 'column';
+  convsList.style.gap = '2px';
+  convsList.style.marginTop = '2px';
+
+  const projectConversations = conversations.filter(c => c.projectPath === path);
+  if (projectConversations.length === 0) {
+    convsList.innerHTML = `<div class="empty-state" style="padding: 4px; text-align: left; font-size: 0.75rem; font-style: italic; color: var(--text-muted);">No conversations yet</div>`;
+  } else {
+    projectConversations.forEach(conv => {
+      const isConvActive = conv.id === activeConversationId;
+      const convItem = document.createElement('div');
+      convItem.className = `conversation-item ${isConvActive ? 'active' : ''}`;
+      convItem.style.padding = '4px 8px';
+      convItem.style.borderRadius = '4px';
+      convItem.style.display = 'flex';
+      convItem.style.alignItems = 'center';
+
+      convItem.innerHTML = `
+        <div class="conversation-details row-details-flex" style="display: flex; flex-direction: column;">
+          <span class="conversation-name" style="font-size: 0.8rem; color: ${isConvActive ? 'var(--text-primary)' : 'var(--text-secondary)'}; font-weight: ${isConvActive ? '500' : 'normal'};">${escapeHtml(conv.title)}</span>
+        </div>
+        <button class="delete-btn icon-btn-ghost" title="Delete conversation">&times;</button>
+      `;
+
+      convItem.querySelector('.conversation-details').addEventListener('click', () => {
+        selectConversation(conv.id);
+      });
+
+      convItem.querySelector('.delete-btn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const approved = await confirmConversationDelete(conv.title);
+        if (approved?.confirmed) {
+          deleteConversation(conv.id);
+        }
+      });
+
+      convsList.appendChild(convItem);
+    });
+  }
+
+  projectContainer.appendChild(convsList);
+  el.projectList.appendChild(projectContainer);
+}
+
+function renderProjectsList() {
+  el.projectList.innerHTML = '';
+
+  if (projects.length === 0) {
+    el.projectList.innerHTML = `
+      <div class="project-item active" id="default-proj-item">
+        <span class="folder-icon">📁</span>
+        <div class="project-details">
+          <span class="project-name">Default Workspace</span>
+          <span class="project-subtext">Select folder to start</span>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  projects.forEach(path => buildProjectCard(path));
+}
+
+function filterProjects(query) {
+  if (!query) {
+    renderProjectsList();
+    return;
+  }
+
+  el.projectList.innerHTML = '';
+
+  projects.forEach(path => {
+    const rawName = path.substring(path.lastIndexOf('\\') + 1) || path;
+    const name = toTitleCase(rawName);
+    if (!name.toLowerCase().includes(query.toLowerCase())) return;
+    buildProjectCard(path);
+  });
+}
+
+window.renderConversationList = renderConversationList;
+window.renderProjectsList = renderProjectsList;
+
+window.onRagStatusChange = (statusText) => {
+  const badge = document.getElementById('rag-index-status');
+  if (!badge) return;
+  badge.textContent = statusText;
+  badge.style.display = statusText ? 'inline-block' : 'none';
+  
+  if (statusText.startsWith('Indexing')) {
+    badge.textContent = 'Indexing…';
+    badge.className = 'badge warning pulse';
+  } else if (statusText === 'Semantic Ready') {
+    badge.textContent = 'Indexed';
+    badge.className = 'badge success';
+  } else if (statusText === 'Awaiting API Key') {
+    badge.className = 'badge danger';
+  } else {
+    badge.className = 'badge muted';
+  }
+};
+
+window.getCurrentProject = () => currentWorkspace;

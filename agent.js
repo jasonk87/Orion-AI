@@ -169,7 +169,14 @@ function getSystemInstruction(disableTools = false, cachedMemory = '') {
   let base;
   if (isOrion) {
     const memBlock = cachedMemory ? `\n\nKnown context about Jason:\n${cachedMemory}` : '';
-    base = DISPATCHER_INSTRUCTION.replace('{{user_memory}}', memBlock);
+    // Time-of-day context injection
+    const now = new Date();
+    const hour = now.getHours();
+    const tod = hour < 5 ? 'late night' : hour < 12 ? 'morning' : hour < 17 ? 'afternoon' : hour < 21 ? 'evening' : 'night';
+    const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+    const timeStr = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+    const timeContext = `\n\nCurrent time: ${timeStr} on ${dateStr} (${tod}).`;
+    base = DISPATCHER_INSTRUCTION.replace('{{user_memory}}', memBlock) + timeContext + orionSessionContinuityContext;
   } else {
     base = SYSTEM_INSTRUCTION;
   }
@@ -177,6 +184,129 @@ function getSystemInstruction(disableTools = false, cachedMemory = '') {
     return base.split('Tools available:')[0] + '\n\nCRITICAL: You are in an analysis phase. DO NOT request any tool use. Provide your analysis in plain text only.';
   }
   return base;
+}
+
+// Session continuity: carries a summary of the previous session into the current one
+let orionSessionContinuityContext = '';
+
+function buildOrionContinuityContext(conversation) {
+  // Only inject on the very first user message in an Orion conversation
+  const userMessages = (conversation.messages || []).filter(m => m.role === 'user');
+  if (userMessages.length !== 1) return '';
+  const allConvs = window.conversations || [];
+  // Find the previous Orion conversation (not this one, not project-scoped)
+  const prev = allConvs.find(c => c.id !== conversation.id && !c.projectPath && c.messages && c.messages.some(m => m.role === 'assistant'));
+  if (!prev) return '';
+  const title = prev.title && prev.title !== 'New Conversation' ? prev.title : null;
+  const msgs = (prev.messages || []).filter(m => m.role === 'user' || m.role === 'assistant');
+  // Last 4 turns (up to 2 user + 2 assistant)
+  const tail = msgs.slice(-4);
+  if (!tail.length) return '';
+  const lines = tail.map(m => `${m.role === 'user' ? 'Jason' : 'Orion'}: ${(m.text || '').substring(0, 200)}`).join('\n');
+  const header = title ? `Last session — "${title}"` : 'Last session';
+  return `\n\n${header} (for context, do not summarize unprompted):\n${lines}`;
+}
+
+// Tracks conversations already auto-summarized to avoid duplicate writes
+const orionAutoSummarizedIds = new Set();
+
+async function autoSaveOrionMemory(conversation, config) {
+  if (!config) return;
+  const convId = conversation.id;
+  if (orionAutoSummarizedIds.has(convId)) return;
+  const msgs = (conversation.messages || []).filter(m => m.role === 'user' || m.role === 'assistant');
+  const userMsgCount = msgs.filter(m => m.role === 'user').length;
+  if (userMsgCount < 4) return; // too short — nothing worth summarizing
+
+  orionAutoSummarizedIds.add(convId); // mark before async to avoid double-fire
+
+  // Build a condensed transcript
+  const transcript = msgs.slice(-20).map(m =>
+    `${m.role === 'user' ? 'Jason' : 'Orion'}: ${(m.text || '').substring(0, 400)}`
+  ).join('\n');
+
+  const analyzePrompt = `You are reviewing a conversation between Jason and Orion (his AI assistant).
+Extract ONLY facts and preferences worth remembering in future sessions — things Jason expressed clearly or decided.
+Return JSON: {"items": [{"type": "fact"|"preference", "text": "..."}]}
+Return {"items": []} if nothing is worth saving.
+Keep each item under 120 characters. Do not save trivial details, greetings, or task steps.
+
+Conversation:
+${transcript}`;
+
+  try {
+    let rawJson = '';
+    if (config.geminiApiKey) {
+      const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${config.geminiApiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: analyzePrompt }] }],
+          generationConfig: { maxOutputTokens: 256, temperature: 0.2, responseMimeType: 'application/json' }
+        })
+      });
+      const data = await resp.json();
+      rawJson = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '{"items":[]}';
+    } else if (config.anthropicApiKey) {
+      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': config.anthropicApiKey, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 256, messages: [{ role: 'user', content: analyzePrompt }] })
+      });
+      const data = await resp.json();
+      rawJson = data?.content?.[0]?.text?.trim() || '{"items":[]}';
+    }
+    const parsed = JSON.parse(rawJson);
+    const items = Array.isArray(parsed?.items) ? parsed.items : [];
+    for (const item of items) {
+      if (!item.text || item.text.length < 5) continue;
+      if (item.type === 'preference') {
+        const mem = await window.api.readGlobalMemory();
+        const prefs = (mem?.user && Array.isArray(mem.user.preferences)) ? mem.user.preferences : [];
+        prefs.push({ text: item.text, addedAt: new Date().toISOString(), source: 'auto-summary' });
+        await window.api.writeGlobalMemory({ user: Object.assign({}, (mem && mem.user) || {}, { preferences: prefs }) });
+      } else {
+        await window.api.appendGlobalFact(item.text, 'auto-summary');
+      }
+    }
+    if (items.length > 0) {
+      console.log(`[Orion] Auto-saved ${items.length} memory item(s) from session.`);
+    }
+  } catch (e) { /* silent — memory auto-save is best-effort */ }
+}
+
+async function generateOrionSmartTitle(conversation, userText, assistantText, config) {
+  if (!config) return;
+  const snippet = userText.substring(0, 300) + (assistantText ? '\n' + assistantText.substring(0, 200) : '');
+  const titlePrompt = `Generate a short, specific title (4-6 words, no quotes) for this conversation snippet. Return ONLY the title, nothing else.\n\n${snippet}`;
+  try {
+    let newTitle = '';
+    if (config.geminiApiKey) {
+      const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${config.geminiApiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts: [{ text: titlePrompt }] }], generationConfig: { maxOutputTokens: 20, temperature: 0.4 } })
+      });
+      const data = await resp.json();
+      newTitle = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+    } else if (config.anthropicApiKey) {
+      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': config.anthropicApiKey, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 20, messages: [{ role: 'user', content: titlePrompt }] })
+      });
+      const data = await resp.json();
+      newTitle = data?.content?.[0]?.text?.trim() || '';
+    }
+    newTitle = newTitle.replace(/^["'`]|["'`]$/g, '').replace(/\.$/, '').trim();
+    if (newTitle && newTitle.length > 2 && newTitle.length < 80) {
+      conversation.title = newTitle;
+      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+      if (window.renderConversationList) window.renderConversationList();
+      const titleEl = document.getElementById('chat-title');
+      if (titleEl && window.activeConversationId === conversation.id) titleEl.textContent = newTitle;
+    }
+  } catch (e) { /* silent — titles are best-effort */ }
 }
 
 // Keep track of active agent running state
@@ -462,6 +592,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   activeRunController = new AbortController();
   window.currentLoopCount = 0;
   currentAgentLogs = [];
+  // Session continuity: build prev-session context on first message, clear otherwise
+  const isOrionMode = (typeof appMode !== 'undefined' && appMode === 'orion');
+  if (isOrionMode) {
+    orionSessionContinuityContext = buildOrionContinuityContext(conversation);
+  } else {
+    orionSessionContinuityContext = '';
+  }
   if (window.onAgentStatusChange) window.onAgentStatusChange(true);
   
   const config = window.getAppConfig();
@@ -964,6 +1101,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     let reviewCompletionLoopExtensions = 0;
     let pendingWorkspaceResolutionPrompts = 0;
     let memoryNudgeSent = false;
+    let skillGateFired = false;
     let blankFinalAnswerNudgeSent = false;
     const repeatedToolFailures = new Map();
     const fileEditCounts = new Map();
@@ -1448,7 +1586,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         // create a skill, prompt Orion to consider whether any reusable capability emerged.
         const didMultiStepWork = !reviewOnly && workWalkthrough.filter(i => i && i.status !== 'error').length >= 5;
         const alreadyCreatedSkill = workWalkthrough.some(i => i && i.toolName === 'create_skill');
-        if (didMultiStepWork && !alreadyCreatedSkill && !isGenericNonAnswer(textVal) && loopCount < maxLoops) {
+        if (!skillGateFired && didMultiStepWork && !alreadyCreatedSkill && !isGenericNonAnswer(textVal) && loopCount < maxLoops) {
+          skillGateFired = true;
           currentAgentLogs.push({ type: 'thought', content: 'Skill gate: multi-step task completed; nudging Orion to consider packaging a reusable skill.' });
           messages.push({
             role: 'user',
@@ -2117,6 +2256,20 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     agentExecutionMode = 'idle';
     agentSubStatus = '';
     if (window.onAgentStatusChange) window.onAgentStatusChange(false);
+
+    // Smart Orion title: generate a better title after the first response
+    if (isOrionMode) {
+      const msgs = conversation.messages || [];
+      const firstUser = msgs.find(m => m.role === 'user');
+      const firstAsst = msgs.find(m => m.role === 'assistant');
+      const currentTitle = conversation.title || '';
+      const needsSmartTitle = firstUser && firstAsst && (currentTitle === 'New Conversation' || currentTitle === window.generateConversationTitle?.(firstUser.text || ''));
+      if (needsSmartTitle) {
+        generateOrionSmartTitle(conversation, firstUser.text || '', firstAsst.text || '', config).catch(() => {});
+      }
+      // Auto-save memory insights from this session (silent, best-effort)
+      autoSaveOrionMemory(conversation, config).catch(() => {});
+    }
 
     // Determine whether the run stopped with genuine work still pending. This drives both the
     // auto-continue decision and an honest terminal message instead of a blanket "Task finished".
@@ -7495,4 +7648,325 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
         }
       } : {
         temperature: 0
-     
+      })
+    },
+    safetySettings: [
+      {
+        category: "HARM_CATEGORY_HARASSMENT",
+        threshold: "BLOCK_NONE"
+      },
+      {
+        category: "HARM_CATEGORY_HATE_SPEECH",
+        threshold: "BLOCK_NONE"
+      },
+      {
+        category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        threshold: "BLOCK_NONE"
+      },
+      {
+        category: "HARM_CATEGORY_DANGEROUS_CONTENT",
+        threshold: "BLOCK_NONE"
+      }
+    ],
+    tools: [
+      {
+        functionDeclarations: buildAgentToolDeclarations()
+      }
+    ]
+  };
+
+  if (disableTools) {
+    delete requestBody.tools;
+    delete requestBody.toolConfig;
+  }
+
+  const attempts = MODEL_API_MAX_ATTEMPTS;
+  let delay = 1500; // Start with 1.5s
+  
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${activeModelName}:generateContent?key=${apiKey}`;
+      const response = await fetchWithTimeout(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody),
+        signal: options.signal
+      }, MODEL_API_REQUEST_TIMEOUT_MS, 'Gemini generateContent request');
+      
+      if (response.ok) {
+        const responseData = await response.json();
+        responseData._orionActiveModelName = activeModelName;
+        return responseData;
+      }
+      
+      const errorText = await response.text();
+      const status = response.status;
+      const apiError = describeModelApiError(status, errorText);
+      const retryDelayMs = Math.min(apiError.retryDelayMs || delay, MODEL_API_MAX_RETRY_WAIT_MS);
+
+      if (isGeminiHardQuotaError(status, apiError.message)) {
+        if (onWarning) {
+          onWarning(`Gemini API returned HTTP ${status} (monthly spend cap). This is a billing limit, not a temporary model rate limit, so Orion is stopping retries.`);
+        }
+        throw createNonRetryableModelError(`HTTP ${status}: ${apiError.message}`);
+      }
+
+      if (isGeminiHighDemandError(status, apiError.message)) {
+        const fallbackModelName = getNextGeminiModelForHighDemand(activeModelName);
+        if (fallbackModelName) {
+          if (onWarning) {
+            onWarning(`Gemini API returned HTTP ${status} (High Demand) for ${activeModelName}. Temporarily switching this request to ${fallbackModelName}; your selected default model is unchanged.`);
+          }
+          activeModelName = fallbackModelName;
+          delay = 1500;
+          i -= 1;
+          continue;
+        }
+      }
+      
+      const isTransient = [429, 500, 502, 503, 504].includes(status);
+      if (!isTransient || i === attempts) {
+        const retryText = apiError.retryDelayMs ? ` Retry after about ${Math.ceil(apiError.retryDelayMs / 1000)} seconds.` : '';
+        const errorMessage = `HTTP ${status}: ${apiError.message}${retryText}`;
+        if (!isTransient) throw createNonRetryableModelError(errorMessage);
+        throw new Error(errorMessage);
+      }
+      
+      if (onWarning) {
+        const kind = status === 429 ? 'Quota/rate limit' : (status === 503 ? 'High Demand' : 'Transient Error');
+        onWarning(`Gemini API returned HTTP ${status} (${kind}). Provider wait/cooldown active (Attempt ${i}/${attempts}).`);
+      }
+      
+      await sleepWithModelApiStatus(retryDelayMs, `Gemini API retry ${i}/${attempts}.`, onWarning);
+      delay = Math.max(delay * 2 + Math.random() * 500, retryDelayMs); // Exponential backoff + API retry hint
+      
+    } catch (e) {
+      if (e && e.nonRetryable) throw e;
+      if (i === attempts) throw e;
+      if (onWarning) {
+        onWarning(`Connection error: ${e.message}. Provider wait/cooldown active (Attempt ${i}/${attempts}).`);
+      }
+      await sleepWithModelApiStatus(delay, `Gemini connection retry ${i}/${attempts}.`, onWarning);
+      delay = delay * 2 + Math.random() * 500;
+    }
+  }
+}
+
+// TOKEN COUNT ESTIMATOR VIA API
+async function countTokens(messages, modelName, config, options = {}) {
+  if (!modelName.startsWith('gemini-')) {
+    return JSON.stringify(messages).length / 4;
+  }
+  
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:countTokens?key=${config.geminiApiKey}`;
+  const requestBody = { contents: messages };
+  
+  const response = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestBody),
+    signal: options.signal
+  }, MODEL_API_REQUEST_TIMEOUT_MS, 'Gemini countTokens request');
+  
+  if (!response.ok) {
+    // Return approximation if API fails
+    return JSON.stringify(messages).length / 4;
+  }
+  const data = await response.json();
+  return data.totalTokens;
+}
+
+// CONTEXT COMPACTOR (Summarizer)
+async function compactHistory(messages, modelName, config) {
+  // Format history for the summarizer prompt
+  let conversationLogsText = "";
+  messages.forEach(m => {
+    const roleName = m.role === 'user' ? 'User' : 'Assistant';
+    let contentText = "";
+    if (m.parts) {
+      m.parts.forEach(p => {
+        if (p.text) contentText += p.text;
+        if (p.functionCall) contentText += ` [Called Tool: ${p.functionCall.name}]`;
+        if (p.functionResponse) contentText += ` [Tool Output: ${JSON.stringify(p.functionResponse.response)}]`;
+      });
+    }
+    conversationLogsText += `${roleName}: ${contentText}\n\n`;
+  });
+  
+  const summaryPrompt = `The following is a conversation history between a user and an AI pair programmer. Summarize the history, detailing:
+1. The overall task and workspace directory.
+2. Major modifications made to files.
+3. Current task list status and remaining goals.
+4. Any errors encountered and how they were resolved.
+Keep the summary highly technical, extremely brief, and complete.
+
+CONVERSATION HISTORY:
+${conversationLogsText}`;
+
+  const text = await callUtilityModel(summaryPrompt, modelName, config, false);
+  let compactedSummary = text || "History compacted.";
+
+  // Retain only the last 3 messages + the summary. A 'tool' message is always
+  // preceded by the 'model' message whose tool_calls it answers (agent.js pushes
+  // them as a pair) — if a plain count-based slice cut started on that 'tool'
+  // message, its issuing 'model' message (and any reasoning_content on it) would
+  // be dropped, leaving an orphaned tool result that providers requiring
+  // reasoning continuity (e.g. DeepSeek thinking mode) reject with a 400.
+  let retainStart = Math.max(0, messages.length - 3);
+  while (retainStart > 0 && messages[retainStart] && messages[retainStart].role === 'tool') {
+    retainStart--;
+  }
+  const lastMessages = messages.slice(retainStart);
+  
+  const newHistory = [
+    {
+      role: 'user',
+      parts: [{
+        text: `Here is a summary of our previous session history, do not repeat it but remember the context:\n\n${compactedSummary}`
+      }]
+    },
+    {
+      role: 'model',
+      parts: [{
+        text: "Understood. I have fully digested the summary context of our workspace history. Let's continue working."
+      }]
+    },
+    ...lastMessages
+  ];
+  
+  return {
+    messages: newHistory,
+    summary: compactedSummary
+  };
+}
+
+if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
+  module.exports = {
+    classifyPlanApprovalIntent,
+    classifyPlanningNeed,
+    tokenizeIntentText,
+    buildLocalMemoryAnswer,
+    getPlanningToolGate,
+    getReviewOnlyToolGate,
+    buildRemainingWorkSummary,
+    normalizeChecklistTasks,
+    shouldApplyChecklistUpdate,
+    hasRequiredTestingPlanSection,
+    STRATEGY_REQUIRED_SECTIONS,
+    hasRequiredStrategySections,
+    validateStrategyContent,
+    strategyRequiresClarification,
+    buildRefinementPrompt,
+    buildOperationalContextFromStrategy,
+    mutateOperationalContext,
+    readOperationalContext,
+    validateRunCommandForAgentUse,
+    extractPythonScriptPath,
+    commandProvidesInput,
+    isLocalSystemFactRequest,
+    isLocalProjectOrFolderRequest,
+    isLocalAccessDeflection,
+    requestNeedsLocalInspection,
+    buildLocalInspectionNoToolGuidance,
+    isGenericNonAnswer,
+    looksLikeLeakedNoToolCorrection,
+    requestNeedsActionableFinalAnswer,
+    answerHasActionableFinalContent,
+    isSubstantiveVisibleAnswer,
+    answerHasInspectionGrounding,
+    getReviewCoverage,
+    answerHasGroundedReviewReport,
+    buildReviewOnlyCompletionGatePrompt,
+    isInventoryOnlyCommand,
+    hasDeepInspectionEvidence,
+    hasOnlyInventoryEvidence,
+    buildFinalAnswerQualityGatePrompt,
+    shouldHaveUsedToolsButDidNot,
+    isFailedToolResult,
+    getToolFailureSignal,
+    buildToolEvidenceEntry,
+    getEpistemicToolGate,
+    buildEpistemicCorrectionPrompt,
+    classifyAgentFailure,
+    recommendedNatureForFailureCategory,
+    buildFailureRecoveryGuidance,
+    resolveConversationWorkspace,
+    isRealVerificationCommand,
+    isVerificationItem,
+    hasVerificationAfterLastFileEdit,
+    isAppLaunchItem,
+    isAppLaunchVerificationItem,
+    hasVerificationAfterLastAppLaunch,
+    hasUnresolvedRegressionWarning,
+    looksLikePlaceholderTestOutput,
+    checkJsSyntaxAfterEdit,
+    buildRepeatedEditFailureEscalation,
+    buildMalformedFunctionCallGuidance,
+    looksLikeLaunchOnlyRequest,
+    hasFailedLaunchAttemptThisRun,
+    getNextGeminiModelForHighDemand,
+    resolveUtilityModelName,
+    trimAgedToolResultsFromMessages,
+    convertGeminiToAnthropicTools,
+    convertGeminiToAnthropicMessages,
+    callAnthropicAPI,
+    convertGeminiToDeepSeekTools,
+    convertGeminiToDeepSeekMessages,
+    callDeepSeekAPI,
+    getNextModelForHighDemand,
+    compactHistory,
+    summarizeToolStart,
+    buildRepeatedFailureKey,
+    updateWalkthroughItem,
+    buildPostEditEvidencePrompt,
+    buildFinalVerificationSummary,
+    stripEchoedSystemScaffold,
+    sanitizeFinalAnswerText,
+    withWorkWalkthrough,
+    hiddenDirectoryForInventory,
+    sensitiveFileForInventory,
+    buildCuratedFileInventory,
+    buildDiscoveryFromToolOutcome,
+    parseModelJsonObject,
+    callGeminiAPI,
+    inspectScreenshotWithModel,
+    inspectScreenshotWithGemini,
+    inspectScreenshotWithOllama,
+    diagnoseModelApiFailure,
+    expandCommonWindowsPath,
+    normalizeLocalPathNameForMatch,
+    tokenizeLocalPathNameForMatch,
+    editDistanceWithin,
+    scoreWorkspaceDirectoryVariant,
+    chooseWorkspaceDirectoryVariant,
+    resolveWorkspacePathForChange,
+    rememberPendingWorkspaceResolution,
+    extractCommandPathArgument,
+    extractDirectoryCandidatesFromCommandOutput,
+    buildPendingWorkspaceResolutionHint,
+    buildPendingWorkspaceResolutionCorrectionPrompt
+  };
+}
+
+function diagnoseModelApiFailure(errorText) {
+  const text = String(errorText || '').toLowerCase();
+  if (!text) return '';
+  if (text.includes('monthly spending cap') || text.includes('project spend cap') || text.includes('ai.studio/spend')) {
+    return 'Diagnosis: the Gemini project has hit a monthly spend cap. This is a hard billing limit, not a temporary model rate limit; retries or model escalation will not continue until the AI Studio spend cap or billing configuration is changed.';
+  }
+  if (text.includes('429') || text.includes('quota') || text.includes('resource has been exhausted')) {
+    return 'Diagnosis: the model provider is rate-limiting or quota-limiting requests. Orion should pause the request loop, preserve state, and resume after cooldown.';
+  }
+  if (text.includes('401') || text.includes('403') || text.includes('api key')) {
+    return 'Diagnosis: the model request looks unauthorized. This is a hard blocker until credentials/config are fixed; Orion should preserve state and explain the exact config to check.';
+  }
+  if (text.includes('fetch') || text.includes('network') || text.includes('econn') || text.includes('timeout')) {
+    return 'Diagnosis: this looks like a network/service availability problem. Orion should stop the repeated request loop, verify connectivity/provider status, then resume from saved state.';
+  }
+  return 'Diagnosis: Orion paused after the model API failed. Preserve the task state, inspect the error, change strategy, and avoid repeating the same request blindly.';
+}
+
+if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
+  module.exports.executeTool = executeTool; // So we can test it specifically
+  module.exports.runAgentLoop = window.runAgentLoop;
+}

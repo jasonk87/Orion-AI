@@ -116,4 +116,10 @@ contextBridge.exposeInMainWorld('api', {
 
   // Skill Memory
   readSkillMemory: () => ipcRenderer.invoke('orion:read-skill-memory'),
-  appendSkillPattern: (pattern) => ipcRenderer.invoke('orion:append-skill-pattern', 
+  appendSkillPattern: (pattern) => ipcRenderer.invoke('orion:append-skill-pattern', { pattern }),
+
+  // Session Memory
+  saveSession: (workspacePath, sessionData) => ipcRenderer.invoke('orion:save-session', { workspacePath, sessionData }),
+  listSessions: (workspacePath, limit) => ipcRenderer.invoke('orion:list-sessions', { workspacePath, limit }),
+  readSession: (workspacePath, sessionId) => ipcRenderer.invoke('orion:read-session', { workspacePath, sessionId })
+});

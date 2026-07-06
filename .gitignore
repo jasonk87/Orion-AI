@@ -13,4 +13,4 @@ config.json
 *.tmp
 *.bak
 .DS_Store
-Thum
+Thumbs.db

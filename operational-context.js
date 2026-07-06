@@ -644,4 +644,21 @@
       reasons.push('No test/smoke/manual verification evidence is recorded.');
     }
 
-    if (reasons.length || missingEvidence.length || pendingWinConditions.length || pe
+    if (reasons.length || missingEvidence.length || pendingWinConditions.length || pendingRequirements.length) {
+      return makeGate('continue_work', reasons, { missingEvidence, pendingWinConditions, pendingRequirements });
+    }
+
+    return makeGate('ready_for_final', [
+      remainingMinorBlockers.length
+        ? 'Mission has evidence-backed satisfied win conditions and only minor non-terminal blockers remain as backlog candidates.'
+        : 'Mission has evidence-backed satisfied win conditions, no active completion-blocking blockers, and verification evidence.'
+    ], {
+      remainingMinorBlockers: remainingMinorBlockers.map(item => ({ id: item.id, title: item.title, details: item.details, severity: item.severity, nature: item.nature })),
+      backlogCandidates: remainingMinorBlockers.map(item => ({ id: item.id, title: item.title, details: item.details, severity: item.severity, nature: item.nature }))
+    });
+  }
+
+  const api = { VERSION, createEmptyContext, normalizeContext, applyAction, formatForPrompt, buildRecentChatView, buildReasoningMessages, evaluateCompletionGate, normalizeSeverity, normalizeNature, compareBlockers };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  if (globalScope) globalScope.OrionOperationalContext = api;
+})(typeof window !== 'undefined' ? window : globalThis);
