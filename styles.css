@@ -850,6 +850,16 @@ body {
 .tool-status.success { background-color: var(--success-glow); color: var(--success-color); }
 .tool-status.error { background-color: var(--error-glow); color: var(--error-color); }
 
+.tool-elapsed {
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.62rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  background-color: rgba(148, 163, 196, 0.08);
+  font-family: ui-monospace, monospace;
+}
+
 .tool-params {
   color: var(--text-muted);
   font-size: 0.7rem;
@@ -2890,18 +2900,4 @@ kbd {
   border-color: rgba(130,115,244,.2);
   outline: none;
   background: rgba(130,115,244,.1);
-  color: var(--text-primary);
-}
-
-.contextual-panel-hidden { display: none !important; }
-
-.toast-region {
-  position: fixed;
-  z-index: 2200;
-  right: 18px;
-  bottom: 18px;
-  pointer-events: none;
-}
-
-.orion-toast {
-  max-width:
+  color: var

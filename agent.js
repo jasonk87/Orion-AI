@@ -1415,11 +1415,107 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       
       // Execute tool calls
       const toolResponseParts = [];
-      
+
+      // ── Parallel execution for read-only batches ──────────────────────────────
+      // When the model returns a batch of calls that are all read-only, run the
+      // executeTool calls concurrently with Promise.all. State mutations (log
+      // updates, ledger entries, working-state transitions) are still sequential.
+      const PARALLELIZABLE_TOOLS = new Set([
+        'read_file', 'list_files', 'get_symbol_index', 'get_workspace_info',
+        'google_search', 'fetch_web_page', 'grep_search', 'search_embeddings',
+        'semantic_search', 'get_file_symbols', 'find_references',
+        'read_command_output', 'get_command_status',
+        'recall_memory', 'read_notes', 'get_project_memory'
+      ]);
+      const canRunParallel = functionCalls.length > 1 &&
+        functionCalls.every(c => PARALLELIZABLE_TOOLS.has(c.name));
+
+      if (canRunParallel) {
+        const parallelNames = functionCalls.map(c => c.name).join(', ');
+        currentAgentLogs.push({ type: 'thought', content: `⚡ Running ${functionCalls.length} independent read-only calls in parallel: ${parallelNames}` });
+        agentSubStatus = `Running ${functionCalls.length} tools in parallel...`;
+
+        // Pre-allocate a log slot and walkthrough item for each call
+        const callMeta = functionCalls.map(call => {
+          const toolName = call.name;
+          const args = call.args || {};
+          const logIndex = currentAgentLogs.length;
+          currentAgentLogs.push({ type: 'tool_call', tool: toolName, params: args, status: 'running' });
+          const walkthroughItem = summarizeToolStart(toolName, args);
+          if (walkthroughItem) workWalkthrough.push(walkthroughItem);
+          return { toolName, args, logIndex, walkthroughItem };
+        });
+        window.renderAiMessage(lastTextResponse, currentAgentLogs);
+
+        // Fire all executeTool calls concurrently
+        const batchStart = Date.now();
+        const parallelResults = await Promise.all(callMeta.map(async ({ toolName, args, logIndex, walkthroughItem }) => {
+          const t0 = Date.now();
+          let result;
+          try {
+            const epistemicGate = getEpistemicToolGate(userPrompt, toolEvidenceLedger, toolName, args);
+            if (!epistemicGate.allowed) {
+              result = { error: epistemicGate.reason, failureCategory: 'unsupported_inference', recoveryGuidance: epistemicGate.guidance };
+            } else {
+              result = await executeTool(toolName, args, workspacePath, config, conversation);
+            }
+          } catch (err) {
+            result = { error: err.message };
+          }
+          const elapsed = Date.now() - t0;
+          return { toolName, args, result, logIndex, walkthroughItem, elapsed };
+        }));
+
+        // Sequential post-processing (state mutations, ledger, UI)
+        for (const { toolName, args, result, logIndex, walkthroughItem, elapsed } of parallelResults) {
+          currentAgentLogs[logIndex].status = isFailedToolResult(result) ? 'error' : 'success';
+          currentAgentLogs[logIndex].result = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
+          currentAgentLogs[logIndex].elapsed = elapsed;
+          updateWalkthroughItem(walkthroughItem, toolName, args, result, isFailedToolResult(result) ? new Error(getToolFailureSignal(result) || 'error') : null);
+          toolEvidenceLedger.push(buildToolEvidenceEntry(toolName, args, result));
+
+          // read_file state tracking
+          if (toolName === 'read_file' && args.path && !isFailedToolResult(result)) {
+            const readKey = String(args.path).toLowerCase();
+            filesSeenThisRun.add(readKey);
+            const wasBlocked = fileNeedsReadBeforeEdit.has(readKey);
+            fileNeedsReadBeforeEdit.delete(readKey);
+            if (wasBlocked && typeof result === 'object' && !Array.isArray(result)) {
+              result.editRetryReminder = `You previously had an edit to ${args.path} blocked until you re-read it. Retry the edit now.`;
+            }
+            const isFullRead = !(Number.isInteger(parseInt(args.startLine, 10)) && Number.isInteger(parseInt(args.endLine, 10)));
+            if (isFullRead) {
+              if (filesFullyReadUnchanged.has(readKey) && typeof result === 'object' && !Array.isArray(result)) {
+                result.redundantReadNote = `You already read ${args.path} earlier this run and it hasn't changed.`;
+              }
+              filesFullyReadUnchanged.add(readKey);
+            }
+          }
+
+          const transition = await recordToolOutcomeInWorkingState(workspacePath, toolName, args, result);
+          if (transition && transition.state) {
+            workingState = transition.state;
+            refreshWorkingStateMessage();
+          }
+
+          toolResponseParts.push({
+            functionResponse: {
+              name: toolName,
+              response: (typeof result === 'object' && result !== null && !Array.isArray(result)) ? result : { output: result }
+            }
+          });
+        }
+
+        const batchElapsed = Date.now() - batchStart;
+        currentAgentLogs.push({ type: 'thought', content: `⚡ Parallel batch done in ${batchElapsed}ms (vs ~${parallelResults.reduce((s, r) => s + r.elapsed, 0)}ms sequential)` });
+        persistCurrentAgentLogs({ render: true });
+
+      } else {
+      // ── Sequential execution (default) ───────────────────────────────────────
       for (const call of functionCalls) {
         const toolName = call.name;
         const args = call.args || {};
-        
+
         agentSubStatus = `Running tool: ${toolName}...`;
         
         const logIndex = currentAgentLogs.length;
@@ -1594,6 +1690,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
         // Execute the tool
         let result;
+        const _toolStartTime = Date.now();
         try {
           result = await executeTool(toolName, args, workspacePath, config, conversation);
           if (result && result._forceYield) {
@@ -1613,6 +1710,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           }
           currentAgentLogs[logIndex].status = isFailedToolResult(result) ? 'error' : 'success';
           currentAgentLogs[logIndex].result = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
+          currentAgentLogs[logIndex].elapsed = Date.now() - _toolStartTime;
           updateWalkthroughItem(walkthroughItem, toolName, args, result, null);
           persistVisualArtifactForTool({
             conversation,
@@ -1628,6 +1726,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           console.error(err);
           currentAgentLogs[logIndex].status = 'error';
           currentAgentLogs[logIndex].result = err.message;
+          currentAgentLogs[logIndex].elapsed = Date.now() - _toolStartTime;
           result = { error: err.message };
           updateWalkthroughItem(walkthroughItem, toolName, args, result, err);
         }
@@ -1859,7 +1958,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           break;
         }
       }
-      
+      } // end sequential else block
+
       // Append tool response parts to message history
       messages.push({ role: 'tool', parts: toolResponseParts });
       
@@ -7418,168 +7518,4 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
       }
       
       await sleepWithModelApiStatus(retryDelayMs, `Gemini API retry ${i}/${attempts}.`, onWarning);
-      delay = Math.max(delay * 2 + Math.random() * 500, retryDelayMs); // Exponential backoff + API retry hint
-      
-    } catch (e) {
-      if (e && e.nonRetryable) throw e;
-      if (i === attempts) throw e;
-      if (onWarning) {
-        onWarning(`Connection error: ${e.message}. Provider wait/cooldown active (Attempt ${i}/${attempts}).`);
-      }
-      await sleepWithModelApiStatus(delay, `Gemini connection retry ${i}/${attempts}.`, onWarning);
-      delay = delay * 2 + Math.random() * 500;
-    }
-  }
-}
-
-// TOKEN COUNT ESTIMATOR VIA API
-async function countTokens(messages, modelName, config, options = {}) {
-  if (!modelName.startsWith('gemini-')) {
-    return JSON.stringify(messages).length / 4;
-  }
-  
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:countTokens?key=${config.geminiApiKey}`;
-  const requestBody = { contents: messages };
-  
-  const response = await fetchWithTimeout(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(requestBody),
-    signal: options.signal
-  }, MODEL_API_REQUEST_TIMEOUT_MS, 'Gemini countTokens request');
-  
-  if (!response.ok) {
-    // Return approximation if API fails
-    return JSON.stringify(messages).length / 4;
-  }
-  const data = await response.json();
-  return data.totalTokens;
-}
-
-// CONTEXT COMPACTOR (Summarizer)
-async function compactHistory(messages, modelName, config) {
-  // Format history for the summarizer prompt
-  let conversationLogsText = "";
-  messages.forEach(m => {
-    const roleName = m.role === 'user' ? 'User' : 'Assistant';
-    let contentText = "";
-    if (m.parts) {
-      m.parts.forEach(p => {
-        if (p.text) contentText += p.text;
-        if (p.functionCall) contentText += ` [Called Tool: ${p.functionCall.name}]`;
-        if (p.functionResponse) contentText += ` [Tool Output: ${JSON.stringify(p.functionResponse.response)}]`;
-      });
-    }
-    conversationLogsText += `${roleName}: ${contentText}\n\n`;
-  });
-  
-  const summaryPrompt = `The following is a conversation history between a user and an AI pair programmer. Summarize the history, detailing:
-1. The overall task and workspace directory.
-2. Major modifications made to files.
-3. Current task list status and remaining goals.
-4. Any errors encountered and how they were resolved.
-Keep the summary highly technical, extremely brief, and complete.
-
-CONVERSATION HISTORY:
-${conversationLogsText}`;
-
-  const text = await callUtilityModel(summaryPrompt, modelName, config, false);
-  let compactedSummary = text || "History compacted.";
-
-  // Retain only the last 3 messages + the summary. A 'tool' message is always
-  // preceded by the 'model' message whose tool_calls it answers (agent.js pushes
-  // them as a pair) — if a plain count-based slice cut started on that 'tool'
-  // message, its issuing 'model' message (and any reasoning_content on it) would
-  // be dropped, leaving an orphaned tool result that providers requiring
-  // reasoning continuity (e.g. DeepSeek thinking mode) reject with a 400.
-  let retainStart = Math.max(0, messages.length - 3);
-  while (retainStart > 0 && messages[retainStart] && messages[retainStart].role === 'tool') {
-    retainStart--;
-  }
-  const lastMessages = messages.slice(retainStart);
-  
-  const newHistory = [
-    {
-      role: 'user',
-      parts: [{
-        text: `Here is a summary of our previous session history, do not repeat it but remember the context:\n\n${compactedSummary}`
-      }]
-    },
-    {
-      role: 'model',
-      parts: [{
-        text: "Understood. I have fully digested the summary context of our workspace history. Let's continue working."
-      }]
-    },
-    ...lastMessages
-  ];
-  
-  return {
-    messages: newHistory,
-    summary: compactedSummary
-  };
-}
-
-if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
-  module.exports = {
-    classifyPlanApprovalIntent,
-    classifyPlanningNeed,
-    tokenizeIntentText,
-    buildLocalMemoryAnswer,
-    getPlanningToolGate,
-    getReviewOnlyToolGate,
-    buildRemainingWorkSummary,
-    normalizeChecklistTasks,
-    shouldApplyChecklistUpdate,
-    hasRequiredTestingPlanSection,
-    STRATEGY_REQUIRED_SECTIONS,
-    hasRequiredStrategySections,
-    validateStrategyContent,
-    strategyRequiresClarification,
-    buildRefinementPrompt,
-    buildOperationalContextFromStrategy,
-    mutateOperationalContext,
-    readOperationalContext,
-    validateRunCommandForAgentUse,
-    extractPythonScriptPath,
-    commandProvidesInput,
-    isLocalSystemFactRequest,
-    isLocalProjectOrFolderRequest,
-    isLocalAccessDeflection,
-    requestNeedsLocalInspection,
-    buildLocalInspectionNoToolGuidance,
-    isGenericNonAnswer,
-    looksLikeLeakedNoToolCorrection,
-    requestNeedsActionableFinalAnswer,
-    answerHasActionableFinalContent,
-    isSubstantiveVisibleAnswer,
-    answerHasInspectionGrounding,
-    getReviewCoverage,
-    answerHasGroundedReviewReport,
-    buildReviewOnlyCompletionGatePrompt,
-    isInventoryOnlyCommand,
-    hasDeepInspectionEvidence,
-    hasOnlyInventoryEvidence,
-    buildFinalAnswerQualityGatePrompt,
-    shouldHaveUsedToolsButDidNot,
-    isFailedToolResult,
-    getToolFailureSignal,
-    buildToolEvidenceEntry,
-    getEpistemicToolGate,
-    buildEpistemicCorrectionPrompt,
-    classifyAgentFailure,
-    recommendedNatureForFailureCategory,
-    buildFailureRecoveryGuidance,
-    resolveConversationWorkspace,
-    isRealVerificationCommand,
-    isVerificationItem,
-    hasVerificationAfterLastFileEdit,
-    isAppLaunchItem,
-    isAppLaunchVerificationItem,
-    hasVerificationAfterLastAppLaunch,
-    hasUnresolvedRegressionWarning,
-    looksLikePlaceholderTestOutput,
-    checkJsSyntaxAfterEdit,
-    buildRepeatedEditFailureEscalation,
-    buildMalformedFunctionCallGuidance,
-    looksLikeLaunch
+      delay = Math.max(delay * 2 + Math.random() * 500, retryDelayMs); // E

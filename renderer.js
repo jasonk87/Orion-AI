@@ -2935,11 +2935,15 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
       } else if (log.type === 'tool_call') {
         const statusClass = log.status || 'running';
         const resBox = log.result ? `<div class="tool-result-box">${escapeHtml(log.result)}</div>` : '';
+        const elapsedBadge = (log.elapsed != null && log.status !== 'running')
+          ? `<span class="tool-elapsed">${log.elapsed >= 1000 ? (log.elapsed / 1000).toFixed(1) + 's' : log.elapsed + 'ms'}</span>`
+          : '';
         logsHtml += `
           <div class="tool-run-badge">
             <div class="tool-call-info">
               <span class="tool-name">🛠️ ${escapeHtml(log.tool)}</span>
               <span class="tool-status ${statusClass}">${statusClass}</span>
+              ${elapsedBadge}
             </div>
             <div class="tool-params">Params: ${escapeHtml(JSON.stringify(log.params))}</div>
             ${resBox}
@@ -4169,6 +4173,4 @@ async function approveCurrentPlanAndContinue(options = {}) {
   conv.awaitingPlanApproval = false;
 
   const approvalText = "Plan approved. Continuing implementation.";
-  appendSystemMessage(approvalText, { conversationId: activeConversationId, source: 'plan-approval' });
-
-  const prompt = 'PLAN APPROVED — EXECUTE NOW. Do not summarize, describe, or restate the plan. Do not rewrite STRATEGY.md or implementation_plan.md — they are 
+  appendSy
