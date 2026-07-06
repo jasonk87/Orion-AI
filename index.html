@@ -69,6 +69,18 @@
 
       <!-- CODER MODE CONTENT -->
       <div id="sidebar-coder-content" class="sidebar-mode-content">
+        <div class="sidebar-top">
+          <div class="new-conv-picker-wrap">
+            <button id="btn-new-conversation-coder" class="btn-primary">
+              <span class="plus-icon">+</span> New Conversation
+            </button>
+            <div class="new-conv-picker-menu" id="new-conv-picker-menu" hidden>
+              <div class="new-conv-picker-item" id="new-conv-picker-standalone" data-target="standalone">&#10022; Standalone</div>
+              <div class="new-conv-picker-divider" id="new-conv-picker-divider" hidden></div>
+              <div class="new-conv-picker-projects" id="new-conv-picker-projects"></div>
+            </div>
+          </div>
+        </div>
         <div class="sidebar-section">
           <div class="section-header">
             <span>Projects</span>
@@ -86,6 +98,17 @@
               </div>
             </div>
             <!-- Dynamically populated projects list -->
+          </div>
+        </div>
+        <div class="sidebar-section">
+          <div class="section-header">
+            <span>Standalone Chats</span>
+            <div class="section-actions">
+              <button id="btn-add-conversation-coder" title="New Standalone Chat">+</button>
+            </div>
+          </div>
+          <div class="conversation-list" id="conversation-list-coder">
+            <!-- Dynamic conversation list (mirrors #conversation-list) -->
           </div>
         </div>
       </div>

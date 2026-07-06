@@ -81,8 +81,15 @@ const el = {
   // Sidebar items
   btnNewChat: document.getElementById('btn-new-chat'),
   btnAddConversation: document.getElementById('btn-add-conversation'),
+  btnAddConversationCoder: document.getElementById('btn-add-conversation-coder'),
+  btnNewConversationCoder: document.getElementById('btn-new-conversation-coder'),
+  newConvPickerMenu: document.getElementById('new-conv-picker-menu'),
+  newConvPickerStandalone: document.getElementById('new-conv-picker-standalone'),
+  newConvPickerDivider: document.getElementById('new-conv-picker-divider'),
+  newConvPickerProjects: document.getElementById('new-conv-picker-projects'),
   projectList: document.getElementById('project-list'),
   conversationList: document.getElementById('conversation-list'),
+  conversationListCoder: document.getElementById('conversation-list-coder'),
   btnSettings: document.getElementById('btn-settings'),
   btnChangeWorkspace: document.getElementById('btn-change-workspace'),
   btnSyncFiles: document.getElementById('btn-sync-files'),
@@ -242,11 +249,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Migrate any project conversations that accumulated in standalone list
   migrateConversations();
   
-  // Select first conversation if exists, otherwise create new one
-  if (conversations.length > 0) {
-    selectConversation(conversations[0].id);
+  // Select the most recent conversation belonging to the restored mode. Dispatch and Coder each
+  // have their own conversation history, so a conversation from the other mode -- even a
+  // standalone one -- must never become the active target just because it's the most recently
+  // created conversation overall.
+  const modeMatch = conversations.find(c => conversationMode(c) === appMode);
+  if (modeMatch) {
+    selectConversation(modeMatch.id);
   } else {
-    createNewConversation();
+    createNewConversation(appMode);
   }
   refreshPhoneCompanionPairing();
   removeLegacyPhoneCompanionTokenBubbles();
@@ -834,6 +845,20 @@ function setAppMode(mode, persist = true) {
   if (coderBtn) coderBtn.classList.toggle('active', mode === 'coder');
   if (orionContent) orionContent.classList.toggle('active', mode === 'orion');
   if (coderContent) coderContent.classList.toggle('active', mode === 'coder');
+
+  // Dispatch and Coder are separate entities with separate conversation histories -- a
+  // conversation that belongs to the other mode must never stay displayed after a mode switch.
+  if (conversations.length > 0) {
+    const activeConv = conversations.find(c => c.id === activeConversationId);
+    if (!activeConv || conversationMode(activeConv) !== mode) {
+      const replacement = conversations.find(c => conversationMode(c) === mode);
+      if (replacement) {
+        selectConversation(replacement.id);
+      } else {
+        createNewConversation(mode);
+      }
+    }
+  }
 
   // Adapt main workspace for mode
   const chatInput = document.getElementById('chat-input');
@@ -1553,9 +1578,52 @@ function setupChatHandlers() {
     });
   }
   
-  el.btnNewChat.addEventListener('click', createNewConversation);
+  // createNewConversation(mode = appMode) must not be passed directly as a listener -- the click
+  // Event object would be passed as `mode` and silently fail the 'coder' check, so wrap each call.
+  el.btnNewChat.addEventListener('click', () => createNewConversation());
   if (el.btnAddConversation) {
-    el.btnAddConversation.addEventListener('click', createNewConversation);
+    el.btnAddConversation.addEventListener('click', () => createNewConversation());
+  }
+  if (el.btnAddConversationCoder) {
+    el.btnAddConversationCoder.addEventListener('click', () => createNewConversation('coder'));
+  }
+  if (el.btnNewConversationCoder && el.newConvPickerMenu) {
+    const closePicker = () => { el.newConvPickerMenu.hidden = true; };
+    const openPicker = () => {
+      el.newConvPickerProjects.innerHTML = '';
+      if (projects.length === 0) {
+        el.newConvPickerDivider.hidden = true;
+        el.newConvPickerProjects.innerHTML = '<div class="new-conv-picker-empty">No projects added yet</div>';
+      } else {
+        el.newConvPickerDivider.hidden = false;
+        projects.forEach(path => {
+          const name = path.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || path;
+          const item = document.createElement('div');
+          item.className = 'new-conv-picker-item';
+          item.textContent = name;
+          item.title = path;
+          item.addEventListener('click', () => {
+            closePicker();
+            createNewConversationUnderProject(path);
+          });
+          el.newConvPickerProjects.appendChild(item);
+        });
+      }
+      el.newConvPickerMenu.hidden = false;
+    };
+    el.btnNewConversationCoder.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!el.newConvPickerMenu.hidden) { closePicker(); return; }
+      openPicker();
+    });
+    if (el.newConvPickerStandalone) {
+      el.newConvPickerStandalone.addEventListener('click', () => {
+        closePicker();
+        createNewConversation('coder');
+      });
+    }
+    el.newConvPickerMenu.addEventListener('click', (e) => e.stopPropagation());
+    document.addEventListener('click', closePicker);
   }
   
   // Model Select changes default
@@ -1881,20 +1949,31 @@ function markQueuedPromptRunning(queueId, conversationId) {
   setQueuedPromptMessageState(queueId, conversationId, 'sent');
 }
 
-function createNewConversation() {
+// Dispatch (Orion) and Coder are separate entities with their own conversation histories --
+// a standalone chat started in Coder is not the same as one started in Dispatch, even though
+// neither has a projectPath. Legacy conversations saved before this field existed infer their
+// mode from projectPath (only Coder ever had projects), so old data keeps behaving as before.
+function conversationMode(conv) {
+  if (!conv) return 'orion';
+  if (conv.mode === 'orion' || conv.mode === 'coder') return conv.mode;
+  return conv.projectPath ? 'coder' : 'orion';
+}
+
+function createNewConversation(mode = appMode) {
   const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
   const title = 'New Conversation';
-  
+
   const newConv = {
     id: newId,
     title: title,
+    mode: mode === 'coder' ? 'coder' : 'orion',
     projectPath: '',
     workspace: '', // will slugify on first prompt
     messages: [],
     tasks: [],
     testResults: null
   };
-  
+
   conversations.unshift(newConv);
   saveConversationsToStorage();
   
@@ -1915,6 +1994,7 @@ function createNewConversationUnderProject(projectPath) {
   const newConv = {
     id: newId,
     title: title,
+    mode: 'coder', // projects only ever exist under Coder
     projectPath: projectPath,
     workspace: '', // set on first prompt
     messages: [],
@@ -1949,12 +2029,15 @@ function getStandaloneWorkspaceForTitle(title, convId) {
   return getStandaloneWorkspaceRoot() + '\\' + slug + suffix;
 }
 
-function createPhoneConversation({ projectPath = '', title = 'New Phone Task' } = {}) {
+function createPhoneConversation({ projectPath = '', mode = 'orion', title = 'New Phone Task' } = {}) {
   const convId = 'conv-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
   const normalizedProjectPath = String(projectPath || '').trim();
   const conv = {
     id: convId,
     title,
+    // A project conversation only ever belongs to Coder, regardless of what the phone's mode
+    // toggle happened to be set to when the request came in.
+    mode: normalizedProjectPath ? 'coder' : (mode === 'coder' ? 'coder' : 'orion'),
     messages: [],
     createdAt: Date.now(),
     workspace: normalizedProjectPath || '',
@@ -2073,7 +2156,26 @@ function migrateConversations() {
   }
 
   let updated = false;
+
+  // One-time bulk fix: Dispatch (Orion) mode didn't exist before it shipped, so every standalone
+  // conversation that existed at that point was actually done in what is now Coder mode, not
+  // Dispatch. Runs exactly once so it never touches genuinely new Dispatch conversations created
+  // after this point.
+  if (!localStorage.getItem('orionCoderModeBackfillDone')) {
+    conversations.forEach(c => {
+      if (!c.projectPath) {
+        c.mode = 'coder';
+      }
+    });
+    localStorage.setItem('orionCoderModeBackfillDone', 'true');
+    updated = true;
+  }
+
   conversations.forEach(c => {
+    if (c.mode !== 'orion' && c.mode !== 'coder') {
+      c.mode = c.projectPath ? 'coder' : 'orion';
+      updated = true;
+    }
     if (!c.projectPath && c.workspace) {
       // Find if workspace is inside any project folder
       const matchingProj = projects.find(proj => {
@@ -2379,41 +2481,50 @@ function confirmConversationDelete(title) {
 }
 
 function renderConversationList() {
-  el.conversationList.innerHTML = '';
-  
-  // Standalone conversations have no projectPath
-  const standaloneConversations = conversations.filter(c => !c.projectPath);
-  
-  if (standaloneConversations.length === 0) {
-    el.conversationList.innerHTML = '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No standalone conversations yet</p>';
-    return;
-  }
-  
-  standaloneConversations.forEach(conv => {
-    const item = document.createElement('div');
-    item.className = `conversation-item ${conv.id === activeConversationId ? 'active' : ''}`;
-    
-    const age = 'now';
-    
-    item.innerHTML = `
-      <div class="conversation-details row-details-flex">
-        <span class="conversation-name">${escapeHtml(conv.title)}</span>
-        <span class="conversation-time">${age}</span>
-      </div>
-      <button class="delete-btn icon-btn-ghost" title="Delete conversation">&times;</button>
-    `;
+  // Dispatch (Orion) and Coder each keep their own standalone-conversation history -- a chat
+  // started in one never appears in the other's list, even though neither has a projectPath.
+  const listConfigs = [
+    { container: el.conversationList, mode: 'orion' },
+    { container: el.conversationListCoder, mode: 'coder' }
+  ].filter(cfg => cfg.container);
+  if (listConfigs.length === 0) return;
 
-    item.querySelector('.conversation-details').addEventListener('click', () => selectConversation(conv.id));
-    
-    item.querySelector('.delete-btn').addEventListener('click', async (e) => {
-      e.stopPropagation();
-      const approved = await confirmConversationDelete(conv.title);
-      if (approved?.confirmed) {
-        deleteConversation(conv.id);
-      }
+  listConfigs.forEach(({ container, mode }) => {
+    container.innerHTML = '';
+
+    const standaloneConversations = conversations.filter(c => !c.projectPath && conversationMode(c) === mode);
+
+    if (standaloneConversations.length === 0) {
+      container.innerHTML = '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No standalone conversations yet</p>';
+      return;
+    }
+
+    standaloneConversations.forEach(conv => {
+      const item = document.createElement('div');
+      item.className = `conversation-item ${conv.id === activeConversationId ? 'active' : ''}`;
+
+      const age = 'now';
+
+      item.innerHTML = `
+        <div class="conversation-details row-details-flex">
+          <span class="conversation-name">${escapeHtml(conv.title)}</span>
+          <span class="conversation-time">${age}</span>
+        </div>
+        <button class="delete-btn icon-btn-ghost" title="Delete conversation">&times;</button>
+      `;
+
+      item.querySelector('.conversation-details').addEventListener('click', () => selectConversation(conv.id));
+
+      item.querySelector('.delete-btn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const approved = await confirmConversationDelete(conv.title);
+        if (approved?.confirmed) {
+          deleteConversation(conv.id);
+        }
+      });
+
+      container.appendChild(item);
     });
-
-    el.conversationList.appendChild(item);
   });
 }
 
@@ -2446,11 +2557,19 @@ function selectConversation(id) {
   renderProjectsList(); // Re-render projects to update active state highlights
   
   // Reload messages
+  const orionSplashEl = document.getElementById('orion-welcome-splash');
   if (conv.messages.length === 0) {
-    el.welcomeSplash.style.display = 'flex';
+    if (appMode === 'orion' && orionSplashEl) {
+      orionSplashEl.style.display = 'flex';
+      el.welcomeSplash.style.display = 'none';
+    } else {
+      el.welcomeSplash.style.display = 'flex';
+      if (orionSplashEl) orionSplashEl.style.display = 'none';
+    }
     el.messagesContainer.style.display = 'none';
     el.messagesContainer.innerHTML = '';
   } else {
+    if (orionSplashEl) orionSplashEl.style.display = 'none';
     el.welcomeSplash.style.display = 'none';
     el.messagesContainer.style.display = 'flex';
     el.messagesContainer.innerHTML = '';
@@ -3740,6 +3859,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     return {
       id: c.id,
       title: c.title || 'New Conversation',
+      mode: conversationMode(c),
       workspace: c.workspace || '',
       projectPath: c.projectPath || '',
       active: c.id === resolvedId,
@@ -3787,6 +3907,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   return {
     conversationId: resolvedId,
     title: conv ? conv.title : '',
+    mode: conversationMode(conv),
     conversations: conversationsSummary,
     projects: projectSummaries,
     workspace: companionWorkspace,
@@ -3867,6 +3988,7 @@ function hasRequiredTestingPlanSection(content) {
 window.startPhoneCompanionTask = async (options = {}) => {
   const conv = createPhoneConversation({
     projectPath: options.projectPath || '',
+    mode: options.mode || 'orion',
     title: 'New Phone Task'
   });
 
@@ -3892,6 +4014,7 @@ window.submitPhoneCompanionPrompt = async (options) => {
   if (!conv) {
     conv = createPhoneConversation({
       projectPath: typeof options === 'object' ? options.projectPath || '' : '',
+      mode: typeof options === 'object' ? options.mode || 'orion' : 'orion',
       title: 'New Phone Task'
     });
     targetId = conv.id;

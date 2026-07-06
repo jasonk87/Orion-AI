@@ -654,6 +654,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   if (!Array.isArray(conversation.messages)) {
     conversation.messages = [];
   }
+  // Clear active bubble tracking so this fresh run starts its own new bubble instead of mutating
+  // whatever bubble the previous run (e.g. a plan awaiting approval) left behind. This must happen
+  // before the very first render below — clearing it later (after that render) let a resumed run
+  // (post plan-approval, post clarification) silently overwrite the old bubble in its old DOM
+  // position instead of appending a new one after the messages that came in between.
+  window.clearActiveAiBubble();
   conversation.messages.push({ role: 'assistant', text: 'Thinking...', logs: [], turns: [], createdAt: Date.now() });
   if (window.saveConversationsToStorage) {
     window.saveConversationsToStorage();
@@ -935,14 +941,21 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const webSearchStatus = (config.googleSearchApiKey && config.googleSearchEngineId)
     ? 'AVAILABLE — google_search and fetch_web_page are ready to use.'
     : 'UNAVAILABLE — googleSearchApiKey or googleSearchEngineId not configured. Do not attempt google_search; use fetch_web_page with a known URL if you must retrieve a specific doc.';
+  // Dispatch is a conversational assistant, not a task-tracking tool -- the "Work Walkthrough"
+  // step-by-step recap (required by RESPONSE FORMAT for Coder's implementation work) is just noise
+  // on a direct answer/discussion reply here, so override that instruction for this conversation.
+  const isDispatchConversation = conversation.mode === 'orion';
+  const workWalkthroughOverride = isDispatchConversation
+    ? '\nThis is a Dispatch conversation, not a Coder/implementation task. Do NOT include a "Work Walkthrough" section, a files-touched list, or a step-by-step recap of tool calls in your response, even if you used tools this turn. Just answer directly and conversationally.'
+    : '';
   messages.splice(2, 0,
     {
       role: 'user',
-      parts: [{ text: `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nWeb search: ${webSearchStatus}\nClient: ${promptSource === 'phone' ? 'PHONE COMPANION — the user is on their phone. Prefer descriptions, text output, and copy-pasteable results over actions that require the desktop (launching GUI apps, opening windows, running interactive commands). If you need to show output, describe it clearly rather than suggesting they look at the screen.' : 'DESKTOP — the user is at their computer. You can launch apps, reference screen elements, and run interactive commands normally.'}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.` }]
+      parts: [{ text: `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nWeb search: ${webSearchStatus}\nClient: ${promptSource === 'phone' ? 'PHONE COMPANION — the user is on their phone. Prefer descriptions, text output, and copy-pasteable results over actions that require the desktop (launching GUI apps, opening windows, running interactive commands). If you need to show output, describe it clearly rather than suggesting they look at the screen.' : 'DESKTOP — the user is at their computer. You can launch apps, reference screen elements, and run interactive commands normally.'}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.${workWalkthroughOverride}` }]
     },
     {
       role: 'model',
-      parts: [{ text: `Understood. Home directory is ${resolvedHomeDir}. Web search: ${webSearchStatus.split(' —')[0]}. Client: ${promptSource === 'phone' ? 'phone companion' : 'desktop'}. I will use these directly without probing.` }]
+      parts: [{ text: `Understood. Home directory is ${resolvedHomeDir}. Web search: ${webSearchStatus.split(' —')[0]}. Client: ${promptSource === 'phone' ? 'phone companion' : 'desktop'}. I will use these directly without probing.${isDispatchConversation ? ' I will skip the Work Walkthrough section for this conversation.' : ''}` }]
     }
   );
 
@@ -1133,10 +1146,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const toolEvidenceLedger = [];
     const maxMalformedToolRetries = 5;
     const canExecuteThisTask = () => !config.planningMode || conversation.planApproved || planningBypassedForTask;
-    
-    // Clear active bubble tracking so we start a new one
-    window.clearActiveAiBubble();
-    
+
     while (loopCount < maxLoops) {
       loopCount++;
       window.currentLoopCount = loopCount;
@@ -1577,7 +1587,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           messages.push({
             role: 'user',
             parts: [{
-              text: '[SYSTEM: You just did substantial workspace inspection. If you discovered a durable architectural fact, API shape, gotcha, or decision that future sessions should know, call append_project_memory, remember_fact, or remember_decision now (1-3 concise entries) before your final answer. If nothing new/durable was learned, skip this and answer normally.]'
+              text: '[SYSTEM: You just did substantial workspace inspection. If you discovered a durable architectural fact, API shape, gotcha, or decision that future sessions should know, call append_project_memory, remember_fact, or remember_decision now (1-3 concise entries) before your final answer. If nothing new/durable was learned, do not repeat, rewrite, or replace your previous answer — it already stands as the final response and must not be lost. Reply with exactly: NO_ADDITIONAL_ACTION]'
             }]
           });
           continue;
@@ -1592,7 +1602,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           messages.push({
             role: 'user',
             parts: [{
-              text: '[SYSTEM: You just completed a multi-step task. Briefly consider: is there a reusable, testable capability here that would save effort on future tasks? If yes, call create_skill now. If not, skip this and give your final answer.]'
+              text: '[SYSTEM: You just completed a multi-step task. Briefly consider: is there a reusable, testable capability here that would save effort on future tasks? If yes, call create_skill now. If not, do not repeat, rewrite, or replace your previous answer — it already stands as the final response and must not be lost. Reply with exactly: NO_ADDITIONAL_ACTION]'
             }]
           });
           continue;
@@ -2349,7 +2359,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         !/ask me to continue/i.test(lastTextResponse)) {
       lastTextResponse += '\n\n[Note: this run hit its per-turn action limit before the task was confirmed complete — the message above may be from partway through, not a final result. Ask me to continue and I will pick up from the current state.]';
     }
-    lastTextResponse = withWorkWalkthrough(lastTextResponse, workWalkthrough, true);
+    lastTextResponse = withWorkWalkthrough(lastTextResponse, workWalkthrough, true, conversation);
 
     // Save walkthrough to file so the chat bubble stays clean
     if (workWalkthrough.length > 0 && workspacePath) {
@@ -4610,9 +4620,16 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
   }
 }
 
-function withWorkWalkthrough(text, items, final = false) {
+function withWorkWalkthrough(text, items, final = false, conversation = null) {
   const meaningfulItems = (items || []).filter(Boolean);
   if (meaningfulItems.length === 0) return text;
+  // Dispatch (Orion) is a conversational assistant, not a task-tracking tool -- the bulleted
+  // step-by-step recap is useful for Coder's implementation work but is just noise on top of a
+  // direct answer/discussion reply. Coder conversations (including legacy ones without a stamped
+  // mode) keep the walkthrough as before.
+  if (conversation && conversation.mode === 'orion') {
+    return sanitizeFinalAnswerText(text);
+  }
   const base = sanitizeFinalAnswerText(text);
   const lines = meaningfulItems.slice(-12).map(item => {
     const marker = item.status === 'error' ? 'Failed' : (item.status === 'running' ? 'Working' : 'Done');
@@ -5159,6 +5176,19 @@ function buildFinalAnswerQualityGatePrompt(userPrompt, answerText, workWalkthrou
 
 Before final response, decide what evidence the user's actual request requires. If they asked for anything beyond a file inventory, read the relevant source files, tests, README/package/config files, or run safe inspection commands before answering. If the user truly requested only an inventory, answer that narrowly and explicitly. Do not produce broad recommendations from filenames alone.]`;
   }
+  // A pure conversational/discussion turn (agentExecutionMode 'answer') is not a task with
+  // deliverables -- a short, direct reply that ends by asking the user a clarifying question is a
+  // complete answer, not an incomplete one, and it need not cite exact file paths when the topic
+  // is a forward-looking design question rather than a description of existing code. Holding it to
+  // this gate's "recommendations, a plan, changes, or a next action" / inspection-grounding bars
+  // tends to make the model regress into a degenerate retry that just refers back to its own
+  // earlier answer instead of restating it.
+  if (agentExecutionMode === 'answer') {
+    const trimmed = sanitizeFinalAnswerText(answerText);
+    if (trimmed.length >= 40 && !isGenericNonAnswer(trimmed) && !looksLikeLeakedNoToolCorrection(trimmed)) {
+      return '';
+    }
+  }
   if (turnAlreadyWroteMemory(workWalkthrough) && turnDidSubstantiveInspection(workWalkthrough) &&
       !answerHasInspectionGrounding(answerText, workWalkthrough)) {
     return `[SYSTEM: Final-response quality gate. You inspected source files and stored durable memory, but the visible final answer is not self-contained or grounded in the inspected evidence.
@@ -5471,13 +5501,13 @@ async function answerLocalMemoryQuestionFastPath({ userPrompt, workspacePath, co
     workWalkthrough[0].status = answer ? 'done' : 'error';
     workWalkthrough[0].detail = `Exit: ${result && result.code !== undefined ? result.code : 'unknown'}, timeout: ${result && result.timeoutMs ? result.timeoutMs : timeoutMs}ms`;
     const finalText = answer || `I could not read your RAM from the local command output.\n\nCommand attempted: \`${command}\`${stderr ? `\n\nError: ${String(stderr).slice(0, 500)}` : ''}`;
-    conversation.messages[aiMessageIndex].text = withWorkWalkthrough(finalText, workWalkthrough, true);
+    conversation.messages[aiMessageIndex].text = withWorkWalkthrough(finalText, workWalkthrough, true, conversation);
     conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
     if (window.renderAiMessage) window.renderAiMessage(conversation.messages[aiMessageIndex].text, currentAgentLogs);
   } catch (error) {
     workWalkthrough[0].status = 'error';
     workWalkthrough[0].detail = error.message;
-    conversation.messages[aiMessageIndex].text = withWorkWalkthrough(`I could not read your RAM because the local command runner failed: ${error.message}`, workWalkthrough, true);
+    conversation.messages[aiMessageIndex].text = withWorkWalkthrough(`I could not read your RAM because the local command runner failed: ${error.message}`, workWalkthrough, true, conversation);
     conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
     if (window.renderAiMessage) window.renderAiMessage(conversation.messages[aiMessageIndex].text, currentAgentLogs);
   } finally {
@@ -5518,10 +5548,29 @@ function shouldHaveUsedToolsButDidNot(text, workWalkthrough, userPrompt = '', co
 // with the topic at all.
 function looksLikeLeakedNoToolCorrection(text) {
   const normalized = String(text || '').toLowerCase();
+  // The Memory/Skill gates ask the model to reply with this exact sentinel when it has nothing to
+  // add, specifically so a real substantive answer already produced this turn never gets
+  // overwritten by a throwaway "no skill needed" / "nothing durable to save" aside. Models don't
+  // always use the sentinel verbatim, so the phrase-based checks below stay as a fallback.
+  if (/^\W*no_additional_action\W*$/i.test(normalized.trim())) return true;
   return /\b(did not require (workspace|tools?|an implementation plan)|no workspace interaction|ready for (your )?next instruction|mention(ed)? (this|the) correction|previous response (was|did not)|does not require (tools?|workspace)|not require workspace interaction)\b/.test(normalized) ||
+    /\b(?:nothing|no)\s+(?:is\s+)?reusable\b/.test(normalized) ||
+    /\bno\s+(?:reusable\s+)?skill\s+(?:is\s+)?needed\b/.test(normalized) ||
+    /\bdoesn'?t\s+warrant\s+a\s+skill\b/.test(normalized) ||
+    /\bone[-\s]?time\s+(?:information|task|thing)\b/.test(normalized) ||
+    /\bno\s+(?:new|durable)\s+(?:facts?|information)\s+(?:to|worth)\s+(?:save|saving|record|recording)\b/.test(normalized) ||
+    /\bnothing\s+(?:new\s+|durable\s+)*(?:was\s+)?learned\b/.test(normalized) ||
     /\b(?:my|the)\s+(?:answer|response|reply)\s+above\b/.test(normalized) ||
     /\balready\s+(?:a\s+)?complete\s+(?:non[-\s]?workspace\s+)?answer\b/.test(normalized) ||
-    /\bi\s+gave\s+you\s+the\s+full\b/.test(normalized);
+    /\bi\s+gave\s+you\s+the\s+full\b/.test(normalized) ||
+    // A gate-nudged retry can regress into referring back to an earlier turn instead of
+    // restating the substantive answer itself — e.g. "I'm already waiting on your call here...
+    // the last message laid it out" instead of actually re-answering. These phrasings are
+    // meta-commentary about a prior response, not a self-contained answer.
+    /\b(?:already\s+)?waiting\s+on\s+your\s+(?:call|answer|response|turn)\b/.test(normalized) ||
+    /\bthe\s+last\s+(?:message|response|answer)\s+(?:already\s+)?(?:laid\s+it\s+out|covered\s+it|covers?\s+it|answered\s+(?:that|this|it))\b/.test(normalized) ||
+    /\bas\s+i\s+(?:already|previously)\s+(?:said|mentioned|explained|noted|laid\s+out|answered)\b/.test(normalized) ||
+    /\b(?:my|the)\s+(?:previous|prior|earlier)\s+(?:answer|response|message)\s+(?:already\s+)?(?:covers?|covered|addressed|laid\s+out|answered)\b/.test(normalized);
 }
 
 function isGenericNonAnswer(text) {
