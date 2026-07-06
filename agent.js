@@ -2196,12 +2196,25 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // Clear the active bubble tracking ONLY after the final render has updated it (removing the spinner)
     window.clearActiveAiBubble();
 
-    // Notify phone companion when a task genuinely finishes (not mid-plan auto-continue)
-    if (!autoContinueExecution && window.api && typeof window.api.notifyPhone === 'function') {
-      const notifTitle = 'Orion AI';
-      const shortResponse = String(lastTextResponse || '').replace(/\s+/g, ' ').slice(0, 120);
-      const notifBody = shortResponse || 'Task complete';
-      window.api.notifyPhone(notifTitle, notifBody).catch(() => {});
+    // Notify phone companion whenever the agent stops — different messages by exit reason
+    if (window.api && typeof window.api.notifyPhone === 'function') {
+      let notifBody;
+      if (userRequestedStop) {
+        notifBody = 'Agent stopped.';
+      } else if (autoContinueExecution) {
+        // Mid-plan continuation queued — skip, phone will get notified when it truly finishes
+        notifBody = null;
+      } else if (ranOutOfLoopBudget) {
+        notifBody = 'Hit action limit — ask Orion to continue.';
+      } else if (forceYield) {
+        notifBody = 'Paused — needs your input.';
+      } else {
+        const shortResponse = String(lastTextResponse || '').replace(/\s+/g, ' ').slice(0, 120);
+        notifBody = shortResponse || 'Task complete';
+      }
+      if (notifBody) {
+        window.api.notifyPhone('Orion AI', notifBody).catch(() => {});
+      }
     }
 
     window.saveConversationsToStorage();
@@ -7512,12 +7525,4 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
         }
       }
       
-      const isTransient = [429, 500, 502, 503, 504].includes(status);
-      if (!isTransient || i === attempts) {
-        const retryText = apiError.retryDelayMs ? ` Retry after about ${Math.ceil(apiError.retryDelayMs / 1000)} seconds.` : '';
-        const errorMessage = `HTTP ${status}: ${apiError.message}${retryText}`;
-        if (!isTransient) throw createNonRetryableModelError(errorMessage);
-        throw new Error(errorMessage);
-      }
-      
-  
+      const 
