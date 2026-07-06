@@ -72,6 +72,7 @@ contextBridge.exposeInMainWorld('api', {
   // Update checker
   checkGitUpdate: () => ipcRenderer.invoke('check-git-update'),
   applyGitUpdate: () => ipcRenderer.invoke('apply-git-update'),
+  restartApp: () => ipcRenderer.invoke('restart-app'),
 
   // Config Controls
   readConfig: () => ipcRenderer.invoke('read-config'),
@@ -115,7 +116,4 @@ contextBridge.exposeInMainWorld('api', {
 
   // Skill Memory
   readSkillMemory: () => ipcRenderer.invoke('orion:read-skill-memory'),
-  appendSkillPattern: (pattern) => ipcRenderer.invoke('orion:append-skill-pattern', { pattern }),
-
-  // Session Memory
-  saveSession: (wo
+  appendSkillPattern: (pattern) => ipcRenderer.invoke('orion:append-skill-pattern', 

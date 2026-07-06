@@ -339,6 +339,10 @@ window.applyPhoneCompanionUpdate = async () => {
   if (!window.api || !window.api.applyGitUpdate) return { success: false, error: 'Not available' };
   try { return await window.api.applyGitUpdate(); } catch (e) { return { success: false, error: e.message }; }
 };
+window.restartApp = async () => {
+  if (!window.api || !window.api.restartApp) return { success: false };
+  try { return await window.api.restartApp(); } catch (e) { return { success: false }; }
+};
 
 // ── Image attach (desktop) ─────────────────────────────────────────────────────
 
@@ -4147,8 +4151,4 @@ async function submitClarificationAnswers({ button, bubble } = {}) {
   }
 
   // Format answers as a readable user message
-  const formattedAnswers = answers.map(a => `${a.header}: ${a.answer}`).join('\n');
-  const userMessage = `Here are my answers:\n${formattedAnswers}`;
-
-  // Clear the awaiting state
-  conv.awaitingClarification = null
+  const formattedAn
