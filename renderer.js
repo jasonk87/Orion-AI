@@ -3771,6 +3771,36 @@ window.discoverPhoneCompanionSkills = async (group) => {
   return { skills: result.skills, count: result.skills.length };
 };
 
+window.getPhoneCompanionModels = () => {
+  const current = el.modelSelect ? el.modelSelect.value : (appConfig.defaultModel || 'gemini-2.5-flash-lite');
+  const models = [];
+  if (el.modelSelect) {
+    for (const opt of el.modelSelect.options) {
+      const group = opt.parentElement && opt.parentElement.tagName === 'OPTGROUP'
+        ? opt.parentElement.label : 'Other';
+      models.push({ value: opt.value, label: opt.textContent.trim(), group });
+    }
+  }
+  return { current, models };
+};
+
+window.setPhoneCompanionModel = async (modelValue) => {
+  if (!el.modelSelect) return { success: false, error: 'Model selector not available on desktop' };
+  let found = false;
+  for (let i = 0; i < el.modelSelect.options.length; i++) {
+    if (el.modelSelect.options[i].value === modelValue) {
+      el.modelSelect.selectedIndex = i;
+      found = true;
+      break;
+    }
+  }
+  if (!found) return { success: false, error: `Unknown model: ${modelValue}` };
+  appConfig.defaultModel = modelValue;
+  localStorage.setItem('ag2_default_model', modelValue);
+  try { await window.api.writeConfig(appConfig); } catch (_) {}
+  return { success: true, model: modelValue };
+};
+
 window.runPhoneCompanionSkill = async ({ name, inputs } = {}) => {
   if (!name) return { success: false, error: "Missing 'name' parameter" };
   const result = await window.api.runSkill(name, inputs || {});
