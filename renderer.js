@@ -2803,11 +2803,15 @@ async function refreshPairedDevicesList() {
     const devices = await window.api.getPhoneCompanionDevices();
     if (devices && devices.length > 0) {
       sectionContainer.style.display = 'block';
-      listContainer.innerHTML = devices.map(d => {
+      const activeDevices = devices.filter(d => !d.revoked);
+      const revokeAllBtn = activeDevices.length > 1
+        ? `<button class="btn-secondary btn-revoke-all-devices" type="button" style="margin-bottom:8px; font-size:0.75rem; opacity:0.8;">Revoke All (${activeDevices.length})</button>`
+        : '';
+      listContainer.innerHTML = revokeAllBtn + devices.map(d => {
         const lastSeen = d.lastSeenAt ? new Date(d.lastSeenAt).toLocaleTimeString() : 'Never';
         const statusText = d.revoked ? 'Revoked' : 'Active';
         const badgeClass = d.revoked ? 'fail' : 'pass';
-        
+
         return `
           <div class="device-item">
             <div class="device-copy">
@@ -2824,6 +2828,10 @@ async function refreshPairedDevicesList() {
       listContainer.querySelectorAll('[data-revoke-device-id]').forEach(button => {
         button.addEventListener('click', () => window.revokeDevice(button.dataset.revokeDeviceId || ''));
       });
+      const revokeAllButton = listContainer.querySelector('.btn-revoke-all-devices');
+      if (revokeAllButton) {
+        revokeAllButton.addEventListener('click', () => window.revokeAllDevices());
+      }
     } else {
       sectionContainer.style.display = 'none';
     }
@@ -2841,6 +2849,19 @@ window.revokeDevice = async (id) => {
   });
   if (approved?.confirmed && window.api && typeof window.api.revokePhoneCompanionDevice === 'function') {
     await window.api.revokePhoneCompanionDevice(id);
+    await refreshPairedDevicesList();
+  }
+};
+
+window.revokeAllDevices = async () => {
+  const approved = await showOrionConfirmDialog({
+    title: 'Revoke all devices?',
+    message: "All paired phones will lose access immediately. You can pair them again later.",
+    confirmLabel: 'Revoke All',
+    danger: true
+  });
+  if (approved?.confirmed && window.api && typeof window.api.revokeAllPhoneCompanionDevices === 'function') {
+    await window.api.revokeAllPhoneCompanionDevices();
     await refreshPairedDevicesList();
   }
 };
@@ -4130,32 +4151,4 @@ async function submitClarificationAnswers({ button, bubble } = {}) {
   const userMessage = `Here are my answers:\n${formattedAnswers}`;
 
   // Clear the awaiting state
-  conv.awaitingClarification = null;
-
-  // Render answers as a visible user message and persist to history
-  renderUserMessage(userMessage);
-  conv.messages.push({ role: 'user', text: userMessage, source: 'clarification-answers' });
-  saveConversationsToStorage();
-
-  if (!appConfig.geminiApiKey) {
-    el.settingsModal.classList.add('active');
-    appendSystemMessage("Please enter and save your Gemini API Key first.");
-    return;
-  }
-
-  window.runAgentLoop(userMessage, el.modelSelect.value, conv, { source: 'clarification-answers' })
-    .catch(err => console.error('Clarification resume failed:', err));
-}
-
-async function approveCurrentPlanAndContinue(options = {}) {
-  const button = options.button || null;
-  const originalLabel = button ? button.textContent : '';
-  const restoreButton = () => {
-    if (!button) return;
-    button.disabled = false;
-    button.classList.remove('approved');
-    button.textContent = originalLabel || 'Start Implementation';
-  };
-  if (button) {
-    button.disabled = true;
-    button.textContent 
+  conv.awaitingClarification = null
