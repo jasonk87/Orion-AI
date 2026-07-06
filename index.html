@@ -34,43 +34,59 @@
     
     <!-- LEFT SIDEBAR -->
     <aside id="left-sidebar">
-      <div class="sidebar-top">
-        <button id="btn-new-chat" class="btn-primary">
-          <span class="plus-icon">+</span> New Conversation
+
+      <!-- Mode Switcher Nav -->
+      <div class="sidebar-mode-nav">
+        <button id="btn-mode-orion" class="mode-nav-item active" title="Orion — Your AI Assistant">
+          <span class="mode-nav-icon">&#10022;</span>
+          <span class="mode-nav-label">Orion</span>
+        </button>
+        <button id="btn-mode-coder" class="mode-nav-item" title="Coder — Project Workspace">
+          <span class="mode-nav-icon">&lt;/&gt;</span>
+          <span class="mode-nav-label">Coder</span>
         </button>
       </div>
 
-      <!-- Projects Section -->
-      <div class="sidebar-section">
-        <div class="section-header">
-          <span>Projects</span>
-          <div class="section-actions">
-            <button id="btn-project-filter" title="Filter Projects">&#128269;</button>
-            <button id="btn-add-project" title="Add Project Folder">&#128193;</button>
-          </div>
+      <!-- ORION MODE CONTENT -->
+      <div id="sidebar-orion-content" class="sidebar-mode-content active">
+        <div class="sidebar-top">
+          <button id="btn-new-chat" class="btn-primary">
+            <span class="plus-icon">+</span> New Chat
+          </button>
         </div>
-        <div class="project-list" id="project-list">
-          <div class="project-item active" id="default-proj-item">
-            <span class="folder-icon">&#128193;</span>
-            <div class="project-details">
-              <span class="project-name" id="project-name-label">Default Workspace</span>
-              <span class="project-subtext" id="project-status-label">Select folder to start</span>
+        <div class="sidebar-section">
+          <div class="section-header">
+            <span>Recents</span>
+            <div class="section-actions">
+              <button id="btn-add-conversation" title="New Chat">+</button>
             </div>
           </div>
-          <!-- Dynamically populated projects list -->
+          <div class="conversation-list" id="conversation-list">
+            <!-- Dynamic conversation list -->
+          </div>
         </div>
       </div>
 
-      <!-- Conversations Section -->
-      <div class="sidebar-section">
-        <div class="section-header">
-          <span>Conversations</span>
-          <div class="section-actions">
-            <button id="btn-add-conversation" title="New Standalone Conversation">+</button>
+      <!-- CODER MODE CONTENT -->
+      <div id="sidebar-coder-content" class="sidebar-mode-content">
+        <div class="sidebar-section">
+          <div class="section-header">
+            <span>Projects</span>
+            <div class="section-actions">
+              <button id="btn-project-filter" title="Filter Projects">&#128269;</button>
+              <button id="btn-add-project" title="Add Project Folder">&#128193;</button>
+            </div>
           </div>
-        </div>
-        <div class="conversation-list" id="conversation-list">
-          <!-- Dynamic conversation list -->
+          <div class="project-list" id="project-list">
+            <div class="project-item active" id="default-proj-item">
+              <span class="folder-icon">&#128193;</span>
+              <div class="project-details">
+                <span class="project-name" id="project-name-label">Default Workspace</span>
+                <span class="project-subtext" id="project-status-label">Select folder to start</span>
+              </div>
+            </div>
+            <!-- Dynamically populated projects list -->
+          </div>
         </div>
       </div>
 
@@ -358,21 +374,4 @@
         <div class="form-group">
           <label for="setting-google-search-api-key">Google Search API Key:</label>
           <input type="password" id="setting-google-search-api-key" placeholder="Leave blank to use Gemini key">
-          <small class="form-help">Requires Google Programmable Search JSON API access.</small>
-        </div>
-
-        <div class="form-group">
-          <label for="setting-workspace-path">Default Workspace Path:</label>
-          <div class="input-with-button">
-            <input type="text" id="setting-workspace-path" placeholder="C:\Users\Owner\Projects...">
-            <button id="btn-browse-default-workspace">Browse</button>
-          </div>
-        </div>
-
-        <div class="form-group">
-          <label for="setting-test-cmd">Regression Test Command:</label>
-          <input type="text" id="setting-test-cmd" placeholder="npm test">
-          <small class="form-help">Shell command run automatically before and after the agent changes files.</small>
-        </div>
-
-        <d
+          <small class="form-help">Requires Google Programm

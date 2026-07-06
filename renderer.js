@@ -67,6 +67,7 @@ let activeAiBubble = null; // Currently rendering AI message bubble
 let currentFileTreeItems = [];
 let currentRunArtifacts = [];
 let expandedFileFolders = new Set();
+let appMode = localStorage.getItem('appMode') || 'orion'; // 'orion' | 'coder'
 
 // DOM ELEMENTS
 const el = {
@@ -821,6 +822,19 @@ function setLeftSidebarCollapsed(collapsed, persist = true) {
   if (persist) localStorage.setItem('leftSidebarCollapsed', String(collapsed));
 }
 
+function setAppMode(mode, persist = true) {
+  appMode = mode;
+  const orionBtn = document.getElementById('btn-mode-orion');
+  const coderBtn = document.getElementById('btn-mode-coder');
+  const orionContent = document.getElementById('sidebar-orion-content');
+  const coderContent = document.getElementById('sidebar-coder-content');
+  if (orionBtn) orionBtn.classList.toggle('active', mode === 'orion');
+  if (coderBtn) coderBtn.classList.toggle('active', mode === 'coder');
+  if (orionContent) orionContent.classList.toggle('active', mode === 'orion');
+  if (coderContent) coderContent.classList.toggle('active', mode === 'coder');
+  if (persist) localStorage.setItem('appMode', mode);
+}
+
 function runCommandPaletteAction(command) {
   const targets = {
     'new-task': el.btnNewChat,
@@ -844,6 +858,11 @@ function setupProgressiveDisclosure() {
       setLeftSidebarCollapsed(!el.leftSidebar.classList.contains('collapsed'));
     });
   }
+
+  // Mode switcher
+  document.getElementById('btn-mode-orion')?.addEventListener('click', () => setAppMode('orion'));
+  document.getElementById('btn-mode-coder')?.addEventListener('click', () => setAppMode('coder'));
+  setAppMode(appMode, false); // Initialize from stored preference
 
   const closePalette = () => el.commandPaletteModal && el.commandPaletteModal.classList.remove('active');
   const openPalette = () => {
@@ -4119,36 +4138,4 @@ async function submitClarificationAnswers({ button, bubble } = {}) {
     if (block) {
       const checked = block.querySelector(`input[type="radio"][name="clarq_${qi}"]:checked`);
       if (checked) {
-        if (checked.value === '__other__') {
-          const otherInput = block.querySelector(`.clarification-other-input[data-qi="${qi}"]`);
-          answer = otherInput ? otherInput.value.trim() : '';
-        } else {
-          const optIdx = parseInt(checked.value, 10);
-          answer = (q.options[optIdx] && q.options[optIdx].label) || '';
-        }
-      }
-    }
-    if (!answer) allAnswered = false;
-    answers.push({ header: q.header, question: q.question, answer: answer || '(no answer)' });
-  });
-
-  if (!allAnswered) {
-    // Briefly flash the submit button to signal something is missing
-    if (button) {
-      button.textContent = 'Answer all questions first';
-      setTimeout(() => { button.textContent = 'Submit'; }, 1800);
-    }
-    return;
-  }
-
-  if (button) {
-    button.disabled = true;
-    button.textContent = 'Submitting…';
-  }
-  if (bubble) {
-    const card = bubble.querySelector('.clarification-card');
-    if (card) card.classList.add('answered');
-  }
-
-  // Format answers as a readable user message
-  const formattedAn
+        if (c
