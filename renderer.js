@@ -2780,6 +2780,17 @@ function updatePhoneCompanionPairingPanel(payload = {}) {
       ? `${expiresText}. Desktop approval required.`
       : 'LAN companion mode is disabled by default. No localhost QR is shown for phones.';
   }
+  // Tailscale panel: show/hide the Tailscale QR block inside the pairing panel
+  const tsBlock = document.getElementById('phone-companion-tailscale-block');
+  const tsQrEl = document.getElementById('phone-companion-tailscale-qr');
+  const tsUrlEl = document.getElementById('phone-companion-tailscale-url');
+  if (tsBlock && payload.tailscaleQrSvg) {
+    tsBlock.style.display = '';
+    if (tsQrEl) tsQrEl.innerHTML = String(payload.tailscaleQrSvg || '');
+    if (tsUrlEl) tsUrlEl.textContent = String(payload.tailscaleStableUrl || payload.tailscalePairUrl || '');
+  } else if (tsBlock) {
+    tsBlock.style.display = 'none';
+  }
   refreshPairedDevicesList().catch(() => {});
 }
 
@@ -2863,9 +2874,28 @@ function renderPhoneCompanionPairingCard(payload) {
   const pairUrl = String(payload.pairUrl || '');
   const stableUrl = String(payload.stableUrl || pairUrl.replace(/\?.*$/, ''));
   const expiresText = payload.expiresAt ? `Expires: ${new Date(payload.expiresAt).toLocaleTimeString()}` : 'Short-lived pairing link';
+
+  // Tailscale section — only shown when Tailscale is active on the desktop
+  const tailscaleQrSvg = String(payload.tailscaleQrSvg || '');
+  const tailscalePairUrl = String(payload.tailscalePairUrl || '');
+  const tailscaleStableUrl = String(payload.tailscaleStableUrl || '');
+  const tailscaleSection = tailscaleQrSvg ? `
+    <div style="border-top:1px solid var(--border-color); margin-top:14px; padding-top:14px;">
+      <div style="font-size:0.7rem; font-weight:800; text-transform:uppercase; letter-spacing:0.08em; color:#34d399; margin-bottom:8px;">🌐 Anywhere via Tailscale</div>
+      <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+        <div aria-label="Tailscale pairing QR code" style="background:#fff; padding:8px; border-radius:8px; line-height:0; border:2px solid #34d399;">${tailscaleQrSvg}</div>
+        <div style="min-width:180px; flex:1;">
+          <div style="color:var(--text-muted); font-size:0.8rem; margin-bottom:6px;">Scan this from any network — coffee shop, cell data, anywhere Tailscale is connected.</div>
+          <div style="font-family:var(--font-mono); font-size:.72rem; word-break:break-all; color:#34d399;">${escapeHtml(tailscaleStableUrl || tailscalePairUrl)}</div>
+        </div>
+      </div>
+    </div>
+  ` : '';
+
   bubble.innerHTML = `
     <div class="message-header" style="color: var(--accent-secondary);">Phone Companion Pairing</div>
     <div class="message-body" style="font-family: var(--font-sans); color: var(--text);">
+      <div style="font-size:0.7rem; font-weight:800; text-transform:uppercase; letter-spacing:0.08em; color:var(--accent-secondary); margin-bottom:8px;">📶 Local Wi-Fi</div>
       <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
         <div data-companion-qr="true" aria-label="Phone Companion pairing QR code" style="background:#fff; padding:8px; border-radius:8px; line-height:0;">${qrSvg}</div>
         <div style="min-width:220px; flex:1;">
@@ -2876,6 +2906,7 @@ function renderPhoneCompanionPairingCard(payload) {
           <div data-pairing-metadata="true" style="color: var(--text-muted); font-size:.74rem; margin-top:8px;">${escapeHtml(expiresText)}</div>
         </div>
       </div>
+      ${tailscaleSection}
     </div>
   `;
   el.messagesContainer.appendChild(bubble);
@@ -4127,50 +4158,4 @@ async function approveCurrentPlanAndContinue(options = {}) {
   };
   if (button) {
     button.disabled = true;
-    button.textContent = 'Starting…';
-  }
-
-  const conv = conversations.find(c => c.id === activeConversationId);
-  if (!conv) { restoreButton(); return { success: false, error: 'No active conversation' }; }
-  if (!conv.awaitingPlanApproval) { restoreButton(); return { success: false, error: 'No plan is awaiting approval' }; }
-  if (!appConfig.geminiApiKey) {
-    el.settingsModal.classList.add('active');
-    appendSystemMessage("Please enter and save your Gemini API Key first.");
-    restoreButton();
-    return { success: false, error: 'Missing Gemini API key' };
-  }
-
-  // Re-validate the testing plan section in implementation_plan.md
-  let planIsValid = false;
-  try {
-    const planText = await readConversationTextArtifact(conv, 'implementation_plan.md', { maxChars: 100000 });
-    planIsValid = hasRequiredTestingPlanSection(planText);
-  } catch (err) {
-    console.error('Error validating plan during approval:', err);
-  }
-
-  if (!planIsValid) {
-    appendSystemMessage("Approval rejected: The implementation plan is missing a valid '## Testing Plan' section. Please ask the agent to revise the plan.");
-    restoreButton();
-    return { success: false, error: "Missing or invalid '## Testing Plan' section in implementation_plan.md" };
-  }
-
-  if (button) {
-    button.classList.add('approved');
-    button.disabled = true;
-    button.textContent = '✓ Implementation Started';
-    // Update the surrounding card immediately so it matches the persistent "started" state
-    // rendered on reload — no flicker, and it clearly reflects that the button was pressed.
-    const card = button.closest('.plan-approval-actions');
-    if (card) card.classList.add('approved');
-    const title = card && card.querySelector('.plan-approval-title');
-    if (title) title.textContent = 'Implementation started';
-    const subtitle = card && card.querySelector('.plan-approval-subtitle');
-    if (subtitle) subtitle.textContent = 'Orion is building from this approved plan.';
-  }
-
-  conv.planApproved = true;
-  conv.awaitingPlanApproval = false;
-
-  const approvalText = "Plan approved. Continuing implementation.";
-  appendSy
+    button.textContent 

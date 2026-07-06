@@ -273,10 +273,19 @@
         <button class="modal-close" id="btn-phone-companion-close">&times;</button>
       </div>
       <div class="modal-body">
+        <div style="font-size:0.68rem; font-weight:800; text-transform:uppercase; letter-spacing:0.08em; color:var(--accent-secondary); margin-bottom:6px;">📶 Local Wi-Fi</div>
         <div id="phone-companion-qr" class="phone-companion-qr"></div>
         <div id="phone-companion-pair-url" class="phone-companion-url"></div>
         <div id="phone-companion-meta" class="phone-companion-meta"></div>
-        
+
+        <!-- Tailscale remote access block — hidden until Tailscale IP detected -->
+        <div id="phone-companion-tailscale-block" style="display:none; margin-top:18px; border-top:1px solid var(--border-color); padding-top:16px;">
+          <div style="font-size:0.68rem; font-weight:800; text-transform:uppercase; letter-spacing:0.08em; color:#34d399; margin-bottom:8px;">🌐 Anywhere via Tailscale</div>
+          <div style="color:var(--text-muted); font-size:0.78rem; margin-bottom:10px;">Scan from any network — works outside your home Wi-Fi.</div>
+          <div id="phone-companion-tailscale-qr" style="line-height:0; display:inline-block; background:#fff; padding:8px; border-radius:8px; border:2px solid #34d399; margin-bottom:8px;"></div>
+          <div id="phone-companion-tailscale-url" style="font-family:var(--font-mono); font-size:0.72rem; word-break:break-all; color:#34d399;"></div>
+        </div>
+
         <!-- Desktop paired-device management UI -->
         <div id="paired-devices-section" style="margin-top: 24px; border-top: 1px solid var(--border-color); padding-top: 16px; display: none;">
           <h3 style="font-size: 0.95rem; margin-bottom: 12px; color: var(--accent-color); font-family: var(--font-sans);">Paired Devices</h3>
@@ -366,24 +375,4 @@
           <small class="form-help">Shell command run automatically before and after the agent changes files.</small>
         </div>
 
-        <div class="form-group">
-          <label for="setting-command-timeout">Command Timeout (ms):</label>
-          <input type="number" id="setting-command-timeout" value="120000">
-          <small class="form-help">Stops tests or shell commands that run too long.</small>
-        </div>
-
-        <div class="form-group">
-          <label for="setting-model-call-delay">Delay Between Model Calls (ms):</label>
-          <input type="number" id="setting-model-call-delay" value="0" min="0" max="60000">
-          <small class="form-help">Adds breathing room between API calls to reduce rate-limit loops.</small>
-        </div>
-
-        <div class="form-group">
-          <label for="setting-compact-threshold">Context Compaction Threshold (Tokens):</label>
-          <input type="number" id="setting-compact-threshold" value="100000">
-          <small class="form-help">Triggers conversation history summarizing when the conversation exceeds this size.</small>
-        </div>
-
-        <div class="form-group checkbox-group">
-          <label>
-            <input type="checkbox" id="setting-
+        <d
