@@ -192,8 +192,10 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
   t.ok(root.text.includes('<title>Orion</title>'), 'root shell serves the Orion mobile UI');
   t.ok(root.text.includes('Recents'), 'root shell includes Codex-style recents');
   t.ok(root.text.includes('Projects'), 'root shell includes project selection');
-  t.ok(root.text.includes('Mission Control'), 'root shell includes mobile mission context');
-  t.ok(root.text.includes('state.operationalContext'), 'mobile shell renders operational context from state');
+  t.ok(root.text.includes('Task List'), 'root shell includes mobile task list status');
+  t.ok(root.text.includes('renderPhoneTaskList'), 'mobile shell renders the conversation checklist from state');
+  t.ok(root.text.includes('data-drawer-destination="settings"'), 'root shell exposes app-level Settings through the drawer');
+  t.notOk(root.text.includes('Skill Registry'), 'root shell does not expose the Skills tab');
   t.notOk(root.text.includes('Start a new Orion task:'), 'new task no longer requires a prompt/name dialog');
 
   const manifest = await request('GET', 1131, '/manifest.webmanifest');

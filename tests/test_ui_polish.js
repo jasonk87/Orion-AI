@@ -42,11 +42,11 @@ test('phone companion finishes with the same dark theme and complete mission hie
   t.ok(companionHtml.includes('--bg: #090b12'), 'phone uses the desktop graphite background');
   t.ok(companionHtml.includes('--accent: #8273f4'), 'phone uses the desktop violet-blue accent');
   t.ok(companionHtml.includes('--success: #46d59b'), 'phone uses the desktop success color');
-  t.ok(companionHtml.includes('#mission-context-card { grid-area: mission; }'), 'Mission Control has an explicit mobile layout area');
+  t.ok(companionHtml.includes('#task-list-card { grid-area: mission; }'), 'Task List has an explicit mobile layout area');
   t.ok(companionHtml.includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
   t.ok(companionHtml.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
-  t.ok(companionHtml.includes('ui-polish-v14'), 'phone shell exposes the current UI build version');
-  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v14"), 'phone service worker cache is bumped for the current UI build');
+  t.ok(companionHtml.includes('ui-polish-v15'), 'phone shell exposes the current UI build version');
+  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v15"), 'phone service worker cache is bumped for the current UI build');
   t.end();
 });
 
@@ -112,6 +112,25 @@ test('phone companion renders approvals and tool calls as first-class mobile UI'
   t.ok(companionHtml.includes('data-clarification-card="true"'), 'phone clarification cards are addressable inside the scrollable transcript');
   t.ok(companionHtml.includes('clarificationHtml + typingHtml'), 'phone appends clarification cards inside the messages container before typing dots');
   t.ok(companionHtml.includes('wasNearBottom'), 'phone only auto-scrolls the transcript when the user is already near the bottom');
+  t.end();
+});
+
+test('phone companion uses a global drawer and Coder-only operations surfaces', (t) => {
+  t.ok(companionHtml.includes('id="app-drawer-overlay"'), 'phone has a global app drawer');
+  t.ok(companionHtml.includes('data-drawer-destination="orion"'), 'drawer exposes Dispatch as a top-level destination');
+  t.ok(companionHtml.includes('data-drawer-destination="coder"'), 'drawer exposes Coder as a top-level destination');
+  t.ok(companionHtml.includes('data-drawer-destination="settings"'), 'drawer exposes Settings as an app-level destination');
+  t.ok(companionHtml.includes('id="screen-settings"'), 'phone has a dedicated Settings screen');
+  t.ok(companionHtml.includes('Check local Orion files'), 'update controls live in Settings copy');
+  t.ok(companionHtml.includes('bottomNav.classList.toggle(\'hidden\', !isCoder)'), 'Coder operations tabs are hidden outside Coder');
+  t.ok(companionHtml.includes('id="task-list-card"'), 'Status shows the task-list card');
+  t.ok(companionHtml.includes('function renderPhoneTaskList'), 'Status renders the actual conversation checklist');
+  t.ok(companionHtml.includes('id="home-approvals-section"'), 'Coder home has a top-level approval section');
+  t.ok(companionHtml.includes('Needs Approval'), 'approval section is labeled plainly');
+  t.ok(companionHtml.includes('data-deny-plan'), 'approval cards can deny without opening the plan');
+  t.notOk(companionHtml.includes('id="panel-skills"'), 'Skills tab is removed from the phone UI');
+  t.notOk(companionHtml.includes('Skill Registry'), 'phone no longer exposes the skill registry page');
+  t.notOk(companionHtml.includes('<div class="section-title">Recent Tasks</div>'), 'Status no longer duplicates recent tasks');
   t.end();
 });
 
