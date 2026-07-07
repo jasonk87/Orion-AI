@@ -2082,6 +2082,40 @@ function isGeneratedStandaloneWorkspace(path) {
   return !!(normalizedPath && standaloneRoot && (normalizedPath === standaloneRoot || normalizedPath.startsWith(standaloneRoot + '\\')));
 }
 
+function inferDesktopProjectsRoot(pathValue) {
+  const normalized = String(pathValue || '').replace(/[\\/]+/g, '\\').replace(/[\\]+$/, '');
+  const match = normalized.match(/^([a-zA-Z]:\\Users\\[^\\]+\\Desktop\\Projects)(?:\\|$)/i);
+  return match ? match[1] : '';
+}
+
+function getDispatchWorkspaceRoot() {
+  const configured = String(appConfig.dispatchWorkspaceRoot || '').trim();
+  if (configured) return configured.replace(/[\\\/]+$/, '');
+
+  for (const projectPath of projects) {
+    const inferred = inferDesktopProjectsRoot(projectPath);
+    if (inferred) return inferred;
+  }
+
+  const fromStandaloneRoot = inferDesktopProjectsRoot(getStandaloneWorkspaceRoot());
+  if (fromStandaloneRoot) return fromStandaloneRoot;
+
+  const fromDefaultWorkspace = inferDesktopProjectsRoot(appConfig.defaultWorkspacePath);
+  if (fromDefaultWorkspace) return fromDefaultWorkspace;
+
+  return 'C:\\Users\\Owner\\Desktop\\Projects';
+}
+
+function getConversationRunWorkspace(conv) {
+  if (!conv) return currentWorkspace || getDispatchWorkspaceRoot();
+  if (conversationMode(conv) === 'orion') {
+    const workspace = String(conv.workspace || '').trim();
+    if (workspace && !isGeneratedStandaloneWorkspace(workspace)) return workspace;
+    return getDispatchWorkspaceRoot();
+  }
+  return conv.workspace || conv.projectPath || '';
+}
+
 function createPhoneConversation({ projectPath = '', mode = 'orion', title = 'New Phone Task' } = {}) {
   const convId = 'conv-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
   const normalizedProjectPath = String(projectPath || '').trim();
@@ -2240,6 +2274,10 @@ function migrateConversations() {
     }
     if (c.mode === 'orion' && c.projectPath) {
       c.projectPath = '';
+      updated = true;
+    }
+    if (c.mode === 'orion' && c.workspace && isGeneratedStandaloneWorkspace(c.workspace)) {
+      c.workspace = '';
       updated = true;
     }
     if (c.projectPath && isGeneratedStandaloneWorkspace(c.workspace)) {
@@ -2622,10 +2660,20 @@ function selectConversation(id) {
   
   el.chatTitle.textContent = conv.title;
   normalizeConversationWorkspace(conv);
+  const convMode = conversationMode(conv);
   
   // Set active workspace to conversation workspace if initialized,
   // otherwise show pending first message
-  if (conv.workspace) {
+  const runWorkspace = getConversationRunWorkspace(conv);
+  if (convMode === 'orion') {
+    currentWorkspace = runWorkspace;
+    expandedFileFolders = new Set();
+    const wsName = currentWorkspace.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || currentWorkspace;
+    el.workspaceLabel.textContent = wsName;
+    el.fileTree.innerHTML = '<p class="empty-state">Dispatch can inspect known projects. Open Coder for file-tree editing.</p>';
+    el.fileCountBadge.textContent = '0';
+    if (el.workspaceFilesPanel) el.workspaceFilesPanel.classList.add('contextual-panel-hidden');
+  } else if (conv.workspace) {
     currentWorkspace = conv.workspace;
     expandedFileFolders = new Set();
     const wsName = conv.workspace.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || conv.workspace;
@@ -2761,16 +2809,23 @@ async function submitMessage() {
   if (!conv.workspace) {
     if (conv.projectPath) {
       conv.workspace = conv.projectPath;
-    } else {
+    } else if (conversationMode(conv) === 'coder') {
       conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id);
     }
   }
 
-  // Ensure currentWorkspace is locked onto this isolated folder
-  currentWorkspace = conv.workspace;
+  // Ensure currentWorkspace is useful for this mode. Coder standalone chats use isolated folders;
+  // Dispatch stays rooted at the real Projects directory unless it explicitly changes workspace.
+  currentWorkspace = getConversationRunWorkspace(conv);
   expandedFileFolders = new Set();
   el.workspaceLabel.textContent = currentWorkspace.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || currentWorkspace;
-  syncWorkspaceFiles();
+  if (conversationMode(conv) === 'coder') {
+    syncWorkspaceFiles();
+  } else {
+    el.fileTree.innerHTML = '<p class="empty-state">Dispatch can inspect known projects. Open Coder for file-tree editing.</p>';
+    el.fileCountBadge.textContent = '0';
+    if (el.workspaceFilesPanel) el.workspaceFilesPanel.classList.add('contextual-panel-hidden');
+  }
   
   // Update messages history (store compact image refs for replay)
   const msgImages = imagesToSend.map(i => ({ data: i.data, mimeType: i.mimeType }));
@@ -3736,12 +3791,18 @@ function escapeHtml(text) {
 window.getAppConfig = () => appConfig;
 window.getActiveConversationId = () => activeConversationId;
 window.getCurrentWorkspace = () => currentWorkspace;
-window.changeActiveWorkspace = function(folderPath) {
-  if (activeConversationId) {
-    const conv = conversations.find(c => c.id === activeConversationId);
+window.changeActiveWorkspace = function(folderPath, options = {}) {
+  const targetConversationId = options.conversationId || activeConversationId;
+  if (targetConversationId) {
+    const conv = conversations.find(c => c.id === targetConversationId);
     if (conv) {
       conv.workspace = folderPath;
-      conv.projectPath = folderPath;
+      const promoteProject = options.promoteProject === true || (options.promoteProject !== false && conversationMode(conv) === 'coder');
+      if (promoteProject) {
+        conv.projectPath = folderPath;
+      } else if (conversationMode(conv) === 'orion') {
+        conv.projectPath = '';
+      }
       saveConversationsToStorage();
     }
   }
@@ -3757,6 +3818,7 @@ window.changeActiveWorkspace = function(folderPath) {
   refreshOperationalContext();
 };
 window.getSelectedModel = () => el.modelSelect ? el.modelSelect.value : appConfig.defaultModel;
+window.getKnownProjects = () => projects.slice();
 window.selectConversationById = selectConversation;
 window.updateTasksChecklist = updateTasksChecklist;
 window.updateOperationalContext = updateOperationalContext;
@@ -3977,7 +4039,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     };
   });
   
-  const companionWorkspace = conv ? (conv.workspace || conv.projectPath || currentWorkspace || '') : currentWorkspace;
+  const companionWorkspace = conv ? getConversationRunWorkspace(conv) : currentWorkspace;
   const operationalResult = companionWorkspace && window.readOperationalContext
     ? await window.readOperationalContext(companionWorkspace)
     : null;
@@ -4127,7 +4189,11 @@ window.submitPhoneCompanionPrompt = async (options) => {
   }
   normalizeConversationWorkspace(conv);
   if (!conv.workspace) {
-    conv.workspace = conv.projectPath || getStandaloneWorkspaceForTitle(conv.title, conv.id);
+    if (conv.projectPath) {
+      conv.workspace = conv.projectPath;
+    } else if (conversationMode(conv) === 'coder') {
+      conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id);
+    }
   }
   saveConversationsToStorage();
 

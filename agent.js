@@ -622,7 +622,6 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   // silently staying on the more expensive model for the rest of the conversation.
   const userSelectedModelName = activeRunModelName;
   let modelEscalatedForEditKey = null;
-  let workspacePath = resolveConversationWorkspace(conversation);
   const promptSource = options.source || 'user';
   const isInternalPrompt = !!options.internalPrompt || promptSource === 'followup' || promptSource === 'system' || promptSource === 'plan-approval';
 
@@ -702,6 +701,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   try {
     if (window.api && window.api.getHomeDir) resolvedHomeDir = await window.api.getHomeDir();
   } catch (_) {}
+  let workspacePath = resolveConversationWorkspace(conversation);
 
   const scopedNotes = await readScopedNotes(workspacePath, conversation);
   const operationalContext = await readOperationalContext(workspacePath);
@@ -960,6 +960,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const workWalkthroughOverride = isDispatchConversation
     ? '\nThis is a Dispatch conversation, not a Coder/implementation task. Do NOT include a "Work Walkthrough" section, a files-touched list, or a step-by-step recap of tool calls in your response, even if you used tools this turn. Just answer directly and conversationally.'
     : '';
+  const knownProjectsFacts = formatKnownProjectsForSystemFacts();
   messages.splice(2, 0,
     {
       role: 'user',
@@ -970,6 +971,19 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       parts: [{ text: `Understood. Home directory is ${resolvedHomeDir}. Web search: ${webSearchStatus.split(' —')[0]}. Client: ${promptSource === 'phone' ? 'phone companion' : 'desktop'}. I will use these directly without probing.${isDispatchConversation ? ' I will skip the Work Walkthrough section for this conversation.' : ''}` }]
     }
   );
+
+  if (knownProjectsFacts) {
+    messages.splice(4, 0,
+      {
+        role: 'user',
+        parts: [{ text: `[ORION KNOWN LOCAL PROJECTS]\nThese are the local projects already registered in the app. When Jason names one of these projects, use the listed absolute path directly.\n${knownProjectsFacts}` }]
+      },
+      {
+        role: 'model',
+        parts: [{ text: 'Understood. I will use the known project paths directly when Jason names one.' }]
+      }
+    );
+  }
 
   // Strategy gate prep: only a fresh plan-worthy task that has not been approved needs it.
   if (!planningBypassedForTask && planningDecision.mode === 'plan' && config.planningMode !== false && !conversation.planApproved && !isInternalPrompt) {
@@ -2936,7 +2950,10 @@ async function executeTool(name, args, workspace, config, conversation) {
         conversation.projectPath = targetPath;
       }
       if (typeof window.changeActiveWorkspace === 'function') {
-        window.changeActiveWorkspace(targetPath);
+        window.changeActiveWorkspace(targetPath, {
+          conversationId: conversation.id,
+          promoteProject: conversation.mode === 'coder'
+        });
       }
       return {
         success: true,
@@ -5969,8 +5986,54 @@ function stableStringify(value) {
   return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
 }
 
+function isGeneratedStandaloneWorkspacePath(pathValue) {
+  return /(?:^|[\\/])standalone-workspaces(?:[\\/]|$)/i.test(String(pathValue || ''));
+}
+
+function getDispatchWorkspaceRoot() {
+  return joinLocalPath(joinLocalPath(resolvedHomeDir || 'C:\\Users\\Owner', 'Desktop'), 'Projects');
+}
+
+function formatKnownProjectsForSystemFacts() {
+  let knownProjects = [];
+  try {
+    if (window.getKnownProjects) {
+      const result = window.getKnownProjects();
+      if (Array.isArray(result)) knownProjects = result;
+    }
+  } catch (_) {}
+  const unique = [];
+  const seen = new Set();
+  for (const projectPath of knownProjects) {
+    const pathText = String(projectPath || '').trim();
+    if (!pathText) continue;
+    const key = pathText.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(pathText);
+    if (unique.length >= 40) break;
+  }
+  if (!unique.length) return '';
+  const lines = unique.map(projectPath => `- ${getLocalPathBaseName(projectPath)}: ${projectPath}`).join('\n');
+  return `\nKnown local projects:\n${lines}`;
+}
+
 function resolveConversationWorkspace(conversation) {
   const conv = conversation && typeof conversation === 'object' ? conversation : {};
+  const hasConversationShape = Object.keys(conv).length > 0;
+  let mode = 'coder';
+  if (conv.mode === 'orion' || conv.mode === 'coder') {
+    mode = conv.mode;
+  } else if (conv.projectPath) {
+    mode = 'coder';
+  } else if (hasConversationShape) {
+    mode = activeConversationMode;
+  }
+  if (mode === 'orion') {
+    const workspace = String(conv.workspace || '').trim();
+    if (workspace && !isGeneratedStandaloneWorkspacePath(workspace)) return workspace;
+    return getDispatchWorkspaceRoot();
+  }
   return conv.workspace || conv.projectPath || (window.getCurrentWorkspace ? window.getCurrentWorkspace() : '');
 }
 

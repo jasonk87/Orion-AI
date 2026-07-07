@@ -673,6 +673,16 @@ test('project conversations provide project path as the agent workspace', (t) =>
     'C:\\Desktop\\Fallback',
     'desktop workspace is only the final fallback'
   );
+  t.equal(
+    agent.resolveConversationWorkspace({ mode: 'orion', workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\OrionAI\\standalone-workspaces\\weather-chat' }),
+    'C:\\Users\\Owner\\Desktop\\Projects',
+    'Dispatch ignores generated standalone workspaces and falls back to the Projects root'
+  );
+  t.equal(
+    agent.resolveConversationWorkspace({ mode: 'orion', workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GritLife' }),
+    'C:\\Users\\Owner\\Desktop\\Projects\\GritLife',
+    'Dispatch keeps an explicitly changed read-only workspace'
+  );
   t.end();
 });
 
@@ -944,19 +954,26 @@ test('workspace artifacts and file explorer controls are wired', (t) => {
   t.end();
 });
 
-test('phone standalone conversations get isolated workspaces', (t) => {
+test('Dispatch uses Projects fallback while Coder standalone conversations get isolated workspaces', (t) => {
   t.ok(rendererJs.includes('function getStandaloneWorkspaceRoot'), 'standalone workspace root helper exists');
   t.ok(rendererJs.includes('Desktop\\\\Projects\\\\OrionAI\\\\standalone-workspaces'), 'default standalone root lives under OrionAI project folder');
   t.ok(rendererJs.includes('function isGeneratedStandaloneWorkspace'), 'renderer can identify generated standalone workspaces');
+  t.ok(rendererJs.includes('function getDispatchWorkspaceRoot'), 'renderer has a real Projects-root fallback for Dispatch');
+  t.ok(rendererJs.includes('function getConversationRunWorkspace'), 'renderer resolves run workspace by conversation mode');
   t.ok(rendererJs.includes("!c.projectPath && c.mode !== 'orion' && c.mode !== 'coder'"), 'legacy coder backfill does not overwrite explicit Dispatch/Coder modes');
   t.ok(rendererJs.includes("if (c.mode === 'orion' && c.projectPath)"), 'migration clears accidental project linkage from explicit Dispatch conversations');
+  t.ok(rendererJs.includes("c.mode === 'orion' && c.workspace && isGeneratedStandaloneWorkspace(c.workspace)"), 'migration clears generated standalone workspaces from Dispatch conversations');
   t.ok(rendererJs.includes("return mode === 'orion' || !c.projectPath;"), 'Dispatch list keeps Dispatch conversations even when they inspected a project workspace');
   t.ok(rendererJs.includes('c.projectPath && isGeneratedStandaloneWorkspace(c.workspace)'), 'migration clears accidental project linkage from generated standalone workspaces');
   t.ok(rendererJs.includes("conversationMode(c) === 'coder' && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)"), 'migration never promotes generated standalone workspaces or Dispatch conversations into projects');
   t.ok(agentJs.includes("if (conversation.mode === 'coder')") && agentJs.includes('conversation.projectPath = targetPath'), 'change_workspace only promotes Coder conversations into project scope');
+  t.ok(agentJs.includes('isGeneratedStandaloneWorkspacePath') && agentJs.includes('getDispatchWorkspaceRoot()'), 'agent ignores generated Dispatch workspaces and falls back to the Projects root');
+  t.ok(agentJs.includes('formatKnownProjectsForSystemFacts'), 'agent can include registered project paths in Dispatch context');
   t.ok(rendererJs.includes('function createPhoneConversation'), 'phone conversations use a dedicated constructor');
   t.ok(rendererJs.includes('projectPath: normalizedProjectPath'), 'phone constructor preserves explicit project linkage only');
-  t.ok(rendererJs.includes('conv.workspace = conv.projectPath || getStandaloneWorkspaceForTitle(conv.title, conv.id)'), 'standalone phone prompt initializes an isolated workspace');
+  t.ok(rendererJs.includes("conversationMode(conv) === 'coder'") && rendererJs.includes('conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id)'), 'only Coder standalone prompts initialize isolated workspaces');
+  t.ok(preloadJs.includes('getFileSymbols') && preloadJs.includes('orion:get-file-symbols'), 'preload exposes the file-symbol tool advertised to the model');
+  t.ok(preloadJs.includes('semanticSearch') && preloadJs.includes('orion:semantic-search'), 'preload exposes semantic search advertised to the model');
   t.end();
 });
 
