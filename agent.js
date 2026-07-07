@@ -138,7 +138,7 @@ WHO YOU'RE TALKING TO:
 Jason. Solo developer. Casual, direct — he wants the answer, not the explanation. He'll give you context as it comes up. Don't ask for everything upfront.
 
 HOW YOU WORK:
-Handle directly: conversation, strategy, planning, research, reading and discussing code or docs, answering questions, web searches.
+Handle directly: conversation, strategy, planning, research, reading and discussing code or docs, answering questions, web searches. You can look at files and search the web to back up what you say, but you cannot write, edit, or run anything — you are read-only by design.
 Route to the coder: anything requiring file changes, writing or debugging code, running tests, building or fixing features. Before routing, make sure you understand the task well enough to hand it off clearly — ask Jason to clarify if you don't. When you route something, tell him. Don't go quiet. Report back with a clean summary when it's done.
 
 HOW YOU THINK:
@@ -152,7 +152,7 @@ At the start of a conversation, call recall_memory with scope="global" to orient
 
 {{user_memory}}
 
-Tools available:
+Tools available (all read-only — you have no file-write, command-execution, or project-memory tools; route anything needing those to the coder):
 - recall_memory: Read memory for the given scope ("global", "project", or "all"). Call this at the start of conversations.
 - remember_fact: Store a durable fact in global memory.
 - remember_preference: Store a user preference at global level.
@@ -160,12 +160,17 @@ Tools available:
 - fetch_web_page: Fetch the text content of a web page.
 - read_file: Read a file's content.
 - list_files: List files in the workspace.
-- get_workspace_info: Return the active workspace directory.`;
+- get_workspace_info: Return the active workspace directory.
+- grep_search: Search file contents across the workspace for a literal string or regex pattern.
+- search_embeddings / semantic_search: Semantic search over the workspace's indexed content.
+- get_symbol_index / get_file_symbols / find_references: Look up functions/classes/symbols and their usages.
+- read_notes / read_project_memory: Read this conversation's or a project's saved notes/memory.
+- change_workspace: Point yourself at a different local folder to read from, when Jason asks about a specific project.`;
 
 // Returns the right system instruction for the current mode.
 // Pass cachedMemory (string) to inject into the dispatcher instruction.
 function getSystemInstruction(disableTools = false, cachedMemory = '') {
-  const isOrion = (typeof appMode !== 'undefined' && appMode === 'orion');
+  const isOrion = activeConversationMode === 'orion';
   let base;
   if (isOrion) {
     const memBlock = cachedMemory ? `\n\nKnown context about Jason:\n${cachedMemory}` : '';
@@ -314,6 +319,11 @@ let isAgentRunning = false;
 let runningConversationId = null;
 let agentSubStatus = '';
 let agentExecutionMode = 'idle';
+// The active conversation's own persistent mode ('orion'/'coder'), set once at the start of each
+// run. Used by getSystemInstruction/buildAgentToolDeclarations instead of the live UI mode toggle
+// (appMode), since a conversation's identity must not depend on which sidebar tab happens to be
+// focused when a background/phone-triggered run executes.
+let activeConversationMode = 'orion';
 let resolvedHomeDir = 'C:\\Users\\Owner';
 let currentAgentLogs = [];
 // Signature of the last observed browser page state (url/title/content), used to detect when a
@@ -593,7 +603,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   window.currentLoopCount = 0;
   currentAgentLogs = [];
   // Session continuity: build prev-session context on first message, clear otherwise
-  const isOrionMode = (typeof appMode !== 'undefined' && appMode === 'orion');
+  const isOrionMode = conversation.mode === 'orion' ||
+    (conversation.mode !== 'coder' && typeof appMode !== 'undefined' && appMode === 'orion');
+  activeConversationMode = isOrionMode ? 'orion' : 'coder';
   if (isOrionMode) {
     orionSessionContinuityContext = buildOrionContinuityContext(conversation);
   } else {
@@ -878,7 +890,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   }
 
   // Surface a direct-task decision once, in one consistent place.
-  if (!isInternalPrompt && !conversation.planApproved && window.appendSystemMessage && planningBypassedForTask && planningDecision.mode === 'direct' && agentExecutionMode === 'direct') {
+  if (!isInternalPrompt && conversation.mode !== 'orion' && !conversation.planApproved && window.appendSystemMessage && planningBypassedForTask && planningDecision.mode === 'direct' && agentExecutionMode === 'direct') {
     window.appendSystemMessage(`Planning mode: direct task, no implementation plan required. ${planningDecision.reason || ''}`.trim());
   }
 
@@ -1515,7 +1527,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           messages.push({ role: 'user', parts: [{ text: pendingWorkspaceResolutionPrompt }] });
           continue;
         }
-        const finalAnswerQualityPrompt = buildFinalAnswerQualityGatePrompt(userPrompt, textVal, workWalkthrough);
+        const finalAnswerQualityPrompt = buildFinalAnswerQualityGatePrompt(userPrompt, textVal, workWalkthrough, conversation);
         if (finalAnswerQualityPrompt && loopCount >= maxLoops && finalAnswerQualityLoopExtensions < 2) {
           finalAnswerQualityLoopExtensions++;
           maxLoops++;
@@ -2920,7 +2932,9 @@ async function executeTool(name, args, workspace, config, conversation) {
       }
       const targetPath = resolution.path;
       conversation.workspace = targetPath;
-      conversation.projectPath = targetPath;
+      if (conversation.mode === 'coder') {
+        conversation.projectPath = targetPath;
+      }
       if (typeof window.changeActiveWorkspace === 'function') {
         window.changeActiveWorkspace(targetPath);
       }
@@ -5168,7 +5182,7 @@ function buildReviewOnlyCompletionGatePrompt(userPrompt, answerText, workWalkthr
   return '';
 }
 
-function buildFinalAnswerQualityGatePrompt(userPrompt, answerText, workWalkthrough = []) {
+function buildFinalAnswerQualityGatePrompt(userPrompt, answerText, workWalkthrough = [], conversation = null) {
   const inspected = (workWalkthrough || []).some(item => item && item.status !== 'error');
   if (!inspected) return '';
   if (hasOnlyInventoryEvidence(workWalkthrough)) {
@@ -5176,14 +5190,17 @@ function buildFinalAnswerQualityGatePrompt(userPrompt, answerText, workWalkthrou
 
 Before final response, decide what evidence the user's actual request requires. If they asked for anything beyond a file inventory, read the relevant source files, tests, README/package/config files, or run safe inspection commands before answering. If the user truly requested only an inventory, answer that narrowly and explicitly. Do not produce broad recommendations from filenames alone.]`;
   }
-  // A pure conversational/discussion turn (agentExecutionMode 'answer') is not a task with
-  // deliverables -- a short, direct reply that ends by asking the user a clarifying question is a
-  // complete answer, not an incomplete one, and it need not cite exact file paths when the topic
-  // is a forward-looking design question rather than a description of existing code. Holding it to
-  // this gate's "recommendations, a plan, changes, or a next action" / inspection-grounding bars
-  // tends to make the model regress into a degenerate retry that just refers back to its own
-  // earlier answer instead of restating it.
-  if (agentExecutionMode === 'answer') {
+  // A Dispatch conversation is a conversational assistant, not a task with deliverables -- a short,
+  // direct reply that ends by asking the user a clarifying question is a complete answer, not an
+  // incomplete one, and it need not cite exact file paths for every claim. Holding it to this
+  // gate's "recommendations, a plan, changes, or a next action" / inspection-grounding bars forces
+  // a redundant re-verification pass (re-reading files it may have already inspected earlier in the
+  // same conversation) purely to satisfy the gate, burning tokens on evidence nobody asked for. This
+  // also tends to make the model regress into a degenerate retry that just refers back to its own
+  // earlier answer instead of restating it. agentExecutionMode 'answer' covers turns classified as
+  // pure discussion; conversation.mode 'orion' covers the rest of Dispatch's turns regardless of
+  // how this specific turn got classified (e.g. verifying a technical claim still counts).
+  if (agentExecutionMode === 'answer' || (conversation && conversation.mode === 'orion')) {
     const trimmed = sanitizeFinalAnswerText(answerText);
     if (trimmed.length >= 40 && !isGenericNonAnswer(trimmed) && !looksLikeLeakedNoToolCorrection(trimmed)) {
       return '';
@@ -6469,12 +6486,25 @@ function convertGeminiToOllamaMessages(geminiMessages) {
   return ollamaMessages;
 }
 
+// Dispatch (Orion) is read-only by design -- it can look at files, code, and the web to back up
+// what it says, but it must never be structurally able to write, edit, run, or execute anything;
+// that's Coder's job. This whitelist is enforced below regardless of what the system prompt text
+// claims, so the restriction can't be talked around by a model that decides to route differently.
+const DISPATCH_TOOL_ALLOWLIST = new Set([
+  'recall_memory', 'remember_fact', 'remember_preference',
+  'google_search', 'fetch_web_page',
+  'read_file', 'list_files', 'get_workspace_info', 'change_workspace',
+  'grep_search', 'search_embeddings', 'semantic_search',
+  'get_symbol_index', 'get_file_symbols', 'find_references',
+  'read_notes', 'read_project_memory'
+]);
+
 // Single source of truth for the agent's tool declarations, consumed by every provider
 // (Gemini, Ollama, and Anthropic). Previously this ~480-line array was duplicated verbatim
 // inside callGeminiAPI and callOllamaAPI, which silently drifted out of sync. Reads the
 // module-level agentExecutionMode so operational-context tools are only offered during execution.
 function buildAgentToolDeclarations() {
-  return [
+  const allTools = [
           ...(agentExecutionMode === 'executing' ? OPERATIONAL_CONTEXT_TOOL_DECLARATIONS : []),
           ...ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS,
           {
@@ -7007,6 +7037,10 @@ function buildAgentToolDeclarations() {
             }
           }
   ];
+  if (activeConversationMode === 'orion') {
+    return allTools.filter(tool => DISPATCH_TOOL_ALLOWLIST.has(tool.name));
+  }
+  return allTools;
 }
 
 

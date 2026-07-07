@@ -117,8 +117,8 @@ test('plan approval continuation is not stored as a fake user message', (t) => {
 // Guard: the message must only appear for genuinely fresh tasks with no approved plan.
 test('direct-task system message is suppressed when a plan is already approved', (t) => {
   t.ok(
-    agentJs.includes('!conversation.planApproved && window.appendSystemMessage && planningBypassedForTask'),
-    '"Planning mode: direct task" message is guarded by !conversation.planApproved'
+    agentJs.includes("conversation.mode !== 'orion' && !conversation.planApproved && window.appendSystemMessage && planningBypassedForTask"),
+    '"Planning mode: direct task" message is guarded by Dispatch mode and !conversation.planApproved'
   );
   t.end();
 });
@@ -947,6 +947,13 @@ test('workspace artifacts and file explorer controls are wired', (t) => {
 test('phone standalone conversations get isolated workspaces', (t) => {
   t.ok(rendererJs.includes('function getStandaloneWorkspaceRoot'), 'standalone workspace root helper exists');
   t.ok(rendererJs.includes('Desktop\\\\Projects\\\\OrionAI\\\\standalone-workspaces'), 'default standalone root lives under OrionAI project folder');
+  t.ok(rendererJs.includes('function isGeneratedStandaloneWorkspace'), 'renderer can identify generated standalone workspaces');
+  t.ok(rendererJs.includes("!c.projectPath && c.mode !== 'orion' && c.mode !== 'coder'"), 'legacy coder backfill does not overwrite explicit Dispatch/Coder modes');
+  t.ok(rendererJs.includes("if (c.mode === 'orion' && c.projectPath)"), 'migration clears accidental project linkage from explicit Dispatch conversations');
+  t.ok(rendererJs.includes("return mode === 'orion' || !c.projectPath;"), 'Dispatch list keeps Dispatch conversations even when they inspected a project workspace');
+  t.ok(rendererJs.includes('c.projectPath && isGeneratedStandaloneWorkspace(c.workspace)'), 'migration clears accidental project linkage from generated standalone workspaces');
+  t.ok(rendererJs.includes("conversationMode(c) === 'coder' && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)"), 'migration never promotes generated standalone workspaces or Dispatch conversations into projects');
+  t.ok(agentJs.includes("if (conversation.mode === 'coder')") && agentJs.includes('conversation.projectPath = targetPath'), 'change_workspace only promotes Coder conversations into project scope');
   t.ok(rendererJs.includes('function createPhoneConversation'), 'phone conversations use a dedicated constructor');
   t.ok(rendererJs.includes('projectPath: normalizedProjectPath'), 'phone constructor preserves explicit project linkage only');
   t.ok(rendererJs.includes('conv.workspace = conv.projectPath || getStandaloneWorkspaceForTitle(conv.title, conv.id)'), 'standalone phone prompt initializes an isolated workspace');

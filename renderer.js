@@ -293,12 +293,13 @@ async function refreshAppRuntimeInfo() {
 
 // ── Auto-update checker ────────────────────────────────────────────────────────
 
-function showUpdateBadge({ commitsBehind, remoteHash } = {}) {
+function showUpdateBadge({ changedCount, changed, sourceDir } = {}) {
   const btn = document.getElementById('btn-update-available');
   if (!btn) return;
-  const count = commitsBehind || '';
+  const count = changedCount || (Array.isArray(changed) ? changed.length : 0);
   btn.textContent = `⬆ Update${count ? ` (${count})` : ''}`;
-  btn.title = `${count ? count + ' new commit' + (count !== 1 ? 's' : '') + ' available' : 'Update available'}${remoteHash ? ' (' + remoteHash + ')' : ''} — click to pull and restart`;
+  const fileCopy = count ? `${count} local file${count !== 1 ? 's' : ''} changed` : 'Local update available';
+  btn.title = `${fileCopy}${sourceDir ? ` from ${sourceDir}` : ''} — click to sync local files and restart`;
   btn.style.display = '';
 }
 
@@ -307,28 +308,68 @@ function hideUpdateBadge() {
   if (btn) btn.style.display = 'none';
 }
 
-async function checkForGitUpdates() {
-  if (!window.api || !window.api.checkGitUpdate) return;
+function restoreUpdateCheckButton(btn) {
+  if (!btn) return;
+  btn.textContent = '↻ Check';
+  btn.disabled = false;
+}
+
+function getUpdateApi() {
+  if (!window.api) return {};
+  return {
+    check: window.api.checkLocalUpdate || window.api.checkGitUpdate,
+    apply: window.api.applyLocalUpdate || window.api.applyGitUpdate
+  };
+}
+
+async function checkForLocalUpdates({ manual = false } = {}) {
+  const updateApi = getUpdateApi();
+  if (!updateApi.check) return;
+  const checkBtn = document.getElementById('btn-check-update');
+  if (manual && checkBtn) {
+    checkBtn.textContent = 'Checking...';
+    checkBtn.disabled = true;
+  }
   try {
-    const result = await window.api.checkGitUpdate();
+    const result = await updateApi.check();
     if (result && result.hasUpdate) {
       showUpdateBadge(result);
+      if (manual && checkBtn) restoreUpdateCheckButton(checkBtn);
     } else {
       hideUpdateBadge();
+      if (manual && checkBtn) {
+        checkBtn.textContent = 'Current';
+        checkBtn.title = 'No local source file updates found';
+        setTimeout(() => {
+          restoreUpdateCheckButton(checkBtn);
+          checkBtn.title = 'Check local source files for updates';
+        }, 1800);
+      }
     }
-  } catch (_) { /* silent */ }
+  } catch (e) {
+    if (manual) {
+      appendSystemMessage(`Update check failed: ${e.message}`);
+      if (checkBtn) restoreUpdateCheckButton(checkBtn);
+    }
+  }
 }
 
 function initUpdateChecker() {
+  const checkBtn = document.getElementById('btn-check-update');
+  if (checkBtn) {
+    checkBtn.addEventListener('click', () => checkForLocalUpdates({ manual: true }));
+  }
   const btn = document.getElementById('btn-update-available');
   if (btn) {
     btn.addEventListener('click', async () => {
       if (btn.disabled) return;
       const orig = btn.textContent;
-      btn.textContent = 'Pulling...';
+      btn.textContent = 'Syncing...';
       btn.disabled = true;
       try {
-        await window.api.applyGitUpdate();
+        const updateApi = getUpdateApi();
+        if (!updateApi.apply) throw new Error('Update is not available in this build');
+        await updateApi.apply();
         btn.textContent = 'Restarting...';
       } catch (e) {
         btn.textContent = orig;
@@ -338,18 +379,20 @@ function initUpdateChecker() {
     });
   }
   // First check after 15 seconds on startup, then every 30 minutes
-  setTimeout(checkForGitUpdates, 15000);
-  setInterval(checkForGitUpdates, 30 * 60 * 1000);
+  setTimeout(checkForLocalUpdates, 15000);
+  setInterval(checkForLocalUpdates, 30 * 60 * 1000);
 }
 
 // Phone companion bridge functions for update
 window.checkPhoneCompanionUpdate = async () => {
-  if (!window.api || !window.api.checkGitUpdate) return { hasUpdate: false };
-  try { return await window.api.checkGitUpdate(); } catch (_) { return { hasUpdate: false }; }
+  const updateApi = getUpdateApi();
+  if (!updateApi.check) return { hasUpdate: false };
+  try { return await updateApi.check(); } catch (_) { return { hasUpdate: false }; }
 };
 window.applyPhoneCompanionUpdate = async () => {
-  if (!window.api || !window.api.applyGitUpdate) return { success: false, error: 'Not available' };
-  try { return await window.api.applyGitUpdate(); } catch (e) { return { success: false, error: e.message }; }
+  const updateApi = getUpdateApi();
+  if (!updateApi.apply) return { success: false, error: 'Not available' };
+  try { return await updateApi.apply(); } catch (e) { return { success: false, error: e.message }; }
 };
 window.restartApp = async () => {
   if (!window.api || !window.api.restartApp) return { success: false };
@@ -2029,6 +2072,16 @@ function getStandaloneWorkspaceForTitle(title, convId) {
   return getStandaloneWorkspaceRoot() + '\\' + slug + suffix;
 }
 
+function normalizePathForComparison(path) {
+  return String(path || '').replace(/[\\/]+/g, '\\').replace(/[\\]+$/, '').toLowerCase();
+}
+
+function isGeneratedStandaloneWorkspace(path) {
+  const normalizedPath = normalizePathForComparison(path);
+  const standaloneRoot = normalizePathForComparison(getStandaloneWorkspaceRoot());
+  return !!(normalizedPath && standaloneRoot && (normalizedPath === standaloneRoot || normalizedPath.startsWith(standaloneRoot + '\\')));
+}
+
 function createPhoneConversation({ projectPath = '', mode = 'orion', title = 'New Phone Task' } = {}) {
   const convId = 'conv-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
   const normalizedProjectPath = String(projectPath || '').trim();
@@ -2163,7 +2216,7 @@ function migrateConversations() {
   // after this point.
   if (!localStorage.getItem('orionCoderModeBackfillDone')) {
     conversations.forEach(c => {
-      if (!c.projectPath) {
+      if (!c.projectPath && c.mode !== 'orion' && c.mode !== 'coder') {
         c.mode = 'coder';
       }
     });
@@ -2172,19 +2225,31 @@ function migrateConversations() {
   }
 
   conversations.forEach(c => {
-    if (c.mode !== 'orion' && c.mode !== 'coder') {
-      c.mode = c.projectPath ? 'coder' : 'orion';
-      updated = true;
-    }
-    if (!c.projectPath && c.workspace) {
-      // Find if workspace is inside any project folder
-      const matchingProj = projects.find(proj => {
+    const hasExplicitMode = c.mode === 'orion' || c.mode === 'coder';
+    const matchingWorkspaceProject = (!c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace))
+      ? projects.find(proj => {
         const lowerWorkspace = c.workspace.toLowerCase();
         const lowerProj = proj.toLowerCase();
         return lowerWorkspace.startsWith(lowerProj);
-      });
-      if (matchingProj) {
-        c.projectPath = matchingProj;
+      })
+      : null;
+
+    if (!hasExplicitMode) {
+      c.mode = (c.projectPath || matchingWorkspaceProject) ? 'coder' : 'orion';
+      updated = true;
+    }
+    if (c.mode === 'orion' && c.projectPath) {
+      c.projectPath = '';
+      updated = true;
+    }
+    if (c.projectPath && isGeneratedStandaloneWorkspace(c.workspace)) {
+      c.projectPath = '';
+      updated = true;
+    }
+    if (conversationMode(c) === 'coder' && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)) {
+      // Find if workspace is inside any project folder
+      if (matchingWorkspaceProject) {
+        c.projectPath = matchingWorkspaceProject;
         updated = true;
       }
     }
@@ -2317,6 +2382,24 @@ function extractConversationMessageLogs(msg) {
     });
   });
   return rebuiltLogs;
+}
+
+function latestToolActivity(logs = []) {
+  return [...logs].reverse().find(log => log && (log.type === 'tool_call' || log.tool));
+}
+
+function formatDispatchToolActivity(logs = []) {
+  const activity = latestToolActivity(logs);
+  if (!activity) return '';
+  const tool = activity.tool || 'tool';
+  const status = activity.status || 'running';
+  const verb = status === 'error' ? 'Had trouble with' : (status === 'running' ? 'Using' : 'Checked');
+  return `
+    <div class="dispatch-tool-activity ${escapeHtml(status)}">
+      <span class="dispatch-tool-pulse"></span>
+      <span>${verb} <code>${escapeHtml(tool)}</code></span>
+    </div>
+  `;
 }
 
 function normalizeConversationMessageForReplay(msg) {
@@ -2492,7 +2575,11 @@ function renderConversationList() {
   listConfigs.forEach(({ container, mode }) => {
     container.innerHTML = '';
 
-    const standaloneConversations = conversations.filter(c => !c.projectPath && conversationMode(c) === mode);
+    const standaloneConversations = conversations.filter(c => {
+      const convMode = conversationMode(c);
+      if (convMode !== mode) return false;
+      return mode === 'orion' || !c.projectPath;
+    });
 
     if (standaloneConversations.length === 0) {
       container.innerHTML = '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No standalone conversations yet</p>';
@@ -3173,9 +3260,19 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     bubble.className = 'message-bubble';
     activeAiBubble = bubble;
   }
+
+  const runningConversationId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+  const activeConv = typeof conversations !== 'undefined'
+    ? conversations.find(c => c.id === activeConversationId)
+    : null;
+  const isDispatchConversation = activeConv && conversationMode(activeConv) === 'orion';
+  const isRunningThisConversation = !!(window.isAgentRunning && window.isAgentRunning() && runningConversationId === activeConversationId);
   
   let logsHtml = '';
   if (hasLogs) {
+    if (isDispatchConversation) {
+      logsHtml = isRunningThisConversation ? formatDispatchToolActivity(logs) : '';
+    } else {
     const isRunning = window.isAgentRunning && window.isAgentRunning();
     const displayStyle = isRunning ? 'flex' : 'none';
     const arrowSymbol = isRunning ? '▲' : '▼';
@@ -3213,6 +3310,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     });
     
     logsHtml += `</div></div>`;
+    }
   }
   
   // Render markdown text
@@ -3224,10 +3322,6 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   let runningIndicatorHtml = '';
   let planApprovalHtml = '';
   let clarificationHtml = '';
-  const runningConversationId = window.getRunningConversationId ? window.getRunningConversationId() : null;
-  const activeConv = typeof conversations !== 'undefined'
-    ? conversations.find(c => c.id === activeConversationId)
-    : null;
   // Decide whether THIS bubble is the plan-approval card. On a fresh live render the message
   // object is not threaded in, so fall back to conversation state (the active bubble during a
   // planning yield is the plan bubble). On reloads the persisted msgMeta.isPlanApprovalCard

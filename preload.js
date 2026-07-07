@@ -70,8 +70,10 @@ contextBridge.exposeInMainWorld('api', {
   appendProjectMemory: (workspacePath, fact) => ipcRenderer.invoke('orion:append-project-memory', { workspacePath, fact }),
   
   // Update checker
-  checkGitUpdate: () => ipcRenderer.invoke('check-git-update'),
-  applyGitUpdate: () => ipcRenderer.invoke('apply-git-update'),
+  checkLocalUpdate: () => ipcRenderer.invoke('check-local-update'),
+  applyLocalUpdate: () => ipcRenderer.invoke('apply-local-update'),
+  checkGitUpdate: () => ipcRenderer.invoke('check-local-update'),
+  applyGitUpdate: () => ipcRenderer.invoke('apply-local-update'),
   restartApp: () => ipcRenderer.invoke('restart-app'),
 
   // Config Controls

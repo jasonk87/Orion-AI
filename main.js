@@ -103,8 +103,9 @@ function registerAllHandlers() {
 
 // ── App lifecycle ──────────────────────────────────────────────────────────────
 
-const gotTheLock = typeof app.requestSingleInstanceLock === 'function' ? app.requestSingleInstanceLock() : true;
-if (!gotTheLock) {
+const isTestRuntime = process.env.NODE_ENV === 'test';
+const gotTheLock = !isTestRuntime && typeof app.requestSingleInstanceLock === 'function' ? app.requestSingleInstanceLock() : true;
+if (!isTestRuntime && !gotTheLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
@@ -115,11 +116,11 @@ if (!gotTheLock) {
   });
 
   app.whenReady().then(async () => {
-    if (await ipcUi.checkForSourceUpdatesAndRelaunch()) return;
+    if (!isTestRuntime && await ipcUi.checkForSourceUpdatesAndRelaunch()) return;
 
     registerAllHandlers();
     createWindow();
-    ipcServer.startPhoneCompanionServer();
+    if (!isTestRuntime) ipcServer.startPhoneCompanionServer();
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -199,6 +200,8 @@ if (process.env.NODE_ENV === 'test') {
     syncSourceUpdateFiles: ipcUi.syncSourceUpdateFiles,
     isLikelySourceDir: ipcUi.isLikelySourceDir,
     resolveUpdateSourceDir: ipcUi.resolveUpdateSourceDir,
+    checkLocalSourceUpdates: ipcUi.checkLocalSourceUpdates,
+    applyLocalSourceUpdateAndRestart: ipcUi.applyLocalSourceUpdateAndRestart,
     AUTO_UPDATE_FILES: ipcUi.AUTO_UPDATE_FILES,
     // safety / shared
     resolveWorkspacePath,

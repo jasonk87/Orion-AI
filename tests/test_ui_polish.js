@@ -36,17 +36,14 @@ test('desktop polish includes accessible focus and reduced-motion behavior', (t)
 });
 
 test('phone companion finishes with the same dark theme and complete mission hierarchy', (t) => {
-  const unifiedThemeIndex = companionHtml.indexOf('Unified Orion dark companion theme');
-  const legacyLightIndex = companionHtml.indexOf('Codex-inspired mobile shell, Orion palette');
-  const desktopAlignedIndex = companionHtml.indexOf('Desktop-aligned Orion mobile refinement');
-  t.ok(unifiedThemeIndex > legacyLightIndex, 'unified dark theme wins the cascade');
-  t.ok(desktopAlignedIndex > unifiedThemeIndex, 'desktop-aligned phone refinement is the final theme layer');
-  t.ok(companionHtml.slice(unifiedThemeIndex).includes('color-scheme: dark'), 'phone declares dark controls');
-  t.ok(companionHtml.slice(desktopAlignedIndex).includes('--bg: #090b12'), 'phone uses the desktop graphite background');
-  t.ok(companionHtml.slice(desktopAlignedIndex).includes('--accent: #8273f4'), 'phone uses the desktop violet-blue accent');
-  t.ok(companionHtml.slice(desktopAlignedIndex).includes('--success: #46d59b'), 'phone uses the desktop success color');
-  t.ok(companionHtml.slice(unifiedThemeIndex).includes('#mission-context-card { grid-area: mission; }'), 'Mission Control has an explicit mobile layout area');
-  t.ok(companionHtml.slice(unifiedThemeIndex).includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
+  const rootIndex = companionHtml.indexOf('Single consolidated :root');
+  t.ok(rootIndex !== -1, 'phone theme is consolidated into one root layer');
+  t.ok(companionHtml.includes('color-scheme: dark'), 'phone declares dark controls');
+  t.ok(companionHtml.includes('--bg: #090b12'), 'phone uses the desktop graphite background');
+  t.ok(companionHtml.includes('--accent: #8273f4'), 'phone uses the desktop violet-blue accent');
+  t.ok(companionHtml.includes('--success: #46d59b'), 'phone uses the desktop success color');
+  t.ok(companionHtml.includes('#mission-context-card { grid-area: mission; }'), 'Mission Control has an explicit mobile layout area');
+  t.ok(companionHtml.includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
   t.ok(companionHtml.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
   t.ok(companionHtml.includes('ui-polish-v14'), 'phone shell exposes the current UI build version');
   t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v14"), 'phone service worker cache is bumped for the current UI build');
@@ -118,6 +115,14 @@ test('phone companion renders approvals and tool calls as first-class mobile UI'
   t.end();
 });
 
+test('Dispatch hides Coder-style tool logs behind compact activity', (t) => {
+  t.ok(renderer.includes('function formatDispatchToolActivity'), 'renderer has a Dispatch-specific compact tool activity renderer');
+  t.ok(renderer.includes("conversationMode(activeConv) === 'orion'"), 'Dispatch detection is based on conversation mode');
+  t.ok(renderer.includes("logsHtml = isRunningThisConversation ? formatDispatchToolActivity(logs) : ''"), 'Dispatch only shows compact activity while the run is active');
+  t.ok(styles.includes('.dispatch-tool-activity'), 'compact Dispatch tool activity is styled');
+  t.end();
+});
+
 test('conversation deletion has visible confirmation UI on desktop and phone', (t) => {
   t.ok(renderer.includes('function showOrionConfirmDialog'), 'desktop has an in-app confirmation modal');
   t.ok(renderer.includes('confirmConversationDelete'), 'desktop conversation delete uses confirmation helper');
@@ -184,9 +189,19 @@ test('desktop exposes quiet runtime version and update state UI', (t) => {
   t.ok(styles.includes('font-family: var(--font-mono);'), 'metadata uses compact code-style numerals');
   t.ok(renderer.includes('refreshAppRuntimeInfo'), 'renderer populates runtime metadata on startup');
   t.ok(preload.includes('getAppRuntimeInfo'), 'preload exposes runtime metadata IPC');
+  t.ok(html.includes('id="btn-check-update"'), 'desktop titlebar exposes a manual local update check');
+  t.ok(styles.includes('.update-check-btn'), 'manual update check has desktop titlebar styling');
+  t.ok(renderer.includes("addEventListener('click', () => checkForLocalUpdates({ manual: true }))"), 'manual update check triggers the local comparison');
   t.ok(main.includes('buildUpdateSplashHtml'), 'main process owns the pre-render update splash');
   t.ok(ipcUiJs.includes('Updating local build'), 'update splash has user-facing maintenance copy');
   t.ok(main.includes('syncSourceUpdateFiles'), 'source updater copies files through a named sync helper');
+  t.ok(preload.includes('checkLocalUpdate'), 'preload exposes local-file update checks');
+  t.ok(preload.includes('applyLocalUpdate'), 'preload exposes local-file update application');
+  t.ok(renderer.includes('checkForLocalUpdates'), 'desktop update checker uses local-file update wording');
+  t.ok(renderer.includes('Syncing...'), 'desktop update action describes local file sync instead of git pull');
+  t.notOk(renderer.includes('Pulling...'), 'desktop update action no longer presents GitHub pull wording');
+  t.ok(ipcUiJs.includes("ipcMain.handle('check-local-update'"), 'main process exposes local-file update IPC');
+  t.ok(ipcUiJs.includes('computeSourceUpdates(srcDir, appRoot)'), 'update check compares local source files against runtime files');
   t.end();
 });
 
