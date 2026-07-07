@@ -967,6 +967,13 @@ test('Dispatch uses Projects fallback while Coder standalone conversations get i
   t.ok(rendererJs.includes('c.projectPath && isGeneratedStandaloneWorkspace(c.workspace)'), 'migration clears accidental project linkage from generated standalone workspaces');
   t.ok(rendererJs.includes("conversationMode(c) === 'coder' && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)"), 'migration never promotes generated standalone workspaces or Dispatch conversations into projects');
   t.ok(agentJs.includes("if (conversation.mode === 'coder')") && agentJs.includes('conversation.projectPath = targetPath'), 'change_workspace only promotes Coder conversations into project scope');
+  t.ok(rendererJs.includes('function addProjectPath'), 'project registration is centralized instead of mixed into every workspace change');
+  t.ok(rendererJs.includes('if (promoteProjectForWorkspace) addProjectPath(folderPath)'), 'Dispatch workspace changes do not add folders to the Coder project list unless explicitly promoted');
+  t.ok(rendererJs.includes('window.promoteWorkspaceToCoder'), 'renderer exposes an explicit Dispatch-to-Coder promotion path');
+  t.ok(rendererJs.includes("source: 'dispatch-handoff'"), 'Dispatch handoffs queue Coder prompts with a distinct source');
+  t.ok(agentJs.includes("'handoff_to_coder'"), 'Dispatch allowlist includes the explicit Coder handoff tool');
+  t.ok(agentJs.includes('change_workspace alone must not add folders to Coder'), 'handoff tool declaration teaches the model that workspace inspection is not project promotion');
+  t.ok(agentJs.includes('window.promoteWorkspaceToCoder'), 'handoff_to_coder executes through the renderer promotion API');
   t.ok(agentJs.includes('isGeneratedStandaloneWorkspacePath') && agentJs.includes('getDispatchWorkspaceRoot()'), 'agent ignores generated Dispatch workspaces and falls back to the Projects root');
   t.ok(agentJs.includes('formatKnownProjectsForSystemFacts'), 'agent can include registered project paths in Dispatch context');
   t.ok(rendererJs.includes('function createPhoneConversation'), 'phone conversations use a dedicated constructor');

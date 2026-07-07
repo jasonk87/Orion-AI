@@ -753,10 +753,7 @@ function setupWorkspaceHandlers() {
 
 async function setWorkspace(folderPath) {
   // If folderPath is in projects list, switch to it
-  if (!projects.includes(folderPath)) {
-    projects.push(folderPath);
-    saveProjectsToStorage();
-  }
+  addProjectPath(folderPath);
   
   // Set current parent project
   currentWorkspace = folderPath;
@@ -2058,6 +2055,32 @@ function createNewConversationUnderProject(projectPath) {
   el.chatInput.focus();
 }
 
+function createCoderConversationForProject(projectPath, { title = 'New Coder Task', select = false } = {}) {
+  const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+  const newConv = {
+    id: newId,
+    title: title || 'New Coder Task',
+    mode: 'coder',
+    projectPath,
+    workspace: projectPath,
+    messages: [],
+    tasks: [],
+    testResults: null
+  };
+
+  conversations.unshift(newConv);
+  saveConversationsToStorage();
+
+  if (select) {
+    selectConversation(newId);
+    el.chatInput.focus();
+  } else {
+    renderConversationList();
+  }
+
+  return newConv;
+}
+
 function getStandaloneWorkspaceRoot() {
   const configured = (appConfig.standaloneWorkspaceRoot || '').trim();
   if (configured) return configured.replace(/[\\\/]+$/, '');
@@ -2070,6 +2093,17 @@ function getStandaloneWorkspaceForTitle(title, convId) {
   // conversations with identical titles never share the same workspace folder.
   const suffix = convId ? '-' + String(convId).replace(/[^a-z0-9]/gi, '').slice(-8) : '';
   return getStandaloneWorkspaceRoot() + '\\' + slug + suffix;
+}
+
+function addProjectPath(folderPath) {
+  const normalized = normalizePathForComparison(folderPath);
+  if (!normalized) return false;
+  const exists = projects.some(pathValue => normalizePathForComparison(pathValue) === normalized);
+  if (exists) return false;
+  projects.push(folderPath);
+  saveProjectsToStorage();
+  renderProjectsList();
+  return true;
 }
 
 function normalizePathForComparison(path) {
@@ -3793,11 +3827,15 @@ window.getActiveConversationId = () => activeConversationId;
 window.getCurrentWorkspace = () => currentWorkspace;
 window.changeActiveWorkspace = function(folderPath, options = {}) {
   const targetConversationId = options.conversationId || activeConversationId;
+  let promoteProjectForWorkspace = options.promoteProject === true;
+  let targetMode = appMode;
   if (targetConversationId) {
     const conv = conversations.find(c => c.id === targetConversationId);
     if (conv) {
       conv.workspace = folderPath;
+      targetMode = conversationMode(conv);
       const promoteProject = options.promoteProject === true || (options.promoteProject !== false && conversationMode(conv) === 'coder');
+      promoteProjectForWorkspace = promoteProject;
       if (promoteProject) {
         conv.projectPath = folderPath;
       } else if (conversationMode(conv) === 'orion') {
@@ -3806,16 +3844,57 @@ window.changeActiveWorkspace = function(folderPath, options = {}) {
       saveConversationsToStorage();
     }
   }
-  if (!projects.includes(folderPath)) {
-    projects.push(folderPath);
-    saveProjectsToStorage();
-    renderProjectsList();
-  }
+  if (promoteProjectForWorkspace) addProjectPath(folderPath);
   currentWorkspace = folderPath;
   expandedFileFolders = new Set();
   el.workspaceLabel.textContent = folderPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || folderPath;
-  syncWorkspaceFiles();
+  if (promoteProjectForWorkspace || targetMode === 'coder') {
+    syncWorkspaceFiles();
+  } else {
+    el.fileTree.innerHTML = '<p class="empty-state">Dispatch is inspecting this folder. Promote it to Coder when you want to build or edit here.</p>';
+    el.fileCountBadge.textContent = '0';
+    if (el.workspaceFilesPanel) el.workspaceFilesPanel.classList.add('contextual-panel-hidden');
+  }
   refreshOperationalContext();
+};
+window.promoteWorkspaceToCoder = function(options = {}) {
+  const folderPath = String(options.path || currentWorkspace || '').trim();
+  if (!folderPath) return { success: false, error: 'No workspace path to promote.' };
+  addProjectPath(folderPath);
+
+  const prompt = String(options.prompt || '').trim();
+  const title = String(options.title || '').trim()
+    || (prompt ? generateConversationTitle(prompt) : 'New Coder Task');
+  const conv = createCoderConversationForProject(folderPath, {
+    title,
+    select: options.open === true
+  });
+
+  if (prompt) {
+    window.promptQueue = window.promptQueue || [];
+    window.promptQueue.push({
+      id: createQueuedPromptId(),
+      prompt,
+      modelSelectValue: window.getSelectedModel(),
+      conversationId: conv.id,
+      source: 'dispatch-handoff',
+      createdAt: Date.now()
+    });
+    persistAssistantStatusMessage(conv.id, 'Queued from Dispatch. Coder will start when the current turn finishes.', {
+      source: 'queue-status',
+      dedupeKey: `dispatch-handoff-${conv.id}`
+    });
+  }
+
+  renderProjectsList();
+  renderConversationList();
+  return {
+    success: true,
+    projectPath: folderPath,
+    conversationId: conv.id,
+    title: conv.title,
+    queued: !!prompt
+  };
 };
 window.getSelectedModel = () => el.modelSelect ? el.modelSelect.value : appConfig.defaultModel;
 window.getKnownProjects = () => projects.slice();

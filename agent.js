@@ -152,7 +152,7 @@ At the start of a conversation, call recall_memory with scope="global" to orient
 
 {{user_memory}}
 
-Tools available (all read-only — you have no file-write, command-execution, or project-memory tools; route anything needing those to the coder):
+Tools available (you can inspect/read and explicitly hand work to Coder; you still cannot edit files, run commands, or write project memory yourself):
 - recall_memory: Read memory for the given scope ("global", "project", or "all"). Call this at the start of conversations.
 - remember_fact: Store a durable fact in global memory.
 - remember_preference: Store a user preference at global level.
@@ -165,7 +165,8 @@ Tools available (all read-only — you have no file-write, command-execution, or
 - search_embeddings / semantic_search: Semantic search over the workspace's indexed content.
 - get_symbol_index / get_file_symbols / find_references: Look up functions/classes/symbols and their usages.
 - read_notes / read_project_memory: Read this conversation's or a project's saved notes/memory.
-- change_workspace: Point yourself at a different local folder to read from, when Jason asks about a specific project.`;
+- change_workspace: Point yourself at a different local folder to read from, when Jason asks about a specific project.
+- handoff_to_coder: Promote the active or specified local folder into Coder and optionally queue the exact task Cody should start. Use when Jason says to make it a project, have Cody start, build it, fix it, or move the discussed direction into implementation.`;
 
 // Returns the right system instruction for the current mode.
 // Pass cachedMemory (string) to inject into the dispatcher instruction.
@@ -2963,6 +2964,38 @@ async function executeTool(name, args, workspace, config, conversation) {
         fuzzyResolved: !!resolution.fuzzyResolved,
         resolvedFrom: resolution.resolvedFrom,
         matchedName: resolution.matchedName || getLocalPathBaseName(targetPath)
+      };
+    }
+
+    case 'handoff_to_coder': {
+      const requestedPath = String(args.path || workspace || conversation.workspace || '').trim();
+      if (!requestedPath) throw new Error("Missing workspace path to hand off to Coder");
+      const resolution = await resolveWorkspacePathForChange(requestedPath);
+      if (!resolution.success) {
+        throw new Error(`Coder handoff path "${resolution.path}" is invalid or does not exist: ${resolution.error}`);
+      }
+      if (typeof window.promoteWorkspaceToCoder !== 'function') {
+        throw new Error('Coder handoff is not available in this Orion build.');
+      }
+      const prompt = String(args.prompt || '').trim();
+      const result = window.promoteWorkspaceToCoder({
+        path: resolution.path,
+        prompt,
+        title: args.title || '',
+        open: args.open === true
+      });
+      if (!result || result.success === false) {
+        throw new Error((result && result.error) || 'Coder handoff failed.');
+      }
+      return {
+        ...result,
+        success: true,
+        message: prompt
+          ? `Promoted ${resolution.path} to Coder and queued the task for Cody.`
+          : `Promoted ${resolution.path} to Coder as a project.`,
+        fuzzyResolved: !!resolution.fuzzyResolved,
+        resolvedFrom: resolution.resolvedFrom,
+        matchedName: resolution.matchedName || getLocalPathBaseName(resolution.path)
       };
     }
 
@@ -6549,14 +6582,16 @@ function convertGeminiToOllamaMessages(geminiMessages) {
   return ollamaMessages;
 }
 
-// Dispatch (Orion) is read-only by design -- it can look at files, code, and the web to back up
-// what it says, but it must never be structurally able to write, edit, run, or execute anything;
-// that's Coder's job. This whitelist is enforced below regardless of what the system prompt text
-// claims, so the restriction can't be talked around by a model that decides to route differently.
+// Dispatch (Orion) can look at files, code, and the web to back up what it says, and it can
+// explicitly hand a workspace to Coder when Jason asks. It must never be structurally able to
+// write, edit, run, or execute anything itself; that's Coder's job. This whitelist is enforced
+// below regardless of what the system prompt text claims, so the restriction can't be talked
+// around by a model that decides to route differently.
 const DISPATCH_TOOL_ALLOWLIST = new Set([
   'recall_memory', 'remember_fact', 'remember_preference',
   'google_search', 'fetch_web_page',
   'read_file', 'list_files', 'get_workspace_info', 'change_workspace',
+  'handoff_to_coder',
   'grep_search', 'search_embeddings', 'semantic_search',
   'get_symbol_index', 'get_file_symbols', 'find_references',
   'read_notes', 'read_project_memory'
@@ -6595,6 +6630,19 @@ function buildAgentToolDeclarations() {
                 path: { type: "STRING", description: "The verified absolute path to the directory you want to set as the active workspace." }
               },
               required: ["path"]
+            }
+          },
+          {
+            name: "handoff_to_coder",
+            description: "Promotes a local folder into Coder as an explicit project and optionally queues a Coder prompt to start implementation. Use after Dispatch has inspected/discussed a project and Jason asks to make it a project, move it to Coder, have Cody start, build it, or fix it. This is the explicit promotion path; change_workspace alone must not add folders to Coder.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                path: { type: "STRING", description: "Optional absolute folder path to promote. Defaults to the current Dispatch workspace." },
+                prompt: { type: "STRING", description: "Optional exact task for Coder to start, such as what to build, fix, or investigate." },
+                title: { type: "STRING", description: "Optional title for the new Coder conversation." },
+                open: { type: "BOOLEAN", description: "Whether to switch the UI to the new Coder conversation immediately. Defaults to false." }
+              }
             }
           },
           {
