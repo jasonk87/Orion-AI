@@ -7425,14 +7425,22 @@ function convertGeminiToDeepSeekMessages(geminiMessages) {
       lastToolCallIds = [];
       (msg.parts || []).forEach(p => {
         if (p.functionCall) {
-          const id = `call_orion_${toolCallCounter++}`;
+          const id = p.functionCall._deepseekToolCallId || p._deepseekToolCallId || `call_orion_${toolCallCounter++}`;
           lastToolCallIds.push(id);
           toolCalls.push({ id, type: 'function', function: { name: p.functionCall.name, arguments: JSON.stringify(p.functionCall.args || {}) } });
         }
       });
       const joinedText = textParts.join('');
       const assistantMsg = { role: 'assistant', content: joinedText || (reasoningContent ? "" : null) };
-      if (reasoningContent) assistantMsg.reasoning_content = reasoningContent;
+      // DeepSeek thinking mode requires reasoning_content to be passed back on every
+      // assistant turn that performed tool calls. Older/sanitized Orion histories may have
+      // tool calls without the hidden reasoning part; include a minimal continuity marker so
+      // DeepSeek does not reject the whole request with a 400.
+      if (reasoningContent) {
+        assistantMsg.reasoning_content = reasoningContent;
+      } else if (toolCalls.length > 0) {
+        assistantMsg.reasoning_content = '[Orion internal note: reasoning_content was not preserved for this earlier tool-call turn; continue from the tool calls and tool results.]';
+      }
       if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
       out.push(assistantMsg);
     } else if (msg.role === 'tool') {
@@ -7495,7 +7503,9 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
           if (typeof args === 'string') {
             try { args = JSON.parse(args); } catch (_) { args = {}; }
           }
-          parts.push({ functionCall: { name: tc.function.name, args: args || {} } });
+          const functionCall = { name: tc.function.name, args: args || {} };
+          if (tc.id) functionCall._deepseekToolCallId = tc.id;
+          parts.push({ functionCall });
         });
         return { _orionActiveModelName: modelName, candidates: [{ content: { parts } }] };
       }

@@ -67,6 +67,40 @@ test('convertGeminiToDeepSeekMessages preserves hidden reasoning_content without
   t.end();
 });
 
+test('convertGeminiToDeepSeekMessages adds reasoning continuity for tool-call turns that lost it', (t) => {
+  const messages = [
+    {
+      role: 'model',
+      parts: [
+        { text: 'I will inspect the file.' },
+        { functionCall: { name: 'read_file', args: { path: 'agent.js' } } }
+      ]
+    }
+  ];
+  const [out] = agent.convertGeminiToDeepSeekMessages(messages);
+  t.equal(out.content, 'I will inspect the file.', 'visible content is preserved');
+  t.ok(out.reasoning_content.includes('reasoning_content was not preserved'), 'tool-call turns always carry reasoning_content for DeepSeek thinking mode');
+  t.equal(out.tool_calls[0].function.name, 'read_file', 'tool call is still present');
+  t.end();
+});
+
+test('convertGeminiToDeepSeekMessages reuses provider tool call ids when they were preserved', (t) => {
+  const messages = [
+    {
+      role: 'model',
+      parts: [
+        { text: 'private tool reasoning', thought: true, _deepseekReasoningContent: true },
+        { functionCall: { name: 'grep_search', args: { pattern: 'foo' }, _deepseekToolCallId: 'call_real_123' } }
+      ]
+    },
+    { role: 'tool', parts: [{ functionResponse: { name: 'grep_search', response: { results: [] } } }] }
+  ];
+  const out = agent.convertGeminiToDeepSeekMessages(messages);
+  t.equal(out[0].tool_calls[0].id, 'call_real_123', 'assistant message keeps the DeepSeek tool call id');
+  t.equal(out[1].tool_call_id, 'call_real_123', 'tool response references the same preserved id');
+  t.end();
+});
+
 test('callDeepSeekAPI posts to the DeepSeek endpoint with Bearer auth and normalizes the reply to Gemini shape', async (t) => {
   const originalFetch = global.fetch;
   let captured = null;
@@ -105,6 +139,7 @@ test('callDeepSeekAPI posts to the DeepSeek endpoint with Bearer auth and normal
     t.equal(parts[1].text, "I'll read the file first.", 'content normalizes to a Gemini text part');
     t.equal(parts[2].functionCall.name, 'read_file', 'tool_calls normalize to a Gemini functionCall');
     t.deepEqual(parts[2].functionCall.args, { path: 'server.js' }, 'stringified arguments are parsed back into functionCall args');
+    t.equal(parts[2].functionCall._deepseekToolCallId, 'call_x', 'provider tool call id is preserved for later DeepSeek requests');
     t.equal(result._orionActiveModelName, 'deepseek-v4-pro', 'reports the active model back to the loop');
   } finally {
     global.fetch = originalFetch;
