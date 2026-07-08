@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, Notification } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const shared = require('./lib/shared');
@@ -51,7 +51,7 @@ function registerAllHandlers() {
   ipcFileTools.registerHandlers(ipcMain);
   ipcShell.registerHandlers(ipcMain, { getWorkspaceEntrypoint, readAppConfig, startStaticWorkspaceServer });
   ipcWorkspace.registerHandlers(ipcMain, { startStaticWorkspaceServer });
-  ipcServer.registerHandlers(ipcMain);
+  ipcServer.registerHandlers(ipcMain, { Notification });
   ipcUi.registerHandlers(ipcMain);
   symbolIndex.registerHandlers(ipcMain);
   ipcSkill.registerHandlers(ipcMain);
@@ -104,6 +104,9 @@ function registerAllHandlers() {
 // ── App lifecycle ──────────────────────────────────────────────────────────────
 
 const isTestRuntime = process.env.NODE_ENV === 'test';
+if (!isTestRuntime && process.platform === 'win32' && typeof app.setAppUserModelId === 'function') {
+  app.setAppUserModelId('orion-ai');
+}
 const gotTheLock = !isTestRuntime && typeof app.requestSingleInstanceLock === 'function' ? app.requestSingleInstanceLock() : true;
 if (!isTestRuntime && !gotTheLock) {
   app.quit();

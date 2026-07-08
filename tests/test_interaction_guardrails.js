@@ -944,6 +944,8 @@ test('workspace artifacts and file explorer controls are wired', (t) => {
   t.ok(rendererJs.includes('cleanupConversationArtifacts'), 'conversation deletion cleans up external artifacts');
   t.ok(rendererJs.includes('openImageArtifact'), 'renderer can open screenshot artifacts');
   t.ok(rendererJs.includes('readWorkspaceFileBase64'), 'renderer loads screenshot and PNG files through the image viewer');
+  t.ok(rendererJs.includes('renderInlineArtifactCards'), 'renderer presents visual artifacts inline in chat');
+  t.ok(rendererJs.includes('orion-artifact://'), 'renderer opens conversation-scoped artifact links');
   t.ok(rendererJs.includes('window.loadRunArtifacts = loadRunArtifacts'), 'agent can refresh the artifact panel after saving screenshot artifacts');
   t.ok(rendererJs.includes('deleteWorkspacePath'), 'file explorer delete handler exists');
   t.ok(rendererJs.includes('moveWorkspacePath'), 'file explorer move handler exists');

@@ -2453,7 +2453,7 @@ test('utility/classifier call sites are wrapped with resolveUtilityModelName ins
 
   t.ok(agentSource.includes('classifyPlanApprovalIntent(userPrompt, resolveUtilityModelName(modelName), config)'),
     'classifyPlanApprovalIntent call site uses the resolved cheap model');
-  const planningNeedMatches = agentSource.match(/classifyPlanningNeed\(userPrompt, resolveUtilityModelName\(modelName\), config\)/g) || [];
+  const planningNeedMatches = agentSource.match(/classifyPlanningNeed\(userPrompt, resolveUtilityModelName\(modelName\), config(?:, conversation\.messages)?\)/g) || [];
   t.ok(planningNeedMatches.length >= 3, 'all classifyPlanningNeed call sites use the resolved cheap model');
   t.ok(agentSource.includes('countTokens(messages, resolveUtilityModelName(modelName), config'),
     'countTokens call site uses the resolved cheap model');

@@ -138,8 +138,8 @@ WHO YOU'RE TALKING TO:
 Jason. Solo developer. Casual, direct — he wants the answer, not the explanation. He'll give you context as it comes up. Don't ask for everything upfront.
 
 HOW YOU WORK:
-Handle directly: conversation, strategy, planning, research, reading and discussing code or docs, answering questions, web searches. You can look at files and search the web to back up what you say, but you cannot write, edit, or run anything — you are read-only by design.
-Route to the coder: anything requiring file changes, writing or debugging code, running tests, building or fixing features. Before routing, make sure you understand the task well enough to hand it off clearly — ask Jason to clarify if you don't. When you route something, tell him. Don't go quiet. Report back with a clean summary when it's done.
+Handle directly: conversation, strategy, planning, research, reading and discussing code or docs, answering questions, web searches. You can look at files and search the web to back up what you say, but you cannot write, edit, run commands, capture screenshots, or operate the desktop yourself — you are read-only by design.
+Route to the coder: anything requiring file changes, writing or debugging code, running tests, building or fixing features, running local commands, capturing the desktop/screen, or producing local files/artifacts for Jason. Before routing, make sure you understand the task well enough to hand it off clearly — ask Jason to clarify if you don't. When you route something, tell him. Don't go quiet. Report back with a clean summary when it's done.
 
 HOW YOU THINK:
 Don't snap-route. Ask yourself first: can I handle this directly? Do I have enough context to give the coder a clear task? Is this a coding problem or a planning conversation first? Think it through, then act.
@@ -163,10 +163,10 @@ Tools available (you can inspect/read and explicitly hand work to Coder; you sti
 - get_workspace_info: Return the active workspace directory.
 - grep_search: Search file contents across the workspace for a literal string or regex pattern.
 - search_embeddings / semantic_search: Semantic search over the workspace's indexed content.
-- get_symbol_index / get_file_symbols / find_references: Look up functions/classes/symbols and their usages.
+- get_symbol_index / get_file_symbols / find_references: Look up functions/classes/symbols and their usages. get_file_symbols supports JS/TS/JSX/TSX and Python files.
 - read_notes / read_project_memory: Read this conversation's or a project's saved notes/memory.
 - change_workspace: Point yourself at a different local folder to read from, when Jason asks about a specific project.
-- handoff_to_coder: Promote the active or specified local folder into Coder and optionally queue the exact task Cody should start. Use when Jason says to make it a project, have Cody start, build it, fix it, or move the discussed direction into implementation.`;
+- handoff_to_coder: Hand off a task to the Coder agent. Pass only: the workspace path and a concise task description (1-3 sentences max). Do NOT package context, plans, or summaries — Coder reads its own workspace. Use when Jason asks to build, fix, implement, run a local command, take a screenshot, inspect the desktop, or produce a local file/artifact.`;
 
 // Returns the right system instruction for the current mode.
 // Pass cachedMemory (string) to inject into the dispatcher instruction.
@@ -530,6 +530,40 @@ window.isAgentRunning = () => isAgentRunning;
 window.getRunningConversationId = () => runningConversationId;
 window.getAgentSubStatus = () => agentSubStatus;
 window.getAgentExecutionMode = () => agentExecutionMode;
+
+// ── Supervisor: expose a snapshot of a Coder conversation for status summaries ──
+window.getCoderConversationSummary = function(coderConvId) {
+  if (typeof conversations === 'undefined') return null;
+  const conv = conversations.find(c => c.id === coderConvId);
+  if (!conv) return null;
+  const msgs = (conv.messages || []).slice(-15);
+  const recentActivity = [];
+  msgs.forEach(msg => {
+    const logs = Array.isArray(msg.logs) ? msg.logs : [];
+    logs.forEach(log => {
+      if (log.type === 'tool_call' && log.tool) {
+        recentActivity.push({ tool: log.tool, status: log.status || 'done', result: String(log.result || '').slice(0, 150) });
+      }
+    });
+    if (msg.role === 'assistant' && msg.text && msg.text.trim() !== 'Thinking...') {
+      recentActivity.push({ tool: '_thought', text: String(msg.text).slice(0, 250) });
+    }
+  });
+  const tasks = Array.isArray(conv.tasks) ? conv.tasks : [];
+  const doneTasks = tasks.filter(t => t.status === 'completed' || t.status === 'x');
+  const pendingTasks = tasks.filter(t => t.status !== 'completed' && t.status !== 'x');
+  return {
+    title: conv.title || 'Coder Task',
+    tasks,
+    doneTasks,
+    pendingTasks,
+    recentActivity: recentActivity.slice(-10),
+    awaitingClarification: conv.awaitingClarification || null,
+    awaitingPlanApproval: !!(conv.awaitingPlanApproval && !conv.planApproved),
+    subStatus: agentSubStatus,
+    isRunning: isAgentRunning && runningConversationId === coderConvId
+  };
+};
 function createUserStopError(mode = stopRequestMode || 'hard') {
   const err = new Error(mode === 'soft' ? 'Agent stop requested by user.' : 'Agent hard stop requested by user.');
   err.userStop = true;
@@ -755,7 +789,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       suppressPlanApprovalCardThisTurn = true;
       const decision = config.planningMode === false
         ? { mode: 'direct', reason: 'Planning mode disabled.' }
-        : await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config);
+        : await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config, conversation.messages);
       planningDecision = decision;
       reviewOnly = !!decision.reviewOnly;
       if (reviewOnly && planningDecision.mode === 'plan') {
@@ -782,7 +816,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // unless the model judges it a genuinely new plan-worthy task.
     const decision = config.planningMode === false
       ? { mode: 'direct', reason: 'Planning mode disabled.' }
-      : await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config);
+      : await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config, conversation.messages);
     // A mission is genuinely in progress when an active subplan still has work or any win
     // condition is unsatisfied. While that is true we must NEVER downgrade to a re-plan: doing
     // so clears planApproved and wipes the operational context (mission/subplan/win conditions),
@@ -808,7 +842,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     agentExecutionMode = 'direct';
   } else {
     // Fresh task, nothing pending or approved. The model decides plan / direct / answer.
-    const decision = await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config);
+    const decision = await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config, conversation.messages);
     planningDecision = decision;
     reviewOnly = !!decision.reviewOnly;
     resetMissionState = true; // a fresh task should not inherit a previous mission's state
@@ -1129,6 +1163,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const executingApprovedPlan = (!config.planningMode || conversation.planApproved || planningBypassedForTask)
       && hasOperationalMissionState(workingState);
     if (executingApprovedPlan && !reviewOnly) maxLoops = 100;
+    // Planning phase (not yet approved, writing a plan doc) needs more room than a simple task
+    // because it must survey the codebase AND produce a complete multi-section plan document.
+    // Without this, deep codebase surveys hit the 20-loop ceiling before finishing the plan.
+    const writingPlan = planningDecision.mode === 'plan' && !conversation.planApproved && !planningBypassedForTask;
+    if (writingPlan && !reviewOnly) maxLoops = 40;
     let planValidationRetries = 0;
     let consecutiveNoToolCalls = 0;
     let malformedCallsCount = 0;
@@ -1142,6 +1181,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     let pendingWorkspaceResolutionPrompts = 0;
     let memoryNudgeSent = false;
     let skillGateFired = false;
+    let skillDiscoveryChecked = false; // true once discover_skills has been called this run
     let blankFinalAnswerNudgeSent = false;
     const repeatedToolFailures = new Map();
     const fileEditCounts = new Map();
@@ -1764,58 +1804,42 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         )) {
           strategyStatus = await readStrategyStatus(workspacePath, conversation);
         }
-        const reviewGate = reviewOnly ? getReviewOnlyToolGate(toolName, args) : { allowed: true, reason: '' };
-        if (!reviewGate.allowed) {
-          const failure = classifyAgentFailure({
-            toolName,
-            args,
-            errorText: reviewGate.reason
-          });
-          const guidance = buildFailureRecoveryGuidance(failure);
-          currentAgentLogs[logIndex].status = 'error';
-          currentAgentLogs[logIndex].result = reviewGate.reason;
+        // Track when discover_skills is called so the create_skill gate knows it's been done
+        if (toolName === 'discover_skills') skillDiscoveryChecked = true;
 
-          toolResponseParts.push({
-            functionResponse: {
-              name: toolName,
-              response: { error: reviewGate.reason, failureCategory: failure.category, recoveryGuidance: guidance }
-            }
-          });
-          const transition = await recordToolOutcomeInWorkingState(workspacePath, toolName, args, { error: reviewGate.reason, failureCategory: failure.category });
-          if (transition && transition.state) {
-            workingState = transition.state;
-            refreshWorkingStateMessage();
-          }
-          updateWalkthroughItem(walkthroughItem, toolName, args, { error: reviewGate.reason, failureCategory: failure.category }, new Error(reviewGate.reason));
-          persistCurrentAgentLogs({ render: true });
-          continue;
-        }
+        const reviewGate = reviewOnly ? getReviewOnlyToolGate(toolName, args) : { allowed: true, reason: '' };
         const planningGate = getPlanningToolGate(config, canExecuteThisTask(), toolName, args, {
           strategyStatus,
           agentExecutionMode
         });
-        if (!planningGate.allowed) {
-          const failure = classifyAgentFailure({
-            toolName,
-            args,
-            errorText: planningGate.reason
-          });
+        // Skill-discovery gate: require discover_skills before create_skill so Orion checks for
+        // an existing skill first rather than recreating capabilities that already exist.
+        const skillDiscoveryGate = (toolName === 'create_skill' && !skillDiscoveryChecked)
+          ? { allowed: false, reason: 'Call discover_skills first to check whether a skill for this already exists, then call create_skill only if nothing suitable is found.' }
+          : { allowed: true, reason: '' };
+        // All gates use identical response logic — handle the first failure found
+        const blockedGate = !reviewGate.allowed ? reviewGate : (!planningGate.allowed ? planningGate : (!skillDiscoveryGate.allowed ? skillDiscoveryGate : null));
+        if (blockedGate) {
+          const failure = classifyAgentFailure({ toolName, args, errorText: blockedGate.reason });
           const guidance = buildFailureRecoveryGuidance(failure);
           currentAgentLogs[logIndex].status = 'error';
-          currentAgentLogs[logIndex].result = planningGate.reason;
-          
+          currentAgentLogs[logIndex].result = blockedGate.reason;
           toolResponseParts.push({
             functionResponse: {
               name: toolName,
-              response: { error: planningGate.reason, failureCategory: failure.category, recoveryGuidance: guidance }
+              response: { error: blockedGate.reason, failureCategory: failure.category, recoveryGuidance: guidance }
             }
           });
-          const transition = await recordToolOutcomeInWorkingState(workspacePath, toolName, args, { error: planningGate.reason, failureCategory: failure.category });
+          const transition = await recordToolOutcomeInWorkingState(workspacePath, toolName, args, { error: blockedGate.reason, failureCategory: failure.category });
           if (transition && transition.state) {
             workingState = transition.state;
             refreshWorkingStateMessage();
           }
-          updateWalkthroughItem(walkthroughItem, toolName, args, { error: planningGate.reason, failureCategory: failure.category }, new Error(planningGate.reason));
+          if (!reviewGate.allowed) {
+            updateWalkthroughItem(walkthroughItem, toolName, args, { error: reviewGate.reason, failureCategory: failure.category }, new Error(reviewGate.reason));
+          } else {
+            updateWalkthroughItem(walkthroughItem, toolName, args, { error: planningGate.reason, failureCategory: failure.category }, new Error(planningGate.reason));
+          }
           persistCurrentAgentLogs({ render: true });
           continue;
         }
@@ -2987,6 +3011,18 @@ async function executeTool(name, args, workspace, config, conversation) {
       if (!result || result.success === false) {
         throw new Error((result && result.error) || 'Coder handoff failed.');
       }
+
+      // ── Supervisor: track the launched Coder conversation ──────────────────
+      conversation.launchedCoderConvId = result.conversationId;
+      conversation.launchedCoderTaskTitle = result.title || 'Coder Task';
+      conversation.launchedCoderTaskStart = Date.now();
+      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+      // Kick off the supervisor monitor in the renderer
+      if (typeof window.startCoderTaskMonitor === 'function') {
+        window.startCoderTaskMonitor(conversation.id, result.conversationId);
+      }
+      // ───────────────────────────────────────────────────────────────────────
+
       return {
         ...result,
         success: true,
@@ -5409,7 +5445,7 @@ ${JSON.stringify(String(userPrompt || ''))}`;
   }
 }
 
-async function classifyPlanningNeed(userPrompt, modelName, config) {
+async function classifyPlanningNeed(userPrompt, modelName, config, recentMessages) {
   const regexFallback = () => ({
     mode: 'plan',
     reason: 'Could not safely classify task complexity.',
@@ -5417,7 +5453,21 @@ async function classifyPlanningNeed(userPrompt, modelName, config) {
     benefitsFromWorkspaceContext: requestPlausiblyBenefitsFromWorkspaceContext(userPrompt),
     taskComplexity: 'standard'
   });
-  const prompt = `Classify whether this Orion AI request should require an implementation plan before acting.
+  // Include the last few exchanges so the classifier can resolve references like "let's do all of
+  // them" or "go ahead" by understanding what "them"/"that" referred to in context.
+  let contextBlock = '';
+  if (Array.isArray(recentMessages) && recentMessages.length > 0) {
+    const snippet = recentMessages
+      .slice(-6)
+      .filter(m => m.role && (m.text || m.parts))
+      .map(m => {
+        const text = m.text || (Array.isArray(m.parts) ? m.parts.map(p => p.text || '').join(' ') : '');
+        return `${m.role === 'user' ? 'User' : 'Orion'}: ${String(text).slice(0, 400)}`;
+      })
+      .join('\n');
+    if (snippet) contextBlock = `\nRecent conversation context (for resolving pronouns like "them"/"that"/"it"):\n${snippet}\n`;
+  }
+  const prompt = `Classify whether this Orion AI request should require an implementation plan before acting.${contextBlock}
 
 Return only compact JSON with:
 {"mode":"plan"|"direct"|"answer","reviewOnly":true|false,"needsLocalInspection":true|false,"benefitsFromWorkspaceContext":true|false,"taskComplexity":"light"|"standard"|"deep","reason":"short reason"}
@@ -5630,6 +5680,11 @@ function looksLikeLeakedNoToolCorrection(text) {
     /\b(?:my|the)\s+(?:answer|response|reply)\s+above\b/.test(normalized) ||
     /\balready\s+(?:a\s+)?complete\s+(?:non[-\s]?workspace\s+)?answer\b/.test(normalized) ||
     /\bi\s+gave\s+you\s+the\s+full\b/.test(normalized) ||
+    // Model says "you already have the full report/answer" — it's pointing back at a prior turn
+    // instead of being a self-contained answer. Canonically produced after memory tools fire and
+    // force one more loop iteration on a turn where the real answer was already written.
+    /\byou\s+already\s+have\s+(?:the\s+)?(?:full\s+)?(?:report|answer|analysis|findings|results|summary|everything|it)\b/.test(normalized) ||
+    /\byou\s+(?:now\s+)?have\s+(?:the\s+)?(?:full|complete|entire)\s+(?:report|answer|analysis|findings|results|summary)\b/.test(normalized) ||
     // A gate-nudged retry can regress into referring back to an earlier turn instead of
     // restating the substantive answer itself — e.g. "I'm already waiting on your call here...
     // the last message laid it out" instead of actually re-answering. These phrasings are
@@ -5945,23 +6000,71 @@ function recommendedNatureForFailureCategory(category) {
 
 function buildFailureRecoveryGuidance(failure) {
   const category = failure && failure.category ? failure.category : 'tool_failure';
+  const toolName = String((failure && failure.toolName) || '');
+  const errorText = String((failure && failure.errorText) || '');
+  const args = (failure && failure.args) || {};
+  const failureCount = Number((failure && failure.failureCount) || 1);
+
+  // Extract useful snippets from the error for inline context
+  const errorSnippet = errorText ? errorText.slice(0, 200).replace(/\n+/g, ' ').trim() : '';
+  const toolLabel = toolName ? `\`${toolName}\`` : 'the tool';
+
   if (category === 'deprecated_command_with_replacement' && failure && failure.replacementHint) {
     return `The command's own output already named the fix: it says to use \`${failure.replacementHint}\`. Run that directly. Do not search the web for documentation that repeats information already in the tool output you just received.`;
   }
-  const messages = {
-    repeated_tool_failure: 'Do not quit the task. Do not retry it blindly. Pause the repeated call, inspect fresh state and recent output, explain the likely cause, then choose a different strategy before retrying: use a different tool, narrower arguments, or ask for the missing prerequisite.',
-    patch_target_missing: 'Re-read the surrounding file lines before editing. Use a narrower exact target, a line-range patch, or adjust the patch to the current file contents instead of repeating the same patch.',
-    workspace_path_missing: 'The workspace path guess failed. Do not call change_workspace again with another guessed path. Resolve the folder first: run a bounded PowerShell Get-ChildItem directory search against the likely parent locations such as C:\\Users\\Owner\\Desktop and C:\\Users\\Owner\\Desktop\\Projects, using name tokens from the user request and the failed path, -Directory, -Depth 2 or -Depth 3, and -ErrorAction SilentlyContinue. Then pick the closest real directory from the local listing and call change_workspace once with that verified absolute path.',
-    command_blocked: 'The command was blocked by safety or planning rules. Keep the safety behavior intact; use a safer non-destructive command, an internal executable/args path, or ask for explicit plan approval when required.',
-    test_failure: 'Treat this as a regression signal. Read the failing test output, identify the first failing assertion or command, fix the code or test expectation, and rerun the relevant tests before summarizing.',
-    missing_dependency: 'Install or configure the missing dependency only after checking the project manifest and existing package manager. If installation is not appropriate, choose a tool that uses available local capabilities.',
-    auth_missing: 'Stop retrying credential-gated work. Preserve state, name the missing credential or permission, and ask the user to provide or configure it before continuing.',
-    timeout: 'Do not repeat the same long-running action unchanged. Check if the process is a GUI/Pygame app that blocks until closed. If so, add an automated exit flag to the code (e.g. exit after N frames/ticks), run with a short timeout, or use start_command/kill_command instead of waiting for a long timeout.',
-    interactive_command_needs_input: 'Do not run an interactive command as a blocking test without stdin. Pipe a short scripted input sequence, redirect an input fixture, or use start_command with a short timeout followed by read_command_output and kill_command.',
-    model_no_tool_use: 'Your response appeared to promise or report workspace work, but no tools were called. If the task requires looking at files, running commands/tests, editing code, creating files, saving memory, or verifying behavior, call the appropriate tools now. If the task does not require tools, answer the user naturally and do not mention tools, workspace operations, or this correction.',
-    tool_failure: 'Inspect the error and current workspace state before trying again. Change one meaningful variable in the next attempt, such as the target path, command, arguments, or verification step.'
-  };
-  return messages[category] || messages.tool_failure;
+
+  if (category === 'repeated_tool_failure') {
+    const countNote = failureCount >= 3 ? ` (${failureCount} consecutive failures)` : '';
+    return `${toolLabel} has failed repeatedly${countNote}. Do not retry it blindly. Do not quit the task. Pause, inspect fresh state and recent output, explain the likely cause${errorSnippet ? ': "' + errorSnippet + '"' : ''}, then choose a different strategy before retrying: use a different tool, narrower arguments, or ask for the missing prerequisite.`;
+  }
+
+  if (category === 'patch_target_missing') {
+    const filePath = args.path || args.file_path || '';
+    const fileHint = filePath ? ` in \`${filePath}\`` : '';
+    return `The patch target${fileHint} was not found in the current file. Re-read the surrounding file lines before editing. Use a narrower exact target, a line-range patch, or adjust the patch to the current file contents instead of repeating the same patch.${errorSnippet ? ' Error: "' + errorSnippet + '"' : ''}`;
+  }
+
+  if (category === 'workspace_path_missing') {
+    const attemptedPath = args.path || args.workspace_path || errorText.match(/'([^']+)'/)?.[1] || '';
+    const pathHint = attemptedPath ? ` The path \`${attemptedPath}\` does not exist.` : '';
+    return `The workspace path guess failed.${pathHint} Do not call change_workspace again with another guessed path. Resolve the folder first: run a bounded PowerShell Get-ChildItem directory search against the likely parent locations such as C:\\Users\\Owner\\Desktop and C:\\Users\\Owner\\Desktop\\Projects, using name tokens from the user request and the failed path, -Directory, -Depth 2 or -Depth 3, and -ErrorAction SilentlyContinue. Then pick the closest real directory from the local listing and call change_workspace once with that verified absolute path.`;
+  }
+
+  if (category === 'command_blocked') {
+    return `${toolLabel} was blocked by safety or planning rules.${errorSnippet ? ' Reason: "' + errorSnippet + '".' : ''} Keep the safety behavior intact; use a safer non-destructive command, an internal executable/args path, or ask for explicit plan approval when required.`;
+  }
+
+  if (category === 'test_failure') {
+    return `Tests failed${errorSnippet ? ': "' + errorSnippet + '"' : ''}. Treat this as a regression signal. Read the failing test output, identify the first failing assertion or command, fix the code or test expectation, and rerun the relevant tests before summarizing.`;
+  }
+
+  if (category === 'missing_dependency') {
+    // Try to extract the missing module/command name from the error
+    const missingMatch = errorText.match(/cannot find module '([^']+)'|command not found[:\s]+(\S+)|no such file[^:]*:\s*(\S+)/i);
+    const missingHint = missingMatch ? ` The missing item appears to be \`${missingMatch[1] || missingMatch[2] || missingMatch[3]}\`.` : (errorSnippet ? ` Error: "${errorSnippet}".` : '');
+    return `A dependency is missing.${missingHint} Install or configure it only after checking the project manifest and existing package manager. If installation is not appropriate, choose a tool that uses available local capabilities.`;
+  }
+
+  if (category === 'auth_missing') {
+    const credHint = errorText.match(/api.?key|credential|token|unauthorized|forbidden/i)?.[0] || '';
+    return `${toolLabel} failed due to missing credentials or permissions${credHint ? ' (' + credHint + ')' : ''}. Stop retrying credential-gated work. Preserve state, name the missing credential or permission, and ask the user to provide or configure it before continuing.`;
+  }
+
+  if (category === 'timeout') {
+    const cmd = args.command ? ` (\`${String(args.command).slice(0, 60)}\`)` : '';
+    return `${toolLabel}${cmd} timed out. Do not repeat the same long-running action unchanged. Check if the process is a GUI/Pygame app that blocks until closed. If so, add an automated exit flag to the code (e.g. exit after N frames/ticks), run with a short timeout, or use start_command/kill_command instead of waiting for a long timeout.`;
+  }
+
+  if (category === 'interactive_command_needs_input') {
+    return `${toolLabel} launched an interactive command that expects stdin input. Do not run it as a blocking call without stdin. Pipe a short scripted input sequence, redirect an input fixture, or use start_command with a short timeout followed by read_command_output and kill_command.`;
+  }
+
+  if (category === 'model_no_tool_use') {
+    return 'Your response appeared to promise or report workspace work, but no tools were called. If the task requires looking at files, running commands/tests, editing code, creating files, saving memory, or verifying behavior, call the appropriate tools now. If the task does not require tools, answer the user naturally and do not mention tools, workspace operations, or this correction.';
+  }
+
+  // Generic tool_failure with actual error context
+  return `${toolLabel} failed${errorSnippet ? ': "' + errorSnippet + '"' : ''}. Inspect the error and current workspace state before trying again. Change one meaningful variable in the next attempt, such as the target path, command, arguments, or verification step.`;
 }
 
 function sleep(ms) {
@@ -6774,7 +6877,7 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "get_file_symbols",
-            description: "Uses an AST parser to return the signatures of all classes, methods, and functions in a file.",
+            description: "Returns signatures and line ranges for classes, methods, and functions in a single JS/TS/JSX/TSX or Python file.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -7856,18 +7959,24 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
     },
     safetySettings: [
       {
+        // Coding tasks can include aggressive content in test data / user message fixtures.
+        // BLOCK_ONLY_HIGH avoids false positives while still filtering obvious harassment.
         category: "HARM_CATEGORY_HARASSMENT",
-        threshold: "BLOCK_NONE"
+        threshold: "BLOCK_ONLY_HIGH"
       },
       {
+        // Hate speech has no legitimate presence in code generation — BLOCK_MEDIUM is fine.
         category: "HARM_CATEGORY_HATE_SPEECH",
-        threshold: "BLOCK_NONE"
+        threshold: "BLOCK_MEDIUM_AND_ABOVE"
       },
       {
+        // Sexually explicit content has no legitimate presence in code generation.
         category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-        threshold: "BLOCK_NONE"
+        threshold: "BLOCK_MEDIUM_AND_ABOVE"
       },
       {
+        // Security code, file system ops, network code, and shell commands legitimately
+        // trigger DANGEROUS_CONTENT. BLOCK_NONE is required for a coding agent.
         category: "HARM_CATEGORY_DANGEROUS_CONTENT",
         threshold: "BLOCK_NONE"
       }
@@ -7996,7 +8105,7 @@ async function compactHistory(messages, modelName, config) {
     }
     conversationLogsText += `${roleName}: ${contentText}\n\n`;
   });
-  
+
   const summaryPrompt = `The following is a conversation history between a user and an AI pair programmer. Summarize the history, detailing:
 1. The overall task and workspace directory.
 2. Major modifications made to files.
@@ -8008,39 +8117,23 @@ CONVERSATION HISTORY:
 ${conversationLogsText}`;
 
   const text = await callUtilityModel(summaryPrompt, modelName, config, false);
-  let compactedSummary = text || "History compacted.";
+  const compactedSummary = text || "History compacted.";
 
-  // Retain only the last 3 messages + the summary. A 'tool' message is always
-  // preceded by the 'model' message whose tool_calls it answers (agent.js pushes
-  // them as a pair) — if a plain count-based slice cut started on that 'tool'
-  // message, its issuing 'model' message (and any reasoning_content on it) would
-  // be dropped, leaving an orphaned tool result that providers requiring
-  // reasoning continuity (e.g. DeepSeek thinking mode) reject with a 400.
-  let retainStart = Math.max(0, messages.length - 3);
-  while (retainStart > 0 && messages[retainStart] && messages[retainStart].role === 'tool') {
-    retainStart--;
+  // Note: runAgent persists the summary and rebuilds its live API messages from conversation
+  // state. The returned messages are kept for tests and provider paths that need a compacted
+  // transcript while preserving model/tool adjacency.
+  let tailStart = Math.max(0, messages.length - 3);
+  if (messages[tailStart] && messages[tailStart].role === 'tool' && tailStart > 0 && messages[tailStart - 1].role === 'model') {
+    tailStart -= 1;
   }
-  const lastMessages = messages.slice(retainStart);
-  
-  const newHistory = [
-    {
-      role: 'user',
-      parts: [{
-        text: `Here is a summary of our previous session history, do not repeat it but remember the context:\n\n${compactedSummary}`
-      }]
-    },
-    {
-      role: 'model',
-      parts: [{
-        text: "Understood. I have fully digested the summary context of our workspace history. Let's continue working."
-      }]
-    },
-    ...lastMessages
-  ];
-  
+  const retainedTail = messages.slice(tailStart);
   return {
-    messages: newHistory,
-    summary: compactedSummary
+    summary: compactedSummary,
+    messages: [
+      { role: 'user', parts: [{ text: `Previous conversation summary:\n${compactedSummary}` }] },
+      { role: 'model', parts: [{ text: 'Understood. I will continue from this compacted context.' }] },
+      ...retainedTail
+    ]
   };
 }
 
@@ -8091,6 +8184,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     buildToolEvidenceEntry,
     getEpistemicToolGate,
     buildEpistemicCorrectionPrompt,
+    getCompactionThreshold,
     classifyAgentFailure,
     recommendedNatureForFailureCategory,
     buildFailureRecoveryGuidance,

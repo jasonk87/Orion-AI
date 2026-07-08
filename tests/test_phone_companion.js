@@ -1,6 +1,8 @@
 const test = require('tape');
 const http = require('http');
+const vm = require('vm');
 const proxyquire = require('proxyquire').noPreserveCache();
+const companionHtml = require('../lib/companion-html');
 
 function request(method, port, path, body, session) {
   return new Promise((resolve, reject) => {
@@ -44,14 +46,28 @@ function makeFsMock(config) {
 function makeElectronMock(handlers = {}) {
   const calls = [];
   const ipcHandlers = {};
+  const notifications = [];
+  class NotificationMock {
+    static isSupported() { return handlers.desktopNotificationsSupported !== false; }
+    constructor(payload) {
+      this.payload = payload;
+      notifications.push(payload);
+    }
+    show() {
+      this.shown = true;
+    }
+  }
   return {
     calls,
     ipcHandlers,
+    notifications,
     mock: {
       app: {
         whenReady: () => ({ then: (cb) => { cb(); } }),
-        on: () => {}
+        on: () => {},
+        setAppUserModelId: () => {}
       },
+      Notification: NotificationMock,
       BrowserWindow: class {
         constructor() {
           this.webContents = {
@@ -127,6 +143,18 @@ async function startMainWithConfig(port, config, handlers) {
     '@noCallThru': true
   };
   const electron = makeElectronMock(handlers);
+  const webPushCalls = [];
+  const webPushMock = handlers && handlers.webPush ? handlers.webPush : {
+    generateVAPIDKeys: () => ({ publicKey: 'test-public-key', privateKey: 'test-private-key' }),
+    setVapidDetails: (mailto, publicKey, privateKey) => {
+      webPushCalls.push({ type: 'setVapidDetails', mailto, publicKey, privateKey });
+    },
+    sendNotification: async (subscription, payload) => {
+      webPushCalls.push({ type: 'sendNotification', subscription, payload });
+    },
+    '@global': true,
+    '@noCallThru': true
+  };
   // Make the os mock global so ipc-server.js uses the controlled network address.
   const osMock = {
     networkInterfaces: () => ({
@@ -140,12 +168,13 @@ async function startMainWithConfig(port, config, handlers) {
   const main = proxyquire('../main.js', {
     electron: electron.mock,
     './lib/config': configMock,
+    'web-push': webPushMock,
     os: osMock
   });
   main.resetCompanionServer();
   main.startPhoneCompanionServer();
   await new Promise(resolve => setTimeout(resolve, 150));
-  return { main, fsMock, electron };
+  return { main, fsMock, electron, webPushCalls };
 }
 
 function closeServer(server) {
@@ -182,6 +211,19 @@ function requestFirstSseFrame(port, path, session) {
     req.end();
   });
 }
+
+test('Phone Companion generated inline script is valid JavaScript', (t) => {
+  const html = companionHtml('pair-code-123456', 'DESKTOP-TEST');
+  const inlineScripts = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)];
+  t.ok(inlineScripts.length > 0, 'phone shell includes inline boot script');
+  inlineScripts.forEach((match, index) => {
+    t.doesNotThrow(
+      () => new vm.Script(match[1], { filename: `phone-companion-inline-${index + 1}.js` }),
+      `inline phone script ${index + 1} compiles`
+    );
+  });
+  t.end();
+});
 
 test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
   const { main } = await startMainWithConfig(1131);
@@ -242,6 +284,22 @@ test('Phone Companion pairing payload is available through IPC for top-bar butto
   t.equal(payload.success, true, 'IPC pairing payload succeeds');
   t.equal(payload.networkEnabled, true, 'initial top-bar payload is phone-reachable on LAN');
   t.ok(payload.pairUrl.includes('http://192.168.50.25:1136/?pair='), 'enabled payload exposes Wi-Fi pairing URL');
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion pairing prefers configured HTTPS origin for mobile notifications', async (t) => {
+  const { main } = await startMainWithConfig(1147, {
+    phoneCompanionHttpsOrigin: 'https://orion-owner.example.test/some/path'
+  });
+
+  const payload = await main.getPhoneCompanionPairingForTest();
+  t.equal(payload.preferredUrlType, 'https', 'HTTPS origin becomes the preferred phone URL');
+  t.equal(payload.secureOrigin, 'https://orion-owner.example.test', 'HTTPS origin is normalized to the origin');
+  t.ok(payload.pairUrl.startsWith('https://orion-owner.example.test/?pair='), 'primary pairing URL uses HTTPS');
+  t.equal(payload.stableUrl, 'https://orion-owner.example.test/', 'stable phone URL uses HTTPS');
+  t.ok(payload.localPairUrl.includes('http://192.168.50.25:1147/?pair='), 'local fallback pairing URL is still available');
+  t.equal(payload.phoneNotificationsAvailable, true, 'payload advertises notification-capable pairing');
+
   await closeServer(main.getCompanionServer());
 });
 
@@ -551,6 +609,32 @@ test('Phone Companion v2 desktop device list and revoke IPC endpoints', async (t
   const updatedDevices = await getDevicesHandler();
   const dev1 = updatedDevices.find(d => d.id === 'dev1');
   t.equal(dev1.revoked, true, 'device status is updated to revoked');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion v2 notify IPC reports desktop and phone delivery', async (t) => {
+  const pushSubscription = { endpoint: 'https://push.example.test/sub', keys: { p256dh: 'p256dh', auth: 'auth' } };
+  const { main, electron, webPushCalls } = await startMainWithConfig(1146, {
+    phoneCompanionDevices: [
+      { id: 'dev1', name: 'iPhone', secret: 'sec1', approved: true, revoked: false, pushSubscription }
+    ]
+  });
+
+  const notifyHandler = electron.ipcHandlers['notify-phone'];
+  t.ok(notifyHandler, 'notify-phone IPC handler is registered');
+
+  const result = await notifyHandler(null, { title: 'Orion AI', body: 'Task complete' });
+  t.equal(result.success, true, 'notification handler reports overall success');
+  t.equal(result.desktop.success, true, 'desktop notification succeeds');
+  t.equal(result.phone.sent, 1, 'phone push sends to the subscribed device');
+  t.equal(electron.notifications[0].title, 'Orion AI', 'desktop notification carries title');
+  t.equal(electron.notifications[0].body, 'Task complete', 'desktop notification carries body');
+
+  const pushSend = webPushCalls.find(call => call.type === 'sendNotification');
+  t.ok(pushSend, 'web-push sendNotification is called');
+  t.deepEqual(pushSend.subscription, pushSubscription, 'web-push receives the stored subscription');
+  t.deepEqual(JSON.parse(pushSend.payload), { title: 'Orion AI', body: 'Task complete' }, 'web-push payload carries title and body');
 
   await closeServer(main.getCompanionServer());
 });

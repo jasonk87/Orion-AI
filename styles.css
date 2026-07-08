@@ -1,32 +1,3 @@
-/* DESIGN SYSTEM VARIABLES */
-:root {
-  --bg-primary: #0a0a0c;
-  --bg-secondary: #121216;
-  --bg-tertiary: #191922;
-  --border-color: #24242e;
-  --border-hover: #38384b;
-  
-  --text-primary: #f1f1f4;
-  --text-secondary: #a3a3c2;
-  --text-muted: #62627a;
-  
-  --accent-color: #a78bfa;
-  --accent-hover: #c4b5fd;
-  --accent-glow: rgba(167, 139, 250, 0.15);
-  
-  --success-color: #34d399;
-  --success-glow: rgba(52, 211, 153, 0.15);
-  --error-color: #f87171;
-  --error-glow: rgba(248, 113, 113, 0.15);
-  --warning-color: #fbbf24;
-  
-  --font-sans: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  --font-mono: 'JetBrains Mono', SFMono-Regular, Consolas, "Liberation Mono", Menlo, Courier, monospace;
-  
-  --transition-fast: 0.15s ease;
-  --transition-normal: 0.25s ease;
-}
-
 /* RESET & BASE STYLES */
 * {
   box-sizing: border-box;
@@ -1591,6 +1562,73 @@ code {
   font-size: 0.68rem;
 }
 
+.inline-artifacts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.inline-artifact-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  max-width: 420px;
+  padding: 10px 12px;
+  border: 1px solid rgba(130, 115, 244, 0.32);
+  border-radius: 8px;
+  background: rgba(17, 24, 39, 0.72);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-family: inherit;
+  text-align: left;
+}
+
+.inline-artifact-card:hover,
+.inline-artifact-card:focus-visible {
+  border-color: rgba(130, 115, 244, 0.58);
+  background: rgba(130, 115, 244, 0.12);
+  outline: none;
+}
+
+.inline-artifact-icon {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 7px;
+  background: rgba(130, 115, 244, 0.18);
+  color: #b8a9ff;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  font-weight: 800;
+}
+
+.inline-artifact-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.inline-artifact-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.86rem;
+  font-weight: 750;
+}
+
+.inline-artifact-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+}
+
 /* .modal-card sets a fixed width: 500px later in this stylesheet; that rule has equal
    specificity to a bare .file-viewer-card selector and appears after it in source order, so it
    was winning and silently clobbering any size set here. Compound the selector with .modal-card
@@ -2408,6 +2446,100 @@ code {
   100% { box-shadow: 0 0 12px rgba(167, 139, 250, 0.12); border-color: rgba(167, 139, 250, 0.35); }
 }
 
+
+/* ── Dispatcher-as-Supervisor: Coder task status card ──────────────────────── */
+/* Persistent floating banner between #chat-feed and #chat-input-wrapper.      */
+/* NOT a chat message — shows while a Coder task is running; hidden otherwise. */
+.coder-task-status-card {
+  display: none;           /* hidden by default */
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  margin: 0 12px 0;
+  background: rgba(16, 185, 129, 0.06);
+  border: 1px solid rgba(16, 185, 129, 0.22);
+  border-radius: 8px;
+  font-size: 0.76rem;
+  color: var(--text-secondary);
+  animation: coder-status-border-pulse 2.4s ease-in-out infinite alternate;
+  transition: opacity 0.2s ease;
+}
+
+.coder-task-status-card.visible {
+  display: flex;
+}
+
+.coder-status-spinner {
+  display: flex;
+  gap: 3px;
+  flex-shrink: 0;
+}
+
+.coder-status-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--success-color);
+  animation: coder-dot-bounce 1.2s ease-in-out infinite;
+}
+
+.coder-status-dot:nth-child(2) { animation-delay: 0.2s; }
+.coder-status-dot:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes coder-dot-bounce {
+  0%, 100% { transform: scaleY(0.5); opacity: 0.4; }
+  50% { transform: scaleY(1.2); opacity: 1; }
+}
+
+@keyframes coder-status-border-pulse {
+  0% { border-color: rgba(16, 185, 129, 0.14); box-shadow: none; }
+  100% { border-color: rgba(16, 185, 129, 0.36); box-shadow: 0 0 10px rgba(16, 185, 129, 0.08); }
+}
+
+.coder-status-body {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.coder-status-label {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  flex-shrink: 0;
+}
+
+.coder-status-task-name {
+  color: var(--success-color);
+  font-weight: 600;
+  font-size: 0.76rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.coder-status-sep {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.coder-status-substatus {
+  color: var(--text-secondary);
+  font-size: 0.73rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.coder-status-elapsed {
+  color: var(--text-muted);
+  font-size: 0.69rem;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+  margin-left: auto;
+}
 
 /* Operational context / Mission Control */
 .operational-context-section {

@@ -31,6 +31,8 @@ test('desktop polish includes accessible focus and reduced-motion behavior', (t)
   t.notOk(html.includes('class="quick-tips"'), 'keeps the welcome state focused on the agent');
   t.ok(styles.includes('#btn-change-workspace,\n#btn-sync-files { display: none; }'), 'hides redundant workspace chrome');
   t.ok(html.includes('aria-label="Minimize window"'), 'window controls have accessible names');
+  t.ok(html.includes('id="setting-phone-https-origin"'), 'desktop settings include a secure phone URL field');
+  t.ok(renderer.includes('normalizePhoneHttpsOrigin'), 'renderer normalizes the secure phone URL before saving');
   t.ok(fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8').includes("el.chatInput.value += `${needsSpace ? ' ' : ''}@`;"), 'file mention button performs a real action');
   t.end();
 });
@@ -45,8 +47,11 @@ test('phone companion finishes with the same dark theme and complete mission hie
   t.ok(companionHtml.includes('#task-list-card { grid-area: mission; }'), 'Task List has an explicit mobile layout area');
   t.ok(companionHtml.includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
   t.ok(companionHtml.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
-  t.ok(companionHtml.includes('ui-polish-v15'), 'phone shell exposes the current UI build version');
-  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v15"), 'phone service worker cache is bumped for the current UI build');
+  t.ok(companionHtml.includes('ui-polish-v18'), 'phone shell exposes the current UI build version');
+  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v18"), 'phone service worker cache is bumped for the current UI build');
+  t.ok(companionHtml.includes('window.isSecureContext'), 'phone explains when browser push is blocked by an insecure context');
+  t.ok(companionHtml.includes('Phone push needs HTTPS or localhost'), 'phone tells the user that HTTPS is required for push notifications');
+  t.ok(companionHtml.includes("companionFetch('/api/push-subscribe'"), 'phone stores push subscriptions through the authenticated fetch path');
   t.end();
 });
 
@@ -139,6 +144,17 @@ test('Dispatch hides Coder-style tool logs behind compact activity', (t) => {
   t.ok(renderer.includes("conversationMode(activeConv) === 'orion'"), 'Dispatch detection is based on conversation mode');
   t.ok(renderer.includes("logsHtml = isRunningThisConversation ? formatDispatchToolActivity(logs) : ''"), 'Dispatch only shows compact activity while the run is active');
   t.ok(styles.includes('.dispatch-tool-activity'), 'compact Dispatch tool activity is styled');
+  t.ok(companionHtml.includes('function renderDispatchToolActivity'), 'phone has a Dispatch-specific compact activity renderer');
+  t.ok(companionHtml.includes('dispatch-activity-log collapsed'), 'phone Dispatch activity defaults to collapsed');
+  t.ok(companionHtml.includes("isDispatchConversation ? renderDispatchToolActivity"), 'phone uses compact activity for Dispatch chat logs');
+  t.end();
+});
+
+test('Dispatch new chat starts conversationally instead of showing a workspace picker', (t) => {
+  t.ok(companionHtml.includes('dispatch-chat-intro'), 'phone has a Dispatch new-chat intro');
+  t.ok(companionHtml.includes('coder-workspace-picker'), 'phone keeps the Coder workspace picker');
+  t.ok(companionHtml.includes("#screen-new-chat.dispatch-mode .coder-workspace-picker { display: none; }"), 'Dispatch hides the workspace picker on new chat');
+  t.ok(companionHtml.includes("newChatPromptEl.placeholder = isDispatchStart ? 'Ask Orion anything...' : 'What should we build?'"), 'new chat placeholder is mode-aware');
   t.end();
 });
 
@@ -238,9 +254,13 @@ test('screenshot artifacts are previewable from the artifact panel', (t) => {
   t.ok(html.includes('id="file-viewer-image-shell"'), 'file viewer includes an image preview shell');
   t.ok(html.includes('id="file-viewer-image"'), 'file viewer includes an image element');
   t.ok(renderer.includes('data-artifact-index'), 'artifact items use click-safe index routing');
+  t.ok(renderer.includes('function renderInlineArtifactCards'), 'renderer shows screenshot artifacts inline in chat');
+  t.ok(renderer.includes('data-open-artifact'), 'inline artifact cards open the file viewer');
+  t.ok(renderer.includes('orion-artifact://'), 'renderer supports conversation-scoped artifact links');
   t.ok(renderer.includes("artifactType === 'screenshot'"), 'renderer identifies screenshot artifacts');
   t.ok(renderer.includes('readWorkspaceFileBase64'), 'renderer loads screenshot bytes through IPC');
   t.ok(styles.includes('.artifact-item.previewable'), 'previewable artifacts have interaction styling');
+  t.ok(styles.includes('.inline-artifact-card'), 'inline artifact cards are styled');
   t.ok(styles.includes('.file-viewer-image'), 'screenshot preview image is styled');
   t.end();
 });

@@ -8,13 +8,7 @@
     "package": "electron-packager . OrionAI --platform=win32 --arch=x64 --out=dist --overwrite --icon=assets/icon.ico --ignore=\"^/config\\.json$\" --ignore=\"^/standalone-workspaces($|/)\" --ignore=\"^/\\.orion($|/)\" --ignore=\"^/dist($|/)\" --ignore=\"^/tests($|/)\" --ignore=\"^/test-runner\\.js$\"",
     "test": "node test-runner.js"
   },
-  "keywords": [
-    "orion",
-    "ai",
-    "pair-programmer",
-    "gemini",
-    "electron"
-  ],
+  "keywords": ["orion","ai","pair-programmer","gemini","electron"],
   "author": "Antigravity Dev team",
   "license": "MIT",
   "dependencies": {

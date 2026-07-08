@@ -1,9 +1,17 @@
-// Configure marked to escape HTML content to prevent XSS vulnerability in Electron renderer
+// Configure marked to escape raw HTML blocks to prevent XSS in Electron renderer.
+// Must NOT escape & first — doing so then letting marked parse the output causes
+// double-escaping (&amp; → &amp;amp;). Escape in a single pass using a regex that
+// replaces only the raw characters, never already-escaped sequences.
 if (typeof marked !== 'undefined') {
   marked.use({
     renderer: {
       html(htmlText) {
-        return htmlText.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        // Single-pass escape: replace raw &, < and > but skip &xxx; entities already present.
+        return String(htmlText).replace(/&(?![a-zA-Z#]\w{0,24};)|[<>]/g, ch => {
+          if (ch === '&') return '&amp;';
+          if (ch === '<') return '&lt;';
+          return '&gt;';
+        });
       }
     }
   });
@@ -12,7 +20,7 @@ if (typeof marked !== 'undefined') {
 function sanitizeRenderedMarkdown(container) {
   container.querySelectorAll('a[href]').forEach(link => {
     const href = link.getAttribute('href') || '';
-    if (!/^(https?:|mailto:|orion-file:)/i.test(href)) {
+    if (!/^(https?:|mailto:|orion-file:|orion-artifact:\/\/)/i.test(href)) {
       link.removeAttribute('href');
       link.removeAttribute('target');
       link.removeAttribute('rel');
@@ -117,6 +125,7 @@ const el = {
   settingWorkspacePath: document.getElementById('setting-workspace-path'),
   settingTestCmd: document.getElementById('setting-test-cmd'),
   settingCommandTimeout: document.getElementById('setting-command-timeout'),
+  settingPhoneHttpsOrigin: document.getElementById('setting-phone-https-origin'),
   settingModelCallDelay: document.getElementById('setting-model-call-delay'),
   settingCompactThreshold: document.getElementById('setting-compact-threshold'),
   settingAutoTest: document.getElementById('setting-auto-test'),
@@ -513,6 +522,7 @@ async function loadSettings() {
   el.settingWorkspacePath.value = appConfig.defaultWorkspacePath || '';
   if (el.settingTestCmd) el.settingTestCmd.value = appConfig.regressionTestCommand || 'npm test';
   if (el.settingCommandTimeout) el.settingCommandTimeout.value = appConfig.commandTimeoutMs || 120000;
+  if (el.settingPhoneHttpsOrigin) el.settingPhoneHttpsOrigin.value = appConfig.phoneCompanionHttpsOrigin || '';
   if (el.settingModelCallDelay) el.settingModelCallDelay.value = appConfig.modelCallDelayMs || 0;
   el.settingCompactThreshold.value = appConfig.compactThresholdTokens || 100000;
   if (el.settingAutoTest) el.settingAutoTest.checked = appConfig.autoTest !== false;
@@ -640,6 +650,17 @@ async function initModelDropdown() {
   appConfig.defaultModel = modelSelect.value;
 }
 
+function normalizePhoneHttpsOrigin(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === 'https:' ? parsed.origin : '';
+  } catch (_) {
+    return '';
+  }
+}
+
 function setupSettingsModal() {
   el.btnSettings.addEventListener('click', () => {
     el.settingsModal.classList.add('active');
@@ -658,6 +679,14 @@ function setupSettingsModal() {
     appConfig.defaultWorkspacePath = el.settingWorkspacePath.value.trim();
     appConfig.regressionTestCommand = el.settingTestCmd ? el.settingTestCmd.value.trim() : appConfig.regressionTestCommand;
     appConfig.commandTimeoutMs = el.settingCommandTimeout ? (parseInt(el.settingCommandTimeout.value) || 120000) : appConfig.commandTimeoutMs;
+    const rawPhoneHttpsOrigin = el.settingPhoneHttpsOrigin ? el.settingPhoneHttpsOrigin.value.trim() : '';
+    const normalizedPhoneHttpsOrigin = normalizePhoneHttpsOrigin(rawPhoneHttpsOrigin);
+    if (rawPhoneHttpsOrigin && !normalizedPhoneHttpsOrigin) {
+      appendSystemMessage("Secure Phone URL must start with https:// so mobile notifications can work.");
+      return;
+    }
+    appConfig.phoneCompanionHttpsOrigin = normalizedPhoneHttpsOrigin;
+    if (el.settingPhoneHttpsOrigin) el.settingPhoneHttpsOrigin.value = normalizedPhoneHttpsOrigin;
     appConfig.modelCallDelayMs = el.settingModelCallDelay ? Math.min(Math.max(parseInt(el.settingModelCallDelay.value) || 0, 0), 60000) : (appConfig.modelCallDelayMs || 0);
     appConfig.compactThresholdTokens = parseInt(el.settingCompactThreshold.value) || 100000;
     appConfig.autoTest = el.settingAutoTest ? el.settingAutoTest.checked : true;
@@ -1535,6 +1564,83 @@ async function openImageArtifact(item) {
   if (el.fileViewerImageMeta) {
     el.fileViewerImageMeta.textContent = [dimensions, size, item.toolName || 'screenshot'].filter(Boolean).join(' / ');
   }
+}
+
+function parseToolResultObject(result) {
+  if (!result) return null;
+  if (typeof result === 'object') return result;
+  if (typeof result !== 'string') return null;
+  try {
+    return JSON.parse(result);
+  } catch (_) {
+    return null;
+  }
+}
+
+function getInlineVisualArtifactsFromLogs(logs = []) {
+  const visualTools = new Set(['take_screenshot', 'preview_app', 'capture_screen']);
+  const seen = new Set();
+  return (Array.isArray(logs) ? logs : [])
+    .filter(log => log && visualTools.has(log.tool))
+    .map(log => {
+      const result = parseToolResultObject(log.result);
+      if (!result || result.success === false || !result.path) return null;
+      const path = String(result.path || '');
+      const key = `${path}|${result.width || 0}|${result.height || 0}`;
+      if (seen.has(key)) return null;
+      seen.add(key);
+      return {
+        toolName: log.tool,
+        path,
+        width: result.width || 0,
+        height: result.height || 0,
+        size: result.size || 0,
+        summary: result.summary || '',
+        displayName: path.split(/[\\/]/).pop() || 'screenshot.png'
+      };
+    })
+    .filter(Boolean);
+}
+
+function renderInlineArtifactCards(logs = []) {
+  const artifacts = getInlineVisualArtifactsFromLogs(logs);
+  if (!artifacts.length) return '';
+  const cards = artifacts.map(item => {
+    const meta = [
+      item.width && item.height ? `${item.width}x${item.height}` : '',
+      item.size ? `${Math.round(item.size / 1024)} KB` : '',
+      item.toolName || 'screenshot'
+    ].filter(Boolean).join(' / ');
+    return `
+      <button class="inline-artifact-card" type="button" data-open-artifact="${escapeHtml(item.path)}" data-artifact-tool="${escapeHtml(item.toolName || 'screenshot')}" data-artifact-width="${escapeHtml(item.width || '')}" data-artifact-height="${escapeHtml(item.height || '')}" data-artifact-size="${escapeHtml(item.size || '')}">
+        <span class="inline-artifact-icon">IMG</span>
+        <span class="inline-artifact-copy">
+          <span class="inline-artifact-title">${escapeHtml(item.displayName)}</span>
+          <span class="inline-artifact-meta">${escapeHtml(meta || 'Screenshot')}</span>
+        </span>
+      </button>
+    `;
+  }).join('');
+  return `<div class="inline-artifacts">${cards}</div>`;
+}
+
+function wireInlineArtifactOpeners(container) {
+  if (!container) return;
+  container.querySelectorAll('[data-open-artifact]').forEach(button => {
+    button.addEventListener('click', () => {
+      const path = button.getAttribute('data-open-artifact') || '';
+      if (!path) return;
+      openImageArtifact({
+        artifactType: 'screenshot',
+        displayName: path.split(/[\\/]/).pop() || 'screenshot.png',
+        screenshotPath: path,
+        toolName: button.getAttribute('data-artifact-tool') || 'screenshot',
+        width: Number(button.getAttribute('data-artifact-width') || 0),
+        height: Number(button.getAttribute('data-artifact-height') || 0),
+        size: Number(button.getAttribute('data-artifact-size') || 0)
+      });
+    });
+  });
 }
 
 function setFileViewerMode(mode) {
@@ -2872,11 +2978,23 @@ async function submitMessage() {
   // Scroll to bottom for the local send action.
   scrollChatToBottom();
 
-  // Trigger local Agent loop
+  // ── Supervisor interception: Orion message while a supervised Coder task runs ──
   if (window.runAgentLoop) {
     const selectedModel = el.modelSelect.value;
     const runOptions = imagesToSend.length ? { images: imagesToSend } : {};
+
     if (window.isAgentRunning && window.isAgentRunning()) {
+      const runningConvId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+      const isOrionConv = conversationMode(conv) === 'orion';
+      const launchedCoderConvId = conv.launchedCoderConvId;
+
+      // If this Orion conversation launched the currently running Coder task, intercept
+      if (isOrionConv && launchedCoderConvId && runningConvId === launchedCoderConvId) {
+        handleSupervisorMessage(conv, prompt, selectedModel);
+        return;
+      }
+
+      // Default: queue as normal
       window.promptQueue.push({ prompt, modelSelectValue: selectedModel, conversationId: conv.id, alreadyRendered: true, images: imagesToSend });
       persistAssistantStatusMessage(conv.id, "Queued. Orion will start this after the current task finishes.", {
         source: 'queue-status',
@@ -3143,6 +3261,7 @@ function showPhoneCompanionPairingCard(payload = {}, options = {}) {
 function updatePhoneCompanionPairingPanel(payload = {}) {
   const pairUrl = String(payload.pairUrl || '');
   const networkEnabled = payload.networkEnabled !== false && !!pairUrl;
+  const secureEnabled = payload.preferredUrlType === 'https' || /^https:\/\//i.test(pairUrl);
   const expiresText = payload.expiresAt ? `Expires: ${new Date(payload.expiresAt).toLocaleTimeString()}` : 'Short-lived pairing link';
   if (el.btnPhoneCompanion) {
     el.btnPhoneCompanion.style.display = '';
@@ -3160,7 +3279,7 @@ function updatePhoneCompanionPairingPanel(payload = {}) {
   }
   if (el.phoneCompanionMeta) {
     el.phoneCompanionMeta.textContent = networkEnabled
-      ? `${expiresText}. Desktop approval required.`
+      ? `${expiresText}. ${secureEnabled ? 'HTTPS enabled for phone notifications.' : 'Live view only; add an HTTPS phone URL in Settings for mobile notifications.'}`
       : 'LAN companion mode is disabled by default. No localhost QR is shown for phones.';
   }
   // Tailscale panel: show/hide the Tailscale QR block inside the pairing panel
@@ -3277,6 +3396,7 @@ function renderPhoneCompanionPairingCard(payload) {
   const qrSvg = String(payload.qrSvg || '');
   const pairUrl = String(payload.pairUrl || '');
   const stableUrl = String(payload.stableUrl || pairUrl.replace(/\?.*$/, ''));
+  const secureEnabled = payload.preferredUrlType === 'https' || /^https:\/\//i.test(pairUrl);
   const expiresText = payload.expiresAt ? `Expires: ${new Date(payload.expiresAt).toLocaleTimeString()}` : 'Short-lived pairing link';
 
   // Tailscale section — only shown when Tailscale is active on the desktop
@@ -3304,7 +3424,7 @@ function renderPhoneCompanionPairingCard(payload) {
         <div data-companion-qr="true" aria-label="Phone Companion pairing QR code" style="background:#fff; padding:8px; border-radius:8px; line-height:0;">${qrSvg}</div>
         <div style="min-width:220px; flex:1;">
           <div style="font-weight:700; margin-bottom:6px;">Scan once to trust this phone</div>
-          <div style="color: var(--text-muted); margin-bottom:8px;">After it connects, add the clean URL to your home screen so the icon opens your saved device session.</div>
+          <div style="color: var(--text-muted); margin-bottom:8px;">${secureEnabled ? 'This HTTPS link can request phone notifications. Add the clean URL to your home screen after pairing.' : 'This local link keeps live view working. Add a Secure Phone URL in Settings to enable background notifications.'}</div>
           <div data-pair-url="${escapeHtml(pairUrl)}" style="font-family: var(--font-mono); font-size:.76rem; word-break:break-all;">${escapeHtml(pairUrl)}</div>
           <div data-stable-phone-url="${escapeHtml(stableUrl)}" style="font-family: var(--font-mono); font-size:.76rem; word-break:break-all; margin-top:6px; color:var(--success-color);">${escapeHtml(stableUrl)}</div>
           <div data-pairing-metadata="true" style="color: var(--text-muted); font-size:.74rem; margin-top:8px;">${escapeHtml(expiresText)}</div>
@@ -3407,6 +3527,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   const renderedMarkdown = displayText
     ? (typeof marked !== 'undefined' ? marked.parse(displayText) : escapeHtml(displayText))
     : '';
+  const inlineArtifactsHtml = renderInlineArtifactCards(logs);
   
   let runningIndicatorHtml = '';
   let planApprovalHtml = '';
@@ -3488,6 +3609,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     ${logsHtml}
     <div class="message-body">
       ${renderedMarkdown}
+      ${inlineArtifactsHtml}
       ${clarificationHtml}
       ${planApprovalHtml}
       ${runningIndicatorHtml}
@@ -3507,6 +3629,19 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
       openFileViewer(relPath);
     });
   });
+  bubble.querySelectorAll('a[href^="orion-artifact://"]').forEach(link => {
+    link.addEventListener('click', (event) => {
+      event.preventDefault();
+      const href = link.getAttribute('href') || '';
+      openImageArtifact({
+        artifactType: 'screenshot',
+        displayName: href.split(/[\\/]/).pop() || 'screenshot.png',
+        screenshotPath: href,
+        toolName: 'artifact'
+      });
+    });
+  });
+  wireInlineArtifactOpeners(bubble);
   const approveButton = bubble.querySelector('.btn-approve-plan');
   if (approveButton) {
     approveButton.addEventListener('click', () => approveCurrentPlanAndContinue({ button: approveButton }));
@@ -3810,6 +3945,144 @@ async function runRegressionTests() {
   return testRunInfo;
 }
 
+// ── CLARIFICATION CARD ────────────────────────────────────────────────────────
+// Builds the interactive question-card HTML. Also used by the supervisor proxy.
+function buildClarificationCardHtml(clarData) {
+  const { intro, questions } = clarData || {};
+  const escapedIntro = (intro || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  const questionsHtml = (questions || []).map((q, qi) => {
+    const escapedHeader = (q.header || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const escapedQuestion = (q.question || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    const optionsHtml = (q.options || []).map((opt, oi) => {
+      const escapedLabel = (opt.label || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const escapedDesc = (opt.description || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const recommendedBadge = opt.recommended
+        ? `<span class="clarification-recommended-badge">Recommended</span>`
+        : '';
+      const descHtml = escapedDesc
+        ? `<span class="clarification-option-desc">${escapedDesc}</span>`
+        : '';
+      return `
+        <label class="clarification-option">
+          <input type="radio" name="clarq_${qi}" value="${oi}" />
+          <span class="clarification-option-body">
+            <span class="clarification-option-label-row">
+              <span class="clarification-option-label">${escapedLabel}</span>
+              ${recommendedBadge}
+            </span>
+            ${descHtml}
+          </span>
+        </label>`;
+    }).join('');
+
+    return `
+      <div class="clarification-question-block" data-qi="${qi}">
+        <div class="clarification-question-header">
+          <span class="clarification-chip">${escapedHeader}</span>
+          <span class="clarification-question-text">${escapedQuestion}</span>
+        </div>
+        <div class="clarification-options">
+          ${optionsHtml}
+          <label class="clarification-other-row">
+            <input type="radio" name="clarq_${qi}" value="__other__" />
+            <input class="clarification-other-input" type="text" placeholder="Other — type your answer…" data-qi="${qi}" />
+          </label>
+        </div>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="clarification-card">
+      ${escapedIntro ? `<div class="clarification-intro">${escapedIntro}</div>` : ''}
+      ${questionsHtml}
+      <div class="clarification-actions">
+        <button class="btn-clarification-submit" type="button">Submit</button>
+      </div>
+    </div>`;
+}
+
+async function submitClarificationAnswers({ button, bubble, targetConversationId } = {}) {
+  const targetId = targetConversationId || activeConversationId;
+  const conv = conversations.find(c => c.id === targetId);
+  if (!conv || !conv.awaitingClarification) return;
+
+  const clarData = conv.awaitingClarification;
+  const questions = clarData.questions || [];
+
+  const answers = [];
+  let allAnswered = true;
+  questions.forEach((q, qi) => {
+    const block = bubble ? bubble.querySelector(`.clarification-question-block[data-qi="${qi}"]`) : null;
+    let answer = null;
+    if (block) {
+      const checked = block.querySelector(`input[type="radio"][name="clarq_${qi}"]:checked`);
+      if (checked) {
+        if (checked.value === '__other__') {
+          const otherInput = block.querySelector(`.clarification-other-input[data-qi="${qi}"]`);
+          answer = otherInput ? otherInput.value.trim() : '';
+        } else {
+          const optIdx = parseInt(checked.value, 10);
+          answer = (q.options[optIdx] && q.options[optIdx].label) || '';
+        }
+      }
+    }
+    if (!answer) allAnswered = false;
+    answers.push({ header: q.header, question: q.question, answer: answer || '(no answer)' });
+  });
+
+  if (!allAnswered) {
+    if (button) {
+      button.textContent = 'Answer all questions first';
+      setTimeout(() => { button.textContent = 'Submit'; }, 1800);
+    }
+    return;
+  }
+
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Submitting…';
+  }
+  if (bubble) {
+    const card = bubble.querySelector('.clarification-card');
+    if (card) card.classList.add('answered');
+  }
+
+  const formattedAnswers = answers.map(a => `${a.header}: ${a.answer}`).join('\n');
+  const userMessage = `Here are my answers:\n${formattedAnswers}`;
+
+  // Supervisor proxy: if these answers belong to a Coder conversation, relay them there
+  const relayConvId = clarData._relayToConvId;
+  if (relayConvId) {
+    const coderConv = conversations.find(c => c.id === relayConvId);
+    if (coderConv) {
+      window.steeringQueue = window.steeringQueue || {};
+      window.steeringQueue[relayConvId] = window.steeringQueue[relayConvId] || [];
+      window.steeringQueue[relayConvId].push(`[CLARIFICATION ANSWER]\n${formattedAnswers}`);
+      coderConv.awaitingClarification = null;
+      conv.awaitingClarification = null;
+      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+      appendSystemMessage('Answers relayed to Coder.', { conversationId: targetId });
+    }
+    return;
+  }
+
+  conv.awaitingClarification = null;
+  renderUserMessage(userMessage);
+  conv.messages.push({ role: 'user', text: userMessage, source: 'clarification-answers' });
+  saveConversationsToStorage();
+
+  if (!appConfig.geminiApiKey) {
+    el.settingsModal.classList.add('active');
+    appendSystemMessage("Please enter and save your Gemini API Key first.");
+    return;
+  }
+
+  window.runAgentLoop(userMessage, el.modelSelect.value, conv, { source: 'clarification-answers' })
+    .catch(err => console.error('Clarification resume failed:', err));
+}
+
 // UTILITY ESCAPE HTML
 function escapeHtml(text) {
   if (typeof text !== 'string') return '';
@@ -3989,6 +4262,9 @@ window.onAgentStatusChange = (running) => {
   const queueBtn = document.getElementById('btn-queue');
 
   if (running) {
+    // ── Supervisor: record which conversation just started ──
+    _supervisorLastRunningConvId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+
     showOrionTyping();
     submitBtn.innerHTML = '&#10022;';
     submitBtn.title = 'Send or queue message';
@@ -4021,6 +4297,13 @@ window.onAgentStatusChange = (running) => {
       showToast('Orion finished the current run.', 'success');
       agentCompletionTimer = setTimeout(() => renderAgentPresence('idle', 'Ready', ''), 2600);
     }
+
+    // ── Supervisor: notify the Orion conversation that launched this Coder task ──
+    // We check all conversations because the finished conv may not be the active one.
+    const justFinishedId = _supervisorLastRunningConvId;
+    _supervisorLastRunningConvId = null;
+    if (justFinishedId) notifySupervisorOfCoderCompletion(justFinishedId);
+    hideCoderStatusCard();
   }
 };
 window.renderUserMessageInChat = renderUserMessage;
@@ -4933,3 +5216,382 @@ window.onRagStatusChange = (statusText) => {
 };
 
 window.getCurrentProject = () => currentWorkspace;
+
+// Serve a workspace file to the phone companion for download/view.
+// Security: path must be absolute and start with the current workspace root.
+window.readWorkspaceFileForPhone = (filePath) => {
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    const fp = String(filePath || '').trim();
+    if (!fp) return { success: false, error: 'No path provided' };
+    const workspace = currentWorkspace || '';
+    const normalized = path.resolve(fp);
+    if (workspace && !normalized.startsWith(path.resolve(workspace))) {
+      return { success: false, error: 'Path outside workspace' };
+    }
+    if (!fs.existsSync(normalized)) return { success: false, error: 'File not found' };
+    const stat = fs.statSync(normalized);
+    if (!stat.isFile()) return { success: false, error: 'Not a file' };
+    if (stat.size > 10 * 1024 * 1024) return { success: false, error: 'File too large (>10 MB)' };
+    const ext = path.extname(normalized).toLowerCase().replace('.', '');
+    const textExts = new Set(['txt','md','csv','json','js','mjs','cjs','ts','jsx','tsx','py','html','htm','css','sh','bash','yml','yaml','xml','sql','toml','ini','env','log','gitignore','prettierrc','eslintrc']);
+    const fileContent = fs.readFileSync(normalized);
+    if (textExts.has(ext)) {
+      return { success: true, content: fileContent.toString('utf8'), encoding: 'utf8', mimeType: 'text/plain' };
+    }
+    const mimeMap = { pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', zip: 'application/zip' };
+    return { success: true, content: fileContent.toString('base64'), encoding: 'base64', mimeType: mimeMap[ext] || 'application/octet-stream' };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DISPATCHER-AS-SUPERVISOR LAYER
+// Manages the Orion → Coder supervision relationship:
+//   • Live steering channel (check-in / steering / normal routing)
+//   • Coder task state monitoring with notifications
+//   • Floating status card
+//   • Clarification proxy
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Track which conversation ID was running when onAgentStatusChange fired (needed
+// for the completion notification because running ID is already cleared by then).
+let _supervisorLastRunningConvId = null;
+
+// Polling interval handle for the Coder task monitor.
+let _coderTaskMonitorInterval = null;
+// { orionConvId, coderConvId, lastKnownState }
+let _coderTaskMonitorMeta = null;
+
+// ── Intent classifier ─────────────────────────────────────────────────────────
+// Returns 'checkin' | 'steering' | 'normal'
+function classifySupervisorIntent(text) {
+  const t = text.trim().toLowerCase();
+  const checkinPatterns = [
+    /\b(how'?s it going|how is it going|any updates?|what'?s happening|what is happening)\b/,
+    /\b(status|progress|update|what'?s (it|cody|the coder) (doing|working on|up to))\b/,
+    /\b(check in|checking in|where are (we|you|things)|what have (you|we|they) done)\b/,
+    /^(how|what|where|any).{0,60}\?$/,
+  ];
+  const steeringPatterns = [
+    /\b(also|additionally|on top of that|in addition)\b/,
+    /\b(instead|skip|ignore|don't|do not|forget about|drop|remove)\b/,
+    /\b(focus on|prioritize|make sure|be sure|actually)\b/,
+    /\b(change|add|include|don't include|avoid|use|don't use)\b/,
+    /\b(while you'?re at it|while (it'?s|cody'?s) working)\b/,
+  ];
+  if (checkinPatterns.some(p => p.test(t))) return 'checkin';
+  if (steeringPatterns.some(p => p.test(t))) return 'steering';
+  // Short imperative sentences are usually steering
+  if (t.length < 120 && /^(also|add|skip|use|make|don't|do|change|include|avoid|focus|prioritize)/.test(t)) return 'steering';
+  return 'normal';
+}
+
+// ── Build a human-readable status summary from Coder conversation data ────────
+function buildCoderStatusSummary(coderConvId) {
+  if (typeof window.getCoderConversationSummary !== 'function') return null;
+  const data = window.getCoderConversationSummary(coderConvId);
+  if (!data) return null;
+
+  const lines = [];
+  const { tasks, doneTasks, pendingTasks, recentActivity, subStatus } = data;
+
+  // Task progress
+  if (tasks.length > 0) {
+    lines.push(`**Tasks:** ${doneTasks.length}/${tasks.length} done.`);
+    const inProg = tasks.find(t => t.status === 'in-progress' || t.status === '/');
+    if (inProg) lines.push(`Currently working on: _${inProg.title || inProg.text || 'a task'}_`);
+  }
+
+  // Most recent tool activity
+  const toolCalls = recentActivity.filter(a => a.tool && a.tool !== '_thought').slice(-3);
+  if (toolCalls.length > 0) {
+    const toolNames = toolCalls.map(tc => tc.tool).join(', ');
+    lines.push(`Recent tools: ${toolNames}`);
+  }
+
+  // Latest thought/text
+  const lastThought = [...recentActivity].reverse().find(a => a.tool === '_thought');
+  if (lastThought && lastThought.text) {
+    const preview = lastThought.text.slice(0, 160).replace(/\s+/g, ' ');
+    lines.push(`Last update: "${preview}${lastThought.text.length > 160 ? '…' : ''}"`);
+  }
+
+  if (subStatus) lines.push(`Currently: ${subStatus}`);
+
+  return lines.length > 0 ? lines.join('\n') : 'Working — no detailed status available yet.';
+}
+
+// ── Main supervisor message handler ──────────────────────────────────────────
+// Called from submitMessage() when user types in Orion while Coder is running.
+function handleSupervisorMessage(orionConv, prompt, model) {
+  const coderConvId = orionConv.launchedCoderConvId;
+  const intent = classifySupervisorIntent(prompt);
+
+  if (intent === 'checkin') {
+    // Build a status reply immediately without starting the full agent loop
+    const summary = buildCoderStatusSummary(coderConvId);
+    const replyText = summary
+      ? `Here's what Coder is up to:\n\n${summary}`
+      : 'Coder is still working — no detailed status available yet.';
+
+    // Persist as an assistant message in the Orion conversation
+    orionConv.messages.push({ role: 'assistant', text: replyText, source: 'supervisor-checkin', createdAt: Date.now() });
+    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    if (typeof window.renderAiMessage === 'function') {
+      // Clear any lingering active bubble so this renders as a fresh new bubble
+      if (typeof window.clearActiveAiBubble === 'function') window.clearActiveAiBubble();
+      window.renderAiMessage(replyText, [], orionConv.id);
+    }
+    if (typeof scrollChatToBottom === 'function') scrollChatToBottom();
+    return;
+  }
+
+  if (intent === 'steering') {
+    // Inject directly into the Coder's steering queue
+    window.steeringQueue = window.steeringQueue || {};
+    window.steeringQueue[coderConvId] = window.steeringQueue[coderConvId] || [];
+    window.steeringQueue[coderConvId].push(prompt);
+    appendSystemMessage(`Steering sent to Coder: "${prompt.slice(0, 80)}${prompt.length > 80 ? '…' : ''}"`, { conversationId: orionConv.id });
+    return;
+  }
+
+  // 'normal' — queue for after Coder finishes
+  window.promptQueue = window.promptQueue || [];
+  window.promptQueue.push({ prompt, modelSelectValue: model, conversationId: orionConv.id, alreadyRendered: true });
+  persistAssistantStatusMessage(orionConv.id, 'Queued — Coder is busy. Orion will handle this when it finishes.', {
+    source: 'queue-status',
+    dedupeKey: `supervisor-queued-${orionConv.id}-${Date.now()}`
+  });
+}
+
+// ── Coder task state monitor ──────────────────────────────────────────────────
+// Polls the Coder conversation every 2s to detect state changes.
+window.startCoderTaskMonitor = function(orionConvId, coderConvId) {
+  // Clear any existing monitor
+  if (_coderTaskMonitorInterval) {
+    clearInterval(_coderTaskMonitorInterval);
+    _coderTaskMonitorInterval = null;
+  }
+
+  _coderTaskMonitorMeta = {
+    orionConvId,
+    coderConvId,
+    lastAwaitingClarification: false,
+    lastAwaitingPlanApproval: false,
+    lastRunning: true,        // Coder just started, so it's running
+    startTime: Date.now(),
+    notifiedClarification: false,
+  };
+
+  _coderTaskMonitorInterval = setInterval(() => {
+    if (!_coderTaskMonitorMeta) return;
+    const { orionConvId, coderConvId } = _coderTaskMonitorMeta;
+
+    const orionConv = conversations.find(c => c.id === orionConvId);
+    const coderConv = conversations.find(c => c.id === coderConvId);
+    if (!orionConv || !coderConv) {
+      stopCoderTaskMonitor();
+      return;
+    }
+
+    const isCoderRunning = !!(window.isAgentRunning && window.isAgentRunning()
+      && window.getRunningConversationId && window.getRunningConversationId() === coderConvId);
+    const nowAwaitingClarification = !!(coderConv.awaitingClarification) && !isCoderRunning;
+    const nowAwaitingPlan = !!(coderConv.awaitingPlanApproval && !coderConv.planApproved) && !isCoderRunning;
+    const elapsed = Math.round((Date.now() - _coderTaskMonitorMeta.startTime) / 1000);
+
+    // Update the status card if active Orion conv is watching
+    if (isCoderRunning && activeConversationId === orionConvId) {
+      const subStatus = window.getAgentSubStatus ? window.getAgentSubStatus() : '';
+      showCoderStatusCard(coderConv.title || 'Coder Task', subStatus, elapsed);
+    }
+
+    // Detect: Coder needs clarification → proxy it into Orion
+    if (nowAwaitingClarification && !_coderTaskMonitorMeta.notifiedClarification) {
+      _coderTaskMonitorMeta.notifiedClarification = true;
+      renderCoderClarificationProxy(orionConv, coderConv.awaitingClarification, coderConvId);
+      showCoderStatusCard(coderConv.title || 'Coder Task', 'Waiting for your input…', elapsed);
+    }
+    // Reset flag if coder cleared its clarification
+    if (!coderConv.awaitingClarification) {
+      _coderTaskMonitorMeta.notifiedClarification = false;
+    }
+
+    // Detect: Coder is awaiting plan approval → notify Orion
+    if (nowAwaitingPlan && !_coderTaskMonitorMeta.lastAwaitingPlanApproval) {
+      _coderTaskMonitorMeta.lastAwaitingPlanApproval = true;
+      notifyOrionConversation(orionConv, `Coder has written an implementation plan and is waiting for your approval. Switch to the Coder conversation to review it.`, 'supervisor-plan');
+    }
+    if (!nowAwaitingPlan) _coderTaskMonitorMeta.lastAwaitingPlanApproval = false;
+
+    _coderTaskMonitorMeta.lastRunning = isCoderRunning;
+  }, 2000);
+};
+
+function stopCoderTaskMonitor() {
+  if (_coderTaskMonitorInterval) {
+    clearInterval(_coderTaskMonitorInterval);
+    _coderTaskMonitorInterval = null;
+  }
+  _coderTaskMonitorMeta = null;
+  hideCoderStatusCard();
+}
+window.stopCoderTaskMonitor = stopCoderTaskMonitor;
+
+// ── Supervisor completion notification ────────────────────────────────────────
+function notifySupervisorOfCoderCompletion(finishedCoderConvId) {
+  if (!finishedCoderConvId) return;
+  const orionConv = conversations.find(c => c.launchedCoderConvId === finishedCoderConvId);
+  if (!orionConv) return;
+
+  // Stop the monitor now that the task finished
+  if (_coderTaskMonitorMeta && _coderTaskMonitorMeta.coderConvId === finishedCoderConvId) {
+    stopCoderTaskMonitor();
+  }
+
+  const coderConv = conversations.find(c => c.id === finishedCoderConvId);
+  const taskTitle = orionConv.launchedCoderTaskTitle || (coderConv && coderConv.title) || 'Coder Task';
+  const tasks = (coderConv && coderConv.tasks) || [];
+  const doneTasks = tasks.filter(t => t.status === 'completed' || t.status === 'x');
+  const pendingTasks = tasks.filter(t => t.status !== 'completed' && t.status !== 'x');
+  const elapsed = orionConv.launchedCoderTaskStart
+    ? Math.round((Date.now() - orionConv.launchedCoderTaskStart) / 60000)
+    : null;
+
+  // Determine outcome
+  const blockedFlag = coderConv && Array.isArray(coderConv.messages)
+    && coderConv.messages.slice(-3).some(m => /blocked|cannot|error|failed/i.test(m.text || ''));
+
+  let summaryText;
+  if (pendingTasks.length > 0 && doneTasks.length === 0) {
+    summaryText = `Coder stopped on **${taskTitle}** — ${pendingTasks.length} task${pendingTasks.length > 1 ? 's' : ''} still pending. It may have hit a blocker. Check the Coder conversation for details.`;
+  } else if (pendingTasks.length > 0) {
+    summaryText = `Coder finished part of **${taskTitle}** — ${doneTasks.length} done, ${pendingTasks.length} remaining. You can queue a continuation or check the Coder conversation.`;
+  } else {
+    const elapsed_str = elapsed ? ` (${elapsed}m)` : '';
+    summaryText = `Coder finished **${taskTitle}**${elapsed_str}. ${doneTasks.length > 0 ? `${doneTasks.length} task${doneTasks.length > 1 ? 's' : ''} completed.` : ''} Ready for your next direction.`;
+  }
+
+  notifyOrionConversation(orionConv, summaryText, 'supervisor-completion');
+
+  // Clear the launched coder conv reference so we don't double-notify
+  orionConv.launchedCoderConvId = null;
+  orionConv.launchedCoderTaskTitle = null;
+  orionConv.launchedCoderTaskStart = null;
+  if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+}
+
+// Appends a message to an Orion conversation, rendering it if active.
+function notifyOrionConversation(orionConv, text, source) {
+  if (!orionConv || !text) return;
+  orionConv.messages.push({ role: 'assistant', text, source, createdAt: Date.now() });
+  if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+  if (activeConversationId === orionConv.id && typeof window.renderAiMessage === 'function') {
+    window.clearActiveAiBubble();
+    window.renderAiMessage(text, [], orionConv.id);
+  }
+}
+
+// ── Clarification proxy ────────────────────────────────────────────────────────
+// Renders the Coder's clarification question in the Orion conversation so the
+// user can answer without switching to the Coder tab.
+function renderCoderClarificationProxy(orionConv, clarData, coderConvId) {
+  if (!orionConv || !clarData) return;
+
+  // Tag the clarification data so submitClarificationAnswers knows to relay it
+  const proxyClarData = { ...clarData, _relayToConvId: coderConvId };
+
+  // Set the clarification on the Orion conversation so the bubble renders it
+  orionConv.awaitingClarification = proxyClarData;
+
+  const introText = `Coder needs your input before continuing:\n\n${clarData.intro || ''}`;
+  // Mark this message as a clarification card
+  orionConv.messages.push({
+    role: 'assistant',
+    text: introText,
+    source: 'supervisor-clarification',
+    isClarificationCard: true,
+    createdAt: Date.now()
+  });
+  if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+
+  // Render it in the active chat if we're looking at this Orion conversation
+  if (activeConversationId === orionConv.id) {
+    if (typeof window.clearActiveAiBubble === 'function') window.clearActiveAiBubble();
+    const bubble = document.createElement('div');
+    bubble.className = 'message-bubble';
+    const clarHtml = buildClarificationCardHtml(proxyClarData);
+    bubble.innerHTML = `
+      <div class="message-header ai">
+        <span>✦ Orion AI</span>
+      </div>
+      <div class="message-body">
+        <p>${escapeHtml(introText)}</p>
+        ${clarHtml}
+      </div>
+    `;
+    const container = document.getElementById('messages-container');
+    if (container) {
+      container.style.display = 'flex';
+      container.appendChild(bubble);
+    }
+    // Wire clarification UI interactions
+    bubble.querySelectorAll('.clarification-option, .clarification-other-row').forEach(row => {
+      row.addEventListener('click', () => {
+        const radio = row.querySelector('input[type="radio"]');
+        if (radio) radio.checked = true;
+        const block = row.closest('.clarification-question-block');
+        if (block) block.querySelectorAll('.clarification-option, .clarification-other-row').forEach(r => r.classList.remove('selected'));
+        row.classList.add('selected');
+      });
+    });
+    bubble.querySelectorAll('.clarification-other-input').forEach(input => {
+      input.addEventListener('focus', () => {
+        const row = input.closest('.clarification-other-row');
+        if (row) {
+          const radio = row.querySelector('input[type="radio"]');
+          if (radio) radio.checked = true;
+          const block = row.closest('.clarification-question-block');
+          if (block) block.querySelectorAll('.clarification-option, .clarification-other-row').forEach(r => r.classList.remove('selected'));
+          row.classList.add('selected');
+        }
+      });
+    });
+    const clarSubmitBtn = bubble.querySelector('.btn-clarification-submit');
+    if (clarSubmitBtn) {
+      clarSubmitBtn.addEventListener('click', () => submitClarificationAnswers({
+        button: clarSubmitBtn,
+        bubble,
+        targetConversationId: orionConv.id
+      }));
+    }
+    scrollChatToBottom();
+    showToast('Coder is waiting for your input.', 'default');
+  }
+}
+
+
+// ── Status card ───────────────────────────────────────────────────────────────
+function showCoderStatusCard(taskTitle, subStatus, elapsedSec) {
+  const card = document.getElementById('coder-task-status-card');
+  if (!card) return;
+  const titleEl = card.querySelector('.coder-status-task-name');
+  const subEl = card.querySelector('.coder-status-substatus');
+  const elapsedEl = card.querySelector('.coder-status-elapsed');
+  if (titleEl) titleEl.textContent = taskTitle || 'Coder Task';
+  if (subEl) subEl.textContent = subStatus || 'Working…';
+  if (elapsedEl) {
+    const mins = Math.floor(elapsedSec / 60);
+    const secs = elapsedSec % 60;
+    elapsedEl.textContent = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
+  }
+  card.classList.add('visible');
+}
+
+function hideCoderStatusCard() {
+  const card = document.getElementById('coder-task-status-card');
+  if (card) card.classList.remove('visible');
+}

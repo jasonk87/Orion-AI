@@ -175,6 +175,24 @@
         </div>
       </div>
 
+      <!-- CODER TASK STATUS CARD (Dispatcher-as-Supervisor) -->
+      <!-- Shown when Dispatcher has an active supervised Coder task running. -->
+      <!-- Not a chat message — a persistent floating banner above the input. -->
+      <div id="coder-task-status-card" class="coder-task-status-card" aria-live="polite">
+        <div class="coder-status-spinner">
+          <span class="coder-status-dot"></span>
+          <span class="coder-status-dot"></span>
+          <span class="coder-status-dot"></span>
+        </div>
+        <div class="coder-status-body">
+          <span class="coder-status-label">Coder working on</span>
+          <span class="coder-status-task-name">task</span>
+          <span class="coder-status-sep">·</span>
+          <span class="coder-status-substatus">Working…</span>
+        </div>
+        <span class="coder-status-elapsed">0s</span>
+      </div>
+
       <!-- CHAT INPUT CONTAINER -->
       <div id="chat-input-wrapper">
         <!-- Image preview area (shown when images are queued) -->
@@ -432,6 +450,12 @@
           <label for="setting-command-timeout">Command Timeout (ms):</label>
           <input type="number" id="setting-command-timeout" value="120000">
           <small class="form-help">Stops tests or shell commands that run too long.</small>
+        </div>
+
+        <div class="form-group">
+          <label for="setting-phone-https-origin">Secure Phone URL (HTTPS):</label>
+          <input type="url" id="setting-phone-https-origin" placeholder="https://your-device.your-tailnet.ts.net">
+          <small class="form-help">Used for phone pairing and Web Push notifications. Point it at this app's phone companion port.</small>
         </div>
 
         <div class="form-group">
