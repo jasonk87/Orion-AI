@@ -332,3 +332,15 @@ test('the AI thinking placeholder only suppresses stale renders, not an actively
     'agent.js renders the placeholder immediately at both points a fresh "Thinking..." message is created');
   t.end();
 });
+
+test('agent status messages update in place instead of spamming transcript tails', (t) => {
+  const agentJsSource = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8').replace(/\r\n/g, '\n');
+  t.ok(renderer.includes('options.updateExisting && options.dedupeKey'), 'system messages can update an existing keyed status');
+  t.ok(renderer.includes('msg.dedupeKey === dedupeKey'), 'existing keyed system messages are found by dedupe key');
+  t.ok(agentJsSource.includes("source: 'supervisor-extension'"), 'supervisor extension status is marked as a status source');
+  t.ok(agentJsSource.includes("dedupeKey: `supervisor-extension-${conversation.id}`"), 'supervisor extension status uses one stable key per conversation');
+  t.ok(agentJsSource.includes("source: 'planning-mode'"), 'planning/direct mode status is marked as a status source');
+  t.ok(agentJsSource.includes("dedupeKey: `planning-mode-${conversation.id}`"), 'planning/direct mode status uses one stable key per conversation');
+  t.ok(agentJsSource.includes('updateExisting: true'), 'agent status system messages request in-place updates');
+  t.end();
+});

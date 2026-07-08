@@ -3140,6 +3140,22 @@ function appendSystemMessage(text, options = {}) {
   const runningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
   const targetId = options.conversationId || runningId || activeConversationId;
   const dedupeKey = options.dedupeKey || text;
+  const conv = conversations.find(c => c.id === targetId);
+  if (conv && options.updateExisting && options.dedupeKey) {
+    const existing = (conv.messages || []).slice().reverse().find(msg =>
+      msg &&
+      msg.role === 'system' &&
+      msg.dedupeKey === dedupeKey
+    );
+    if (existing) {
+      existing.text = text;
+      existing.updatedAt = Date.now();
+      if (options.source) existing.source = options.source;
+      saveConversationsToStorage();
+      if (targetId === activeConversationId) selectConversation(targetId);
+      return;
+    }
+  }
   const windowMs = Number(options.windowMs || 1500);
   window.recentSystemMessages = window.recentSystemMessages || {};
   const now = Date.now();
@@ -3147,7 +3163,6 @@ function appendSystemMessage(text, options = {}) {
   if (now - lastAt < windowMs) {
     return;
   }
-  const conv = conversations.find(c => c.id === targetId);
   if (conv && options.dedupeKey) {
     conv.systemMessageDedupe = conv.systemMessageDedupe || {};
     const convLastAt = conv.systemMessageDedupe[dedupeKey] || 0;
@@ -3163,6 +3178,7 @@ function appendSystemMessage(text, options = {}) {
   }
   if (conv) {
     const sysMsg = { role: 'system', text: text };
+    if (options.dedupeKey) sysMsg.dedupeKey = options.dedupeKey;
     if (options.source === 'plan-approval') {
       sysMsg.source = 'plan-approval'; // Matches: role: 'system', source: 'plan-approval'
     } else if (options.source) {

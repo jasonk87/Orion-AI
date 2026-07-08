@@ -972,7 +972,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
   // Surface a direct-task decision once, in one consistent place.
   if (!isInternalPrompt && conversation.mode !== 'orion' && !conversation.planApproved && window.appendSystemMessage && planningBypassedForTask && planningDecision.mode === 'direct' && agentExecutionMode === 'direct') {
-    window.appendSystemMessage(`Planning mode: direct task, no implementation plan required. ${planningDecision.reason || ''}`.trim());
+    window.appendSystemMessage(`Planning mode: direct task, no implementation plan required. ${planningDecision.reason || ''}`.trim(), {
+      conversationId: conversation.id,
+      source: 'planning-mode',
+      dedupeKey: `planning-mode-${conversation.id}`,
+      updateExisting: true
+    });
   }
 
   // Structural reset of stale mission state for genuinely new work. This only clears whatever
@@ -2339,17 +2344,32 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       
       if (loopCount === maxLoops && !isStopRequested && !forceYield) {
         if (window.appendSystemMessage) {
-          window.appendSystemMessage("Action limit reached. Checking with Supervisor...", { conversationId: conversation.id });
+          window.appendSystemMessage("Action limit reached. Checking with Supervisor...", {
+            conversationId: conversation.id,
+            source: 'supervisor-extension',
+            dedupeKey: `supervisor-extension-${conversation.id}`,
+            updateExisting: true
+          });
         }
         const isStuck = await evaluateLoopStateWithSupervisor(activeRunModelName, workWalkthrough, false, config);
         if (!isStuck) {
           maxLoops += 15;
           if (window.appendSystemMessage) {
-            window.appendSystemMessage("Supervisor approved +15 turn extension.", { conversationId: conversation.id });
+            window.appendSystemMessage("Supervisor approved +15 turn extension.", {
+              conversationId: conversation.id,
+              source: 'supervisor-extension',
+              dedupeKey: `supervisor-extension-${conversation.id}`,
+              updateExisting: true
+            });
           }
         } else {
           if (window.appendSystemMessage) {
-            window.appendSystemMessage("Supervisor halted run due to looping.", { conversationId: conversation.id });
+            window.appendSystemMessage("Supervisor halted run due to looping.", {
+              conversationId: conversation.id,
+              source: 'supervisor-extension',
+              dedupeKey: `supervisor-extension-${conversation.id}`,
+              updateExisting: true
+            });
           }
         }
       }
