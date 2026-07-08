@@ -1740,7 +1740,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       const PARALLELIZABLE_TOOLS = new Set([
         'read_file', 'read_multiple_files', 'list_files', 'get_symbol_index', 'get_workspace_info',
         'google_search', 'fetch_web_page', 'grep_search', 'search_embeddings',
-        'semantic_search', 'get_file_symbols', 'find_references',
+        'semantic_search', 'fetch_page', 'git_diff', 'git_rollback', 'edit_config', 'get_file_symbols', 'find_references',
         'read_command_output', 'get_command_status',
         'recall_memory', 'read_notes', 'get_project_memory'
       ]);
@@ -2878,6 +2878,34 @@ async function executeTool(name, args, workspace, config, conversation) {
       });
       if (!result || result.success === false) throw new Error((result && result.error) || 'grep_search failed');
       return result;
+    }
+
+    case 'fetch_page': {
+      if (!args.url) throw new Error("Missing 'url' parameter");
+      const result = await window.api.fetchWebPage(args.url);
+      if (result.error) throw new Error(result.error);
+      return { content: result.content || result.success || result };
+    }
+
+    case 'git_diff': {
+      const result = await window.api.gitDiff(workspace, args.path);
+      if (!result.success) throw new Error(result.error || 'Failed to get git diff');
+      return { diff: result.stdout || '(no differences)' };
+    }
+
+    case 'git_rollback': {
+      if (!args.path) throw new Error("Missing 'path' parameter");
+      const result = await window.api.gitRollback(workspace, args.path);
+      if (!result.success) throw new Error(result.error || 'Failed to roll back file');
+      return { success: true, message: `Rolled back ${args.path}` };
+    }
+
+    case 'edit_config': {
+      if (!args.path) throw new Error("Missing 'path' parameter");
+      if (!args.updates) throw new Error("Missing 'updates' parameter");
+      const result = await window.api.editConfig(workspace, args.path, args.updates);
+      if (!result.success) throw new Error(result.error || 'Failed to edit config');
+      return { success: true, message: `Updated config at ${args.path}` };
     }
 
     case 'get_file_symbols': {
@@ -6802,7 +6830,7 @@ const DISPATCH_TOOL_ALLOWLIST = new Set([
   'read_file', 'read_multiple_files', 'list_files', 'get_workspace_info', 'change_workspace',
   'handoff_to_coder',
   'grep_search', 'search_embeddings', 'semantic_search',
-  'get_symbol_index', 'get_file_symbols', 'find_references',
+  'get_symbol_index', 'fetch_page', 'git_diff', 'git_rollback', 'edit_config', 'get_file_symbols', 'find_references',
   'read_notes', 'read_project_memory'
 ]);
 
@@ -6994,6 +7022,54 @@ function buildAgentToolDeclarations() {
                 timeoutMs: { type: "NUMBER", description: "Optional timeout in milliseconds before Orion stops the command." }
               },
               required: ["command"]
+            }
+          },
+          {
+            name: "fetch_page",
+            description: "Fetches and parses a web page from a URL. Great for reading documentation, API references, or any external link.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                url: { type: "STRING", description: "The full URL to fetch." }
+              },
+              required: ["url"]
+            }
+          },
+          {
+            name: "git_diff",
+            description: "Gets the current git diff for the workspace or a specific file.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                path: { type: "STRING", description: "Optional relative path to a specific file to diff." }
+              }
+            }
+          },
+          {
+            name: "git_rollback",
+            description: "Rolls back changes to a specific file using git checkout HEAD.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                path: { type: "STRING", description: "Relative path to the file to roll back." }
+              },
+              required: ["path"]
+            }
+          },
+          {
+            name: "edit_config",
+            description: "Safely edits a JSON config file (like package.json or .orionrc) by merging key-value pairs without risking syntax errors.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                path: { type: "STRING", description: "Relative path to the JSON file." },
+                updates: {
+                  type: "OBJECT",
+                  description: "An object containing key-value pairs to update in the config. Values can be deeply nested.",
+                  additionalProperties: true
+                }
+              },
+              required: ["path", "updates"]
             }
           },
           {
