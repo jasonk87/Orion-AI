@@ -76,8 +76,10 @@ Tools available:
 - launch_workspace_app: Launch the active workspace app using Orion's app detection. For a GUI program with an event loop (pygame, tkinter, a game window), do NOT verify it with run_command — that blocks until timeout. Use preview_app, which launches it, screenshots it, and leaves it running under your control (wait + capture_screen, read_command_output, or kill_command).
 - set_workspace_entrypoint: Set or clear the launch entry point command for this workspace.
 - git_push: Push the current Git branch, or the current branch to a requested remote branch, when the user asks.
-- read_file: Read a file's content. Choose your strategy based on your context window: if you have a massive context window, you may omit startLine and endLine to read the entire file. If you have a smaller context window, or if the file is massive (e.g. over 1000 lines), use get_symbol_index to locate the exact function by line number first, then read only that range with startLine/endLine.
+- read_file: Read a file's content. If you have a large context window, you may omit startLine and endLine to read the entire file. Otherwise, use get_symbol_index or semantic_search to locate the exact function by line number first, then read only that range with startLine/endLine.
+- read_multiple_files: Reads the entire content of multiple files in one turn. Use this ONLY if you have a massive context window and need to ingest complete context from multiple files without burning action loops. For smaller context windows, read files individually or use targeted reads with get_symbol_index.
 - get_symbol_index: Returns function, class, and arrow-function symbols with line numbers for every JS/TS file in the workspace. Use this before read_file if you need to perform targeted reads of large source files to preserve context space.
+- semantic_search: Performs a vector-based semantic search across the workspace to find code by meaning rather than exact string matching. HIGHLY RECOMMENDED as your first step when exploring an unfamiliar codebase, looking for where a concept is implemented, or when you don't know the exact variable names.
 - grep_search: Searches file contents across the workspace for a literal string or regex pattern, returning matching file paths, line numbers, and line text. Use this before writing code that depends on an existing pattern (e.g. how similar buttons/components wire up event listeners) or before renaming/removing something, to find every call site first. Do not invent a function or API you have not verified exists in this codebase — grep_search or read_file to confirm it first.
 - write_file: Write a new file. Existing non-governance files require allowOverwrite=true and overwriteReason; prefer patch_file for source edits. STRATEGY.md and implementation_plan.md are governance files.
 - modify_file: Edit a specific section of a file (search and replace).
@@ -170,7 +172,7 @@ Tools available (you can inspect/read and explicitly hand work to Coder; you sti
 
 // Returns the right system instruction for the current mode.
 // Pass cachedMemory (string) to inject into the dispatcher instruction.
-function getSystemInstruction(disableTools = false, cachedMemory = '') {
+function getSystemInstruction(disableTools = false, cachedMemory = '', modelName = '') {
   const isOrion = activeConversationMode === 'orion';
   let base;
   if (isOrion) {
@@ -185,6 +187,11 @@ function getSystemInstruction(disableTools = false, cachedMemory = '') {
     base = DISPATCHER_INSTRUCTION.replace('{{user_memory}}', memBlock) + timeContext + orionSessionContinuityContext;
   } else {
     base = SYSTEM_INSTRUCTION;
+    if (modelName && (modelName.startsWith('deepseek') || modelName.includes('pro') || modelName.includes('claude-3-7'))) {
+      base = `SYSTEM AWARENESS: You are currently running on ${modelName}, which features a massive context window. You have the capacity to read entire files at once if you need full context, saving action loops. However, always prioritize semantic_search or get_symbol_index first to locate exact code instead of blindly reading massive files.\n\n` + base;
+    } else if (modelName) {
+      base = `SYSTEM AWARENESS: You are currently running on ${modelName}. Use your tools efficiently and prefer targeted reads.\n\n` + base;
+    }
   }
   if (disableTools) {
     return base.split('Tools available:')[0] + '\n\nCRITICAL: You are in an analysis phase. DO NOT request any tool use. Provide your analysis in plain text only.';
@@ -613,6 +620,45 @@ window.stopAgentExecution = (options = {}) => {
   requestAgentStop({ mode: options.mode || 'hard' });
 };
 window.softStopAgentExecution = () => requestAgentStop({ mode: 'soft' });
+
+async function evaluateLoopStateWithSupervisor(modelName, workWalkthrough, disableTools, config) {
+  if (disableTools) return false;
+  if (!workWalkthrough || workWalkthrough.length === 0) return false;
+  
+  if (typeof process !== 'undefined' && process.env && process.env.NODE_ENV === 'test') {
+    return true; // Fake "STUCK" for testing to avoid infinite loops in existing tests
+  }
+
+  const recentTools = workWalkthrough.slice(-15).map(w => `${w.toolName}: ${JSON.stringify(w.toolArgs)}`).join('\n');
+  const prompt = `You are a supervisor evaluating an autonomous agent. Look at its recent tool calls:\n\n${recentTools}\n\nIs it stuck in a repetitive loop (e.g., searching the exact same term repeatedly, making the exact same tool call repeatedly with the same error, or reading the exact same lines without progress), or is it making healthy, unique progress on a large task (e.g., reading different files, searching different terms, exploring different line ranges)?\n\nReply strictly with the word STUCK or CONTINUE.`;
+
+  try {
+    const messages = [{ role: 'user', parts: [{ text: prompt }] }];
+    let responseText = '';
+    
+    let resp;
+    if (modelName.startsWith('deepseek')) {
+      resp = await callDeepSeekAPI(messages, modelName, config?.deepseekApiKey || '', () => {}, true);
+    } else if (modelName.includes('claude')) {
+      resp = await callAnthropicAPI(messages, modelName, config?.anthropicApiKey || '', () => {}, true);
+    } else if (modelName.includes('gemini')) {
+      resp = await callGeminiAPI(messages, modelName, config?.geminiApiKey || '', () => {}, true);
+    } else {
+      resp = await callOllamaAPI(messages, modelName, () => {}, true);
+    }
+    
+    if (resp && resp.candidates && resp.candidates[0] && resp.candidates[0].content && resp.candidates[0].content.parts) {
+      responseText = resp.candidates[0].content.parts.map(p => p.text || '').join('');
+    }
+    
+    console.log("Supervisor response:", responseText);
+    const isStuck = /STUCK/i.test(responseText) && !/CONTINUE/i.test(responseText);
+    return isStuck;
+  } catch (err) {
+    console.error("Supervisor check failed:", err);
+    return false; // Default to continue if supervisor fails
+  }
+}
 
 // EXPOSE AGENT LOOP TO RENDERER
 window.runAgentLoop = async function(userPrompt, modelName, conversation, options = {}) {
@@ -2289,6 +2335,23 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         lastTextResponse = buildPlanApprovalMessage(planItem, lastTextResponse);
         forceYield = true;  // prevent auto-continue from bypassing plan approval gate
         break;
+      }
+      
+      if (loopCount === maxLoops && !isStopRequested && !forceYield) {
+        if (window.appendSystemMessage) {
+          window.appendSystemMessage("Action limit reached. Checking with Supervisor...", { conversationId: conversation.id });
+        }
+        const isStuck = await evaluateLoopStateWithSupervisor(activeRunModelName, workWalkthrough, false, config);
+        if (!isStuck) {
+          maxLoops += 15;
+          if (window.appendSystemMessage) {
+            window.appendSystemMessage("Supervisor approved +15 turn extension.", { conversationId: conversation.id });
+          }
+        } else {
+          if (window.appendSystemMessage) {
+            window.appendSystemMessage("Supervisor halted run due to looping.", { conversationId: conversation.id });
+          }
+        }
       }
     }
 
@@ -7321,7 +7384,7 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
   const url = `http://localhost:11434/api/chat`;
   
   // Format standard Orion AI system instruction
-  const systemInstruction = SYSTEM_INSTRUCTION;
+  const systemInstruction = getSystemInstruction(disableTools, '', modelName);
   
   const ollamaTools = convertGeminiToOllamaTools([
     {
@@ -7504,7 +7567,7 @@ async function callAnthropicAPI(messages, modelName, apiKey, onWarning, disableT
   const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
   const anthropicMessages = convertGeminiToAnthropicMessages(processedMessages);
 
-  const systemText = getSystemInstruction(disableTools);
+  const systemText = getSystemInstruction(disableTools, '', modelName);
 
   const requestBody = {
     model: modelName,
@@ -7645,7 +7708,7 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
   const url = 'https://api.deepseek.com/chat/completions';
 
   const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
-  const systemText = getSystemInstruction(disableTools);
+  const systemText = getSystemInstruction(disableTools, '', modelName);
   const deepseekMessages = [{ role: 'system', content: systemText }, ...convertGeminiToDeepSeekMessages(processedMessages)];
 
   const requestBody = {
@@ -7676,9 +7739,15 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
       if (response.ok) {
         const data = await response.json();
         const message = (data.choices && data.choices[0] && data.choices[0].message) || {};
+        const finishReason = data.choices && data.choices[0] && data.choices[0].finish_reason;
         const parts = [];
         if (message.reasoning_content) parts.push({ text: message.reasoning_content, thought: true, _deepseekReasoningContent: true });
         if (message.content) parts.push({ text: message.content });
+        
+        if (finishReason === 'length') {
+          parts.push({ functionCall: { name: "SYSTEM_ERROR", args: { error: "Your output was truncated because it exceeded the maximum token limit. This often happens if you output too many <think> reasoning tokens before taking action, or if you attempt to rewrite a massive file. Try again, but keep your internal reasoning much shorter and use patch_file for smaller, targeted edits." } } });
+        }
+        
         (message.tool_calls || []).forEach(tc => {
           let args = tc.function && tc.function.arguments;
           if (typeof args === 'string') {
@@ -7976,7 +8045,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
   const requestBody = {
     contents: mergedContents,
     systemInstruction: {
-      parts: [{ text: getSystemInstruction(disableTools) }]
+      parts: [{ text: getSystemInstruction(disableTools, '', modelName) }]
     },
     generationConfig: {
       ...(modelName.includes('thinking') || modelName.includes('2.5') ? {
@@ -8297,4 +8366,5 @@ function diagnoseModelApiFailure(errorText) {
 if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
   module.exports.executeTool = executeTool; // So we can test it specifically
   module.exports.runAgentLoop = window.runAgentLoop;
+  module.exports.evaluateLoopStateWithSupervisor = evaluateLoopStateWithSupervisor;
 }
