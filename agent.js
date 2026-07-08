@@ -4275,6 +4275,14 @@ function getCompactionThreshold(modelName, config) {
 }
 
 function persistCompactedConversation(conversation, summary) {
+  // Capture backup state before destructive overwrite
+  conversation.compactionHistory = conversation.compactionHistory || [];
+  conversation.compactionHistory.push({
+    timestamp: Date.now(),
+    summary,
+    messages: [...conversation.messages]
+  });
+
   const recentMessages = conversation.messages
     .filter(message => !(message.role === 'assistant' && message.text === 'Thinking...'))
     .slice(-8);
@@ -7525,8 +7533,18 @@ function convertGeminiToAnthropicMessages(geminiMessages) {
 
   (geminiMessages || []).forEach(msg => {
     if (msg.role === 'user') {
-      const text = (msg.parts || []).map(p => p.text).filter(Boolean).join('');
-      out.push({ role: 'user', content: text || '(no content)' });
+      const blocks = [];
+      (msg.parts || []).forEach(p => {
+        if (p.text) blocks.push({ type: 'text', text: p.text });
+        if (p.inlineData) {
+          blocks.push({
+            type: 'image',
+            source: { type: 'base64', media_type: p.inlineData.mimeType, data: p.inlineData.data }
+          });
+        }
+      });
+      if (blocks.length === 0) blocks.push({ type: 'text', text: '(no content)' });
+      out.push({ role: 'user', content: blocks });
     } else if (msg.role === 'model') {
       const blocks = [];
       lastToolUseIds = [];
@@ -7677,8 +7695,18 @@ function convertGeminiToDeepSeekMessages(geminiMessages) {
 
   (geminiMessages || []).forEach(msg => {
     if (msg.role === 'user') {
-      const text = (msg.parts || []).map(p => p.text).filter(Boolean).join('');
-      out.push({ role: 'user', content: text || '(no content)' });
+      const blocks = [];
+      (msg.parts || []).forEach(p => {
+        if (p.text) blocks.push({ type: 'text', text: p.text });
+        if (p.inlineData) {
+          blocks.push({
+            type: 'image_url',
+            image_url: { url: `data:${p.inlineData.mimeType};base64,${p.inlineData.data}` }
+          });
+        }
+      });
+      if (blocks.length === 0) blocks.push({ type: 'text', text: '(no content)' });
+      out.push({ role: 'user', content: blocks });
     } else if (msg.role === 'model') {
       const textParts = (msg.parts || []).filter(p => p.text && !p.thought && !p._deepseekReasoningContent).map(p => p.text);
       const reasoningContent = (msg.parts || [])
@@ -8219,7 +8247,13 @@ async function compactHistory(messages, modelName, config) {
       m.parts.forEach(p => {
         if (p.text) contentText += p.text;
         if (p.functionCall) contentText += ` [Called Tool: ${p.functionCall.name}]`;
-        if (p.functionResponse) contentText += ` [Tool Output: ${JSON.stringify(p.functionResponse.response)}]`;
+        if (p.functionResponse) {
+          let out = JSON.stringify(p.functionResponse.response);
+          if (out.length > 2000) {
+            out = out.slice(0, 1000) + '\\n\\n...[TRUNCATED_FOR_COMPACTION]...\\n\\n' + out.slice(-1000);
+          }
+          contentText += ` [Tool Output: ${out}]`;
+        }
       });
     }
     conversationLogsText += `${roleName}: ${contentText}\n\n`;
