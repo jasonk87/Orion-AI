@@ -76,8 +76,8 @@ Tools available:
 - launch_workspace_app: Launch the active workspace app using Orion's app detection. For a GUI program with an event loop (pygame, tkinter, a game window), do NOT verify it with run_command — that blocks until timeout. Use preview_app, which launches it, screenshots it, and leaves it running under your control (wait + capture_screen, read_command_output, or kill_command).
 - set_workspace_entrypoint: Set or clear the launch entry point command for this workspace.
 - git_push: Push the current Git branch, or the current branch to a requested remote branch, when the user asks.
-- read_file: Read a file's content. For large files, first call get_symbol_index to locate the exact function/class by line number, then read only that range with startLine/endLine.
-- get_symbol_index: Returns function, class, and arrow-function symbols with line numbers for every JS/TS file in the workspace. Always call this before read_file on large source files — identify the target symbol's line range first. For any source file roughly above 300 lines or a few thousand characters, prefer get_symbol_index plus a targeted read_file(startLine, endLine) over reading the whole file in one call — a full read of a large file costs many times the tokens of a scoped read and usually contains far more than the current task needs.
+- read_file: Read a file's content. Choose your strategy based on your context window: if you have a massive context window, you may omit startLine and endLine to read the entire file. If you have a smaller context window, or if the file is massive (e.g. over 1000 lines), use get_symbol_index to locate the exact function by line number first, then read only that range with startLine/endLine.
+- get_symbol_index: Returns function, class, and arrow-function symbols with line numbers for every JS/TS file in the workspace. Use this before read_file if you need to perform targeted reads of large source files to preserve context space.
 - grep_search: Searches file contents across the workspace for a literal string or regex pattern, returning matching file paths, line numbers, and line text. Use this before writing code that depends on an existing pattern (e.g. how similar buttons/components wire up event listeners) or before renaming/removing something, to find every call site first. Do not invent a function or API you have not verified exists in this codebase — grep_search or read_file to confirm it first.
 - write_file: Write a new file. Existing non-governance files require allowOverwrite=true and overwriteReason; prefer patch_file for source edits. STRATEGY.md and implementation_plan.md are governance files.
 - modify_file: Edit a specific section of a file (search and replace).
@@ -1687,7 +1687,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // executeTool calls concurrently with Promise.all. State mutations (log
       // updates, ledger entries, working-state transitions) are still sequential.
       const PARALLELIZABLE_TOOLS = new Set([
-        'read_file', 'list_files', 'get_symbol_index', 'get_workspace_info',
+        'read_file', 'read_multiple_files', 'list_files', 'get_symbol_index', 'get_workspace_info',
         'google_search', 'fetch_web_page', 'grep_search', 'search_embeddings',
         'semantic_search', 'get_file_symbols', 'find_references',
         'read_command_output', 'get_command_status',
@@ -2826,6 +2826,21 @@ async function executeTool(name, args, workspace, config, conversation) {
       });
       if (content.error) throw new Error(content.error);
       return { content: content };
+    }
+    
+    case 'read_multiple_files': {
+      if (!args.paths || !Array.isArray(args.paths)) throw new Error("Missing 'paths' array parameter");
+      
+      const readPromises = args.paths.map(async (path) => {
+        const content = isOrionGovernanceArtifactPath(path)
+          ? await readOrionGovernanceArtifactText(workspace, conversation, path, { maxChars: 500000 }).catch(e => ({ error: e.message }))
+          : await window.api.readFile(workspace, path, { maxChars: 500000 }).catch(e => ({ error: e.message }));
+        if (content && content.error) throw new Error(`Error reading ${path}: ${content.error}`);
+        return `\n\n--- File: ${path} ---\n${content}`;
+      });
+
+      const results = await Promise.all(readPromises);
+      return { content: results.join("") };
     }
     
     case 'write_file': {
@@ -5718,7 +5733,7 @@ function requestPlausiblyBenefitsFromWorkspaceContext(prompt) {
   return referencesAppOrCode && isIdeaOrDesignRequest;
 }
 
-const INSPECTION_TOOLS = new Set(['list_files', 'read_file', 'get_workspace_info', 'grep_search', 'search_embeddings', 'get_symbol_index']);
+const INSPECTION_TOOLS = new Set(['list_files', 'read_file', 'read_multiple_files', 'get_workspace_info', 'grep_search', 'search_embeddings', 'get_symbol_index']);
 const MEMORY_WRITE_TOOLS = new Set(['append_project_memory', 'remember_fact', 'remember_decision']);
 
 function hasPriorWorkspaceInspection(conversation) {
@@ -6693,7 +6708,7 @@ function convertGeminiToOllamaMessages(geminiMessages) {
 const DISPATCH_TOOL_ALLOWLIST = new Set([
   'recall_memory', 'remember_fact', 'remember_preference',
   'google_search', 'fetch_web_page',
-  'read_file', 'list_files', 'get_workspace_info', 'change_workspace',
+  'read_file', 'read_multiple_files', 'list_files', 'get_workspace_info', 'change_workspace',
   'handoff_to_coder',
   'grep_search', 'search_embeddings', 'semantic_search',
   'get_symbol_index', 'get_file_symbols', 'find_references',
@@ -6779,6 +6794,21 @@ function buildAgentToolDeclarations() {
                 branch: { type: "STRING", description: "Remote branch name to push to. Defaults to current branch." },
                 setUpstream: { type: "BOOLEAN", description: "Whether to set upstream with -u. Defaults to true." }
               }
+            }
+          },
+          {
+            name: "read_multiple_files",
+            description: "Reads the entire content of multiple files in one turn. Use this ONLY if you have a massive context window and need to ingest complete context from multiple files without burning action loops. For smaller context windows, read files individually or use targeted reads with get_symbol_index.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                paths: { 
+                  type: "ARRAY", 
+                  items: { type: "STRING" },
+                  description: "Array of relative paths of the files to read" 
+                }
+              },
+              required: ["paths"]
             }
           },
           {
@@ -6888,7 +6918,7 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "semantic_search",
-            description: "Performs a vector-based semantic search across the workspace to find code by meaning rather than exact string matching.",
+            description: "Performs a vector-based semantic search across the workspace to find code by meaning rather than exact string matching. HIGHLY RECOMMENDED as your first step when exploring an unfamiliar codebase, looking for where a concept is implemented, or when you don't know the exact variable names.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -7698,7 +7728,7 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
 const TOOL_RESULT_TRIM_THRESHOLD_CHARS = 4000;
 const TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES = 6;
 const TRIMMABLE_TOOL_RESULT_NAMES = new Set([
-  'list_files', 'read_file', 'get_symbol_index', 'read_command_output',
+  'list_files', 'read_file', 'read_multiple_files', 'get_symbol_index', 'read_command_output',
   'google_search', 'fetch_web_page', 'read_notes', 'read_operational_context',
   'read_project_memory', 'recall_memory', 'discover_skills'
 ]);
