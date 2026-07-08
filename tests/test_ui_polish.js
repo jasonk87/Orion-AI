@@ -31,46 +31,60 @@ test('desktop polish includes accessible focus and reduced-motion behavior', (t)
   t.notOk(html.includes('class="quick-tips"'), 'keeps the welcome state focused on the agent');
   t.ok(styles.includes('#btn-change-workspace,\n#btn-sync-files { display: none; }'), 'hides redundant workspace chrome');
   t.ok(html.includes('aria-label="Minimize window"'), 'window controls have accessible names');
+  t.ok(html.includes('id="setting-phone-https-origin"'), 'desktop settings include a secure phone URL field');
+  t.ok(renderer.includes('normalizePhoneHttpsOrigin'), 'renderer normalizes the secure phone URL before saving');
   t.ok(fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8').includes("el.chatInput.value += `${needsSpace ? ' ' : ''}@`;"), 'file mention button performs a real action');
   t.end();
 });
 
 test('phone companion finishes with the same dark theme and complete mission hierarchy', (t) => {
-  const unifiedThemeIndex = companionHtml.indexOf('Unified Orion dark companion theme');
-  const legacyLightIndex = companionHtml.indexOf('Codex-inspired mobile shell, Orion palette');
-  const desktopAlignedIndex = companionHtml.indexOf('Desktop-aligned Orion mobile refinement');
-  t.ok(unifiedThemeIndex > legacyLightIndex, 'unified dark theme wins the cascade');
-  t.ok(desktopAlignedIndex > unifiedThemeIndex, 'desktop-aligned phone refinement is the final theme layer');
-  t.ok(companionHtml.slice(unifiedThemeIndex).includes('color-scheme: dark'), 'phone declares dark controls');
-  t.ok(companionHtml.slice(desktopAlignedIndex).includes('--bg: #090b12'), 'phone uses the desktop graphite background');
-  t.ok(companionHtml.slice(desktopAlignedIndex).includes('--accent: #8273f4'), 'phone uses the desktop violet-blue accent');
-  t.ok(companionHtml.slice(desktopAlignedIndex).includes('--success: #46d59b'), 'phone uses the desktop success color');
-  t.ok(companionHtml.slice(unifiedThemeIndex).includes('#mission-context-card { grid-area: mission; }'), 'Mission Control has an explicit mobile layout area');
-  t.ok(companionHtml.slice(unifiedThemeIndex).includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
+  const rootIndex = companionHtml.indexOf('Single consolidated :root');
+  t.ok(rootIndex !== -1, 'phone theme is consolidated into one root layer');
+  t.ok(companionHtml.includes('color-scheme: dark'), 'phone declares dark controls');
+  t.ok(companionHtml.includes('--bg: #090b12'), 'phone uses the desktop graphite background');
+  t.ok(companionHtml.includes('--accent: #8273f4'), 'phone uses the desktop violet-blue accent');
+  t.ok(companionHtml.includes('--success: #46d59b'), 'phone uses the desktop success color');
+  t.ok(companionHtml.includes('#task-list-card { grid-area: mission; }'), 'Task List has an explicit mobile layout area');
+  t.ok(companionHtml.includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
   t.ok(companionHtml.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
-  t.ok(companionHtml.includes('ui-polish-v13'), 'phone shell exposes the current UI build version');
-  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v13"), 'phone service worker cache is bumped for the current UI build');
+  t.ok(companionHtml.includes('ui-polish-v18'), 'phone shell exposes the current UI build version');
+  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v18"), 'phone service worker cache is bumped for the current UI build');
+  t.ok(companionHtml.includes('window.isSecureContext'), 'phone explains when browser push is blocked by an insecure context');
+  t.ok(companionHtml.includes('Phone push needs HTTPS or localhost'), 'phone tells the user that HTTPS is required for push notifications');
+  t.ok(companionHtml.includes("companionFetch('/api/push-subscribe'"), 'phone stores push subscriptions through the authenticated fetch path');
   t.end();
 });
 
 test('phone companion renders approvals and tool calls as first-class mobile UI', (t) => {
+  const ipcServer = fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8');
   t.ok(companionHtml.includes('id="plan-panel"'), 'phone includes the approval panel');
   t.ok(companionHtml.includes('Start Implementation'), 'phone keeps the approval start action');
   t.ok(companionHtml.includes('id="deny-plan"'), 'phone keeps deny action');
   t.ok(companionHtml.includes('id="revise-plan"'), 'phone keeps revise action');
   t.ok(companionHtml.includes('function renderToolCallRows'), 'phone renders tool calls with a dedicated renderer');
+  t.ok(companionHtml.includes('function formatToolResultPreview'), 'phone formats tool results before rendering them');
+  t.ok(companionHtml.includes('function summarizeFileListResult'), 'phone summarizes large workspace inventory results');
+  t.ok(companionHtml.includes('function formatToolParams'), 'phone formats tool params compactly');
   t.ok(companionHtml.includes('function splitAssistantOutput'), 'phone splits appended walkthroughs out of assistant prose');
+  t.ok(companionHtml.includes('<script src="/marked.min.js"></script>'), 'phone loads the shared Markdown parser');
   t.ok(companionHtml.includes('function renderInlineMarkdown'), 'phone formats assistant Markdown instead of plain escaped text');
+  t.ok(companionHtml.includes('function renderMarkdownFallback'), 'phone keeps a local Markdown fallback if the parser fails');
+  t.ok(companionHtml.includes('function sanitizeMarkdownHtml'), 'phone sanitizes parsed Markdown before rendering');
   t.ok(companionHtml.includes("html.push('<p>' + renderInlineMarkdown"), 'phone renders Markdown paragraphs');
   t.ok(companionHtml.includes("html.push('<h' + level"), 'phone renders Markdown headings');
   t.ok(companionHtml.includes("'<li>' + renderInlineMarkdown"), 'phone renders Markdown lists');
+  t.ok(companionHtml.includes('function consumeMarkdownTable'), 'phone fallback renderer supports Markdown tables');
+  t.ok(ipcServer.indexOf("url.pathname === '/marked.min.js'") < ipcServer.indexOf('const device = authenticateCompanionRequest'), 'phone Markdown parser asset is served before companion auth');
+  t.ok(ipcServer.includes("'/marked.min.js'"), 'phone service worker caches the Markdown parser asset');
   t.ok(companionHtml.includes('.message .message-answer h2'), 'phone styles Markdown headings inside assistant messages');
   t.ok(companionHtml.includes('.message .message-answer ul'), 'phone styles Markdown lists inside assistant messages');
   t.ok(companionHtml.includes('function renderWorkWalkthroughBlock'), 'phone renders walkthroughs with structured UI');
   t.ok(companionHtml.includes('agent-logs-container'), 'phone reuses the desktop execution log container');
   t.ok(companionHtml.includes('tool-run-badge'), 'phone reuses the desktop tool-call badge');
+  t.ok(companionHtml.includes('tool-result-label'), 'phone labels bounded tool result previews');
   t.ok(companionHtml.includes('msg.logs || []'), 'phone renders per-message tool logs in chat bubbles');
   t.ok(renderer.includes("logs: replayMsg.role === 'assistant' ? replayLogs : []"), 'desktop state sends assistant logs to phone chat replay');
+  t.notOk(renderer.includes("replayLogs.map(log => log.content || log.result || '')"), 'desktop state does not leak raw tool results into phone assistant prose');
   t.notOk(companionHtml.includes('phone-tool-call'), 'phone does not use a separate phone-only tool-call UI');
   t.ok(companionHtml.includes('latest-output-card'), 'phone separates latest output from tool rows');
   t.ok(renderer.includes('latestToolCalls'), 'desktop state exposes tool calls to the phone companion');
@@ -98,6 +112,49 @@ test('phone companion renders approvals and tool calls as first-class mobile UI'
   t.ok(companionHtml.includes('message assistant typing-assistant'), 'phone typing dots occupy the next assistant message position');
   t.ok(companionHtml.includes("const typingHtml = state.running ? renderInlineTypingIndicator() : ''"), 'phone appends dots after rendered messages while active');
   t.ok(companionHtml.includes("typingIndicatorEl.classList.remove('visible')"), 'phone does not show the old bottom typing strip');
+  t.notOk(companionHtml.includes('id="clarification-panel"'), 'phone no longer renders clarification questions as a separate panel outside the transcript');
+  t.ok(companionHtml.includes('function renderClarificationMessage'), 'phone renders clarification questions through the chat-message renderer');
+  t.ok(companionHtml.includes('data-clarification-card="true"'), 'phone clarification cards are addressable inside the scrollable transcript');
+  t.ok(companionHtml.includes('clarificationHtml + typingHtml'), 'phone appends clarification cards inside the messages container before typing dots');
+  t.ok(companionHtml.includes('wasNearBottom'), 'phone only auto-scrolls the transcript when the user is already near the bottom');
+  t.end();
+});
+
+test('phone companion uses a global drawer and Coder-only operations surfaces', (t) => {
+  t.ok(companionHtml.includes('id="app-drawer-overlay"'), 'phone has a global app drawer');
+  t.ok(companionHtml.includes('data-drawer-destination="orion"'), 'drawer exposes Dispatch as a top-level destination');
+  t.ok(companionHtml.includes('data-drawer-destination="coder"'), 'drawer exposes Coder as a top-level destination');
+  t.ok(companionHtml.includes('data-drawer-destination="settings"'), 'drawer exposes Settings as an app-level destination');
+  t.ok(companionHtml.includes('id="screen-settings"'), 'phone has a dedicated Settings screen');
+  t.ok(companionHtml.includes('Check local Orion files'), 'update controls live in Settings copy');
+  t.ok(companionHtml.includes('bottomNav.classList.toggle(\'hidden\', !isCoder)'), 'Coder operations tabs are hidden outside Coder');
+  t.ok(companionHtml.includes('id="task-list-card"'), 'Status shows the task-list card');
+  t.ok(companionHtml.includes('function renderPhoneTaskList'), 'Status renders the actual conversation checklist');
+  t.ok(companionHtml.includes('id="home-approvals-section"'), 'Coder home has a top-level approval section');
+  t.ok(companionHtml.includes('Needs Approval'), 'approval section is labeled plainly');
+  t.ok(companionHtml.includes('data-deny-plan'), 'approval cards can deny without opening the plan');
+  t.notOk(companionHtml.includes('id="panel-skills"'), 'Skills tab is removed from the phone UI');
+  t.notOk(companionHtml.includes('Skill Registry'), 'phone no longer exposes the skill registry page');
+  t.notOk(companionHtml.includes('<div class="section-title">Recent Tasks</div>'), 'Status no longer duplicates recent tasks');
+  t.end();
+});
+
+test('Dispatch hides Coder-style tool logs behind compact activity', (t) => {
+  t.ok(renderer.includes('function formatDispatchToolActivity'), 'renderer has a Dispatch-specific compact tool activity renderer');
+  t.ok(renderer.includes("conversationMode(activeConv) === 'orion'"), 'Dispatch detection is based on conversation mode');
+  t.ok(renderer.includes("logsHtml = isRunningThisConversation ? formatDispatchToolActivity(logs) : ''"), 'Dispatch only shows compact activity while the run is active');
+  t.ok(styles.includes('.dispatch-tool-activity'), 'compact Dispatch tool activity is styled');
+  t.ok(companionHtml.includes('function renderDispatchToolActivity'), 'phone has a Dispatch-specific compact activity renderer');
+  t.ok(companionHtml.includes('dispatch-activity-log collapsed'), 'phone Dispatch activity defaults to collapsed');
+  t.ok(companionHtml.includes("isDispatchConversation ? renderDispatchToolActivity"), 'phone uses compact activity for Dispatch chat logs');
+  t.end();
+});
+
+test('Dispatch new chat starts conversationally instead of showing a workspace picker', (t) => {
+  t.ok(companionHtml.includes('dispatch-chat-intro'), 'phone has a Dispatch new-chat intro');
+  t.ok(companionHtml.includes('coder-workspace-picker'), 'phone keeps the Coder workspace picker');
+  t.ok(companionHtml.includes("#screen-new-chat.dispatch-mode .coder-workspace-picker { display: none; }"), 'Dispatch hides the workspace picker on new chat');
+  t.ok(companionHtml.includes("newChatPromptEl.placeholder = isDispatchStart ? 'Ask Orion anything...' : 'What should we build?'"), 'new chat placeholder is mode-aware');
   t.end();
 });
 
@@ -167,9 +224,19 @@ test('desktop exposes quiet runtime version and update state UI', (t) => {
   t.ok(styles.includes('font-family: var(--font-mono);'), 'metadata uses compact code-style numerals');
   t.ok(renderer.includes('refreshAppRuntimeInfo'), 'renderer populates runtime metadata on startup');
   t.ok(preload.includes('getAppRuntimeInfo'), 'preload exposes runtime metadata IPC');
+  t.ok(html.includes('id="btn-check-update"'), 'desktop titlebar exposes a manual local update check');
+  t.ok(styles.includes('.update-check-btn'), 'manual update check has desktop titlebar styling');
+  t.ok(renderer.includes("addEventListener('click', () => checkForLocalUpdates({ manual: true }))"), 'manual update check triggers the local comparison');
   t.ok(main.includes('buildUpdateSplashHtml'), 'main process owns the pre-render update splash');
   t.ok(ipcUiJs.includes('Updating local build'), 'update splash has user-facing maintenance copy');
   t.ok(main.includes('syncSourceUpdateFiles'), 'source updater copies files through a named sync helper');
+  t.ok(preload.includes('checkLocalUpdate'), 'preload exposes local-file update checks');
+  t.ok(preload.includes('applyLocalUpdate'), 'preload exposes local-file update application');
+  t.ok(renderer.includes('checkForLocalUpdates'), 'desktop update checker uses local-file update wording');
+  t.ok(renderer.includes('Syncing...'), 'desktop update action describes local file sync instead of git pull');
+  t.notOk(renderer.includes('Pulling...'), 'desktop update action no longer presents GitHub pull wording');
+  t.ok(ipcUiJs.includes("ipcMain.handle('check-local-update'"), 'main process exposes local-file update IPC');
+  t.ok(ipcUiJs.includes('computeSourceUpdates(srcDir, appRoot)'), 'update check compares local source files against runtime files');
   t.end();
 });
 
@@ -187,9 +254,13 @@ test('screenshot artifacts are previewable from the artifact panel', (t) => {
   t.ok(html.includes('id="file-viewer-image-shell"'), 'file viewer includes an image preview shell');
   t.ok(html.includes('id="file-viewer-image"'), 'file viewer includes an image element');
   t.ok(renderer.includes('data-artifact-index'), 'artifact items use click-safe index routing');
+  t.ok(renderer.includes('function renderInlineArtifactCards'), 'renderer shows screenshot artifacts inline in chat');
+  t.ok(renderer.includes('data-open-artifact'), 'inline artifact cards open the file viewer');
+  t.ok(renderer.includes('orion-artifact://'), 'renderer supports conversation-scoped artifact links');
   t.ok(renderer.includes("artifactType === 'screenshot'"), 'renderer identifies screenshot artifacts');
   t.ok(renderer.includes('readWorkspaceFileBase64'), 'renderer loads screenshot bytes through IPC');
   t.ok(styles.includes('.artifact-item.previewable'), 'previewable artifacts have interaction styling');
+  t.ok(styles.includes('.inline-artifact-card'), 'inline artifact cards are styled');
   t.ok(styles.includes('.file-viewer-image'), 'screenshot preview image is styled');
   t.end();
 });
@@ -243,5 +314,21 @@ test('the model dropdown is rebuilt from a single JS source that includes Claude
   // just erase anyway — that duplication is exactly what caused them to silently never appear.
   t.notOk(html.includes('value="claude-opus-4-8"'), 'index.html no longer has a dead duplicate Claude option');
   t.notOk(html.includes('value="deepseek-v4-flash"'), 'index.html no longer has a dead duplicate DeepSeek option');
+  t.end();
+});
+
+// The chat area used to show nothing at all — no bubble, no spinner — between the user sending a
+// message and the model's first response arriving, because renderAiMessage's placeholder guard
+// unconditionally skipped the very first "Thinking..." call of a run. Fixed to only skip it when
+// no run is actually in progress, so a live run's running-indicator spinner shows immediately.
+test('the AI thinking placeholder only suppresses stale renders, not an actively running turn', (t) => {
+  t.ok(renderer.includes('const runningNow = window.isAgentRunning && window.isAgentRunning()'),
+    'renderAiMessage checks whether a run is actively in progress before suppressing the placeholder');
+  t.ok(renderer.includes('if (!runningNow) return;'),
+    'the placeholder is only suppressed when nothing is actually running');
+  const agentJsSource = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8').replace(/\r\n/g, '\n');
+  const placeholderRenderCalls = agentJsSource.match(/window\.renderAiMessage\('Thinking\.\.\.', \[\]/g) || [];
+  t.ok(placeholderRenderCalls.length >= 2,
+    'agent.js renders the placeholder immediately at both points a fresh "Thinking..." message is created');
   t.end();
 });

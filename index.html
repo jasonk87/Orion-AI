@@ -22,6 +22,8 @@
       <span class="workspace-indicator" id="workspace-label" role="button" tabindex="0">No Workspace Loaded - Click to Choose</span>
     </div>
     <div class="titlebar-right">
+      <button id="btn-check-update" class="update-check-btn" aria-label="Check for local updates" title="Check local source files for updates">&#8635; Check</button>
+      <button id="btn-update-available" class="update-available-btn" style="display:none" aria-label="Update available" title="Update available — click to sync local files and restart">&#8679; Update</button>
       <button class="win-btn" id="btn-minimize" aria-label="Minimize window" title="Minimize">&#128469;&#xFE0E;</button>
       <button class="win-btn" id="btn-maximize" aria-label="Maximize window" title="Maximize">&#128470;&#xFE0E;</button>
       <button class="win-btn btn-close" id="btn-close" aria-label="Close window" title="Close">&#128473;&#xFE0E;</button>
@@ -33,43 +35,82 @@
     
     <!-- LEFT SIDEBAR -->
     <aside id="left-sidebar">
-      <div class="sidebar-top">
-        <button id="btn-new-chat" class="btn-primary">
-          <span class="plus-icon">+</span> New Conversation
+
+      <!-- Mode Switcher Nav -->
+      <div class="sidebar-mode-nav">
+        <button id="btn-mode-orion" class="mode-nav-item active" title="Orion — Your AI Assistant">
+          <span class="mode-nav-icon">&#10022;</span>
+          <span class="mode-nav-label">Orion</span>
+        </button>
+        <button id="btn-mode-coder" class="mode-nav-item" title="Coder — Project Workspace">
+          <span class="mode-nav-icon">&lt;/&gt;</span>
+          <span class="mode-nav-label">Coder</span>
         </button>
       </div>
 
-      <!-- Projects Section -->
-      <div class="sidebar-section">
-        <div class="section-header">
-          <span>Projects</span>
-          <div class="section-actions">
-            <button id="btn-project-filter" title="Filter Projects">&#128269;</button>
-            <button id="btn-add-project" title="Add Project Folder">&#128193;</button>
-          </div>
+      <!-- ORION MODE CONTENT -->
+      <div id="sidebar-orion-content" class="sidebar-mode-content active">
+        <div class="sidebar-top">
+          <button id="btn-new-chat" class="btn-primary">
+            <span class="plus-icon">+</span> New Chat
+          </button>
         </div>
-        <div class="project-list" id="project-list">
-          <div class="project-item active" id="default-proj-item">
-            <span class="folder-icon">&#128193;</span>
-            <div class="project-details">
-              <span class="project-name" id="project-name-label">Default Workspace</span>
-              <span class="project-subtext" id="project-status-label">Select folder to start</span>
+        <div class="sidebar-section">
+          <div class="section-header">
+            <span>Recents</span>
+            <div class="section-actions">
+              <button id="btn-add-conversation" title="New Chat">+</button>
             </div>
           </div>
-          <!-- Dynamically populated projects list -->
+          <div class="conversation-list" id="conversation-list">
+            <!-- Dynamic conversation list -->
+          </div>
         </div>
       </div>
 
-      <!-- Conversations Section -->
-      <div class="sidebar-section">
-        <div class="section-header">
-          <span>Conversations</span>
-          <div class="section-actions">
-            <button id="btn-add-conversation" title="New Standalone Conversation">+</button>
+      <!-- CODER MODE CONTENT -->
+      <div id="sidebar-coder-content" class="sidebar-mode-content">
+        <div class="sidebar-top">
+          <div class="new-conv-picker-wrap">
+            <button id="btn-new-conversation-coder" class="btn-primary">
+              <span class="plus-icon">+</span> New Conversation
+            </button>
+            <div class="new-conv-picker-menu" id="new-conv-picker-menu" hidden>
+              <div class="new-conv-picker-item" id="new-conv-picker-standalone" data-target="standalone">&#10022; Standalone</div>
+              <div class="new-conv-picker-divider" id="new-conv-picker-divider" hidden></div>
+              <div class="new-conv-picker-projects" id="new-conv-picker-projects"></div>
+            </div>
           </div>
         </div>
-        <div class="conversation-list" id="conversation-list">
-          <!-- Dynamic conversation list -->
+        <div class="sidebar-section">
+          <div class="section-header">
+            <span>Projects</span>
+            <div class="section-actions">
+              <button id="btn-project-filter" title="Filter Projects">&#128269;</button>
+              <button id="btn-add-project" title="Add Project Folder">&#128193;</button>
+            </div>
+          </div>
+          <div class="project-list" id="project-list">
+            <div class="project-item active" id="default-proj-item">
+              <span class="folder-icon">&#128193;</span>
+              <div class="project-details">
+                <span class="project-name" id="project-name-label">Default Workspace</span>
+                <span class="project-subtext" id="project-status-label">Select folder to start</span>
+              </div>
+            </div>
+            <!-- Dynamically populated projects list -->
+          </div>
+        </div>
+        <div class="sidebar-section">
+          <div class="section-header">
+            <span>Standalone Chats</span>
+            <div class="section-actions">
+              <button id="btn-add-conversation-coder" title="New Standalone Chat">+</button>
+            </div>
+          </div>
+          <div class="conversation-list" id="conversation-list-coder">
+            <!-- Dynamic conversation list (mirrors #conversation-list) -->
+          </div>
         </div>
       </div>
 
@@ -105,7 +146,20 @@
 
       <!-- CHAT CONTENT FEED -->
       <div id="chat-feed">
-        <!-- Welcoming splash or history messages -->
+        <!-- Orion (Dispatcher) Welcome Splash -->
+        <div class="orion-welcome-splash" id="orion-welcome-splash" style="display:none;">
+          <div class="orion-welcome-icon">&#10022;</div>
+          <h1 id="orion-greeting-name">Good evening, Jason.</h1>
+          <p class="orion-welcome-sub">What are we working on?</p>
+          <div class="orion-prompt-chips">
+            <button class="orion-prompt-chip" data-prompt="What did we work on last time?">Pick up where we left off</button>
+            <button class="orion-prompt-chip" data-prompt="Search the web for ">Search the web…</button>
+            <button class="orion-prompt-chip" data-prompt="Help me think through ">Think something through</button>
+            <button class="orion-prompt-chip" data-prompt="What's on my plate today?">What's on my plate?</button>
+          </div>
+        </div>
+
+        <!-- Coder Welcome Splash -->
         <div class="welcome-splash" id="welcome-splash">
           <h1>Orion AI</h1>
           <p>Describe the outcome. Orion will plan, act, verify, and keep going.</p>
@@ -121,14 +175,39 @@
         </div>
       </div>
 
+      <!-- CODER TASK STATUS CARD (Dispatcher-as-Supervisor) -->
+      <!-- Shown when Dispatcher has an active supervised Coder task running. -->
+      <!-- Not a chat message — a persistent floating banner above the input. -->
+      <div id="coder-task-status-card" class="coder-task-status-card" aria-live="polite">
+        <div class="coder-status-spinner">
+          <span class="coder-status-dot"></span>
+          <span class="coder-status-dot"></span>
+          <span class="coder-status-dot"></span>
+        </div>
+        <div class="coder-status-body">
+          <span class="coder-status-label">Coder working on</span>
+          <span class="coder-status-task-name">task</span>
+          <span class="coder-status-sep">·</span>
+          <span class="coder-status-substatus">Working…</span>
+        </div>
+        <span class="coder-status-elapsed">0s</span>
+      </div>
+
       <!-- CHAT INPUT CONTAINER -->
       <div id="chat-input-wrapper">
+        <!-- Image preview area (shown when images are queued) -->
+        <div id="image-preview-container" class="image-preview-container" style="display:none" aria-label="Attached images">
+          <div id="image-preview-thumbnails" class="image-preview-thumbnails"></div>
+        </div>
+        <!-- Hidden file input for image attach -->
+        <input type="file" id="image-file-input" accept="image/*" style="display:none" aria-hidden="true" tabindex="-1">
         <div class="chat-input-container">
           <textarea id="chat-input" placeholder="Ask Orion to build, fix, or investigate..." rows="1"></textarea>
-          
+
           <div class="chat-input-toolbar">
             <div class="toolbar-left">
               <button class="tool-btn" id="btn-add-file" title="Add file contextual reference">+</button>
+              <button class="tool-btn" id="btn-attach-image" title="Attach image (or paste an image with Ctrl+V)" aria-label="Attach image">&#128247;</button>
               <div class="model-select-wrapper">
                 <select id="model-select">
                   <option value="gemini-2.5-flash-lite" selected>Gemini 2.5 Flash Lite</option>
@@ -265,10 +344,19 @@
         <button class="modal-close" id="btn-phone-companion-close">&times;</button>
       </div>
       <div class="modal-body">
+        <div style="font-size:0.68rem; font-weight:800; text-transform:uppercase; letter-spacing:0.08em; color:var(--accent-secondary); margin-bottom:6px;">📶 Local Wi-Fi</div>
         <div id="phone-companion-qr" class="phone-companion-qr"></div>
         <div id="phone-companion-pair-url" class="phone-companion-url"></div>
         <div id="phone-companion-meta" class="phone-companion-meta"></div>
-        
+
+        <!-- Tailscale remote access block — hidden until Tailscale IP detected -->
+        <div id="phone-companion-tailscale-block" style="display:none; margin-top:18px; border-top:1px solid var(--border-color); padding-top:16px;">
+          <div style="font-size:0.68rem; font-weight:800; text-transform:uppercase; letter-spacing:0.08em; color:#34d399; margin-bottom:8px;">🌐 Anywhere via Tailscale</div>
+          <div style="color:var(--text-muted); font-size:0.78rem; margin-bottom:10px;">Scan from any network — works outside your home Wi-Fi.</div>
+          <div id="phone-companion-tailscale-qr" style="line-height:0; display:inline-block; background:#fff; padding:8px; border-radius:8px; border:2px solid #34d399; margin-bottom:8px;"></div>
+          <div id="phone-companion-tailscale-url" style="font-family:var(--font-mono); font-size:0.72rem; word-break:break-all; color:#34d399;"></div>
+        </div>
+
         <!-- Desktop paired-device management UI -->
         <div id="paired-devices-section" style="margin-top: 24px; border-top: 1px solid var(--border-color); padding-top: 16px; display: none;">
           <h3 style="font-size: 0.95rem; margin-bottom: 12px; color: var(--accent-color); font-family: var(--font-sans);">Paired Devices</h3>
@@ -362,6 +450,12 @@
           <label for="setting-command-timeout">Command Timeout (ms):</label>
           <input type="number" id="setting-command-timeout" value="120000">
           <small class="form-help">Stops tests or shell commands that run too long.</small>
+        </div>
+
+        <div class="form-group">
+          <label for="setting-phone-https-origin">Secure Phone URL (HTTPS):</label>
+          <input type="url" id="setting-phone-https-origin" placeholder="https://your-device.your-tailnet.ts.net">
+          <small class="form-help">Used for phone pairing and Web Push notifications. Point it at this app's phone companion port.</small>
         </div>
 
         <div class="form-group">

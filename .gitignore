@@ -2,6 +2,7 @@ node_modules/
 dist/
 standalone-workspaces/
 .orion/
+.codex-remote-attachments/
 
 config.json
 .env
@@ -10,5 +11,6 @@ config.json
 
 *.log
 *.tmp
+*.bak
 .DS_Store
 Thumbs.db

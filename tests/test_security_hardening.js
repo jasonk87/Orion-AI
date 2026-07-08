@@ -67,10 +67,10 @@ test('destructive command guard catches audited variants', (t) => {
 
 test('renderer and package hardening are wired', (t) => {
   t.ok(rendererJs.includes('function sanitizeRenderedMarkdown(container)'), 'renderer sanitizes markdown links');
-  t.ok(rendererJs.includes("!/^(https?:|mailto:|orion-file:)/i.test(href)"), 'renderer allowlists markdown protocols');
+  t.ok(rendererJs.includes("!/^(https?:|mailto:|orion-file:|orion-artifact:\\/\\/)/i.test(href)"), 'renderer allowlists markdown protocols');
   t.ok(companionHtmlJs.includes('function sanitizeMarkdownHref'), 'phone companion sanitizes markdown links');
-  t.ok(companionHtmlJs.includes('/^(https?:|mailto:|orion-file:)/i.test(value)'), 'phone companion allowlists markdown protocols');
-  t.ok(companionHtmlJs.includes('let html = escapeHtml(text).replace'), 'phone companion escapes inline markdown input before formatting');
+  t.ok(companionHtmlJs.includes("new RegExp('^(https?:|mailto:|orion-file:|orion-artifact://)', 'i').test(value)"), 'phone companion allowlists markdown protocols');
+  t.ok(companionHtmlJs.includes('let html = escapeHtml(processed)'), 'phone companion escapes inline markdown input before formatting');
   t.ok(rendererJs.includes("if (typeof Prism !== 'undefined') Prism.highlightAllUnder(bubble);"), 'renderer tolerates local Prism removal');
   t.notOk(indexHtml.includes('cdnjs.cloudflare.com'), 'desktop renderer no longer loads CDN scripts');
   t.ok(indexHtml.includes('node_modules/prismjs/prism.js'), 'desktop renderer loads local Prism');
@@ -104,6 +104,7 @@ test('config failures and command retention safeguards are wired', (t) => {
   t.ok(ipcShellJs.includes('pruneCommandSessions();'), 'completed sessions are pruned');
   t.ok(ipcShellJs.includes('resolveWindowsShellExecutable'), 'packaged command runner resolves Windows shell by absolute path');
   t.ok(ipcShellJs.includes("'System32', 'WindowsPowerShell'"), 'PowerShell resolver checks the Windows system path');
+  t.ok(ipcShellJs.includes("&& !conversationId"), 'desktop screenshot capture can save a conversation artifact without a workspace');
   t.end();
 });
 

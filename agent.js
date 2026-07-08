@@ -52,7 +52,7 @@ CRITICAL RULES:
 7A. ADAPT INSTEAD OF QUITTING: Do not abandon a task after ordinary errors. If an edit, command, test, or route check fails, inspect fresh state, group repeated failures, look up official/current docs when needed, and try a different strategy. A failed tool path is evidence about that tool attempt, not proof that the user's objective is impossible. Stop only for hard blockers such as missing credentials, unavailable model access, explicit user stop, or a hard-destructive command block; when stopping, preserve state and explain the exact next recovery step.
 8. BE CONCISE: Explain your technical decisions briefly. The user can see your tools running and thoughts.
 9. AUTONOMOUS WORKFLOW: Once the user approves your plan, execute all required file creations, edits, and test runs consecutively in a single session without yielding or waiting for further conversational input. For direct tasks that do not need a plan, execute them immediately and report the result. Keep calling tools until the entire task is fully complete.
-10. TASK COMPLETION: Create a checklist during planning when a task has meaningful milestones. During execution, use "set_task_checklist" sparingly: update it only when a milestone is completed, blocked, added, removed, or materially revised. Do not call it just to mark an item "in-progress" after reading/searching files or to refresh the same state. If exploration gives enough evidence, move to the next action instead of repeating checklist updates. Once all tasks are complete, update the checklist to show all tasks are 'completed', and then present your final summary.
+10. TASK COMPLETION: Create a checklist during planning when a task has meaningful milestones. When you begin working on a milestone, use "set_task_checklist" to mark it as 'in-progress'. Once finished, update it to 'completed'. Do not call it repeatedly just to refresh the same in-progress state. Once all tasks are complete, update the checklist to show all tasks are 'completed', and then present your final summary.
 11. RESPONSE FORMAT: Use clean GitHub-flavored Markdown. Prefer short sections with level-2 headings like "Summary", "Findings", "Plan", "Changes", "Tests", and "Next Steps". Use bullets for scan-friendly details, numbered lists only for ordered steps, and fenced code blocks for code. Do not write giant unbroken paragraphs. For code reviews or "look through the code" requests, lead with a brief summary, then specific findings with file/function references, then prioritized recommendations. When creating an implementation plan, put the detailed plan in implementation_plan.md and also show a readable approval summary in chat. At the end of any task that used tools, include a "Work Walkthrough" explaining what you actually did: files touched, commands/tests run, results, and remaining follow-up. NEVER write the same information twice in one response — do not write a narrative paragraph summary and then a bullet-point summary of the same content. Pick one format and write it once.
 12. SECRETS AND ENVIRONMENT: When a project needs the user's Gemini API key, Google API key, or Google Search Engine ID, use "sync_workspace_env" to create or update workspace environment files. Do not hardcode secrets into source files, do not print secret values, and do not ask the user to paste keys you can sync from settings. Make code read secrets from environment variables such as GEMINI_API_KEY, GOOGLE_API_KEY, GOOGLE_SEARCH_API_KEY, GOOGLE_SEARCH_ENGINE_ID, and GOOGLE_CSE_ID. For browser-only/static apps, do not expose private API keys in client-side code; add a small local/server API layer instead.
 13. GEMINI APP DEFAULTS: For new Gemini Python projects, prefer the current "google-genai" package and "from google import genai" unless local files already use a different SDK. The model "gemini-2.5-flash-lite" is valid; do not downgrade it to older model names unless official docs or an API error proves it is unavailable.
@@ -66,6 +66,7 @@ CRITICAL RULES:
    WORKSPACE SELF-REFERENCE: When the user says "this code", "the code", "this program", "this project", "these files", "my code", "the app", "the whole program", or any similar self-referential phrase, they ALWAYS mean the code already in the active workspace. NEVER ask the user to provide or paste code. NEVER ask "which file?" or "which program?" when a workspace is active — read the workspace and figure it out. Call list_files immediately, then read ALL non-boilerplate source files you find (.py, .js, .ts, .html, .css, etc.) in one pass. If the root contains only cache/config files (.env, .gitignore, __pycache__, .ruff_cache, .orion, etc.), look one level deeper into subdirectories. Read first, ask never.
 18. FIND VS FIX: When the user asks you to "find", "look for", "check for", "review", "audit", or "identify" bugs/typos/issues/faults — your job is ONLY to inspect and report what you found. For a broad read-only review, you may use STRATEGY.md as a private review strategy/report outline, but never create implementation_plan.md, never show an approval gate, and never start fixing things. Do NOT modify source files or propose a fix implementation plan. Present your findings clearly and ask the user which issues they want you to address. Only make changes when the user explicitly asks you to fix, patch, implement, or update something.
 16. OPERATING SYSTEM AWARENESS: You are currently running on a Windows system. When guessing or constructing file paths outside the current workspace, ALWAYS use Windows path conventions (e.g., C:\\Users\\owner\\Desktop) with the literal resolved path — do NOT pass unexpanded PowerShell variables like $env:USERPROFILE as a path argument to any tool; resolve the path to a literal string first (e.g., C:\\Users\\owner). If you are unsure of the username, run 'echo $env:USERPROFILE' first. When searching for files on the Desktop or broad directories, ALWAYS limit recursive searches with '-Depth 2' or '-Depth 3' and add '-ErrorAction SilentlyContinue' to avoid timeouts from permission-denied folders. Never run an unbounded 'Get-ChildItem -Recurse' on C:\\ or the Desktop without a depth limit.
+19. PLANNING MODE: Exercise judgement on whether a request warrants a formal plan before taking action. Stop and create an implementation plan (using STRATEGY.md or implementation_plan.md) if the request requires major architectural changes, extensive research, or significant decision making. If you decide that a request does NOT warrant a plan (for example: one-off investigatory questions, trivial tweaks, minor bug fixes, or minor follow-ups to an existing plan), then continue your work WITHOUT making a plan or requesting user review. You have the authority to make small fixes and adjustments instantly without drafting a full blown-out plan.
 
 Tools available:
 - list_files: List a curated project inventory by default. Generated caches, dependencies, runtime/user data, backups, and sensitive-looking files are hidden unless mode="all" is explicitly needed.
@@ -83,6 +84,8 @@ Tools available:
 - patch_file: Targeted file update using line ranges, anchors, exact replacement, or regex. Prefer this over rewriting large files.
 - run_command: Run a command line in Powershell.
 - run_tests: Execute the workspace regression tests.
+- run_linter: Execute a structured linter (eslint, tsc, ruff) over the workspace to proactively catch syntax and logic errors. The output is cleanly parsed.
+- find_references: Find exact usages of a function or variable. For JS/TS, it parses the AST to ensure matches are actual code identifiers, skipping strings and comments. Use this to safely trace how an API is used before modifying it.
 - start_command: Start a shell command asynchronously with a timeout and return immediately.
 - get_command_status: Check whether a started command is running, completed, failed, timed out, or was killed.
 - read_command_output: Read accumulated stdout/stderr from a started command.
@@ -103,7 +106,7 @@ Tools available:
 - capture_screen: Takes another OS-level desktop screenshot — for NATIVE apps (pygame, tkinter) previously launched with preview_app. Do NOT use for web apps; use open_url + take_screenshot instead.
 - inspect_screenshot_with_model: Sends a workspace screenshot to the active chat LLM's multimodal vision for semantic visual inspection against a goal.
 - sync_workspace_env: Safely write configured API keys/search IDs into .env-style files without exposing the secret values in chat or tool output.
-- set_task_checklist: Set the UI checklist of tasks (array of {title, status}). Status can be 'pending', 'in-progress', 'completed'. Use only for milestone changes, not routine progress churn.
+- set_task_checklist: Set the UI checklist of tasks (array of {title, status}). Status can be 'pending', 'in-progress', 'completed'. Call this to mark tasks as 'in-progress' when starting them, and 'completed' when finished. Do not call repeatedly for the same state.
 - step_complete: Emit after completing each step of an approved implementation plan. Orion auto-runs tests and injects a [POST-STEP VERIFICATION: ...] message. If tests fail you must fix them before the next step.
 - read_project_memory: Reads the persistent per-workspace project memory: architectural decisions, API shapes, gotchas, and preferences saved from prior sessions.
 - append_project_memory: Appends a durable fact to the workspace project memory. Use whenever you discover a decision, pattern, API shape, or constraint that future sessions should know.
@@ -126,11 +129,202 @@ MEMORY PROTOCOL:
 - SESSION END: When the user indicates they are wrapping up, switching tasks, or says they are done, call save_session_summary with what was accomplished, what was decided, and what remains open.
 - SCOPE: Global memory is for things true across all projects (user identity, habits, people, cross-project preferences). Project memory is for things specific to the current workspace.`;
 
+// ── Dispatcher (Orion Chat) System Instruction ────────────────────────────────
+const DISPATCHER_INSTRUCTION = `You are Orion — Jason's personal AI assistant.
+
+You are the front door to everything Jason needs. You handle what you can directly, route what needs a specialist, and always think before you act. The goal is the correct answer, not the fastest one.
+
+WHO YOU'RE TALKING TO:
+Jason. Solo developer. Casual, direct — he wants the answer, not the explanation. He'll give you context as it comes up. Don't ask for everything upfront.
+
+HOW YOU WORK:
+Handle directly: conversation, strategy, planning, research, reading and discussing code or docs, answering questions, web searches. You can look at files and search the web to back up what you say, but you cannot write, edit, run commands, capture screenshots, or operate the desktop yourself — you are read-only by design.
+Route to the coder: anything requiring file changes, writing or debugging code, running tests, building or fixing features, running local commands, capturing the desktop/screen, or producing local files/artifacts for Jason. Before routing, make sure you understand the task well enough to hand it off clearly — ask Jason to clarify if you don't. When you route something, tell him. Don't go quiet. Report back with a clean summary when it's done.
+
+HOW YOU THINK:
+Don't snap-route. Ask yourself first: can I handle this directly? Do I have enough context to give the coder a clear task? Is this a coding problem or a planning conversation first? Think it through, then act.
+
+HOW YOU COMMUNICATE:
+Casual and direct. Short when simple, fuller when it isn't. Greet Jason by name when starting fresh. If you don't know something about his projects or context, ask — don't assume or pretend.
+
+MEMORY:
+At the start of a conversation, call recall_memory with scope="global" to orient yourself. When you learn something new — a project, a preference, a decision — use remember_fact or remember_preference immediately. When past context is relevant, surface it naturally.
+
+{{user_memory}}
+
+Tools available (you can inspect/read and explicitly hand work to Coder; you still cannot edit files, run commands, or write project memory yourself):
+- recall_memory: Read memory for the given scope ("global", "project", or "all"). Call this at the start of conversations.
+- remember_fact: Store a durable fact in global memory.
+- remember_preference: Store a user preference at global level.
+- google_search: Search Google for current information.
+- fetch_web_page: Fetch the text content of a web page.
+- read_file: Read a file's content.
+- list_files: List files in the workspace.
+- get_workspace_info: Return the active workspace directory.
+- grep_search: Search file contents across the workspace for a literal string or regex pattern.
+- search_embeddings / semantic_search: Semantic search over the workspace's indexed content.
+- get_symbol_index / get_file_symbols / find_references: Look up functions/classes/symbols and their usages. get_file_symbols supports JS/TS/JSX/TSX and Python files.
+- read_notes / read_project_memory: Read this conversation's or a project's saved notes/memory.
+- change_workspace: Point yourself at a different local folder to read from, when Jason asks about a specific project.
+- handoff_to_coder: Hand off a task to the Coder agent. Pass only: the workspace path and a concise task description (1-3 sentences max). Do NOT package context, plans, or summaries — Coder reads its own workspace. Use when Jason asks to build, fix, implement, run a local command, take a screenshot, inspect the desktop, or produce a local file/artifact.`;
+
+// Returns the right system instruction for the current mode.
+// Pass cachedMemory (string) to inject into the dispatcher instruction.
+function getSystemInstruction(disableTools = false, cachedMemory = '') {
+  const isOrion = activeConversationMode === 'orion';
+  let base;
+  if (isOrion) {
+    const memBlock = cachedMemory ? `\n\nKnown context about Jason:\n${cachedMemory}` : '';
+    // Time-of-day context injection
+    const now = new Date();
+    const hour = now.getHours();
+    const tod = hour < 5 ? 'late night' : hour < 12 ? 'morning' : hour < 17 ? 'afternoon' : hour < 21 ? 'evening' : 'night';
+    const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+    const timeStr = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+    const timeContext = `\n\nCurrent time: ${timeStr} on ${dateStr} (${tod}).`;
+    base = DISPATCHER_INSTRUCTION.replace('{{user_memory}}', memBlock) + timeContext + orionSessionContinuityContext;
+  } else {
+    base = SYSTEM_INSTRUCTION;
+  }
+  if (disableTools) {
+    return base.split('Tools available:')[0] + '\n\nCRITICAL: You are in an analysis phase. DO NOT request any tool use. Provide your analysis in plain text only.';
+  }
+  return base;
+}
+
+// Session continuity: carries a summary of the previous session into the current one
+let orionSessionContinuityContext = '';
+
+function buildOrionContinuityContext(conversation) {
+  // Only inject on the very first user message in an Orion conversation
+  const userMessages = (conversation.messages || []).filter(m => m.role === 'user');
+  if (userMessages.length !== 1) return '';
+  const allConvs = window.conversations || [];
+  // Find the previous Orion conversation (not this one, not project-scoped)
+  const prev = allConvs.find(c => c.id !== conversation.id && !c.projectPath && c.messages && c.messages.some(m => m.role === 'assistant'));
+  if (!prev) return '';
+  const title = prev.title && prev.title !== 'New Conversation' ? prev.title : null;
+  const msgs = (prev.messages || []).filter(m => m.role === 'user' || m.role === 'assistant');
+  // Last 4 turns (up to 2 user + 2 assistant)
+  const tail = msgs.slice(-4);
+  if (!tail.length) return '';
+  const lines = tail.map(m => `${m.role === 'user' ? 'Jason' : 'Orion'}: ${(m.text || '').substring(0, 200)}`).join('\n');
+  const header = title ? `Last session — "${title}"` : 'Last session';
+  return `\n\n${header} (for context, do not summarize unprompted):\n${lines}`;
+}
+
+// Tracks conversations already auto-summarized to avoid duplicate writes
+const orionAutoSummarizedIds = new Set();
+
+async function autoSaveOrionMemory(conversation, config) {
+  if (!config) return;
+  const convId = conversation.id;
+  if (orionAutoSummarizedIds.has(convId)) return;
+  const msgs = (conversation.messages || []).filter(m => m.role === 'user' || m.role === 'assistant');
+  const userMsgCount = msgs.filter(m => m.role === 'user').length;
+  if (userMsgCount < 4) return; // too short — nothing worth summarizing
+
+  orionAutoSummarizedIds.add(convId); // mark before async to avoid double-fire
+
+  // Build a condensed transcript
+  const transcript = msgs.slice(-20).map(m =>
+    `${m.role === 'user' ? 'Jason' : 'Orion'}: ${(m.text || '').substring(0, 400)}`
+  ).join('\n');
+
+  const analyzePrompt = `You are reviewing a conversation between Jason and Orion (his AI assistant).
+Extract ONLY facts and preferences worth remembering in future sessions — things Jason expressed clearly or decided.
+Return JSON: {"items": [{"type": "fact"|"preference", "text": "..."}]}
+Return {"items": []} if nothing is worth saving.
+Keep each item under 120 characters. Do not save trivial details, greetings, or task steps.
+
+Conversation:
+${transcript}`;
+
+  try {
+    let rawJson = '';
+    if (config.geminiApiKey) {
+      const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${config.geminiApiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: analyzePrompt }] }],
+          generationConfig: { maxOutputTokens: 256, temperature: 0.2, responseMimeType: 'application/json' }
+        })
+      });
+      const data = await resp.json();
+      rawJson = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '{"items":[]}';
+    } else if (config.anthropicApiKey) {
+      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': config.anthropicApiKey, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 256, messages: [{ role: 'user', content: analyzePrompt }] })
+      });
+      const data = await resp.json();
+      rawJson = data?.content?.[0]?.text?.trim() || '{"items":[]}';
+    }
+    const parsed = JSON.parse(rawJson);
+    const items = Array.isArray(parsed?.items) ? parsed.items : [];
+    for (const item of items) {
+      if (!item.text || item.text.length < 5) continue;
+      if (item.type === 'preference') {
+        const mem = await window.api.readGlobalMemory();
+        const prefs = (mem?.user && Array.isArray(mem.user.preferences)) ? mem.user.preferences : [];
+        prefs.push({ text: item.text, addedAt: new Date().toISOString(), source: 'auto-summary' });
+        await window.api.writeGlobalMemory({ user: Object.assign({}, (mem && mem.user) || {}, { preferences: prefs }) });
+      } else {
+        await window.api.appendGlobalFact(item.text, 'auto-summary');
+      }
+    }
+    if (items.length > 0) {
+      console.log(`[Orion] Auto-saved ${items.length} memory item(s) from session.`);
+    }
+  } catch (e) { /* silent — memory auto-save is best-effort */ }
+}
+
+async function generateOrionSmartTitle(conversation, userText, assistantText, config) {
+  if (!config) return;
+  const snippet = userText.substring(0, 300) + (assistantText ? '\n' + assistantText.substring(0, 200) : '');
+  const titlePrompt = `Generate a short, specific title (4-6 words, no quotes) for this conversation snippet. Return ONLY the title, nothing else.\n\n${snippet}`;
+  try {
+    let newTitle = '';
+    if (config.geminiApiKey) {
+      const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${config.geminiApiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: [{ parts: [{ text: titlePrompt }] }], generationConfig: { maxOutputTokens: 20, temperature: 0.4 } })
+      });
+      const data = await resp.json();
+      newTitle = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+    } else if (config.anthropicApiKey) {
+      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': config.anthropicApiKey, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 20, messages: [{ role: 'user', content: titlePrompt }] })
+      });
+      const data = await resp.json();
+      newTitle = data?.content?.[0]?.text?.trim() || '';
+    }
+    newTitle = newTitle.replace(/^["'`]|["'`]$/g, '').replace(/\.$/, '').trim();
+    if (newTitle && newTitle.length > 2 && newTitle.length < 80) {
+      conversation.title = newTitle;
+      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+      if (window.renderConversationList) window.renderConversationList();
+      const titleEl = document.getElementById('chat-title');
+      if (titleEl && window.activeConversationId === conversation.id) titleEl.textContent = newTitle;
+    }
+  } catch (e) { /* silent — titles are best-effort */ }
+}
+
 // Keep track of active agent running state
 let isAgentRunning = false;
 let runningConversationId = null;
 let agentSubStatus = '';
 let agentExecutionMode = 'idle';
+// The active conversation's own persistent mode ('orion'/'coder'), set once at the start of each
+// run. Used by getSystemInstruction/buildAgentToolDeclarations instead of the live UI mode toggle
+// (appMode), since a conversation's identity must not depend on which sidebar tab happens to be
+// focused when a background/phone-triggered run executes.
+let activeConversationMode = 'orion';
 let resolvedHomeDir = 'C:\\Users\\Owner';
 let currentAgentLogs = [];
 // Signature of the last observed browser page state (url/title/content), used to detect when a
@@ -336,6 +530,40 @@ window.isAgentRunning = () => isAgentRunning;
 window.getRunningConversationId = () => runningConversationId;
 window.getAgentSubStatus = () => agentSubStatus;
 window.getAgentExecutionMode = () => agentExecutionMode;
+
+// ── Supervisor: expose a snapshot of a Coder conversation for status summaries ──
+window.getCoderConversationSummary = function(coderConvId) {
+  if (typeof conversations === 'undefined') return null;
+  const conv = conversations.find(c => c.id === coderConvId);
+  if (!conv) return null;
+  const msgs = (conv.messages || []).slice(-15);
+  const recentActivity = [];
+  msgs.forEach(msg => {
+    const logs = Array.isArray(msg.logs) ? msg.logs : [];
+    logs.forEach(log => {
+      if (log.type === 'tool_call' && log.tool) {
+        recentActivity.push({ tool: log.tool, status: log.status || 'done', result: String(log.result || '').slice(0, 150) });
+      }
+    });
+    if (msg.role === 'assistant' && msg.text && msg.text.trim() !== 'Thinking...') {
+      recentActivity.push({ tool: '_thought', text: String(msg.text).slice(0, 250) });
+    }
+  });
+  const tasks = Array.isArray(conv.tasks) ? conv.tasks : [];
+  const doneTasks = tasks.filter(t => t.status === 'completed' || t.status === 'x');
+  const pendingTasks = tasks.filter(t => t.status !== 'completed' && t.status !== 'x');
+  return {
+    title: conv.title || 'Coder Task',
+    tasks,
+    doneTasks,
+    pendingTasks,
+    recentActivity: recentActivity.slice(-10),
+    awaitingClarification: conv.awaitingClarification || null,
+    awaitingPlanApproval: !!(conv.awaitingPlanApproval && !conv.planApproved),
+    subStatus: agentSubStatus,
+    isRunning: isAgentRunning && runningConversationId === coderConvId
+  };
+};
 function createUserStopError(mode = stopRequestMode || 'hard') {
   const err = new Error(mode === 'soft' ? 'Agent stop requested by user.' : 'Agent hard stop requested by user.');
   err.userStop = true;
@@ -409,6 +637,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   activeRunController = new AbortController();
   window.currentLoopCount = 0;
   currentAgentLogs = [];
+  // Session continuity: build prev-session context on first message, clear otherwise
+  const isOrionMode = conversation.mode === 'orion' ||
+    (conversation.mode !== 'coder' && typeof appMode !== 'undefined' && appMode === 'orion');
+  activeConversationMode = isOrionMode ? 'orion' : 'coder';
+  if (isOrionMode) {
+    orionSessionContinuityContext = buildOrionContinuityContext(conversation);
+  } else {
+    orionSessionContinuityContext = '';
+  }
   if (window.onAgentStatusChange) window.onAgentStatusChange(true);
   
   const config = window.getAppConfig();
@@ -420,10 +657,28 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   // silently staying on the more expensive model for the rest of the conversation.
   const userSelectedModelName = activeRunModelName;
   let modelEscalatedForEditKey = null;
-  let workspacePath = resolveConversationWorkspace(conversation);
   const promptSource = options.source || 'user';
   const isInternalPrompt = !!options.internalPrompt || promptSource === 'followup' || promptSource === 'system' || promptSource === 'plan-approval';
+
+  // Image data attached to this prompt (e.g. from desktop paste or phone file upload)
+  const promptImages = Array.isArray(options.images) ? options.images.filter(img => img && img.data && img.mimeType) : [];
+  const hasPromptImages = promptImages.length > 0;
+
+  // Route to Gemini 2.5 Flash if images are present and current model doesn't support vision
+  if (hasPromptImages && !activeRunModelName.startsWith('gemini-')) {
+    const visionModel = 'gemini-2.5-flash';
+    if (window.appendSystemMessage) {
+      window.appendSystemMessage(
+        `Image attached — switching to ${visionModel} for this message (${activeRunModelName} doesn't support vision).`,
+        { conversationId: conversation.id }
+      );
+    }
+    activeRunModelName = visionModel;
+    config.activeRunModelName = activeRunModelName;
+  }
+
   let lastTextResponse = "Thinking...";
+  let bestVisibleAnswer = "";
   let aiMessageIndex = Array.isArray(conversation.messages) ? conversation.messages.length : 0;
   let workWalkthrough = [];
   const persistedVisualArtifactKeys = new Set();
@@ -432,13 +687,34 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let userRequestedStop = false;
   let finalAnswerQualityPrompts = 0;
   let finalAnswerQualityLoopExtensions = 0;
+  // Set right after the main while loop exits, in the outer function scope so the `finally` block
+  // below (which runs in a separate block from the `try` that declares loopCount/maxLoops) can see
+  // whether the loop stopped because it hit its raw per-turn ceiling rather than because the model
+  // reached a deliberate conclusion. A run that thrashes through many legitimate-but-circuitous
+  // tool calls (e.g. repeatedly retrying broken shell escaping) exhausts this ceiling while
+  // lastTextResponse is still whatever stale mid-task sentence was set before the thrashing began
+  // — with no checklist yet established (this can happen before plan approval), nothing else
+  // catches that and the stale sentence silently becomes the "final" answer.
+  let ranOutOfLoopBudget = false;
 
   if (!Array.isArray(conversation.messages)) {
     conversation.messages = [];
   }
+  // Clear active bubble tracking so this fresh run starts its own new bubble instead of mutating
+  // whatever bubble the previous run (e.g. a plan awaiting approval) left behind. This must happen
+  // before the very first render below — clearing it later (after that render) let a resumed run
+  // (post plan-approval, post clarification) silently overwrite the old bubble in its old DOM
+  // position instead of appending a new one after the messages that came in between.
+  window.clearActiveAiBubble();
   conversation.messages.push({ role: 'assistant', text: 'Thinking...', logs: [], turns: [], createdAt: Date.now() });
   if (window.saveConversationsToStorage) {
     window.saveConversationsToStorage();
+  }
+  // Show the running-indicator spinner immediately instead of leaving the chat area blank until
+  // the first tool call (or the whole run finishing) — the model's first response can take a
+  // while, and without this the user has no visible sign the run is even happening.
+  if (window.renderAiMessage) {
+    window.renderAiMessage('Thinking...', [], conversation.id, conversation.messages[aiMessageIndex]);
   }
 
   // ── INTENT ROUTING — driven by structural state, never by parsing the user's words ──
@@ -460,6 +736,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   try {
     if (window.api && window.api.getHomeDir) resolvedHomeDir = await window.api.getHomeDir();
   } catch (_) {}
+  let workspacePath = resolveConversationWorkspace(conversation);
 
   const scopedNotes = await readScopedNotes(workspacePath, conversation);
   const operationalContext = await readOperationalContext(workspacePath);
@@ -477,6 +754,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let planNeedsTestingSection = false;
   let strategyStatus = { exists: false, valid: false, missingSections: STRATEGY_REQUIRED_SECTIONS, needsClarification: false };
   let resetMissionState = false;
+  let suppressPlanApprovalCardThisTurn = false;
 
   if (isInternalPrompt) {
     // System-driven continuation (approved-plan execution, queued follow-up): just build.
@@ -486,9 +764,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     agentExecutionMode = 'executing';
   } else if (conversation.awaitingPlanApproval && !conversation.planApproved) {
     // The user is replying to a pending plan. The model classifies their reply.
-    approvalIntent = await classifyPlanApprovalIntent(userPrompt, resolveUtilityModelName(modelName), config.geminiApiKey);
+    approvalIntent = await classifyPlanApprovalIntent(userPrompt, resolveUtilityModelName(modelName), config);
     if (approvalIntent.intent === 'approve') {
-      const planText = await readImplementationPlanText(workspacePath);
+      const planText = await readImplementationPlanText(workspacePath, conversation);
       if (hasRequiredTestingPlanSection(planText)) {
         conversation.planApproved = true;
         conversation.awaitingPlanApproval = false;
@@ -507,6 +785,26 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       if (window.saveConversationsToStorage) window.saveConversationsToStorage();
       planningDecision = { mode: 'answer', reason: 'User declined the pending plan.' };
       agentExecutionMode = 'answer';
+    } else if (approvalIntent.intent === 'other') {
+      suppressPlanApprovalCardThisTurn = true;
+      const decision = config.planningMode === false
+        ? { mode: 'direct', reason: 'Planning mode disabled.' }
+        : await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config, conversation.messages);
+      planningDecision = decision;
+      reviewOnly = !!decision.reviewOnly;
+      if (reviewOnly && planningDecision.mode === 'plan') {
+        planningDecision = {
+          ...planningDecision,
+          mode: 'direct',
+          reason: `${planningDecision.reason || ''} Separate read-only request while a plan is pending; answer directly without plan approval.`.trim()
+        };
+      }
+      if (reviewOnly || planningDecision.mode === 'direct') {
+        planningBypassedForTask = true;
+        agentExecutionMode = 'direct';
+      } else if (planningDecision.mode === 'answer') {
+        agentExecutionMode = 'answer';
+      }
     } else {
       // revise or unclear: address the user without executing destructive tools
       planningDecision = { mode: 'direct', reason: approvalIntent.intent === 'revise' ? 'User asked to revise the pending plan.' : 'Ambiguous reply to a pending plan.' };
@@ -518,7 +816,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // unless the model judges it a genuinely new plan-worthy task.
     const decision = config.planningMode === false
       ? { mode: 'direct', reason: 'Planning mode disabled.' }
-      : await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config.geminiApiKey);
+      : await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config, conversation.messages);
     // A mission is genuinely in progress when an active subplan still has work or any win
     // condition is unsatisfied. While that is true we must NEVER downgrade to a re-plan: doing
     // so clears planApproved and wipes the operational context (mission/subplan/win conditions),
@@ -544,7 +842,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     agentExecutionMode = 'direct';
   } else {
     // Fresh task, nothing pending or approved. The model decides plan / direct / answer.
-    const decision = await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config.geminiApiKey);
+    const decision = await classifyPlanningNeed(userPrompt, resolveUtilityModelName(modelName), config, conversation.messages);
     planningDecision = decision;
     reviewOnly = !!decision.reviewOnly;
     resetMissionState = true; // a fresh task should not inherit a previous mission's state
@@ -627,7 +925,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   }
 
   // Surface a direct-task decision once, in one consistent place.
-  if (!isInternalPrompt && !conversation.planApproved && window.appendSystemMessage && planningBypassedForTask && planningDecision.mode === 'direct' && agentExecutionMode === 'direct') {
+  if (!isInternalPrompt && conversation.mode !== 'orion' && !conversation.planApproved && window.appendSystemMessage && planningBypassedForTask && planningDecision.mode === 'direct' && agentExecutionMode === 'direct') {
     window.appendSystemMessage(`Planning mode: direct task, no implementation plan required. ${planningDecision.reason || ''}`.trim());
   }
 
@@ -642,7 +940,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
   // Canonical operational state seeds reasoning. Conversation remains a bounded UI/input view;
   // old model and tool turns are deliberately not replayed as task truth.
-  let messages = OperationalContext.buildReasoningMessages(workingState, conversation.messages, promptForModel);
+  let messages = OperationalContext.buildReasoningMessages(workingState, conversation.messages, promptForModel, promptImages);
 
   // OC injection optimization: subsequent turns inject a short header instead of full OC state
   const OC_SHORT_HEADER = '[Operational context on file — request specific sections if needed: goals, current_task, do_not_touch, notes]';
@@ -687,20 +985,44 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   }
 
   // Inject resolved system facts so the model never needs to probe for the home directory
+  const webSearchStatus = (config.googleSearchApiKey && config.googleSearchEngineId)
+    ? 'AVAILABLE — google_search and fetch_web_page are ready to use.'
+    : 'UNAVAILABLE — googleSearchApiKey or googleSearchEngineId not configured. Do not attempt google_search; use fetch_web_page with a known URL if you must retrieve a specific doc.';
+  // Dispatch is a conversational assistant, not a task-tracking tool -- the "Work Walkthrough"
+  // step-by-step recap (required by RESPONSE FORMAT for Coder's implementation work) is just noise
+  // on a direct answer/discussion reply here, so override that instruction for this conversation.
+  const isDispatchConversation = conversation.mode === 'orion';
+  const workWalkthroughOverride = isDispatchConversation
+    ? '\nThis is a Dispatch conversation, not a Coder/implementation task. Do NOT include a "Work Walkthrough" section, a files-touched list, or a step-by-step recap of tool calls in your response, even if you used tools this turn. Just answer directly and conversationally.'
+    : '';
+  const knownProjectsFacts = formatKnownProjectsForSystemFacts();
   messages.splice(2, 0,
     {
       role: 'user',
-      parts: [{ text: `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.` }]
+      parts: [{ text: `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nWeb search: ${webSearchStatus}\nClient: ${promptSource === 'phone' ? 'PHONE COMPANION — the user is on their phone. Prefer descriptions, text output, and copy-pasteable results over actions that require the desktop (launching GUI apps, opening windows, running interactive commands). If you need to show output, describe it clearly rather than suggesting they look at the screen.' : 'DESKTOP — the user is at their computer. You can launch apps, reference screen elements, and run interactive commands normally.'}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.${workWalkthroughOverride}` }]
     },
     {
       role: 'model',
-      parts: [{ text: `Understood. Home directory is ${resolvedHomeDir}. I will use this directly without probing.` }]
+      parts: [{ text: `Understood. Home directory is ${resolvedHomeDir}. Web search: ${webSearchStatus.split(' —')[0]}. Client: ${promptSource === 'phone' ? 'phone companion' : 'desktop'}. I will use these directly without probing.${isDispatchConversation ? ' I will skip the Work Walkthrough section for this conversation.' : ''}` }]
     }
   );
 
+  if (knownProjectsFacts) {
+    messages.splice(4, 0,
+      {
+        role: 'user',
+        parts: [{ text: `[ORION KNOWN LOCAL PROJECTS]\nThese are the local projects already registered in the app. When Jason names one of these projects, use the listed absolute path directly.\n${knownProjectsFacts}` }]
+      },
+      {
+        role: 'model',
+        parts: [{ text: 'Understood. I will use the known project paths directly when Jason names one.' }]
+      }
+    );
+  }
+
   // Strategy gate prep: only a fresh plan-worthy task that has not been approved needs it.
   if (!planningBypassedForTask && planningDecision.mode === 'plan' && config.planningMode !== false && !conversation.planApproved && !isInternalPrompt) {
-    strategyStatus = await readStrategyStatus(workspacePath);
+        strategyStatus = await readStrategyStatus(workspacePath, conversation);
   }
 
   // Approval-reply system notes (revise / unclear / approved-but-invalid).
@@ -767,6 +1089,21 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       window.renderAiMessage(lastTextResponse, currentAgentLogs, conversation.id, msg);
     }
   }
+
+  function rememberBestVisibleAnswer(text) {
+    if (isSubstantiveVisibleAnswer(text)) {
+      bestVisibleAnswer = String(text || '');
+    }
+  }
+
+  function useBestVisibleAnswerIfGateEcho(text) {
+    if (bestVisibleAnswer && looksLikeLeakedNoToolCorrection(text)) {
+      lastTextResponse = bestVisibleAnswer;
+      conversation.messages[aiMessageIndex].text = lastTextResponse;
+      return true;
+    }
+    return false;
+  }
   
   try {
     if (approvalIntent && approvalIntent.intent === 'deny') {
@@ -782,17 +1119,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
     // Check if we need to compact context
     try {
-      const tokenCount = await countTokens(messages, resolveUtilityModelName(modelName), config.geminiApiKey, { signal: getActiveRunSignal() });
+      const tokenCount = await countTokens(messages, resolveUtilityModelName(modelName), config, { signal: getActiveRunSignal() });
       console.log("Current conversation tokens:", tokenCount);
       const compactThreshold = getCompactionThreshold(modelName, config);
       if (config.autoCompact !== false && tokenCount > compactThreshold) {
         window.appendSystemMessage(`Context reached ${tokenCount} tokens; compacting for ${modelName} at threshold ${compactThreshold}.`);
-        const compactResult = await compactHistory(messages, resolveUtilityModelName(modelName), config.geminiApiKey);
+        const compactResult = await compactHistory(messages, resolveUtilityModelName(modelName), config);
         persistCompactedConversation(conversation, compactResult.summary);
         await appendScopedNotes(workspacePath, conversation, `\n\n## Context Compaction ${new Date().toISOString()}\n${compactResult.summary}\n`);
         const checkpoint = await checkpointOperationalContext(workspacePath, 'context_compaction', 'Conversation context was compacted; canonical mission state was preserved.', 'Continue the active subplan from operational context.');
         if (checkpoint && checkpoint.state) workingState = checkpoint.state;
-        messages = OperationalContext.buildReasoningMessages(workingState, conversation.messages, promptForModel);
+        messages = OperationalContext.buildReasoningMessages(workingState, conversation.messages, promptForModel, promptImages);
         if (scopedNotes.content && scopedNotes.content.trim()) {
           messages.splice(2, 0,
             {
@@ -808,6 +1145,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         aiMessageIndex = conversation.messages.length;
         conversation.messages.push({ role: 'assistant', text: 'Thinking...', logs: [], turns: [] });
         window.saveConversationsToStorage();
+        if (window.renderAiMessage) {
+          window.renderAiMessage('Thinking...', [], conversation.id, conversation.messages[aiMessageIndex]);
+        }
       }
     } catch (e) {
       if (isUserStopError(e)) throw e;
@@ -823,6 +1163,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const executingApprovedPlan = (!config.planningMode || conversation.planApproved || planningBypassedForTask)
       && hasOperationalMissionState(workingState);
     if (executingApprovedPlan && !reviewOnly) maxLoops = 100;
+    // Planning phase (not yet approved, writing a plan doc) needs more room than a simple task
+    // because it must survey the codebase AND produce a complete multi-section plan document.
+    // Without this, deep codebase surveys hit the 20-loop ceiling before finishing the plan.
+    const writingPlan = planningDecision.mode === 'plan' && !conversation.planApproved && !planningBypassedForTask;
+    if (writingPlan && !reviewOnly) maxLoops = 40;
     let planValidationRetries = 0;
     let consecutiveNoToolCalls = 0;
     let malformedCallsCount = 0;
@@ -835,6 +1180,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     let reviewCompletionLoopExtensions = 0;
     let pendingWorkspaceResolutionPrompts = 0;
     let memoryNudgeSent = false;
+    let skillGateFired = false;
+    let skillDiscoveryChecked = false; // true once discover_skills has been called this run
+    let blankFinalAnswerNudgeSent = false;
     const repeatedToolFailures = new Map();
     const fileEditCounts = new Map();
     const fileNeedsReadBeforeEdit = new Set(); // files that must be read before the next edit
@@ -865,10 +1213,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const toolEvidenceLedger = [];
     const maxMalformedToolRetries = 5;
     const canExecuteThisTask = () => !config.planningMode || conversation.planApproved || planningBypassedForTask;
-    
-    // Clear active bubble tracking so we start a new one
-    window.clearActiveAiBubble();
-    
+
     while (loopCount < maxLoops) {
       loopCount++;
       window.currentLoopCount = loopCount;
@@ -1060,7 +1405,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       });
       
       if (textVal) {
-        lastTextResponse = textVal;
+        if (!useBestVisibleAnswerIfGateEcho(textVal)) {
+          lastTextResponse = textVal;
+          rememberBestVisibleAnswer(textVal);
+        }
       }
       
       // Update live chat bubbles — skip render when there are no tool calls so the
@@ -1075,12 +1423,37 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // If no tool calls, the agent is done, unless there are pending tasks in the checklist
       if (functionCalls.length === 0) {
         consecutiveNoToolCalls++;
-        const pendingTasks = conversation.tasks ? conversation.tasks.filter(t => t.status !== 'completed' && t.status !== 'x') : [];
-        if (config.planningMode && !canExecuteThisTask() && !hasAnyChecklist(conversation) && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
+        if (bestVisibleAnswer && looksLikeLeakedNoToolCorrection(textVal)) {
+          currentAgentLogs.push({ type: 'thought', content: 'Answer continuity guard: a later gate response referred to an earlier answer instead of being the answer, so Orion kept the substantive visible answer.' });
+          break;
+        }
+        // A model can do a batch of real tool work (reads/searches) and then, on the very next
+        // turn, return truly nothing at all — no tool call, no text. Every other recovery gate
+        // below shares a small per-run budget (finalAnswerQualityPrompts, evidencePrompts, etc.),
+        // and a long investigative turn can exhaust that budget on earlier nudges before ever
+        // reaching this specific case, letting a blank response fall straight through to the
+        // generic "did not produce an answer" bailout at the end of the run. A blank response
+        // after real work is the clearest possible signal the model just stopped mid-task, so it
+        // gets one dedicated, budget-exempt retry here, ahead of every other gate.
+        if (!textVal.trim() && !blankFinalAnswerNudgeSent && workWalkthrough.some(item => item && item.status !== 'error')) {
+          blankFinalAnswerNudgeSent = true;
+          if (loopCount >= maxLoops) maxLoops++;
+          currentAgentLogs.push({ type: 'thought', content: 'Blank-response guard: the model gathered evidence but returned nothing at all. Forcing one more turn to write the actual answer.' });
           messages.push({
             role: 'user',
             parts: [{
-              text: '[SYSTEM: Planning Mode is active and no checklist or implementation plan has been created for this request. Either create the implementation plan and checklist with tools now, or give a complete non-workspace answer that does not promise later action.]'
+              text: `[SYSTEM: Your last response contained no text and no tool call, even though you already gathered evidence this run (file reads, searches, etc.). Do not stop mid-task. Write your complete, direct answer to the user's original request now, using everything you found. The user's original message was: "${String(userPrompt || '').replace(/"/g, "'").slice(0, 500)}"]`
+            }]
+          });
+          continue;
+        }
+        const pendingTasks = conversation.tasks ? conversation.tasks.filter(t => t.status !== 'completed' && t.status !== 'x') : [];
+        if (config.planningMode && !canExecuteThisTask() && !hasAnyChecklist(conversation) &&
+            !isSubstantiveVisibleAnswer(textVal) && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
+          messages.push({
+            role: 'user',
+            parts: [{
+              text: '[SYSTEM: Planning Mode is active and no checklist or implementation plan has been created for this request. Either create the implementation plan and checklist with tools now, or give a complete direct answer that does not promise later action.]'
             }]
           });
           continue;
@@ -1143,7 +1516,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           console.log(`No tool calls, but there are ${pendingTasks.length} pending tasks. Continuing loop automatically.`);
           
           // Append a system message instructing the model to continue
-          const prompt = `[SYSTEM: You returned a response without calling any tools, but there are still pending tasks in the checklist: ${pendingTasks.map(t => `"${t.title}"`).join(', ')}. Continue with the next concrete tool action if one is needed. Do not call set_task_checklist merely to mark in-progress work. If the pending task is already complete, mark it completed; if you are blocked, explain the blocker and the next recovery step. When everything is fully complete and verified, output your final summary.]`;
+          const prompt = `[SYSTEM: You returned a response without calling any tools, but there are still pending tasks in the checklist: ${pendingTasks.map(t => `"${t.title}"`).join(', ')}. Continue with the next concrete tool action if one is needed. Be sure to mark tasks as 'in-progress' when starting them and 'completed' when done. If you are blocked, explain the blocker and the next recovery step. When everything is fully complete and verified, output your final summary.]`;
           
           messages.push({ role: 'user', parts: [{ text: prompt }] });
           continue;
@@ -1209,7 +1582,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           messages.push({ role: 'user', parts: [{ text: pendingWorkspaceResolutionPrompt }] });
           continue;
         }
-        const finalAnswerQualityPrompt = buildFinalAnswerQualityGatePrompt(userPrompt, textVal, workWalkthrough);
+        const finalAnswerQualityPrompt = buildFinalAnswerQualityGatePrompt(userPrompt, textVal, workWalkthrough, conversation);
         if (finalAnswerQualityPrompt && loopCount >= maxLoops && finalAnswerQualityLoopExtensions < 2) {
           finalAnswerQualityLoopExtensions++;
           maxLoops++;
@@ -1281,7 +1654,22 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           messages.push({
             role: 'user',
             parts: [{
-              text: '[SYSTEM: You just did substantial workspace inspection. If you discovered a durable architectural fact, API shape, gotcha, or decision that future sessions should know, call append_project_memory, remember_fact, or remember_decision now (1-3 concise entries) before your final answer. If nothing new/durable was learned, skip this and answer normally.]'
+              text: '[SYSTEM: You just did substantial workspace inspection. If you discovered a durable architectural fact, API shape, gotcha, or decision that future sessions should know, call append_project_memory, remember_fact, or remember_decision now (1-3 concise entries) before your final answer. If nothing new/durable was learned, do not repeat, rewrite, or replace your previous answer — it already stands as the final response and must not be lost. Reply with exactly: NO_ADDITIONAL_ACTION]'
+            }]
+          });
+          continue;
+        }
+        // Skill creation nudge: after a multi-step task (5+ tool calls) that didn't already
+        // create a skill, prompt Orion to consider whether any reusable capability emerged.
+        const didMultiStepWork = !reviewOnly && workWalkthrough.filter(i => i && i.status !== 'error').length >= 5;
+        const alreadyCreatedSkill = workWalkthrough.some(i => i && i.toolName === 'create_skill');
+        if (!skillGateFired && didMultiStepWork && !alreadyCreatedSkill && !isGenericNonAnswer(textVal) && loopCount < maxLoops) {
+          skillGateFired = true;
+          currentAgentLogs.push({ type: 'thought', content: 'Skill gate: multi-step task completed; nudging Orion to consider packaging a reusable skill.' });
+          messages.push({
+            role: 'user',
+            parts: [{
+              text: '[SYSTEM: You just completed a multi-step task. Briefly consider: is there a reusable, testable capability here that would save effort on future tasks? If yes, call create_skill now. If not, do not repeat, rewrite, or replace your previous answer — it already stands as the final response and must not be lost. Reply with exactly: NO_ADDITIONAL_ACTION]'
             }]
           });
           continue;
@@ -1293,11 +1681,107 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       
       // Execute tool calls
       const toolResponseParts = [];
-      
+
+      // ── Parallel execution for read-only batches ──────────────────────────────
+      // When the model returns a batch of calls that are all read-only, run the
+      // executeTool calls concurrently with Promise.all. State mutations (log
+      // updates, ledger entries, working-state transitions) are still sequential.
+      const PARALLELIZABLE_TOOLS = new Set([
+        'read_file', 'list_files', 'get_symbol_index', 'get_workspace_info',
+        'google_search', 'fetch_web_page', 'grep_search', 'search_embeddings',
+        'semantic_search', 'get_file_symbols', 'find_references',
+        'read_command_output', 'get_command_status',
+        'recall_memory', 'read_notes', 'get_project_memory'
+      ]);
+      const canRunParallel = functionCalls.length > 1 &&
+        functionCalls.every(c => PARALLELIZABLE_TOOLS.has(c.name));
+
+      if (canRunParallel) {
+        const parallelNames = functionCalls.map(c => c.name).join(', ');
+        currentAgentLogs.push({ type: 'thought', content: `⚡ Running ${functionCalls.length} independent read-only calls in parallel: ${parallelNames}` });
+        agentSubStatus = `Running ${functionCalls.length} tools in parallel...`;
+
+        // Pre-allocate a log slot and walkthrough item for each call
+        const callMeta = functionCalls.map(call => {
+          const toolName = call.name;
+          const args = call.args || {};
+          const logIndex = currentAgentLogs.length;
+          currentAgentLogs.push({ type: 'tool_call', tool: toolName, params: args, status: 'running' });
+          const walkthroughItem = summarizeToolStart(toolName, args);
+          if (walkthroughItem) workWalkthrough.push(walkthroughItem);
+          return { toolName, args, logIndex, walkthroughItem };
+        });
+        window.renderAiMessage(lastTextResponse, currentAgentLogs);
+
+        // Fire all executeTool calls concurrently
+        const batchStart = Date.now();
+        const parallelResults = await Promise.all(callMeta.map(async ({ toolName, args, logIndex, walkthroughItem }) => {
+          const t0 = Date.now();
+          let result;
+          try {
+            const epistemicGate = getEpistemicToolGate(userPrompt, toolEvidenceLedger, toolName, args);
+            if (!epistemicGate.allowed) {
+              result = { error: epistemicGate.reason, failureCategory: 'unsupported_inference', recoveryGuidance: epistemicGate.guidance };
+            } else {
+              result = await executeTool(toolName, args, workspacePath, config, conversation);
+            }
+          } catch (err) {
+            result = { error: err.message };
+          }
+          const elapsed = Date.now() - t0;
+          return { toolName, args, result, logIndex, walkthroughItem, elapsed };
+        }));
+
+        // Sequential post-processing (state mutations, ledger, UI)
+        for (const { toolName, args, result, logIndex, walkthroughItem, elapsed } of parallelResults) {
+          currentAgentLogs[logIndex].status = isFailedToolResult(result) ? 'error' : 'success';
+          currentAgentLogs[logIndex].result = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
+          currentAgentLogs[logIndex].elapsed = elapsed;
+          updateWalkthroughItem(walkthroughItem, toolName, args, result, isFailedToolResult(result) ? new Error(getToolFailureSignal(result) || 'error') : null);
+          toolEvidenceLedger.push(buildToolEvidenceEntry(toolName, args, result));
+
+          // read_file state tracking
+          if (toolName === 'read_file' && args.path && !isFailedToolResult(result)) {
+            const readKey = String(args.path).toLowerCase();
+            filesSeenThisRun.add(readKey);
+            const wasBlocked = fileNeedsReadBeforeEdit.has(readKey);
+            fileNeedsReadBeforeEdit.delete(readKey);
+            if (wasBlocked && typeof result === 'object' && !Array.isArray(result)) {
+              result.editRetryReminder = `You previously had an edit to ${args.path} blocked until you re-read it. Retry the edit now.`;
+            }
+            const isFullRead = !(Number.isInteger(parseInt(args.startLine, 10)) && Number.isInteger(parseInt(args.endLine, 10)));
+            if (isFullRead) {
+              if (filesFullyReadUnchanged.has(readKey) && typeof result === 'object' && !Array.isArray(result)) {
+                result.redundantReadNote = `You already read ${args.path} earlier this run and it hasn't changed.`;
+              }
+              filesFullyReadUnchanged.add(readKey);
+            }
+          }
+
+          const transition = await recordToolOutcomeInWorkingState(workspacePath, toolName, args, result);
+          if (transition && transition.state) {
+            workingState = transition.state;
+            refreshWorkingStateMessage();
+          }
+
+          toolResponseParts.push({
+            functionResponse: {
+              name: toolName,
+              response: (typeof result === 'object' && result !== null && !Array.isArray(result)) ? result : { output: result }
+            }
+          });
+        }
+
+        const batchElapsed = Date.now() - batchStart;
+        currentAgentLogs.push({ type: 'thought', content: `⚡ Parallel batch done in ${batchElapsed}ms (vs ~${parallelResults.reduce((s, r) => s + r.elapsed, 0)}ms sequential)` });
+        persistCurrentAgentLogs({ render: true });
+
+      } else {
+      // ── Sequential execution (default) ───────────────────────────────────────
       for (const call of functionCalls) {
         const toolName = call.name;
         const args = call.args || {};
-        
+
         agentSubStatus = `Running tool: ${toolName}...`;
         
         const logIndex = currentAgentLogs.length;
@@ -1318,60 +1802,44 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           (toolName === 'write_file' && (isImplementationPlanPath(args.path) || isStrategyPath(args.path))) ||
           toolName === 'modify_file' || toolName === 'patch_file' || toolName === 'run_command' || toolName === 'start_command' || toolName === 'run_tests'
         )) {
-          strategyStatus = await readStrategyStatus(workspacePath);
+          strategyStatus = await readStrategyStatus(workspacePath, conversation);
         }
-        const reviewGate = reviewOnly ? getReviewOnlyToolGate(toolName, args) : { allowed: true, reason: '' };
-        if (!reviewGate.allowed) {
-          const failure = classifyAgentFailure({
-            toolName,
-            args,
-            errorText: reviewGate.reason
-          });
-          const guidance = buildFailureRecoveryGuidance(failure);
-          currentAgentLogs[logIndex].status = 'error';
-          currentAgentLogs[logIndex].result = reviewGate.reason;
+        // Track when discover_skills is called so the create_skill gate knows it's been done
+        if (toolName === 'discover_skills') skillDiscoveryChecked = true;
 
-          toolResponseParts.push({
-            functionResponse: {
-              name: toolName,
-              response: { error: reviewGate.reason, failureCategory: failure.category, recoveryGuidance: guidance }
-            }
-          });
-          const transition = await recordToolOutcomeInWorkingState(workspacePath, toolName, args, { error: reviewGate.reason, failureCategory: failure.category });
-          if (transition && transition.state) {
-            workingState = transition.state;
-            refreshWorkingStateMessage();
-          }
-          updateWalkthroughItem(walkthroughItem, toolName, args, { error: reviewGate.reason, failureCategory: failure.category }, new Error(reviewGate.reason));
-          persistCurrentAgentLogs({ render: true });
-          continue;
-        }
+        const reviewGate = reviewOnly ? getReviewOnlyToolGate(toolName, args) : { allowed: true, reason: '' };
         const planningGate = getPlanningToolGate(config, canExecuteThisTask(), toolName, args, {
           strategyStatus,
           agentExecutionMode
         });
-        if (!planningGate.allowed) {
-          const failure = classifyAgentFailure({
-            toolName,
-            args,
-            errorText: planningGate.reason
-          });
+        // Skill-discovery gate: require discover_skills before create_skill so Orion checks for
+        // an existing skill first rather than recreating capabilities that already exist.
+        const skillDiscoveryGate = (toolName === 'create_skill' && !skillDiscoveryChecked)
+          ? { allowed: false, reason: 'Call discover_skills first to check whether a skill for this already exists, then call create_skill only if nothing suitable is found.' }
+          : { allowed: true, reason: '' };
+        // All gates use identical response logic — handle the first failure found
+        const blockedGate = !reviewGate.allowed ? reviewGate : (!planningGate.allowed ? planningGate : (!skillDiscoveryGate.allowed ? skillDiscoveryGate : null));
+        if (blockedGate) {
+          const failure = classifyAgentFailure({ toolName, args, errorText: blockedGate.reason });
           const guidance = buildFailureRecoveryGuidance(failure);
           currentAgentLogs[logIndex].status = 'error';
-          currentAgentLogs[logIndex].result = planningGate.reason;
-          
+          currentAgentLogs[logIndex].result = blockedGate.reason;
           toolResponseParts.push({
             functionResponse: {
               name: toolName,
-              response: { error: planningGate.reason, failureCategory: failure.category, recoveryGuidance: guidance }
+              response: { error: blockedGate.reason, failureCategory: failure.category, recoveryGuidance: guidance }
             }
           });
-          const transition = await recordToolOutcomeInWorkingState(workspacePath, toolName, args, { error: planningGate.reason, failureCategory: failure.category });
+          const transition = await recordToolOutcomeInWorkingState(workspacePath, toolName, args, { error: blockedGate.reason, failureCategory: failure.category });
           if (transition && transition.state) {
             workingState = transition.state;
             refreshWorkingStateMessage();
           }
-          updateWalkthroughItem(walkthroughItem, toolName, args, { error: planningGate.reason, failureCategory: failure.category }, new Error(planningGate.reason));
+          if (!reviewGate.allowed) {
+            updateWalkthroughItem(walkthroughItem, toolName, args, { error: reviewGate.reason, failureCategory: failure.category }, new Error(reviewGate.reason));
+          } else {
+            updateWalkthroughItem(walkthroughItem, toolName, args, { error: planningGate.reason, failureCategory: failure.category }, new Error(planningGate.reason));
+          }
           persistCurrentAgentLogs({ render: true });
           continue;
         }
@@ -1472,6 +1940,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
         // Execute the tool
         let result;
+        const _toolStartTime = Date.now();
         try {
           result = await executeTool(toolName, args, workspacePath, config, conversation);
           if (result && result._forceYield) {
@@ -1491,6 +1960,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           }
           currentAgentLogs[logIndex].status = isFailedToolResult(result) ? 'error' : 'success';
           currentAgentLogs[logIndex].result = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
+          currentAgentLogs[logIndex].elapsed = Date.now() - _toolStartTime;
           updateWalkthroughItem(walkthroughItem, toolName, args, result, null);
           persistVisualArtifactForTool({
             conversation,
@@ -1506,6 +1976,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           console.error(err);
           currentAgentLogs[logIndex].status = 'error';
           currentAgentLogs[logIndex].result = err.message;
+          currentAgentLogs[logIndex].elapsed = Date.now() - _toolStartTime;
           result = { error: err.message };
           updateWalkthroughItem(walkthroughItem, toolName, args, result, err);
         }
@@ -1737,7 +2208,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           break;
         }
       }
-      
+      } // end sequential else block
+
       // Append tool response parts to message history
       messages.push({ role: 'tool', parts: toolResponseParts });
       
@@ -1772,10 +2244,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         // Structural Validation: Check for Testing Plan section before presenting plan for approval
         let planIsValid = false;
         try {
-          const planContent = await window.api.readFile(workspacePath, 'implementation_plan.md', { maxChars: 100000 });
-          const planText = typeof planContent === 'string'
-            ? planContent
-            : (planContent && !planContent.error && typeof planContent.content === 'string' ? planContent.content : '');
+          const planText = await readImplementationPlanText(workspacePath, conversation);
           planIsValid = hasRequiredTestingPlanSection(planText);
         } catch (err) {
           console.error('Error checking implementation_plan.md for testing section:', err);
@@ -1809,6 +2278,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             }
             const planItem = workWalkthrough.find(item => item.kind === 'plan');
             lastTextResponse = buildPlanApprovalMessage(planItem, lastTextResponse);
+            forceYield = true;  // prevent auto-continue from bypassing plan approval gate
             break;
           }
         }
@@ -1817,22 +2287,16 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         conversation.awaitingPlanApproval = true;
         const planItem = workWalkthrough.find(item => item.kind === 'plan');
         lastTextResponse = buildPlanApprovalMessage(planItem, lastTextResponse);
+        forceYield = true;  // prevent auto-continue from bypassing plan approval gate
         break;
       }
     }
 
-    // Fallback: if the agent ran in planning mode but never wrote a new plan (e.g. reviewed
-    // an existing one and summarized it), check whether implementation_plan.md exists on disk.
-    // If it does, gate on approval now so the next user message is properly routed.
-    if (!forceYield && !reviewOnly && planningDecision.mode === 'plan' && !conversation.awaitingPlanApproval && !conversation.planApproved) {
-      try {
-        const existingPlanText = await readImplementationPlanText(workspacePath);
-        if (existingPlanText && existingPlanText.trim()) {
-          conversation.awaitingPlanApproval = true;
-          console.log('Planning turn ended without forceYield; existing implementation_plan.md found — gating on approval.');
-        }
-      } catch (_) {}
-    }
+    ranOutOfLoopBudget = loopCount >= maxLoops;
+
+    // Plan approval is conversation state. A workspace-level implementation_plan.md may be an
+    // artifact from another conversation or an older task, so its mere presence must not reactivate
+    // approval mode for this run.
   } catch (error) {
     if (isUserStopError(error)) {
       userRequestedStop = true;
@@ -1853,6 +2317,20 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     agentExecutionMode = 'idle';
     agentSubStatus = '';
     if (window.onAgentStatusChange) window.onAgentStatusChange(false);
+
+    // Smart Orion title: generate a better title after the first response
+    if (isOrionMode) {
+      const msgs = conversation.messages || [];
+      const firstUser = msgs.find(m => m.role === 'user');
+      const firstAsst = msgs.find(m => m.role === 'assistant');
+      const currentTitle = conversation.title || '';
+      const needsSmartTitle = firstUser && firstAsst && (currentTitle === 'New Conversation' || currentTitle === window.generateConversationTitle?.(firstUser.text || ''));
+      if (needsSmartTitle) {
+        generateOrionSmartTitle(conversation, firstUser.text || '', firstAsst.text || '', config).catch(() => {});
+      }
+      // Auto-save memory insights from this session (silent, best-effort)
+      autoSaveOrionMemory(conversation, config).catch(() => {});
+    }
 
     // Determine whether the run stopped with genuine work still pending. This drives both the
     // auto-continue decision and an honest terminal message instead of a blanket "Task finished".
@@ -1879,7 +2357,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // model can forget to do — it must not be the only signal stall detection trusts, or a pass
     // that made real file edits (but no checklist update) looks identical to a pass that thrashed
     // on nothing but failed tool calls, and both get stopped prematurely as "stalled."
-    const EDIT_OR_COMMAND_TOOLS = new Set(['write_file', 'modify_file', 'patch_file', 'run_command', 'start_command', 'run_tests']);
+    const EDIT_OR_COMMAND_TOOLS = new Set(['write_file', 'modify_file', 'patch_file', 'run_command', 'start_command', 'run_tests', 'run_linter']);
     const hadSuccessfulEditOrCommandThisPass = (workWalkthrough || []).some(item => item && item.status !== 'error' && EDIT_OR_COMMAND_TOOLS.has(item.toolName));
 
     conversation._planExecAutoContinues = conversation._planExecAutoContinues || 0;
@@ -1901,7 +2379,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // fallback keeps long work going even if operational mission state is unexpectedly absent.
     const hasResumableWork = hasOperationalMissionState(workingState) || pendingChecklist.length > 0;
     if (!forceYield && !userRequestedStop && canExecuteAtExit && hasPendingWork && madeProgressThisRun && !blockersActive && !stalled
-        && hasResumableWork && conversation._planExecAutoContinues < AUTO_CONTINUE_BUDGET) {
+        && hasResumableWork && conversation._planExecAutoContinues < AUTO_CONTINUE_BUDGET
+        && !conversation.awaitingPlanApproval) {
       autoContinueExecution = true;
       conversation._planExecAutoContinues++;
     }
@@ -1918,13 +2397,26 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         lastTextResponse = "Task finished.";
       }
     }
-    lastTextResponse = withWorkWalkthrough(lastTextResponse, workWalkthrough, true);
+    if (bestVisibleAnswer && looksLikeLeakedNoToolCorrection(lastTextResponse)) {
+      lastTextResponse = bestVisibleAnswer;
+    }
+    // A run that exhausted its raw per-turn ceiling while thrashing on legitimate-but-circuitous
+    // tool calls (e.g. repeatedly retrying broken shell escaping) and never reached a checklist —
+    // so autoContinueExecution never engaged — otherwise leaves whatever stale mid-task sentence
+    // was set before the thrashing began as the silent "final" answer, with the tool log the only
+    // hint anything went wrong. Append an explicit, honest note so the user knows to ask Orion to
+    // continue instead of assuming the task finished or is simply taking a while.
+    if (ranOutOfLoopBudget && !autoContinueExecution && madeProgressThisRun &&
+        !/ask me to continue/i.test(lastTextResponse)) {
+      lastTextResponse += '\n\n[Note: this run hit its per-turn action limit before the task was confirmed complete — the message above may be from partway through, not a final result. Ask me to continue and I will pick up from the current state.]';
+    }
+    lastTextResponse = withWorkWalkthrough(lastTextResponse, workWalkthrough, true, conversation);
 
     // Save walkthrough to file so the chat bubble stays clean
     if (workWalkthrough.length > 0 && workspacePath) {
       try {
         const walkthroughMd = buildWorkWalkthroughMarkdown(workWalkthrough, lastTextResponse);
-        await window.api.writeFile(workspacePath, 'work_walkthrough.md', walkthroughMd);
+        await writeOrionGovernanceArtifactText(workspacePath, conversation, 'work_walkthrough.md', walkthroughMd);
       } catch (_) {}
     }
 
@@ -1934,7 +2426,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // Permanently mark the bubble that carries the plan-approval card so it can be re-rendered
     // with a persistent "Implementation started" state after approval, instead of vanishing on
     // the next reload and looking like the button was never pressed.
-    if (conversation.awaitingPlanApproval) {
+    if (conversation.awaitingPlanApproval && !suppressPlanApprovalCardThisTurn) {
       conversation.messages[aiMessageIndex].isPlanApprovalCard = true;
     }
     if (conversation.awaitingClarification) {
@@ -1967,7 +2459,28 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     
     // Clear the active bubble tracking ONLY after the final render has updated it (removing the spinner)
     window.clearActiveAiBubble();
-    
+
+    // Notify phone companion whenever the agent stops — different messages by exit reason
+    if (window.api && typeof window.api.notifyPhone === 'function') {
+      let notifBody;
+      if (userRequestedStop) {
+        notifBody = 'Agent stopped.';
+      } else if (autoContinueExecution) {
+        // Mid-plan continuation queued — skip, phone will get notified when it truly finishes
+        notifBody = null;
+      } else if (ranOutOfLoopBudget) {
+        notifBody = 'Hit action limit — ask Orion to continue.';
+      } else if (forceYield) {
+        notifBody = 'Paused — needs your input.';
+      } else {
+        const shortResponse = String(lastTextResponse || '').replace(/\s+/g, ' ').slice(0, 120);
+        notifBody = shortResponse || 'Task complete';
+      }
+      if (notifBody) {
+        window.api.notifyPhone('Orion AI', notifBody).catch(() => {});
+      }
+    }
+
     window.saveConversationsToStorage();
     if (window.renderConversationList) window.renderConversationList();
     if (window.renderProjectsList) window.renderProjectsList();
@@ -1976,7 +2489,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   // If the run stopped mid-plan with real progress and pending work, queue an internal
   // continuation so a multi-phase build keeps going instead of falsely ending. Real user
   // queue items take priority, so only enqueue when nothing else is waiting.
-  if (autoContinueExecution && window.promptQueue && window.promptQueue.length === 0) {
+  if (autoContinueExecution && window.promptQueue && window.promptQueue.length === 0 && !conversation.awaitingPlanApproval) {
     window.promptQueue.push({
       prompt: '[ORION INTERNAL CONTINUATION - not a user message] The approved plan is still in progress. Continue executing the remaining checklist items and subplan steps now: write and edit the actual source files for the next pending tasks, then verify. Do not restate the plan or stop until the work is genuinely complete or you hit a real blocker. Do not quote this as something the user said.',
       modelSelectValue: modelName,
@@ -2284,9 +2797,29 @@ async function executeTool(name, args, workspace, config, conversation) {
       return result;
     }
 
+    case 'get_file_symbols': {
+      if (!args.path) throw new Error("Missing 'path' parameter");
+      const result = await window.api.getFileSymbols(workspace, args.path);
+      if (!result.success) throw new Error(result.error || 'Failed to extract file symbols');
+      return result.symbols;
+    }
+
+    case 'semantic_search': {
+      if (!args.query) throw new Error("Missing 'query' parameter");
+      const result = await window.api.semanticSearch(args.query, workspace, config, 10);
+      if (!result.success) throw new Error(result.error || 'Semantic search failed');
+      return result.results;
+    }
+
     case 'read_file': {
       if (!args.path) throw new Error("Missing 'path' parameter");
-      const content = await window.api.readFile(workspace, args.path, {
+      const content = isOrionGovernanceArtifactPath(args.path)
+        ? await readOrionGovernanceArtifactText(workspace, conversation, args.path, {
+          startLine: args.startLine,
+          endLine: args.endLine,
+          maxChars: args.maxChars
+        })
+        : await window.api.readFile(workspace, args.path, {
         startLine: args.startLine,
         endLine: args.endLine,
         maxChars: args.maxChars
@@ -2300,8 +2833,11 @@ async function executeTool(name, args, workspace, config, conversation) {
       if (args.content === undefined) throw new Error("Missing 'content' parameter");
       const isPlanFile = isImplementationPlanPath(args.path);
       const isStrategyFile = isStrategyPath(args.path);
-      const existingContent = await window.api.readFile(workspace, args.path, { maxChars: 200000 });
-      if (!isPlanFile && !isStrategyFile && existingContent && !existingContent.error && args.allowOverwrite !== true) {
+      const isGovernanceArtifact = isOrionGovernanceArtifactPath(args.path);
+      const existingContent = isGovernanceArtifact
+        ? await readOrionGovernanceArtifactText(workspace, conversation, args.path, { maxChars: 200000 }).catch(error => ({ error: error.message }))
+        : await window.api.readFile(workspace, args.path, { maxChars: 200000 });
+      if (!isGovernanceArtifact && !isPlanFile && !isStrategyFile && existingContent && !existingContent.error && args.allowOverwrite !== true) {
         throw new Error("write_file refused to overwrite an existing file. Use patch_file for surgical edits, or set allowOverwrite=true with overwriteReason when a full rewrite is explicitly required.");
       }
       if (args.allowOverwrite === true && !String(args.overwriteReason || '').trim()) {
@@ -2315,16 +2851,20 @@ async function executeTool(name, args, workspace, config, conversation) {
         beforePass = testRes.success;
       }
       
-      const writeRes = await window.api.writeFile(workspace, args.path, args.content);
+      const writeRes = isGovernanceArtifact
+        ? await writeOrionGovernanceArtifactText(workspace, conversation, args.path, args.content)
+        : await window.api.writeFile(workspace, args.path, args.content);
       if (writeRes.error) throw new Error(writeRes.error);
       
       // Refresh directory UI
-      if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
+      if (!isGovernanceArtifact && window.syncWorkspaceFiles) window.syncWorkspaceFiles();
       
       let testFeedback = "";
-      const writeSyntaxCheck = await checkJsSyntaxAfterEdit(workspace, args.path);
-      if (!writeSyntaxCheck.ok) {
-        testFeedback += `\n[WARNING] SYNTAX ERROR DETECTED: node --check failed for ${args.path}:\n${writeSyntaxCheck.error}`;
+      if (!isGovernanceArtifact) {
+        const writeSyntaxCheck = await checkJsSyntaxAfterEdit(workspace, args.path);
+        if (!writeSyntaxCheck.ok) {
+          testFeedback += `\n[WARNING] SYNTAX ERROR DETECTED: node --check failed for ${args.path}:\n${writeSyntaxCheck.error}`;
+        }
       }
       if (config.autoTest) {
         const testRes = await window.runRegressionTests();
@@ -2332,7 +2872,7 @@ async function executeTool(name, args, workspace, config, conversation) {
           testFeedback += "\n[WARNING] REGRESSION DETECTED: Regression tests failed after this write. Please review your modifications.";
         }
       }
-      const missingHtmlRefs = await findMissingHtmlLocalReferences(workspace, args.path, args.content);
+      const missingHtmlRefs = isGovernanceArtifact ? [] : await findMissingHtmlLocalReferences(workspace, args.path, args.content);
       if (missingHtmlRefs.length) {
         testFeedback += `\n[WARNING] Missing local HTML references from ${args.path}: ${missingHtmlRefs.map(ref => `\`${ref}\``).join(', ')}. Create these files or remove the references before considering the UI verified.`;
       }
@@ -2431,9 +2971,14 @@ async function executeTool(name, args, workspace, config, conversation) {
       }
       const targetPath = resolution.path;
       conversation.workspace = targetPath;
-      conversation.projectPath = targetPath;
+      if (conversation.mode === 'coder') {
+        conversation.projectPath = targetPath;
+      }
       if (typeof window.changeActiveWorkspace === 'function') {
-        window.changeActiveWorkspace(targetPath);
+        window.changeActiveWorkspace(targetPath, {
+          conversationId: conversation.id,
+          promoteProject: conversation.mode === 'coder'
+        });
       }
       return {
         success: true,
@@ -2443,6 +2988,50 @@ async function executeTool(name, args, workspace, config, conversation) {
         fuzzyResolved: !!resolution.fuzzyResolved,
         resolvedFrom: resolution.resolvedFrom,
         matchedName: resolution.matchedName || getLocalPathBaseName(targetPath)
+      };
+    }
+
+    case 'handoff_to_coder': {
+      const requestedPath = String(args.path || workspace || conversation.workspace || '').trim();
+      if (!requestedPath) throw new Error("Missing workspace path to hand off to Coder");
+      const resolution = await resolveWorkspacePathForChange(requestedPath);
+      if (!resolution.success) {
+        throw new Error(`Coder handoff path "${resolution.path}" is invalid or does not exist: ${resolution.error}`);
+      }
+      if (typeof window.promoteWorkspaceToCoder !== 'function') {
+        throw new Error('Coder handoff is not available in this Orion build.');
+      }
+      const prompt = String(args.prompt || '').trim();
+      const result = window.promoteWorkspaceToCoder({
+        path: resolution.path,
+        prompt,
+        title: args.title || '',
+        open: args.open === true
+      });
+      if (!result || result.success === false) {
+        throw new Error((result && result.error) || 'Coder handoff failed.');
+      }
+
+      // ── Supervisor: track the launched Coder conversation ──────────────────
+      conversation.launchedCoderConvId = result.conversationId;
+      conversation.launchedCoderTaskTitle = result.title || 'Coder Task';
+      conversation.launchedCoderTaskStart = Date.now();
+      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+      // Kick off the supervisor monitor in the renderer
+      if (typeof window.startCoderTaskMonitor === 'function') {
+        window.startCoderTaskMonitor(conversation.id, result.conversationId);
+      }
+      // ───────────────────────────────────────────────────────────────────────
+
+      return {
+        ...result,
+        success: true,
+        message: prompt
+          ? `Promoted ${resolution.path} to Coder and queued the task for Cody.`
+          : `Promoted ${resolution.path} to Coder as a project.`,
+        fuzzyResolved: !!resolution.fuzzyResolved,
+        resolvedFrom: resolution.resolvedFrom,
+        matchedName: resolution.matchedName || getLocalPathBaseName(resolution.path)
       };
     }
 
@@ -2603,6 +3192,20 @@ async function executeTool(name, args, workspace, config, conversation) {
         output: testRes.output
       };
     }
+    
+    case 'run_linter': {
+      if (!args.linterType) throw new Error("Missing 'linterType' parameter");
+      const res = await window.api.runLinter(workspace, args.linterType, args.targetPath || '.');
+      if (!res.success) throw new Error(res.error || 'Failed to run linter');
+      return { success: true, results: res.results };
+    }
+    
+    case 'find_references': {
+      if (!args.symbolName) throw new Error("Missing 'symbolName' parameter");
+      const res = await window.api.findReferences(workspace, args.symbolName, args.targetPath || '.');
+      if (!res.success) throw new Error(res.error || 'Failed to find references');
+      return { success: true, results: res.results };
+    }
 
     case 'google_search': {
       if (!args.query) throw new Error("Missing 'query' parameter");
@@ -2723,9 +3326,8 @@ async function executeTool(name, args, workspace, config, conversation) {
     }
 
     case 'take_screenshot': {
-      const result = await window.api.takeScreenshot(workspace, args.destination || '');
+      const result = await window.api.takeScreenshot(workspace, args.destination || '', conversation.id);
       if (!result.success) throw new Error(result.error || 'Screenshot failed');
-      if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
       return result;
     }
 
@@ -2751,7 +3353,8 @@ async function executeTool(name, args, workspace, config, conversation) {
         warmupMs: args.warmupMs,
         timeoutMs: args.timeoutMs,
         processId,
-        destination: args.destination || ''
+        destination: args.destination || '',
+        conversationId: conversation.id
       });
       // Track the processId so we can auto-kill it next time
       if (result && result.success) {
@@ -2762,17 +3365,16 @@ async function executeTool(name, args, workspace, config, conversation) {
       // A crash before render is a real, reportable failure the model must act on — surface it as
       // a failed result (not a thrown error) so the recovery guidance and stderr reach the model.
       if (!result.success && !result.crashed) throw new Error(result.error || 'App preview failed');
-      if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
       return result;
     }
 
     case 'capture_screen': {
       const result = await window.api.captureScreen(workspace, {
         delayMs: args.delayMs,
-        destination: args.destination || ''
+        destination: args.destination || '',
+        conversationId: conversation.id
       });
       if (!result.success) throw new Error(result.error || 'Screen capture failed');
-      if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
       return result;
     }
 
@@ -3191,6 +3793,9 @@ function shouldApplyChecklistUpdate(previousTasks = [], nextTasks = []) {
         meaningful = true;
       }
       if (previousTask.status === 'in-progress' && task.status === 'pending') {
+        meaningful = true;
+      }
+      if (previousTask.status === 'pending' && task.status === 'in-progress') {
         meaningful = true;
       }
     }
@@ -3790,15 +4395,53 @@ function validateStrategyContent(content) {
   };
 }
 
-async function readStrategyStatus(workspacePath) {
+function isWorkWalkthroughPath(pathValue) {
+  return normalizeInventoryPath(pathValue).toLowerCase() === 'work_walkthrough.md';
+}
+
+function isOrionGovernanceArtifactPath(pathValue) {
+  return isImplementationPlanPath(pathValue) || isStrategyPath(pathValue) || isWorkWalkthroughPath(pathValue);
+}
+
+function applyTextReadOptions(content, options = {}, label = 'Artifact') {
+  const text = String(content || '');
+  const startLine = parseInt(options.startLine, 10);
+  const endLine = parseInt(options.endLine, 10);
+  if (Number.isInteger(startLine) && Number.isInteger(endLine) && startLine > 0 && endLine >= startLine) {
+    const lines = text.split(/\r?\n/);
+    return lines.slice(startLine - 1, endLine).map((line, index) => `${startLine + index}: ${line}`).join('\n');
+  }
+  const maxChars = parseInt(options.maxChars, 10);
+  if (Number.isInteger(maxChars) && maxChars > 0 && text.length > maxChars) {
+    return text.slice(0, maxChars) + `\n\n[Orion] ${label} truncated at ${maxChars} characters. Use startLine/endLine to inspect targeted sections.`;
+  }
+  return text;
+}
+
+async function readOrionGovernanceArtifactText(workspacePath, conversation, relativePath, options = {}) {
+  if (conversation && conversation.id && window.api && typeof window.api.readConversationArtifact === 'function') {
+    const artifact = await window.api.readConversationArtifact(conversation.id, relativePath, options || {});
+    if (artifact && artifact.success) return applyTextReadOptions(artifact.content || '', options, 'Conversation artifact');
+  }
+  const result = await window.api.readFile(workspacePath, relativePath, options || {});
+  if (typeof result === 'string') return result;
+  if (result && !result.error && typeof result.content === 'string') return result.content;
+  throw new Error((result && result.error) || 'Artifact does not exist');
+}
+
+async function writeOrionGovernanceArtifactText(workspacePath, conversation, relativePath, content) {
+  if (conversation && conversation.id && window.api && typeof window.api.writeConversationArtifact === 'function') {
+    return await window.api.writeConversationArtifact(conversation.id, relativePath, content);
+  }
+  return await window.api.writeFile(workspacePath, relativePath, content);
+}
+
+async function readStrategyStatus(workspacePath, conversation) {
   try {
     if (!window.api || typeof window.api.readFile !== 'function') {
       return { exists: false, valid: false, missingSections: STRATEGY_REQUIRED_SECTIONS, needsClarification: false, content: '' };
     }
-    const result = await window.api.readFile(workspacePath, 'STRATEGY.md', { maxChars: 120000 });
-    const content = typeof result === 'string'
-      ? result
-      : (result && !result.error && typeof result.content === 'string' ? result.content : '');
+    const content = await readOrionGovernanceArtifactText(workspacePath, conversation, 'STRATEGY.md', { maxChars: 120000 });
     if (!content) return { exists: false, valid: false, missingSections: STRATEGY_REQUIRED_SECTIONS, needsClarification: false, content: '' };
     return { exists: true, content, ...validateStrategyContent(content) };
   } catch (err) {
@@ -3839,7 +4482,7 @@ function getPlanningToolGate(config, canExecute, toolName, args = {}, options = 
   if (!config || !config.planningMode || canExecute) {
     return { allowed: true, forceYield: false, reason: '' };
   }
-  const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'start_command', 'run_tests', 'sync_workspace_env', 'launch_workspace_app', 'preview_app', 'git_push', 'download_file', 'download_from_page', 'extract_archive', 'take_screenshot'];
+  const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'start_command', 'run_tests', 'run_linter', 'sync_workspace_env', 'launch_workspace_app', 'preview_app', 'git_push', 'download_file', 'download_from_page', 'extract_archive', 'take_screenshot'];
   const completionTools = ['complete_subplan', 'evaluate_win_conditions'];
   const strategyStatus = options.strategyStatus || {};
   const executionMode = options.agentExecutionMode || '';
@@ -3992,10 +4635,12 @@ function summarizeToolStart(toolName, args = {}) {
     const opDetail = op.type && opLabels[op.type] ? ` (${opLabels[op.type]})` : '';
     return { toolName, kind: 'file', status: 'running', path: args.path, operationType: op.type, label: `Patched \`${args.path || 'file'}\`${opDetail}` };
   }
+  if (toolName === 'run_tests') return { toolName, kind: 'test', status: 'running', label: 'Ran regression tests' };
+  if (toolName === 'run_linter') return { toolName, kind: 'test', status: 'running', label: `Ran ${args.linterType || 'linter'} on ${args.targetPath || 'workspace'}` };
+  if (toolName === 'find_references') return { toolName, status: 'running', label: `Found references for \`${args.symbolName || ''}\`` };
   if (toolName === 'run_command' || toolName === 'start_command') {
     return { toolName, kind: 'command', status: 'running', command: args.command, label: `${toolName === 'start_command' ? 'Started' : 'Ran'} \`${args.command || 'command'}\`` };
   }
-  if (toolName === 'run_tests') return { toolName, kind: 'test', status: 'running', label: 'Ran regression tests' };
   if (toolName === 'set_task_checklist') {
     const count = Array.isArray(args.tasks) ? args.tasks.length : 0;
     return { toolName, kind: 'checklist', status: 'running', label: `Requested checklist update${count ? ` (${count} items)` : ''}` };
@@ -4075,9 +4720,16 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
   }
 }
 
-function withWorkWalkthrough(text, items, final = false) {
+function withWorkWalkthrough(text, items, final = false, conversation = null) {
   const meaningfulItems = (items || []).filter(Boolean);
   if (meaningfulItems.length === 0) return text;
+  // Dispatch (Orion) is a conversational assistant, not a task-tracking tool -- the bulleted
+  // step-by-step recap is useful for Coder's implementation work but is just noise on top of a
+  // direct answer/discussion reply. Coder conversations (including legacy ones without a stamped
+  // mode) keep the walkthrough as before.
+  if (conversation && conversation.mode === 'orion') {
+    return sanitizeFinalAnswerText(text);
+  }
   const base = sanitizeFinalAnswerText(text);
   const lines = meaningfulItems.slice(-12).map(item => {
     const marker = item.status === 'error' ? 'Failed' : (item.status === 'running' ? 'Working' : 'Done');
@@ -4232,6 +4884,7 @@ function isVerificationItem(item) {
   if (item.status === 'error') return false;
   if (looksLikePlaceholderTestOutput(item.output)) return false;
   if (item.toolName === 'run_tests' || item.kind === 'test') return true;
+  if (item.toolName === 'evaluate_win_conditions') return true;
   if (item.toolName === 'run_command') return isRealVerificationCommand(item.command);
   if (item.toolName === 'start_command') return isRealVerificationCommand(item.command);
   // A bounded GUI preview that actually captured a screenshot is real evidence the app rendered.
@@ -4531,10 +5184,40 @@ function hasOnlyInventoryEvidence(workWalkthrough = []) {
 function answerHasActionableFinalContent(answerText) {
   const text = sanitizeFinalAnswerText(answerText);
   if (isGenericNonAnswer(text)) return false;
+  if (looksLikeLeakedNoToolCorrection(text)) return false;
   if (text.length < 120) return false;
   const nonBlankLines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
   if (nonBlankLines.length >= 3) return true;
   return /[.!?]\s+\S+.*[.!?]/s.test(text);
+}
+
+function isSubstantiveVisibleAnswer(text) {
+  return answerHasActionableFinalContent(text) && !looksLikeLeakedNoToolCorrection(text);
+}
+
+function getInspectedEvidenceAnchors(workWalkthrough = []) {
+  const anchors = new Set();
+  (workWalkthrough || []).forEach(item => {
+    if (!item || item.status === 'error') return;
+    if (item.toolName !== 'read_file' && item.kind !== 'file') return;
+    const raw = String(item.path || item.label || '');
+    const backtickMatch = raw.match(/`([^`]+)`/);
+    const filePath = (backtickMatch ? backtickMatch[1] : raw).trim();
+    if (!filePath) return;
+    anchors.add(filePath.toLowerCase());
+    const parts = filePath.split(/[\\/]/).filter(Boolean);
+    if (parts.length) anchors.add(parts[parts.length - 1].toLowerCase());
+  });
+  return [...anchors].filter(anchor => anchor.length >= 4);
+}
+
+function answerHasInspectionGrounding(answerText, workWalkthrough = []) {
+  const text = sanitizeFinalAnswerText(answerText);
+  const lower = text.toLowerCase();
+  if (/(?:^|[\s`'"(\[])(?:[\w.-]+[\\/])*[\w.-]+\.(?:js|jsx|ts|tsx|py|json|md|html|css|mjs|cjs|yml|yaml|toml|rs|go|java|cs|cpp|c|h)(?::\d+)?\b/i.test(text)) {
+    return true;
+  }
+  return getInspectedEvidenceAnchors(workWalkthrough).some(anchor => lower.includes(anchor));
 }
 
 function getReviewCoverage(workWalkthrough = []) {
@@ -4580,12 +5263,12 @@ function buildReviewOnlyCompletionGatePrompt(userPrompt, answerText, workWalkthr
     return `[SYSTEM: Review completion gate. You have not inspected enough of the program to finish a broad bug/structural review yet. Current coverage: ${coverage.fileCount} source file(s) read${coverage.hasInventory ? ' with inventory context' : ''}. Continue with concrete tools: list files if needed, then read the main entry point, adjacent modules, config/package files, and tests where present. Do not stop after one file with general possibilities.]`;
   }
   if (!answerHasGroundedReviewReport(answerText)) {
-    return '[SYSTEM: Review completion gate. Your draft is not a grounded findings report yet. Either continue inspecting files, or produce a concrete report now with specific findings tied to file paths and line/function context, severity/impact, and a clear note if no specific issues were found. Do not ask the user whether to keep inspecting; finish the review from the available evidence or gather the missing evidence with tools.]';
+    return '[SYSTEM: Review completion gate. Your draft is not a grounded findings report yet. Either continue inspecting files, or produce a concrete report now with specific findings tied to file paths and line/function context, severity/impact, and a clear note if no specific issues were found. Do not ask the user whether to keep inspecting; finish the review from the available evidence or gather the missing evidence with tools. Only the final saved assistant response counts. Write a complete, standalone report, not a continuation, correction, or shorter follow-up to earlier text.]';
   }
   return '';
 }
 
-function buildFinalAnswerQualityGatePrompt(userPrompt, answerText, workWalkthrough = []) {
+function buildFinalAnswerQualityGatePrompt(userPrompt, answerText, workWalkthrough = [], conversation = null) {
   const inspected = (workWalkthrough || []).some(item => item && item.status !== 'error');
   if (!inspected) return '';
   if (hasOnlyInventoryEvidence(workWalkthrough)) {
@@ -4593,10 +5276,32 @@ function buildFinalAnswerQualityGatePrompt(userPrompt, answerText, workWalkthrou
 
 Before final response, decide what evidence the user's actual request requires. If they asked for anything beyond a file inventory, read the relevant source files, tests, README/package/config files, or run safe inspection commands before answering. If the user truly requested only an inventory, answer that narrowly and explicitly. Do not produce broad recommendations from filenames alone.]`;
   }
+  // A Dispatch conversation is a conversational assistant, not a task with deliverables -- a short,
+  // direct reply that ends by asking the user a clarifying question is a complete answer, not an
+  // incomplete one, and it need not cite exact file paths for every claim. Holding it to this
+  // gate's "recommendations, a plan, changes, or a next action" / inspection-grounding bars forces
+  // a redundant re-verification pass (re-reading files it may have already inspected earlier in the
+  // same conversation) purely to satisfy the gate, burning tokens on evidence nobody asked for. This
+  // also tends to make the model regress into a degenerate retry that just refers back to its own
+  // earlier answer instead of restating it. agentExecutionMode 'answer' covers turns classified as
+  // pure discussion; conversation.mode 'orion' covers the rest of Dispatch's turns regardless of
+  // how this specific turn got classified (e.g. verifying a technical claim still counts).
+  if (agentExecutionMode === 'answer' || (conversation && conversation.mode === 'orion')) {
+    const trimmed = sanitizeFinalAnswerText(answerText);
+    if (trimmed.length >= 40 && !isGenericNonAnswer(trimmed) && !looksLikeLeakedNoToolCorrection(trimmed)) {
+      return '';
+    }
+  }
+  if (turnAlreadyWroteMemory(workWalkthrough) && turnDidSubstantiveInspection(workWalkthrough) &&
+      !answerHasInspectionGrounding(answerText, workWalkthrough)) {
+    return `[SYSTEM: Final-response quality gate. You inspected source files and stored durable memory, but the visible final answer is not self-contained or grounded in the inspected evidence.
+
+Before final response, answer the user's actual request directly using the files, functions, behaviors, and facts you inspected. Do not rely on any earlier draft answer being visible to the user; restate the substantive answer now.]`;
+  }
   if (answerHasActionableFinalContent(answerText)) return '';
   return `[SYSTEM: Final-response quality gate. You inspected context, but inspection alone is not completion.
 
-Before final response, answer the user's actual request directly, using the evidence you gathered. If more evidence is needed, call the necessary tools now; otherwise produce a substantive answer now. Do not stop at phrases like "Ah, the path is...", an acknowledgement, a file-inspection summary, or an empty response.]`;
+Before final response, answer the user's actual request directly, using the evidence you gathered. If more evidence is needed, call the necessary tools now; otherwise produce a substantive answer now. Do not stop at phrases like "Ah, the path is...", an acknowledgement, a file-inspection summary, or an empty response. Only the final saved assistant response counts. Write a complete, standalone answer, not a continuation, correction, or shorter follow-up to earlier text.]`;
 }
 
 function buildPlanApprovalMessage(planItem, fallbackText) {
@@ -4623,12 +5328,10 @@ function hasRequiredTestingPlanSection(content) {
   return /^\*\*[^*\n]*?(testing plan|test plan|validation plan)[^*\n]*?\*\*\s*$/im.test(text);
 }
 
-async function readImplementationPlanText(workspacePath) {
+async function readImplementationPlanText(workspacePath, conversation) {
   if (!workspacePath) return '';
   try {
-    const planContent = await window.api.readFile(workspacePath, 'implementation_plan.md', { maxChars: 100000 });
-    if (typeof planContent === 'string') return planContent;
-    if (planContent && !planContent.error && typeof planContent.content === 'string') return planContent.content;
+    return await readOrionGovernanceArtifactText(workspacePath, conversation, 'implementation_plan.md', { maxChars: 100000 });
   } catch (err) {
     console.error('Error reading implementation_plan.md:', err);
   }
@@ -4639,45 +5342,102 @@ function hasAnyChecklist(conversation) {
   return !!(conversation && Array.isArray(conversation.tasks) && conversation.tasks.length > 0);
 }
 
-async function classifyPlanApprovalIntent(userPrompt, modelName, apiKey) {
+async function callUtilityModel(prompt, modelName, config, requireJson = true) {
+  if (modelName.startsWith('deepseek')) {
+    if (!config.deepseekApiKey) return null;
+    try {
+      const response = await fetch('https://api.deepseek.com/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.deepseekApiKey}` },
+        body: JSON.stringify({
+          model: modelName,
+          messages: [{ role: 'user', content: prompt }],
+          temperature: 0,
+          ...(requireJson ? { response_format: { type: 'json_object' } } : {})
+        })
+      });
+      if (!response.ok) return null;
+      const data = await response.json();
+      return (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || null;
+    } catch (e) {
+      console.error('DeepSeek utility call failed:', e);
+      return null;
+    }
+  } else if (modelName.startsWith('gemini-')) {
+    if (!config.geminiApiKey) return null;
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${config.geminiApiKey}`;
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0,
+            ...(requireJson ? { responseMimeType: 'application/json' } : {})
+          }
+        })
+      });
+      if (!response.ok) return null;
+      const data = await response.json();
+      return (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0].text) || null;
+    } catch (e) {
+      console.error('Gemini utility call failed:', e);
+      return null;
+    }
+  } else {
+    // Assume Ollama local for anything else
+    try {
+      const response = await fetch(`http://localhost:11434/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: modelName,
+          messages: [
+            { role: 'system', content: "You are a concise, technical summarizer utility." },
+            { role: 'user', content: prompt }
+          ],
+          stream: false,
+          options: { temperature: 0 }
+        })
+      });
+      if (!response.ok) return null;
+      const resData = await response.json();
+      let text = resData.message && resData.message.content;
+      // Some Ollama models don't support JSON mode reliably, but we try to parse it if required
+      if (requireJson && text) {
+        // Just return the raw text, the caller uses JSON.parse which will handle it
+      }
+      return text || null;
+    } catch (e) {
+      console.error('Ollama utility call failed:', e);
+      return null;
+    }
+  }
+}
+
+async function classifyPlanApprovalIntent(userPrompt, modelName, config) {
   const fallback = { intent: 'unclear', reason: 'Could not classify plan approval intent.' };
   const prompt = `Classify the user's latest message about a pending implementation plan.
 
 Return only compact JSON with:
-{"intent":"approve"|"deny"|"revise"|"unclear","reason":"short reason"}
+{"intent":"approve"|"deny"|"revise"|"other"|"unclear","reason":"short reason"}
 
 Definitions:
 - approve: the user clearly wants execution of the existing pending plan to begin.
 - deny: the user clearly rejects, cancels, or stops the pending plan.
 - revise: the user asks for more review, a different plan, changes, additions, or clarification before execution.
+- other: the user is asking a separate question or reporting that the previous answer did not satisfy their request, rather than giving a verdict on the pending plan.
 - unclear: the user intent is ambiguous.
 
 User message:
 ${JSON.stringify(String(userPrompt || ''))}`;
 
   try {
-    if (modelName && !modelName.startsWith('gemini-')) {
-      return fallback;
-    }
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName || 'gemini-2.5-flash-lite'}:generateContent?key=${apiKey}`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0,
-          responseMimeType: 'application/json'
-        }
-      })
-    });
-    if (!response.ok) return fallback;
-    const data = await response.json();
-    const text = data.candidates && data.candidates[0] && data.candidates[0].content &&
-      data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
-      data.candidates[0].content.parts[0].text;
-    const parsed = JSON.parse(text || '{}');
-    const intent = ['approve', 'deny', 'revise', 'unclear'].includes(parsed.intent) ? parsed.intent : 'unclear';
+    const text = await callUtilityModel(prompt, modelName, config, true);
+    if (!text) return fallback;
+    const parsed = JSON.parse(text);
+    const intent = ['approve', 'deny', 'revise', 'other', 'unclear'].includes(parsed.intent) ? parsed.intent : 'unclear';
     return { intent, reason: String(parsed.reason || '') };
   } catch (e) {
     console.error('Plan approval classifier failed:', e);
@@ -4685,7 +5445,7 @@ ${JSON.stringify(String(userPrompt || ''))}`;
   }
 }
 
-async function classifyPlanningNeed(userPrompt, modelName, apiKey) {
+async function classifyPlanningNeed(userPrompt, modelName, config, recentMessages) {
   const regexFallback = () => ({
     mode: 'plan',
     reason: 'Could not safely classify task complexity.',
@@ -4693,7 +5453,21 @@ async function classifyPlanningNeed(userPrompt, modelName, apiKey) {
     benefitsFromWorkspaceContext: requestPlausiblyBenefitsFromWorkspaceContext(userPrompt),
     taskComplexity: 'standard'
   });
-  const prompt = `Classify whether this Orion AI request should require an implementation plan before acting.
+  // Include the last few exchanges so the classifier can resolve references like "let's do all of
+  // them" or "go ahead" by understanding what "them"/"that" referred to in context.
+  let contextBlock = '';
+  if (Array.isArray(recentMessages) && recentMessages.length > 0) {
+    const snippet = recentMessages
+      .slice(-6)
+      .filter(m => m.role && (m.text || m.parts))
+      .map(m => {
+        const text = m.text || (Array.isArray(m.parts) ? m.parts.map(p => p.text || '').join(' ') : '');
+        return `${m.role === 'user' ? 'User' : 'Orion'}: ${String(text).slice(0, 400)}`;
+      })
+      .join('\n');
+    if (snippet) contextBlock = `\nRecent conversation context (for resolving pronouns like "them"/"that"/"it"):\n${snippet}\n`;
+  }
+  const prompt = `Classify whether this Orion AI request should require an implementation plan before acting.${contextBlock}
 
 Return only compact JSON with:
 {"mode":"plan"|"direct"|"answer","reviewOnly":true|false,"needsLocalInspection":true|false,"benefitsFromWorkspaceContext":true|false,"taskComplexity":"light"|"standard"|"deep","reason":"short reason"}
@@ -4754,27 +5528,9 @@ User message:
 ${JSON.stringify(String(userPrompt || ''))}`;
 
   try {
-    if (modelName && !modelName.startsWith('gemini-')) {
-      return regexFallback();
-    }
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName || 'gemini-2.5-flash-lite'}:generateContent?key=${apiKey}`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0,
-          responseMimeType: 'application/json'
-        }
-      })
-    });
-    if (!response.ok) return regexFallback();
-    const data = await response.json();
-    const text = data.candidates && data.candidates[0] && data.candidates[0].content &&
-      data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
-      data.candidates[0].content.parts[0].text;
-    const parsed = JSON.parse(text || '{}');
+    const text = await callUtilityModel(prompt, modelName, config, true);
+    if (!text) return regexFallback();
+    const parsed = JSON.parse(text);
     const mode = ['plan', 'direct', 'answer'].includes(parsed.mode) ? parsed.mode : 'plan';
     const taskComplexity = ['light', 'standard', 'deep'].includes(parsed.taskComplexity) ? parsed.taskComplexity : 'standard';
     return {
@@ -4862,13 +5618,13 @@ async function answerLocalMemoryQuestionFastPath({ userPrompt, workspacePath, co
     workWalkthrough[0].status = answer ? 'done' : 'error';
     workWalkthrough[0].detail = `Exit: ${result && result.code !== undefined ? result.code : 'unknown'}, timeout: ${result && result.timeoutMs ? result.timeoutMs : timeoutMs}ms`;
     const finalText = answer || `I could not read your RAM from the local command output.\n\nCommand attempted: \`${command}\`${stderr ? `\n\nError: ${String(stderr).slice(0, 500)}` : ''}`;
-    conversation.messages[aiMessageIndex].text = withWorkWalkthrough(finalText, workWalkthrough, true);
+    conversation.messages[aiMessageIndex].text = withWorkWalkthrough(finalText, workWalkthrough, true, conversation);
     conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
     if (window.renderAiMessage) window.renderAiMessage(conversation.messages[aiMessageIndex].text, currentAgentLogs);
   } catch (error) {
     workWalkthrough[0].status = 'error';
     workWalkthrough[0].detail = error.message;
-    conversation.messages[aiMessageIndex].text = withWorkWalkthrough(`I could not read your RAM because the local command runner failed: ${error.message}`, workWalkthrough, true);
+    conversation.messages[aiMessageIndex].text = withWorkWalkthrough(`I could not read your RAM because the local command runner failed: ${error.message}`, workWalkthrough, true, conversation);
     conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
     if (window.renderAiMessage) window.renderAiMessage(conversation.messages[aiMessageIndex].text, currentAgentLogs);
   } finally {
@@ -4909,7 +5665,34 @@ function shouldHaveUsedToolsButDidNot(text, workWalkthrough, userPrompt = '', co
 // with the topic at all.
 function looksLikeLeakedNoToolCorrection(text) {
   const normalized = String(text || '').toLowerCase();
-  return /\b(did not require (workspace|tools?|an implementation plan)|no workspace interaction|ready for (your )?next instruction|mention(ed)? (this|the) correction|previous response (was|did not)|does not require (tools?|workspace)|not require workspace interaction)\b/.test(normalized);
+  // The Memory/Skill gates ask the model to reply with this exact sentinel when it has nothing to
+  // add, specifically so a real substantive answer already produced this turn never gets
+  // overwritten by a throwaway "no skill needed" / "nothing durable to save" aside. Models don't
+  // always use the sentinel verbatim, so the phrase-based checks below stay as a fallback.
+  if (/^\W*no_additional_action\W*$/i.test(normalized.trim())) return true;
+  return /\b(did not require (workspace|tools?|an implementation plan)|no workspace interaction|ready for (your )?next instruction|mention(ed)? (this|the) correction|previous response (was|did not)|does not require (tools?|workspace)|not require workspace interaction)\b/.test(normalized) ||
+    /\b(?:nothing|no)\s+(?:is\s+)?reusable\b/.test(normalized) ||
+    /\bno\s+(?:reusable\s+)?skill\s+(?:is\s+)?needed\b/.test(normalized) ||
+    /\bdoesn'?t\s+warrant\s+a\s+skill\b/.test(normalized) ||
+    /\bone[-\s]?time\s+(?:information|task|thing)\b/.test(normalized) ||
+    /\bno\s+(?:new|durable)\s+(?:facts?|information)\s+(?:to|worth)\s+(?:save|saving|record|recording)\b/.test(normalized) ||
+    /\bnothing\s+(?:new\s+|durable\s+)*(?:was\s+)?learned\b/.test(normalized) ||
+    /\b(?:my|the)\s+(?:answer|response|reply)\s+above\b/.test(normalized) ||
+    /\balready\s+(?:a\s+)?complete\s+(?:non[-\s]?workspace\s+)?answer\b/.test(normalized) ||
+    /\bi\s+gave\s+you\s+the\s+full\b/.test(normalized) ||
+    // Model says "you already have the full report/answer" — it's pointing back at a prior turn
+    // instead of being a self-contained answer. Canonically produced after memory tools fire and
+    // force one more loop iteration on a turn where the real answer was already written.
+    /\byou\s+already\s+have\s+(?:the\s+)?(?:full\s+)?(?:report|answer|analysis|findings|results|summary|everything|it)\b/.test(normalized) ||
+    /\byou\s+(?:now\s+)?have\s+(?:the\s+)?(?:full|complete|entire)\s+(?:report|answer|analysis|findings|results|summary)\b/.test(normalized) ||
+    // A gate-nudged retry can regress into referring back to an earlier turn instead of
+    // restating the substantive answer itself — e.g. "I'm already waiting on your call here...
+    // the last message laid it out" instead of actually re-answering. These phrasings are
+    // meta-commentary about a prior response, not a self-contained answer.
+    /\b(?:already\s+)?waiting\s+on\s+your\s+(?:call|answer|response|turn)\b/.test(normalized) ||
+    /\bthe\s+last\s+(?:message|response|answer)\s+(?:already\s+)?(?:laid\s+it\s+out|covered\s+it|covers?\s+it|answered\s+(?:that|this|it))\b/.test(normalized) ||
+    /\bas\s+i\s+(?:already|previously)\s+(?:said|mentioned|explained|noted|laid\s+out|answered)\b/.test(normalized) ||
+    /\b(?:my|the)\s+(?:previous|prior|earlier)\s+(?:answer|response|message)\s+(?:already\s+)?(?:covers?|covered|addressed|laid\s+out|answered)\b/.test(normalized);
 }
 
 function isGenericNonAnswer(text) {
@@ -5217,23 +6000,71 @@ function recommendedNatureForFailureCategory(category) {
 
 function buildFailureRecoveryGuidance(failure) {
   const category = failure && failure.category ? failure.category : 'tool_failure';
+  const toolName = String((failure && failure.toolName) || '');
+  const errorText = String((failure && failure.errorText) || '');
+  const args = (failure && failure.args) || {};
+  const failureCount = Number((failure && failure.failureCount) || 1);
+
+  // Extract useful snippets from the error for inline context
+  const errorSnippet = errorText ? errorText.slice(0, 200).replace(/\n+/g, ' ').trim() : '';
+  const toolLabel = toolName ? `\`${toolName}\`` : 'the tool';
+
   if (category === 'deprecated_command_with_replacement' && failure && failure.replacementHint) {
     return `The command's own output already named the fix: it says to use \`${failure.replacementHint}\`. Run that directly. Do not search the web for documentation that repeats information already in the tool output you just received.`;
   }
-  const messages = {
-    repeated_tool_failure: 'Do not quit the task. Do not retry it blindly. Pause the repeated call, inspect fresh state and recent output, explain the likely cause, then choose a different strategy before retrying: use a different tool, narrower arguments, or ask for the missing prerequisite.',
-    patch_target_missing: 'Re-read the surrounding file lines before editing. Use a narrower exact target, a line-range patch, or adjust the patch to the current file contents instead of repeating the same patch.',
-    workspace_path_missing: 'The workspace path guess failed. Do not call change_workspace again with another guessed path. Resolve the folder first: run a bounded PowerShell Get-ChildItem directory search against the likely parent locations such as C:\\Users\\Owner\\Desktop and C:\\Users\\Owner\\Desktop\\Projects, using name tokens from the user request and the failed path, -Directory, -Depth 2 or -Depth 3, and -ErrorAction SilentlyContinue. Then pick the closest real directory from the local listing and call change_workspace once with that verified absolute path.',
-    command_blocked: 'The command was blocked by safety or planning rules. Keep the safety behavior intact; use a safer non-destructive command, an internal executable/args path, or ask for explicit plan approval when required.',
-    test_failure: 'Treat this as a regression signal. Read the failing test output, identify the first failing assertion or command, fix the code or test expectation, and rerun the relevant tests before summarizing.',
-    missing_dependency: 'Install or configure the missing dependency only after checking the project manifest and existing package manager. If installation is not appropriate, choose a tool that uses available local capabilities.',
-    auth_missing: 'Stop retrying credential-gated work. Preserve state, name the missing credential or permission, and ask the user to provide or configure it before continuing.',
-    timeout: 'Do not repeat the same long-running action unchanged. Check if the process is a GUI/Pygame app that blocks until closed. If so, add an automated exit flag to the code (e.g. exit after N frames/ticks), run with a short timeout, or use start_command/kill_command instead of waiting for a long timeout.',
-    interactive_command_needs_input: 'Do not run an interactive command as a blocking test without stdin. Pipe a short scripted input sequence, redirect an input fixture, or use start_command with a short timeout followed by read_command_output and kill_command.',
-    model_no_tool_use: 'Your response appeared to promise or report workspace work, but no tools were called. If the task requires looking at files, running commands/tests, editing code, creating files, saving memory, or verifying behavior, call the appropriate tools now. If the task does not require tools, answer the user naturally and do not mention tools, workspace operations, or this correction.',
-    tool_failure: 'Inspect the error and current workspace state before trying again. Change one meaningful variable in the next attempt, such as the target path, command, arguments, or verification step.'
-  };
-  return messages[category] || messages.tool_failure;
+
+  if (category === 'repeated_tool_failure') {
+    const countNote = failureCount >= 3 ? ` (${failureCount} consecutive failures)` : '';
+    return `${toolLabel} has failed repeatedly${countNote}. Do not retry it blindly. Do not quit the task. Pause, inspect fresh state and recent output, explain the likely cause${errorSnippet ? ': "' + errorSnippet + '"' : ''}, then choose a different strategy before retrying: use a different tool, narrower arguments, or ask for the missing prerequisite.`;
+  }
+
+  if (category === 'patch_target_missing') {
+    const filePath = args.path || args.file_path || '';
+    const fileHint = filePath ? ` in \`${filePath}\`` : '';
+    return `The patch target${fileHint} was not found in the current file. Re-read the surrounding file lines before editing. Use a narrower exact target, a line-range patch, or adjust the patch to the current file contents instead of repeating the same patch.${errorSnippet ? ' Error: "' + errorSnippet + '"' : ''}`;
+  }
+
+  if (category === 'workspace_path_missing') {
+    const attemptedPath = args.path || args.workspace_path || errorText.match(/'([^']+)'/)?.[1] || '';
+    const pathHint = attemptedPath ? ` The path \`${attemptedPath}\` does not exist.` : '';
+    return `The workspace path guess failed.${pathHint} Do not call change_workspace again with another guessed path. Resolve the folder first: run a bounded PowerShell Get-ChildItem directory search against the likely parent locations such as C:\\Users\\Owner\\Desktop and C:\\Users\\Owner\\Desktop\\Projects, using name tokens from the user request and the failed path, -Directory, -Depth 2 or -Depth 3, and -ErrorAction SilentlyContinue. Then pick the closest real directory from the local listing and call change_workspace once with that verified absolute path.`;
+  }
+
+  if (category === 'command_blocked') {
+    return `${toolLabel} was blocked by safety or planning rules.${errorSnippet ? ' Reason: "' + errorSnippet + '".' : ''} Keep the safety behavior intact; use a safer non-destructive command, an internal executable/args path, or ask for explicit plan approval when required.`;
+  }
+
+  if (category === 'test_failure') {
+    return `Tests failed${errorSnippet ? ': "' + errorSnippet + '"' : ''}. Treat this as a regression signal. Read the failing test output, identify the first failing assertion or command, fix the code or test expectation, and rerun the relevant tests before summarizing.`;
+  }
+
+  if (category === 'missing_dependency') {
+    // Try to extract the missing module/command name from the error
+    const missingMatch = errorText.match(/cannot find module '([^']+)'|command not found[:\s]+(\S+)|no such file[^:]*:\s*(\S+)/i);
+    const missingHint = missingMatch ? ` The missing item appears to be \`${missingMatch[1] || missingMatch[2] || missingMatch[3]}\`.` : (errorSnippet ? ` Error: "${errorSnippet}".` : '');
+    return `A dependency is missing.${missingHint} Install or configure it only after checking the project manifest and existing package manager. If installation is not appropriate, choose a tool that uses available local capabilities.`;
+  }
+
+  if (category === 'auth_missing') {
+    const credHint = errorText.match(/api.?key|credential|token|unauthorized|forbidden/i)?.[0] || '';
+    return `${toolLabel} failed due to missing credentials or permissions${credHint ? ' (' + credHint + ')' : ''}. Stop retrying credential-gated work. Preserve state, name the missing credential or permission, and ask the user to provide or configure it before continuing.`;
+  }
+
+  if (category === 'timeout') {
+    const cmd = args.command ? ` (\`${String(args.command).slice(0, 60)}\`)` : '';
+    return `${toolLabel}${cmd} timed out. Do not repeat the same long-running action unchanged. Check if the process is a GUI/Pygame app that blocks until closed. If so, add an automated exit flag to the code (e.g. exit after N frames/ticks), run with a short timeout, or use start_command/kill_command instead of waiting for a long timeout.`;
+  }
+
+  if (category === 'interactive_command_needs_input') {
+    return `${toolLabel} launched an interactive command that expects stdin input. Do not run it as a blocking call without stdin. Pipe a short scripted input sequence, redirect an input fixture, or use start_command with a short timeout followed by read_command_output and kill_command.`;
+  }
+
+  if (category === 'model_no_tool_use') {
+    return 'Your response appeared to promise or report workspace work, but no tools were called. If the task requires looking at files, running commands/tests, editing code, creating files, saving memory, or verifying behavior, call the appropriate tools now. If the task does not require tools, answer the user naturally and do not mention tools, workspace operations, or this correction.';
+  }
+
+  // Generic tool_failure with actual error context
+  return `${toolLabel} failed${errorSnippet ? ': "' + errorSnippet + '"' : ''}. Inspect the error and current workspace state before trying again. Change one meaningful variable in the next attempt, such as the target path, command, arguments, or verification step.`;
 }
 
 function sleep(ms) {
@@ -5291,8 +6122,54 @@ function stableStringify(value) {
   return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
 }
 
+function isGeneratedStandaloneWorkspacePath(pathValue) {
+  return /(?:^|[\\/])standalone-workspaces(?:[\\/]|$)/i.test(String(pathValue || ''));
+}
+
+function getDispatchWorkspaceRoot() {
+  return joinLocalPath(joinLocalPath(resolvedHomeDir || 'C:\\Users\\Owner', 'Desktop'), 'Projects');
+}
+
+function formatKnownProjectsForSystemFacts() {
+  let knownProjects = [];
+  try {
+    if (window.getKnownProjects) {
+      const result = window.getKnownProjects();
+      if (Array.isArray(result)) knownProjects = result;
+    }
+  } catch (_) {}
+  const unique = [];
+  const seen = new Set();
+  for (const projectPath of knownProjects) {
+    const pathText = String(projectPath || '').trim();
+    if (!pathText) continue;
+    const key = pathText.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(pathText);
+    if (unique.length >= 40) break;
+  }
+  if (!unique.length) return '';
+  const lines = unique.map(projectPath => `- ${getLocalPathBaseName(projectPath)}: ${projectPath}`).join('\n');
+  return `\nKnown local projects:\n${lines}`;
+}
+
 function resolveConversationWorkspace(conversation) {
   const conv = conversation && typeof conversation === 'object' ? conversation : {};
+  const hasConversationShape = Object.keys(conv).length > 0;
+  let mode = 'coder';
+  if (conv.mode === 'orion' || conv.mode === 'coder') {
+    mode = conv.mode;
+  } else if (conv.projectPath) {
+    mode = 'coder';
+  } else if (hasConversationShape) {
+    mode = activeConversationMode;
+  }
+  if (mode === 'orion') {
+    const workspace = String(conv.workspace || '').trim();
+    if (workspace && !isGeneratedStandaloneWorkspacePath(workspace)) return workspace;
+    return getDispatchWorkspaceRoot();
+  }
   return conv.workspace || conv.projectPath || (window.getCurrentWorkspace ? window.getCurrentWorkspace() : '');
 }
 
@@ -5699,6 +6576,10 @@ function isGeminiHardQuotaError(status, message) {
   return /monthly spending cap|project spend cap|ai\.studio\/spend|billing/i.test(String(message || ''));
 }
 
+function isNonRetryableModelHttpStatus(status) {
+  return status === 400 || status === 401 || status === 402 || status === 403;
+}
+
 function createNonRetryableModelError(message) {
   const error = new Error(message);
   error.nonRetryable = true;
@@ -5804,12 +6685,27 @@ function convertGeminiToOllamaMessages(geminiMessages) {
   return ollamaMessages;
 }
 
+// Dispatch (Orion) can look at files, code, and the web to back up what it says, and it can
+// explicitly hand a workspace to Coder when Jason asks. It must never be structurally able to
+// write, edit, run, or execute anything itself; that's Coder's job. This whitelist is enforced
+// below regardless of what the system prompt text claims, so the restriction can't be talked
+// around by a model that decides to route differently.
+const DISPATCH_TOOL_ALLOWLIST = new Set([
+  'recall_memory', 'remember_fact', 'remember_preference',
+  'google_search', 'fetch_web_page',
+  'read_file', 'list_files', 'get_workspace_info', 'change_workspace',
+  'handoff_to_coder',
+  'grep_search', 'search_embeddings', 'semantic_search',
+  'get_symbol_index', 'get_file_symbols', 'find_references',
+  'read_notes', 'read_project_memory'
+]);
+
 // Single source of truth for the agent's tool declarations, consumed by every provider
 // (Gemini, Ollama, and Anthropic). Previously this ~480-line array was duplicated verbatim
 // inside callGeminiAPI and callOllamaAPI, which silently drifted out of sync. Reads the
 // module-level agentExecutionMode so operational-context tools are only offered during execution.
 function buildAgentToolDeclarations() {
-  return [
+  const allTools = [
           ...(agentExecutionMode === 'executing' ? OPERATIONAL_CONTEXT_TOOL_DECLARATIONS : []),
           ...ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS,
           {
@@ -5837,6 +6733,19 @@ function buildAgentToolDeclarations() {
                 path: { type: "STRING", description: "The verified absolute path to the directory you want to set as the active workspace." }
               },
               required: ["path"]
+            }
+          },
+          {
+            name: "handoff_to_coder",
+            description: "Promotes a local folder into Coder as an explicit project and optionally queues a Coder prompt to start implementation. Use after Dispatch has inspected/discussed a project and Jason asks to make it a project, move it to Coder, have Cody start, build it, or fix it. This is the explicit promotion path; change_workspace alone must not add folders to Coder.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                path: { type: "STRING", description: "Optional absolute folder path to promote. Defaults to the current Dispatch workspace." },
+                prompt: { type: "STRING", description: "Optional exact task for Coder to start, such as what to build, fix, or investigate." },
+                title: { type: "STRING", description: "Optional title for the new Coder conversation." },
+                open: { type: "BOOLEAN", description: "Whether to switch the UI to the new Coder conversation immediately. Defaults to false." }
+              }
             }
           },
           {
@@ -5967,6 +6876,28 @@ function buildAgentToolDeclarations() {
             }
           },
           {
+            name: "get_file_symbols",
+            description: "Returns signatures and line ranges for classes, methods, and functions in a single JS/TS/JSX/TSX or Python file.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                path: { type: "STRING", description: "The path to the file." }
+              },
+              required: ["path"]
+            }
+          },
+          {
+            name: "semantic_search",
+            description: "Performs a vector-based semantic search across the workspace to find code by meaning rather than exact string matching.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                query: { type: "STRING", description: "The semantic query to search for (e.g. 'where does user authentication happen')." }
+              },
+              required: ["query"]
+            }
+          },
+          {
             name: "get_command_status",
             description: "Checks status for a command started with start_command.",
             parameters: {
@@ -6036,6 +6967,30 @@ function buildAgentToolDeclarations() {
             parameters: { type: "OBJECT", properties: {} }
           },
           {
+            name: "run_linter",
+            description: "Runs a proactive structured linter (eslint, tsc, or ruff) and returns a clean array of errors.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                linterType: { type: "STRING", description: "The type of linter to run: 'eslint', 'tsc', or 'ruff'." },
+                targetPath: { type: "STRING", description: "The path to lint (default is '.')." }
+              },
+              required: ["linterType"]
+            }
+          },
+          {
+            name: "find_references",
+            description: "Finds usages of a function or variable across the workspace, using AST validation for JS/TS to skip noise.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                symbolName: { type: "STRING", description: "The literal string name of the symbol to find references for." },
+                targetPath: { type: "STRING", description: "Optional path restriction (default is '.')." }
+              },
+              required: ["symbolName"]
+            }
+          },
+          {
             name: "google_search",
             description: "Searches Google for current documentation, API references, examples, and troubleshooting. Do not use for facts about this local machine, workspace state, installed tools, paths, memory, disk, processes, or environment variables; inspect local state instead.",
             parameters: {
@@ -6075,7 +7030,7 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "set_task_checklist",
-            description: "Sets the task checklist in the side panel for meaningful milestones only. Pass an array of items with a status ('pending', 'in-progress', 'completed'); do not call this just to refresh in-progress state.",
+            description: "Sets the task checklist in the side panel. Pass an array of items with a status ('pending', 'in-progress', 'completed'). Use this to mark tasks as 'in-progress' when you start them and 'completed' when done.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -6296,6 +7251,10 @@ function buildAgentToolDeclarations() {
             }
           }
   ];
+  if (activeConversationMode === 'orion') {
+    return allTools.filter(tool => DISPATCH_TOOL_ALLOWLIST.has(tool.name));
+  }
+  return allTools;
 }
 
 
@@ -6515,9 +7474,7 @@ async function callAnthropicAPI(messages, modelName, apiKey, onWarning, disableT
   const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
   const anthropicMessages = convertGeminiToAnthropicMessages(processedMessages);
 
-  const systemText = disableTools
-    ? (SYSTEM_INSTRUCTION.split('Tools available:')[0] + '\n\nCRITICAL: You are in an analysis phase. DO NOT request any tool use. Provide your analysis in plain text only.')
-    : SYSTEM_INSTRUCTION;
+  const systemText = getSystemInstruction(disableTools);
 
   const requestBody = {
     model: modelName,
@@ -6561,8 +7518,8 @@ async function callAnthropicAPI(messages, modelName, apiKey, onWarning, disableT
       const apiError = describeModelApiError(status, errorText);
       const retryDelayMs = Math.min(apiError.retryDelayMs || delay, MODEL_API_MAX_RETRY_WAIT_MS);
 
-      // 401/403 (bad key) and 400 (malformed request) are not worth retrying.
-      if (status === 401 || status === 403 || status === 400) {
+      // Auth, billing, and malformed-request failures are not worth retrying.
+      if (isNonRetryableModelHttpStatus(status)) {
         throw createNonRetryableModelError(`Anthropic API HTTP ${status}: ${apiError.message}`);
       }
       if (i === attempts) {
@@ -6610,17 +7567,31 @@ function convertGeminiToDeepSeekMessages(geminiMessages) {
       const text = (msg.parts || []).map(p => p.text).filter(Boolean).join('');
       out.push({ role: 'user', content: text || '(no content)' });
     } else if (msg.role === 'model') {
-      const textParts = (msg.parts || []).filter(p => p.text).map(p => p.text);
+      const textParts = (msg.parts || []).filter(p => p.text && !p.thought && !p._deepseekReasoningContent).map(p => p.text);
+      const reasoningContent = (msg.parts || [])
+        .filter(p => (p._deepseekReasoningContent || p.thought) && p.text)
+        .map(p => p.text)
+        .join('');
       const toolCalls = [];
       lastToolCallIds = [];
       (msg.parts || []).forEach(p => {
         if (p.functionCall) {
-          const id = `call_orion_${toolCallCounter++}`;
+          const id = p.functionCall._deepseekToolCallId || p._deepseekToolCallId || `call_orion_${toolCallCounter++}`;
           lastToolCallIds.push(id);
           toolCalls.push({ id, type: 'function', function: { name: p.functionCall.name, arguments: JSON.stringify(p.functionCall.args || {}) } });
         }
       });
-      const assistantMsg = { role: 'assistant', content: textParts.join('') || null };
+      const joinedText = textParts.join('');
+      const assistantMsg = { role: 'assistant', content: joinedText || (reasoningContent ? "" : null) };
+      // DeepSeek thinking mode requires reasoning_content to be passed back on every
+      // assistant turn that performed tool calls. Older/sanitized Orion histories may have
+      // tool calls without the hidden reasoning part; include a minimal continuity marker so
+      // DeepSeek does not reject the whole request with a 400.
+      if (reasoningContent) {
+        assistantMsg.reasoning_content = reasoningContent;
+      } else if (toolCalls.length > 0) {
+        assistantMsg.reasoning_content = '[Orion internal note: reasoning_content was not preserved for this earlier tool-call turn; continue from the tool calls and tool results.]';
+      }
       if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
       out.push(assistantMsg);
     } else if (msg.role === 'tool') {
@@ -6644,14 +7615,14 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
   const url = 'https://api.deepseek.com/chat/completions';
 
   const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
-  const systemText = disableTools
-    ? (SYSTEM_INSTRUCTION.split('Tools available:')[0] + '\n\nCRITICAL: You are in an analysis phase. DO NOT request any tool use. Provide your analysis in plain text only.')
-    : SYSTEM_INSTRUCTION;
+  const systemText = getSystemInstruction(disableTools);
   const deepseekMessages = [{ role: 'system', content: systemText }, ...convertGeminiToDeepSeekMessages(processedMessages)];
 
   const requestBody = {
     model: modelName,
     messages: deepseekMessages,
+    thinking: { type: 'enabled' },
+    reasoning_effort: modelName === 'deepseek-v4-pro' ? 'max' : 'high',
     temperature: 0
   };
   if (!disableTools) {
@@ -6676,13 +7647,16 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
         const data = await response.json();
         const message = (data.choices && data.choices[0] && data.choices[0].message) || {};
         const parts = [];
+        if (message.reasoning_content) parts.push({ text: message.reasoning_content, thought: true, _deepseekReasoningContent: true });
         if (message.content) parts.push({ text: message.content });
         (message.tool_calls || []).forEach(tc => {
           let args = tc.function && tc.function.arguments;
           if (typeof args === 'string') {
             try { args = JSON.parse(args); } catch (_) { args = {}; }
           }
-          parts.push({ functionCall: { name: tc.function.name, args: args || {} } });
+          const functionCall = { name: tc.function.name, args: args || {} };
+          if (tc.id) functionCall._deepseekToolCallId = tc.id;
+          parts.push({ functionCall });
         });
         return { _orionActiveModelName: modelName, candidates: [{ content: { parts } }] };
       }
@@ -6692,7 +7666,7 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
       const apiError = describeModelApiError(status, errorText);
       const retryDelayMs = Math.min(apiError.retryDelayMs || delay, MODEL_API_MAX_RETRY_WAIT_MS);
 
-      if (status === 401 || status === 403 || status === 400) {
+      if (isNonRetryableModelHttpStatus(status)) {
         throw createNonRetryableModelError(`DeepSeek API HTTP ${status}: ${apiError.message}`);
       }
       if (i === attempts) {
@@ -6866,6 +7840,9 @@ async function inspectScreenshotWithModel({ imageBase64, mimeType, path, goal, m
   if (modelName.startsWith('gemini-')) {
     return await inspectScreenshotWithGemini({ imageBase64, mimeType, path, goal, modelName, apiKey });
   }
+  if (apiKey) {
+    return await inspectScreenshotWithGemini({ imageBase64, mimeType, path, goal, modelName: 'gemini-2.5-flash', apiKey });
+  }
   return await inspectScreenshotWithOllama({ imageBase64, path, goal, modelName });
 }
 
@@ -6922,7 +7899,9 @@ async function inspectScreenshotWithOllama({ imageBase64, path, goal, modelName 
         temperature: 0
       }
     })
-  }, MODEL_API_REQUEST_TIMEOUT_MS, 'Ollama vision screenshot inspection');
+  }, MODEL_API_REQUEST_TIMEOUT_MS, 'Ollama vision screenshot inspection').catch(err => {
+    throw new Error(`Could not connect to Ollama at localhost:11434 (${err.message}). Is Ollama running?`);
+  });
 
   if (!response.ok) {
     const errText = await response.text();
@@ -6967,7 +7946,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
   const requestBody = {
     contents: mergedContents,
     systemInstruction: {
-      parts: [{ text: disableTools ? (SYSTEM_INSTRUCTION.split('Tools available:')[0] + '\n\nCRITICAL: You are in an analysis phase. DO NOT output any function calls. Provide your analysis in markdown text only.') : SYSTEM_INSTRUCTION }]
+      parts: [{ text: getSystemInstruction(disableTools) }]
     },
     generationConfig: {
       ...(modelName.includes('thinking') || modelName.includes('2.5') ? {
@@ -6980,18 +7959,24 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
     },
     safetySettings: [
       {
+        // Coding tasks can include aggressive content in test data / user message fixtures.
+        // BLOCK_ONLY_HIGH avoids false positives while still filtering obvious harassment.
         category: "HARM_CATEGORY_HARASSMENT",
-        threshold: "BLOCK_NONE"
+        threshold: "BLOCK_ONLY_HIGH"
       },
       {
+        // Hate speech has no legitimate presence in code generation — BLOCK_MEDIUM is fine.
         category: "HARM_CATEGORY_HATE_SPEECH",
-        threshold: "BLOCK_NONE"
+        threshold: "BLOCK_MEDIUM_AND_ABOVE"
       },
       {
+        // Sexually explicit content has no legitimate presence in code generation.
         category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-        threshold: "BLOCK_NONE"
+        threshold: "BLOCK_MEDIUM_AND_ABOVE"
       },
       {
+        // Security code, file system ops, network code, and shell commands legitimately
+        // trigger DANGEROUS_CONTENT. BLOCK_NONE is required for a coding agent.
         category: "HARM_CATEGORY_DANGEROUS_CONTENT",
         threshold: "BLOCK_NONE"
       }
@@ -7081,12 +8066,12 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
 }
 
 // TOKEN COUNT ESTIMATOR VIA API
-async function countTokens(messages, modelName, apiKey, options = {}) {
+async function countTokens(messages, modelName, config, options = {}) {
   if (!modelName.startsWith('gemini-')) {
     return JSON.stringify(messages).length / 4;
   }
   
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:countTokens?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:countTokens?key=${config.geminiApiKey}`;
   const requestBody = { contents: messages };
   
   const response = await fetchWithTimeout(url, {
@@ -7105,9 +8090,7 @@ async function countTokens(messages, modelName, apiKey, options = {}) {
 }
 
 // CONTEXT COMPACTOR (Summarizer)
-async function compactHistory(messages, modelName, apiKey) {
-  const isOllama = !modelName.startsWith('gemini-');
-  
+async function compactHistory(messages, modelName, config) {
   // Format history for the summarizer prompt
   let conversationLogsText = "";
   messages.forEach(m => {
@@ -7122,7 +8105,7 @@ async function compactHistory(messages, modelName, apiKey) {
     }
     conversationLogsText += `${roleName}: ${contentText}\n\n`;
   });
-  
+
   const summaryPrompt = `The following is a conversation history between a user and an AI pair programmer. Summarize the history, detailing:
 1. The overall task and workspace directory.
 2. Major modifications made to files.
@@ -7133,79 +8116,24 @@ Keep the summary highly technical, extremely brief, and complete.
 CONVERSATION HISTORY:
 ${conversationLogsText}`;
 
-  let compactedSummary = "History compacted.";
-  
-  if (isOllama) {
-    try {
-      const response = await fetch(`http://localhost:11434/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: modelName,
-          messages: [
-            { role: 'system', content: "You are a concise, technical summarizer utility." },
-            { role: 'user', content: summaryPrompt }
-          ],
-          stream: false
-        })
-      });
-      if (response.ok) {
-        const resData = await response.json();
-        compactedSummary = resData.message.content;
-      }
-    } catch (e) {
-      console.error("Local Ollama compaction error:", e);
-    }
-  } else {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
-    const requestBody = {
-      contents: [{ role: 'user', parts: [{ text: summaryPrompt }] }],
-      systemInstruction: {
-        parts: [{ text: "You are a concise, technical summarizer utility." }]
-      },
-      generationConfig: {
-        thinkingConfig: {
-          thinkingBudget: GEMINI_THINKING_BUDGET
-        }
-      }
-    };
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody)
-      });
-      if (response.ok) {
-        const resData = await response.json();
-        compactedSummary = resData.candidates[0].content.parts[0].text;
-      }
-    } catch (e) {
-      console.error("Gemini compaction error:", e);
-    }
+  const text = await callUtilityModel(summaryPrompt, modelName, config, false);
+  const compactedSummary = text || "History compacted.";
+
+  // Note: runAgent persists the summary and rebuilds its live API messages from conversation
+  // state. The returned messages are kept for tests and provider paths that need a compacted
+  // transcript while preserving model/tool adjacency.
+  let tailStart = Math.max(0, messages.length - 3);
+  if (messages[tailStart] && messages[tailStart].role === 'tool' && tailStart > 0 && messages[tailStart - 1].role === 'model') {
+    tailStart -= 1;
   }
-  
-  // Retain only the last 3 messages + the summary
-  const lastMessages = messages.slice(-3);
-  
-  const newHistory = [
-    {
-      role: 'user',
-      parts: [{
-        text: `Here is a summary of our previous session history, do not repeat it but remember the context:\n\n${compactedSummary}`
-      }]
-    },
-    {
-      role: 'model',
-      parts: [{
-        text: "Understood. I have fully digested the summary context of our workspace history. Let's continue working."
-      }]
-    },
-    ...lastMessages
-  ];
-  
+  const retainedTail = messages.slice(tailStart);
   return {
-    messages: newHistory,
-    summary: compactedSummary
+    summary: compactedSummary,
+    messages: [
+      { role: 'user', parts: [{ text: `Previous conversation summary:\n${compactedSummary}` }] },
+      { role: 'model', parts: [{ text: 'Understood. I will continue from this compacted context.' }] },
+      ...retainedTail
+    ]
   };
 }
 
@@ -7241,6 +8169,8 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     looksLikeLeakedNoToolCorrection,
     requestNeedsActionableFinalAnswer,
     answerHasActionableFinalContent,
+    isSubstantiveVisibleAnswer,
+    answerHasInspectionGrounding,
     getReviewCoverage,
     answerHasGroundedReviewReport,
     buildReviewOnlyCompletionGatePrompt,
@@ -7254,6 +8184,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     buildToolEvidenceEntry,
     getEpistemicToolGate,
     buildEpistemicCorrectionPrompt,
+    getCompactionThreshold,
     classifyAgentFailure,
     recommendedNatureForFailureCategory,
     buildFailureRecoveryGuidance,
@@ -7281,6 +8212,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     convertGeminiToDeepSeekMessages,
     callDeepSeekAPI,
     getNextModelForHighDemand,
+    compactHistory,
     summarizeToolStart,
     buildRepeatedFailureKey,
     updateWalkthroughItem,

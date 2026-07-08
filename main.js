@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, Notification } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const shared = require('./lib/shared');
@@ -51,11 +51,22 @@ function registerAllHandlers() {
   ipcFileTools.registerHandlers(ipcMain);
   ipcShell.registerHandlers(ipcMain, { getWorkspaceEntrypoint, readAppConfig, startStaticWorkspaceServer });
   ipcWorkspace.registerHandlers(ipcMain, { startStaticWorkspaceServer });
-  ipcServer.registerHandlers(ipcMain);
+  ipcServer.registerHandlers(ipcMain, { Notification });
   ipcUi.registerHandlers(ipcMain);
   symbolIndex.registerHandlers(ipcMain);
   ipcSkill.registerHandlers(ipcMain);
   ipcMemory.registerHandlers(ipcMain);
+
+  const { runLinter } = require('./lib/run-linter');
+  const { findReferences } = require('./lib/find-references');
+
+  ipcMain.handle('orion:run-linter', async (event, args) => {
+    return await runLinter(args.workspacePath, args.linterType, args.targetPath);
+  });
+  
+  ipcMain.handle('orion:find-references', async (event, args) => {
+    return await findReferences(args.workspacePath, args.symbolName, args.targetPath);
+  });
 
   const getConversationsPath = () => path.join(app.getPath('userData'), 'conversations.json');
   ipcMain.handle('read-conversations', () => {
@@ -92,8 +103,12 @@ function registerAllHandlers() {
 
 // ── App lifecycle ──────────────────────────────────────────────────────────────
 
-const gotTheLock = typeof app.requestSingleInstanceLock === 'function' ? app.requestSingleInstanceLock() : true;
-if (!gotTheLock) {
+const isTestRuntime = process.env.NODE_ENV === 'test';
+if (!isTestRuntime && process.platform === 'win32' && typeof app.setAppUserModelId === 'function') {
+  app.setAppUserModelId('orion-ai');
+}
+const gotTheLock = !isTestRuntime && typeof app.requestSingleInstanceLock === 'function' ? app.requestSingleInstanceLock() : true;
+if (!isTestRuntime && !gotTheLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
@@ -104,11 +119,11 @@ if (!gotTheLock) {
   });
 
   app.whenReady().then(async () => {
-    if (await ipcUi.checkForSourceUpdatesAndRelaunch()) return;
+    if (!isTestRuntime && await ipcUi.checkForSourceUpdatesAndRelaunch()) return;
 
     registerAllHandlers();
     createWindow();
-    ipcServer.startPhoneCompanionServer();
+    if (!isTestRuntime) ipcServer.startPhoneCompanionServer();
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -188,6 +203,8 @@ if (process.env.NODE_ENV === 'test') {
     syncSourceUpdateFiles: ipcUi.syncSourceUpdateFiles,
     isLikelySourceDir: ipcUi.isLikelySourceDir,
     resolveUpdateSourceDir: ipcUi.resolveUpdateSourceDir,
+    checkLocalSourceUpdates: ipcUi.checkLocalSourceUpdates,
+    applyLocalSourceUpdateAndRestart: ipcUi.applyLocalSourceUpdateAndRestart,
     AUTO_UPDATE_FILES: ipcUi.AUTO_UPDATE_FILES,
     // safety / shared
     resolveWorkspacePath,

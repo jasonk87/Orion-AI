@@ -392,7 +392,17 @@
               : 'none — call update_mission_context first to define win conditions';
             throw new Error(`Win condition not found: "${identity}". Available win conditions: ${available}`);
           }
-          const status = normalizeStatus(evaluation.status, ['pending', 'in_progress', 'satisfied'], condition.status);
+          // Normalize status: accept "completed" as an alias for "satisfied" since the model
+          // naturally uses "completed" when marking work done. If the value is unrecognized,
+          // throw a clear error instead of silently falling back to the existing status (which
+          // would cause the condition to stay "pending" forever with no feedback to the model).
+          const rawStatus = cleanText(evaluation.status, 40).toLowerCase().replace(/\s+/g, '_').replace(/-/g, '_');
+          const normalizedStatus = rawStatus === 'completed' ? 'satisfied' : rawStatus;
+          const VALID_WIN_STATUSES = ['pending', 'in_progress', 'satisfied'];
+          if (!VALID_WIN_STATUSES.includes(normalizedStatus)) {
+            throw new Error(`Invalid win condition status "${evaluation.status}" for "${condition.title}". Valid values: ${VALID_WIN_STATUSES.join(', ')} (or "completed" as alias for "satisfied").`);
+          }
+          const status = normalizedStatus;
           const evidence = Array.isArray(evaluation.evidence) ? evaluation.evidence.map(value => cleanText(value, 1000)).filter(Boolean) : [];
           if (status === 'satisfied' && evidence.length === 0 && condition.evidence.length === 0) throw new Error(`Win condition '${condition.title}' requires evidence before it can be satisfied`);
           condition.status = status;
@@ -488,7 +498,7 @@
     return view.slice(-Math.max(0, Number(limit) || MAX_CHAT_VIEW_MESSAGES));
   }
 
-  function buildReasoningMessages(input, conversationMessages, currentInput) {
+  function buildReasoningMessages(input, conversationMessages, currentInput, images = []) {
     const state = normalizeContext(input);
     const statePrompt = formatForPrompt(state) || [
       '[ORION OPERATIONAL CONTEXT - canonical working state]',
@@ -505,7 +515,17 @@
       messages.push({ role: 'user', parts: [{ text: `[RECENT USER CHAT VIEW - non-canonical]\nThis carries the user's recent intent plus your own recent substantive replies, so you can resolve references like "number 1" or "that idea" back to what you actually said. Self-diagnosis of your own past errors/blockers and "I will now..." promises are deliberately excluded from this view — those are not replayed, so use operational context, notes, files, and tool results for task facts, blockers, and completion evidence, not this chat view.\n\n${chatView.map(item => `${item.role}: ${item.text}`).join('\n\n')}` }] });
       messages.push({ role: 'model', parts: [{ text: 'Recent chat (including my own prior replies, excluding self-diagnosis/promises) received as non-canonical context.' }] });
     }
-    messages.push({ role: 'user', parts: [{ text: cleanText(currentInput, 12000) }] });
+    // Build the final user message, including any attached images as inline_data parts
+    const userParts = [];
+    if (Array.isArray(images) && images.length > 0) {
+      images.forEach(img => {
+        if (img && img.data && img.mimeType) {
+          userParts.push({ inline_data: { mime_type: img.mimeType, data: img.data } });
+        }
+      });
+    }
+    userParts.push({ text: cleanText(currentInput, 12000) });
+    messages.push({ role: 'user', parts: userParts });
     return messages;
   }
 

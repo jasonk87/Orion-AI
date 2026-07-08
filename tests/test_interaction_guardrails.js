@@ -4,6 +4,7 @@ const path = require('path');
 
 const rendererJs = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8');
 const agentJs = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
+const preloadJs = fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8');
 global.window = {};
 global.fetch = async () => ({ ok: false });
 const agent = require('../agent.js');
@@ -116,8 +117,8 @@ test('plan approval continuation is not stored as a fake user message', (t) => {
 // Guard: the message must only appear for genuinely fresh tasks with no approved plan.
 test('direct-task system message is suppressed when a plan is already approved', (t) => {
   t.ok(
-    agentJs.includes('!conversation.planApproved && window.appendSystemMessage && planningBypassedForTask'),
-    '"Planning mode: direct task" message is guarded by !conversation.planApproved'
+    agentJs.includes("conversation.mode !== 'orion' && !conversation.planApproved && window.appendSystemMessage && planningBypassedForTask"),
+    '"Planning mode: direct task" message is guarded by Dispatch mode and !conversation.planApproved'
   );
   t.end();
 });
@@ -519,6 +520,28 @@ test('local system fact failures do not become fake blockers or web research', (
     true,
     'read_file counts as deeper inspection evidence'
   );
+  const inspectedThenRemembered = [
+    { toolName: 'read_file', label: 'Read `server.js`', status: 'done' },
+    { toolName: 'read_file', label: 'Read `public/controller.html`', status: 'done' },
+    { toolName: 'remember_fact', label: 'Used remember_fact', status: 'done' }
+  ];
+  t.ok(
+    agent.buildFinalAnswerQualityGatePrompt(
+      'what do you think about this program?',
+      "We're all set here! My review above is the complete answer. Enjoy your arcade hub.",
+      inspectedThenRemembered
+    ).includes('not self-contained'),
+    'final quality gate rejects a memory-follow-up answer that is not grounded in inspected evidence'
+  );
+  t.equal(
+    agent.buildFinalAnswerQualityGatePrompt(
+      'what do you think about this program?',
+      'The strongest part is the playful arcade scope, but server.js is carrying too many modes and public/controller.html has grown into a dense controller surface. I would split game-mode logic out of the server first, then tighten the controller panels around the active mode.',
+      inspectedThenRemembered
+    ),
+    '',
+    'final quality gate accepts a self-contained answer grounded in inspected files after memory persistence'
+  );
   const oneFileReview = [
     { toolName: 'list_files', label: 'Listed workspace files', status: 'done' },
     { toolName: 'read_file', label: 'Read `ai_assistant/communication/cli.py`', status: 'done' }
@@ -555,6 +578,27 @@ test('local system fact failures do not become fake blockers or web research', (
     agent.answerHasActionableFinalContent('I reviewed the project structure and found that the agent loop can gather context without producing a useful final response. The next step is to continue from the gathered files, read the core source modules, and give the user a grounded answer instead of stopping at file inventory. This is a substantive response with enough detail to stand on its own.'),
     true,
     'substantive answers satisfy the final quality gate without action keywords'
+  );
+
+  // A user reported a real UX problem: the model writes a long, detailed narrative answer, a gate
+  // catches it as not-yet-grounded/not-actionable and forces a redo, and the redo produces a
+  // shorter, different summary. Gate messages that can trigger a full redo must make the next
+  // response standalone without inviting the model to talk about an "answer above."
+  t.ok(
+    agent.buildReviewOnlyCompletionGatePrompt(
+      'Can you go through this program and find any bugs, errors or structural problems',
+      'I reviewed `app.py:10` and found one issue. Would you like me to continue inspecting?',
+      broadReview
+    ).includes('Only the final saved assistant response counts'),
+    'review-only completion gate asks for a standalone final response without answer-above wording'
+  );
+  t.ok(
+    agent.buildFinalAnswerQualityGatePrompt(
+      'tell me about this workspace',
+      'Ah! The path is C:\\Projects\\OrionAI.',
+      [{ toolName: 'read_file', label: 'Read agent.js', status: 'done' }]
+    ).includes('Only the final saved assistant response counts'),
+    'final-answer quality gate asks for a standalone final response without answer-above wording'
   );
 
   const failedCommand = {
@@ -628,6 +672,16 @@ test('project conversations provide project path as the agent workspace', (t) =>
     agent.resolveConversationWorkspace({}),
     'C:\\Desktop\\Fallback',
     'desktop workspace is only the final fallback'
+  );
+  t.equal(
+    agent.resolveConversationWorkspace({ mode: 'orion', workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\OrionAI\\standalone-workspaces\\weather-chat' }),
+    'C:\\Users\\Owner\\Desktop\\Projects',
+    'Dispatch ignores generated standalone workspaces and falls back to the Projects root'
+  );
+  t.equal(
+    agent.resolveConversationWorkspace({ mode: 'orion', workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GritLife' }),
+    'C:\\Users\\Owner\\Desktop\\Projects\\GritLife',
+    'Dispatch keeps an explicitly changed read-only workspace'
   );
   t.end();
 });
@@ -884,8 +938,14 @@ test('workspace artifacts and file explorer controls are wired', (t) => {
   t.ok(agentJs.includes('persistVisualArtifactForTool'), 'agent writes screenshot artifacts as soon as they are captured');
   t.ok(agentJs.includes("type: 'orion-visual-artifact'"), 'screenshot artifacts have a dedicated artifact type');
   t.ok(agentJs.includes('collectVisualArtifacts'), 'final run artifacts retain visual artifact metadata');
-  t.ok(rendererJs.includes('mergeRunAndWorkspaceScreenshotArtifacts'), 'renderer merges run artifacts with workspace screenshots');
+  t.ok(preloadJs.includes('readConversationArtifact'), 'preload exposes conversation-scoped artifact reads');
+  t.ok(preloadJs.includes('deleteConversationArtifacts'), 'preload exposes conversation artifact cleanup');
+  t.ok(rendererJs.includes('Artifacts are saved outside the project after runs'), 'artifact panel explains project-isolated storage');
+  t.ok(rendererJs.includes('cleanupConversationArtifacts'), 'conversation deletion cleans up external artifacts');
   t.ok(rendererJs.includes('openImageArtifact'), 'renderer can open screenshot artifacts');
+  t.ok(rendererJs.includes('readWorkspaceFileBase64'), 'renderer loads screenshot and PNG files through the image viewer');
+  t.ok(rendererJs.includes('renderInlineArtifactCards'), 'renderer presents visual artifacts inline in chat');
+  t.ok(rendererJs.includes('orion-artifact://'), 'renderer opens conversation-scoped artifact links');
   t.ok(rendererJs.includes('window.loadRunArtifacts = loadRunArtifacts'), 'agent can refresh the artifact panel after saving screenshot artifacts');
   t.ok(rendererJs.includes('deleteWorkspacePath'), 'file explorer delete handler exists');
   t.ok(rendererJs.includes('moveWorkspacePath'), 'file explorer move handler exists');
@@ -896,12 +956,33 @@ test('workspace artifacts and file explorer controls are wired', (t) => {
   t.end();
 });
 
-test('phone standalone conversations get isolated workspaces', (t) => {
+test('Dispatch uses Projects fallback while Coder standalone conversations get isolated workspaces', (t) => {
   t.ok(rendererJs.includes('function getStandaloneWorkspaceRoot'), 'standalone workspace root helper exists');
   t.ok(rendererJs.includes('Desktop\\\\Projects\\\\OrionAI\\\\standalone-workspaces'), 'default standalone root lives under OrionAI project folder');
+  t.ok(rendererJs.includes('function isGeneratedStandaloneWorkspace'), 'renderer can identify generated standalone workspaces');
+  t.ok(rendererJs.includes('function getDispatchWorkspaceRoot'), 'renderer has a real Projects-root fallback for Dispatch');
+  t.ok(rendererJs.includes('function getConversationRunWorkspace'), 'renderer resolves run workspace by conversation mode');
+  t.ok(rendererJs.includes("!c.projectPath && c.mode !== 'orion' && c.mode !== 'coder'"), 'legacy coder backfill does not overwrite explicit Dispatch/Coder modes');
+  t.ok(rendererJs.includes("if (c.mode === 'orion' && c.projectPath)"), 'migration clears accidental project linkage from explicit Dispatch conversations');
+  t.ok(rendererJs.includes("c.mode === 'orion' && c.workspace && isGeneratedStandaloneWorkspace(c.workspace)"), 'migration clears generated standalone workspaces from Dispatch conversations');
+  t.ok(rendererJs.includes("return mode === 'orion' || !c.projectPath;"), 'Dispatch list keeps Dispatch conversations even when they inspected a project workspace');
+  t.ok(rendererJs.includes('c.projectPath && isGeneratedStandaloneWorkspace(c.workspace)'), 'migration clears accidental project linkage from generated standalone workspaces');
+  t.ok(rendererJs.includes("conversationMode(c) === 'coder' && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)"), 'migration never promotes generated standalone workspaces or Dispatch conversations into projects');
+  t.ok(agentJs.includes("if (conversation.mode === 'coder')") && agentJs.includes('conversation.projectPath = targetPath'), 'change_workspace only promotes Coder conversations into project scope');
+  t.ok(rendererJs.includes('function addProjectPath'), 'project registration is centralized instead of mixed into every workspace change');
+  t.ok(rendererJs.includes('if (promoteProjectForWorkspace) addProjectPath(folderPath)'), 'Dispatch workspace changes do not add folders to the Coder project list unless explicitly promoted');
+  t.ok(rendererJs.includes('window.promoteWorkspaceToCoder'), 'renderer exposes an explicit Dispatch-to-Coder promotion path');
+  t.ok(rendererJs.includes("source: 'dispatch-handoff'"), 'Dispatch handoffs queue Coder prompts with a distinct source');
+  t.ok(agentJs.includes("'handoff_to_coder'"), 'Dispatch allowlist includes the explicit Coder handoff tool');
+  t.ok(agentJs.includes('change_workspace alone must not add folders to Coder'), 'handoff tool declaration teaches the model that workspace inspection is not project promotion');
+  t.ok(agentJs.includes('window.promoteWorkspaceToCoder'), 'handoff_to_coder executes through the renderer promotion API');
+  t.ok(agentJs.includes('isGeneratedStandaloneWorkspacePath') && agentJs.includes('getDispatchWorkspaceRoot()'), 'agent ignores generated Dispatch workspaces and falls back to the Projects root');
+  t.ok(agentJs.includes('formatKnownProjectsForSystemFacts'), 'agent can include registered project paths in Dispatch context');
   t.ok(rendererJs.includes('function createPhoneConversation'), 'phone conversations use a dedicated constructor');
   t.ok(rendererJs.includes('projectPath: normalizedProjectPath'), 'phone constructor preserves explicit project linkage only');
-  t.ok(rendererJs.includes('conv.workspace = conv.projectPath || getStandaloneWorkspaceForTitle(conv.title, conv.id)'), 'standalone phone prompt initializes an isolated workspace');
+  t.ok(rendererJs.includes("conversationMode(conv) === 'coder'") && rendererJs.includes('conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id)'), 'only Coder standalone prompts initialize isolated workspaces');
+  t.ok(preloadJs.includes('getFileSymbols') && preloadJs.includes('orion:get-file-symbols'), 'preload exposes the file-symbol tool advertised to the model');
+  t.ok(preloadJs.includes('semanticSearch') && preloadJs.includes('orion:semantic-search'), 'preload exposes semantic search advertised to the model');
   t.end();
 });
 
@@ -951,9 +1032,9 @@ test('legacy phone companion token announcements are scrubbed and blocked', (t) 
   t.end();
 });
 
-test('checklist updates are milestone-only to avoid progress churn', (t) => {
-  t.ok(agentJs.includes('Use only for milestone changes'), 'tool description warns against routine checklist churn');
-  t.ok(agentJs.includes('Do not call it just to mark an item "in-progress"'), 'system prompt blocks in-progress-only updates');
+test('checklist updates allow marking a milestone in-progress but block repeated no-op refreshes', (t) => {
+  t.ok(agentJs.includes("Do not call repeatedly for the same state"), 'tool description warns against repeated no-op refreshes');
+  t.ok(agentJs.includes('Do not call it repeatedly just to refresh the same in-progress state'), 'system prompt blocks repeated in-progress refreshes');
 
   const initial = agent.shouldApplyChecklistUpdate([], [
     { title: 'Explore the codebase', status: 'pending' },
@@ -961,14 +1042,23 @@ test('checklist updates are milestone-only to avoid progress churn', (t) => {
   ]);
   t.equal(initial.allowed, true, 'initial checklist creation is allowed');
 
-  const churn = agent.shouldApplyChecklistUpdate([
+  const startingWork = agent.shouldApplyChecklistUpdate([
     { title: 'Explore the codebase', status: 'pending' },
     { title: 'Implement fix', status: 'pending' },
   ], [
     { title: 'Explore the codebase', status: 'in-progress' },
     { title: 'Implement fix', status: 'pending' },
   ]);
-  t.equal(churn.allowed, false, 'pending to in-progress only is skipped');
+  t.equal(startingWork.allowed, true, 'pending to in-progress is allowed when starting a milestone');
+
+  const churn = agent.shouldApplyChecklistUpdate([
+    { title: 'Explore the codebase', status: 'in-progress' },
+    { title: 'Implement fix', status: 'pending' },
+  ], [
+    { title: 'Explore the codebase', status: 'in-progress' },
+    { title: 'Implement fix', status: 'pending' },
+  ]);
+  t.equal(churn.allowed, false, 'resending the exact same in-progress state is skipped as a no-op');
 
   const completed = agent.shouldApplyChecklistUpdate([
     { title: 'Explore the codebase', status: 'in-progress' },

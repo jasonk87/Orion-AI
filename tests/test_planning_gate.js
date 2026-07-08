@@ -16,6 +16,9 @@ global.fetch = async (url, options) => {
     if (text.includes('"what"')) {
       return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"intent":"unclear","reason":""}' }] } }] }) };
     }
+    if (text.includes('"you never answered"')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"intent":"other","reason":"Separate follow-up question, not a plan verdict."}' }] } }] }) };
+    }
     return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"intent":"deny","reason":""}' }] } }] }) };
   }
 
@@ -70,39 +73,42 @@ function validStrategy(overrides = {}) {
 }
 
 test('classifyPlanApprovalIntent returns correct intents', async (t) => {
-  const approveRes = await agent.classifyPlanApprovalIntent('good to go', 'gemini-1', 'key');
+  const approveRes = await agent.classifyPlanApprovalIntent('good to go', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(approveRes.intent, 'approve', 'Recognizes approve intent');
 
-  const denyRes = await agent.classifyPlanApprovalIntent('stop', 'gemini-1', 'key');
+  const denyRes = await agent.classifyPlanApprovalIntent('stop', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(denyRes.intent, 'deny', 'Recognizes deny intent');
 
-  const reviseRes = await agent.classifyPlanApprovalIntent('no wait', 'gemini-1', 'key');
+  const reviseRes = await agent.classifyPlanApprovalIntent('no wait', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(reviseRes.intent, 'revise', 'Recognizes revise intent');
 
-  const unclearRes = await agent.classifyPlanApprovalIntent('what', 'gemini-1', 'key');
+  const unclearRes = await agent.classifyPlanApprovalIntent('what', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(unclearRes.intent, 'unclear', 'Recognizes unclear intent');
+
+  const otherRes = await agent.classifyPlanApprovalIntent('you never answered', 'gemini-1', { geminiApiKey: 'key' });
+  t.equal(otherRes.intent, 'other', 'Recognizes a separate follow-up as outside pending-plan approval');
 
   t.end();
 });
 
 test('classifyPlanningNeed returns correct modes', async (t) => {
-  const directRes = await agent.classifyPlanningNeed('run tests', 'gemini-1', 'key');
+  const directRes = await agent.classifyPlanningNeed('run tests', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(directRes.mode, 'direct', 'Recognizes direct mode');
 
-  const envRes = await agent.classifyPlanningNeed('what all python environments do i have installed on this computer', 'gemini-1', 'key');
+  const envRes = await agent.classifyPlanningNeed('what all python environments do i have installed on this computer', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(envRes.mode, 'direct', 'Recognizes local Python environment inventory as direct mode');
 
-  const localProjectAdviceRes = await agent.classifyPlanningNeed('I have a folder on my desktop called rocket sumo, recommend similar games and improvements', 'gemini-1', 'key');
+  const localProjectAdviceRes = await agent.classifyPlanningNeed('I have a folder on my desktop called rocket sumo, recommend similar games and improvements', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(localProjectAdviceRes.mode, 'direct', 'Recognizes local project recommendation as direct inspection mode');
 
-  const planRes = await agent.classifyPlanningNeed('build a whole app', 'gemini-1', 'key');
+  const planRes = await agent.classifyPlanningNeed('build a whole app', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(planRes.mode, 'plan', 'Recognizes plan mode');
 
-  const reviewRes = await agent.classifyPlanningNeed('look through my program and find any bugs', 'gemini-1', 'key');
+  const reviewRes = await agent.classifyPlanningNeed('look through my program and find any bugs', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(reviewRes.mode, 'direct', 'Recognizes read-only bug hunts as direct mode');
   t.equal(reviewRes.reviewOnly, true, 'Carries review-only flag for bug hunts');
 
-  const answerRes = await agent.classifyPlanningNeed('explain', 'gemini-1', 'key');
+  const answerRes = await agent.classifyPlanningNeed('explain', 'gemini-1', { geminiApiKey: 'key' });
   t.equal(answerRes.mode, 'answer', 'Recognizes answer mode');
 
   t.end();
@@ -124,7 +130,7 @@ test('review-only gate allows strategy but blocks implementation artifacts and e
 
   const source = require('fs').readFileSync(require('path').join(__dirname, '../agent.js'), 'utf8');
   t.ok(source.includes("if (reviewOnly && planningDecision.mode === 'plan')"), 'runtime forces plan-classified reviews back to direct mode');
-  t.ok(source.includes('!reviewOnly && planningDecision.mode === \'plan\''), 'fallback approval gate ignores review-only tasks');
+  t.ok(source.includes('Plan approval is conversation state'), 'project-level implementation_plan.md files do not reactivate approval mode');
   t.end();
 });
 
@@ -1752,7 +1758,10 @@ test('a real detected regression stops the run with a specific message, not a ge
 // looksLikeLeakedNoToolCorrection() detects this specific failure mode so a stronger retry can fire.
 test('looksLikeLeakedNoToolCorrection detects a model describing its own internal correction instead of answering', (t) => {
   const leaked = 'Understood. My previous response was a discussion about game features and did not require workspace interaction or an implementation plan. I am ready for your next instruction.';
+  const answerAboveLeak = 'My answer above is already a complete non-workspace answer — I gave you the full architectural design and build-starting roadmap. It is your move from here.';
   t.equal(agent.looksLikeLeakedNoToolCorrection(leaked), true, 'the exact leaked phrasing from the transcript is detected');
+  t.equal(agent.looksLikeLeakedNoToolCorrection(answerAboveLeak), true, 'a final gate answer that points at an answer above is detected');
+  t.equal(agent.answerHasActionableFinalContent(answerAboveLeak), false, 'meta references to an answer above are not accepted as substantive final content');
   t.equal(
     agent.looksLikeLeakedNoToolCorrection("Sure! Let's dig into Assetto Corsa's tire model and how that could inspire Apex Velocity's pit-stop mechanic."),
     false,
@@ -1806,6 +1815,59 @@ test('a leaked no-tool-use correction triggers a stronger retry instead of being
     t.ok(aiMessage.text.includes('Assetto Corsa'), 'the eventual real, on-topic answer is what gets shown');
   } finally {
     global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+
+  t.end();
+});
+
+test('planning mode accepts a complete direct answer instead of forcing an answer-above rewrite', async (t) => {
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0 });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = { readFile: async () => '', listFiles: async () => ([]) };
+
+  const conversation = { id: 'test-complete-direct-answer', messages: [], awaitingPlanApproval: false, planApproved: false };
+  const fullAnswer = [
+    'A grittier modern BitLife should be built around pressure, not just menus.',
+    'The core loop would track needs, money, reputation, relationships, risk, and consequences so every choice changes future options.',
+    'I would prototype it as a narrative simulation first, then add jobs, crime, health, social status, housing, and event chains once the state model feels good.'
+  ].join('\n\n');
+
+  let modelTurnCount = 0;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"plan","reason":"Could become a build, but a design answer is allowed."}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    modelTurnCount++;
+    const text = modelTurnCount === 1
+      ? fullAnswer
+      : 'My answer above is already a complete non-workspace answer — I gave you the full architectural design and build-starting roadmap.';
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text }] } }] }) };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
+    await window.runAgentLoop('How could we create a more modern version of BitLife with grit and simulation?', 'gemini-1', conversation);
+
+    const aiMessage = conversation.messages.find(m => m.role === 'assistant');
+    t.ok(aiMessage, 'assistant message was created');
+    t.equal(modelTurnCount, 1, 'a complete direct answer does not get a planning-mode retry');
+    t.equal(aiMessage.text, fullAnswer, 'the complete answer is preserved as the final text');
+    t.notOk(/my answer above|complete non-workspace answer/i.test(aiMessage.text), 'the answer-above rewrite is not shown');
+  } finally {
     global.fetch = originalFetch;
     global.setTimeout = originalSetTimeout;
   }
@@ -2382,21 +2444,261 @@ test('trimAgedToolResultsFromMessages is a no-op for short conversations and ret
   t.end();
 });
 
-// The four call sites (classifyPlanApprovalIntent, classifyPlanningNeed x2, countTokens,
+// The utility/classifier call sites (classifyPlanApprovalIntent, classifyPlanningNeed, countTokens,
 // compactHistory) must actually use the resolved cheap model, not the raw modelName.
 test('utility/classifier call sites are wrapped with resolveUtilityModelName instead of using the raw modelName', (t) => {
   const fs = require('fs');
   const path = require('path');
   const agentSource = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
 
-  t.ok(agentSource.includes('classifyPlanApprovalIntent(userPrompt, resolveUtilityModelName(modelName), config.geminiApiKey)'),
+  t.ok(agentSource.includes('classifyPlanApprovalIntent(userPrompt, resolveUtilityModelName(modelName), config)'),
     'classifyPlanApprovalIntent call site uses the resolved cheap model');
-  const planningNeedMatches = agentSource.match(/classifyPlanningNeed\(userPrompt, resolveUtilityModelName\(modelName\), config\.geminiApiKey\)/g) || [];
-  t.equal(planningNeedMatches.length, 2, 'both classifyPlanningNeed call sites use the resolved cheap model');
-  t.ok(agentSource.includes('countTokens(messages, resolveUtilityModelName(modelName), config.geminiApiKey'),
+  const planningNeedMatches = agentSource.match(/classifyPlanningNeed\(userPrompt, resolveUtilityModelName\(modelName\), config(?:, conversation\.messages)?\)/g) || [];
+  t.ok(planningNeedMatches.length >= 3, 'all classifyPlanningNeed call sites use the resolved cheap model');
+  t.ok(agentSource.includes('countTokens(messages, resolveUtilityModelName(modelName), config'),
     'countTokens call site uses the resolved cheap model');
-  t.ok(agentSource.includes('compactHistory(messages, resolveUtilityModelName(modelName), config.geminiApiKey)'),
+  t.ok(agentSource.includes('compactHistory(messages, resolveUtilityModelName(modelName), config)'),
     'compactHistory call site uses the resolved cheap model');
+  t.end();
+});
+
+// A user reported DeepSeek rejecting a request mid-run with "reasoning_content in the thinking
+// mode must be passed back to the API". Root cause: compactHistory's `messages.slice(-3)` is a
+// plain count-based cut, and a 'tool' message is always immediately preceded by the 'model'
+// message whose tool_calls it answers (agent.js pushes them as a pair). If the -3 cut landed on
+// the 'tool' message, its issuing 'model' message (and any reasoning_content on it) was dropped,
+// leaving an orphaned tool result with no matching assistant tool_calls/reasoning for DeepSeek's
+// thinking mode to echo back.
+test('compactHistory never retains a tool message without its issuing model message', async (t) => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({ ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: 'Summary.' }] } }] }) });
+  try {
+    const messages = [
+      { role: 'user', parts: [{ text: 'do the first thing' }] },
+      { role: 'model', parts: [{ text: 'thinking', thought: true }, { functionCall: { name: 'read_file', args: { path: 'a.js' } } }] },
+      { role: 'tool', parts: [{ functionResponse: { name: 'read_file', response: { content: 'a' } } }] },
+      { role: 'model', parts: [{ text: 'now the second thing' }] },
+    ];
+    const result = await agent.compactHistory(messages, 'gemini-2.5-flash-lite', { geminiApiKey: 'k' });
+    const retained = result.messages.slice(2); // after the synthetic summary user/model pair
+    if (retained.length && retained[0].role === 'tool') {
+      t.fail('retained slice must not start with an orphaned tool message');
+    } else {
+      t.pass('retained slice does not start with an orphaned tool message');
+    }
+    t.end();
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('compactHistory still trims to a short tail when the boundary already falls on a non-tool message', async (t) => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({ ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: 'Summary.' }] } }] }) });
+  try {
+    const messages = [
+      { role: 'user', parts: [{ text: 'turn 1' }] },
+      { role: 'model', parts: [{ text: 'reply 1' }] },
+      { role: 'user', parts: [{ text: 'turn 2' }] },
+      { role: 'model', parts: [{ text: 'reply 2' }] },
+      { role: 'user', parts: [{ text: 'turn 3' }] },
+    ];
+    const result = await agent.compactHistory(messages, 'gemini-2.5-flash-lite', { geminiApiKey: 'k' });
+    const retained = result.messages.slice(2);
+    t.equal(retained.length, 3, 'retains exactly the last 3 messages when no tool boundary is crossed');
+    t.equal(retained[0].parts[0].text, 'turn 2', 'retained slice still starts at the expected message');
+    t.end();
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+// A transcript showed a model do a long batch of read-only investigation (grep_search/read_file)
+// on a plain "look through the code and tell me X" request, then return a completely blank final
+// turn (no text, no tool call). None of the checklist/win-condition/auto-continue machinery
+// applies to a read-only ask, so the run fell straight through to the generic "I inspected the
+// workspace but did not produce the requested answer" bailout, leaving the user with no real
+// answer. The fix: a blank response after real tool work gets one dedicated, budget-exempt nudge
+// to actually answer, ahead of every other recovery gate.
+test('a blank final response after real tool work is nudged to produce an actual answer instead of bailing out', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: false });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    readFile: async () => 'def main():\n    pass\n',
+    listFiles: async () => ([{ path: 'main.py', isDir: false, size: 100 }]),
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+  };
+
+  const conversation = { id: 'test-blank-final-response', messages: [], awaitingPlanApproval: false, planApproved: false };
+
+  let turnCount = 0;
+  let sawBlankRecoveryNudge = false;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"answer","reason":"read-only investigation"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+    if (/no text and no tool call/i.test(lastText)) sawBlankRecoveryNudge = true;
+
+    turnCount++;
+    if (turnCount === 1) {
+      return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'read_file', args: { path: 'main.py' } } }] } }] }) };
+    }
+    if (turnCount === 2) {
+      // Truly blank turn: no text, no functionCall — the exact failure from the transcript.
+      return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [] } }] }) };
+    }
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'The game starts in main.py, which currently just calls pass.' }] } }] }) };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
+    await window.runAgentLoop('look through the game and see where we start', 'gemini-1', conversation);
+
+    t.ok(sawBlankRecoveryNudge, 'the blank-response recovery nudge was sent after the empty turn');
+    const aiMessage = conversation.messages.find(m => m.role === 'assistant');
+    t.ok(aiMessage, 'assistant message was created');
+    t.ok(/main\.py/.test(aiMessage.text || ''), 'the run recovered and produced the real answer, not the generic bailout');
+    t.notOk(/did not produce the requested answer/i.test(aiMessage.text || ''), 'the generic no-answer bailout message is not shown once recovery succeeds');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+  t.end();
+});
+
+// A user reported the "thinking" UI vanished — the chat area showed nothing at all between
+// hitting send and the final answer appearing, leaving no way to tell the run wasn't stuck.
+// Root cause: renderAiMessage's placeholder guard (renderer.js) unconditionally no-op'd on the
+// very first call of a run (text === 'Thinking...', no bubble yet, no logs yet) so the
+// agent-running-indicator spinner never appeared until either a tool call fired or the whole run
+// finished — for a plain conversational answer with no tool calls, that meant the entire
+// duration of the model's response with zero visible feedback. Fixed by calling renderAiMessage
+// immediately when the placeholder message is created (agent.js), and by only suppressing that
+// placeholder in the renderer when no run is actually in progress (so stale placeholders from a
+// dead run still don't reappear on reload/replay).
+test('the running-indicator placeholder is rendered immediately at the start of a run, not only after the first tool call', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  const renderCalls = [];
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = (text, logs, conversationId) => { renderCalls.push({ text, logs, conversationId }); };
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: false });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    listFiles: async () => ([]),
+    readFile: async () => '',
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+  };
+
+  const conversation = { id: 'test-thinking-placeholder', messages: [], awaitingPlanApproval: false, planApproved: false };
+
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"answer","reason":"plain question"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+    // A plain conversational answer — no tool calls at all — is exactly the case where nothing
+    // used to render at all until this final response came back.
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'The sky looks blue because of Rayleigh scattering.' }] } }] }) };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
+    await window.runAgentLoop('why is the sky blue', 'gemini-1', conversation);
+
+    t.ok(renderCalls.length >= 2, 'renderAiMessage was called at least twice — once as the immediate placeholder, once with the real answer');
+    t.equal(renderCalls[0].text, 'Thinking...', 'the very first render call is the immediate placeholder, shown before any model response arrives');
+    const finalCall = renderCalls[renderCalls.length - 1];
+    t.ok(/Rayleigh scattering/.test(finalCall.text || ''), 'a later render call carries the real answer');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+  t.end();
+});
+
+// A transcript showed a run silently die mid-task: the model set an intro sentence ("Let me now
+// write the strategy doc..."), then thrashed for many turns retrying broken shell-escaping via
+// run_command, without a checklist ever being created (this was pre-plan-approval), until the raw
+// per-turn loop ceiling was hit. Because lastTextResponse was never "Thinking..." (it held that
+// stale intro sentence) and no checklist existed to trigger auto-continue, nothing flagged the run
+// as incomplete — the stale sentence just silently became the "final" answer with the tool log as
+// the only hint anything went wrong.
+test('a run that exhausts its per-turn ceiling while thrashing on tool calls gets an explicit incomplete-run note, not a silently stale answer', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: false });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.api = {
+    listFiles: async () => ([]),
+    readFile: async () => '',
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
+    runCommand: async () => ({ success: true, code: 0, stdout: '', stderr: '' }),
+  };
+
+  const conversation = { id: 'test-loop-ceiling', messages: [], awaitingPlanApproval: false, planApproved: false };
+
+  let turnCount = 0;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"writing a file"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    turnCount++;
+    // First turn: a real intro sentence alongside the tool call, exactly like the transcript.
+    // Every turn after that: only a tool call, no text at all — the model never updates
+    // lastTextResponse again, so it stays stuck on that first sentence for the rest of the run.
+    const parts = turnCount === 1
+      ? [{ text: 'Good — the workspace is live. Let me now write the strategy doc.' }, { functionCall: { name: 'run_command', args: { command: 'echo hi' } } }]
+      : [{ functionCall: { name: 'run_command', args: { command: 'echo hi' } } }];
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts } }] }) };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
+    await window.runAgentLoop('build me a strategy doc', 'gemini-1', conversation);
+
+    const aiMessage = conversation.messages.find(m => m.role === 'assistant');
+    t.ok(aiMessage, 'assistant message was created');
+    t.ok(/hit its per-turn action limit/i.test(aiMessage.text || ''), 'the final message explicitly flags that the run hit its loop ceiling');
+    t.ok(/ask me to continue/i.test(aiMessage.text || ''), 'the final message tells the user how to recover');
+    t.ok(/Good — the workspace is live/.test(aiMessage.text || ''), 'the original stale sentence is preserved, not silently discarded');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
   t.end();
 });
 
@@ -2483,4 +2785,3 @@ test('grep_search is declared in the shared tool-declaration source consumed by 
   t.ok(agentSource.includes("case 'grep_search'"), 'the executor has a grep_search case');
   t.end();
 });
-

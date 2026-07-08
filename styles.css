@@ -1,32 +1,3 @@
-/* DESIGN SYSTEM VARIABLES */
-:root {
-  --bg-primary: #0a0a0c;
-  --bg-secondary: #121216;
-  --bg-tertiary: #191922;
-  --border-color: #24242e;
-  --border-hover: #38384b;
-  
-  --text-primary: #f1f1f4;
-  --text-secondary: #a3a3c2;
-  --text-muted: #62627a;
-  
-  --accent-color: #a78bfa;
-  --accent-hover: #c4b5fd;
-  --accent-glow: rgba(167, 139, 250, 0.15);
-  
-  --success-color: #34d399;
-  --success-glow: rgba(52, 211, 153, 0.15);
-  --error-color: #f87171;
-  --error-glow: rgba(248, 113, 113, 0.15);
-  --warning-color: #fbbf24;
-  
-  --font-sans: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  --font-mono: 'JetBrains Mono', SFMono-Regular, Consolas, "Liberation Mono", Menlo, Courier, monospace;
-  
-  --transition-fast: 0.15s ease;
-  --transition-normal: 0.25s ease;
-}
-
 /* RESET & BASE STYLES */
 * {
   box-sizing: border-box;
@@ -405,6 +376,185 @@ body {
   color: var(--text-muted);
 }
 
+/* ── Orion Mode: main workspace adaptations ──────────── */
+body[data-mode="orion"] .workspace-action-bar { display: none !important; }
+body[data-mode="orion"] #right-sidebar { display: none !important; }
+body[data-mode="orion"] #welcome-splash { display: none !important; }
+body[data-mode="orion"] #chat-workspace { border-left: none; }
+
+/* Orion welcome splash */
+.orion-welcome-splash {
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  gap: 12px;
+  text-align: center;
+  padding: 48px 32px;
+  animation: fadeIn 0.4s ease;
+}
+
+.orion-welcome-icon {
+  font-size: 2.8rem;
+  color: var(--accent-color);
+  margin-bottom: 8px;
+  opacity: 0.9;
+}
+
+.orion-welcome-splash h1 {
+  font-size: 1.8rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.orion-welcome-sub {
+  font-size: 0.95rem;
+  color: var(--text-muted);
+  margin: 0;
+}
+
+/* ── Orion typing indicator ────────────────────────── */
+.orion-typing-indicator {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 10px 0 6px 2px;
+  animation: message-enter 200ms ease both;
+}
+.orion-typing-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent-color);
+  opacity: 0.5;
+  animation: orion-dot-pulse 1.2s ease-in-out infinite;
+}
+.orion-typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.orion-typing-dot:nth-child(3) { animation-delay: 0.4s; }
+@keyframes orion-dot-pulse {
+  0%, 80%, 100% { opacity: 0.3; transform: scale(0.85); }
+  40% { opacity: 1; transform: scale(1); }
+}
+.orion-typing-label {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  margin-left: 4px;
+}
+
+/* ── Mode Switcher Nav ─────────────────────────────── */
+.sidebar-mode-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-bottom: 14px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.mode-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  font-weight: 500;
+  font-family: var(--font-sans);
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  transition: background 0.15s, color 0.15s;
+}
+
+.mode-nav-item:hover {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+.mode-nav-item.active {
+  color: var(--accent-color);
+  background: rgba(99, 102, 241, 0.1);
+}
+
+.mode-nav-icon {
+  font-size: 0.95rem;
+  width: 18px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.mode-nav-label {
+  font-size: 0.9rem;
+}
+
+.sidebar-mode-content {
+  display: none;
+  flex-direction: column;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.sidebar-mode-content.active {
+  display: flex;
+}
+
+/* ── Coder "New Conversation" picker (Standalone or a project) ──── */
+.new-conv-picker-wrap {
+  position: relative;
+}
+
+.new-conv-picker-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 40;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 6px;
+  max-height: 280px;
+  overflow-y: auto;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.4);
+}
+
+.new-conv-picker-item {
+  padding: 8px 10px;
+  border-radius: 7px;
+  font-size: 0.82rem;
+  color: var(--text-primary);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.new-conv-picker-item:hover {
+  background: var(--bg-secondary);
+}
+
+.new-conv-picker-divider {
+  height: 1px;
+  background: var(--border-color);
+  margin: 6px 2px;
+}
+
+.new-conv-picker-empty {
+  padding: 8px 10px;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* ── Sidebar Footer ────────────────────────────────── */
 .sidebar-footer {
   border-top: 1px solid var(--border-color);
   padding-top: 12px;
@@ -637,9 +787,19 @@ body {
 .message-header {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
   font-size: 0.8rem;
   font-weight: 600;
+}
+
+.msg-timestamp {
+  font-size: 0.7rem;
+  font-weight: 400;
+  color: var(--text-muted);
+  letter-spacing: 0;
+  opacity: 0.7;
+  margin-left: auto;
 }
 
 .message-header.user {
@@ -850,6 +1010,16 @@ body {
 .tool-status.success { background-color: var(--success-glow); color: var(--success-color); }
 .tool-status.error { background-color: var(--error-glow); color: var(--error-color); }
 
+.tool-elapsed {
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.62rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  background-color: rgba(148, 163, 196, 0.08);
+  font-family: ui-monospace, monospace;
+}
+
 .tool-params {
   color: var(--text-muted);
   font-size: 0.7rem;
@@ -866,6 +1036,48 @@ body {
   max-height: 150px;
   overflow-y: auto;
   white-space: pre;
+}
+
+.dispatch-tool-activity {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  max-width: 100%;
+  margin: 0 0 10px;
+  padding: 7px 10px;
+  border: 1px solid rgba(130, 115, 244, 0.2);
+  border-radius: 999px;
+  background: rgba(130, 115, 244, 0.08);
+  color: var(--text-secondary);
+  font-size: 0.74rem;
+}
+
+.dispatch-tool-activity code {
+  color: var(--accent-secondary);
+  font-size: 0.72rem;
+}
+
+.dispatch-tool-pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent-secondary);
+  box-shadow: 0 0 0 3px rgba(130, 115, 244, 0.15);
+}
+
+.dispatch-tool-activity.running .dispatch-tool-pulse {
+  animation: orion-dot-pulse 1.4s ease-in-out infinite;
+}
+
+.dispatch-tool-activity.error {
+  border-color: rgba(255, 123, 123, 0.24);
+  background: rgba(255, 123, 123, 0.08);
+}
+
+.dispatch-tool-activity.error .dispatch-tool-pulse {
+  background: var(--error-color);
+  box-shadow: 0 0 0 3px rgba(255, 123, 123, 0.12);
 }
 
 /* CODE RENDERING */
@@ -1348,6 +1560,73 @@ code {
 .artifact-meta {
   color: var(--text-muted);
   font-size: 0.68rem;
+}
+
+.inline-artifacts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.inline-artifact-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  max-width: 420px;
+  padding: 10px 12px;
+  border: 1px solid rgba(130, 115, 244, 0.32);
+  border-radius: 8px;
+  background: rgba(17, 24, 39, 0.72);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-family: inherit;
+  text-align: left;
+}
+
+.inline-artifact-card:hover,
+.inline-artifact-card:focus-visible {
+  border-color: rgba(130, 115, 244, 0.58);
+  background: rgba(130, 115, 244, 0.12);
+  outline: none;
+}
+
+.inline-artifact-icon {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 7px;
+  background: rgba(130, 115, 244, 0.18);
+  color: #b8a9ff;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  font-weight: 800;
+}
+
+.inline-artifact-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.inline-artifact-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.86rem;
+  font-weight: 750;
+}
+
+.inline-artifact-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 0.72rem;
 }
 
 /* .modal-card sets a fixed width: 500px later in this stylesheet; that rule has equal
@@ -2168,6 +2447,100 @@ code {
 }
 
 
+/* ── Dispatcher-as-Supervisor: Coder task status card ──────────────────────── */
+/* Persistent floating banner between #chat-feed and #chat-input-wrapper.      */
+/* NOT a chat message — shows while a Coder task is running; hidden otherwise. */
+.coder-task-status-card {
+  display: none;           /* hidden by default */
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  margin: 0 12px 0;
+  background: rgba(16, 185, 129, 0.06);
+  border: 1px solid rgba(16, 185, 129, 0.22);
+  border-radius: 8px;
+  font-size: 0.76rem;
+  color: var(--text-secondary);
+  animation: coder-status-border-pulse 2.4s ease-in-out infinite alternate;
+  transition: opacity 0.2s ease;
+}
+
+.coder-task-status-card.visible {
+  display: flex;
+}
+
+.coder-status-spinner {
+  display: flex;
+  gap: 3px;
+  flex-shrink: 0;
+}
+
+.coder-status-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--success-color);
+  animation: coder-dot-bounce 1.2s ease-in-out infinite;
+}
+
+.coder-status-dot:nth-child(2) { animation-delay: 0.2s; }
+.coder-status-dot:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes coder-dot-bounce {
+  0%, 100% { transform: scaleY(0.5); opacity: 0.4; }
+  50% { transform: scaleY(1.2); opacity: 1; }
+}
+
+@keyframes coder-status-border-pulse {
+  0% { border-color: rgba(16, 185, 129, 0.14); box-shadow: none; }
+  100% { border-color: rgba(16, 185, 129, 0.36); box-shadow: 0 0 10px rgba(16, 185, 129, 0.08); }
+}
+
+.coder-status-body {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.coder-status-label {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  flex-shrink: 0;
+}
+
+.coder-status-task-name {
+  color: var(--success-color);
+  font-weight: 600;
+  font-size: 0.76rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.coder-status-sep {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.coder-status-substatus {
+  color: var(--text-secondary);
+  font-size: 0.73rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.coder-status-elapsed {
+  color: var(--text-muted);
+  font-size: 0.69rem;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
 /* Operational context / Mission Control */
 .operational-context-section {
   flex: 0 0 auto;
@@ -2395,6 +2768,94 @@ select:focus-visible,
   line-height: 1;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ── Update controls ── */
+.update-check-btn,
+.update-available-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 10px;
+  margin-right: 6px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+  -webkit-app-region: no-drag;
+  white-space: nowrap;
+}
+
+.update-check-btn {
+  border-color: rgba(151,164,196,.18);
+  background: rgba(255,255,255,.035);
+  color: rgba(210,216,235,.76);
+}
+
+.update-available-btn {
+  border-color: rgba(70, 213, 155, 0.45);
+  background: rgba(70, 213, 155, 0.12);
+  color: #46d59b;
+}
+
+.update-check-btn:hover {
+  background: rgba(255,255,255,.07);
+}
+
+.update-available-btn:hover {
+  background: rgba(70, 213, 155, 0.22);
+  transform: scale(1.03);
+}
+.update-check-btn:disabled,
+.update-available-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+  transform: none;
+}
+
+/* ── Image attach preview ── */
+.image-preview-container {
+  padding: 6px 12px 0;
+}
+.image-preview-thumbnails {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.img-preview-thumb {
+  position: relative;
+  display: inline-flex;
+}
+.img-preview-thumb img {
+  height: 56px;
+  max-width: 120px;
+  border-radius: 6px;
+  object-fit: cover;
+  border: 1px solid rgba(151,164,196,.18);
+}
+.img-preview-remove {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: rgba(239, 68, 68, 0.9);
+  color: #fff;
+  border: none;
+  font-size: 0.72rem;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
 }
 
 .menu-item { color: var(--text-muted); padding: 5px 7px; }
@@ -2882,4 +3343,209 @@ kbd {
   .queued-prompt-footer { align-items: flex-start; }
   .queued-prompt-actions { width: 100%; justify-content: flex-end; }
   .model-select-wrapper { max-width: 150px; }
+}
+
+/* ═══════════════════════════════════════════════════════
+   UI POLISH PASS 2
+   ═══════════════════════════════════════════════════════ */
+
+/* ── User vs AI message differentiation ──────────────── */
+.message-bubble:has(.message-header.user) {
+  background: rgba(130, 115, 244, 0.055);
+  border: 1px solid rgba(130, 115, 244, 0.12);
+  border-radius: 12px;
+  padding: 12px 16px;
+  gap: 6px;
+}
+
+.message-bubble:has(.message-header.ai) {
+  gap: 6px;
+  padding: 2px 0;
+  border-left: 2px solid rgba(130, 115, 244, 0.22);
+  padding-left: 14px;
+  margin-left: 2px;
+}
+
+/* ── Orion mode: tighter message column ──────────────── */
+body[data-mode="orion"] .messages-container {
+  max-width: 720px;
+}
+
+/* ── Orion welcome icon glow ─────────────────────────── */
+.orion-welcome-icon {
+  position: relative;
+  display: inline-block;
+  animation: orion-orb-breathe 3.5s ease-in-out infinite;
+}
+
+.orion-welcome-icon::before {
+  content: '';
+  position: absolute;
+  inset: -20px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(130, 115, 244, 0.32) 0%, transparent 68%);
+  pointer-events: none;
+  z-index: -1;
+}
+
+/* ── Orion prompt chips ──────────────────────────────── */
+.orion-prompt-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 8px;
+}
+
+.orion-prompt-chip {
+  background: rgba(130, 115, 244, 0.07);
+  border: 1px solid rgba(130, 115, 244, 0.2);
+  border-radius: 20px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-family: var(--font-sans);
+  font-size: 0.8rem;
+  padding: 7px 15px;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, transform 0.15s;
+}
+
+.orion-prompt-chip:hover {
+  background: rgba(130, 115, 244, 0.16);
+  border-color: rgba(130, 115, 244, 0.48);
+  color: var(--text-primary);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(130, 115, 244, 0.12);
+}
+
+/* ── Chat input toolbar separator ────────────────────── */
+.chat-input-toolbar {
+  border-top-color: rgba(151, 164, 196, 0.09) !important;
+  margin-top: 8px;
+}
+
+/* ── Model selector — minimal ghost style ────────────── */
+.model-select-wrapper select {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  padding: 3px 5px;
+  border-radius: 5px;
+}
+
+.model-select-wrapper select:hover {
+  border-color: rgba(151, 164, 196, 0.18);
+  color: var(--text-secondary);
+  background: rgba(151, 164, 196, 0.04);
+}
+
+.model-select-wrapper select:focus {
+  border-color: rgba(130, 115, 244, 0.4);
+  outline: none;
+}
+
+/* ── Send button — slightly larger ───────────────────── */
+.btn-send {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  font-size: 1rem;
+  flex-shrink: 0;
+}
+
+/* ── Code block header polish ────────────────────────── */
+.code-header {
+  padding: 7px 14px;
+  background: rgba(255, 255, 255, 0.025);
+  border-bottom-color: rgba(151, 164, 196, 0.1);
+}
+
+.code-lang {
+  font-size: 0.67rem;
+  letter-spacing: 0.07em;
+  color: rgba(167, 139, 250, 0.65);
+}
+
+.code-action-btn {
+  font-size: 0.7rem;
+  padding: 3px 9px;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  background: transparent;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+
+.code-action-btn:hover {
+  border-color: rgba(151, 164, 196, 0.22);
+  background: rgba(151, 164, 196, 0.06);
+  color: var(--text-secondary);
+  transform: none;
+}
+
+/* ── Conversation title ───────────────────────────────── */
+#chat-title {
+  font-size: 0.91rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+}
+
+/* ── Message body font improvements ─────────────────── */
+.message-body {
+  font-size: 0.925rem;
+  line-height: 1.66;
+}
+
+/* ── Conversation items — hover refinement ───────────── */
+.conversation-item:hover .conversation-name {
+  color: var(--text-primary);
+}
+
+.conversation-item.active .conversation-name {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+/* ── Agent state pill — tighter, more readable ────────── */
+.agent-state-pill {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(151, 164, 196, 0.1);
+  border-radius: 20px;
+  padding: 3px 8px 3px 6px;
+  gap: 5px;
+  font-size: 0.61rem;
+  letter-spacing: 0.03em;
+  font-weight: 600;
+}
+
+.agent-state-pill.thinking,
+.agent-state-pill.acting {
+  background: rgba(130, 115, 244, 0.08);
+  border-color: rgba(130, 115, 244, 0.2);
+  color: #c4b5fd;
+}
+
+.agent-state-pill.complete {
+  background: rgba(52, 211, 153, 0.06);
+  border-color: rgba(52, 211, 153, 0.18);
+  color: #6ee7b7;
+}
+
+.agent-state-pill.attention {
+  background: rgba(241, 104, 118, 0.07);
+  border-color: rgba(241, 104, 118, 0.22);
+}
+
+/* ── Orion splash — greeting size bump ───────────────── */
+.orion-welcome-splash h1 {
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.orion-welcome-sub {
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  letter-spacing: 0.01em;
 }

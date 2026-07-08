@@ -1,9 +1,17 @@
-// Configure marked to escape HTML content to prevent XSS vulnerability in Electron renderer
+// Configure marked to escape raw HTML blocks to prevent XSS in Electron renderer.
+// Must NOT escape & first — doing so then letting marked parse the output causes
+// double-escaping (&amp; → &amp;amp;). Escape in a single pass using a regex that
+// replaces only the raw characters, never already-escaped sequences.
 if (typeof marked !== 'undefined') {
   marked.use({
     renderer: {
       html(htmlText) {
-        return htmlText.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        // Single-pass escape: replace raw &, < and > but skip &xxx; entities already present.
+        return String(htmlText).replace(/&(?![a-zA-Z#]\w{0,24};)|[<>]/g, ch => {
+          if (ch === '&') return '&amp;';
+          if (ch === '<') return '&lt;';
+          return '&gt;';
+        });
       }
     }
   });
@@ -12,7 +20,7 @@ if (typeof marked !== 'undefined') {
 function sanitizeRenderedMarkdown(container) {
   container.querySelectorAll('a[href]').forEach(link => {
     const href = link.getAttribute('href') || '';
-    if (!/^(https?:|mailto:|orion-file:)/i.test(href)) {
+    if (!/^(https?:|mailto:|orion-file:|orion-artifact:\/\/)/i.test(href)) {
       link.removeAttribute('href');
       link.removeAttribute('target');
       link.removeAttribute('rel');
@@ -67,6 +75,7 @@ let activeAiBubble = null; // Currently rendering AI message bubble
 let currentFileTreeItems = [];
 let currentRunArtifacts = [];
 let expandedFileFolders = new Set();
+let appMode = localStorage.getItem('appMode') || 'orion'; // 'orion' | 'coder'
 
 // DOM ELEMENTS
 const el = {
@@ -80,8 +89,15 @@ const el = {
   // Sidebar items
   btnNewChat: document.getElementById('btn-new-chat'),
   btnAddConversation: document.getElementById('btn-add-conversation'),
+  btnAddConversationCoder: document.getElementById('btn-add-conversation-coder'),
+  btnNewConversationCoder: document.getElementById('btn-new-conversation-coder'),
+  newConvPickerMenu: document.getElementById('new-conv-picker-menu'),
+  newConvPickerStandalone: document.getElementById('new-conv-picker-standalone'),
+  newConvPickerDivider: document.getElementById('new-conv-picker-divider'),
+  newConvPickerProjects: document.getElementById('new-conv-picker-projects'),
   projectList: document.getElementById('project-list'),
   conversationList: document.getElementById('conversation-list'),
+  conversationListCoder: document.getElementById('conversation-list-coder'),
   btnSettings: document.getElementById('btn-settings'),
   btnChangeWorkspace: document.getElementById('btn-change-workspace'),
   btnSyncFiles: document.getElementById('btn-sync-files'),
@@ -109,6 +125,7 @@ const el = {
   settingWorkspacePath: document.getElementById('setting-workspace-path'),
   settingTestCmd: document.getElementById('setting-test-cmd'),
   settingCommandTimeout: document.getElementById('setting-command-timeout'),
+  settingPhoneHttpsOrigin: document.getElementById('setting-phone-https-origin'),
   settingModelCallDelay: document.getElementById('setting-model-call-delay'),
   settingCompactThreshold: document.getElementById('setting-compact-threshold'),
   settingAutoTest: document.getElementById('setting-auto-test'),
@@ -188,7 +205,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupProgressiveDisclosure();
   setupRightSidebarToggle();
   setupChatHandlers();
-  
+  initUpdateChecker();
+  initImageAttach();
+
   // Bind manual task checklist add button
   const btnAddTaskManual = document.getElementById('btn-add-task-manual');
   if (btnAddTaskManual) {
@@ -239,11 +258,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Migrate any project conversations that accumulated in standalone list
   migrateConversations();
   
-  // Select first conversation if exists, otherwise create new one
-  if (conversations.length > 0) {
-    selectConversation(conversations[0].id);
+  // Select the most recent conversation belonging to the restored mode. Dispatch and Coder each
+  // have their own conversation history, so a conversation from the other mode -- even a
+  // standalone one -- must never become the active target just because it's the most recently
+  // created conversation overall.
+  const modeMatch = conversations.find(c => conversationMode(c) === appMode);
+  if (modeMatch) {
+    selectConversation(modeMatch.id);
   } else {
-    createNewConversation();
+    createNewConversation(appMode);
   }
   refreshPhoneCompanionPairing();
   removeLegacyPhoneCompanionTokenBubbles();
@@ -277,6 +300,212 @@ async function refreshAppRuntimeInfo() {
   }
 }
 
+// ── Auto-update checker ────────────────────────────────────────────────────────
+
+function showUpdateBadge({ changedCount, changed, sourceDir } = {}) {
+  const btn = document.getElementById('btn-update-available');
+  if (!btn) return;
+  const count = changedCount || (Array.isArray(changed) ? changed.length : 0);
+  btn.textContent = `⬆ Update${count ? ` (${count})` : ''}`;
+  const fileCopy = count ? `${count} local file${count !== 1 ? 's' : ''} changed` : 'Local update available';
+  btn.title = `${fileCopy}${sourceDir ? ` from ${sourceDir}` : ''} — click to sync local files and restart`;
+  btn.style.display = '';
+}
+
+function hideUpdateBadge() {
+  const btn = document.getElementById('btn-update-available');
+  if (btn) btn.style.display = 'none';
+}
+
+function restoreUpdateCheckButton(btn) {
+  if (!btn) return;
+  btn.textContent = '↻ Check';
+  btn.disabled = false;
+}
+
+function getUpdateApi() {
+  if (!window.api) return {};
+  return {
+    check: window.api.checkLocalUpdate || window.api.checkGitUpdate,
+    apply: window.api.applyLocalUpdate || window.api.applyGitUpdate
+  };
+}
+
+async function checkForLocalUpdates({ manual = false } = {}) {
+  const updateApi = getUpdateApi();
+  if (!updateApi.check) return;
+  const checkBtn = document.getElementById('btn-check-update');
+  if (manual && checkBtn) {
+    checkBtn.textContent = 'Checking...';
+    checkBtn.disabled = true;
+  }
+  try {
+    const result = await updateApi.check();
+    if (result && result.hasUpdate) {
+      showUpdateBadge(result);
+      if (manual && checkBtn) restoreUpdateCheckButton(checkBtn);
+    } else {
+      hideUpdateBadge();
+      if (manual && checkBtn) {
+        checkBtn.textContent = 'Current';
+        checkBtn.title = 'No local source file updates found';
+        setTimeout(() => {
+          restoreUpdateCheckButton(checkBtn);
+          checkBtn.title = 'Check local source files for updates';
+        }, 1800);
+      }
+    }
+  } catch (e) {
+    if (manual) {
+      appendSystemMessage(`Update check failed: ${e.message}`);
+      if (checkBtn) restoreUpdateCheckButton(checkBtn);
+    }
+  }
+}
+
+function initUpdateChecker() {
+  const checkBtn = document.getElementById('btn-check-update');
+  if (checkBtn) {
+    checkBtn.addEventListener('click', () => checkForLocalUpdates({ manual: true }));
+  }
+  const btn = document.getElementById('btn-update-available');
+  if (btn) {
+    btn.addEventListener('click', async () => {
+      if (btn.disabled) return;
+      const orig = btn.textContent;
+      btn.textContent = 'Syncing...';
+      btn.disabled = true;
+      try {
+        const updateApi = getUpdateApi();
+        if (!updateApi.apply) throw new Error('Update is not available in this build');
+        await updateApi.apply();
+        btn.textContent = 'Restarting...';
+      } catch (e) {
+        btn.textContent = orig;
+        btn.disabled = false;
+        appendSystemMessage(`Update failed: ${e.message}`);
+      }
+    });
+  }
+  // First check after 15 seconds on startup, then every 30 minutes
+  setTimeout(checkForLocalUpdates, 15000);
+  setInterval(checkForLocalUpdates, 30 * 60 * 1000);
+}
+
+// Phone companion bridge functions for update
+window.checkPhoneCompanionUpdate = async () => {
+  const updateApi = getUpdateApi();
+  if (!updateApi.check) return { hasUpdate: false };
+  try { return await updateApi.check(); } catch (_) { return { hasUpdate: false }; }
+};
+window.applyPhoneCompanionUpdate = async () => {
+  const updateApi = getUpdateApi();
+  if (!updateApi.apply) return { success: false, error: 'Not available' };
+  try { return await updateApi.apply(); } catch (e) { return { success: false, error: e.message }; }
+};
+window.restartApp = async () => {
+  if (!window.api || !window.api.restartApp) return { success: false };
+  try { return await window.api.restartApp(); } catch (e) { return { success: false }; }
+};
+
+// ── Image attach (desktop) ─────────────────────────────────────────────────────
+
+let pendingImages = []; // Array of { data: base64string, mimeType: string, previewUrl: string, name: string }
+
+function addPendingImage(img) {
+  if (pendingImages.length >= 4) {
+    appendSystemMessage('Maximum 4 images per message.');
+    return;
+  }
+  pendingImages.push(img);
+  renderImagePreviews();
+}
+
+function clearPendingImages() {
+  pendingImages = [];
+  renderImagePreviews();
+}
+
+function renderImagePreviews() {
+  const container = document.getElementById('image-preview-container');
+  const thumbnails = document.getElementById('image-preview-thumbnails');
+  if (!container || !thumbnails) return;
+  if (pendingImages.length === 0) {
+    container.style.display = 'none';
+    thumbnails.innerHTML = '';
+    return;
+  }
+  container.style.display = '';
+  thumbnails.innerHTML = pendingImages.map((img, i) =>
+    `<div class="img-preview-thumb" data-idx="${i}">` +
+    `<img src="${img.previewUrl}" alt="${escapeHtml(img.name || 'image')}" title="${escapeHtml(img.name || 'image')}">` +
+    `<button class="img-preview-remove" data-idx="${i}" title="Remove image" aria-label="Remove image">&times;</button>` +
+    `</div>`
+  ).join('');
+  thumbnails.querySelectorAll('.img-preview-remove').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const idx = parseInt(btn.dataset.idx, 10);
+      if (!isNaN(idx)) {
+        pendingImages.splice(idx, 1);
+        renderImagePreviews();
+      }
+    });
+  });
+}
+
+function attachImageFile(file) {
+  if (!file) return;
+  if (!file.type.startsWith('image/')) {
+    appendSystemMessage('Only image files can be attached to messages.');
+    return;
+  }
+  if (file.size > 15 * 1024 * 1024) {
+    appendSystemMessage('Image too large — maximum size is 15 MB.');
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const dataUrl = e.target.result;
+    const base64 = dataUrl.split(',')[1];
+    addPendingImage({ data: base64, mimeType: file.type, previewUrl: dataUrl, name: file.name });
+  };
+  reader.readAsDataURL(file);
+}
+
+function initImageAttach() {
+  // Image attach button opens file picker
+  const btnAttach = document.getElementById('btn-attach-image');
+  const fileInput = document.getElementById('image-file-input');
+  if (btnAttach && fileInput) {
+    btnAttach.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files && fileInput.files.length > 0) {
+        for (const file of fileInput.files) {
+          attachImageFile(file);
+        }
+        fileInput.value = '';
+      }
+    });
+  }
+
+  // Paste image from clipboard (Ctrl+V into chat area or globally when chat is focused)
+  document.addEventListener('paste', (e) => {
+    const active = document.activeElement;
+    const isChatFocused = active && (active.id === 'chat-input' || active.closest('#chat-input-wrapper'));
+    if (!isChatFocused && active && active.id !== 'chat-input') return;
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    for (const item of items) {
+      if (item.type.startsWith('image/')) {
+        e.preventDefault();
+        const file = item.getAsFile();
+        if (file) attachImageFile(file);
+        break;
+      }
+    }
+  });
+}
+
 // --- SETTINGS CONFIGURATION ---
 async function loadSettings() {
   const loadedConfig = await window.api.readConfig();
@@ -293,6 +522,7 @@ async function loadSettings() {
   el.settingWorkspacePath.value = appConfig.defaultWorkspacePath || '';
   if (el.settingTestCmd) el.settingTestCmd.value = appConfig.regressionTestCommand || 'npm test';
   if (el.settingCommandTimeout) el.settingCommandTimeout.value = appConfig.commandTimeoutMs || 120000;
+  if (el.settingPhoneHttpsOrigin) el.settingPhoneHttpsOrigin.value = appConfig.phoneCompanionHttpsOrigin || '';
   if (el.settingModelCallDelay) el.settingModelCallDelay.value = appConfig.modelCallDelayMs || 0;
   el.settingCompactThreshold.value = appConfig.compactThresholdTokens || 100000;
   if (el.settingAutoTest) el.settingAutoTest.checked = appConfig.autoTest !== false;
@@ -420,6 +650,17 @@ async function initModelDropdown() {
   appConfig.defaultModel = modelSelect.value;
 }
 
+function normalizePhoneHttpsOrigin(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === 'https:' ? parsed.origin : '';
+  } catch (_) {
+    return '';
+  }
+}
+
 function setupSettingsModal() {
   el.btnSettings.addEventListener('click', () => {
     el.settingsModal.classList.add('active');
@@ -438,6 +679,14 @@ function setupSettingsModal() {
     appConfig.defaultWorkspacePath = el.settingWorkspacePath.value.trim();
     appConfig.regressionTestCommand = el.settingTestCmd ? el.settingTestCmd.value.trim() : appConfig.regressionTestCommand;
     appConfig.commandTimeoutMs = el.settingCommandTimeout ? (parseInt(el.settingCommandTimeout.value) || 120000) : appConfig.commandTimeoutMs;
+    const rawPhoneHttpsOrigin = el.settingPhoneHttpsOrigin ? el.settingPhoneHttpsOrigin.value.trim() : '';
+    const normalizedPhoneHttpsOrigin = normalizePhoneHttpsOrigin(rawPhoneHttpsOrigin);
+    if (rawPhoneHttpsOrigin && !normalizedPhoneHttpsOrigin) {
+      appendSystemMessage("Secure Phone URL must start with https:// so mobile notifications can work.");
+      return;
+    }
+    appConfig.phoneCompanionHttpsOrigin = normalizedPhoneHttpsOrigin;
+    if (el.settingPhoneHttpsOrigin) el.settingPhoneHttpsOrigin.value = normalizedPhoneHttpsOrigin;
     appConfig.modelCallDelayMs = el.settingModelCallDelay ? Math.min(Math.max(parseInt(el.settingModelCallDelay.value) || 0, 0), 60000) : (appConfig.modelCallDelayMs || 0);
     appConfig.compactThresholdTokens = parseInt(el.settingCompactThreshold.value) || 100000;
     appConfig.autoTest = el.settingAutoTest ? el.settingAutoTest.checked : true;
@@ -533,10 +782,7 @@ function setupWorkspaceHandlers() {
 
 async function setWorkspace(folderPath) {
   // If folderPath is in projects list, switch to it
-  if (!projects.includes(folderPath)) {
-    projects.push(folderPath);
-    saveProjectsToStorage();
-  }
+  addProjectPath(folderPath);
   
   // Set current parent project
   currentWorkspace = folderPath;
@@ -656,6 +902,71 @@ function setLeftSidebarCollapsed(collapsed, persist = true) {
   if (persist) localStorage.setItem('leftSidebarCollapsed', String(collapsed));
 }
 
+function setAppMode(mode, persist = true) {
+  appMode = mode;
+  document.body.setAttribute('data-mode', mode);
+
+  const orionBtn = document.getElementById('btn-mode-orion');
+  const coderBtn = document.getElementById('btn-mode-coder');
+  const orionContent = document.getElementById('sidebar-orion-content');
+  const coderContent = document.getElementById('sidebar-coder-content');
+  if (orionBtn) orionBtn.classList.toggle('active', mode === 'orion');
+  if (coderBtn) coderBtn.classList.toggle('active', mode === 'coder');
+  if (orionContent) orionContent.classList.toggle('active', mode === 'orion');
+  if (coderContent) coderContent.classList.toggle('active', mode === 'coder');
+
+  // Dispatch and Coder are separate entities with separate conversation histories -- a
+  // conversation that belongs to the other mode must never stay displayed after a mode switch.
+  if (conversations.length > 0) {
+    const activeConv = conversations.find(c => c.id === activeConversationId);
+    if (!activeConv || conversationMode(activeConv) !== mode) {
+      const replacement = conversations.find(c => conversationMode(c) === mode);
+      if (replacement) {
+        selectConversation(replacement.id);
+      } else {
+        createNewConversation(mode);
+      }
+    }
+  }
+
+  // Adapt main workspace for mode
+  const chatInput = document.getElementById('chat-input');
+  const orionSplash = document.getElementById('orion-welcome-splash');
+
+  if (mode === 'orion') {
+    if (chatInput) chatInput.placeholder = 'Ask Orion anything…';
+    // Show Orion greeting splash if no active conversation with messages
+    const conv = conversations.find(c => c.id === activeConversationId);
+    const hasMessages = conv && conv.messages && conv.messages.length > 0;
+    if (!hasMessages) {
+      if (el.welcomeSplash) el.welcomeSplash.style.display = 'none';
+      if (orionSplash) orionSplash.style.display = 'flex';
+      if (el.messagesContainer) el.messagesContainer.style.display = 'none';
+    }
+    // Update greeting time
+    updateOrionGreeting();
+  } else {
+    if (chatInput) chatInput.placeholder = 'Ask Orion to build, fix, or investigate…';
+    if (orionSplash) orionSplash.style.display = 'none';
+    // Restore coder splash if no messages
+    const conv = conversations.find(c => c.id === activeConversationId);
+    const hasMessages = conv && conv.messages && conv.messages.length > 0;
+    if (!hasMessages) {
+      if (el.welcomeSplash) el.welcomeSplash.style.display = 'flex';
+    }
+  }
+
+  if (persist) localStorage.setItem('appMode', mode);
+}
+
+function updateOrionGreeting() {
+  const nameEl = document.getElementById('orion-greeting-name');
+  if (!nameEl) return;
+  const hour = new Date().getHours();
+  const tod = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
+  nameEl.textContent = `${tod}, Jason.`;
+}
+
 function runCommandPaletteAction(command) {
   const targets = {
     'new-task': el.btnNewChat,
@@ -679,6 +990,27 @@ function setupProgressiveDisclosure() {
       setLeftSidebarCollapsed(!el.leftSidebar.classList.contains('collapsed'));
     });
   }
+
+  // Mode switcher
+  document.getElementById('btn-mode-orion')?.addEventListener('click', () => setAppMode('orion'));
+  document.getElementById('btn-mode-coder')?.addEventListener('click', () => setAppMode('coder'));
+  setAppMode(appMode, false); // Initialize from stored preference
+
+  // Orion prompt chips — populate input (with focus) so Jason can review/edit before sending
+  document.getElementById('orion-welcome-splash')?.addEventListener('click', (e) => {
+    const chip = e.target.closest('.orion-prompt-chip');
+    if (!chip) return;
+    const prompt = chip.dataset.prompt || '';
+    if (!prompt) return;
+    const input = el.chatInput;
+    if (!input) return;
+    input.value = prompt;
+    input.focus();
+    // Put cursor at end
+    input.setSelectionRange(prompt.length, prompt.length);
+    // Trigger resize in case the input uses auto-height
+    input.dispatchEvent(new Event('input'));
+  });
 
   const closePalette = () => el.commandPaletteModal && el.commandPaletteModal.classList.remove('active');
   const openPalette = () => {
@@ -1006,18 +1338,34 @@ async function loadRunArtifacts() {
 }
 
 function mergeRunAndWorkspaceScreenshotArtifacts(runArtifacts = []) {
-  const merged = Array.isArray(runArtifacts) ? [...runArtifacts] : [];
-  const existingScreenshots = new Set(merged
-    .filter(item => item && item.artifactType === 'screenshot')
-    .map(item => `${item.workspacePath || currentWorkspace}|${item.screenshotPath}`));
-  getWorkspaceScreenshotArtifacts().forEach(item => {
-    const key = `${item.workspacePath}|${item.screenshotPath}`;
-    if (!existingScreenshots.has(key)) {
-      existingScreenshots.add(key);
-      merged.push(item);
-    }
-  });
-  return merged.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+  return (Array.isArray(runArtifacts) ? [...runArtifacts] : [])
+    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+}
+
+function normalizeViewerPath(pathValue) {
+  return String(pathValue || '').replace(/\\/g, '/').replace(/^\/+/, '').trim().toLowerCase();
+}
+
+function isViewerGovernanceArtifactPath(pathValue) {
+  const normalized = normalizeViewerPath(pathValue);
+  return normalized === 'implementation_plan.md' || normalized === 'strategy.md' || normalized === 'work_walkthrough.md';
+}
+
+function extractTextReadContent(result) {
+  if (typeof result === 'string') return result;
+  if (result && !result.error && typeof result.content === 'string') return result.content;
+  if (result && result.error) throw new Error(result.error);
+  return '';
+}
+
+async function readConversationTextArtifact(conv, relativePath, options = {}) {
+  if (conv && conv.id && isViewerGovernanceArtifactPath(relativePath) && window.api.readConversationArtifact) {
+    const artifact = await window.api.readConversationArtifact(conv.id, relativePath, options);
+    if (artifact && artifact.success) return artifact.content || '';
+  }
+  const workspace = (conv && conv.workspace) || currentWorkspace;
+  const result = await window.api.readFile(workspace, relativePath, options);
+  return extractTextReadContent(result);
 }
 
 function getWorkspaceScreenshotArtifacts() {
@@ -1143,6 +1491,16 @@ function setupFileViewerModal() {
 
 async function openFileViewer(relPath) {
   if (!currentWorkspace || !relPath) return;
+  if (/\.(png|jpe?g|webp|gif)$/i.test(relPath)) {
+    await openImageArtifact({
+      artifactType: 'screenshot',
+      displayName: relPath.split(/[\\/]/).pop(),
+      workspacePath: currentWorkspace,
+      screenshotPath: relPath,
+      toolName: 'workspace image'
+    });
+    return;
+  }
   viewedFilePath = relPath;
   el.fileViewerTitle.textContent = relPath;
   const isMarkdown = /\.(md|markdown)$/i.test(relPath);
@@ -1154,9 +1512,16 @@ async function openFileViewer(relPath) {
   }
   el.fileViewerModal.classList.add('active');
 
-  const content = await window.api.readFile(currentWorkspace, relPath, { maxChars: 200000 });
-  if (content && content.error) {
-    const errorText = `Error loading file: ${content.error}`;
+  let content = '';
+  let readError = '';
+  try {
+    const conv = conversations.find(c => c.id === activeConversationId);
+    content = await readConversationTextArtifact(conv, relPath, { maxChars: 200000 });
+  } catch (err) {
+    readError = err && err.message ? err.message : 'unknown error';
+  }
+  if (readError) {
+    const errorText = `Error loading file: ${readError}`;
     if (isMarkdown && el.fileViewerMarkdown) {
       el.fileViewerMarkdown.textContent = errorText;
     } else {
@@ -1175,7 +1540,8 @@ async function openFileViewer(relPath) {
 async function openImageArtifact(item) {
   const workspacePath = item.workspacePath || currentWorkspace;
   const relPath = item.screenshotPath || item.path;
-  if (!workspacePath || !relPath || !window.api.readWorkspaceFileBase64) {
+  const isArtifactRef = /^orion-artifact:\/\//i.test(String(relPath || ''));
+  if ((!workspacePath && !isArtifactRef) || !relPath || !window.api.readWorkspaceFileBase64) {
     showToast('Screenshot artifact is missing its workspace path.', 'attention');
     return;
   }
@@ -1198,6 +1564,83 @@ async function openImageArtifact(item) {
   if (el.fileViewerImageMeta) {
     el.fileViewerImageMeta.textContent = [dimensions, size, item.toolName || 'screenshot'].filter(Boolean).join(' / ');
   }
+}
+
+function parseToolResultObject(result) {
+  if (!result) return null;
+  if (typeof result === 'object') return result;
+  if (typeof result !== 'string') return null;
+  try {
+    return JSON.parse(result);
+  } catch (_) {
+    return null;
+  }
+}
+
+function getInlineVisualArtifactsFromLogs(logs = []) {
+  const visualTools = new Set(['take_screenshot', 'preview_app', 'capture_screen']);
+  const seen = new Set();
+  return (Array.isArray(logs) ? logs : [])
+    .filter(log => log && visualTools.has(log.tool))
+    .map(log => {
+      const result = parseToolResultObject(log.result);
+      if (!result || result.success === false || !result.path) return null;
+      const path = String(result.path || '');
+      const key = `${path}|${result.width || 0}|${result.height || 0}`;
+      if (seen.has(key)) return null;
+      seen.add(key);
+      return {
+        toolName: log.tool,
+        path,
+        width: result.width || 0,
+        height: result.height || 0,
+        size: result.size || 0,
+        summary: result.summary || '',
+        displayName: path.split(/[\\/]/).pop() || 'screenshot.png'
+      };
+    })
+    .filter(Boolean);
+}
+
+function renderInlineArtifactCards(logs = []) {
+  const artifacts = getInlineVisualArtifactsFromLogs(logs);
+  if (!artifacts.length) return '';
+  const cards = artifacts.map(item => {
+    const meta = [
+      item.width && item.height ? `${item.width}x${item.height}` : '',
+      item.size ? `${Math.round(item.size / 1024)} KB` : '',
+      item.toolName || 'screenshot'
+    ].filter(Boolean).join(' / ');
+    return `
+      <button class="inline-artifact-card" type="button" data-open-artifact="${escapeHtml(item.path)}" data-artifact-tool="${escapeHtml(item.toolName || 'screenshot')}" data-artifact-width="${escapeHtml(item.width || '')}" data-artifact-height="${escapeHtml(item.height || '')}" data-artifact-size="${escapeHtml(item.size || '')}">
+        <span class="inline-artifact-icon">IMG</span>
+        <span class="inline-artifact-copy">
+          <span class="inline-artifact-title">${escapeHtml(item.displayName)}</span>
+          <span class="inline-artifact-meta">${escapeHtml(meta || 'Screenshot')}</span>
+        </span>
+      </button>
+    `;
+  }).join('');
+  return `<div class="inline-artifacts">${cards}</div>`;
+}
+
+function wireInlineArtifactOpeners(container) {
+  if (!container) return;
+  container.querySelectorAll('[data-open-artifact]').forEach(button => {
+    button.addEventListener('click', () => {
+      const path = button.getAttribute('data-open-artifact') || '';
+      if (!path) return;
+      openImageArtifact({
+        artifactType: 'screenshot',
+        displayName: path.split(/[\\/]/).pop() || 'screenshot.png',
+        screenshotPath: path,
+        toolName: button.getAttribute('data-artifact-tool') || 'screenshot',
+        width: Number(button.getAttribute('data-artifact-width') || 0),
+        height: Number(button.getAttribute('data-artifact-height') || 0),
+        size: Number(button.getAttribute('data-artifact-size') || 0)
+      });
+    });
+  });
 }
 
 function setFileViewerMode(mode) {
@@ -1281,9 +1724,52 @@ function setupChatHandlers() {
     });
   }
   
-  el.btnNewChat.addEventListener('click', createNewConversation);
+  // createNewConversation(mode = appMode) must not be passed directly as a listener -- the click
+  // Event object would be passed as `mode` and silently fail the 'coder' check, so wrap each call.
+  el.btnNewChat.addEventListener('click', () => createNewConversation());
   if (el.btnAddConversation) {
-    el.btnAddConversation.addEventListener('click', createNewConversation);
+    el.btnAddConversation.addEventListener('click', () => createNewConversation());
+  }
+  if (el.btnAddConversationCoder) {
+    el.btnAddConversationCoder.addEventListener('click', () => createNewConversation('coder'));
+  }
+  if (el.btnNewConversationCoder && el.newConvPickerMenu) {
+    const closePicker = () => { el.newConvPickerMenu.hidden = true; };
+    const openPicker = () => {
+      el.newConvPickerProjects.innerHTML = '';
+      if (projects.length === 0) {
+        el.newConvPickerDivider.hidden = true;
+        el.newConvPickerProjects.innerHTML = '<div class="new-conv-picker-empty">No projects added yet</div>';
+      } else {
+        el.newConvPickerDivider.hidden = false;
+        projects.forEach(path => {
+          const name = path.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || path;
+          const item = document.createElement('div');
+          item.className = 'new-conv-picker-item';
+          item.textContent = name;
+          item.title = path;
+          item.addEventListener('click', () => {
+            closePicker();
+            createNewConversationUnderProject(path);
+          });
+          el.newConvPickerProjects.appendChild(item);
+        });
+      }
+      el.newConvPickerMenu.hidden = false;
+    };
+    el.btnNewConversationCoder.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!el.newConvPickerMenu.hidden) { closePicker(); return; }
+      openPicker();
+    });
+    if (el.newConvPickerStandalone) {
+      el.newConvPickerStandalone.addEventListener('click', () => {
+        closePicker();
+        createNewConversation('coder');
+      });
+    }
+    el.newConvPickerMenu.addEventListener('click', (e) => e.stopPropagation());
+    document.addEventListener('click', closePicker);
   }
   
   // Model Select changes default
@@ -1588,15 +2074,17 @@ function sendQueuedPromptNow(queueId, conversationId) {
   }
 
   setQueuedPromptMessageState(queueId, conversationId, 'sent');
+  const queuedImages = Array.isArray(item.images) ? item.images : [];
   if (!item.alreadyRendered && conv.messages) {
-    conv.messages.push({ role: 'user', source: item.source || 'queue', text: item.prompt, createdAt: Date.now() });
+    conv.messages.push({ role: 'user', source: item.source || 'queue', text: item.prompt, createdAt: Date.now(), ...(queuedImages.length ? { images: queuedImages } : {}) });
     saveConversationsToStorage();
   }
   if (conversationId === activeConversationId && !item.alreadyRendered) {
-    renderUserMessage(item.prompt);
+    renderUserMessage(item.prompt, queuedImages, Date.now());
   }
   window.runAgentLoop(item.prompt, item.modelSelectValue || (el.modelSelect && el.modelSelect.value), conv, {
-    source: item.source || 'queue'
+    source: item.source || 'queue',
+    ...(queuedImages.length ? { images: queuedImages } : {})
   }).catch(error => {
     console.error('Queued prompt send-now run failed:', error);
     appendSystemMessage(`Queued prompt failed to start: ${error.message}`, { conversationId });
@@ -1607,20 +2095,31 @@ function markQueuedPromptRunning(queueId, conversationId) {
   setQueuedPromptMessageState(queueId, conversationId, 'sent');
 }
 
-function createNewConversation() {
+// Dispatch (Orion) and Coder are separate entities with their own conversation histories --
+// a standalone chat started in Coder is not the same as one started in Dispatch, even though
+// neither has a projectPath. Legacy conversations saved before this field existed infer their
+// mode from projectPath (only Coder ever had projects), so old data keeps behaving as before.
+function conversationMode(conv) {
+  if (!conv) return 'orion';
+  if (conv.mode === 'orion' || conv.mode === 'coder') return conv.mode;
+  return conv.projectPath ? 'coder' : 'orion';
+}
+
+function createNewConversation(mode = appMode) {
   const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
   const title = 'New Conversation';
-  
+
   const newConv = {
     id: newId,
     title: title,
+    mode: mode === 'coder' ? 'coder' : 'orion',
     projectPath: '',
     workspace: '', // will slugify on first prompt
     messages: [],
     tasks: [],
     testResults: null
   };
-  
+
   conversations.unshift(newConv);
   saveConversationsToStorage();
   
@@ -1641,6 +2140,7 @@ function createNewConversationUnderProject(projectPath) {
   const newConv = {
     id: newId,
     title: title,
+    mode: 'coder', // projects only ever exist under Coder
     projectPath: projectPath,
     workspace: '', // set on first prompt
     messages: [],
@@ -1661,6 +2161,32 @@ function createNewConversationUnderProject(projectPath) {
   el.chatInput.focus();
 }
 
+function createCoderConversationForProject(projectPath, { title = 'New Coder Task', select = false } = {}) {
+  const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+  const newConv = {
+    id: newId,
+    title: title || 'New Coder Task',
+    mode: 'coder',
+    projectPath,
+    workspace: projectPath,
+    messages: [],
+    tasks: [],
+    testResults: null
+  };
+
+  conversations.unshift(newConv);
+  saveConversationsToStorage();
+
+  if (select) {
+    selectConversation(newId);
+    el.chatInput.focus();
+  } else {
+    renderConversationList();
+  }
+
+  return newConv;
+}
+
 function getStandaloneWorkspaceRoot() {
   const configured = (appConfig.standaloneWorkspaceRoot || '').trim();
   if (configured) return configured.replace(/[\\\/]+$/, '');
@@ -1675,12 +2201,70 @@ function getStandaloneWorkspaceForTitle(title, convId) {
   return getStandaloneWorkspaceRoot() + '\\' + slug + suffix;
 }
 
-function createPhoneConversation({ projectPath = '', title = 'New Phone Task' } = {}) {
+function addProjectPath(folderPath) {
+  const normalized = normalizePathForComparison(folderPath);
+  if (!normalized) return false;
+  const exists = projects.some(pathValue => normalizePathForComparison(pathValue) === normalized);
+  if (exists) return false;
+  projects.push(folderPath);
+  saveProjectsToStorage();
+  renderProjectsList();
+  return true;
+}
+
+function normalizePathForComparison(path) {
+  return String(path || '').replace(/[\\/]+/g, '\\').replace(/[\\]+$/, '').toLowerCase();
+}
+
+function isGeneratedStandaloneWorkspace(path) {
+  const normalizedPath = normalizePathForComparison(path);
+  const standaloneRoot = normalizePathForComparison(getStandaloneWorkspaceRoot());
+  return !!(normalizedPath && standaloneRoot && (normalizedPath === standaloneRoot || normalizedPath.startsWith(standaloneRoot + '\\')));
+}
+
+function inferDesktopProjectsRoot(pathValue) {
+  const normalized = String(pathValue || '').replace(/[\\/]+/g, '\\').replace(/[\\]+$/, '');
+  const match = normalized.match(/^([a-zA-Z]:\\Users\\[^\\]+\\Desktop\\Projects)(?:\\|$)/i);
+  return match ? match[1] : '';
+}
+
+function getDispatchWorkspaceRoot() {
+  const configured = String(appConfig.dispatchWorkspaceRoot || '').trim();
+  if (configured) return configured.replace(/[\\\/]+$/, '');
+
+  for (const projectPath of projects) {
+    const inferred = inferDesktopProjectsRoot(projectPath);
+    if (inferred) return inferred;
+  }
+
+  const fromStandaloneRoot = inferDesktopProjectsRoot(getStandaloneWorkspaceRoot());
+  if (fromStandaloneRoot) return fromStandaloneRoot;
+
+  const fromDefaultWorkspace = inferDesktopProjectsRoot(appConfig.defaultWorkspacePath);
+  if (fromDefaultWorkspace) return fromDefaultWorkspace;
+
+  return 'C:\\Users\\Owner\\Desktop\\Projects';
+}
+
+function getConversationRunWorkspace(conv) {
+  if (!conv) return currentWorkspace || getDispatchWorkspaceRoot();
+  if (conversationMode(conv) === 'orion') {
+    const workspace = String(conv.workspace || '').trim();
+    if (workspace && !isGeneratedStandaloneWorkspace(workspace)) return workspace;
+    return getDispatchWorkspaceRoot();
+  }
+  return conv.workspace || conv.projectPath || '';
+}
+
+function createPhoneConversation({ projectPath = '', mode = 'orion', title = 'New Phone Task' } = {}) {
   const convId = 'conv-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
   const normalizedProjectPath = String(projectPath || '').trim();
   const conv = {
     id: convId,
     title,
+    // A project conversation only ever belongs to Coder, regardless of what the phone's mode
+    // toggle happened to be set to when the request came in.
+    mode: normalizedProjectPath ? 'coder' : (mode === 'coder' ? 'coder' : 'orion'),
     messages: [],
     createdAt: Date.now(),
     workspace: normalizedProjectPath || '',
@@ -1799,16 +2383,51 @@ function migrateConversations() {
   }
 
   let updated = false;
+
+  // One-time bulk fix: Dispatch (Orion) mode didn't exist before it shipped, so every standalone
+  // conversation that existed at that point was actually done in what is now Coder mode, not
+  // Dispatch. Runs exactly once so it never touches genuinely new Dispatch conversations created
+  // after this point.
+  if (!localStorage.getItem('orionCoderModeBackfillDone')) {
+    conversations.forEach(c => {
+      if (!c.projectPath && c.mode !== 'orion' && c.mode !== 'coder') {
+        c.mode = 'coder';
+      }
+    });
+    localStorage.setItem('orionCoderModeBackfillDone', 'true');
+    updated = true;
+  }
+
   conversations.forEach(c => {
-    if (!c.projectPath && c.workspace) {
-      // Find if workspace is inside any project folder
-      const matchingProj = projects.find(proj => {
+    const hasExplicitMode = c.mode === 'orion' || c.mode === 'coder';
+    const matchingWorkspaceProject = (!c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace))
+      ? projects.find(proj => {
         const lowerWorkspace = c.workspace.toLowerCase();
         const lowerProj = proj.toLowerCase();
         return lowerWorkspace.startsWith(lowerProj);
-      });
-      if (matchingProj) {
-        c.projectPath = matchingProj;
+      })
+      : null;
+
+    if (!hasExplicitMode) {
+      c.mode = (c.projectPath || matchingWorkspaceProject) ? 'coder' : 'orion';
+      updated = true;
+    }
+    if (c.mode === 'orion' && c.projectPath) {
+      c.projectPath = '';
+      updated = true;
+    }
+    if (c.mode === 'orion' && c.workspace && isGeneratedStandaloneWorkspace(c.workspace)) {
+      c.workspace = '';
+      updated = true;
+    }
+    if (c.projectPath && isGeneratedStandaloneWorkspace(c.workspace)) {
+      c.projectPath = '';
+      updated = true;
+    }
+    if (conversationMode(c) === 'coder' && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)) {
+      // Find if workspace is inside any project folder
+      if (matchingWorkspaceProject) {
+        c.projectPath = matchingWorkspaceProject;
         updated = true;
       }
     }
@@ -1943,6 +2562,24 @@ function extractConversationMessageLogs(msg) {
   return rebuiltLogs;
 }
 
+function latestToolActivity(logs = []) {
+  return [...logs].reverse().find(log => log && (log.type === 'tool_call' || log.tool));
+}
+
+function formatDispatchToolActivity(logs = []) {
+  const activity = latestToolActivity(logs);
+  if (!activity) return '';
+  const tool = activity.tool || 'tool';
+  const status = activity.status || 'running';
+  const verb = status === 'error' ? 'Had trouble with' : (status === 'running' ? 'Using' : 'Checked');
+  return `
+    <div class="dispatch-tool-activity ${escapeHtml(status)}">
+      <span class="dispatch-tool-pulse"></span>
+      <span>${verb} <code>${escapeHtml(tool)}</code></span>
+    </div>
+  `;
+}
+
 function normalizeConversationMessageForReplay(msg) {
   return {
     ...(msg || {}),
@@ -2005,6 +2642,10 @@ function saveConversationsToStorage() {
     localStorage.setItem('ag2_conversations_backup', serialized);
   } catch (e) {
     console.error("Failed to save conversations to localStorage; disk persistence remains primary", e);
+  }
+
+  if (window.api && typeof window.api.syncPhoneCompanion === 'function') {
+    window.api.syncPhoneCompanion();
   }
 }
 
@@ -2101,41 +2742,54 @@ function confirmConversationDelete(title) {
 }
 
 function renderConversationList() {
-  el.conversationList.innerHTML = '';
-  
-  // Standalone conversations have no projectPath
-  const standaloneConversations = conversations.filter(c => !c.projectPath);
-  
-  if (standaloneConversations.length === 0) {
-    el.conversationList.innerHTML = '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No standalone conversations yet</p>';
-    return;
-  }
-  
-  standaloneConversations.forEach(conv => {
-    const item = document.createElement('div');
-    item.className = `conversation-item ${conv.id === activeConversationId ? 'active' : ''}`;
-    
-    const age = 'now';
-    
-    item.innerHTML = `
-      <div class="conversation-details row-details-flex">
-        <span class="conversation-name">${escapeHtml(conv.title)}</span>
-        <span class="conversation-time">${age}</span>
-      </div>
-      <button class="delete-btn icon-btn-ghost" title="Delete conversation">&times;</button>
-    `;
+  // Dispatch (Orion) and Coder each keep their own standalone-conversation history -- a chat
+  // started in one never appears in the other's list, even though neither has a projectPath.
+  const listConfigs = [
+    { container: el.conversationList, mode: 'orion' },
+    { container: el.conversationListCoder, mode: 'coder' }
+  ].filter(cfg => cfg.container);
+  if (listConfigs.length === 0) return;
 
-    item.querySelector('.conversation-details').addEventListener('click', () => selectConversation(conv.id));
-    
-    item.querySelector('.delete-btn').addEventListener('click', async (e) => {
-      e.stopPropagation();
-      const approved = await confirmConversationDelete(conv.title);
-      if (approved?.confirmed) {
-        deleteConversation(conv.id);
-      }
+  listConfigs.forEach(({ container, mode }) => {
+    container.innerHTML = '';
+
+    const standaloneConversations = conversations.filter(c => {
+      const convMode = conversationMode(c);
+      if (convMode !== mode) return false;
+      return mode === 'orion' || !c.projectPath;
     });
 
-    el.conversationList.appendChild(item);
+    if (standaloneConversations.length === 0) {
+      container.innerHTML = '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No standalone conversations yet</p>';
+      return;
+    }
+
+    standaloneConversations.forEach(conv => {
+      const item = document.createElement('div');
+      item.className = `conversation-item ${conv.id === activeConversationId ? 'active' : ''}`;
+
+      const age = 'now';
+
+      item.innerHTML = `
+        <div class="conversation-details row-details-flex">
+          <span class="conversation-name">${escapeHtml(conv.title)}</span>
+          <span class="conversation-time">${age}</span>
+        </div>
+        <button class="delete-btn icon-btn-ghost" title="Delete conversation">&times;</button>
+      `;
+
+      item.querySelector('.conversation-details').addEventListener('click', () => selectConversation(conv.id));
+
+      item.querySelector('.delete-btn').addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const approved = await confirmConversationDelete(conv.title);
+        if (approved?.confirmed) {
+          deleteConversation(conv.id);
+        }
+      });
+
+      container.appendChild(item);
+    });
   });
 }
 
@@ -2146,10 +2800,20 @@ function selectConversation(id) {
   
   el.chatTitle.textContent = conv.title;
   normalizeConversationWorkspace(conv);
+  const convMode = conversationMode(conv);
   
   // Set active workspace to conversation workspace if initialized,
   // otherwise show pending first message
-  if (conv.workspace) {
+  const runWorkspace = getConversationRunWorkspace(conv);
+  if (convMode === 'orion') {
+    currentWorkspace = runWorkspace;
+    expandedFileFolders = new Set();
+    const wsName = currentWorkspace.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || currentWorkspace;
+    el.workspaceLabel.textContent = wsName;
+    el.fileTree.innerHTML = '<p class="empty-state">Dispatch can inspect known projects. Open Coder for file-tree editing.</p>';
+    el.fileCountBadge.textContent = '0';
+    if (el.workspaceFilesPanel) el.workspaceFilesPanel.classList.add('contextual-panel-hidden');
+  } else if (conv.workspace) {
     currentWorkspace = conv.workspace;
     expandedFileFolders = new Set();
     const wsName = conv.workspace.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || conv.workspace;
@@ -2168,11 +2832,19 @@ function selectConversation(id) {
   renderProjectsList(); // Re-render projects to update active state highlights
   
   // Reload messages
+  const orionSplashEl = document.getElementById('orion-welcome-splash');
   if (conv.messages.length === 0) {
-    el.welcomeSplash.style.display = 'flex';
+    if (appMode === 'orion' && orionSplashEl) {
+      orionSplashEl.style.display = 'flex';
+      el.welcomeSplash.style.display = 'none';
+    } else {
+      el.welcomeSplash.style.display = 'flex';
+      if (orionSplashEl) orionSplashEl.style.display = 'none';
+    }
     el.messagesContainer.style.display = 'none';
     el.messagesContainer.innerHTML = '';
   } else {
+    if (orionSplashEl) orionSplashEl.style.display = 'none';
     el.welcomeSplash.style.display = 'none';
     el.messagesContainer.style.display = 'flex';
     el.messagesContainer.innerHTML = '';
@@ -2182,7 +2854,7 @@ function selectConversation(id) {
       const replayLogs = Array.isArray(replayMsg.logs) ? replayMsg.logs : [];
       window.clearActiveAiBubble();
       if (replayMsg.role === 'user') {
-        renderUserMessage(replayMsg.text);
+        renderUserMessage(replayMsg.text, Array.isArray(replayMsg.images) ? replayMsg.images : [], replayMsg.createdAt || null);
       } else if (replayMsg.role === 'assistant') {
         if (isEmptyThinkingPlaceholder(replayMsg.text, replayLogs)) return;
         renderAiMessage(replayMsg.text, replayLogs, activeConversationId, replayMsg);
@@ -2251,9 +2923,14 @@ async function submitMessage() {
   // Hide splash
   el.welcomeSplash.style.display = 'none';
   el.messagesContainer.style.display = 'flex';
-  
-  // Render user prompt
-  renderUserMessage(prompt);
+
+  // Capture and clear pending images before rendering
+  const imagesToSend = pendingImages.length > 0 ? [...pendingImages] : [];
+  clearPendingImages();
+
+  // Render user prompt (with any attached images)
+  const userMsgTs = Date.now();
+  renderUserMessage(prompt, imagesToSend, userMsgTs);
   el.chatInput.value = '';
   
   // Rename the conversation from its first message. Gated on message count/title rather than
@@ -2272,38 +2949,59 @@ async function submitMessage() {
   if (!conv.workspace) {
     if (conv.projectPath) {
       conv.workspace = conv.projectPath;
-    } else {
+    } else if (conversationMode(conv) === 'coder') {
       conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id);
     }
   }
 
-  // Ensure currentWorkspace is locked onto this isolated folder
-  currentWorkspace = conv.workspace;
+  // Ensure currentWorkspace is useful for this mode. Coder standalone chats use isolated folders;
+  // Dispatch stays rooted at the real Projects directory unless it explicitly changes workspace.
+  currentWorkspace = getConversationRunWorkspace(conv);
   expandedFileFolders = new Set();
   el.workspaceLabel.textContent = currentWorkspace.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || currentWorkspace;
-  syncWorkspaceFiles();
+  if (conversationMode(conv) === 'coder') {
+    syncWorkspaceFiles();
+  } else {
+    el.fileTree.innerHTML = '<p class="empty-state">Dispatch can inspect known projects. Open Coder for file-tree editing.</p>';
+    el.fileCountBadge.textContent = '0';
+    if (el.workspaceFilesPanel) el.workspaceFilesPanel.classList.add('contextual-panel-hidden');
+  }
   
-  // Update messages history
-  conv.messages.push({ role: 'user', text: prompt });
+  // Update messages history (store compact image refs for replay)
+  const msgImages = imagesToSend.map(i => ({ data: i.data, mimeType: i.mimeType }));
+  conv.messages.push({ role: 'user', text: prompt, ...(msgImages.length ? { images: msgImages } : {}) });
   saveConversationsToStorage();
-  
+
   renderConversationList();
   renderProjectsList();
-  
+
   // Scroll to bottom for the local send action.
   scrollChatToBottom();
-  
-  // Trigger local Agent loop
+
+  // ── Supervisor interception: Orion message while a supervised Coder task runs ──
   if (window.runAgentLoop) {
     const selectedModel = el.modelSelect.value;
+    const runOptions = imagesToSend.length ? { images: imagesToSend } : {};
+
     if (window.isAgentRunning && window.isAgentRunning()) {
-      window.promptQueue.push({ prompt, modelSelectValue: selectedModel, conversationId: conv.id, alreadyRendered: true });
+      const runningConvId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+      const isOrionConv = conversationMode(conv) === 'orion';
+      const launchedCoderConvId = conv.launchedCoderConvId;
+
+      // If this Orion conversation launched the currently running Coder task, intercept
+      if (isOrionConv && launchedCoderConvId && runningConvId === launchedCoderConvId) {
+        handleSupervisorMessage(conv, prompt, selectedModel);
+        return;
+      }
+
+      // Default: queue as normal
+      window.promptQueue.push({ prompt, modelSelectValue: selectedModel, conversationId: conv.id, alreadyRendered: true, images: imagesToSend });
       persistAssistantStatusMessage(conv.id, "Queued. Orion will start this after the current task finishes.", {
         source: 'queue-status',
         dedupeKey: `queued-${conv.id}-${prompt}`
       });
     } else {
-      await window.runAgentLoop(prompt, selectedModel, conv);
+      await window.runAgentLoop(prompt, selectedModel, conv, runOptions);
       loadRunArtifacts();
     }
   } else {
@@ -2405,13 +3103,29 @@ function normalizeConversationWorkspace(conv) {
 }
 
 // RENDER HELPER FUNCTIONS
-function renderUserMessage(text) {
+
+function formatMsgTime(ts) {
+  if (!ts) return '';
+  return new Date(ts).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+}
+
+function renderUserMessage(text, images = [], timestamp = null) {
   const stickToBottom = shouldAutoScrollChat();
   const bubble = document.createElement('div');
   bubble.className = 'message-bubble';
+  const timeStr = formatMsgTime(timestamp || Date.now());
+  const imgsHtml = (images && images.length)
+    ? images.map(img =>
+        `<img src="data:${escapeHtml(img.mimeType)};base64,${img.data}" alt="attached image" ` +
+        `style="max-width:100%;max-height:280px;border-radius:8px;margin-top:8px;display:block;border:1px solid rgba(151,164,196,.15);">`
+      ).join('')
+    : '';
   bubble.innerHTML = `
-    <div class="message-header user">🧑 User</div>
-    <div class="message-body">${escapeHtml(text).replace(/\n/g, '<br>')}</div>
+    <div class="message-header user">
+      <span>🧑 You</span>
+      <span class="msg-timestamp">${timeStr}</span>
+    </div>
+    <div class="message-body">${escapeHtml(text).replace(/\n/g, '<br>')}${imgsHtml}</div>
   `;
   sanitizeRenderedMarkdown(bubble);
   el.messagesContainer.appendChild(bubble);
@@ -2547,6 +3261,7 @@ function showPhoneCompanionPairingCard(payload = {}, options = {}) {
 function updatePhoneCompanionPairingPanel(payload = {}) {
   const pairUrl = String(payload.pairUrl || '');
   const networkEnabled = payload.networkEnabled !== false && !!pairUrl;
+  const secureEnabled = payload.preferredUrlType === 'https' || /^https:\/\//i.test(pairUrl);
   const expiresText = payload.expiresAt ? `Expires: ${new Date(payload.expiresAt).toLocaleTimeString()}` : 'Short-lived pairing link';
   if (el.btnPhoneCompanion) {
     el.btnPhoneCompanion.style.display = '';
@@ -2564,8 +3279,19 @@ function updatePhoneCompanionPairingPanel(payload = {}) {
   }
   if (el.phoneCompanionMeta) {
     el.phoneCompanionMeta.textContent = networkEnabled
-      ? `${expiresText}. Desktop approval required.`
+      ? `${expiresText}. ${secureEnabled ? 'HTTPS enabled for phone notifications.' : 'Live view only; add an HTTPS phone URL in Settings for mobile notifications.'}`
       : 'LAN companion mode is disabled by default. No localhost QR is shown for phones.';
+  }
+  // Tailscale panel: show/hide the Tailscale QR block inside the pairing panel
+  const tsBlock = document.getElementById('phone-companion-tailscale-block');
+  const tsQrEl = document.getElementById('phone-companion-tailscale-qr');
+  const tsUrlEl = document.getElementById('phone-companion-tailscale-url');
+  if (tsBlock && payload.tailscaleQrSvg) {
+    tsBlock.style.display = '';
+    if (tsQrEl) tsQrEl.innerHTML = String(payload.tailscaleQrSvg || '');
+    if (tsUrlEl) tsUrlEl.textContent = String(payload.tailscaleStableUrl || payload.tailscalePairUrl || '');
+  } else if (tsBlock) {
+    tsBlock.style.display = 'none';
   }
   refreshPairedDevicesList().catch(() => {});
 }
@@ -2579,11 +3305,15 @@ async function refreshPairedDevicesList() {
     const devices = await window.api.getPhoneCompanionDevices();
     if (devices && devices.length > 0) {
       sectionContainer.style.display = 'block';
-      listContainer.innerHTML = devices.map(d => {
+      const activeDevices = devices.filter(d => !d.revoked);
+      const revokeAllBtn = activeDevices.length > 1
+        ? `<button class="btn-secondary btn-revoke-all-devices" type="button" style="margin-bottom:8px; font-size:0.75rem; opacity:0.8;">Revoke All (${activeDevices.length})</button>`
+        : '';
+      listContainer.innerHTML = revokeAllBtn + devices.map(d => {
         const lastSeen = d.lastSeenAt ? new Date(d.lastSeenAt).toLocaleTimeString() : 'Never';
         const statusText = d.revoked ? 'Revoked' : 'Active';
         const badgeClass = d.revoked ? 'fail' : 'pass';
-        
+
         return `
           <div class="device-item">
             <div class="device-copy">
@@ -2600,6 +3330,10 @@ async function refreshPairedDevicesList() {
       listContainer.querySelectorAll('[data-revoke-device-id]').forEach(button => {
         button.addEventListener('click', () => window.revokeDevice(button.dataset.revokeDeviceId || ''));
       });
+      const revokeAllButton = listContainer.querySelector('.btn-revoke-all-devices');
+      if (revokeAllButton) {
+        revokeAllButton.addEventListener('click', () => window.revokeAllDevices());
+      }
     } else {
       sectionContainer.style.display = 'none';
     }
@@ -2617,6 +3351,19 @@ window.revokeDevice = async (id) => {
   });
   if (approved?.confirmed && window.api && typeof window.api.revokePhoneCompanionDevice === 'function') {
     await window.api.revokePhoneCompanionDevice(id);
+    await refreshPairedDevicesList();
+  }
+};
+
+window.revokeAllDevices = async () => {
+  const approved = await showOrionConfirmDialog({
+    title: 'Revoke all devices?',
+    message: "All paired phones will lose access immediately. You can pair them again later.",
+    confirmLabel: 'Revoke All',
+    danger: true
+  });
+  if (approved?.confirmed && window.api && typeof window.api.revokeAllPhoneCompanionDevices === 'function') {
+    await window.api.revokeAllPhoneCompanionDevices();
     await refreshPairedDevicesList();
   }
 };
@@ -2649,20 +3396,41 @@ function renderPhoneCompanionPairingCard(payload) {
   const qrSvg = String(payload.qrSvg || '');
   const pairUrl = String(payload.pairUrl || '');
   const stableUrl = String(payload.stableUrl || pairUrl.replace(/\?.*$/, ''));
+  const secureEnabled = payload.preferredUrlType === 'https' || /^https:\/\//i.test(pairUrl);
   const expiresText = payload.expiresAt ? `Expires: ${new Date(payload.expiresAt).toLocaleTimeString()}` : 'Short-lived pairing link';
+
+  // Tailscale section — only shown when Tailscale is active on the desktop
+  const tailscaleQrSvg = String(payload.tailscaleQrSvg || '');
+  const tailscalePairUrl = String(payload.tailscalePairUrl || '');
+  const tailscaleStableUrl = String(payload.tailscaleStableUrl || '');
+  const tailscaleSection = tailscaleQrSvg ? `
+    <div style="border-top:1px solid var(--border-color); margin-top:14px; padding-top:14px;">
+      <div style="font-size:0.7rem; font-weight:800; text-transform:uppercase; letter-spacing:0.08em; color:#34d399; margin-bottom:8px;">🌐 Anywhere via Tailscale</div>
+      <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+        <div aria-label="Tailscale pairing QR code" style="background:#fff; padding:8px; border-radius:8px; line-height:0; border:2px solid #34d399;">${tailscaleQrSvg}</div>
+        <div style="min-width:180px; flex:1;">
+          <div style="color:var(--text-muted); font-size:0.8rem; margin-bottom:6px;">Scan this from any network — coffee shop, cell data, anywhere Tailscale is connected.</div>
+          <div style="font-family:var(--font-mono); font-size:.72rem; word-break:break-all; color:#34d399;">${escapeHtml(tailscaleStableUrl || tailscalePairUrl)}</div>
+        </div>
+      </div>
+    </div>
+  ` : '';
+
   bubble.innerHTML = `
     <div class="message-header" style="color: var(--accent-secondary);">Phone Companion Pairing</div>
     <div class="message-body" style="font-family: var(--font-sans); color: var(--text);">
+      <div style="font-size:0.7rem; font-weight:800; text-transform:uppercase; letter-spacing:0.08em; color:var(--accent-secondary); margin-bottom:8px;">📶 Local Wi-Fi</div>
       <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
         <div data-companion-qr="true" aria-label="Phone Companion pairing QR code" style="background:#fff; padding:8px; border-radius:8px; line-height:0;">${qrSvg}</div>
         <div style="min-width:220px; flex:1;">
           <div style="font-weight:700; margin-bottom:6px;">Scan once to trust this phone</div>
-          <div style="color: var(--text-muted); margin-bottom:8px;">After it connects, add the clean URL to your home screen so the icon opens your saved device session.</div>
+          <div style="color: var(--text-muted); margin-bottom:8px;">${secureEnabled ? 'This HTTPS link can request phone notifications. Add the clean URL to your home screen after pairing.' : 'This local link keeps live view working. Add a Secure Phone URL in Settings to enable background notifications.'}</div>
           <div data-pair-url="${escapeHtml(pairUrl)}" style="font-family: var(--font-mono); font-size:.76rem; word-break:break-all;">${escapeHtml(pairUrl)}</div>
           <div data-stable-phone-url="${escapeHtml(stableUrl)}" style="font-family: var(--font-mono); font-size:.76rem; word-break:break-all; margin-top:6px; color:var(--success-color);">${escapeHtml(stableUrl)}</div>
           <div data-pairing-metadata="true" style="color: var(--text-muted); font-size:.74rem; margin-top:8px;">${escapeHtml(expiresText)}</div>
         </div>
       </div>
+      ${tailscaleSection}
     </div>
   `;
   el.messagesContainer.appendChild(bubble);
@@ -2678,12 +3446,22 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   const hasLogs = Array.isArray(logs) && logs.length > 0;
   const isThinkingPlaceholder = String(text || '').trim() === 'Thinking...';
   if (!activeAiBubble && isThinkingPlaceholder && !hasLogs) {
-    return;
+    // A stale "Thinking..." placeholder from a run that ended without ever producing real text
+    // must not reappear on conversation load/replay. But while a run is actively in progress for
+    // this conversation, this is the very first call for the turn — before any tool call has
+    // happened — and skipping it left the chat area completely blank (no bubble, no spinner)
+    // until either a tool call fired or the whole run finished, which could be the entire
+    // duration of the model's first response. Let it through so the running-indicator spinner
+    // below shows immediately instead of leaving the user with no feedback at all.
+    const runningNow = window.isAgentRunning && window.isAgentRunning() &&
+      (window.getRunningConversationId ? window.getRunningConversationId() === targetId : true);
+    if (!runningNow) return;
   }
   const stickToBottom = shouldAutoScrollChat();
   let bubble;
   const isNew = !activeAiBubble;
-  
+  if (isNew) hideOrionTyping(); // remove typing indicator when real bubble appears
+
   if (!isNew) {
     bubble = activeAiBubble;
   } else {
@@ -2691,9 +3469,19 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     bubble.className = 'message-bubble';
     activeAiBubble = bubble;
   }
+
+  const runningConversationId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+  const activeConv = typeof conversations !== 'undefined'
+    ? conversations.find(c => c.id === activeConversationId)
+    : null;
+  const isDispatchConversation = activeConv && conversationMode(activeConv) === 'orion';
+  const isRunningThisConversation = !!(window.isAgentRunning && window.isAgentRunning() && runningConversationId === activeConversationId);
   
   let logsHtml = '';
   if (hasLogs) {
+    if (isDispatchConversation) {
+      logsHtml = isRunningThisConversation ? formatDispatchToolActivity(logs) : '';
+    } else {
     const isRunning = window.isAgentRunning && window.isAgentRunning();
     const displayStyle = isRunning ? 'flex' : 'none';
     const arrowSymbol = isRunning ? '▲' : '▼';
@@ -2713,11 +3501,15 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
       } else if (log.type === 'tool_call') {
         const statusClass = log.status || 'running';
         const resBox = log.result ? `<div class="tool-result-box">${escapeHtml(log.result)}</div>` : '';
+        const elapsedBadge = (log.elapsed != null && log.status !== 'running')
+          ? `<span class="tool-elapsed">${log.elapsed >= 1000 ? (log.elapsed / 1000).toFixed(1) + 's' : log.elapsed + 'ms'}</span>`
+          : '';
         logsHtml += `
           <div class="tool-run-badge">
             <div class="tool-call-info">
               <span class="tool-name">🛠️ ${escapeHtml(log.tool)}</span>
               <span class="tool-status ${statusClass}">${statusClass}</span>
+              ${elapsedBadge}
             </div>
             <div class="tool-params">Params: ${escapeHtml(JSON.stringify(log.params))}</div>
             ${resBox}
@@ -2727,6 +3519,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     });
     
     logsHtml += `</div></div>`;
+    }
   }
   
   // Render markdown text
@@ -2734,14 +3527,11 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   const renderedMarkdown = displayText
     ? (typeof marked !== 'undefined' ? marked.parse(displayText) : escapeHtml(displayText))
     : '';
+  const inlineArtifactsHtml = renderInlineArtifactCards(logs);
   
   let runningIndicatorHtml = '';
   let planApprovalHtml = '';
   let clarificationHtml = '';
-  const runningConversationId = window.getRunningConversationId ? window.getRunningConversationId() : null;
-  const activeConv = typeof conversations !== 'undefined'
-    ? conversations.find(c => c.id === activeConversationId)
-    : null;
   // Decide whether THIS bubble is the plan-approval card. On a fresh live render the message
   // object is not threaded in, so fall back to conversation state (the active bubble during a
   // planning yield is the plan bubble). On reloads the persisted msgMeta.isPlanApprovalCard
@@ -2810,11 +3600,16 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     `;
   }
   
+  const aiMsgTime = isNew ? formatMsgTime(Date.now()) : '';
   bubble.innerHTML = `
-    <div class="message-header ai">✦ Orion AI</div>
+    <div class="message-header ai">
+      <span>✦ Orion AI</span>
+      ${aiMsgTime ? `<span class="msg-timestamp">${aiMsgTime}</span>` : ''}
+    </div>
     ${logsHtml}
     <div class="message-body">
       ${renderedMarkdown}
+      ${inlineArtifactsHtml}
       ${clarificationHtml}
       ${planApprovalHtml}
       ${runningIndicatorHtml}
@@ -2834,6 +3629,19 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
       openFileViewer(relPath);
     });
   });
+  bubble.querySelectorAll('a[href^="orion-artifact://"]').forEach(link => {
+    link.addEventListener('click', (event) => {
+      event.preventDefault();
+      const href = link.getAttribute('href') || '';
+      openImageArtifact({
+        artifactType: 'screenshot',
+        displayName: href.split(/[\\/]/).pop() || 'screenshot.png',
+        screenshotPath: href,
+        toolName: 'artifact'
+      });
+    });
+  });
+  wireInlineArtifactOpeners(bubble);
   const approveButton = bubble.querySelector('.btn-approve-plan');
   if (approveButton) {
     approveButton.addEventListener('click', () => approveCurrentPlanAndContinue({ button: approveButton }));
@@ -3137,6 +3945,144 @@ async function runRegressionTests() {
   return testRunInfo;
 }
 
+// ── CLARIFICATION CARD ────────────────────────────────────────────────────────
+// Builds the interactive question-card HTML. Also used by the supervisor proxy.
+function buildClarificationCardHtml(clarData) {
+  const { intro, questions } = clarData || {};
+  const escapedIntro = (intro || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  const questionsHtml = (questions || []).map((q, qi) => {
+    const escapedHeader = (q.header || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const escapedQuestion = (q.question || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    const optionsHtml = (q.options || []).map((opt, oi) => {
+      const escapedLabel = (opt.label || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const escapedDesc = (opt.description || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const recommendedBadge = opt.recommended
+        ? `<span class="clarification-recommended-badge">Recommended</span>`
+        : '';
+      const descHtml = escapedDesc
+        ? `<span class="clarification-option-desc">${escapedDesc}</span>`
+        : '';
+      return `
+        <label class="clarification-option">
+          <input type="radio" name="clarq_${qi}" value="${oi}" />
+          <span class="clarification-option-body">
+            <span class="clarification-option-label-row">
+              <span class="clarification-option-label">${escapedLabel}</span>
+              ${recommendedBadge}
+            </span>
+            ${descHtml}
+          </span>
+        </label>`;
+    }).join('');
+
+    return `
+      <div class="clarification-question-block" data-qi="${qi}">
+        <div class="clarification-question-header">
+          <span class="clarification-chip">${escapedHeader}</span>
+          <span class="clarification-question-text">${escapedQuestion}</span>
+        </div>
+        <div class="clarification-options">
+          ${optionsHtml}
+          <label class="clarification-other-row">
+            <input type="radio" name="clarq_${qi}" value="__other__" />
+            <input class="clarification-other-input" type="text" placeholder="Other — type your answer…" data-qi="${qi}" />
+          </label>
+        </div>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="clarification-card">
+      ${escapedIntro ? `<div class="clarification-intro">${escapedIntro}</div>` : ''}
+      ${questionsHtml}
+      <div class="clarification-actions">
+        <button class="btn-clarification-submit" type="button">Submit</button>
+      </div>
+    </div>`;
+}
+
+async function submitClarificationAnswers({ button, bubble, targetConversationId } = {}) {
+  const targetId = targetConversationId || activeConversationId;
+  const conv = conversations.find(c => c.id === targetId);
+  if (!conv || !conv.awaitingClarification) return;
+
+  const clarData = conv.awaitingClarification;
+  const questions = clarData.questions || [];
+
+  const answers = [];
+  let allAnswered = true;
+  questions.forEach((q, qi) => {
+    const block = bubble ? bubble.querySelector(`.clarification-question-block[data-qi="${qi}"]`) : null;
+    let answer = null;
+    if (block) {
+      const checked = block.querySelector(`input[type="radio"][name="clarq_${qi}"]:checked`);
+      if (checked) {
+        if (checked.value === '__other__') {
+          const otherInput = block.querySelector(`.clarification-other-input[data-qi="${qi}"]`);
+          answer = otherInput ? otherInput.value.trim() : '';
+        } else {
+          const optIdx = parseInt(checked.value, 10);
+          answer = (q.options[optIdx] && q.options[optIdx].label) || '';
+        }
+      }
+    }
+    if (!answer) allAnswered = false;
+    answers.push({ header: q.header, question: q.question, answer: answer || '(no answer)' });
+  });
+
+  if (!allAnswered) {
+    if (button) {
+      button.textContent = 'Answer all questions first';
+      setTimeout(() => { button.textContent = 'Submit'; }, 1800);
+    }
+    return;
+  }
+
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Submitting…';
+  }
+  if (bubble) {
+    const card = bubble.querySelector('.clarification-card');
+    if (card) card.classList.add('answered');
+  }
+
+  const formattedAnswers = answers.map(a => `${a.header}: ${a.answer}`).join('\n');
+  const userMessage = `Here are my answers:\n${formattedAnswers}`;
+
+  // Supervisor proxy: if these answers belong to a Coder conversation, relay them there
+  const relayConvId = clarData._relayToConvId;
+  if (relayConvId) {
+    const coderConv = conversations.find(c => c.id === relayConvId);
+    if (coderConv) {
+      window.steeringQueue = window.steeringQueue || {};
+      window.steeringQueue[relayConvId] = window.steeringQueue[relayConvId] || [];
+      window.steeringQueue[relayConvId].push(`[CLARIFICATION ANSWER]\n${formattedAnswers}`);
+      coderConv.awaitingClarification = null;
+      conv.awaitingClarification = null;
+      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+      appendSystemMessage('Answers relayed to Coder.', { conversationId: targetId });
+    }
+    return;
+  }
+
+  conv.awaitingClarification = null;
+  renderUserMessage(userMessage);
+  conv.messages.push({ role: 'user', text: userMessage, source: 'clarification-answers' });
+  saveConversationsToStorage();
+
+  if (!appConfig.geminiApiKey) {
+    el.settingsModal.classList.add('active');
+    appendSystemMessage("Please enter and save your Gemini API Key first.");
+    return;
+  }
+
+  window.runAgentLoop(userMessage, el.modelSelect.value, conv, { source: 'clarification-answers' })
+    .catch(err => console.error('Clarification resume failed:', err));
+}
+
 // UTILITY ESCAPE HTML
 function escapeHtml(text) {
   if (typeof text !== 'string') return '';
@@ -3152,27 +4098,79 @@ function escapeHtml(text) {
 window.getAppConfig = () => appConfig;
 window.getActiveConversationId = () => activeConversationId;
 window.getCurrentWorkspace = () => currentWorkspace;
-window.changeActiveWorkspace = function(folderPath) {
-  if (activeConversationId) {
-    const conv = conversations.find(c => c.id === activeConversationId);
+window.changeActiveWorkspace = function(folderPath, options = {}) {
+  const targetConversationId = options.conversationId || activeConversationId;
+  let promoteProjectForWorkspace = options.promoteProject === true;
+  let targetMode = appMode;
+  if (targetConversationId) {
+    const conv = conversations.find(c => c.id === targetConversationId);
     if (conv) {
       conv.workspace = folderPath;
-      conv.projectPath = folderPath;
+      targetMode = conversationMode(conv);
+      const promoteProject = options.promoteProject === true || (options.promoteProject !== false && conversationMode(conv) === 'coder');
+      promoteProjectForWorkspace = promoteProject;
+      if (promoteProject) {
+        conv.projectPath = folderPath;
+      } else if (conversationMode(conv) === 'orion') {
+        conv.projectPath = '';
+      }
       saveConversationsToStorage();
     }
   }
-  if (!projects.includes(folderPath)) {
-    projects.push(folderPath);
-    saveProjectsToStorage();
-    renderProjectsList();
-  }
+  if (promoteProjectForWorkspace) addProjectPath(folderPath);
   currentWorkspace = folderPath;
   expandedFileFolders = new Set();
   el.workspaceLabel.textContent = folderPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || folderPath;
-  syncWorkspaceFiles();
+  if (promoteProjectForWorkspace || targetMode === 'coder') {
+    syncWorkspaceFiles();
+  } else {
+    el.fileTree.innerHTML = '<p class="empty-state">Dispatch is inspecting this folder. Promote it to Coder when you want to build or edit here.</p>';
+    el.fileCountBadge.textContent = '0';
+    if (el.workspaceFilesPanel) el.workspaceFilesPanel.classList.add('contextual-panel-hidden');
+  }
   refreshOperationalContext();
 };
+window.promoteWorkspaceToCoder = function(options = {}) {
+  const folderPath = String(options.path || currentWorkspace || '').trim();
+  if (!folderPath) return { success: false, error: 'No workspace path to promote.' };
+  addProjectPath(folderPath);
+
+  const prompt = String(options.prompt || '').trim();
+  const title = String(options.title || '').trim()
+    || (prompt ? generateConversationTitle(prompt) : 'New Coder Task');
+  const conv = createCoderConversationForProject(folderPath, {
+    title,
+    select: options.open === true
+  });
+
+  if (prompt) {
+    window.promptQueue = window.promptQueue || [];
+    window.promptQueue.push({
+      id: createQueuedPromptId(),
+      prompt,
+      modelSelectValue: window.getSelectedModel(),
+      conversationId: conv.id,
+      source: 'dispatch-handoff',
+      createdAt: Date.now()
+    });
+    persistAssistantStatusMessage(conv.id, 'Queued from Dispatch. Coder will start when the current turn finishes.', {
+      source: 'queue-status',
+      dedupeKey: `dispatch-handoff-${conv.id}`
+    });
+  }
+
+  renderProjectsList();
+  renderConversationList();
+  return {
+    success: true,
+    projectPath: folderPath,
+    conversationId: conv.id,
+    title: conv.title,
+    queued: !!prompt
+  };
+};
 window.getSelectedModel = () => el.modelSelect ? el.modelSelect.value : appConfig.defaultModel;
+window.getKnownProjects = () => projects.slice();
 window.selectConversationById = selectConversation;
 window.updateTasksChecklist = updateTasksChecklist;
 window.updateOperationalContext = updateOperationalContext;
@@ -3235,12 +4233,39 @@ function showToast(message, tone = 'default') {
   }, 3200);
 }
 
+// Typing indicator for Orion mode
+let orionTypingEl = null;
+function showOrionTyping() {
+  if (typeof appMode === 'undefined' || appMode !== 'orion') return;
+  if (orionTypingEl) return;
+  orionTypingEl = document.createElement('div');
+  orionTypingEl.className = 'orion-typing-indicator';
+  orionTypingEl.innerHTML = `
+    <span class="orion-typing-dot"></span>
+    <span class="orion-typing-dot"></span>
+    <span class="orion-typing-dot"></span>
+    <span class="orion-typing-label">Orion is thinking…</span>
+  `;
+  el.messagesContainer.appendChild(orionTypingEl);
+  el.messagesContainer.scrollTop = el.messagesContainer.scrollHeight;
+}
+function hideOrionTyping() {
+  if (orionTypingEl) {
+    orionTypingEl.remove();
+    orionTypingEl = null;
+  }
+}
+
 window.onAgentStatusChange = (running) => {
   const submitBtn = el.btnSubmit;
   const steerBtn = document.getElementById('btn-steer');
   const queueBtn = document.getElementById('btn-queue');
-  
+
   if (running) {
+    // ── Supervisor: record which conversation just started ──
+    _supervisorLastRunningConvId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+
+    showOrionTyping();
     submitBtn.innerHTML = '&#10022;';
     submitBtn.title = 'Send or queue message';
     if (el.btnStopAgent) {
@@ -3252,6 +4277,7 @@ window.onAgentStatusChange = (running) => {
     clearInterval(agentPresenceTimer);
     agentPresenceTimer = setInterval(refreshAgentPresence, 250);
   } else {
+    hideOrionTyping();
     clearInterval(agentPresenceTimer);
     agentPresenceTimer = null;
     submitBtn.innerHTML = '&#10022;';
@@ -3271,6 +4297,13 @@ window.onAgentStatusChange = (running) => {
       showToast('Orion finished the current run.', 'success');
       agentCompletionTimer = setTimeout(() => renderAgentPresence('idle', 'Ready', ''), 2600);
     }
+
+    // ── Supervisor: notify the Orion conversation that launched this Coder task ──
+    // We check all conversations because the finished conv may not be the active one.
+    const justFinishedId = _supervisorLastRunningConvId;
+    _supervisorLastRunningConvId = null;
+    if (justFinishedId) notifySupervisorOfCoderCompletion(justFinishedId);
+    hideCoderStatusCard();
   }
 };
 window.renderUserMessageInChat = renderUserMessage;
@@ -3293,9 +4326,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   });
   const messages = normalizedPhoneMessages.map(replayMsg => {
     const replayLogs = Array.isArray(replayMsg.logs) ? replayMsg.logs : [];
-    const text = replayMsg.role === 'assistant' && replayMsg.text === 'Thinking...' && replayLogs.length
-      ? replayLogs.map(log => log.content || log.result || '').filter(Boolean).join('\n')
-      : replayMsg.text;
+    const text = replayMsg.text;
     return {
       role: replayMsg.role,
       content: text,
@@ -3346,6 +4377,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     return {
       id: c.id,
       title: c.title || 'New Conversation',
+      mode: conversationMode(c),
       workspace: c.workspace || '',
       projectPath: c.projectPath || '',
       active: c.id === resolvedId,
@@ -3369,7 +4401,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     };
   });
   
-  const companionWorkspace = conv ? (conv.workspace || conv.projectPath || currentWorkspace || '') : currentWorkspace;
+  const companionWorkspace = conv ? getConversationRunWorkspace(conv) : currentWorkspace;
   const operationalResult = companionWorkspace && window.readOperationalContext
     ? await window.readOperationalContext(companionWorkspace)
     : null;
@@ -3393,6 +4425,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   return {
     conversationId: resolvedId,
     title: conv ? conv.title : '',
+    mode: conversationMode(conv),
     conversations: conversationsSummary,
     projects: projectSummaries,
     workspace: companionWorkspace,
@@ -3473,6 +4506,7 @@ function hasRequiredTestingPlanSection(content) {
 window.startPhoneCompanionTask = async (options = {}) => {
   const conv = createPhoneConversation({
     projectPath: options.projectPath || '',
+    mode: options.mode || 'orion',
     title: 'New Phone Task'
   });
 
@@ -3487,6 +4521,10 @@ window.submitPhoneCompanionPrompt = async (options) => {
   // Can be called with either a string or an options object
   const text = typeof options === 'string' ? options.trim() : String(options.prompt || '').trim();
   let targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
+  // Image data from phone companion (optional)
+  const phoneImageData = typeof options === 'object' && options.imageData ? options.imageData : null;
+  const phoneImageMime = typeof options === 'object' && options.imageMimeType ? options.imageMimeType : 'image/jpeg';
+  const phoneImages = phoneImageData ? [{ data: phoneImageData, mimeType: phoneImageMime }] : [];
 
   if (!text) return { success: false, error: 'Missing prompt' };
 
@@ -3494,6 +4532,7 @@ window.submitPhoneCompanionPrompt = async (options) => {
   if (!conv) {
     conv = createPhoneConversation({
       projectPath: typeof options === 'object' ? options.projectPath || '' : '',
+      mode: typeof options === 'object' ? options.mode || 'orion' : 'orion',
       title: 'New Phone Task'
     });
     targetId = conv.id;
@@ -3512,16 +4551,20 @@ window.submitPhoneCompanionPrompt = async (options) => {
   }
   normalizeConversationWorkspace(conv);
   if (!conv.workspace) {
-    conv.workspace = conv.projectPath || getStandaloneWorkspaceForTitle(conv.title, conv.id);
+    if (conv.projectPath) {
+      conv.workspace = conv.projectPath;
+    } else if (conversationMode(conv) === 'coder') {
+      conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id);
+    }
   }
   saveConversationsToStorage();
 
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
 
   if (isGlobalRunning) {
-    window.promptQueue.push({ prompt: text, modelSelectValue: window.getSelectedModel(), conversationId: targetId, source: 'phone' });
+    window.promptQueue.push({ prompt: text, modelSelectValue: window.getSelectedModel(), conversationId: targetId, source: 'phone', images: phoneImages });
     if (conv.messages) {
-      conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now() });
+      conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
       saveConversationsToStorage();
     }
     persistAssistantStatusMessage(targetId, "Queued. Orion will start this after the current task finishes.", {
@@ -3529,20 +4572,20 @@ window.submitPhoneCompanionPrompt = async (options) => {
       dedupeKey: `phone-queued-${targetId}-${text}`
     });
     if (targetId === activeConversationId) {
-      renderUserMessage(text);
+      renderUserMessage(text, phoneImages, Date.now());
     }
     return { success: true, queued: true, conversationId: targetId, title: conv.title || 'New Conversation' };
   }
 
   // Directly run agent loop on the target conversation (without forcing desktop UI switch)
   if (conv.messages) {
-    conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now() });
+    conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
     saveConversationsToStorage();
   }
   if (targetId === activeConversationId) {
-    renderUserMessage(text);
+    renderUserMessage(text, phoneImages, Date.now());
   }
-  window.runAgentLoop(text, window.getSelectedModel(), conv, { source: 'phone' })
+  window.runAgentLoop(text, window.getSelectedModel(), conv, { source: 'phone', images: phoneImages })
     .catch(err => {
       console.error("Phone-started agent loop failed:", err);
       persistAssistantStatusMessage(targetId, `Orion could not start this phone request: ${err.message}`, {
@@ -3587,11 +4630,7 @@ window.approvePhoneCompanionPlan = async (targetId) => {
   // Re-validate the testing plan section in implementation_plan.md
   let planIsValid = false;
   try {
-    const workspace = conv.workspace || currentWorkspace;
-    const planContent = await window.api.readFile(workspace, 'implementation_plan.md', { maxChars: 100000 });
-    const planText = typeof planContent === 'string'
-      ? planContent
-      : (planContent && !planContent.error && typeof planContent.content === 'string' ? planContent.content : '');
+    const planText = await readConversationTextArtifact(conv, 'implementation_plan.md', { maxChars: 100000 });
     planIsValid = hasRequiredTestingPlanSection(planText);
   } catch (err) {
     console.error('Error validating plan during phone approval:', err);
@@ -3603,6 +4642,23 @@ window.approvePhoneCompanionPlan = async (targetId) => {
 
   conv.planApproved = true;
   conv.awaitingPlanApproval = false;
+
+  if (resolvedId === activeConversationId) {
+    const buttons = document.querySelectorAll('.btn-approve-plan:not(.approved)');
+    buttons.forEach(button => {
+      button.classList.add('approved');
+      button.disabled = true;
+      button.textContent = '✓ Implementation Started';
+      const card = button.closest('.plan-approval-actions');
+      if (card) {
+        card.classList.add('approved');
+        const title = card.querySelector('.plan-approval-title');
+        if (title) title.textContent = 'Implementation started';
+        const subtitle = card.querySelector('.plan-approval-subtitle');
+        if (subtitle) subtitle.textContent = 'Orion is building from this approved plan.';
+      }
+    });
+  }
 
   const approvalText = "Plan approved via Phone Companion. Continuing implementation.";
   appendSystemMessage(approvalText, { conversationId: resolvedId, source: 'plan-approval' });
@@ -3630,6 +4686,8 @@ window.denyPhoneCompanionPlan = async (targetId) => {
   conv.awaitingPlanApproval = false;
   conv.planApproved = false;
   if (resolvedId === activeConversationId) {
+    const cards = document.querySelectorAll('.plan-approval-actions');
+    cards.forEach(card => card.remove());
     appendSystemMessage("Phone companion denied the pending plan.");
   }
   saveConversationsToStorage();
@@ -3662,7 +4720,7 @@ window.submitPhoneCompanionClarification = async ({ conversationId, answers } = 
 
   conv.awaitingClarification = null;
   if (resolvedId === activeConversationId) {
-    renderUserMessage(userMessage);
+    renderUserMessage(userMessage, [], Date.now());
   }
   conv.messages.push({ role: 'user', text: userMessage, source: 'clarification-answers' });
   saveConversationsToStorage();
@@ -3709,6 +4767,36 @@ window.discoverPhoneCompanionSkills = async (group) => {
   const result = await window.api.discoverSkills(group || null);
   if (!result || !result.success) return { skills: [], count: 0 };
   return { skills: result.skills, count: result.skills.length };
+};
+
+window.getPhoneCompanionModels = () => {
+  const current = el.modelSelect ? el.modelSelect.value : (appConfig.defaultModel || 'gemini-2.5-flash-lite');
+  const models = [];
+  if (el.modelSelect) {
+    for (const opt of el.modelSelect.options) {
+      const group = opt.parentElement && opt.parentElement.tagName === 'OPTGROUP'
+        ? opt.parentElement.label : 'Other';
+      models.push({ value: opt.value, label: opt.textContent.trim(), group });
+    }
+  }
+  return { current, models };
+};
+
+window.setPhoneCompanionModel = async (modelValue) => {
+  if (!el.modelSelect) return { success: false, error: 'Model selector not available on desktop' };
+  let found = false;
+  for (let i = 0; i < el.modelSelect.options.length; i++) {
+    if (el.modelSelect.options[i].value === modelValue) {
+      el.modelSelect.selectedIndex = i;
+      found = true;
+      break;
+    }
+  }
+  if (!found) return { success: false, error: `Unknown model: ${modelValue}` };
+  appConfig.defaultModel = modelValue;
+  localStorage.setItem('ag2_default_model', modelValue);
+  try { await window.api.writeConfig(appConfig); } catch (_) {}
+  return { success: true, model: modelValue };
 };
 
 window.runPhoneCompanionSkill = async ({ name, inputs } = {}) => {
@@ -3829,7 +4917,7 @@ async function submitClarificationAnswers({ button, bubble } = {}) {
   conv.awaitingClarification = null;
 
   // Render answers as a visible user message and persist to history
-  renderUserMessage(userMessage);
+  renderUserMessage(userMessage, [], Date.now());
   conv.messages.push({ role: 'user', text: userMessage, source: 'clarification-answers' });
   saveConversationsToStorage();
 
@@ -3870,11 +4958,7 @@ async function approveCurrentPlanAndContinue(options = {}) {
   // Re-validate the testing plan section in implementation_plan.md
   let planIsValid = false;
   try {
-    const workspace = conv.workspace || currentWorkspace;
-    const planContent = await window.api.readFile(workspace, 'implementation_plan.md', { maxChars: 100000 });
-    const planText = typeof planContent === 'string'
-      ? planContent
-      : (planContent && !planContent.error && typeof planContent.content === 'string' ? planContent.content : '');
+    const planText = await readConversationTextArtifact(conv, 'implementation_plan.md', { maxChars: 100000 });
     planIsValid = hasRequiredTestingPlanSection(planText);
   } catch (err) {
     console.error('Error validating plan during approval:', err);
@@ -3924,6 +5008,7 @@ async function approveCurrentPlanAndContinue(options = {}) {
 function deleteConversation(id) {
   const convToDelete = conversations.find(c => c.id === id);
   const parentProj = convToDelete ? convToDelete.projectPath : '';
+  cleanupConversationArtifacts(id);
   
   conversations = conversations.filter(c => c.id !== id);
   saveConversationsToStorage();
@@ -3946,6 +5031,8 @@ function deleteConversation(id) {
 }
 
 function removeProject(path) {
+  const removedConversationIds = conversations.filter(c => c.projectPath === path).map(c => c.id);
+  removedConversationIds.forEach(cleanupConversationArtifacts);
   projects = projects.filter(p => p !== path);
   saveProjectsToStorage();
   
@@ -3960,6 +5047,13 @@ function removeProject(path) {
     renderConversationList();
     renderProjectsList();
   }
+}
+
+function cleanupConversationArtifacts(id) {
+  if (!id || !window.api || typeof window.api.deleteConversationArtifacts !== 'function') return;
+  window.api.deleteConversationArtifacts(id).catch(err => {
+    console.warn('Failed to delete conversation artifacts:', err);
+  });
 }
 
 // Shared helper — builds one project card and appends it to el.projectList
@@ -4122,3 +5216,382 @@ window.onRagStatusChange = (statusText) => {
 };
 
 window.getCurrentProject = () => currentWorkspace;
+
+// Serve a workspace file to the phone companion for download/view.
+// Security: path must be absolute and start with the current workspace root.
+window.readWorkspaceFileForPhone = (filePath) => {
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    const fp = String(filePath || '').trim();
+    if (!fp) return { success: false, error: 'No path provided' };
+    const workspace = currentWorkspace || '';
+    const normalized = path.resolve(fp);
+    if (workspace && !normalized.startsWith(path.resolve(workspace))) {
+      return { success: false, error: 'Path outside workspace' };
+    }
+    if (!fs.existsSync(normalized)) return { success: false, error: 'File not found' };
+    const stat = fs.statSync(normalized);
+    if (!stat.isFile()) return { success: false, error: 'Not a file' };
+    if (stat.size > 10 * 1024 * 1024) return { success: false, error: 'File too large (>10 MB)' };
+    const ext = path.extname(normalized).toLowerCase().replace('.', '');
+    const textExts = new Set(['txt','md','csv','json','js','mjs','cjs','ts','jsx','tsx','py','html','htm','css','sh','bash','yml','yaml','xml','sql','toml','ini','env','log','gitignore','prettierrc','eslintrc']);
+    const fileContent = fs.readFileSync(normalized);
+    if (textExts.has(ext)) {
+      return { success: true, content: fileContent.toString('utf8'), encoding: 'utf8', mimeType: 'text/plain' };
+    }
+    const mimeMap = { pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', zip: 'application/zip' };
+    return { success: true, content: fileContent.toString('base64'), encoding: 'base64', mimeType: mimeMap[ext] || 'application/octet-stream' };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DISPATCHER-AS-SUPERVISOR LAYER
+// Manages the Orion → Coder supervision relationship:
+//   • Live steering channel (check-in / steering / normal routing)
+//   • Coder task state monitoring with notifications
+//   • Floating status card
+//   • Clarification proxy
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Track which conversation ID was running when onAgentStatusChange fired (needed
+// for the completion notification because running ID is already cleared by then).
+let _supervisorLastRunningConvId = null;
+
+// Polling interval handle for the Coder task monitor.
+let _coderTaskMonitorInterval = null;
+// { orionConvId, coderConvId, lastKnownState }
+let _coderTaskMonitorMeta = null;
+
+// ── Intent classifier ─────────────────────────────────────────────────────────
+// Returns 'checkin' | 'steering' | 'normal'
+function classifySupervisorIntent(text) {
+  const t = text.trim().toLowerCase();
+  const checkinPatterns = [
+    /\b(how'?s it going|how is it going|any updates?|what'?s happening|what is happening)\b/,
+    /\b(status|progress|update|what'?s (it|cody|the coder) (doing|working on|up to))\b/,
+    /\b(check in|checking in|where are (we|you|things)|what have (you|we|they) done)\b/,
+    /^(how|what|where|any).{0,60}\?$/,
+  ];
+  const steeringPatterns = [
+    /\b(also|additionally|on top of that|in addition)\b/,
+    /\b(instead|skip|ignore|don't|do not|forget about|drop|remove)\b/,
+    /\b(focus on|prioritize|make sure|be sure|actually)\b/,
+    /\b(change|add|include|don't include|avoid|use|don't use)\b/,
+    /\b(while you'?re at it|while (it'?s|cody'?s) working)\b/,
+  ];
+  if (checkinPatterns.some(p => p.test(t))) return 'checkin';
+  if (steeringPatterns.some(p => p.test(t))) return 'steering';
+  // Short imperative sentences are usually steering
+  if (t.length < 120 && /^(also|add|skip|use|make|don't|do|change|include|avoid|focus|prioritize)/.test(t)) return 'steering';
+  return 'normal';
+}
+
+// ── Build a human-readable status summary from Coder conversation data ────────
+function buildCoderStatusSummary(coderConvId) {
+  if (typeof window.getCoderConversationSummary !== 'function') return null;
+  const data = window.getCoderConversationSummary(coderConvId);
+  if (!data) return null;
+
+  const lines = [];
+  const { tasks, doneTasks, pendingTasks, recentActivity, subStatus } = data;
+
+  // Task progress
+  if (tasks.length > 0) {
+    lines.push(`**Tasks:** ${doneTasks.length}/${tasks.length} done.`);
+    const inProg = tasks.find(t => t.status === 'in-progress' || t.status === '/');
+    if (inProg) lines.push(`Currently working on: _${inProg.title || inProg.text || 'a task'}_`);
+  }
+
+  // Most recent tool activity
+  const toolCalls = recentActivity.filter(a => a.tool && a.tool !== '_thought').slice(-3);
+  if (toolCalls.length > 0) {
+    const toolNames = toolCalls.map(tc => tc.tool).join(', ');
+    lines.push(`Recent tools: ${toolNames}`);
+  }
+
+  // Latest thought/text
+  const lastThought = [...recentActivity].reverse().find(a => a.tool === '_thought');
+  if (lastThought && lastThought.text) {
+    const preview = lastThought.text.slice(0, 160).replace(/\s+/g, ' ');
+    lines.push(`Last update: "${preview}${lastThought.text.length > 160 ? '…' : ''}"`);
+  }
+
+  if (subStatus) lines.push(`Currently: ${subStatus}`);
+
+  return lines.length > 0 ? lines.join('\n') : 'Working — no detailed status available yet.';
+}
+
+// ── Main supervisor message handler ──────────────────────────────────────────
+// Called from submitMessage() when user types in Orion while Coder is running.
+function handleSupervisorMessage(orionConv, prompt, model) {
+  const coderConvId = orionConv.launchedCoderConvId;
+  const intent = classifySupervisorIntent(prompt);
+
+  if (intent === 'checkin') {
+    // Build a status reply immediately without starting the full agent loop
+    const summary = buildCoderStatusSummary(coderConvId);
+    const replyText = summary
+      ? `Here's what Coder is up to:\n\n${summary}`
+      : 'Coder is still working — no detailed status available yet.';
+
+    // Persist as an assistant message in the Orion conversation
+    orionConv.messages.push({ role: 'assistant', text: replyText, source: 'supervisor-checkin', createdAt: Date.now() });
+    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    if (typeof window.renderAiMessage === 'function') {
+      // Clear any lingering active bubble so this renders as a fresh new bubble
+      if (typeof window.clearActiveAiBubble === 'function') window.clearActiveAiBubble();
+      window.renderAiMessage(replyText, [], orionConv.id);
+    }
+    if (typeof scrollChatToBottom === 'function') scrollChatToBottom();
+    return;
+  }
+
+  if (intent === 'steering') {
+    // Inject directly into the Coder's steering queue
+    window.steeringQueue = window.steeringQueue || {};
+    window.steeringQueue[coderConvId] = window.steeringQueue[coderConvId] || [];
+    window.steeringQueue[coderConvId].push(prompt);
+    appendSystemMessage(`Steering sent to Coder: "${prompt.slice(0, 80)}${prompt.length > 80 ? '…' : ''}"`, { conversationId: orionConv.id });
+    return;
+  }
+
+  // 'normal' — queue for after Coder finishes
+  window.promptQueue = window.promptQueue || [];
+  window.promptQueue.push({ prompt, modelSelectValue: model, conversationId: orionConv.id, alreadyRendered: true });
+  persistAssistantStatusMessage(orionConv.id, 'Queued — Coder is busy. Orion will handle this when it finishes.', {
+    source: 'queue-status',
+    dedupeKey: `supervisor-queued-${orionConv.id}-${Date.now()}`
+  });
+}
+
+// ── Coder task state monitor ──────────────────────────────────────────────────
+// Polls the Coder conversation every 2s to detect state changes.
+window.startCoderTaskMonitor = function(orionConvId, coderConvId) {
+  // Clear any existing monitor
+  if (_coderTaskMonitorInterval) {
+    clearInterval(_coderTaskMonitorInterval);
+    _coderTaskMonitorInterval = null;
+  }
+
+  _coderTaskMonitorMeta = {
+    orionConvId,
+    coderConvId,
+    lastAwaitingClarification: false,
+    lastAwaitingPlanApproval: false,
+    lastRunning: true,        // Coder just started, so it's running
+    startTime: Date.now(),
+    notifiedClarification: false,
+  };
+
+  _coderTaskMonitorInterval = setInterval(() => {
+    if (!_coderTaskMonitorMeta) return;
+    const { orionConvId, coderConvId } = _coderTaskMonitorMeta;
+
+    const orionConv = conversations.find(c => c.id === orionConvId);
+    const coderConv = conversations.find(c => c.id === coderConvId);
+    if (!orionConv || !coderConv) {
+      stopCoderTaskMonitor();
+      return;
+    }
+
+    const isCoderRunning = !!(window.isAgentRunning && window.isAgentRunning()
+      && window.getRunningConversationId && window.getRunningConversationId() === coderConvId);
+    const nowAwaitingClarification = !!(coderConv.awaitingClarification) && !isCoderRunning;
+    const nowAwaitingPlan = !!(coderConv.awaitingPlanApproval && !coderConv.planApproved) && !isCoderRunning;
+    const elapsed = Math.round((Date.now() - _coderTaskMonitorMeta.startTime) / 1000);
+
+    // Update the status card if active Orion conv is watching
+    if (isCoderRunning && activeConversationId === orionConvId) {
+      const subStatus = window.getAgentSubStatus ? window.getAgentSubStatus() : '';
+      showCoderStatusCard(coderConv.title || 'Coder Task', subStatus, elapsed);
+    }
+
+    // Detect: Coder needs clarification → proxy it into Orion
+    if (nowAwaitingClarification && !_coderTaskMonitorMeta.notifiedClarification) {
+      _coderTaskMonitorMeta.notifiedClarification = true;
+      renderCoderClarificationProxy(orionConv, coderConv.awaitingClarification, coderConvId);
+      showCoderStatusCard(coderConv.title || 'Coder Task', 'Waiting for your input…', elapsed);
+    }
+    // Reset flag if coder cleared its clarification
+    if (!coderConv.awaitingClarification) {
+      _coderTaskMonitorMeta.notifiedClarification = false;
+    }
+
+    // Detect: Coder is awaiting plan approval → notify Orion
+    if (nowAwaitingPlan && !_coderTaskMonitorMeta.lastAwaitingPlanApproval) {
+      _coderTaskMonitorMeta.lastAwaitingPlanApproval = true;
+      notifyOrionConversation(orionConv, `Coder has written an implementation plan and is waiting for your approval. Switch to the Coder conversation to review it.`, 'supervisor-plan');
+    }
+    if (!nowAwaitingPlan) _coderTaskMonitorMeta.lastAwaitingPlanApproval = false;
+
+    _coderTaskMonitorMeta.lastRunning = isCoderRunning;
+  }, 2000);
+};
+
+function stopCoderTaskMonitor() {
+  if (_coderTaskMonitorInterval) {
+    clearInterval(_coderTaskMonitorInterval);
+    _coderTaskMonitorInterval = null;
+  }
+  _coderTaskMonitorMeta = null;
+  hideCoderStatusCard();
+}
+window.stopCoderTaskMonitor = stopCoderTaskMonitor;
+
+// ── Supervisor completion notification ────────────────────────────────────────
+function notifySupervisorOfCoderCompletion(finishedCoderConvId) {
+  if (!finishedCoderConvId) return;
+  const orionConv = conversations.find(c => c.launchedCoderConvId === finishedCoderConvId);
+  if (!orionConv) return;
+
+  // Stop the monitor now that the task finished
+  if (_coderTaskMonitorMeta && _coderTaskMonitorMeta.coderConvId === finishedCoderConvId) {
+    stopCoderTaskMonitor();
+  }
+
+  const coderConv = conversations.find(c => c.id === finishedCoderConvId);
+  const taskTitle = orionConv.launchedCoderTaskTitle || (coderConv && coderConv.title) || 'Coder Task';
+  const tasks = (coderConv && coderConv.tasks) || [];
+  const doneTasks = tasks.filter(t => t.status === 'completed' || t.status === 'x');
+  const pendingTasks = tasks.filter(t => t.status !== 'completed' && t.status !== 'x');
+  const elapsed = orionConv.launchedCoderTaskStart
+    ? Math.round((Date.now() - orionConv.launchedCoderTaskStart) / 60000)
+    : null;
+
+  // Determine outcome
+  const blockedFlag = coderConv && Array.isArray(coderConv.messages)
+    && coderConv.messages.slice(-3).some(m => /blocked|cannot|error|failed/i.test(m.text || ''));
+
+  let summaryText;
+  if (pendingTasks.length > 0 && doneTasks.length === 0) {
+    summaryText = `Coder stopped on **${taskTitle}** — ${pendingTasks.length} task${pendingTasks.length > 1 ? 's' : ''} still pending. It may have hit a blocker. Check the Coder conversation for details.`;
+  } else if (pendingTasks.length > 0) {
+    summaryText = `Coder finished part of **${taskTitle}** — ${doneTasks.length} done, ${pendingTasks.length} remaining. You can queue a continuation or check the Coder conversation.`;
+  } else {
+    const elapsed_str = elapsed ? ` (${elapsed}m)` : '';
+    summaryText = `Coder finished **${taskTitle}**${elapsed_str}. ${doneTasks.length > 0 ? `${doneTasks.length} task${doneTasks.length > 1 ? 's' : ''} completed.` : ''} Ready for your next direction.`;
+  }
+
+  notifyOrionConversation(orionConv, summaryText, 'supervisor-completion');
+
+  // Clear the launched coder conv reference so we don't double-notify
+  orionConv.launchedCoderConvId = null;
+  orionConv.launchedCoderTaskTitle = null;
+  orionConv.launchedCoderTaskStart = null;
+  if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+}
+
+// Appends a message to an Orion conversation, rendering it if active.
+function notifyOrionConversation(orionConv, text, source) {
+  if (!orionConv || !text) return;
+  orionConv.messages.push({ role: 'assistant', text, source, createdAt: Date.now() });
+  if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+  if (activeConversationId === orionConv.id && typeof window.renderAiMessage === 'function') {
+    window.clearActiveAiBubble();
+    window.renderAiMessage(text, [], orionConv.id);
+  }
+}
+
+// ── Clarification proxy ────────────────────────────────────────────────────────
+// Renders the Coder's clarification question in the Orion conversation so the
+// user can answer without switching to the Coder tab.
+function renderCoderClarificationProxy(orionConv, clarData, coderConvId) {
+  if (!orionConv || !clarData) return;
+
+  // Tag the clarification data so submitClarificationAnswers knows to relay it
+  const proxyClarData = { ...clarData, _relayToConvId: coderConvId };
+
+  // Set the clarification on the Orion conversation so the bubble renders it
+  orionConv.awaitingClarification = proxyClarData;
+
+  const introText = `Coder needs your input before continuing:\n\n${clarData.intro || ''}`;
+  // Mark this message as a clarification card
+  orionConv.messages.push({
+    role: 'assistant',
+    text: introText,
+    source: 'supervisor-clarification',
+    isClarificationCard: true,
+    createdAt: Date.now()
+  });
+  if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+
+  // Render it in the active chat if we're looking at this Orion conversation
+  if (activeConversationId === orionConv.id) {
+    if (typeof window.clearActiveAiBubble === 'function') window.clearActiveAiBubble();
+    const bubble = document.createElement('div');
+    bubble.className = 'message-bubble';
+    const clarHtml = buildClarificationCardHtml(proxyClarData);
+    bubble.innerHTML = `
+      <div class="message-header ai">
+        <span>✦ Orion AI</span>
+      </div>
+      <div class="message-body">
+        <p>${escapeHtml(introText)}</p>
+        ${clarHtml}
+      </div>
+    `;
+    const container = document.getElementById('messages-container');
+    if (container) {
+      container.style.display = 'flex';
+      container.appendChild(bubble);
+    }
+    // Wire clarification UI interactions
+    bubble.querySelectorAll('.clarification-option, .clarification-other-row').forEach(row => {
+      row.addEventListener('click', () => {
+        const radio = row.querySelector('input[type="radio"]');
+        if (radio) radio.checked = true;
+        const block = row.closest('.clarification-question-block');
+        if (block) block.querySelectorAll('.clarification-option, .clarification-other-row').forEach(r => r.classList.remove('selected'));
+        row.classList.add('selected');
+      });
+    });
+    bubble.querySelectorAll('.clarification-other-input').forEach(input => {
+      input.addEventListener('focus', () => {
+        const row = input.closest('.clarification-other-row');
+        if (row) {
+          const radio = row.querySelector('input[type="radio"]');
+          if (radio) radio.checked = true;
+          const block = row.closest('.clarification-question-block');
+          if (block) block.querySelectorAll('.clarification-option, .clarification-other-row').forEach(r => r.classList.remove('selected'));
+          row.classList.add('selected');
+        }
+      });
+    });
+    const clarSubmitBtn = bubble.querySelector('.btn-clarification-submit');
+    if (clarSubmitBtn) {
+      clarSubmitBtn.addEventListener('click', () => submitClarificationAnswers({
+        button: clarSubmitBtn,
+        bubble,
+        targetConversationId: orionConv.id
+      }));
+    }
+    scrollChatToBottom();
+    showToast('Coder is waiting for your input.', 'default');
+  }
+}
+
+
+// ── Status card ───────────────────────────────────────────────────────────────
+function showCoderStatusCard(taskTitle, subStatus, elapsedSec) {
+  const card = document.getElementById('coder-task-status-card');
+  if (!card) return;
+  const titleEl = card.querySelector('.coder-status-task-name');
+  const subEl = card.querySelector('.coder-status-substatus');
+  const elapsedEl = card.querySelector('.coder-status-elapsed');
+  if (titleEl) titleEl.textContent = taskTitle || 'Coder Task';
+  if (subEl) subEl.textContent = subStatus || 'Working…';
+  if (elapsedEl) {
+    const mins = Math.floor(elapsedSec / 60);
+    const secs = elapsedSec % 60;
+    elapsedEl.textContent = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
+  }
+  card.classList.add('visible');
+}
+
+function hideCoderStatusCard() {
+  const card = document.getElementById('coder-task-status-card');
+  if (card) card.classList.remove('visible');
+}
