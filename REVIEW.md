@@ -1,55 +1,73 @@
-# OrionAI Code Review
+# Orion AI — Active Issue Review
 
-## CRITICAL
+> Last audited: 2026-07-06
+> All source claims verified against live `main` branch code.
 
-### 1. Config write race condition (`lib/config.js`)
-`writeAppConfig` writes to a hardcoded temp filename `config.tmp.json` then renames it. Two concurrent callers (SSE updating `lastSeenAt` on every request + another endpoint updating `selectedConversationId`) both write to the same temp file. Last rename wins, first write's data is silently lost. `atomicWriteFileSync()` already exists in the file and does this correctly — `writeAppConfig` just doesn't use it.
-
-### 2. SSE drops on Android after ~60s (`lib/ipc-server.js`)
-The `/api/events` endpoint sends no keepalive pings. Android Chrome aggressively kills idle connections. When it drops, the 3-second polling fallback is suppressed because `lastSseMessageAt` was recently set. The phone shows stale state and doesn't recover. **This is very likely contributing to the "everything unresponsive" issue on your Pixel.** Fix: send `': ping\n\n'` every ~20 seconds inside the SSE handler.
+This file tracks known issues, both fixed and open. Items move to **RESOLVED** only when confirmed against the actual source files.
 
 ---
 
-## MODERATE
+## RESOLVED — Previously Reported, Now Fixed
 
-### 3. Deny plan button: no error handling, no double-tap protection (`companion-html.js`)
-The async click handler has no try/catch and doesn't disable the button. Network failure = unhandled promise rejection. Double-tap = two requests. The approve button handles both correctly; deny doesn't.
+All 7 issues from the original REVIEW.md have been verified fixed in the current source.
 
-### 4. Orphan conversations on new chat failure (`companion-html.js`)
-`startNewPhoneChat` (now defined) creates the conversation first, then sends the prompt separately. If the prompt call fails, the conversation exists in Orion but the UI stays on the new-chat screen. That conversation becomes unreachable from the phone.
+### Critical
 
-### 5. Markdown double-escapes HTML entities in link labels (`companion-html.js`)
-`renderInlineMarkdown` runs `escapeHtml()` on the whole string first, then the link regex captures text that's already HTML-escaped. Any `&`, `<`, `>`, `"`, or `'` in a link label renders as `&amp;amp;` etc.
+| ID | Issue | Evidence |
+|----|-------|----------|
+| #1 | **Config write race** — `writeAppConfig` used `config.tmp.json`; concurrent callers could silently lose data | `atomicWriteFileSync` is used; no temp-file pattern remains (`lib/config.js:138`) |
+| #2 | **SSE drops (~60s)** — No keepalive pings; phone companion showed stale state | Keepalive `: ping\n\n` fires every 20s (`lib/ipc-server.js:747-749`) |
 
-### 6. Three `:root` CSS blocks — first two are dead (`companion-html.js`)
-There are three separate `:root { }` declarations in the stylesheet. The third overrides everything. The first block (where most CSS variables like `--accent`, `--bg`, etc. are defined) has zero effect at runtime. All three should be collapsed into one.
+### Moderate
 
-### 7. `callRendererFunction` throws on any falsy return (`lib/ipc-server.js`)
-`if (!result) throw new Error('Phone companion bridge is not ready yet')` — if any renderer function legitimately returns `false`, `0`, `null`, or `''`, the phone gets a 500 error. Should be `if (result === undefined)`.
+| ID | Issue | Evidence |
+|----|-------|----------|
+| #3 | **Deny-plan lacks try/catch** — Button had no double-tap or error protection | `denyBtn.disabled = true` on click, `.catch()` re-enables, "Denying…" feedback (`companion-html.js:2714-2727`) |
+| #4 | **Orphan conversations on phone** — `startNewPhoneChat` navigated away before creating conversation | Creates conversation first, navigates to chat, *then* sends prompt; error shown in-chat on failure (`companion-html.js:2225-2265`) |
+| #5 | **Markdown double-escapes HTML entities** — `<br>` appeared as `&lt;br&gt;` in link labels | `renderInlineMarkdown` extracts code blocks and markdown links from raw text *before* HTML-escaping the rest (`companion-html.js:2442-2470`) |
+| #6 | **Three `:root` CSS blocks** — Only the third took effect; first two were dead code | One `:root` block in `styles.css:2678`; companion-html has one with "Single consolidated :root" comment (line 22) |
+| #7 | **callRendererFunction falsy rejection** — Returned `false`, `0`, or `''` was incorrectly rejected as missing | Checks `=== undefined \|\| === null`, not all falsy values (`lib/ipc-server.js:507`) |
+
+### Minor — Also Fixed
+
+| Issue | Evidence |
+|-------|----------|
+| `machineName` never passed to `companionHtml()` | Parameter is passed and used for connection badge, drawer meta, and conn-text (`companion-html.js:5, 1158, 1540, 1822, 1889, 1893`) |
+| `body overflow:hidden` breaks Android keyboard | Comment explicitly notes: "overflow:hidden only on .app-root — keeping it on html/body breaks Android keyboard reflow" (`companion-html.js:39`); html/body have no `overflow` property |
+| `main.js.bak` committed to repo | Not found anywhere in source tree — cleaned up |
+| Debug overlay / tap-test elements in companion | Not found in source — removed |
+| Hidden compat DOM elements (`#project-select`, etc.) | Not found in source — removed |
+| Tool log expand placeholder dies on re-render | Not found in source — removed |
+| SW caches `/marked.min.js` | No service worker registration exists; entire push/SW pipeline is absent from current codebase |
 
 ---
 
-## MINOR
+## OPEN — Verified Active Issues
 
-- **`machineName` never passed to `companionHtml()`** — the connection badge always says "Connected to Desktop" regardless of actual machine name (`lib/ipc-server.js:292`)
-- **`body { overflow: hidden }` breaks Android keyboard reflow** — known Chrome Android issue where the virtual keyboard opening doesn't shrink the layout, pushing the composer input off-screen (`companion-html.js:34`)
-- **`#typing-indicator` element is dead** — `applyState()` always removes the `visible` class; the actual typing indicator is rendered directly into `messagesEl.innerHTML`. The standalone element does nothing.
-- **`main.js.bak` (198KB) committed to repo** — should be deleted and added to `.gitignore`
-- **Service worker caches `/marked.min.js`** — if marked isn't installed, SW install fails permanently and offline mode is broken
-- **Tool log "open" expand/collapse is a dead placeholder** — every tool call renders `<span>open</span>` that was never wired up to anything
-- **Hidden compat DOM elements never used** — `#project-select`, `#new-task-dup`, `#queue-line`, etc. are in a `display:none` div and are never queried by any JS
-- **`startPhoneCompanionServer` not awaited** — returns the pairing payload before confirming the server has actually bound to the port
-- **`stateRequestSerial` guard can silently drop state loads** — when `minSerial` is provided, the counter isn't incremented, so concurrent loads using the real counter can make the `minSerial` stale and silently discard state updates
-- **Debug overlay in production** — the red TAP TEST button and `window.onerror` display (added this session for diagnostics) need to be removed once we confirm clicks work on your phone
+These are the remaining known issues, confirmed against current source.
+
+### Minor
+
+1. **`#typing-indicator` is dead on phone companion**
+   - Element exists in HTML (`companion-html.js:1353`), has visibility CSS rules (`.typing-indicator.visible` at line 600), and is queried into `typingIndicatorEl` (line 1605).
+   - **No code ever toggles the `visible` class.** The desktop UI's typing indicator (`orion-typing-indicator` in renderer.js) works independently, but the phone companion's standalone element never appears.
+   - *Fix: toggle `typingIndicatorEl.classList.toggle('visible', isTyping)` in the companion state update path.*
+
+2. **`startPhoneCompanionServer` is fire-and-forget**
+   - Called at `main.js:186` without `await`.
+   - The function (`lib/ipc-server.js:519`) likely returns a Promise. If binding fails, the error is silently lost and the phone companion will never start.
+   - *Fix: add `await` and handle rejection (log + desktop notification).*
+
+3. **`stateRequestSerial` guard can silently drop state loads**
+   - `companion-html.js:1710` initializes `stateRequestSerial = 0`.
+   - When `minSerial` is provided (line 3134), the counter is NOT incremented, but the guard at line 3163 (`if (requestSerial < stateRequestSerial) return`) compares against the real counter.
+   - A concurrent `minSerial` load followed by a real-counter load can cause the real-counter response to be discarded because `stateRequestSerial` advanced past it.
+   - *Fix: increment `stateRequestSerial` even when `minSerial` is used, or track a separate counter for minSerial loads.*
 
 ---
 
-## Priority Order
+## Architectural Notes (Not Bugs, Worth Knowing)
 
-1. **SSE keepalive** — almost certainly part of the Android unresponsiveness
-2. **Config write race** — silent data corruption
-3. **Three `:root` blocks** — easy cleanup with visual impact
-4. **`callRendererFunction` falsy check** — defensive fix
-5. **`machineName`** — tiny fix, obvious improvement
-6. **`body overflow: hidden`** — Android keyboard fix
-7. **Deny plan error handling** — parity with approve button
+- **Monolithic core files**: `agent.js` (~8,634 lines), `renderer.js` (~5,704 lines), `companion-html.js` (~3,950 lines) carry the entire app. Duplicated function definitions exist (`buildClarificationCardHtml` at lines 3966 and 4825; `submitClarificationAnswers` at lines 4022 and 4881).
+- **Push notification pipeline**: The `web-push` npm package is listed in dependencies and server-side VAPID/notify functions may exist in an earlier branch state, but the **current source has zero push infrastructure** — no service worker, no `PushManager.subscribe()`, no notification permission request, no `/api/subscribe` endpoint, no `notifyPhoneDevice` calls.
+- **REVIEW.md audit gap**: Before this rewrite, the document listed 7 unfixed bugs that had actually been resolved for some time. Consider adding a CI check that greps for `RESOLVED` items with stale dates.
