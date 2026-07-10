@@ -58,6 +58,7 @@ contextBridge.exposeInMainWorld('api', {
   browserDownloadFromPage: (workspacePath, selector, url, destination) => ipcRenderer.invoke('browser-download-from-page', { workspacePath, selector, url, destination }),
   browserWaitForPage: (timeoutMs) => ipcRenderer.invoke('browser-wait-for-page', { timeoutMs }),
   takeScreenshot: (workspacePath, destination, conversationId) => ipcRenderer.invoke('take-screenshot', { workspacePath, destination, conversationId }),
+  showAgentBrowser: () => ipcRenderer.invoke('show-agent-browser'),
   previewApp: (workspacePath, options = {}) => ipcRenderer.invoke('preview-workspace-app', { workspacePath, command: options.command, warmupMs: options.warmupMs, destination: options.destination, processId: options.processId, timeoutMs: options.timeoutMs, conversationId: options.conversationId }),
   captureScreen: (workspacePath, options = {}) => ipcRenderer.invoke('capture-screen', { workspacePath, destination: options.destination, delayMs: options.delayMs, conversationId: options.conversationId }),
   inspectScreenshot: (workspacePath, relativePath) => ipcRenderer.invoke('inspect-screenshot', { workspacePath, relativePath }),
@@ -85,8 +86,11 @@ contextBridge.exposeInMainWorld('api', {
   readConfig: () => ipcRenderer.invoke('read-config'),
   getAppRuntimeInfo: () => ipcRenderer.invoke('get-app-runtime-info'),
   writeConfig: (config) => ipcRenderer.invoke('write-config', config),
-  readConversations: () => ipcRenderer.invoke('read-conversations'),
-  writeConversations: (conversations) => ipcRenderer.invoke('write-conversations', conversations),
+  readConversationsIndex: () => ipcRenderer.invoke('read-conversations-index'),
+  readConversation: (id) => ipcRenderer.invoke('read-conversation', id),
+  writeConversation: (conv) => ipcRenderer.invoke('write-conversation', conv),
+  writeConversationsIndex: (index) => ipcRenderer.invoke('write-conversations-index', index),
+  deleteConversation: (id) => ipcRenderer.invoke('delete-conversation', id),
   
   // Shell Runner
   runCommand: (command, cwd, processId, timeoutMs) => ipcRenderer.invoke('run-command', { command, cwd, processId, timeoutMs }),

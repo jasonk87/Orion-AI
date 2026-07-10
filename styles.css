@@ -3549,3 +3549,52 @@ body[data-mode="orion"] .messages-container {
   color: var(--text-muted);
   letter-spacing: 0.01em;
 }
+
+/* UI Polish Additions */
+.btn-primary, .btn-secondary, .chrome-icon-button, .command-item, .conversation-row, .project-item {
+  transition: all 0.2s ease;
+}
+
+@keyframes pulse-dot {
+  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(70, 213, 155, 0.7); }
+  70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(70, 213, 155, 0); }
+  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(70, 213, 155, 0); }
+}
+
+@keyframes shimmer {
+  0% { opacity: 0.4; }
+  50% { opacity: 0.8; }
+  100% { opacity: 0.4; }
+}
+
+.agent-state-pill.thinking .agent-state-dot,
+.agent-state-pill.acting .agent-state-dot {
+  animation: pulse-dot 1.5s infinite;
+}
+
+.ai-thinking-placeholder {
+  animation: shimmer 1.5s infinite;
+}
+
+.secondary-action {
+  display: none !important;
+}
+
+/* System Messages Redesign */
+.system-log-line {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 6px 12px;
+  margin: 6px auto;
+  max-width: 85%;
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: #8e8e93;
+}
+.system-log-line .system-icon { opacity: 0.5; }
+.system-log-line .system-text { opacity: 0.8; }

@@ -1,0 +1,16 @@
+{
+  "name": "test-skill",
+  "displayName": "Test Skill",
+  "description": "A test skill",
+  "group": "test-group",
+  "version": "1.0.0",
+  "inputs": {
+    "val": "number"
+  },
+  "outputs": {
+    "out": "number"
+  },
+  "createdBy": "orion",
+  "createdAt": "2026-07-08T22:12:48.177Z",
+  "tested": true
+}

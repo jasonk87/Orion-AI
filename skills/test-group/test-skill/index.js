@@ -1,0 +1,1 @@
+module.exports = async (inputs) => { return { out: inputs.val * 2 }; };

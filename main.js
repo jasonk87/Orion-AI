@@ -68,35 +68,95 @@ function registerAllHandlers() {
     return await findReferences(args.workspacePath, args.symbolName, args.targetPath);
   });
 
-  const getConversationsPath = () => path.join(app.getPath('userData'), 'conversations.json');
-  ipcMain.handle('read-conversations', () => {
-    const filePath = getConversationsPath();
-    try {
-      if (!fs.existsSync(filePath)) {
-        return { success: true, conversations: [], path: filePath, missing: true };
+  const getConversationsDir = () => {
+    const dir = path.join(app.getPath('userData'), 'conversations');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  };
+  const getConversationsIndexPath = () => path.join(app.getPath('userData'), 'conversations-index.json');
+  const getLegacyConversationsPath = () => path.join(app.getPath('userData'), 'conversations.json');
+
+  function migrateLegacyConversations() {
+    const legacyPath = getLegacyConversationsPath();
+    const indexPath = getConversationsIndexPath();
+    if (fs.existsSync(legacyPath) && !fs.existsSync(indexPath)) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(legacyPath, 'utf8').replace(/^\uFEFF/, ''));
+        if (Array.isArray(parsed)) {
+          const dir = getConversationsDir();
+          const index = [];
+          for (const conv of parsed) {
+            atomicWriteFileSync(path.join(dir, `conv-${conv.id}.json`), `${JSON.stringify(conv, null, 2)}\n`, 'utf8');
+            const stub = { ...conv };
+            delete stub.messages;
+            delete stub.tasks;
+            delete stub.testResults;
+            delete stub.fileTree;
+            delete stub.scratchpad;
+            stub.hasMessages = Array.isArray(conv.messages) && conv.messages.length > 0;
+            index.push(stub);
+          }
+          atomicWriteFileSync(indexPath, `${JSON.stringify(index, null, 2)}\n`, 'utf8');
+          fs.renameSync(legacyPath, legacyPath + '.bak');
+        }
+      } catch (err) {
+        console.error("Migration failed:", err);
       }
+    }
+  }
+
+  ipcMain.handle('read-conversations-index', () => {
+    migrateLegacyConversations();
+    const filePath = getConversationsIndexPath();
+    try {
+      if (!fs.existsSync(filePath)) return { success: true, index: [], path: filePath, missing: true };
       const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, ''));
-      return { success: true, conversations: Array.isArray(parsed) ? parsed : [], path: filePath };
+      return { success: true, index: Array.isArray(parsed) ? parsed : [], path: filePath };
     } catch (error) {
-      return { success: false, conversations: [], path: filePath, error: error.message };
+      return { success: false, index: [], path: filePath, error: error.message };
     }
   });
-  ipcMain.handle('write-conversations', (event, payload) => {
-    const filePath = getConversationsPath();
+
+  ipcMain.handle('write-conversations-index', (event, payload) => {
+    const filePath = getConversationsIndexPath();
     try {
-      const conversations = Array.isArray(payload)
-        ? payload
-        : (payload && Array.isArray(payload.conversations) ? payload.conversations : null);
-      const revision = payload && Number(payload.revision || 0);
-      if (!Array.isArray(conversations)) throw new Error('Conversation payload must be an array');
-      if (revision && revision < lastConversationWriteRevision) {
-        return { success: true, path: filePath, count: conversations.length, stale: true };
-      }
-      atomicWriteFileSync(filePath, `${JSON.stringify(conversations, null, 2)}\n`, 'utf8');
-      if (revision) lastConversationWriteRevision = revision;
-      return { success: true, path: filePath, count: conversations.length };
+      const index = Array.isArray(payload) ? payload : (payload && payload.index ? payload.index : []);
+      atomicWriteFileSync(filePath, `${JSON.stringify(index, null, 2)}\n`, 'utf8');
+      return { success: true };
     } catch (error) {
-      return { success: false, path: filePath, error: error.message };
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('read-conversation', (event, id) => {
+    const filePath = path.join(getConversationsDir(), `conv-${id}.json`);
+    try {
+      if (!fs.existsSync(filePath)) return { success: false, missing: true };
+      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, ''));
+      return { success: true, conversation: parsed };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('write-conversation', (event, conv) => {
+    if (!conv || !conv.id) return { success: false, error: "Missing conv.id" };
+    const filePath = path.join(getConversationsDir(), `conv-${conv.id}.json`);
+    try {
+      atomicWriteFileSync(filePath, `${JSON.stringify(conv, null, 2)}\n`, 'utf8');
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('delete-conversation', (event, id) => {
+    const filePath = path.join(getConversationsDir(), `conv-${id}.json`);
+    try {
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error.message };
     }
   });
 }

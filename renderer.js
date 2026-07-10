@@ -248,6 +248,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
   
+  const btnShowAgentBrowser = document.getElementById('btn-show-agent-browser');
+  if (btnShowAgentBrowser) {
+    btnShowAgentBrowser.addEventListener('click', async () => {
+      if (window.api && typeof window.api.showAgentBrowser === 'function') {
+        const result = await window.api.showAgentBrowser();
+        if (!result.success) {
+          alert(`Failed to show agent browser: ${result.error}`);
+        }
+      }
+    });
+  }
+  
   // Load projects from local storage
   loadProjectsFromStorage();
   renderProjectsList();
@@ -2323,11 +2335,6 @@ function conversationSortTime(conversation) {
 
 function chooseRicherConversation(current, candidate) {
   if (!current) return candidate;
-  const currentScore = conversationMessageValue(current);
-  const candidateScore = conversationMessageValue(candidate);
-  if (candidateScore !== currentScore) {
-    return candidateScore > currentScore ? candidate : current;
-  }
   return conversationSortTime(candidate) >= conversationSortTime(current) ? candidate : current;
 }
 
@@ -2345,19 +2352,31 @@ async function loadConversationsFromStorage() {
   const local = parseConversationStorageCandidate(localStorage.getItem('ag2_conversations'), 'ag2_conversations');
   const backup = parseConversationStorageCandidate(localStorage.getItem('ag2_conversations_backup'), 'ag2_conversations_backup');
   let disk = [];
-  if (window.api && typeof window.api.readConversations === 'function') {
+  if (window.api && typeof window.api.readConversationsIndex === 'function') {
     try {
-      const result = await window.api.readConversations();
-      if (result && result.success && Array.isArray(result.conversations)) {
-        disk = result.conversations;
+      const result = await window.api.readConversationsIndex();
+      if (result && result.success && Array.isArray(result.index)) {
+        disk = result.index;
       } else if (result && result.error) {
-        console.warn('Failed to read disk conversation store', result.error);
+        console.warn('Failed to read disk conversation index', result.error);
       }
     } catch (error) {
-      console.warn('Disk conversation store is unavailable', error);
+      console.warn('Disk conversation index is unavailable', error);
     }
   }
-  conversations = mergeConversationSets(disk, local, backup);
+  
+  // Merge and enforce stub formatting
+  conversations = mergeConversationSets(disk, local, backup).map(c => {
+    // A conversation is a stub if it explicitly says so, OR if it has no messages in its payload
+    const isStub = c.isStub !== false && (!Array.isArray(c.messages) || c.messages.length === 0);
+    return {
+      ...c,
+      isStub,
+      messages: Array.isArray(c.messages) ? c.messages : [],
+      tasks: Array.isArray(c.tasks) ? c.tasks : [],
+    };
+  });
+  
   scrubLegacyPhoneCompanionTokenMessages();
   if (conversations.length > 0) {
     saveConversationsToStorage();
@@ -2612,36 +2631,85 @@ async function refreshPhoneCompanionPairing() {
   }
 }
 
+let saveConversationsTimeout = null;
+let dirtyConversationIds = new Set();
+
+window.markConversationDirty = function(id) {
+  if (id) dirtyConversationIds.add(id);
+};
+
 function saveConversationsToStorage() {
+  if (saveConversationsTimeout) clearTimeout(saveConversationsTimeout);
+  saveConversationsTimeout = setTimeout(() => {
+    executeSaveConversationsToStorage();
+  }, 300);
+}
+
+function executeSaveConversationsToStorage() {
   const revision = ++conversationSaveRevision;
-  let snapshot = null;
-  try {
-    snapshot = JSON.parse(JSON.stringify(conversations));
-  } catch (error) {
-    console.error("Failed to serialize conversations", error);
-    return;
+  
+  // 1. Build the lightweight index
+  const index = conversations.map(c => {
+    return {
+      id: c.id,
+      title: c.title,
+      mode: c.mode,
+      projectPath: c.projectPath,
+      workspace: c.workspace,
+      launchedCoderConvId: c.launchedCoderConvId,
+      planApproved: c.planApproved,
+      awaitingPlanApproval: c.awaitingPlanApproval,
+      updatedAt: c.updatedAt || Date.now(),
+      createdAt: c.createdAt || Date.now(),
+      isStub: true, // index always represents stubs
+      hasMessages: Array.isArray(c.messages) && c.messages.length > 0
+    };
+  });
+
+  // 2. Identify dirty, fully-loaded conversations to write individually
+  const dirtyIds = [...dirtyConversationIds];
+  dirtyConversationIds.clear();
+  
+  if (typeof activeConversationId !== 'undefined' && activeConversationId) dirtyIds.push(activeConversationId);
+  if (window.getRunningConversationId) {
+    const rId = window.getRunningConversationId();
+    if (rId) dirtyIds.push(rId);
+  }
+  
+  const uniqueDirtyIds = [...new Set(dirtyIds)];
+  const conversationsToWrite = uniqueDirtyIds
+    .map(id => conversations.find(c => c.id === id))
+    .filter(c => c && !c.isStub); // Only write full payloads
+
+  // 3. Dispatch to disk
+  if (window.api) {
+    if (typeof window.api.writeConversationsIndex === 'function') {
+      window.api.writeConversationsIndex({ revision, index }).then(result => {
+        if (result && result.success) {
+          lastConversationDiskSaveError = '';
+        } else {
+          lastConversationDiskSaveError = result && result.error ? result.error : 'Unknown disk index save error';
+        }
+      }).catch(error => {
+        lastConversationDiskSaveError = error.message || String(error);
+        console.error("Failed to save conversation index", error);
+      });
+    }
+    
+    if (typeof window.api.writeConversation === 'function') {
+      conversationsToWrite.forEach(c => {
+        window.api.writeConversation(c).catch(e => console.error(`Save failed for conv ${c.id}`, e));
+      });
+    }
   }
 
-  if (window.api && typeof window.api.writeConversations === 'function') {
-    window.api.writeConversations({ revision, conversations: snapshot }).then(result => {
-      if (result && result.success) {
-        lastConversationDiskSaveError = '';
-      } else {
-        lastConversationDiskSaveError = result && result.error ? result.error : 'Unknown disk save error';
-        console.error("Failed to save conversations to disk", lastConversationDiskSaveError);
-      }
-    }).catch(error => {
-      lastConversationDiskSaveError = error.message || String(error);
-      console.error("Failed to save conversations to disk", error);
-    });
-  }
-
+  // 4. Save index to localStorage for instant boot
   try {
-    const serialized = JSON.stringify(snapshot);
-    localStorage.setItem('ag2_conversations', serialized);
-    localStorage.setItem('ag2_conversations_backup', serialized);
-  } catch (e) {
-    console.error("Failed to save conversations to localStorage; disk persistence remains primary", e);
+    const serializedIndex = JSON.stringify(index);
+    localStorage.setItem('ag2_conversations', serializedIndex);
+    localStorage.setItem('ag2_conversations_backup', serializedIndex);
+  } catch (err) {
+    console.warn("Failed to write conversations index to localStorage", err);
   }
 
   if (window.api && typeof window.api.syncPhoneCompanion === 'function') {
@@ -2793,10 +2861,56 @@ function renderConversationList() {
   });
 }
 
-function selectConversation(id) {
+async function selectConversation(id) {
   activeConversationId = id;
   const conv = conversations.find(c => c.id === id);
   if (!conv) return;
+
+  if (conv.isStub && conv.hasMessages) {
+    el.messagesContainer.innerHTML = '<div class="loading-state" style="text-align:center; padding:20px; color:#888;">Loading conversation...</div>';
+    el.messagesContainer.style.display = 'flex';
+    const orionSplashEl = document.getElementById('orion-welcome-splash');
+    if (orionSplashEl) orionSplashEl.style.display = 'none';
+    el.welcomeSplash.style.display = 'none';
+    
+    try {
+      if (window.api && typeof window.api.readConversation === 'function') {
+        const result = await window.api.readConversation(id);
+        if (activeConversationId !== id) return;
+        
+        if (result && result.success && result.conversation) {
+          const loadedConv = result.conversation;
+          conv.messages = Array.isArray(loadedConv.messages) ? loadedConv.messages : [];
+          conv.tasks = Array.isArray(loadedConv.tasks) ? loadedConv.tasks : [];
+          conv.testResults = loadedConv.testResults;
+          conv.fileTree = loadedConv.fileTree;
+          conv.scratchpad = loadedConv.scratchpad;
+          conv.isStub = false;
+        } else {
+          el.messagesContainer.innerHTML = `<div class="error-state" style="text-align:center; padding:20px; color:var(--red);">Failed to load conversation</div>`;
+          return;
+        }
+      }
+    } catch (err) {
+      if (activeConversationId !== id) return;
+      console.error("Hydration failed", err);
+      el.messagesContainer.innerHTML = `<div class="error-state" style="text-align:center; padding:20px; color:var(--red);">Error loading conversation</div>`;
+      return;
+    }
+    
+    const fullConvs = conversations.filter(c => !c.isStub && c.id !== activeConversationId && c.id !== (window.getRunningConversationId ? window.getRunningConversationId() : null));
+    if (fullConvs.length > 50) {
+      fullConvs.sort((a, b) => conversationSortTime(a) - conversationSortTime(b));
+      fullConvs.slice(0, fullConvs.length - 50).forEach(c => {
+        c.messages = [];
+        c.tasks = [];
+        c.testResults = null;
+        c.fileTree = null;
+        c.scratchpad = '';
+        c.isStub = true;
+      });
+    }
+  }
   
   el.chatTitle.textContent = conv.title;
   normalizeConversationWorkspace(conv);
@@ -2878,7 +2992,9 @@ function selectConversation(id) {
     const recoveredAssistantMessage = buildMissingAssistantResponseMessage(replayMessages, {
       queued: queuedForThisConversation
     });
-    if (recoveredAssistantMessage) {
+    const isThisConversationRunning = window.isAgentRunning && window.isAgentRunning() && 
+      (window.getRunningConversationId ? window.getRunningConversationId() === activeConversationId : true);
+    if (recoveredAssistantMessage && !isThisConversationRunning) {
       window.clearActiveAiBubble();
       renderAiMessage(recoveredAssistantMessage.text, [], activeConversationId, recoveredAssistantMessage);
     }
@@ -2942,6 +3058,27 @@ async function submitMessage() {
     conv.title = generateConversationTitle(prompt);
     el.chatTitle.textContent = conv.title;
     renderConversationList();
+
+    if (typeof callUtilityModel === 'function' && window.appConfig && window.selectedModel) {
+      const titlePrompt = `Generate a very short, concise title (maximum 3 to 5 words) for a conversation that starts with the following prompt. Do not use quotes or punctuation in the title.\n\nPrompt: "${prompt}"`;
+      callUtilityModel(titlePrompt, window.selectedModel, window.appConfig, false)
+        .then(betterTitle => {
+          if (betterTitle) {
+            const cleanTitle = betterTitle.replace(/["']/g, '').trim();
+            if (cleanTitle && cleanTitle.length < 50) {
+              conv.title = cleanTitle;
+              if (activeConversationId === conv.id) {
+                el.chatTitle.textContent = conv.title;
+              }
+              renderConversationList();
+              if (typeof saveConversationsToStorage === 'function') {
+                saveConversationsToStorage();
+              }
+            }
+          }
+        })
+        .catch(err => console.error("Async title generation failed:", err));
+    }
   }
 
   // Initialize the folder path if this is still the first prompt (project-scoped conversations
@@ -3587,7 +3724,22 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   if (isClarificationBubble && activeConv && activeConv.awaitingClarification) {
     clarificationHtml = buildClarificationCardHtml(activeConv.awaitingClarification);
   }
-  if (window.isAgentRunning && window.isAgentRunning() && runningConversationId === activeConversationId) {
+  let isLastAssistantMsg = true;
+  if (msgMeta && activeConv && activeConv.messages) {
+    const lastAsst = activeConv.messages.slice().reverse().find(m => {
+      const r = String((m && m.role) || '').toLowerCase();
+      return r === 'assistant' || r === 'model' || r === 'ai' || r === 'orion';
+    });
+    if (lastAsst) {
+      if (lastAsst.createdAt && msgMeta.createdAt) {
+        isLastAssistantMsg = lastAsst.createdAt === msgMeta.createdAt;
+      } else {
+        isLastAssistantMsg = lastAsst.text === msgMeta.text;
+      }
+    }
+  }
+
+  if (isLastAssistantMsg && window.isAgentRunning && window.isAgentRunning() && runningConversationId === activeConversationId) {
     const stepNum = window.currentLoopCount || 1;
     
     // Check if the current conversation's plan has been approved
@@ -4956,6 +5108,9 @@ function deleteConversation(id) {
   const convToDelete = conversations.find(c => c.id === id);
   const parentProj = convToDelete ? convToDelete.projectPath : '';
   cleanupConversationArtifacts(id);
+  if (window.api && typeof window.api.deleteConversation === 'function') {
+    window.api.deleteConversation(id);
+  }
   
   conversations = conversations.filter(c => c.id !== id);
   saveConversationsToStorage();
@@ -4979,7 +5134,12 @@ function deleteConversation(id) {
 
 function removeProject(path) {
   const removedConversationIds = conversations.filter(c => c.projectPath === path).map(c => c.id);
-  removedConversationIds.forEach(cleanupConversationArtifacts);
+  removedConversationIds.forEach(id => {
+    cleanupConversationArtifacts(id);
+    if (window.api && typeof window.api.deleteConversation === 'function') {
+      window.api.deleteConversation(id);
+    }
+  });
   projects = projects.filter(p => p !== path);
   saveProjectsToStorage();
   

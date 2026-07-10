@@ -9,6 +9,12 @@ VOICE AND IDENTITY:
 - For personal-memory questions, answer from chat context and durable memory. If you do not know or have not saved the fact, say that plainly, e.g. "I don't have your name saved yet," not "I cannot know personal information."
 - Avoid distancing language like "I do not have access to personal information" unless the user asks about unavailable private data outside the conversation or memory.
 
+SCRATCHPAD CHAIN-OF-THOUGHT CONTRACT:
+- You have access to a private reasoning space via the update_scratchpad tool.
+- Use it to break down complex tasks, write intermediate logic, do math, or list hypotheses BEFORE executing actions.
+- The scratchpad is strictly an ADDITION for intermediate scratch work. You MUST still report your final blockers, state changes, and mission updates to the user in chat. Do not hide your actual conclusions in the scratchpad.
+- The scratchpad state completely overwrites each time. If you want to keep previous scratchpad context, include it in your updated content.
+
 MEMORY REASONING CONTRACT:
 - Definition: durable memory means facts, preferences, identity details, decisions, and recurring context that the user expects Orion to carry across turns or sessions.
 - Definition: private unavailable data means information the user has not provided, Orion has not observed, and Orion has no legitimate local/tool path to inspect.
@@ -65,6 +71,7 @@ CRITICAL RULES:
    LOCAL PROJECT RECOMMENDATIONS: If the user asks for ideas, recommendations, comparisons, or improvements for an existing local project/folder/program, inspect that local project first, then recommend from evidence. Do not ask the user to describe what is inside before using local tools. Do not claim access is limited to explicitly provided paths when the user has named a Desktop/project location.
    WORKSPACE SELF-REFERENCE: When the user says "this code", "the code", "this program", "this project", "these files", "my code", "the app", "the whole program", or any similar self-referential phrase, they ALWAYS mean the code already in the active workspace. NEVER ask the user to provide or paste code. NEVER ask "which file?" or "which program?" when a workspace is active — read the workspace and figure it out. Call list_files immediately, then read ALL non-boilerplate source files you find (.py, .js, .ts, .html, .css, etc.) in one pass. If the root contains only cache/config files (.env, .gitignore, __pycache__, .ruff_cache, .orion, etc.), look one level deeper into subdirectories. Read first, ask never.
 18. FIND VS FIX: When the user asks you to "find", "look for", "check for", "review", "audit", or "identify" bugs/typos/issues/faults — your job is ONLY to inspect and report what you found. For a broad read-only review, you may use STRATEGY.md as a private review strategy/report outline, but never create implementation_plan.md, never show an approval gate, and never start fixing things. Do NOT modify source files or propose a fix implementation plan. Present your findings clearly and ask the user which issues they want you to address. Only make changes when the user explicitly asks you to fix, patch, implement, or update something.
+18A. DIAGNOSTIC RIGOR: When diagnosing why something fails or explaining how a system behaves, run this self-check before committing to your conclusion. (a) VERIFY LOAD-BEARING CLAIMS: if your explanation depends on something existing — a limit, a mechanism, an API, an external system/platform, a config value, a behavior — you MUST have actually verified it with a tool (read the file, grep_search for it, web search). If you have not verified it, verify it now or do not assert it. Never invent an external cause you never checked for; one grep_search that returns nothing kills a wrong theory for almost no cost, while asserting a phantom cause wastes far more and misleads the user. (b) TRACE THE DATA, NOT JUST THE CODE: reading where something is defined is not the same as knowing what it receives at runtime. Read the responsible function IN FULL (use get_symbol_index/get_file_symbols to jump to it, not a keyhole 20-line window of a large file), and confirm the inputs and properties it references actually exist and are populated — a reference to a property that is never set (so it is always undefined) is a common real bug that only shows when you trace the data. (c) PREFER THE BORING INTERNAL CAUSE: for "we built X to prevent Y, but Y still happens," the likely answer is a bug in X — is it wired in, does it receive the data it needs, does its condition actually fire? Exhaust the in-code explanations before blaming anything outside the codebase.
 16. OPERATING SYSTEM AWARENESS: You are currently running on a Windows system. When guessing or constructing file paths outside the current workspace, ALWAYS use Windows path conventions (e.g., C:\\Users\\owner\\Desktop) with the literal resolved path — do NOT pass unexpanded PowerShell variables like $env:USERPROFILE as a path argument to any tool; resolve the path to a literal string first (e.g., C:\\Users\\owner). If you are unsure of the username, run 'echo $env:USERPROFILE' first. When searching for files on the Desktop or broad directories, ALWAYS limit recursive searches with '-Depth 2' or '-Depth 3' and add '-ErrorAction SilentlyContinue' to avoid timeouts from permission-denied folders. Never run an unbounded 'Get-ChildItem -Recurse' on C:\\ or the Desktop without a depth limit.
 19. PLANNING MODE: Exercise judgement on whether a request warrants a formal plan before taking action. Stop and create an implementation plan (using STRATEGY.md or implementation_plan.md) if the request requires major architectural changes, extensive research, or significant decision making. If you decide that a request does NOT warrant a plan (for example: one-off investigatory questions, trivial tweaks, minor bug fixes, or minor follow-ups to an existing plan), then continue your work WITHOUT making a plan or requesting user review. You have the authority to make small fixes and adjustments instantly without drafting a full blown-out plan.
 
@@ -145,6 +152,11 @@ Route to the coder: anything requiring file changes, writing or debugging code, 
 
 HOW YOU THINK:
 Don't snap-route. Ask yourself first: can I handle this directly? Do I have enough context to give the coder a clear task? Is this a coding problem or a planning conversation first? Think it through, then act.
+
+BEFORE YOU COMMIT TO A CLAIM OR DIAGNOSIS (silent self-check, then answer):
+- Load-bearing claims: if your explanation depends on something existing — a limit, a mechanism, an API, an external system, a config value, a behavior — confirm you actually verified it (read the file, grepped for it, searched the web). If you did not verify it, verify it now or do not assert it. Never invent an external cause you never checked for. One grep that comes back empty kills a wrong theory for almost no cost; asserting a phantom wastes far more.
+- Trace the data, don't just locate the code. When diagnosing why something fails, read the responsible function in full and check that the inputs and properties it references actually exist and are populated. "Where X is defined" is not the same as "what X receives at runtime" — the bug is usually in the second one.
+- Prefer the boring internal cause. For "we built X to prevent Y, but Y still happens," the likely answer is a bug in X — is it wired in, does it get the data it needs, does its condition actually fire? Exhaust the in-code explanations before blaming anything outside the codebase.
 
 HOW YOU COMMUNICATE:
 Casual and direct. Short when simple, fuller when it isn't. Greet Jason by name when starting fresh. If you don't know something about his projects or context, ask — don't assume or pretend.
@@ -456,7 +468,7 @@ const ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS = [
   },
   {
     name: 'open_url',
-    description: 'Opens a URL in Orion’s hidden browser worker and returns page title, text snippet, and links.',
+    description: 'Opens a URL in Orion’s browser worker and returns page title, text snippet, and links.',
     parameters: { type: 'OBJECT', properties: { url: { type: 'STRING' } }, required: ['url'] }
   },
   {
@@ -629,7 +641,18 @@ async function evaluateLoopStateWithSupervisor(modelName, workWalkthrough, disab
     return true; // Fake "STUCK" for testing to avoid infinite loops in existing tests
   }
 
-  const recentTools = workWalkthrough.slice(-15).map(w => `${w.toolName}: ${JSON.stringify(w.toolArgs)}`).join('\n');
+  // Walkthrough items carry a human-readable `label` (which encodes the actual target: file path,
+  // line range, search term, URL, command), plus `status` and a post-run `detail`. Earlier this
+  // read `w.toolArgs`, a property that never exists on these items, so every line rendered as
+  // "read_file: undefined" — leaving the supervisor blind to WHICH file/term each call targeted.
+  // It could see that read_file ran 8 times but not whether those were 8 different files
+  // (progress) or the same file 8 times (stuck), which is the one distinction it exists to make.
+  const recentTools = workWalkthrough.slice(-15).map(w => {
+    const target = w.label || w.toolName || 'unknown step';
+    const status = w.status && w.status !== 'running' ? ` [${w.status}]` : '';
+    const detail = w.detail ? ` — ${String(w.detail).slice(0, 120)}` : '';
+    return `${target}${status}${detail}`;
+  }).join('\n');
   const prompt = `You are a supervisor evaluating an autonomous agent. Look at its recent tool calls:\n\n${recentTools}\n\nIs it stuck in a repetitive loop (e.g., searching the exact same term repeatedly, making the exact same tool call repeatedly with the same error, or reading the exact same lines without progress), or is it making healthy, unique progress on a large task (e.g., reading different files, searching different terms, exploring different line ranges)?\n\nReply strictly with the word STUCK or CONTINUE.`;
 
   try {
@@ -1027,11 +1050,29 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     );
   }
 
-  if (projectMemory.facts && projectMemory.facts.length > 0) {
-    const memText = projectMemory.facts.map((f, i) => `${i + 1}. [${f.category || 'general'}] ${f.text}`).join('\n');
+  let rulesText = '';
+  if (workspacePath && window.api && window.api.readFile) {
+    try {
+      const result = await window.api.readFile(workspacePath, '.orion/rules.md');
+      if (result && result.content && !result.error) {
+        rulesText = result.content;
+      }
+    } catch (_) {}
+  }
+
+  let scratchpadText = conversation.scratchpad || '';
+
+  if ((projectMemory.facts && projectMemory.facts.length > 0) || rulesText || scratchpadText) {
+    const memText = (projectMemory.facts || []).map((f, i) => `${i + 1}. [${f.category || 'general'}] ${f.text}`).join('\n');
+    const combinedText = [
+      memText ? `[ORION PROJECT MEMORY]\nPersistent workspace facts from prior sessions.\n\n${memText}` : '',
+      rulesText ? `[PROJECT GOTCHAS & RULES]\nFound in .orion/rules.md. ALWAYS follow these rules for this project:\n\n${rulesText}` : '',
+      scratchpadText ? `[CURRENT SCRATCHPAD STATE]\nYour persistent chain-of-thought scratchpad. Update this with update_scratchpad when you need to think through a task.\n\n${scratchpadText}` : ''
+    ].filter(Boolean).join('\n\n---\n\n');
+
     messages.splice(2, 0,
-      { role: 'user', parts: [{ text: `[ORION PROJECT MEMORY]\nPersistent workspace facts from prior sessions. Reference these when relevant.\n\n${memText}` }] },
-      { role: 'model', parts: [{ text: 'Understood. I have the workspace project memory loaded.' }] }
+      { role: 'user', parts: [{ text: combinedText }] },
+      { role: 'model', parts: [{ text: 'Understood. I have the context data loaded.' }] }
     );
   }
 
@@ -1175,6 +1216,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       const compactThreshold = getCompactionThreshold(modelName, config);
       if (config.autoCompact !== false && tokenCount > compactThreshold) {
         window.appendSystemMessage(`Context reached ${tokenCount} tokens; compacting for ${modelName} at threshold ${compactThreshold}.`);
+        if (typeof window.api.writeConversationArtifact === 'function') {
+          try {
+            const backupStr = JSON.stringify(conversation.messages, null, 2);
+            await window.api.writeConversationArtifact(conversation.id, `compaction-backup-${Date.now()}.json`, backupStr);
+          } catch (e) {
+            console.warn("Failed to backup conversation pre-compaction", e);
+          }
+        }
         const compactResult = await compactHistory(messages, resolveUtilityModelName(modelName), config);
         persistCompactedConversation(conversation, compactResult.summary);
         await appendScopedNotes(workspacePath, conversation, `\n\n## Context Compaction ${new Date().toISOString()}\n${compactResult.summary}\n`);
@@ -1739,7 +1788,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // updates, ledger entries, working-state transitions) are still sequential.
       const PARALLELIZABLE_TOOLS = new Set([
         'read_file', 'read_multiple_files', 'list_files', 'get_symbol_index', 'get_workspace_info',
-        'google_search', 'fetch_web_page', 'grep_search', 'search_embeddings',
+        'google_search', 'fetch_web_page', 'grep_search', 'search_embeddings', 'search_api_docs',
         'semantic_search', 'fetch_page', 'git_diff', 'git_rollback', 'edit_config', 'get_file_symbols', 'find_references',
         'read_command_output', 'get_command_status',
         'recall_memory', 'read_notes', 'get_project_memory'
@@ -2915,6 +2964,22 @@ async function executeTool(name, args, workspace, config, conversation) {
       return result.symbols;
     }
 
+    case 'fetch_api_docs': {
+      if (!args.library_name || !args.version || !args.url) throw new Error("Missing parameters for fetch_api_docs");
+      if (typeof window.api.fetchApiDocs !== 'function') throw new Error("fetchApiDocs IPC not available");
+      const result = await window.api.fetchApiDocs({ libraryName: args.library_name, version: args.version, url: args.url });
+      if (!result.success) throw new Error(result.error || 'Failed to fetch API docs');
+      return result;
+    }
+
+    case 'search_api_docs': {
+      if (!args.library_name || !args.version || !args.query) throw new Error("Missing parameters for search_api_docs");
+      if (typeof window.api.searchApiDocs !== 'function') throw new Error("searchApiDocs IPC not available");
+      const result = await window.api.searchApiDocs({ libraryName: args.library_name, version: args.version, query: args.query, config });
+      if (!result.success) throw new Error(result.error || 'Failed to search API docs');
+      return result.results;
+    }
+
     case 'semantic_search': {
       if (!args.query) throw new Error("Missing 'query' parameter");
       const result = await window.api.semanticSearch(args.query, workspace, config, 10);
@@ -3159,6 +3224,15 @@ async function executeTool(name, args, workspace, config, conversation) {
         resolvedFrom: resolution.resolvedFrom,
         matchedName: resolution.matchedName || getLocalPathBaseName(resolution.path)
       };
+    }
+
+    case 'update_scratchpad': {
+      if (!args.content && args.content !== '') throw new Error("Missing 'content' parameter");
+      conversation.scratchpad = args.content;
+      if (typeof window.updateScratchpadUI === 'function') {
+        window.updateScratchpadUI(conversation.scratchpad);
+      }
+      return { success: true, message: "Scratchpad updated successfully." };
     }
 
     case 'run_command': {
@@ -6826,9 +6900,10 @@ function convertGeminiToOllamaMessages(geminiMessages) {
 // around by a model that decides to route differently.
 const DISPATCH_TOOL_ALLOWLIST = new Set([
   'recall_memory', 'remember_fact', 'remember_preference',
-  'google_search', 'fetch_web_page',
+  'google_search', 'fetch_web_page', 'fetch_api_docs', 'search_api_docs',
   'read_file', 'read_multiple_files', 'list_files', 'get_workspace_info', 'change_workspace',
   'handoff_to_coder',
+  'open_url', 'click_element', 'fill_input', 'take_screenshot', 'navigate_back',
   'grep_search', 'search_embeddings', 'semantic_search',
   'get_symbol_index', 'fetch_page', 'git_diff', 'git_rollback', 'edit_config', 'get_file_symbols', 'find_references',
   'read_notes', 'read_project_memory'
@@ -6857,6 +6932,43 @@ function buildAgentToolDeclarations() {
             name: "get_workspace_info",
             description: "Returns the active workspace directory, conversation scope, and project metadata. Use when the user asks where the project/program is or asks for the directory.",
             parameters: { type: "OBJECT", properties: {} }
+          },
+          {
+            name: "fetch_api_docs",
+            description: "Downloads documentation from a URL (e.g. a markdown repo, a DevDocs JSON, or a raw webpage) and caches it persistently in ~/orion-docs-cache/<library_name>@<version>/. Use this when you are missing library documentation and want to index it for offline semantic search.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                library_name: { type: "STRING", description: "The name of the library (e.g., 'pygame')." },
+                version: { type: "STRING", description: "The version of the library (e.g., '2.6.0')." },
+                url: { type: "STRING", description: "The direct URL to the documentation to fetch (can be markdown, HTML, or DevDocs endpoint)." }
+              },
+              required: ["library_name", "version", "url"]
+            }
+          },
+          {
+            name: "search_api_docs",
+            description: "Semantically searches the locally cached documentation for a specific library and version (in ~/orion-docs-cache/<library_name>@<version>/). Returns relevant chunks. Use this instead of web searching for syntax when documentation is locally cached.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                library_name: { type: "STRING", description: "The name of the library." },
+                version: { type: "STRING", description: "The version of the library." },
+                query: { type: "STRING", description: "The semantic query." }
+              },
+              required: ["library_name", "version", "query"]
+            }
+          },
+          {
+            name: "update_scratchpad",
+            description: "Updates your private Chain-of-Thought scratchpad. This is your personal space to break down complex tasks, write intermediate logic, or list hypotheses. Note: this tool OVERWRITES the scratchpad state, so include previous content if you wish to keep it.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                content: { type: "STRING", description: "The markdown content for your scratchpad." }
+              },
+              required: ["content"]
+            }
           },
           {
             name: "change_workspace",
@@ -8315,7 +8427,7 @@ async function countTokens(messages, modelName, config, options = {}) {
 // CONTEXT COMPACTOR (Summarizer)
 async function compactHistory(messages, modelName, config) {
   // Format history for the summarizer prompt
-  let conversationLogsText = "";
+  let logLines = [];
   messages.forEach(m => {
     const roleName = m.role === 'user' ? 'User' : 'Assistant';
     let contentText = "";
@@ -8324,16 +8436,38 @@ async function compactHistory(messages, modelName, config) {
         if (p.text) contentText += p.text;
         if (p.functionCall) contentText += ` [Called Tool: ${p.functionCall.name}]`;
         if (p.functionResponse) {
-          let out = JSON.stringify(p.functionResponse.response);
-          if (out.length > 2000) {
-            out = out.slice(0, 1000) + '\\n\\n...[TRUNCATED_FOR_COMPACTION]...\\n\\n' + out.slice(-1000);
+          const resp = p.functionResponse.response || {};
+          let out = '';
+          if (resp.error) {
+            out = `Error: ${String(resp.error).slice(0, 500)}`;
+          } else {
+            out = "Success (details omitted for compaction)";
           }
           contentText += ` [Tool Output: ${out}]`;
         }
       });
     }
-    conversationLogsText += `${roleName}: ${contentText}\n\n`;
+    logLines.push(`${roleName}: ${contentText}`);
   });
+
+  // Dynamic Summarizer Overflow Protection
+  // getCompactionThreshold already returns ~82% of the raw model budget.
+  // We use 70% of that (roughly 57% of total raw token capacity) as a safe ceiling for the summarizer prompt.
+  const thresholdTokens = getCompactionThreshold(modelName, config) || 128000;
+  const MAX_CHARS = Math.floor((thresholdTokens * 4) * 0.70);
+  
+  let finalLogs = [];
+  let charCount = 0;
+  for (let i = logLines.length - 1; i >= 0; i--) {
+    if (charCount + logLines[i].length > MAX_CHARS && finalLogs.length > 2) {
+      finalLogs.unshift("[... older messages truncated to fit summarizer context ...]");
+      break;
+    }
+    finalLogs.unshift(logLines[i]);
+    charCount += logLines[i].length;
+  }
+  
+  const conversationLogsText = finalLogs.join('\n\n') + '\n\n';
 
   const summaryPrompt = `The following is a conversation history between a user and an AI pair programmer. Summarize the history, detailing:
 1. The overall task and workspace directory.

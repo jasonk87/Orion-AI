@@ -2513,6 +2513,55 @@ test('compactHistory still trims to a short tail when the boundary already falls
   }
 });
 
+test('compactHistory dynamically truncates conversation context to protect summarizer from overflow', async (t) => {
+  const originalFetch = global.fetch;
+  let interceptedPrompt = '';
+  global.fetch = async (url, options) => {
+    if (options && options.body) {
+      try {
+        const body = JSON.parse(options.body);
+        interceptedPrompt = body.contents[0].parts[0].text;
+      } catch (e) {}
+    }
+    return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: 'Summary.' }] } }] }) };
+  };
+  try {
+    // Generate enough history to overflow a very small budget
+    const messages = [];
+    for (let i = 0; i < 20; i++) {
+      messages.push({ role: 'user', parts: [{ text: 'a'.repeat(500) }] });
+    }
+    // config with a tiny token budget of 1000.
+    // getCompactionThreshold = Math.floor(1000 * 0.82) = 820 tokens.
+    // MAX_CHARS = Math.floor(820 * 4 * 0.7) = 2296 chars.
+    const config = {
+      geminiApiKey: 'k',
+      modelContextBudgets: { 'gemini-2.5-mock': 1000 },
+      autoCompact: true
+    };
+    
+    await agent.compactHistory(messages, 'gemini-2.5-mock', config);
+    
+    if (interceptedPrompt.includes('[... older messages truncated to fit summarizer context ...]')) {
+      t.pass('Prompt includes truncation marker');
+    } else {
+      t.fail('Prompt is missing truncation marker');
+    }
+    
+    // The prompt length should be well under the total original size of 10,000+ characters.
+    // We expect the conversation logs text to be capped around MAX_CHARS (~2296).
+    // Plus the static summaryPrompt template chars. So < 3500 chars total.
+    if (interceptedPrompt.length < 3500) {
+      t.pass(`Intercepted prompt length (${interceptedPrompt.length}) is safely bounded`);
+    } else {
+      t.fail(`Intercepted prompt length (${interceptedPrompt.length}) exceeded bounds`);
+    }
+    t.end();
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 // A transcript showed a model do a long batch of read-only investigation (grep_search/read_file)
 // on a plain "look through the code and tell me X" request, then return a completely blank final
 // turn (no text, no tool call). None of the checklist/win-condition/auto-continue machinery
