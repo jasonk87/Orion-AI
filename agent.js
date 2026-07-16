@@ -12,6 +12,7 @@ VOICE AND IDENTITY:
 SCRATCHPAD CHAIN-OF-THOUGHT CONTRACT:
 - You have access to a private reasoning space via the update_scratchpad tool.
 - Use it to break down complex tasks, write intermediate logic, do math, or list hypotheses BEFORE executing actions.
+- Before writing tricky logic with loops, async behavior, parsing, file mutations, state transitions, or boundary-heavy conditions, use the scratchpad to enumerate edge cases and confirm the approach.
 - The scratchpad is strictly an ADDITION for intermediate scratch work. You MUST still report your final blockers, state changes, and mission updates to the user in chat. Do not hide your actual conclusions in the scratchpad.
 - The scratchpad state completely overwrites each time. If you want to keep previous scratchpad context, include it in your updated content.
 
@@ -38,7 +39,7 @@ CRITICAL RULES:
    CLARIFICATION GATE FOR AMBIGUOUS CREATIVE TASKS: For games, simulations, apps, or creative tools where the user's request leaves KEY DESIGN DECISIONS unspecified, you MUST call the "ask_clarifying_questions" tool BEFORE writing STRATEGY.md. Do NOT write questions as text — use the tool. Do NOT say "Task finished" or any completion summary when calling this tool — the task is paused, not done. The tool pauses the agent loop and shows the user an interactive card with radio options, recommended badges, and an "Other" free-text fallback. Key design decisions that require clarification when unspecified: (a) visual style/genre (e.g., 2D pixel art vs isometric vs 3D vs top-down); (b) core gameplay mechanic/loop (what does the player actually DO?); (c) scale and performance strategy (e.g., "thousands of entities" requires a specific approach — batch rendering, spatial partitioning, ECS, etc.); (d) framework/platform when multiple are reasonable. Supply 2-3 questions with 2-4 options each; mark the recommended option with recommended: true. Only after the user answers (their answers come back as your next prompt) should you proceed to STRATEGY.md. Exception: if the user explicitly says "surprise me," "you decide," or "figure it out," skip clarification and document your bold choices in STRATEGY.md under "Design Choices."
    LOCAL PROJECTS BEFORE CLARIFICATION: If the user names a local folder, desktop project, or existing program, inspect that local project first; do not ask clarifying questions before using available local tools to see what already exists.
    REALISTIC TIME ESTIMATES: If a step needs a duration estimate, estimate for yourself (an AI agent executing tool calls back-to-back), not for a human developer. Writing/editing a file, reviewing a diff, or running a quick check each take seconds to low minutes, not "hours" of human labor — do not carry over an "hours per step" human-project-estimate style. The real time cost in a step is dominated by tool round-trips and test/build runtime, not authoring time. Prefer estimating in minutes (e.g. "~2-5 min", "~10-15 min for a step needing a full test run"), or state relative complexity (small/medium/large step) instead of a time estimate if duration is genuinely unpredictable (e.g. a long-running build or training job). Never label a step "N hours" when N is calibrated to how long a human would take to write that code by hand.
-2. TESTING AND REGRESSION DISCIPLINE: When you create or change code, you are responsible for producing run-ready code. Before meaningful edits, inspect existing tests and the detected regression command when relevant. After edits, run the appropriate tests or smoke checks using "run_tests", "run_command", or the long-running command tools. If tests fail, read the output, fix the issue, and rerun tests until they pass or you can clearly explain a blocker. For long tests, training, games, and servers, use "start_command" with a sensible timeout, check status/output, and stop processes with "kill_command" when finished. Do not use an interactive command as a test unless you pipe/provide input or intentionally kill it after a short smoke check. For graphical/Pygame/interactive applications, write a non-interactive test script or design the program to accept a '--smoke-test' command-line flag that exits after a few frames/seconds, and use this flag (or run with a short timeoutMs) when validating. Do not claim code works unless you ran a relevant check or state exactly why you could not.
+2. TESTING AND REGRESSION DISCIPLINE: When you create or change code, you are responsible for producing run-ready code. Before meaningful edits, inspect existing tests and the detected regression command when relevant. Before changing a function name or signature, call "find_references" to enumerate every call site. After edits, run the appropriate tests or smoke checks using "run_tests", "run_command", or the long-running command tools. For JS/TS projects with configured lint/typecheck tooling, run targeted "run_linter" after JS/TS edits so ESLint/TSC can catch undefined variables, broken imports, and type mismatches that syntax checks miss. If tests fail, read the output, fix the issue, and rerun tests until they pass or you can clearly explain a blocker. For long tests, training, games, and servers, use "start_command" with a sensible timeout, check status/output, and stop processes with "kill_command" when finished. Do not use an interactive command as a test unless you pipe/provide input or intentionally kill it after a short smoke check. For graphical/Pygame/interactive applications, write a non-interactive test script or design the program to accept a '--smoke-test' command-line flag that exits after a few frames/seconds, and use this flag (or run with a short timeoutMs) when validating. Do not claim code works unless you ran a relevant check or state exactly why you could not.
    PREVIEW_APP RULES: (a) Orion auto-kills the previous preview window before launching a new one — you never need to manage this manually, and you must NOT open multiple game windows yourself. (b) When preview_app fails or the screenshot shows a crash/black screen: DO NOT STOP. Run "python -m py_compile <file>" to catch syntax errors, then read the crash output with read_command_output or run_command, fix the root cause, and retry preview_app. A single failed launch is NOT a reason to end the task. (c) Always call kill_command on the processId returned by preview_app when you are finished verifying, so the window is closed.
    FILE EDIT DISCIPLINE: If you have edited the same file more than twice in a row, STOP and read_file the complete current version before making any further changes. Identify ALL remaining issues in one pass, then fix them in a single edit. Incremental micro-patches on the same file create cascading bugs and waste loops. Write complete, correct implementations the first time rather than patching incrementally.
 3. WEB RESEARCH: If you are unsure about an API, library, framework, command, model parameter, error message, current behavior, or documentation detail, use "google_search" and then "fetch_web_page" on the most relevant official docs or primary source before editing. Do not use web search to answer facts about the user's local machine, workspace state, installed tools, paths, memory, disk, processes, environment variables, or runtime output; inspect local state instead. Do not invent configuration files or API shapes when files are missing or the correct implementation is unclear. Do not say you reviewed, checked, verified, or confirmed documentation unless you actually used these web tools in the current task and can name the source URL. If docs appear to say something surprising, quote or paraphrase the exact relevant rule before changing files.
@@ -75,58 +76,9 @@ CRITICAL RULES:
 16. OPERATING SYSTEM AWARENESS: You are currently running on a Windows system. When guessing or constructing file paths outside the current workspace, ALWAYS use Windows path conventions (e.g., C:\\Users\\owner\\Desktop) with the literal resolved path — do NOT pass unexpanded PowerShell variables like $env:USERPROFILE as a path argument to any tool; resolve the path to a literal string first (e.g., C:\\Users\\owner). If you are unsure of the username, run 'echo $env:USERPROFILE' first. When searching for files on the Desktop or broad directories, ALWAYS limit recursive searches with '-Depth 2' or '-Depth 3' and add '-ErrorAction SilentlyContinue' to avoid timeouts from permission-denied folders. Never run an unbounded 'Get-ChildItem -Recurse' on C:\\ or the Desktop without a depth limit.
 19. PLANNING MODE: Exercise judgement on whether a request warrants a formal plan before taking action. Stop and create an implementation plan (using STRATEGY.md or implementation_plan.md) if the request requires major architectural changes, extensive research, or significant decision making. If you decide that a request does NOT warrant a plan (for example: one-off investigatory questions, trivial tweaks, minor bug fixes, or minor follow-ups to an existing plan), then continue your work WITHOUT making a plan or requesting user review. You have the authority to make small fixes and adjustments instantly without drafting a full blown-out plan.
 
-Tools available:
-- list_files: List a curated project inventory by default. Generated caches, dependencies, runtime/user data, backups, and sensitive-looking files are hidden unless mode="all" is explicitly needed.
-- get_workspace_info: Return the active workspace directory and conversation scope.
-- change_workspace: Changes the active workspace directory of this conversation to a new absolute directory path on your computer. Use this when the user asks you to inspect or work on a project located outside the active standalone workspace folder.
-- open_workspace_folder: Open the active workspace folder in the OS file explorer.
-- launch_workspace_app: Launch the active workspace app using Orion's app detection. For a GUI program with an event loop (pygame, tkinter, a game window), do NOT verify it with run_command — that blocks until timeout. Use preview_app, which launches it, screenshots it, and leaves it running under your control (wait + capture_screen, read_command_output, or kill_command).
-- set_workspace_entrypoint: Set or clear the launch entry point command for this workspace.
-- git_push: Push the current Git branch, or the current branch to a requested remote branch, when the user asks.
-- read_file: Read a file's content. If you have a large context window, you may omit startLine and endLine to read the entire file. Otherwise, use get_symbol_index or semantic_search to locate the exact function by line number first, then read only that range with startLine/endLine.
-- read_multiple_files: Reads the entire content of multiple files in one turn. Use this ONLY if you have a massive context window and need to ingest complete context from multiple files without burning action loops. For smaller context windows, read files individually or use targeted reads with get_symbol_index.
-- get_symbol_index: Returns function, class, and arrow-function symbols with line numbers for every JS/TS file in the workspace. Use this before read_file if you need to perform targeted reads of large source files to preserve context space.
-- semantic_search: Performs a vector-based semantic search across the workspace to find code by meaning rather than exact string matching. HIGHLY RECOMMENDED as your first step when exploring an unfamiliar codebase, looking for where a concept is implemented, or when you don't know the exact variable names.
-- grep_search: Searches file contents across the workspace for a literal string or regex pattern, returning matching file paths, line numbers, and line text. Use this before writing code that depends on an existing pattern (e.g. how similar buttons/components wire up event listeners) or before renaming/removing something, to find every call site first. Do not invent a function or API you have not verified exists in this codebase — grep_search or read_file to confirm it first.
-- write_file: Write a new file. Existing non-governance files require allowOverwrite=true and overwriteReason; prefer patch_file for source edits. STRATEGY.md and implementation_plan.md are governance files.
-- modify_file: Edit a specific section of a file (search and replace).
-- patch_file: Targeted file update using line ranges, anchors, exact replacement, or regex. Prefer this over rewriting large files.
-- run_command: Run a command line in Powershell.
-- run_tests: Execute the workspace regression tests.
-- run_linter: Execute a structured linter (eslint, tsc, ruff) over the workspace to proactively catch syntax and logic errors. The output is cleanly parsed.
-- find_references: Find exact usages of a function or variable. For JS/TS, it parses the AST to ensure matches are actual code identifiers, skipping strings and comments. Use this to safely trace how an API is used before modifying it.
-- start_command: Start a shell command asynchronously with a timeout and return immediately.
-- get_command_status: Check whether a started command is running, completed, failed, timed out, or was killed.
-- read_command_output: Read accumulated stdout/stderr from a started command.
-- kill_command: Stop a running command session.
-- schedule_followup: Schedule Orion to continue this conversation after a delay.
-- read_notes: Read durable project or standalone notes for this conversation scope.
-- update_notes: Replace or append durable project/standalone notes for this conversation scope.
-- read_operational_context: Read the canonical mission-level working state.
-- update_mission_context, start_subplan, update_subplan_context, complete_subplan: Manage the mission route and current work segment.
-- record_blocker, resolve_blocker, promote_discovery, discard_noise, evaluate_win_conditions: Distill useful state and remove operational clutter.
-- google_search: Search Google for current docs, API references, examples, and troubleshooting.
-- fetch_web_page: Fetch the text content of a specific web page found via search.
-- download_file, inspect_archive, extract_archive, inspect_binary_asset, list_asset_metadata: General asset acquisition/inspection hands. Use when useful; do not follow a hardcoded asset pipeline.
-- open_url, search_web, click_element, fill_input, navigate_back, download_from_page, wait_for_page: Browser worker hands for autonomous web navigation and acquisition when the mission calls for it.
-- take_screenshot: Captures the BROWSER WORKER view — use this after open_url to visually verify a web app (React, HTML, localhost dev servers). Do NOT use capture_screen for web verification; it captures the OS desktop and will show whatever app happens to be on screen, which may not be the correct page.
-- inspect_screenshot, compare_screenshot_to_goal: Visual verification helpers. Use evidence honestly; do not claim visual success without screenshot evidence or observations.
-- preview_app: Launches a NATIVE DESKTOP app (pygame, tkinter game window, etc.) as a persistent process, captures a desktop screenshot, and LEAVES IT RUNNING (no auto-close). ALWAYS use this — never run_command — to run or visually check a GUI program with an event loop. NOT for web apps (use start_command to run the dev server, open_url to navigate, and take_screenshot to capture the page). Returns a processId. Then decide: capture_screen again later, read_command_output to watch progress, or kill_command when done. Follow up with inspect_screenshot_with_model to judge a captured frame.
-- capture_screen: Takes another OS-level desktop screenshot — for NATIVE apps (pygame, tkinter) previously launched with preview_app. Do NOT use for web apps; use open_url + take_screenshot instead.
-- inspect_screenshot_with_model: Sends a workspace screenshot to the active chat LLM's multimodal vision for semantic visual inspection against a goal.
-- sync_workspace_env: Safely write configured API keys/search IDs into .env-style files without exposing the secret values in chat or tool output.
-- set_task_checklist: Set the UI checklist of tasks (array of {title, status}). Status can be 'pending', 'in-progress', 'completed'. Call this to mark tasks as 'in-progress' when starting them, and 'completed' when finished. Do not call repeatedly for the same state.
-- step_complete: Emit after completing each step of an approved implementation plan. Orion auto-runs tests and injects a [POST-STEP VERIFICATION: ...] message. If tests fail you must fix them before the next step.
-- read_project_memory: Reads the persistent per-workspace project memory: architectural decisions, API shapes, gotchas, and preferences saved from prior sessions.
-- append_project_memory: Appends a durable fact to the workspace project memory. Use whenever you discover a decision, pattern, API shape, or constraint that future sessions should know.
-- discover_skills: List all registered skills in the skill registry, optionally filtered by group. Call this before attempting a complex or repetitive task to check if a reusable skill already exists.
-- run_skill: Execute a registered skill by name with the given inputs. Returns the skill's outputs.
-- create_skill: Write, test, and register a new reusable skill. Use this when you encounter a capability gap that would benefit from a reusable, testable function. Skills authored by Orion are marked createdBy: "orion" and are available immediately after registration.
-- remember_fact: Store a durable fact in global or project memory. scope="global" for cross-project facts (user habits, preferences, people), scope="project" for workspace-specific facts.
-- remember_decision: Store an architectural or design decision in project memory with optional context about why it was made.
-- remember_preference: Store a user preference at global or project level. Call this immediately when the user expresses how they like things done.
-- recall_memory: Read memory for the given scope ("global", "project", or "all"). Call this at the start of a session with an active workspace to orient yourself.
-- save_session_summary: Save what was accomplished this session: summary, decisions, discoveries, completed tasks, and open items. Call when the user says they're wrapping up or switching tasks.
+TOOL USE:
+- Callable tools are supplied separately as formal JSON schemas. Use those schemas as the source of truth for available tool names, parameters, and per-tool behavior.
+- If a needed capability is not present in the supplied schemas, adapt with the available tools or explain the blocker; do not invent undeclared tool names.
 
 SKILL REGISTRY GUIDANCE: The skill registry is a library of reusable, tested capabilities. Before starting a complex or repetitive task, call discover_skills to check if a relevant skill already exists. If a task requires a capability that doesn't exist yet and would be useful in the future, use create_skill to author it — provide the JS implementation and a test that exits 0 on success. Skills are stored persistently and shared across all conversations.
 
@@ -166,21 +118,8 @@ At the start of a conversation, call recall_memory with scope="global" to orient
 
 {{user_memory}}
 
-Tools available (you can inspect/read and explicitly hand work to Coder; you still cannot edit files, run commands, or write project memory yourself):
-- recall_memory: Read memory for the given scope ("global", "project", or "all"). Call this at the start of conversations.
-- remember_fact: Store a durable fact in global memory.
-- remember_preference: Store a user preference at global level.
-- google_search: Search Google for current information.
-- fetch_web_page: Fetch the text content of a web page.
-- read_file: Read a file's content.
-- list_files: List files in the workspace.
-- get_workspace_info: Return the active workspace directory.
-- grep_search: Search file contents across the workspace for a literal string or regex pattern.
-- search_embeddings / semantic_search: Semantic search over the workspace's indexed content.
-- get_symbol_index / get_file_symbols / find_references: Look up functions/classes/symbols and their usages. get_file_symbols supports JS/TS/JSX/TSX and Python files.
-- read_notes / read_project_memory: Read this conversation's or a project's saved notes/memory.
-- change_workspace: Point yourself at a different local folder to read from, when Jason asks about a specific project.
-- handoff_to_coder: Hand off a task to the Coder agent. Pass only: the workspace path and a concise task description (1-3 sentences max). Do NOT package context, plans, or summaries — Coder reads its own workspace. Use when Jason asks to build, fix, implement, run a local command, take a screenshot, inspect the desktop, or produce a local file/artifact.`;
+TOOL USE:
+Your callable tools are supplied separately as formal schemas. In Dispatch, use read/search/memory/workspace/handoff tools when available. You still cannot edit files, run commands, capture screenshots, or produce local artifacts yourself; hand those tasks to Coder with a concise task description.`;
 
 // Returns the right system instruction for the current mode.
 // Pass cachedMemory (string) to inject into the dispatcher instruction.
@@ -206,7 +145,7 @@ function getSystemInstruction(disableTools = false, cachedMemory = '', modelName
     }
   }
   if (disableTools) {
-    return base.split('Tools available:')[0] + '\n\nCRITICAL: You are in an analysis phase. DO NOT request any tool use. Provide your analysis in plain text only.';
+    return base + '\n\nCRITICAL: You are in an analysis phase. DO NOT request any tool use. Provide your analysis in plain text only.';
   }
   return base;
 }
@@ -1077,7 +1016,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   }
 
   // Inject resolved system facts so the model never needs to probe for the home directory
-  const webSearchStatus = (config.googleSearchApiKey && config.googleSearchEngineId)
+  const webSearchAvailable = !!(config.googleSearchApiKey && config.googleSearchEngineId);
+  const webSearchLabel = webSearchAvailable ? 'AVAILABLE' : 'UNAVAILABLE';
+  const webSearchStatus = webSearchAvailable
     ? 'AVAILABLE — google_search and fetch_web_page are ready to use.'
     : 'UNAVAILABLE — googleSearchApiKey or googleSearchEngineId not configured. Do not attempt google_search; use fetch_web_page with a known URL if you must retrieve a specific doc.';
   // Dispatch is a conversational assistant, not a task-tracking tool -- the "Work Walkthrough"
@@ -1088,18 +1029,31 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     ? '\nThis is a Dispatch conversation, not a Coder/implementation task. Do NOT include a "Work Walkthrough" section, a files-touched list, or a step-by-step recap of tool calls in your response, even if you used tools this turn. Just answer directly and conversationally.'
     : '';
   const knownProjectsFacts = formatKnownProjectsForSystemFacts();
+  const systemFactsSignature = JSON.stringify({
+    home: resolvedHomeDir,
+    workspace: workspacePath || '',
+    webSearch: webSearchLabel,
+    promptSource: promptSource === 'phone' ? 'phone' : 'desktop',
+    knownProjectsFacts,
+    dispatch: isDispatchConversation
+  });
+  const shouldInjectFullSystemFacts = conversation._systemFactsSignature !== systemFactsSignature;
+  conversation._systemFactsSignature = systemFactsSignature;
+  const systemFactsText = shouldInjectFullSystemFacts
+    ? `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nWeb search: ${webSearchStatus}\nClient: ${promptSource === 'phone' ? 'PHONE COMPANION — the user is on their phone. Prefer descriptions, text output, and copy-pasteable results over actions that require the desktop (launching GUI apps, opening windows, running interactive commands). If you need to show output, describe it clearly rather than suggesting they look at the screen.' : 'DESKTOP — the user is at their computer. You can launch apps, reference screen elements, and run interactive commands normally.'}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.${workWalkthroughOverride}`
+    : `[ORION SYSTEM FACTS - compact]\nStable system facts are unchanged from earlier in this conversation. Current workspace: ${workspacePath || '(none)'}. Home: ${resolvedHomeDir}. Web search: ${webSearchLabel}. Client: ${promptSource === 'phone' ? 'phone companion' : 'desktop'}.\nUse the current workspace for self-referential phrases like "this program" or "the project." Do NOT run echo or whoami to discover these paths.${workWalkthroughOverride}`;
   messages.splice(2, 0,
     {
       role: 'user',
-      parts: [{ text: `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nWeb search: ${webSearchStatus}\nClient: ${promptSource === 'phone' ? 'PHONE COMPANION — the user is on their phone. Prefer descriptions, text output, and copy-pasteable results over actions that require the desktop (launching GUI apps, opening windows, running interactive commands). If you need to show output, describe it clearly rather than suggesting they look at the screen.' : 'DESKTOP — the user is at their computer. You can launch apps, reference screen elements, and run interactive commands normally.'}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.${workWalkthroughOverride}` }]
+      parts: [{ text: systemFactsText }]
     },
     {
       role: 'model',
-      parts: [{ text: `Understood. Home directory is ${resolvedHomeDir}. Web search: ${webSearchStatus.split(' —')[0]}. Client: ${promptSource === 'phone' ? 'phone companion' : 'desktop'}. I will use these directly without probing.${isDispatchConversation ? ' I will skip the Work Walkthrough section for this conversation.' : ''}` }]
+      parts: [{ text: `Understood. System facts loaded (${shouldInjectFullSystemFacts ? 'full' : 'compact'}). Web search: ${webSearchLabel}. Client: ${promptSource === 'phone' ? 'phone companion' : 'desktop'}.${isDispatchConversation ? ' I will skip the Work Walkthrough section for this conversation.' : ''}` }]
     }
   );
 
-  if (knownProjectsFacts) {
+  if (shouldInjectFullSystemFacts && knownProjectsFacts) {
     messages.splice(4, 0,
       {
         role: 'user',
@@ -3088,6 +3042,9 @@ async function executeTool(name, args, workspace, config, conversation) {
       const index = fileData.indexOf(args.target);
       if (index === -1) {
         throw new Error(`Target content block not found in file: ${args.path}. Ensure exact match including whitespace.`);
+      }
+      if (fileData.indexOf(args.target, index + args.target.length) !== -1) {
+        throw new Error(`Target content block is not unique in file: ${args.path}. Provide a larger exact target, or use patch_file replace_range only after re-reading the current line numbers.`);
       }
       
       const newContent = fileData.substring(0, index) + args.replacement + fileData.substring(index + args.target.length);
@@ -7044,7 +7001,7 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "read_file",
-            description: "Reads the entire content of a file located at path relative to the workspace root.",
+            description: "Reads a file located at path relative to the workspace root. For files over about 200 lines, prefer startLine/endLine targeted reads after using get_symbol_index or get_file_symbols to locate the section you need; full reads are fine when whole-file context is genuinely needed.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -7101,8 +7058,8 @@ function buildAgentToolDeclarations() {
                     anchor: { type: "STRING", description: "Anchor text for insert" },
                     position: { type: "STRING", description: "before or after for insert" },
                     content: { type: "STRING", description: "Inserted content or replacement range content" },
-                    startLine: { type: "NUMBER", description: "1-based start line for replace_range" },
-                    endLine: { type: "NUMBER", description: "1-based end line for replace_range" },
+                    startLine: { type: "NUMBER", description: "1-based start line for replace_range. WARNING: every prior edit to this file can shift line numbers. Before any replace_range call, re-read the file or targeted section to get current line numbers; stale numbers from before a previous edit can corrupt the file." },
+                    endLine: { type: "NUMBER", description: "1-based end line for replace_range. WARNING: every prior edit to this file can shift line numbers. Before any replace_range call, re-read the file or targeted section to get current line numbers; stale numbers from before a previous edit can corrupt the file." },
                     count: { type: "NUMBER", description: "Maximum replacements for replace" }
                   },
                   required: ["type"]
@@ -7197,7 +7154,7 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "semantic_search",
-            description: "Performs a vector-based semantic search across the workspace to find code by meaning rather than exact string matching. HIGHLY RECOMMENDED as your first step when exploring an unfamiliar codebase, looking for where a concept is implemented, or when you don't know the exact variable names.",
+            description: "Performs a vector-based semantic search across the workspace to find code by meaning rather than exact string matching. HIGHLY RECOMMENDED as your first step when exploring an unfamiliar codebase, looking for where a concept is implemented, or when you don't know the exact variable names. Semantic similarity scores do not prove relevance; always cross-check top results with targeted read_file or grep_search before treating them as the authoritative location.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -7289,7 +7246,7 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "find_references",
-            description: "Finds usages of a function or variable across the workspace, using AST validation for JS/TS to skip noise.",
+            description: "Finds usages of a function or variable across the workspace. Call this BEFORE renaming, removing, or changing the signature of any function so every caller can be updated. Uses AST validation for JS/TS to filter false positives from string literals and comments.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -7339,7 +7296,7 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "set_task_checklist",
-            description: "Sets the task checklist in the side panel. Pass an array of items with a status ('pending', 'in-progress', 'completed'). Use this to mark tasks as 'in-progress' when you start them and 'completed' when done.",
+            description: "Sets the task checklist in the side panel. Pass an array of items with a status ('pending', 'in-progress', 'completed'). Use this to mark tasks as 'in-progress' when you start them and 'completed' when done. Do not call repeatedly for the same state.",
             parameters: {
               type: "OBJECT",
               properties: {
