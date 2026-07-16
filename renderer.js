@@ -2662,7 +2662,7 @@ function executeSaveConversationsToStorage() {
       updatedAt: c.updatedAt || Date.now(),
       createdAt: c.createdAt || Date.now(),
       isStub: true, // index always represents stubs
-      hasMessages: Array.isArray(c.messages) && c.messages.length > 0
+      hasMessages: c.isStub ? !!c.hasMessages : (Array.isArray(c.messages) && c.messages.length > 0)
     };
   });
 
@@ -2866,7 +2866,7 @@ async function selectConversation(id) {
   const conv = conversations.find(c => c.id === id);
   if (!conv) return;
 
-  if (conv.isStub && conv.hasMessages) {
+  if (conv.isStub) {
     el.messagesContainer.innerHTML = '<div class="loading-state" style="text-align:center; padding:20px; color:#888;">Loading conversation...</div>';
     el.messagesContainer.style.display = 'flex';
     const orionSplashEl = document.getElementById('orion-welcome-splash');
