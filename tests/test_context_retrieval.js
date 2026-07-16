@@ -7,6 +7,7 @@ const {
   inspectCodeContext,
   mergeRanges
 } = require('../lib/context-retrieval');
+const { resetWorkspaceIndexServices } = require('../lib/workspace-index-service');
 
 function makeWorkspace(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-context-'));
@@ -46,7 +47,10 @@ function makeWorkspace(t) {
     '});'
   ].join('\n'), 'utf8');
 
-  t.teardown(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.teardown(() => {
+    resetWorkspaceIndexServices();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
   return dir;
 }
 
