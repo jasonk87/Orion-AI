@@ -48,3 +48,72 @@ test('evaluateLoopStateWithSupervisor respects disableTools', async (t) => {
   t.equal(isStuck, false, 'returns false immediately if tools are disabled');
   t.end();
 });
+
+test('evaluateLoopStateWithSupervisorDecision parses bounded corrective JSON and includes context receipt', async (t) => {
+  const originalFetch = global.fetch;
+  let requestBody = '';
+  global.fetch = async (url, options) => {
+    requestBody = String(options && options.body || '');
+    return {
+      ok: true,
+      json: async () => ({
+        candidates: [{
+          content: {
+            parts: [{
+              text: JSON.stringify({
+                status: 'stuck',
+                pattern: 'fragmented_context_acquisition',
+                evidence: ['duplicate reads'],
+                recommendedAction: {
+                  type: 'consolidate_context',
+                  tool: 'inspect_code_context',
+                  target: 'agent.js completion gate'
+                },
+                avoid: ['read_file agent.js'],
+                confidence: 0.91
+              })
+            }]
+          }
+        }]
+      })
+    };
+  };
+
+  const oldEnv = process.env.NODE_ENV;
+  delete process.env.NODE_ENV;
+
+  const decision = await agent.evaluateLoopStateWithSupervisorDecision(
+    'gemini-1.5-flash',
+    Array(3).fill({ toolName: 'read_file', label: 'Read `agent.js`', status: 'done' }),
+    false,
+    {},
+    { duplicateLinesReturned: 1200, repeatedReads: [{ path: 'agent.js', readCalls: 3 }] }
+  );
+
+  process.env.NODE_ENV = oldEnv;
+  global.fetch = originalFetch;
+
+  t.equal(decision.status, 'stuck', 'structured status is preserved');
+  t.equal(decision.recommendedAction.type, 'consolidate_context', 'structured corrective action is preserved');
+  t.ok(requestBody.includes('duplicateLinesReturned'), 'context acquisition receipt is sent to the supervisor');
+  t.ok(requestBody.includes('Judge patterns, not a single call'), 'prompt explicitly avoids one-call guessing');
+  t.end();
+});
+
+test('context acquisition ledger tracks duplicate reads and invalidates after edits', (t) => {
+  const ledger = agent.createContextAcquisitionLedger();
+  agent.recordContextAcquisitionToolResult(ledger, 'read_file', { path: 'agent.js' }, { content: 'a\nb\nc' });
+  agent.recordContextAcquisitionToolResult(ledger, 'read_file', { path: 'agent.js' }, { content: 'a\nb\nc' });
+
+  let receipt = agent.buildContextAcquisitionReceipt(ledger);
+  t.equal(receipt.readCalls, 2, 'two read calls are tracked');
+  t.equal(receipt.duplicateLinesReturned, 3, 'second unchanged full read is counted as duplicate source');
+  t.equal(receipt.repeatedReads[0].path, 'agent.js', 'repeated read identifies the file');
+
+  agent.invalidateContextAcquisitionForFile(ledger, 'agent.js', 'patch_file');
+  agent.recordContextAcquisitionToolResult(ledger, 'read_file', { path: 'agent.js' }, { content: 'a\nchanged\nc' });
+  receipt = agent.buildContextAcquisitionReceipt(ledger);
+  t.equal(receipt.invalidations, 1, 'file mutation invalidates the prior read state');
+  t.equal(receipt.repeatedReads.length, 0, 'post-edit reread is not treated as duplicate');
+  t.end();
+});

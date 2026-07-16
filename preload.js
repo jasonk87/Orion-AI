@@ -23,6 +23,8 @@ contextBridge.exposeInMainWorld('api', {
   listFiles: (dirPath) => ipcRenderer.invoke('list-files', dirPath),
   grepSearch: (workspacePath, pattern, options) => ipcRenderer.invoke('grep-search', { workspacePath, pattern, options }),
   readFile: (workspacePath, relativePath, options) => ipcRenderer.invoke('read-file', { workspacePath, relativePath, options }),
+  readMultipleRanges: (workspacePath, files, options) => ipcRenderer.invoke('read-multiple-ranges', { workspacePath, files, options }),
+  inspectCodeContext: (workspacePath, request) => ipcRenderer.invoke('orion:inspect-code-context', { ...(request || {}), workspacePath }),
   deletePath: (workspacePath, relativePath) => ipcRenderer.invoke('delete-path', { workspacePath, relativePath }),
   movePath: (workspacePath, fromPath, toPath) => ipcRenderer.invoke('move-path', { workspacePath, fromPath, toPath }),
   renamePath: (workspacePath, relativePath, newName) => ipcRenderer.invoke('rename-path', { workspacePath, relativePath, newName }),

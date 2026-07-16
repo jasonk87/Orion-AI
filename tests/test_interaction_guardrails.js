@@ -990,6 +990,8 @@ test('Dispatch uses Projects fallback while Coder standalone conversations get i
   t.ok(rendererJs.includes("conversationMode(conv) === 'coder'") && rendererJs.includes('conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id)'), 'only Coder standalone prompts initialize isolated workspaces');
   t.ok(preloadJs.includes('getFileSymbols') && preloadJs.includes('orion:get-file-symbols'), 'preload exposes the file-symbol tool advertised to the model');
   t.ok(preloadJs.includes('semanticSearch') && preloadJs.includes('orion:semantic-search'), 'preload exposes semantic search advertised to the model');
+  t.ok(preloadJs.includes('readMultipleRanges') && preloadJs.includes('read-multiple-ranges'), 'preload exposes bundled range reads advertised to the model');
+  t.ok(preloadJs.includes('inspectCodeContext') && preloadJs.includes('orion:inspect-code-context'), 'preload exposes context packet inspection advertised to the model');
   t.end();
 });
 
@@ -1004,11 +1006,24 @@ test('token-saving prompt cleanup keeps tool schemas authoritative', (t) => {
   t.end();
 });
 
+test('incidental observations are bounded Coder-only run notes', (t) => {
+  t.ok(agentJs.includes('INCIDENTAL OBSERVATIONS'), 'Coder prompt includes incidental observation policy');
+  t.ok(agentJs.includes('name: "note_incidental_issue"'), 'Coder tool schema exposes note_incidental_issue');
+  t.ok(agentJs.includes('recordIncidentalIssueCandidate(incidentalIssueBuffer, args)'), 'tool records into the run-scoped buffer');
+  t.ok(agentJs.includes('appendIncidentalObservationsToFinal'), 'final handoff can append vetted incidental observations');
+  const allowlistStart = agentJs.indexOf('const DISPATCH_TOOL_ALLOWLIST = new Set([');
+  const allowlistEnd = agentJs.indexOf(']);', allowlistStart);
+  const allowlistBlock = agentJs.slice(allowlistStart, allowlistEnd);
+  t.notOk(allowlistBlock.includes('note_incidental_issue'), 'Dispatch allowlist does not include note_incidental_issue');
+  t.end();
+});
+
 test('edit intelligence prompt and schema guardrails are wired', (t) => {
   t.ok(agentJs.includes('Before changing a function name or signature, call "find_references"'), 'system prompt requires references before function renames/signature changes');
   t.ok(agentJs.includes('run targeted "run_linter" after JS/TS edits'), 'system prompt calls out targeted JS/TS lint/typecheck after edits');
   t.ok(agentJs.includes('Before writing tricky logic with loops, async behavior, parsing, file mutations'), 'scratchpad guidance targets tricky logic instead of every function');
-  t.ok(agentJs.includes('For files over about 200 lines, prefer startLine/endLine targeted reads'), 'read_file schema discourages wasteful large full-file reads');
+  t.ok(agentJs.includes('Use full-file reads when the file fits the active context budget'), 'read_file schema allows full reads when they are cheaper than repeated chunks');
+  t.ok(agentJs.includes('read_multiple_ranges') && agentJs.includes('inspect_code_context'), 'agent exposes consolidated exact-source retrieval tools');
   t.ok(agentJs.includes('Semantic similarity scores do not prove relevance'), 'semantic_search schema requires verification of semantic results');
   t.ok(agentJs.includes('Call this BEFORE renaming, removing, or changing the signature of any function'), 'find_references schema is proactive for refactors');
   t.ok(agentJs.includes('stale numbers from before a previous edit can corrupt the file'), 'replace_range schema warns about stale line numbers');
@@ -1020,6 +1035,8 @@ test('search tools expose optional context without shrinking semantic recall', (
   t.ok(agentJs.includes('contextLines: Number.isFinite(Number(args.contextLines))'), 'grep_search forwards optional contextLines');
   t.ok(agentJs.includes('Optional number of surrounding lines to include before and after each match'), 'grep_search schema declares contextLines');
   t.ok(semanticSearchJs.includes('topK = 10'), 'semantic search defaults to ten results');
+  t.ok(agentJs.includes("case 'read_multiple_ranges'"), 'read_multiple_ranges has an executor');
+  t.ok(agentJs.includes("case 'inspect_code_context'"), 'inspect_code_context has an executor');
   t.end();
 });
 

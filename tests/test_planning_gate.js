@@ -2876,6 +2876,62 @@ test('grep_search surfaces a backend failure as a thrown error instead of a sile
   t.end();
 });
 
+test('read_multiple_ranges forwards bundled range requests to IPC', async (t) => {
+  let capturedArgs = null;
+  global.window.api = {
+    readMultipleRanges: async (workspace, files, options) => {
+      capturedArgs = { workspace, files, options };
+      return {
+        success: true,
+        sections: [{ path: 'agent.js', startLine: 10, endLine: 20, content: '10: code' }],
+        metrics: { sectionCount: 1, estimatedTokens: 20 },
+        content: '10: code'
+      };
+    }
+  };
+  const result = await agent.executeTool('read_multiple_ranges', {
+    files: [{ path: 'agent.js', ranges: [{ startLine: 10, endLine: 20 }] }],
+    maxChars: 12345
+  }, '/test/workspace', {});
+  t.equal(capturedArgs.workspace, '/test/workspace', 'the active workspace is passed through');
+  t.equal(capturedArgs.files[0].path, 'agent.js', 'file path is forwarded');
+  t.equal(capturedArgs.files[0].ranges[0].startLine, 10, 'range start is forwarded');
+  t.equal(capturedArgs.options.maxChars, 12345, 'maxChars is forwarded');
+  t.equal(result.sections.length, 1, 'sections are returned to the model');
+  t.end();
+});
+
+test('inspect_code_context forwards context packet requests to IPC', async (t) => {
+  let capturedArgs = null;
+  global.window.api = {
+    inspectCodeContext: async (workspace, request) => {
+      capturedArgs = { workspace, request };
+      return {
+        success: true,
+        sections: [{ path: 'agent.js', startLine: 1, endLine: 12, content: '1: code' }],
+        metrics: { sectionCount: 1, estimatedTokens: 30 },
+        content: '1: code'
+      };
+    }
+  };
+  const result = await agent.executeTool('inspect_code_context', {
+    query: 'completion gate loop',
+    paths: ['agent.js'],
+    symbols: ['buildCompletionGateMessage'],
+    include: ['definitions', 'callers'],
+    budgetTokens: 9000,
+    contextLines: 6,
+    expand: true
+  }, '/test/workspace', {});
+  t.equal(capturedArgs.workspace, '/test/workspace', 'the active workspace is passed through');
+  t.equal(capturedArgs.request.query, 'completion gate loop', 'query is forwarded');
+  t.equal(capturedArgs.request.symbols[0], 'buildCompletionGateMessage', 'symbols are forwarded');
+  t.equal(capturedArgs.request.budgetTokens, 9000, 'budget is forwarded');
+  t.equal(capturedArgs.request.expand, true, 'expand flag is forwarded');
+  t.equal(result.sections.length, 1, 'sections are returned to the model');
+  t.end();
+});
+
 test('grep_search is declared in the shared tool-declaration source consumed by every provider', (t) => {
   const fs = require('fs');
   const path = require('path');

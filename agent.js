@@ -80,6 +80,13 @@ TOOL USE:
 - Callable tools are supplied separately as formal JSON schemas. Use those schemas as the source of truth for available tool names, parameters, and per-tool behavior.
 - If a needed capability is not present in the supplied schemas, adapt with the available tools or explain the blocker; do not invent undeclared tool names.
 
+INCIDENTAL OBSERVATIONS:
+- While inspecting material required for the current task, you may notice a separate serious issue. Do not search for unrelated issues, broaden inspection, interrupt the current task, or spend extra tool calls investigating it.
+- Call note_incidental_issue only when the evidence is already directly visible, confidence is high, impact is substantial, the issue is actionable, it is outside the current task, and it is not already known or being addressed.
+- Valid incidental observations include clear security exposure, data-loss or corruption paths, ordinary-path crashes, silent failure after lost work, state races, runaway loops, and unsafe destructive operations.
+- Do not record style concerns, generic missing tests, minor duplication, TODOs, broad refactors, alternative architecture preferences, or anything mainly phrased as could/might/consider.
+- Incidental observations are silent until the final handoff unless continuing would risk immediate data loss or corruption.
+
 SKILL REGISTRY GUIDANCE: The skill registry is a library of reusable, tested capabilities. Before starting a complex or repetitive task, call discover_skills to check if a relevant skill already exists. If a task requires a capability that doesn't exist yet and would be useful in the future, use create_skill to author it — provide the JS implementation and a test that exits 0 on success. Skills are stored persistently and shared across all conversations.
 
 MEMORY PROTOCOL:
@@ -572,7 +579,149 @@ window.stopAgentExecution = (options = {}) => {
 };
 window.softStopAgentExecution = () => requestAgentStop({ mode: 'soft' });
 
-async function evaluateLoopStateWithSupervisor(modelName, workWalkthrough, disableTools, config) {
+function buildSupervisorEvidencePacket(workWalkthrough = [], contextReceipt = {}) {
+  const recentTools = (workWalkthrough || []).slice(-20).map((w, index) => {
+    const target = w.label || w.toolName || 'unknown step';
+    const status = w.status && w.status !== 'running' ? ` [${w.status}]` : '';
+    const detail = w.detail ? ` - ${String(w.detail).slice(0, 160)}` : '';
+    return `${index + 1}. ${target}${status}${detail}`;
+  }).join('\n');
+
+  const signatures = new Map();
+  for (const item of (workWalkthrough || [])) {
+    if (!item) continue;
+    const key = [
+      item.toolName || 'unknown',
+      item.path || '',
+      item.command || '',
+      item.label || ''
+    ].join('|').toLowerCase();
+    signatures.set(key, (signatures.get(key) || 0) + 1);
+  }
+
+  return {
+    recentTools,
+    repeated: [...signatures.entries()]
+      .filter(([, count]) => count >= 2)
+      .slice(-8)
+      .map(([signature, count]) => ({ signature, count })),
+    fileMutations: (workWalkthrough || []).filter(isFileMutationItem).length,
+    verificationCount: (workWalkthrough || []).filter(isVerificationItem).length,
+    context: contextReceipt || {}
+  };
+}
+
+function normalizeSupervisorDecision(responseText) {
+  const parsed = parseModelJsonObject(responseText);
+  if (parsed && typeof parsed === 'object' && Object.keys(parsed).length > 0) {
+    const rawStatus = String(parsed.status || '').toLowerCase();
+    const status = rawStatus === 'stuck' || rawStatus === 'continue' || rawStatus === 'finalize'
+      ? rawStatus
+      : (rawStatus === 'blocked' ? 'stuck' : 'continue');
+    return {
+      status,
+      pattern: String(parsed.pattern || ''),
+      evidence: Array.isArray(parsed.evidence) ? parsed.evidence.map(String).slice(0, 8) : [],
+      recommendedAction: parsed.recommendedAction && typeof parsed.recommendedAction === 'object'
+        ? parsed.recommendedAction
+        : { type: status === 'stuck' ? 'change_tool_strategy' : 'continue' },
+      avoid: Array.isArray(parsed.avoid) ? parsed.avoid.map(String).slice(0, 8) : [],
+      confidence: Number.isFinite(Number(parsed.confidence)) ? Number(parsed.confidence) : 0
+    };
+  }
+
+  const text = String(responseText || '');
+  if (/STUCK/i.test(text) && !/CONTINUE/i.test(text)) {
+    return {
+      status: 'stuck',
+      pattern: 'legacy_stuck_response',
+      evidence: [],
+      recommendedAction: { type: 'change_tool_strategy' },
+      avoid: [],
+      confidence: 0.5
+    };
+  }
+  return {
+    status: 'continue',
+    pattern: 'legacy_continue_response',
+    evidence: [],
+    recommendedAction: { type: 'continue' },
+    avoid: [],
+    confidence: 0.5
+  };
+}
+
+function buildSupervisorDecisionPrompt(evidencePacket) {
+  return `You are a bounded supervisor for an autonomous local coding agent. Decide whether the run is healthy or stuck.
+
+Evidence:
+Recent tool calls:
+${evidencePacket.recentTools || '(none)'}
+
+Repeated signatures:
+${JSON.stringify(evidencePacket.repeated || [], null, 2)}
+
+Context acquisition receipt:
+${JSON.stringify(evidencePacket.context || {}, null, 2)}
+
+File mutations this run: ${evidencePacket.fileMutations || 0}
+Verification calls this run: ${evidencePacket.verificationCount || 0}
+
+Judge patterns, not a single call. Healthy progress includes reading different relevant files/ranges, running new verification, or making file mutations. Stuck patterns include repeated unchanged reads, repeated identical failures, fragmented context acquisition, identical completion-gate blocks, command loops with no new evidence, or tool oscillation.
+
+Return compact JSON only:
+{
+  "status": "continue" | "stuck" | "finalize",
+  "pattern": "short_pattern_name",
+  "evidence": ["specific evidence from the packet"],
+  "recommendedAction": {
+    "type": "continue" | "consolidate_context" | "change_tool_strategy" | "run_verification" | "finalize" | "ask_user",
+    "tool": "optional tool name",
+    "target": "optional file/symbol/query target"
+  },
+  "avoid": ["specific repeated action to avoid"],
+  "confidence": 0.0
+}`;
+}
+
+async function evaluateLoopStateWithSupervisorDecision(modelName, workWalkthrough, disableTools, config, contextReceipt = {}) {
+  if (disableTools) return { status: 'continue', recommendedAction: { type: 'continue' }, confidence: 1 };
+  if (!workWalkthrough || workWalkthrough.length === 0) {
+    return { status: 'continue', recommendedAction: { type: 'continue' }, confidence: 1 };
+  }
+
+  if (typeof process !== 'undefined' && process.env && process.env.NODE_ENV === 'test') {
+    return { status: 'stuck', pattern: 'test_mode', recommendedAction: { type: 'change_tool_strategy' }, confidence: 1 };
+  }
+
+  const prompt = buildSupervisorDecisionPrompt(buildSupervisorEvidencePacket(workWalkthrough, contextReceipt));
+
+  try {
+    const messages = [{ role: 'user', parts: [{ text: prompt }] }];
+    let responseText = '';
+    let resp;
+    if (modelName.startsWith('deepseek')) {
+      resp = await callDeepSeekAPI(messages, modelName, config?.deepseekApiKey || '', () => {}, true);
+    } else if (modelName.includes('claude')) {
+      resp = await callAnthropicAPI(messages, modelName, config?.anthropicApiKey || '', () => {}, true);
+    } else if (modelName.includes('gemini')) {
+      resp = await callGeminiAPI(messages, modelName, config?.geminiApiKey || '', () => {}, true);
+    } else {
+      resp = await callOllamaAPI(messages, modelName, () => {}, true);
+    }
+
+    if (resp && resp.candidates && resp.candidates[0] && resp.candidates[0].content && resp.candidates[0].content.parts) {
+      responseText = resp.candidates[0].content.parts.map(p => p.text || '').join('');
+    }
+    console.log("Supervisor response:", responseText);
+    return normalizeSupervisorDecision(responseText);
+  } catch (err) {
+    console.error("Supervisor check failed:", err);
+    return { status: 'continue', pattern: 'supervisor_failed', evidence: [err.message], recommendedAction: { type: 'continue' }, confidence: 0 };
+  }
+}
+
+async function evaluateLoopStateWithSupervisorLegacy(modelName, workWalkthrough, disableTools, config) {
   if (disableTools) return false;
   if (!workWalkthrough || workWalkthrough.length === 0) return false;
   
@@ -620,6 +769,11 @@ async function evaluateLoopStateWithSupervisor(modelName, workWalkthrough, disab
     console.error("Supervisor check failed:", err);
     return false; // Default to continue if supervisor fails
   }
+}
+
+async function evaluateLoopStateWithSupervisor(modelName, workWalkthrough, disableTools, config, contextReceipt = {}) {
+  const decision = await evaluateLoopStateWithSupervisorDecision(modelName, workWalkthrough, disableTools, config, contextReceipt);
+  return decision && decision.status === 'stuck';
 }
 
 // EXPOSE AGENT LOOP TO RENDERER
@@ -1150,6 +1304,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     }
     return false;
   }
+
+  const incidentalIssueBuffer = [];
   
   try {
     if (approvalIntent && approvalIntent.intent === 'deny') {
@@ -1267,6 +1423,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // error (miscalculated line ranges drifting after each edit) with zero escalation ever firing.
     const consecutiveEditFailureCounts = new Map(); // path (lowercased) -> streak count
     const toolEvidenceLedger = [];
+    const contextAcquisitionLedger = createContextAcquisitionLedger();
+    let supervisorCorrectionAttempts = 0;
     const maxMalformedToolRetries = 5;
     const canExecuteThisTask = () => !config.planningMode || conversation.planApproved || planningBypassedForTask;
 
@@ -1758,7 +1916,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // executeTool calls concurrently with Promise.all. State mutations (log
       // updates, ledger entries, working-state transitions) are still sequential.
       const PARALLELIZABLE_TOOLS = new Set([
-        'read_file', 'read_multiple_files', 'list_files', 'get_symbol_index', 'get_workspace_info',
+        'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context', 'list_files', 'get_symbol_index', 'get_workspace_info',
         'google_search', 'fetch_web_page', 'grep_search', 'search_embeddings', 'search_api_docs',
         'semantic_search', 'fetch_page', 'git_diff', 'git_rollback', 'edit_config', 'get_file_symbols', 'find_references',
         'read_command_output', 'get_command_status',
@@ -1810,6 +1968,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           currentAgentLogs[logIndex].elapsed = elapsed;
           updateWalkthroughItem(walkthroughItem, toolName, args, result, isFailedToolResult(result) ? new Error(getToolFailureSignal(result) || 'error') : null);
           toolEvidenceLedger.push(buildToolEvidenceEntry(toolName, args, result));
+          recordContextAcquisitionToolResult(contextAcquisitionLedger, toolName, args, result);
 
           // read_file state tracking
           if (toolName === 'read_file' && args.path && !isFailedToolResult(result)) {
@@ -1826,6 +1985,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
                 result.redundantReadNote = `You already read ${args.path} earlier this run and it hasn't changed.`;
               }
               filesFullyReadUnchanged.add(readKey);
+            }
+          }
+          if ((toolName === 'read_multiple_files' || toolName === 'read_multiple_ranges' || toolName === 'inspect_code_context') && !isFailedToolResult(result)) {
+            for (const section of getContextSectionsFromToolResult(toolName, args, result)) {
+              const readKey = String(section.path || '').toLowerCase();
+              if (readKey) {
+                filesSeenThisRun.add(readKey);
+                fileNeedsReadBeforeEdit.delete(readKey);
+              }
             }
           }
 
@@ -1940,7 +2108,24 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         }
         
         // Launch-only scope guard: a plain "launch/run this" request is low-risk and read-only —
-        // it does not authorize repeated source edits just because the launch failed on a
+        if (toolName === 'note_incidental_issue') {
+          const result = recordIncidentalIssueCandidate(incidentalIssueBuffer, args);
+          currentAgentLogs[logIndex].status = 'success';
+          currentAgentLogs[logIndex].result = JSON.stringify(result, null, 2);
+          updateWalkthroughItem(walkthroughItem, toolName, args, result, null);
+          toolEvidenceLedger.push(buildToolEvidenceEntry(toolName, args, result));
+          toolResponseParts.push({
+            functionResponse: {
+              name: toolName,
+              response: result
+            }
+          });
+          persistCurrentAgentLogs({ render: true });
+          continue;
+        }
+
+        // Launch-only scope guard: a plain launch/run request is low-risk and read-only.
+        // It does not authorize repeated source edits just because the launch failed on a
         // pre-existing bug. Block the first edit attempt this turn and require the model to report
         // the failure and ask before making changes, instead of silently starting to fix code
         // nobody asked it to touch.
@@ -1965,7 +2150,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         if ((toolName === 'modify_file' || toolName === 'patch_file') && args.path) {
           const editKey = String(args.path).toLowerCase();
           if (!filesSeenThisRun.has(editKey)) {
-            const blockMsg = `EDIT BLOCKED: You have not read ${args.path} this session, so you would be editing content you haven't seen. Call read_file on ${args.path} first (for a large file, get_symbol_index then a targeted read_file of the relevant range), then make your edit against its actual current content. Editing a file blind is the top cause of corruption.`;
+            const blockMsg = `EDIT BLOCKED: You have not read ${args.path} this session, so you would be editing content you haven't seen. Call read_file, read_multiple_ranges, or inspect_code_context for ${args.path} first (for a large file, retrieve the complete relevant function/class instead of arbitrary chunks), then make your edit against its actual current content. Editing a file blind is the top cause of corruption.`;
             currentAgentLogs[logIndex].status = 'error';
             currentAgentLogs[logIndex].result = blockMsg;
             updateWalkthroughItem(walkthroughItem, toolName, args, { error: blockMsg }, new Error(blockMsg));
@@ -2080,6 +2265,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
         const evidenceEntry = buildToolEvidenceEntry(toolName, args, result);
         toolEvidenceLedger.push(evidenceEntry);
+        recordContextAcquisitionToolResult(contextAcquisitionLedger, toolName, args, result);
 
         if (toolName === 'write_file' && isStrategyPath(args.path) && !isFailedToolResult(result)) {
           try {
@@ -2161,6 +2347,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           if (toolName === 'write_file') filesSeenThisRun.add(editKey);
           // The file's content just changed, so a subsequent re-read is legitimate (not redundant).
           filesFullyReadUnchanged.delete(editKey);
+          invalidateContextAcquisitionForFile(contextAcquisitionLedger, args.path, toolName);
           const editCount = (fileEditCounts.get(editKey) || 0) + 1;
           fileEditCounts.set(editKey, editCount);
           if (editCount >= 2) {
@@ -2246,6 +2433,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               result.redundantReadNote = `You already read ${args.path} earlier this run and it has not changed since — this is the same content. Re-reading files you already have (especially large ones) wastes context; rely on your earlier read and proceed to the next concrete action instead of reading this file again.`;
             }
             filesFullyReadUnchanged.add(readKey);
+          }
+        }
+        if ((toolName === 'read_multiple_files' || toolName === 'read_multiple_ranges' || toolName === 'inspect_code_context') && !isFailedToolResult(result)) {
+          for (const section of getContextSectionsFromToolResult(toolName, args, result)) {
+            const readKey = String(section.path || '').toLowerCase();
+            if (readKey) {
+              filesSeenThisRun.add(readKey);
+              fileNeedsReadBeforeEdit.delete(readKey);
+            }
           }
         }
         // A genuine passing verification (not a placeholder script) proves the workspace is
@@ -2371,11 +2567,41 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             updateExisting: true
           });
         }
-        const isStuck = await evaluateLoopStateWithSupervisor(activeRunModelName, workWalkthrough, false, config);
-        if (!isStuck) {
+        const supervisorDecision = await evaluateLoopStateWithSupervisorDecision(
+          activeRunModelName,
+          workWalkthrough,
+          false,
+          config,
+          buildContextAcquisitionReceipt(contextAcquisitionLedger)
+        );
+        const recommendedAction = supervisorDecision && supervisorDecision.recommendedAction ? supervisorDecision.recommendedAction : { type: 'continue' };
+        const actionType = String(recommendedAction.type || '').toLowerCase();
+        if (!supervisorDecision || supervisorDecision.status === 'continue') {
           maxLoops += 15;
           if (window.appendSystemMessage) {
             window.appendSystemMessage("Supervisor approved +15 turn extension.", {
+              conversationId: conversation.id,
+              source: 'supervisor-extension',
+              dedupeKey: `supervisor-extension-${conversation.id}`,
+              updateExisting: true
+            });
+          }
+        } else if (supervisorDecision.status === 'stuck' && supervisorCorrectionAttempts < 1 && (actionType === 'consolidate_context' || actionType === 'change_tool_strategy' || actionType === 'run_verification')) {
+          supervisorCorrectionAttempts += 1;
+          maxLoops += 4;
+          const avoidText = Array.isArray(supervisorDecision.avoid) && supervisorDecision.avoid.length
+            ? ` Avoid repeating: ${supervisorDecision.avoid.join('; ')}.`
+            : '';
+          const targetText = recommendedAction.target ? ` Target: ${recommendedAction.target}.` : '';
+          const toolText = recommendedAction.tool ? ` Prefer tool: ${recommendedAction.tool}.` : '';
+          messages.push({
+            role: 'user',
+            parts: [{
+              text: `[SYSTEM: Supervisor detected a likely loop (${supervisorDecision.pattern || 'stuck'}). Use one bounded correction attempt now.${toolText}${targetText}${avoidText} If context acquisition is fragmented, call inspect_code_context or read_multiple_ranges to retrieve the needed exact source in one bundle. Do not repeat the same failed/read action.]`
+            }]
+          });
+          if (window.appendSystemMessage) {
+            window.appendSystemMessage("Supervisor requested one bounded correction attempt.", {
               conversationId: conversation.id,
               source: 'supervisor-extension',
               dedupeKey: `supervisor-extension-${conversation.id}`,
@@ -2513,6 +2739,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         !/ask me to continue/i.test(lastTextResponse)) {
       lastTextResponse += '\n\n[Note: this run hit its per-turn action limit before the task was confirmed complete — the message above may be from partway through, not a final result. Ask me to continue and I will pick up from the current state.]';
     }
+    lastTextResponse = appendIncidentalObservationsToFinal(lastTextResponse, incidentalIssueBuffer, conversation, {
+      autoContinueExecution,
+      forceYield
+    });
     lastTextResponse = withWorkWalkthrough(lastTextResponse, workWalkthrough, true, conversation);
 
     // Save walkthrough to file so the chat bubble stays clean
@@ -2989,6 +3219,34 @@ async function executeTool(name, args, workspace, config, conversation) {
 
       const results = await Promise.all(readPromises);
       return { content: results.join("") };
+    }
+
+    case 'read_multiple_ranges': {
+      if (!Array.isArray(args.files)) throw new Error("Missing 'files' array parameter");
+      if (typeof window.api.readMultipleRanges !== 'function') throw new Error('readMultipleRanges IPC not available');
+      const result = await window.api.readMultipleRanges(workspace, args.files, {
+        maxChars: Number.isFinite(Number(args.maxChars)) ? Number(args.maxChars) : 500000
+      });
+      if (!result || result.success === false) throw new Error((result && result.error) || 'read_multiple_ranges failed');
+      return result;
+    }
+
+    case 'inspect_code_context': {
+      if (!args.query && !Array.isArray(args.symbols) && !Array.isArray(args.paths)) {
+        throw new Error("inspect_code_context needs a query, symbols, or paths");
+      }
+      if (typeof window.api.inspectCodeContext !== 'function') throw new Error('inspectCodeContext IPC not available');
+      const result = await window.api.inspectCodeContext(workspace, {
+        query: args.query || '',
+        paths: Array.isArray(args.paths) ? args.paths : [],
+        symbols: Array.isArray(args.symbols) ? args.symbols : [],
+        include: Array.isArray(args.include) ? args.include : undefined,
+        budgetTokens: Number.isFinite(Number(args.budgetTokens)) ? Number(args.budgetTokens) : undefined,
+        contextLines: Number.isFinite(Number(args.contextLines)) ? Number(args.contextLines) : undefined,
+        expand: args.expand === true
+      });
+      if (!result || result.success === false) throw new Error((result && result.error) || 'inspect_code_context failed');
+      return result;
     }
     
     case 'write_file': {
@@ -4278,6 +4536,13 @@ function summarizeToolOutcome(toolName, args, result) {
     if (result.entryCount !== undefined) parts.push(`entryCount=${result.entryCount}`);
     if (result.status) parts.push(`status=${result.status}`);
     if (result.exitCode !== undefined) parts.push(`exitCode=${result.exitCode}`);
+    if (toolName === 'note_incidental_issue') {
+      parts.push(result.recorded ? `recorded=${result.issue && result.issue.file ? result.issue.file : 'candidate'}` : `rejected=${result.reason || 'threshold not met'}`);
+    }
+    if ((toolName === 'read_multiple_ranges' || toolName === 'inspect_code_context') && result.metrics) {
+      parts.push(`sections=${result.metrics.sectionCount || 0}`);
+      parts.push(`estimatedTokens=${result.metrics.estimatedTokens || 0}`);
+    }
     if (result.error) parts.push(`error=${String(result.error)}`);
     if (!parts.length && result.output) parts.push(String(result.output));
   } else if (result !== undefined) {
@@ -4782,6 +5047,17 @@ function summarizeToolStart(toolName, args = {}) {
       : '';
     return { toolName, status: 'running', label: `Read \`${args.path || 'file'}\`${rangeLabel}` };
   }
+  if (toolName === 'read_multiple_ranges') {
+    const fileCount = Array.isArray(args.files) ? args.files.length : 0;
+    return { toolName, status: 'running', label: `Read bundled source ranges${fileCount ? ` from ${fileCount} file(s)` : ''}` };
+  }
+  if (toolName === 'inspect_code_context') {
+    const target = args.query || (Array.isArray(args.symbols) && args.symbols.length ? args.symbols.join(', ') : 'requested code context');
+    return { toolName, status: 'running', label: `Inspected code context for \`${String(target).slice(0, 80)}\`` };
+  }
+  if (toolName === 'note_incidental_issue') {
+    return null;
+  }
   if (toolName === 'list_files') return { toolName, status: 'running', label: 'Listed workspace files' };
   if (toolName === 'get_workspace_info') return { toolName, status: 'running', label: 'Checked active workspace directory' };
   if (toolName === 'open_workspace_folder') return { toolName, status: 'running', label: 'Opened workspace folder' };
@@ -4873,6 +5149,11 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
     item.detail = result && result.skipped ? result.message : '';
   } else if (toolName === 'get_workspace_info') {
     item.detail = result && result.workspace ? `Directory: \`${result.workspace}\`` : '';
+  } else if (toolName === 'read_multiple_ranges' || toolName === 'inspect_code_context') {
+    const metrics = result && result.metrics ? result.metrics : {};
+    item.detail = metrics.sectionCount ? `${metrics.sectionCount} exact source section(s), ~${metrics.estimatedTokens || 0} tokens` : '';
+  } else if (toolName === 'note_incidental_issue') {
+    item.detail = result && result.recorded ? 'Kept for final handoff' : (result && result.reason ? result.reason : '');
   } else if (toolName === 'launch_workspace_app') {
     item.detail = result && result.message ? result.message : '';
   } else if (toolName === 'set_workspace_entrypoint') {
@@ -5363,6 +5644,8 @@ function hasDeepInspectionEvidence(workWalkthrough = []) {
     if (!item || item.status === 'error') return false;
     if (isInventoryOnlyTool(item)) return false;
     return item.toolName === 'read_file' ||
+      item.toolName === 'read_multiple_ranges' ||
+      item.toolName === 'inspect_code_context' ||
       item.toolName === 'grep_search' ||
       item.toolName === 'search_embeddings' ||
       item.toolName === 'run_command' ||
@@ -5395,7 +5678,7 @@ function getInspectedEvidenceAnchors(workWalkthrough = []) {
   const anchors = new Set();
   (workWalkthrough || []).forEach(item => {
     if (!item || item.status === 'error') return;
-    if (item.toolName !== 'read_file' && item.kind !== 'file') return;
+    if (item.toolName !== 'read_file' && item.toolName !== 'read_multiple_ranges' && item.toolName !== 'inspect_code_context' && item.kind !== 'file') return;
     const raw = String(item.path || item.label || '');
     const backtickMatch = raw.match(/`([^`]+)`/);
     const filePath = (backtickMatch ? backtickMatch[1] : raw).trim();
@@ -5914,7 +6197,7 @@ function requestPlausiblyBenefitsFromWorkspaceContext(prompt) {
   return referencesAppOrCode && isIdeaOrDesignRequest;
 }
 
-const INSPECTION_TOOLS = new Set(['list_files', 'read_file', 'read_multiple_files', 'get_workspace_info', 'grep_search', 'search_embeddings', 'get_symbol_index']);
+const INSPECTION_TOOLS = new Set(['list_files', 'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context', 'get_workspace_info', 'grep_search', 'search_embeddings', 'get_symbol_index']);
 const MEMORY_WRITE_TOOLS = new Set(['append_project_memory', 'remember_fact', 'remember_decision']);
 
 function hasPriorWorkspaceInspection(conversation) {
@@ -5928,8 +6211,9 @@ function turnDidSubstantiveInspection(workWalkthrough) {
   const done = (workWalkthrough || []).filter(item => item && item.status !== 'error');
   const inspectionCalls = done.filter(item => INSPECTION_TOOLS.has(item.toolName));
   if (inspectionCalls.length >= 2) return true;
+  if (inspectionCalls.some(item => item.toolName === 'inspect_code_context' || item.toolName === 'read_multiple_ranges')) return true;
   const toolNames = new Set(inspectionCalls.map(item => item.toolName));
-  return toolNames.has('get_symbol_index') && toolNames.has('read_file');
+  return toolNames.has('get_symbol_index') && (toolNames.has('read_file') || toolNames.has('read_multiple_ranges'));
 }
 
 function turnAlreadyWroteMemory(workWalkthrough) {
@@ -6087,6 +6371,345 @@ function buildToolEvidenceEntry(toolName, args = {}, result = {}) {
     failure,
     category: failure ? classifyAgentFailure({ toolName, args, result, errorText: failure }).category : 'success',
     summary: summarizeToolOutcome(toolName, args, result).summary
+  };
+}
+
+function estimateTextTokens(text) {
+  return Math.ceil(String(text || '').length / 4);
+}
+
+const INCIDENTAL_ISSUE_CATEGORIES = new Set([
+  'security',
+  'data_loss',
+  'silent_failure',
+  'crash_path',
+  'state_race',
+  'runaway_loop',
+  'destructive_path'
+]);
+const INCIDENTAL_ISSUE_SEVERITIES = new Set(['major', 'critical']);
+const INCIDENTAL_MIN_CONFIDENCE = 0.85;
+const INCIDENTAL_MAX_CANDIDATES = 3;
+
+function compactIncidentalIssueText(value, maxLength = 500) {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+}
+
+function normalizeIncidentalIssueCandidate(args = {}) {
+  const confidence = Number(args.confidence);
+  return {
+    file: compactIncidentalIssueText(args.file, 240),
+    location: compactIncidentalIssueText(args.location, 240),
+    category: compactIncidentalIssueText(args.category, 80).toLowerCase(),
+    severity: compactIncidentalIssueText(args.severity, 40).toLowerCase(),
+    confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : 0,
+    observation: compactIncidentalIssueText(args.observation, 700),
+    impact: compactIncidentalIssueText(args.impact, 700),
+    evidence: compactIncidentalIssueText(args.evidence, 700),
+    suggestedCheck: compactIncidentalIssueText(args.suggestedCheck, 500),
+    outsideCurrentTask: args.outsideCurrentTask === true || String(args.outsideCurrentTask).toLowerCase() === 'true'
+  };
+}
+
+function fingerprintIncidentalIssue(issue = {}) {
+  return [
+    issue.file,
+    issue.location,
+    issue.category,
+    issue.observation
+  ].map(value => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim()).join('|');
+}
+
+function recordIncidentalIssueCandidate(buffer, args = {}) {
+  const candidates = Array.isArray(buffer) ? buffer : [];
+  const issue = normalizeIncidentalIssueCandidate(args);
+  const requiredFields = ['file', 'location', 'observation', 'impact', 'evidence', 'suggestedCheck'];
+  const missing = requiredFields.filter(key => !issue[key]);
+  if (missing.length) {
+    return {
+      success: true,
+      recorded: false,
+      reason: `Rejected incidental observation: missing ${missing.join(', ')}.`,
+      count: candidates.length
+    };
+  }
+  if (!INCIDENTAL_ISSUE_CATEGORIES.has(issue.category)) {
+    return {
+      success: true,
+      recorded: false,
+      reason: `Rejected incidental observation: category must be one of ${[...INCIDENTAL_ISSUE_CATEGORIES].join(', ')}.`,
+      count: candidates.length
+    };
+  }
+  if (!INCIDENTAL_ISSUE_SEVERITIES.has(issue.severity)) {
+    return {
+      success: true,
+      recorded: false,
+      reason: 'Rejected incidental observation: severity must be major or critical.',
+      count: candidates.length
+    };
+  }
+  if (issue.confidence < INCIDENTAL_MIN_CONFIDENCE) {
+    return {
+      success: true,
+      recorded: false,
+      reason: `Rejected incidental observation: confidence must be at least ${INCIDENTAL_MIN_CONFIDENCE}.`,
+      count: candidates.length
+    };
+  }
+  if (!issue.outsideCurrentTask) {
+    return {
+      success: true,
+      recorded: false,
+      reason: 'Rejected incidental observation: issue must be outside the current task.',
+      count: candidates.length
+    };
+  }
+  const fingerprint = fingerprintIncidentalIssue(issue);
+  if (candidates.some(candidate => candidate.fingerprint === fingerprint)) {
+    return {
+      success: true,
+      recorded: false,
+      reason: 'Rejected incidental observation: duplicate candidate already recorded.',
+      count: candidates.length
+    };
+  }
+  if (candidates.length >= INCIDENTAL_MAX_CANDIDATES) {
+    return {
+      success: true,
+      recorded: false,
+      reason: `Rejected incidental observation: run-scoped buffer is capped at ${INCIDENTAL_MAX_CANDIDATES}.`,
+      count: candidates.length
+    };
+  }
+  const recorded = {
+    ...issue,
+    fingerprint,
+    recordedAt: Date.now()
+  };
+  candidates.push(recorded);
+  return {
+    success: true,
+    recorded: true,
+    count: candidates.length,
+    issue: {
+      file: recorded.file,
+      location: recorded.location,
+      category: recorded.category,
+      severity: recorded.severity,
+      confidence: recorded.confidence,
+      observation: recorded.observation
+    }
+  };
+}
+
+function formatIncidentalObservations(buffer, maxItems = 2) {
+  const candidates = Array.isArray(buffer) ? buffer : [];
+  const ranked = candidates
+    .filter(candidate => candidate && candidate.observation)
+    .sort((a, b) => {
+      const severityDelta = (b.severity === 'critical' ? 2 : 1) - (a.severity === 'critical' ? 2 : 1);
+      return severityDelta || ((Number(b.confidence) || 0) - (Number(a.confidence) || 0));
+    })
+    .slice(0, Math.max(0, maxItems));
+  if (!ranked.length) return '';
+  const lines = ['## Incidental Observations', 'While working, I also noticed:'];
+  for (const issue of ranked) {
+    const severity = issue.severity === 'critical' ? 'Critical' : 'Major';
+    lines.push(`- **${severity}:** \`${issue.file}\` (${issue.location}) - ${issue.observation}`);
+    lines.push(`  Impact: ${issue.impact}`);
+    lines.push(`  Evidence: ${issue.evidence}`);
+    lines.push(`  Suggested check: ${issue.suggestedCheck}`);
+  }
+  return lines.join('\n');
+}
+
+function appendIncidentalObservationsToFinal(text, buffer, conversation = {}, options = {}) {
+  if (!Array.isArray(buffer) || !buffer.length) return text;
+  if (conversation && conversation.mode === 'orion') return text;
+  if (options.autoContinueExecution || options.forceYield) return text;
+  const section = formatIncidentalObservations(buffer);
+  if (!section) return text;
+  const base = String(text || '').trimEnd();
+  if (base.includes('## Incidental Observations')) return base;
+  return `${base}\n\n${section}`;
+}
+
+function createContextAcquisitionLedger() {
+  return {
+    files: new Map(),
+    events: [],
+    readCalls: 0,
+    searchCalls: 0,
+    failedSearchCalls: 0,
+    uniqueLinesReturned: 0,
+    duplicateLinesReturned: 0,
+    estimatedSourceTokens: 0,
+    invalidations: 0
+  };
+}
+
+function normalizeLedgerPath(pathValue) {
+  return String(pathValue || '').replace(/\\/g, '/').toLowerCase();
+}
+
+function mergeLedgerRange(existingRanges, startLine, endLine) {
+  existingRanges.push({ startLine, endLine });
+  existingRanges.sort((a, b) => a.startLine - b.startLine || a.endLine - b.endLine);
+  const merged = [];
+  for (const range of existingRanges) {
+    const last = merged[merged.length - 1];
+    if (!last || range.startLine > last.endLine + 1) {
+      merged.push({ ...range });
+    } else {
+      last.endLine = Math.max(last.endLine, range.endLine);
+    }
+  }
+  existingRanges.splice(0, existingRanges.length, ...merged);
+}
+
+function countRangeOverlap(existingRanges, startLine, endLine) {
+  let overlap = 0;
+  for (const range of existingRanges || []) {
+    const start = Math.max(startLine, range.startLine);
+    const end = Math.min(endLine, range.endLine);
+    if (end >= start) overlap += end - start + 1;
+  }
+  return overlap;
+}
+
+function countResultLines(value) {
+  const text = String(value || '');
+  if (!text) return 0;
+  return text.split(/\r?\n/).length;
+}
+
+function getContextSectionsFromToolResult(toolName, args = {}, result = {}) {
+  if (!result || isFailedToolResult(result)) return [];
+  if (toolName === 'read_file' && args.path) {
+    const content = String(result.content || '');
+    const hasRange = Number.isInteger(parseInt(args.startLine, 10)) && Number.isInteger(parseInt(args.endLine, 10));
+    const lineCount = countResultLines(content);
+    const startLine = hasRange ? parseInt(args.startLine, 10) : 1;
+    const endLine = hasRange ? parseInt(args.endLine, 10) : Math.max(1, lineCount);
+    return [{ path: args.path, startLine, endLine, lineCount, estimatedTokens: estimateTextTokens(content), fullRead: !hasRange }];
+  }
+  if (toolName === 'read_multiple_files' && Array.isArray(args.paths)) {
+    const content = String(result.content || '');
+    const perFileTokenEstimate = Math.ceil(estimateTextTokens(content) / Math.max(1, args.paths.length));
+    return args.paths.map(pathValue => ({
+      path: pathValue,
+      startLine: 1,
+      endLine: countResultLines(content),
+      lineCount: countResultLines(content),
+      estimatedTokens: perFileTokenEstimate,
+      fullRead: true
+    }));
+  }
+  if ((toolName === 'read_multiple_ranges' || toolName === 'inspect_code_context') && Array.isArray(result.sections)) {
+    return result.sections
+      .filter(section => section && section.path)
+      .map(section => ({
+        path: section.path,
+        startLine: Number(section.startLine) || 1,
+        endLine: Number(section.endLine) || Number(section.startLine) || 1,
+        lineCount: Number(section.lineCount) || Math.max(1, (Number(section.endLine) || 1) - (Number(section.startLine) || 1) + 1),
+        estimatedTokens: Number(section.estimatedTokens) || estimateTextTokens(section.content || ''),
+        fullRead: false
+      }));
+  }
+  return [];
+}
+
+function recordContextAcquisitionToolResult(ledger, toolName, args = {}, result = {}) {
+  if (!ledger) return;
+  if (toolName === 'grep_search' || toolName === 'semantic_search' || toolName === 'search_embeddings' || toolName === 'get_symbol_index' || toolName === 'get_file_symbols' || toolName === 'find_references') {
+    ledger.searchCalls += 1;
+    if (isFailedToolResult(result)) ledger.failedSearchCalls += 1;
+    ledger.events.push({
+      toolName,
+      kind: 'search',
+      failed: isFailedToolResult(result),
+      target: args.pattern || args.query || args.symbolName || args.path || ''
+    });
+    ledger.events = ledger.events.slice(-40);
+    return;
+  }
+
+  const sections = getContextSectionsFromToolResult(toolName, args, result);
+  for (const section of sections) {
+    const pathKey = normalizeLedgerPath(section.path);
+    if (!pathKey) continue;
+    const fileEntry = ledger.files.get(pathKey) || {
+      path: String(section.path),
+      ranges: [],
+      fullReads: 0,
+      readCalls: 0,
+      duplicateLines: 0,
+      uniqueLines: 0,
+      estimatedTokens: 0
+    };
+    const startLine = Math.max(1, Number(section.startLine) || 1);
+    const endLine = Math.max(startLine, Number(section.endLine) || startLine);
+    const lineCount = Math.max(1, endLine - startLine + 1);
+    const duplicateLines = countRangeOverlap(fileEntry.ranges, startLine, endLine);
+    const uniqueLines = Math.max(0, lineCount - duplicateLines);
+    fileEntry.readCalls += 1;
+    if (section.fullRead) fileEntry.fullReads += 1;
+    fileEntry.duplicateLines += duplicateLines;
+    fileEntry.uniqueLines += uniqueLines;
+    fileEntry.estimatedTokens += Number(section.estimatedTokens) || 0;
+    mergeLedgerRange(fileEntry.ranges, startLine, endLine);
+    ledger.files.set(pathKey, fileEntry);
+
+    ledger.readCalls += 1;
+    ledger.uniqueLinesReturned += uniqueLines;
+    ledger.duplicateLinesReturned += duplicateLines;
+    ledger.estimatedSourceTokens += Number(section.estimatedTokens) || 0;
+    ledger.events.push({
+      toolName,
+      kind: 'read',
+      path: fileEntry.path,
+      startLine,
+      endLine,
+      duplicateLines,
+      fullRead: !!section.fullRead
+    });
+  }
+  ledger.events = ledger.events.slice(-40);
+}
+
+function invalidateContextAcquisitionForFile(ledger, pathValue, reason = 'file mutation') {
+  if (!ledger || !pathValue) return;
+  const key = normalizeLedgerPath(pathValue);
+  if (ledger.files.delete(key)) ledger.invalidations += 1;
+  ledger.events.push({ toolName: reason, kind: 'invalidation', path: String(pathValue) });
+  ledger.events = ledger.events.slice(-40);
+}
+
+function buildContextAcquisitionReceipt(ledger) {
+  if (!ledger) return {};
+  const repeatedReads = [...ledger.files.values()]
+    .filter(file => file.readCalls >= 2 || file.duplicateLines > 0 || file.fullReads >= 2)
+    .sort((a, b) => (b.duplicateLines - a.duplicateLines) || (b.readCalls - a.readCalls))
+    .slice(0, 6)
+    .map(file => ({
+      path: file.path,
+      readCalls: file.readCalls,
+      fullReads: file.fullReads,
+      uniqueLines: file.uniqueLines,
+      duplicateLines: file.duplicateLines
+    }));
+  return {
+    readCalls: ledger.readCalls,
+    searchCalls: ledger.searchCalls,
+    failedSearchCalls: ledger.failedSearchCalls,
+    uniqueLinesReturned: ledger.uniqueLinesReturned,
+    duplicateLinesReturned: ledger.duplicateLinesReturned,
+    estimatedSourceTokens: ledger.estimatedSourceTokens,
+    invalidations: ledger.invalidations,
+    repeatedReads,
+    recentEvents: ledger.events.slice(-12)
   };
 }
 
@@ -6889,7 +7512,7 @@ function convertGeminiToOllamaMessages(geminiMessages) {
 const DISPATCH_TOOL_ALLOWLIST = new Set([
   'recall_memory', 'remember_fact', 'remember_preference',
   'google_search', 'fetch_web_page', 'fetch_api_docs', 'search_api_docs',
-  'read_file', 'read_multiple_files', 'list_files', 'get_workspace_info', 'change_workspace',
+  'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context', 'list_files', 'get_workspace_info', 'change_workspace',
   'handoff_to_coder',
   'open_url', 'click_element', 'fill_input', 'take_screenshot', 'navigate_back',
   'grep_search', 'search_embeddings', 'semantic_search',
@@ -6956,6 +7579,30 @@ function buildAgentToolDeclarations() {
                 content: { type: "STRING", description: "The markdown content for your scratchpad." }
               },
               required: ["content"]
+            }
+          },
+          {
+            name: "note_incidental_issue",
+            description: "Records a run-scoped incidental observation that was unmistakably visible while inspecting material required for the current task. Do not search for unrelated issues, do not interrupt the task, and do not use this for style, refactors, TODOs, generic missing tests, minor duplication, or speculative concerns. Weak candidates are rejected without failing the run.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                file: { type: "STRING", description: "File path containing the directly visible evidence." },
+                location: { type: "STRING", description: "Specific function, line range, execution path, or UI/backend location." },
+                category: {
+                  type: "STRING",
+                  enum: ["security", "data_loss", "silent_failure", "crash_path", "state_race", "runaway_loop", "destructive_path"],
+                  description: "Serious issue class. Do not use for style, design preference, complexity, or generic test gaps."
+                },
+                severity: { type: "STRING", enum: ["major", "critical"], description: "Only major or critical observations should be recorded." },
+                confidence: { type: "NUMBER", description: "0-1 confidence. Must be at least 0.85." },
+                observation: { type: "STRING", description: "Concise statement of what is wrong and why it is wrong." },
+                impact: { type: "STRING", description: "Concrete user-visible, data, security, reliability, or operational impact." },
+                evidence: { type: "STRING", description: "Direct evidence already visible in the inspected material. Do not cite uninspected assumptions." },
+                suggestedCheck: { type: "STRING", description: "Clear next inspection or repair step for a later task." },
+                outsideCurrentTask: { type: "BOOLEAN", description: "Must be true. If it affects the current task, handle it as part of the task instead." }
+              },
+              required: ["file", "location", "category", "severity", "confidence", "observation", "impact", "evidence", "suggestedCheck", "outsideCurrentTask"]
             }
           },
           {
@@ -7032,7 +7679,7 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "read_file",
-            description: "Reads a file located at path relative to the workspace root. For files over about 200 lines, prefer startLine/endLine targeted reads after using get_symbol_index or get_file_symbols to locate the section you need; full reads are fine when whole-file context is genuinely needed.",
+            description: "Reads a file located at path relative to the workspace root. Use full-file reads when the file fits the active context budget or whole-file structure matters. For very large files, prefer inspect_code_context, read_multiple_ranges, get_symbol_index, or get_file_symbols so Orion gets complete relevant functions/classes in one turn instead of many arbitrary chunks.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -7042,6 +7689,68 @@ function buildAgentToolDeclarations() {
                 maxChars: { type: "NUMBER", description: "Optional maximum characters to return." }
               },
               required: ["path"]
+            }
+          },
+          {
+            name: "read_multiple_ranges",
+            description: "Reads multiple exact line ranges across one or more files in a single tool call. Use this after symbol/search results identify several relevant locations; it avoids one model round trip per range while still returning exact source for editing.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                files: {
+                  type: "ARRAY",
+                  description: "Files and ranges to read.",
+                  items: {
+                    type: "OBJECT",
+                    properties: {
+                      path: { type: "STRING", description: "Relative file path." },
+                      ranges: {
+                        type: "ARRAY",
+                        description: "Line ranges to return from this file.",
+                        items: {
+                          type: "OBJECT",
+                          properties: {
+                            startLine: { type: "NUMBER", description: "1-based start line." },
+                            endLine: { type: "NUMBER", description: "1-based end line." }
+                          },
+                          required: ["startLine", "endLine"]
+                        }
+                      }
+                    },
+                    required: ["path", "ranges"]
+                  }
+                },
+                maxChars: { type: "NUMBER", description: "Optional maximum returned characters for the whole bundle." }
+              },
+              required: ["files"]
+            }
+          },
+          {
+            name: "inspect_code_context",
+            description: "Builds one consolidated exact-source context packet for a code question. Use this when you need implementation, callers, imports, and related tests without spending many turns on grep/read cycles. The backend performs local symbol and lexical retrieval, expands hits to complete functions/classes, merges overlapping ranges, and returns exact code sections with line numbers. Summaries are not substituted for code needed for edits.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                query: { type: "STRING", description: "What you need to understand, debug, or change." },
+                paths: {
+                  type: "ARRAY",
+                  items: { type: "STRING" },
+                  description: "Optional relative paths to prioritize. Omit when location is unknown."
+                },
+                symbols: {
+                  type: "ARRAY",
+                  items: { type: "STRING" },
+                  description: "Optional function/class/variable names to retrieve definitions and callers for."
+                },
+                include: {
+                  type: "ARRAY",
+                  items: { type: "STRING", enum: ["definitions", "callers", "imports", "tests"] },
+                  description: "Context kinds to include. Defaults to definitions/imports/tests."
+                },
+                budgetTokens: { type: "NUMBER", description: "Approximate source-token budget for the returned packet. Defaults to 18000." },
+                contextLines: { type: "NUMBER", description: "Fallback surrounding lines for lexical hits outside symbols." },
+                expand: { type: "BOOLEAN", description: "When true, search beyond provided paths for related files." }
+              }
             }
           },
           {
@@ -8022,7 +8731,7 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
 const TOOL_RESULT_TRIM_THRESHOLD_CHARS = 4000;
 const TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES = 6;
 const TRIMMABLE_TOOL_RESULT_NAMES = new Set([
-  'list_files', 'read_file', 'read_multiple_files', 'get_symbol_index', 'read_command_output',
+  'list_files', 'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context', 'get_symbol_index', 'read_command_output',
   'google_search', 'fetch_web_page', 'read_notes', 'read_operational_context',
   'read_project_memory', 'recall_memory', 'discover_skills'
 ]);
@@ -8534,6 +9243,14 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     isFailedToolResult,
     getToolFailureSignal,
     buildToolEvidenceEntry,
+    createContextAcquisitionLedger,
+    recordContextAcquisitionToolResult,
+    invalidateContextAcquisitionForFile,
+    buildContextAcquisitionReceipt,
+    getContextSectionsFromToolResult,
+    recordIncidentalIssueCandidate,
+    formatIncidentalObservations,
+    appendIncidentalObservationsToFinal,
     getEpistemicToolGate,
     buildEpistemicCorrectionPrompt,
     getCompactionThreshold,
@@ -8568,6 +9285,9 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     summarizeToolStart,
     buildRepeatedFailureKey,
     updateWalkthroughItem,
+    buildSupervisorEvidencePacket,
+    normalizeSupervisorDecision,
+    evaluateLoopStateWithSupervisorDecision,
     buildPostEditEvidencePrompt,
     buildFinalVerificationSummary,
     buildCompletionGateLoopSignature,
