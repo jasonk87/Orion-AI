@@ -5,6 +5,7 @@ const path = require('path');
 const rendererJs = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8');
 const agentJs = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
 const preloadJs = fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8');
+const semanticSearchJs = fs.readFileSync(path.join(__dirname, '../lib/semantic-search.js'), 'utf8');
 global.window = {};
 global.fetch = async () => ({ ok: false });
 const agent = require('../agent.js');
@@ -1006,6 +1007,13 @@ test('edit intelligence prompt and schema guardrails are wired', (t) => {
   t.ok(agentJs.includes('Call this BEFORE renaming, removing, or changing the signature of any function'), 'find_references schema is proactive for refactors');
   t.ok(agentJs.includes('stale numbers from before a previous edit can corrupt the file'), 'replace_range schema warns about stale line numbers');
   t.ok(agentJs.includes('fileData.indexOf(args.target, index + args.target.length)'), 'modify_file refuses non-unique targets before replacing');
+  t.end();
+});
+
+test('search tools expose optional context without shrinking semantic recall', (t) => {
+  t.ok(agentJs.includes('contextLines: Number.isFinite(Number(args.contextLines))'), 'grep_search forwards optional contextLines');
+  t.ok(agentJs.includes('Optional number of surrounding lines to include before and after each match'), 'grep_search schema declares contextLines');
+  t.ok(semanticSearchJs.includes('topK = 10'), 'semantic search defaults to ten results');
   t.end();
 });
 

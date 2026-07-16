@@ -82,6 +82,21 @@ test('grep-search supports regex patterns', async (t) => {
   t.end();
 });
 
+test('grep-search can include nearby context lines when requested', async (t) => {
+  const grepSearch = getGrepSearchHandler();
+  const root = makeFixtureWorkspace();
+  try {
+    const result = await grepSearch({}, { workspacePath: root, pattern: "socket.on('input'", options: { contextLines: 1 } });
+    const match = result.results[0];
+    t.equal(match.context.length, 3, 'one line of context is returned before and after the match');
+    t.deepEqual(match.context.map(line => line.line), [1, 2, 3], 'context reports original line numbers');
+    t.equal(match.context[1].match, true, 'matched line is marked inside the context block');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+  t.end();
+});
+
 test('grep-search respects filePattern and truncates at maxResults', async (t) => {
   const grepSearch = getGrepSearchHandler();
   const root = makeFixtureWorkspace();

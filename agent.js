@@ -2877,7 +2877,8 @@ async function executeTool(name, args, workspace, config, conversation) {
         regex: !!args.regex,
         caseSensitive: !!args.caseSensitive,
         filePattern: args.filePattern,
-        maxResults: Number.isFinite(Number(args.maxResults)) ? Number(args.maxResults) : 100
+        maxResults: Number.isFinite(Number(args.maxResults)) ? Number(args.maxResults) : 100,
+        contextLines: Number.isFinite(Number(args.contextLines)) ? Number(args.contextLines) : 0
       });
       if (!result || result.success === false) throw new Error((result && result.error) || 'grep_search failed');
       return result;
@@ -7325,7 +7326,8 @@ function buildAgentToolDeclarations() {
                 regex: { type: "BOOLEAN", description: "Treat pattern as a regular expression. Defaults to false (literal substring match)." },
                 caseSensitive: { type: "BOOLEAN", description: "Case-sensitive match. Defaults to false." },
                 filePattern: { type: "STRING", description: "Optional file extension filter, e.g. '.js' or '.html'. Searches all text files if omitted." },
-                maxResults: { type: "NUMBER", description: "Maximum number of matches to return before truncation. Defaults to 100." }
+                maxResults: { type: "NUMBER", description: "Maximum number of matches to return before truncation. Defaults to 100." },
+                contextLines: { type: "NUMBER", description: "Optional number of surrounding lines to include before and after each match. Defaults to 0; use 2-3 when the matched line alone is not enough to understand the call site." }
               },
               required: ["pattern"]
             }

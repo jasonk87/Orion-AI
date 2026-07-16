@@ -2781,11 +2781,12 @@ test('grep_search passes the workspace, pattern, and options through to window.a
   t.equal(capturedArgs.options.regex, false, 'regex defaults to false for a plain literal search');
   t.equal(capturedArgs.options.caseSensitive, false, 'caseSensitive defaults to false');
   t.equal(capturedArgs.options.maxResults, 100, 'maxResults defaults to 100');
+  t.equal(capturedArgs.options.contextLines, 0, 'contextLines defaults to 0');
   t.equal(result.results[0].path, 'server.js', 'the match result is returned to the model');
   t.end();
 });
 
-test('grep_search forwards regex/caseSensitive/filePattern/maxResults when the model specifies them', async (t) => {
+test('grep_search forwards regex/caseSensitive/filePattern/maxResults/contextLines when the model specifies them', async (t) => {
   let capturedArgs = null;
   global.window.api = {
     grepSearch: async (workspace, pattern, options) => {
@@ -2798,12 +2799,14 @@ test('grep_search forwards regex/caseSensitive/filePattern/maxResults when the m
     regex: true,
     caseSensitive: true,
     filePattern: '.html',
-    maxResults: 25
+    maxResults: 25,
+    contextLines: 3
   }, '/test/workspace', {});
   t.equal(capturedArgs.options.regex, true, 'regex flag is forwarded');
   t.equal(capturedArgs.options.caseSensitive, true, 'caseSensitive flag is forwarded');
   t.equal(capturedArgs.options.filePattern, '.html', 'filePattern is forwarded');
   t.equal(capturedArgs.options.maxResults, 25, 'maxResults is forwarded');
+  t.equal(capturedArgs.options.contextLines, 3, 'contextLines is forwarded');
   t.end();
 });
 
