@@ -1107,6 +1107,59 @@ test('checkJsSyntaxAfterEdit runs node --check on JS files and skips non-JS path
   t.end();
 });
 
+test('set_task_checklist completion is UI progress and is not blocked by operational completion gate', async (t) => {
+  const originalApi = global.window.api;
+  const originalGetActiveConversationId = global.window.getActiveConversationId;
+  const originalUpdateTasksChecklist = global.window.updateTasksChecklist;
+  const originalSaveConversationsToStorage = global.window.saveConversationsToStorage;
+
+  const operationalState = {
+    version: 1,
+    mission: { statement: 'Build the feature', createdAt: null, updatedAt: null },
+    winConditions: [{ id: 'win-1', title: 'Tests pass', status: 'pending', evidence: [] }],
+    activeObjective: null,
+    activeSubplan: null,
+    blockers: { active: [], resolved: [] },
+    discoveries: [],
+    discarded: [],
+    latestEvidence: [],
+    lastDistillation: null,
+    lastCheckpoint: null
+  };
+  let uiTasks = null;
+  let saved = false;
+  global.window.api = {
+    readFile: async () => JSON.stringify(operationalState)
+  };
+  global.window.getActiveConversationId = () => 'conv-checklist';
+  global.window.updateTasksChecklist = (tasks) => { uiTasks = tasks; };
+  global.window.saveConversationsToStorage = () => { saved = true; };
+
+  const conversation = {
+    id: 'conv-checklist',
+    tasks: [{ title: 'Patch UI', status: 'pending' }]
+  };
+
+  try {
+    const result = await agent.executeTool('set_task_checklist', {
+      tasks: [{ title: 'Patch UI', status: 'completed' }]
+    }, '/test/workspace', {}, conversation);
+
+    t.equal(result.success, true, 'checklist update succeeds');
+    t.notOk(result.skipped, 'checklist completion is not skipped by mission completion state');
+    t.equal(conversation.tasks[0].status, 'completed', 'conversation checklist is completed');
+    t.equal(uiTasks[0].status, 'completed', 'visible checklist receives completed state');
+    t.equal(saved, true, 'conversation storage is saved after checklist update');
+  } finally {
+    global.window.api = originalApi;
+    global.window.getActiveConversationId = originalGetActiveConversationId;
+    global.window.updateTasksChecklist = originalUpdateTasksChecklist;
+    global.window.saveConversationsToStorage = originalSaveConversationsToStorage;
+  }
+
+  t.end();
+});
+
 test('a syntax error introduced by an edit is captured as an unresolved regression, distinct from a test-suite regression', (t) => {
   const item = { label: 'Wrote broken.js' };
   agent.updateWalkthroughItem(item, 'write_file', { path: 'broken.js' }, {

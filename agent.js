@@ -1230,6 +1230,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     let postEditEvidenceLoopExtensions = 0;
     let completionGatePrompts = 0;
     let completionGateLoopExtensions = 0;
+    let lastCompletionGateBlockSignature = '';
+    let lastCompletionGateBlockFileMutationCount = -1;
     let reviewCompletionPrompts = 0;
     let reviewCompletionLoopExtensions = 0;
     let pendingWorkspaceResolutionPrompts = 0;
@@ -1653,6 +1655,21 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         // approved plan slip straight to "Task finished" with most of the work still pending.
         if (hasOperationalMissionState(workingState) && canExecuteThisTask() && agentExecutionMode !== 'answer') {
           const completionGate = evaluateWorkingStateCompletion(workingState, conversation);
+          const completionGateSignature = buildCompletionGateLoopSignature(completionGate);
+          const completionGateFileMutationCount = workWalkthrough.filter(isFileMutationItem).length;
+          if (shouldEscapeRepeatedCompletionGateBlock({
+            gate: completionGate,
+            signature: completionGateSignature,
+            previousSignature: lastCompletionGateBlockSignature,
+            fileMutationCount: completionGateFileMutationCount,
+            previousFileMutationCount: lastCompletionGateBlockFileMutationCount
+          })) {
+            currentAgentLogs.push({ type: 'thought', content: 'Completion gate loop escape: identical completion block repeated without intervening file mutations, so Orion stopped prompting for more work.' });
+            lastTextResponse = bestVisibleAnswer || `I am stopping instead of repeating the same completion gate loop.\n\n${buildCompletionGateMessage(completionGate)}`;
+            break;
+          }
+          lastCompletionGateBlockSignature = completionGateSignature;
+          lastCompletionGateBlockFileMutationCount = completionGateFileMutationCount;
           if (completionGate.status === 'continue_work' && loopCount >= maxLoops && completionGateLoopExtensions < 3) {
             completionGateLoopExtensions++;
             maxLoops++;
@@ -1701,7 +1718,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             break;
           }
         }
-        if (!memoryNudgeSent && !reviewOnly && turnDidSubstantiveInspection(workWalkthrough) &&
+        if (!bestVisibleAnswer && !memoryNudgeSent && !reviewOnly && turnDidSubstantiveInspection(workWalkthrough) &&
             !turnAlreadyWroteMemory(workWalkthrough) && !isGenericNonAnswer(textVal) && loopCount < maxLoops) {
           memoryNudgeSent = true;
           currentAgentLogs.push({ type: 'thought', content: 'Memory gate: substantial workspace inspection happened this turn; nudging Orion to persist any durable facts before finishing.' });
@@ -1717,7 +1734,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         // create a skill, prompt Orion to consider whether any reusable capability emerged.
         const didMultiStepWork = !reviewOnly && workWalkthrough.filter(i => i && i.status !== 'error').length >= 5;
         const alreadyCreatedSkill = workWalkthrough.some(i => i && i.toolName === 'create_skill');
-        if (!skillGateFired && didMultiStepWork && !alreadyCreatedSkill && !isGenericNonAnswer(textVal) && loopCount < maxLoops) {
+        if (!bestVisibleAnswer && !skillGateFired && didMultiStepWork && !alreadyCreatedSkill && !isGenericNonAnswer(textVal) && loopCount < maxLoops) {
           skillGateFired = true;
           currentAgentLogs.push({ type: 'thought', content: 'Skill gate: multi-step task completed; nudging Orion to consider packaging a reusable skill.' });
           messages.push({
@@ -3585,22 +3602,6 @@ async function executeTool(name, args, workspace, config, conversation) {
           message: `Checklist update skipped: ${gate.reason}`
         };
       }
-      if (args.tasks.length > 0 && args.tasks.every(task => task.status === 'completed' || task.status === 'x')) {
-        const currentOperational = await readOperationalContext(workspace);
-        if (currentOperational.success && hasOperationalMissionState(currentOperational.state)) {
-          const completionGate = OperationalContext.evaluateCompletionGate(currentOperational.state, { explicitRequirements: args.tasks });
-          if (completionGate.status !== 'ready_for_final') {
-            return {
-              success: true,
-              skipped: true,
-              reason: 'completion_gate',
-              message: `Checklist completion skipped: ${buildCompletionGateMessage(completionGate)}`,
-              completionGate
-            };
-          }
-        }
-      }
-
       // Update local storage representation in target conversation
       conversation.tasks = args.tasks;
 
@@ -4121,6 +4122,36 @@ function buildCompletionGateMessage(gate) {
   if (gate.remainingMinorBlockers && gate.remainingMinorBlockers.length) parts.push(`Remaining minor blockers: ${gate.remainingMinorBlockers.map(item => item.title).join('; ')}`);
   if (gate.backlogCandidates && gate.backlogCandidates.length) parts.push(`Backlog candidates: ${gate.backlogCandidates.map(item => item.title).join('; ')}`);
   return parts.join('\n');
+}
+
+function buildCompletionGateLoopSignature(gate) {
+  const normalized = gate && typeof gate === 'object' ? gate : {};
+  return JSON.stringify({
+    status: normalized.status || '',
+    reasons: normalized.reasons || [],
+    missingEvidence: normalized.missingEvidence || [],
+    pendingWinConditions: (normalized.pendingWinConditions || []).map(item => ({
+      title: item && item.title || '',
+      status: item && item.status || ''
+    })),
+    pendingRequirements: (normalized.pendingRequirements || []).map(item => ({
+      title: item && item.title || '',
+      status: item && item.status || ''
+    })),
+    blockers: (normalized.blockers || []).map(item => ({
+      title: item && item.title || '',
+      severity: item && item.severity || '',
+      nature: item && item.nature || ''
+    }))
+  });
+}
+
+function shouldEscapeRepeatedCompletionGateBlock({ gate, signature, previousSignature, fileMutationCount, previousFileMutationCount }) {
+  return !!(gate && gate.status === 'continue_work' &&
+    signature &&
+    previousSignature &&
+    signature === previousSignature &&
+    Number(fileMutationCount) === Number(previousFileMutationCount));
 }
 
 function evaluateWorkingStateCompletion(state, conversation) {
@@ -5135,15 +5166,14 @@ Do not report this step as complete until the regression is actually fixed and v
   }
 
   if ((options.promptCount || 0) >= (options.maxPrompts || 2)) return '';
-  const missingRead = !hasReadAfterLastFileEdit(list);
   const missingVerification = !hasVerificationAfterLastFileEdit(list);
-  if (!missingRead && !missingVerification) return '';
+  if (!missingVerification) return '';
 
   return `[SYSTEM: Post-edit evidence gate. You changed source files (${fileList}) but have not yet produced enough evidence to finish.
 
 Before giving a final answer:
-- Re-read the touched source files or the relevant changed sections to reconcile the actual code against the task and approved plan.
 - Run at least one real verification check after the edits. Use the project regression command when available. For Python/Pygame/interactive GUI apps, prefer \`python -m py_compile <file>\` plus \`preview_app\` (it launches the window, screenshots it, and leaves it running so you never hang) — then inspect_screenshot_with_model to confirm it looks right, and capture_screen again or kill_command as needed. Commands that only create folders, list files, or move assets do not count as verification.
+- If the verification result is unclear, failed, or points back to a changed section, inspect the relevant file lines before patching again.
 - If a check cannot run, inspect the blocker and state the exact reason in the final summary.
 - If the evidence reveals a bug or mismatch, fix it and rerun the relevant check.
 
@@ -8540,6 +8570,8 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     updateWalkthroughItem,
     buildPostEditEvidencePrompt,
     buildFinalVerificationSummary,
+    buildCompletionGateLoopSignature,
+    shouldEscapeRepeatedCompletionGateBlock,
     stripEchoedSystemScaffold,
     sanitizeFinalAnswerText,
     withWorkWalkthrough,

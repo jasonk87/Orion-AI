@@ -294,6 +294,21 @@ test('completion gate accepts evidence-backed completed mission', (t) => {
   t.end();
 });
 
+test('completion gate accepts win-condition verification evidence without a separate latest-evidence record', (t) => {
+  let state = missionState();
+  state = operational.applyAction(state, 'evaluate_win_conditions', {
+    evaluations: [
+      { id: 'economy', status: 'satisfied', evidence: ['economy.test.js passed'] },
+      { id: 'npcs', status: 'satisfied', evidence: ['manual NPC autonomy smoke verification passed'] }
+    ]
+  }, T0).state;
+
+  const gate = operational.evaluateCompletionGate(state);
+  t.equal(gate.status, 'ready_for_final', 'win-condition evidence itself satisfies latest proof and verification requirements');
+  t.deepEqual(gate.missingEvidence, [], 'no extra checkpoint/latest-evidence record is required');
+  t.end();
+});
+
 test('completion gate ignores chat trimming and judges operational state', (t) => {
   let state = missionState();
   state = operational.applyAction(state, 'evaluate_win_conditions', {

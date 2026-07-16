@@ -823,6 +823,12 @@ test('post-edit evidence gate requires real verification before finalizing', (t)
   ];
   t.equal(agent.hasVerificationAfterLastFileEdit(verified), true, 'real verification after edit satisfies evidence gate');
   t.equal(agent.buildPostEditEvidencePrompt(verified, { canExecute: true, promptCount: 0 }), '', 'guard does not fire after read and verification evidence');
+
+  const verifiedWithoutReread = [
+    { kind: 'file', toolName: 'patch_file', path: 'main.py', status: 'done' },
+    { toolName: 'run_command', kind: 'command', command: 'python -m py_compile main.py', label: 'Ran `python -m py_compile main.py`', status: 'done' }
+  ];
+  t.equal(agent.buildPostEditEvidencePrompt(verifiedWithoutReread, { canExecute: true, promptCount: 0 }), '', 'guard does not force an extra reread after a clean edit followed by real verification');
   t.end();
 });
 
@@ -1014,6 +1020,36 @@ test('search tools expose optional context without shrinking semantic recall', (
   t.ok(agentJs.includes('contextLines: Number.isFinite(Number(args.contextLines))'), 'grep_search forwards optional contextLines');
   t.ok(agentJs.includes('Optional number of surrounding lines to include before and after each match'), 'grep_search schema declares contextLines');
   t.ok(semanticSearchJs.includes('topK = 10'), 'semantic search defaults to ten results');
+  t.end();
+});
+
+test('post-final cleanup gates and repeated completion blocks cannot consume useful final answers', (t) => {
+  t.ok(agentJs.includes('!bestVisibleAnswer && !memoryNudgeSent'), 'memory nudge does not run after a substantive final answer already exists');
+  t.ok(agentJs.includes('!bestVisibleAnswer && !skillGateFired'), 'skill nudge does not run after a substantive final answer already exists');
+
+  const gate = {
+    status: 'continue_work',
+    reasons: ['No test/smoke/manual verification evidence is recorded.'],
+    missingEvidence: ['tests, smoke check, manual verification, or inspected evidence'],
+    pendingWinConditions: [],
+    pendingRequirements: []
+  };
+  const signature = agent.buildCompletionGateLoopSignature(gate);
+  t.equal(signature, agent.buildCompletionGateLoopSignature({ ...gate }), 'completion block signatures are stable for identical gate reasons');
+  t.equal(agent.shouldEscapeRepeatedCompletionGateBlock({
+    gate,
+    signature,
+    previousSignature: signature,
+    fileMutationCount: 1,
+    previousFileMutationCount: 1
+  }), true, 'identical completion blocks with no intervening file mutations escape instead of looping');
+  t.equal(agent.shouldEscapeRepeatedCompletionGateBlock({
+    gate,
+    signature,
+    previousSignature: signature,
+    fileMutationCount: 2,
+    previousFileMutationCount: 1
+  }), false, 'new file mutations reset the repeated-block escape');
   t.end();
 });
 
