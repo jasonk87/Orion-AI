@@ -247,13 +247,51 @@ test('packaged updater resolves the real source root from packaged resources', (
 });
 
 test('packaged updater tracks all runtime modules required by main process', (t) => {
-  const requiredRuntimeFiles = [
-    'lib/ipc-ui.js',
-    'lib/ipc-skill.js',
-    'lib/ipc-memory.js',
-    'lib/memory-manager.js',
-    'lib/skill-loader.js'
-  ];
+  const fs = require('fs');
+  const path = require('path');
+  const parser = require('@babel/parser');
+  const repoRoot = path.resolve(__dirname, '..');
+  const pending = ['main.js'];
+  const requiredRuntimeFiles = new Set();
+
+  function visit(node, relativeRequires) {
+    if (!node || typeof node !== 'object') return;
+    if (
+      node.type === 'CallExpression'
+      && node.callee?.type === 'Identifier'
+      && node.callee.name === 'require'
+      && node.arguments?.length === 1
+      && node.arguments[0].type === 'StringLiteral'
+      && node.arguments[0].value.startsWith('.')
+    ) {
+      relativeRequires.push(node.arguments[0].value);
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach(child => visit(child, relativeRequires));
+      else if (value && typeof value === 'object') visit(value, relativeRequires);
+    }
+  }
+
+  while (pending.length) {
+    const relativeFile = pending.pop();
+    if (requiredRuntimeFiles.has(relativeFile)) continue;
+    requiredRuntimeFiles.add(relativeFile);
+
+    const absoluteFile = path.join(repoRoot, relativeFile);
+    const source = fs.readFileSync(absoluteFile, 'utf8');
+    const ast = parser.parse(source, { sourceType: 'unambiguous' });
+    const relativeRequires = [];
+    visit(ast, relativeRequires);
+
+    for (const specifier of relativeRequires) {
+      const unresolved = path.resolve(path.dirname(absoluteFile), specifier);
+      const candidates = [unresolved, `${unresolved}.js`, path.join(unresolved, 'index.js')];
+      const dependency = candidates.find(candidate => fs.existsSync(candidate) && fs.statSync(candidate).isFile());
+      if (!dependency || !dependency.startsWith(`${repoRoot}${path.sep}`)) continue;
+      const relativeDependency = path.relative(repoRoot, dependency).replace(/\\/g, '/');
+      if (!requiredRuntimeFiles.has(relativeDependency)) pending.push(relativeDependency);
+    }
+  }
 
   for (const file of requiredRuntimeFiles) {
     t.ok(main.AUTO_UPDATE_FILES.includes(file), `auto-update includes ${file}`);
