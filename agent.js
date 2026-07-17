@@ -1186,6 +1186,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const workWalkthroughOverride = isDispatchConversation
     ? '\nThis is a Dispatch conversation, not a Coder/implementation task. Do NOT include a "Work Walkthrough" section, a files-touched list, or a step-by-step recap of tool calls in your response, even if you used tools this turn. Just answer directly and conversationally.'
     : '';
+  const dispatchProjectContext = isDispatchConversation && conversation.dispatchContextSummary
+    ? `\nFresh project session context: ${String(conversation.dispatchContextSummary).replace(/\s+/g, ' ').trim().slice(0, 1800)}\nThis is a compact re-entry summary, not current source-code evidence. Preserve established discussion and decisions, but refresh only the files needed by the user's current question before making code claims.`
+    : '';
   const knownProjectsFacts = formatKnownProjectsForSystemFacts();
   const systemFactsSignature = JSON.stringify({
     home: resolvedHomeDir,
@@ -1193,13 +1196,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     webSearch: webSearchLabel,
     promptSource: promptSource === 'phone' ? 'phone' : 'desktop',
     knownProjectsFacts,
-    dispatch: isDispatchConversation
+    dispatch: isDispatchConversation,
+    dispatchProjectContext
   });
   const shouldInjectFullSystemFacts = conversation._systemFactsSignature !== systemFactsSignature;
   conversation._systemFactsSignature = systemFactsSignature;
   const systemFactsText = shouldInjectFullSystemFacts
-    ? `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nWeb search: ${webSearchStatus}\nClient: ${promptSource === 'phone' ? 'PHONE COMPANION — the user is on their phone. Prefer descriptions, text output, and copy-pasteable results over actions that require the desktop (launching GUI apps, opening windows, running interactive commands). If you need to show output, describe it clearly rather than suggesting they look at the screen.' : 'DESKTOP — the user is at their computer. You can launch apps, reference screen elements, and run interactive commands normally.'}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.${workWalkthroughOverride}`
-    : `[ORION SYSTEM FACTS - compact]\nStable system facts are unchanged from earlier in this conversation. Current workspace: ${workspacePath || '(none)'}. Home: ${resolvedHomeDir}. Web search: ${webSearchLabel}. Client: ${promptSource === 'phone' ? 'phone companion' : 'desktop'}.\nUse the current workspace for self-referential phrases like "this program" or "the project." Do NOT run echo or whoami to discover these paths.${workWalkthroughOverride}`;
+    ? `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nWeb search: ${webSearchStatus}\nClient: ${promptSource === 'phone' ? 'PHONE COMPANION — the user is on their phone. Prefer descriptions, text output, and copy-pasteable results over actions that require the desktop (launching GUI apps, opening windows, running interactive commands). If you need to show output, describe it clearly rather than suggesting they look at the screen.' : 'DESKTOP — the user is at their computer. You can launch apps, reference screen elements, and run interactive commands normally.'}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.${dispatchProjectContext}${workWalkthroughOverride}`
+    : `[ORION SYSTEM FACTS - compact]\nStable system facts are unchanged from earlier in this conversation. Current workspace: ${workspacePath || '(none)'}. Home: ${resolvedHomeDir}. Web search: ${webSearchLabel}. Client: ${promptSource === 'phone' ? 'phone companion' : 'desktop'}.\nUse the current workspace for self-referential phrases like "this program" or "the project." Do NOT run echo or whoami to discover these paths.${dispatchProjectContext}${workWalkthroughOverride}`;
   messages.splice(2, 0,
     {
       role: 'user',
@@ -3432,6 +3436,12 @@ async function executeTool(name, args, workspace, config, conversation) {
       conversation.workspace = targetPath;
       if (conversation.mode === 'coder') {
         conversation.projectPath = targetPath;
+      } else if (conversation.mode === 'orion' && window.getKnownProjects) {
+        const normalizedTarget = String(targetPath).replace(/[\\/]+/g, '\\').replace(/\\+$/, '').toLowerCase();
+        const knownProject = (window.getKnownProjects() || []).find(projectPath =>
+          String(projectPath || '').replace(/[\\/]+/g, '\\').replace(/\\+$/, '').toLowerCase() === normalizedTarget
+        );
+        if (knownProject) conversation.dispatchProjectPath = knownProject;
       }
       if (typeof window.changeActiveWorkspace === 'function') {
         window.changeActiveWorkspace(targetPath, {

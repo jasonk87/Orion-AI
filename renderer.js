@@ -75,7 +75,16 @@ let activeAiBubble = null; // Currently rendering AI message bubble
 let currentFileTreeItems = [];
 let currentRunArtifacts = [];
 let expandedFileFolders = new Set();
-let appMode = localStorage.getItem('appMode') || 'orion'; // 'orion' | 'coder'
+// Every cold launch begins at a clean Dispatch draft. Mode changes during the running app are
+// still preserved in memory, but an old persisted UI preference must not reopen Coder or an old
+// Dispatch transcript on the next launch.
+let appMode = 'orion'; // 'orion' | 'coder'
+let lastDispatchConversationId = '';
+let dispatchDraft = {
+  active: true,
+  projectPath: '',
+  contextSummary: ''
+};
 
 // DOM ELEMENTS
 const el = {
@@ -270,16 +279,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Migrate any project conversations that accumulated in standalone list
   migrateConversations();
   
-  // Select the most recent conversation belonging to the restored mode. Dispatch and Coder each
-  // have their own conversation history, so a conversation from the other mode -- even a
-  // standalone one -- must never become the active target just because it's the most recently
-  // created conversation overall.
-  const modeMatch = conversations.find(c => conversationMode(c) === appMode);
-  if (modeMatch) {
-    selectConversation(modeMatch.id);
-  } else {
-    createNewConversation(appMode);
-  }
+  // A cold launch is an uncommitted Dispatch draft. Existing transcripts remain available inside
+  // Dispatch, but none is selected and no empty record is created merely by opening Orion.
+  startDispatchDraft({ coldLaunch: true });
   refreshPhoneCompanionPairing();
   removeLegacyPhoneCompanionTokenBubbles();
 });
@@ -927,18 +929,25 @@ function setAppMode(mode, persist = true) {
   if (orionContent) orionContent.classList.toggle('active', mode === 'orion');
   if (coderContent) coderContent.classList.toggle('active', mode === 'coder');
 
-  // Dispatch and Coder are separate entities with separate conversation histories -- a
-  // conversation that belongs to the other mode must never stay displayed after a mode switch.
-  if (conversations.length > 0) {
-    const activeConv = conversations.find(c => c.id === activeConversationId);
-    if (!activeConv || conversationMode(activeConv) !== mode) {
-      const replacement = conversations.find(c => conversationMode(c) === mode);
-      if (replacement) {
-        selectConversation(replacement.id);
-      } else {
-        createNewConversation(mode);
-      }
+  // Dispatch preserves its current in-session focus, including an uncommitted draft, but never
+  // chooses an old transcript merely because the user opened the mode. Coder keeps its existing
+  // task-oriented selection behavior.
+  const activeConv = conversations.find(c => c.id === activeConversationId);
+  if (mode === 'orion') {
+    if (activeConv && conversationMode(activeConv) === 'orion') {
+      lastDispatchConversationId = activeConv.id;
+      dispatchDraft.active = false;
+    } else if (dispatchDraft.active) {
+      startDispatchDraft(dispatchDraft);
+    } else {
+      const remembered = conversations.find(c => c.id === lastDispatchConversationId && conversationMode(c) === 'orion');
+      if (remembered) selectConversation(remembered.id);
+      else startDispatchDraft();
     }
+  } else if (!activeConv || conversationMode(activeConv) !== 'coder') {
+    const replacement = conversations.find(c => conversationMode(c) === 'coder');
+    if (replacement) selectConversation(replacement.id);
+    else createNewConversation('coder');
   }
 
   // Adapt main workspace for mode
@@ -979,6 +988,117 @@ function updateOrionGreeting() {
   nameEl.textContent = `${tod}, Jason.`;
 }
 
+function collectDispatchActiveWork(isGlobalRunning = false, globalRunningId = '') {
+  const activeWork = [];
+  conversations.filter(conversation => conversationMode(conversation) === 'orion').forEach(dispatchConversation => {
+    const coderId = dispatchConversation.launchedCoderConvId;
+    const coderConversation = coderId ? conversations.find(conversation => conversation.id === coderId) : null;
+    if (coderConversation) {
+      const running = isGlobalRunning && globalRunningId === coderConversation.id;
+      const queued = Array.isArray(window.promptQueue)
+        && window.promptQueue.some(item => item && item.conversationId === coderConversation.id);
+      const waitingForInput = !!coderConversation.awaitingClarification;
+      const waitingForReview = !!(coderConversation.awaitingPlanApproval && !coderConversation.planApproved);
+      const status = running ? 'running' : ((queued || waitingForInput || waitingForReview) ? 'waiting' : 'blocked');
+      const subStatus = running && window.getAgentSubStatus
+        ? window.getAgentSubStatus()
+        : (queued
+          ? 'Queued for Coder'
+          : (waitingForInput
+            ? 'Waiting for your input'
+            : (waitingForReview ? 'Plan ready for review' : 'Needs attention')));
+      const projectPath = coderConversation.projectPath || inferDispatchProjectPath(dispatchConversation);
+      activeWork.push({
+        id: coderConversation.id,
+        supervisingConversationId: dispatchConversation.id,
+        title: dispatchConversation.launchedCoderTaskTitle || coderConversation.title || 'Coder task',
+        projectPath,
+        projectName: (projectPath || 'Standalone').replace(/[\\\/]+$/, '').split(/[\\\/]/).pop(),
+        status,
+        subStatus,
+        startedAt: dispatchConversation.launchedCoderTaskStart || coderConversation.createdAt || 0,
+        completedAt: 0
+      });
+    } else if (dispatchConversation.lastDelegatedWork) {
+      const receipt = dispatchConversation.lastDelegatedWork;
+      const projectPath = receipt.projectPath || inferDispatchProjectPath(dispatchConversation);
+      activeWork.push({
+        id: receipt.coderConversationId || '',
+        supervisingConversationId: dispatchConversation.id,
+        title: receipt.title || 'Coder task',
+        projectPath,
+        projectName: (projectPath || 'Standalone').replace(/[\\\/]+$/, '').split(/[\\\/]/).pop(),
+        status: receipt.status || 'completed',
+        subStatus: receipt.subStatus || 'Completed',
+        startedAt: receipt.startedAt || 0,
+        completedAt: receipt.completedAt || 0
+      });
+    }
+  });
+  return activeWork.sort((a, b) => (b.completedAt || b.startedAt || 0) - (a.completedAt || a.startedAt || 0));
+}
+
+function renderDesktopDispatchLanding() {
+  const projectSection = document.getElementById('dispatch-desktop-project-section');
+  const projectList = document.getElementById('dispatch-desktop-projects');
+  const activeSection = document.getElementById('dispatch-desktop-active-work');
+  if (!projectSection || !projectList || !activeSection) return;
+
+  const dispatchConversations = conversations
+    .filter(conversation => conversationMode(conversation) === 'orion')
+    .slice()
+    .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+  const grouped = new Map();
+  dispatchConversations.forEach(conversation => {
+    const projectPath = inferDispatchProjectPath(conversation);
+    if (!projectPath) return;
+    if (!grouped.has(projectPath)) grouped.set(projectPath, []);
+    grouped.get(projectPath).push(conversation);
+  });
+  const runningConversationId = window.getRunningConversationId ? window.getRunningConversationId() : '';
+  const globallyRunning = !!(window.isAgentRunning && window.isAgentRunning());
+  const activeWork = collectDispatchActiveWork(globallyRunning, runningConversationId);
+
+  const projectRows = projects.map(projectPath => {
+    const discussions = grouped.get(projectPath) || [];
+    const latest = discussions[0] || null;
+    const updatedAt = latest ? (latest.updatedAt || latest.createdAt || 0) : 0;
+    const delegatedWork = activeWork.find(work =>
+      work.projectPath
+      && normalizePathForComparison(work.projectPath) === normalizePathForComparison(projectPath)
+      && work.status !== 'completed'
+    );
+    return { projectPath, latest, updatedAt, delegatedWork };
+  }).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 4);
+
+  projectSection.hidden = projectRows.length === 0;
+  projectList.innerHTML = projectRows.map(({ projectPath, latest, delegatedWork }) => {
+    const projectName = projectPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || projectPath;
+    const summary = latest ? deriveDispatchDiscussionSummary(latest) : 'Start a new project discussion';
+    return `<div class="dispatch-desktop-project-row">
+      <div class="dispatch-desktop-project-copy">
+        <div class="dispatch-desktop-project-name">${escapeHtml(projectName)}</div>
+        <div class="dispatch-desktop-project-meta">${escapeHtml(summary)}${delegatedWork ? ` · Coder ${escapeHtml(delegatedWork.status)}` : ''}</div>
+      </div>
+      <div class="dispatch-desktop-row-actions">
+        ${latest ? `<button type="button" data-dispatch-continue="${escapeHtml(latest.id)}">Continue</button>` : ''}
+        <button type="button" data-dispatch-fresh-project="${escapeHtml(projectPath)}" data-dispatch-summary="${escapeHtml(summary)}">Start fresh</button>
+      </div>
+    </div>`;
+  }).join('');
+
+  const visibleWork = activeWork.slice(0, 3);
+  activeSection.hidden = visibleWork.length === 0;
+  activeSection.innerHTML = visibleWork.length ? `<div class="dispatch-desktop-section-head"><span>Active work</span></div>
+    <div class="dispatch-desktop-work-list">${visibleWork.map(work => `<button class="dispatch-desktop-work-row" type="button" data-dispatch-supervisor="${escapeHtml(work.supervisingConversationId)}">
+      <span class="dispatch-desktop-work-copy">
+        <span class="dispatch-desktop-work-title">${escapeHtml(work.title)}</span>
+        <span class="dispatch-desktop-work-meta">${escapeHtml(work.projectName)} · ${escapeHtml(work.subStatus || work.status)}</span>
+      </span>
+      <span aria-hidden="true">›</span>
+    </button>`).join('')}</div>` : '';
+}
+
 function runCommandPaletteAction(command) {
   const targets = {
     'new-task': el.btnNewChat,
@@ -1010,6 +1130,21 @@ function setupProgressiveDisclosure() {
 
   // Orion prompt chips — populate input (with focus) so Jason can review/edit before sending
   document.getElementById('orion-welcome-splash')?.addEventListener('click', (e) => {
+    const continueButton = e.target.closest('[data-dispatch-continue], [data-dispatch-supervisor]');
+    if (continueButton) {
+      const conversationId = continueButton.getAttribute('data-dispatch-continue')
+        || continueButton.getAttribute('data-dispatch-supervisor');
+      if (conversationId) selectConversation(conversationId);
+      return;
+    }
+    const freshProjectButton = e.target.closest('[data-dispatch-fresh-project]');
+    if (freshProjectButton) {
+      startDispatchDraft({
+        projectPath: freshProjectButton.getAttribute('data-dispatch-fresh-project') || '',
+        contextSummary: freshProjectButton.getAttribute('data-dispatch-summary') || ''
+      });
+      return;
+    }
     const chip = e.target.closest('.orion-prompt-chip');
     if (!chip) return;
     const prompt = chip.dataset.prompt || '';
@@ -1022,6 +1157,10 @@ function setupProgressiveDisclosure() {
     input.setSelectionRange(prompt.length, prompt.length);
     // Trigger resize in case the input uses auto-height
     input.dispatchEvent(new Event('input'));
+  });
+  document.getElementById('btn-dispatch-browse')?.addEventListener('click', () => {
+    setLeftSidebarCollapsed(false);
+    el.conversationList?.querySelector('.conversation-item, .empty-state')?.scrollIntoView({ block: 'nearest' });
   });
 
   const closePalette = () => el.commandPaletteModal && el.commandPaletteModal.classList.remove('active');
@@ -2117,7 +2256,105 @@ function conversationMode(conv) {
   return conv.projectPath ? 'coder' : 'orion';
 }
 
+function compactDispatchDiscussionText(value, fallback = '') {
+  const text = String(value || '')
+    .replace(/\[[^\]]+\]/g, ' ')
+    .replace(/[`*_#>|]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) return String(fallback || '').trim();
+  return text.length > 150 ? `${text.slice(0, 147).trim()}...` : text;
+}
+
+function deriveDispatchDiscussionSummary(conv) {
+  if (!conv) return '';
+  if (conv.dispatchDiscussionSummary) return compactDispatchDiscussionText(conv.dispatchDiscussionSummary, conv.title);
+  const messages = Array.isArray(conv.messages) ? conv.messages : [];
+  const latestUser = [...messages].reverse().find(message => normalizeConversationMessageRole(message) === 'user');
+  return compactDispatchDiscussionText(
+    latestUser ? extractConversationMessageText(latestUser) : '',
+    conv.title && conv.title !== 'New Conversation' && conv.title !== 'New Phone Task' ? conv.title : ''
+  );
+}
+
+function inferDispatchProjectPath(conv) {
+  if (!conv || conversationMode(conv) !== 'orion') return '';
+  const explicit = String(conv.dispatchProjectPath || '').trim();
+  if (explicit) return explicit;
+  const workspace = String(conv.workspace || '').trim();
+  if (!workspace || isGeneratedStandaloneWorkspace(workspace)) return '';
+  const normalizedWorkspace = normalizePathForComparison(workspace);
+  return projects.find(projectPath => normalizePathForComparison(projectPath) === normalizedWorkspace) || '';
+}
+
+function createDispatchConversationFromDraft(prompt = '') {
+  const normalizedPrompt = String(prompt || '').trim();
+  if (!normalizedPrompt) return null;
+  const projectPath = String(dispatchDraft.projectPath || '').trim();
+  const conv = {
+    id: 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
+    title: generateConversationTitle(normalizedPrompt) || 'New Conversation',
+    mode: 'orion',
+    projectPath: '',
+    dispatchProjectPath: projectPath,
+    dispatchContextSummary: compactDispatchDiscussionText(dispatchDraft.contextSummary),
+    dispatchDiscussionSummary: compactDispatchDiscussionText(normalizedPrompt),
+    workspace: projectPath,
+    messages: [],
+    tasks: [],
+    testResults: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    isStub: false
+  };
+  conversations.unshift(conv);
+  activeConversationId = conv.id;
+  lastDispatchConversationId = conv.id;
+  dispatchDraft = { active: false, projectPath: '', contextSummary: '' };
+  return conv;
+}
+
+function startDispatchDraft(options = {}) {
+  appMode = 'orion';
+  dispatchDraft = {
+    active: true,
+    projectPath: String(options.projectPath || '').trim(),
+    contextSummary: compactDispatchDiscussionText(options.contextSummary)
+  };
+  activeConversationId = null;
+  currentWorkspace = dispatchDraft.projectPath || getDispatchWorkspaceRoot();
+  document.body.setAttribute('data-mode', 'orion');
+  document.getElementById('btn-mode-orion')?.classList.add('active');
+  document.getElementById('btn-mode-coder')?.classList.remove('active');
+  document.getElementById('sidebar-orion-content')?.classList.add('active');
+  document.getElementById('sidebar-coder-content')?.classList.remove('active');
+  el.chatTitle.textContent = dispatchDraft.projectPath
+    ? (dispatchDraft.projectPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || 'Orion')
+    : 'Orion';
+  el.workspaceLabel.textContent = dispatchDraft.projectPath
+    ? (dispatchDraft.projectPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || '')
+    : '';
+  el.chatInput.value = '';
+  el.chatInput.placeholder = 'Ask Orion anything...';
+  if (el.welcomeSplash) el.welcomeSplash.style.display = 'none';
+  const orionSplash = document.getElementById('orion-welcome-splash');
+  if (orionSplash) orionSplash.style.display = 'flex';
+  if (el.messagesContainer) {
+    el.messagesContainer.innerHTML = '';
+    el.messagesContainer.style.display = 'none';
+  }
+  if (el.workspaceFilesPanel) el.workspaceFilesPanel.classList.add('contextual-panel-hidden');
+  updateOrionGreeting();
+  renderConversationList();
+  renderDesktopDispatchLanding();
+  el.chatInput.focus();
+}
+
 function createNewConversation(mode = appMode) {
+  if (mode !== 'coder') {
+    startDispatchDraft();
+    return null;
+  }
   const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
   const title = 'New Conversation';
 
@@ -2268,9 +2505,10 @@ function getConversationRunWorkspace(conv) {
   return conv.workspace || conv.projectPath || '';
 }
 
-function createPhoneConversation({ projectPath = '', mode = 'orion', title = 'New Phone Task' } = {}) {
+function createPhoneConversation({ projectPath = '', dispatchProjectPath = '', contextSummary = '', mode = 'orion', title = 'New Phone Task' } = {}) {
   const convId = 'conv-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
   const normalizedProjectPath = String(projectPath || '').trim();
+  const normalizedDispatchProjectPath = mode === 'orion' ? String(dispatchProjectPath || '').trim() : '';
   const conv = {
     id: convId,
     title,
@@ -2279,15 +2517,17 @@ function createPhoneConversation({ projectPath = '', mode = 'orion', title = 'Ne
     mode: normalizedProjectPath ? 'coder' : (mode === 'coder' ? 'coder' : 'orion'),
     messages: [],
     createdAt: Date.now(),
-    workspace: normalizedProjectPath || '',
+    workspace: normalizedProjectPath || normalizedDispatchProjectPath || '',
     projectPath: normalizedProjectPath,
+    dispatchProjectPath: normalizedDispatchProjectPath,
+    dispatchContextSummary: compactDispatchDiscussionText(contextSummary),
+    dispatchDiscussionSummary: '',
     tasks: [],
     awaitingPlanApproval: false,
     planApproved: false,
     awaitingClarification: null
   };
   conversations.unshift(conv);
-  saveConversationsToStorage();
   return conv;
 }
 
@@ -2432,7 +2672,19 @@ function migrateConversations() {
       updated = true;
     }
     if (c.mode === 'orion' && c.projectPath) {
+      // Preserve useful legacy Dispatch linkage while moving it off the Coder-owned field.
+      if (!c.dispatchProjectPath && !isGeneratedStandaloneWorkspace(c.projectPath)) {
+        c.dispatchProjectPath = c.projectPath;
+      }
       c.projectPath = '';
+      updated = true;
+    }
+    if (c.mode === 'orion' && !c.dispatchProjectPath && matchingWorkspaceProject) {
+      c.dispatchProjectPath = matchingWorkspaceProject;
+      updated = true;
+    }
+    if (c.mode === 'orion' && c.dispatchProjectPath && isGeneratedStandaloneWorkspace(c.dispatchProjectPath)) {
+      c.dispatchProjectPath = '';
       updated = true;
     }
     if (c.mode === 'orion' && c.workspace && isGeneratedStandaloneWorkspace(c.workspace)) {
@@ -2454,6 +2706,13 @@ function migrateConversations() {
       const before = c.messages.length;
       c.messages = c.messages.filter(msg => !isLegacyPhoneCompanionTokenMessage(msg && msg.text));
       if (c.messages.length !== before) updated = true;
+    }
+    if (c.mode === 'orion') {
+      const summary = deriveDispatchDiscussionSummary(c);
+      if (summary && summary !== c.dispatchDiscussionSummary) {
+        c.dispatchDiscussionSummary = summary;
+        updated = true;
+      }
     }
   });
   if (updated) {
@@ -2655,8 +2914,14 @@ function executeSaveConversationsToStorage() {
       title: c.title,
       mode: c.mode,
       projectPath: c.projectPath,
+      dispatchProjectPath: c.dispatchProjectPath || '',
+      dispatchContextSummary: c.dispatchContextSummary || '',
+      dispatchDiscussionSummary: deriveDispatchDiscussionSummary(c),
       workspace: c.workspace,
       launchedCoderConvId: c.launchedCoderConvId,
+      launchedCoderTaskTitle: c.launchedCoderTaskTitle,
+      launchedCoderTaskStart: c.launchedCoderTaskStart,
+      lastDelegatedWork: c.lastDelegatedWork || null,
       planApproved: c.planApproved,
       awaitingPlanApproval: c.awaitingPlanApproval,
       updatedAt: c.updatedAt || Date.now(),
@@ -2868,6 +3133,11 @@ async function selectConversation(id) {
   const conv = conversations.find(c => c.id === id);
   if (!conv) return;
 
+  if (conversationMode(conv) === 'orion') {
+    dispatchDraft = { active: false, projectPath: '', contextSummary: '' };
+    lastDispatchConversationId = conv.id;
+  }
+
   if (conv.isStub) {
     el.messagesContainer.innerHTML = '<div class="loading-state" style="text-align:center; padding:20px; color:#888;">Loading conversation...</div>';
     el.messagesContainer.style.display = 'flex';
@@ -3034,7 +3304,10 @@ async function submitMessage() {
     return;
   }
   
-  const conv = conversations.find(c => c.id === activeConversationId);
+  let conv = conversations.find(c => c.id === activeConversationId);
+  if (!conv && appMode === 'orion' && dispatchDraft.active) {
+    conv = createDispatchConversationFromDraft(prompt);
+  }
   if (!conv) return;
   normalizeConversationWorkspace(conv);
   
@@ -3108,7 +3381,13 @@ async function submitMessage() {
   
   // Update messages history (store compact image refs for replay)
   const msgImages = imagesToSend.map(i => ({ data: i.data, mimeType: i.mimeType }));
-  conv.messages.push({ role: 'user', text: prompt, ...(msgImages.length ? { images: msgImages } : {}) });
+  conv.messages.push({ role: 'user', text: prompt, createdAt: userMsgTs, ...(msgImages.length ? { images: msgImages } : {}) });
+  if (conversationMode(conv) === 'orion') {
+    conv.dispatchProjectPath = inferDispatchProjectPath(conv);
+    conv.dispatchDiscussionSummary = compactDispatchDiscussionText(prompt, conv.title);
+  }
+  conv.updatedAt = Date.now();
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
   saveConversationsToStorage();
 
   renderConversationList();
@@ -4283,6 +4562,9 @@ window.changeActiveWorkspace = function(folderPath, options = {}) {
         conv.projectPath = folderPath;
       } else if (conversationMode(conv) === 'orion') {
         conv.projectPath = '';
+        const normalizedFolder = normalizePathForComparison(folderPath);
+        const knownProject = projects.find(projectPath => normalizePathForComparison(projectPath) === normalizedFolder);
+        if (knownProject) conv.dispatchProjectPath = knownProject;
       }
       saveConversationsToStorage();
     }
@@ -4519,6 +4801,22 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   const requestedConv = requestedId ? conversations.find(c => c.id === requestedId) : null;
   const activeConv = activeConversationId ? conversations.find(c => c.id === activeConversationId) : null;
   const conv = requestedConv || activeConv || conversations[0] || null;
+  if (conv && conv.isStub && conv.hasMessages && window.api && typeof window.api.readConversation === 'function') {
+    try {
+      const result = await window.api.readConversation(conv.id);
+      if (result && result.success && result.conversation) {
+        const loadedConv = result.conversation;
+        conv.messages = Array.isArray(loadedConv.messages) ? loadedConv.messages : [];
+        conv.tasks = Array.isArray(loadedConv.tasks) ? loadedConv.tasks : [];
+        conv.testResults = loadedConv.testResults;
+        conv.fileTree = loadedConv.fileTree;
+        conv.scratchpad = loadedConv.scratchpad;
+        conv.isStub = false;
+      }
+    } catch (err) {
+      console.error('Phone companion stub hydration failed', err);
+    }
+  }
   const resolvedId = conv ? conv.id : '';
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
   const globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
@@ -4587,6 +4885,9 @@ window.getPhoneCompanionState = async (targetConversationId) => {
       mode: conversationMode(c),
       workspace: c.workspace || '',
       projectPath: c.projectPath || '',
+      dispatchProjectPath: inferDispatchProjectPath(c),
+      discussionSummary: deriveDispatchDiscussionSummary(c),
+      launchedCoderConvId: c.launchedCoderConvId || '',
       active: c.id === resolvedId,
       isDesktopActive: c.id === activeConversationId,
       awaitingPlanApproval: !!(c.awaitingPlanApproval && !c.planApproved),
@@ -4600,13 +4901,23 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   const projectSummaries = projects.map(path => {
     const name = path.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || path;
     const projectConversations = conversations.filter(c => c.projectPath === path);
+    const dispatchConversations = conversations.filter(c => conversationMode(c) === 'orion' && inferDispatchProjectPath(c) === path);
+    const latestDispatch = dispatchConversations
+      .slice()
+      .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0))[0];
     return {
       path,
       name,
       conversationCount: projectConversations.length,
-      updatedAt: projectConversations.reduce((latest, c) => Math.max(latest, c.updatedAt || c.createdAt || 0), 0)
+      dispatchConversationCount: dispatchConversations.length,
+      latestDispatchConversationId: latestDispatch ? latestDispatch.id : '',
+      latestDiscussion: latestDispatch ? deriveDispatchDiscussionSummary(latestDispatch) : '',
+      updatedAt: [...projectConversations, ...dispatchConversations]
+        .reduce((latest, c) => Math.max(latest, c.updatedAt || c.createdAt || 0), 0)
     };
   });
+
+  const activeWork = collectDispatchActiveWork(isGlobalRunning, globalRunningId);
   
   const companionWorkspace = conv ? getConversationRunWorkspace(conv) : currentWorkspace;
   const operationalResult = companionWorkspace && window.readOperationalContext
@@ -4635,6 +4946,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     mode: conversationMode(conv),
     conversations: conversationsSummary,
     projects: projectSummaries,
+    activeWork: activeWork.slice(0, 6),
     workspace: companionWorkspace,
     running: isActiveTargetRunning,
     globalRunning: isGlobalRunning,
@@ -4713,15 +5025,49 @@ function hasRequiredTestingPlanSection(content) {
 window.startPhoneCompanionTask = async (options = {}) => {
   const conv = createPhoneConversation({
     projectPath: options.projectPath || '',
+    dispatchProjectPath: options.dispatchProjectPath || '',
+    contextSummary: options.contextSummary || '',
     mode: options.mode || 'orion',
     title: 'New Phone Task'
   });
 
-  const prompt = String(options.prompt || '').trim();
-  if (prompt) {
-    await window.submitPhoneCompanionPrompt({ prompt, conversationId: conv.id });
+  let prompt = String(options.prompt || '').trim();
+  if (prompt && typeof options.fileContent === 'string' && options.fileContent.length > 0) {
+    const fileName = String(options.fileName || 'file.txt').replace(/[^\w.\-]/g, '_').slice(0, 80);
+    const content = options.fileContent.length > 80000
+      ? options.fileContent.slice(0, 80000) + '\n[... truncated]'
+      : options.fileContent;
+    prompt = `[Attached file: ${fileName}]\n\`\`\`\n${content}\n\`\`\`\n\n${prompt}`;
   }
-  return { success: true, conversationId: conv.id, workspace: conv.workspace, projectPath: conv.projectPath };
+  if (prompt) {
+    try {
+      await window.submitPhoneCompanionPrompt({
+        prompt,
+        conversationId: conv.id,
+        imageData: options.imageData,
+        imageMimeType: options.imageMimeType,
+        fileContent: options.fileContent,
+        fileName: options.fileName
+      });
+    } catch (error) {
+      conversations = conversations.filter(item => item.id !== conv.id);
+      throw error;
+    }
+  } else if (conversationMode(conv) === 'coder') {
+    saveConversationsToStorage();
+  } else {
+    // A blank Dispatch request is only a client-side draft. Never leave an empty conversation in
+    // the durable index if an older phone client still calls this endpoint before the first send.
+    conversations = conversations.filter(item => item.id !== conv.id);
+    return { success: true, draft: true, conversationId: '', workspace: '', projectPath: '', dispatchProjectPath: '' };
+  }
+  return {
+    success: true,
+    conversationId: conv.id,
+    workspace: conv.workspace,
+    projectPath: conv.projectPath,
+    dispatchProjectPath: conv.dispatchProjectPath || ''
+  };
 };
 
 window.submitPhoneCompanionPrompt = async (options) => {
@@ -4739,6 +5085,8 @@ window.submitPhoneCompanionPrompt = async (options) => {
   if (!conv) {
     conv = createPhoneConversation({
       projectPath: typeof options === 'object' ? options.projectPath || '' : '',
+      dispatchProjectPath: typeof options === 'object' ? options.dispatchProjectPath || '' : '',
+      contextSummary: typeof options === 'object' ? options.contextSummary || '' : '',
       mode: typeof options === 'object' ? options.mode || 'orion' : 'orion',
       title: 'New Phone Task'
     });
@@ -4751,10 +5099,18 @@ window.submitPhoneCompanionPrompt = async (options) => {
   if (conv.projectPath && !conv.workspace) {
     conv.workspace = conv.projectPath;
   }
+  const incomingDispatchProjectPath = typeof options === 'object' ? String(options.dispatchProjectPath || '').trim() : '';
+  if (conversationMode(conv) === 'orion' && incomingDispatchProjectPath) {
+    conv.dispatchProjectPath = incomingDispatchProjectPath;
+    conv.workspace = incomingDispatchProjectPath;
+  }
 
   // Generate a short title if it's new
   if (conv.messages.length === 0 || conv.title === 'New Phone Task' || conv.title === 'Untitled Conversation') {
     conv.title = text.length > 40 ? text.substring(0, 40) + '...' : text;
+  }
+  if (conversationMode(conv) === 'orion') {
+    conv.dispatchDiscussionSummary = compactDispatchDiscussionText(text, conv.title);
   }
   normalizeConversationWorkspace(conv);
   if (!conv.workspace) {
@@ -4764,6 +5120,8 @@ window.submitPhoneCompanionPrompt = async (options) => {
       conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id);
     }
   }
+  conv.updatedAt = Date.now();
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
   saveConversationsToStorage();
 
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
@@ -5623,10 +5981,24 @@ function notifySupervisorOfCoderCompletion(finishedCoderConvId) {
 
   notifyOrionConversation(orionConv, summaryText, 'supervisor-completion');
 
+  orionConv.lastDelegatedWork = {
+    coderConversationId: finishedCoderConvId,
+    title: taskTitle,
+    projectPath: (coderConv && coderConv.projectPath) || inferDispatchProjectPath(orionConv),
+    status: blockedFlag || pendingTasks.length > 0 ? 'blocked' : 'completed',
+    subStatus: blockedFlag
+      ? 'Stopped with a blocker'
+      : (pendingTasks.length > 0 ? `${doneTasks.length} complete, ${pendingTasks.length} remaining` : 'Completed'),
+    startedAt: orionConv.launchedCoderTaskStart || 0,
+    completedAt: Date.now()
+  };
+
   // Clear the launched coder conv reference so we don't double-notify
   orionConv.launchedCoderConvId = null;
   orionConv.launchedCoderTaskTitle = null;
   orionConv.launchedCoderTaskStart = null;
+  orionConv.updatedAt = Date.now();
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
   if (window.saveConversationsToStorage) window.saveConversationsToStorage();
 }
 
@@ -5634,6 +6006,8 @@ function notifySupervisorOfCoderCompletion(finishedCoderConvId) {
 function notifyOrionConversation(orionConv, text, source) {
   if (!orionConv || !text) return;
   orionConv.messages.push({ role: 'assistant', text, source, createdAt: Date.now() });
+  orionConv.updatedAt = Date.now();
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
   if (window.saveConversationsToStorage) window.saveConversationsToStorage();
   if (activeConversationId === orionConv.id && typeof window.renderAiMessage === 'function') {
     window.clearActiveAiBubble();

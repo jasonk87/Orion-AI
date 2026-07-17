@@ -232,10 +232,12 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
   t.equal(root.statusCode, 200, 'root shell is available without token-in-URL auth');
   t.notOk(root.text.includes('phoneCompanionToken'), 'root shell does not expose legacy token');
   t.ok(root.text.includes('<title>Orion</title>'), 'root shell serves the Orion mobile UI');
-  t.ok(root.text.includes('Dispatch History'), 'root shell keeps Dispatch topics behind secondary history');
-  t.ok(root.text.includes('data-drawer-destination="history"'), 'root shell exposes history through the global drawer');
+  t.notOk(root.text.includes('data-drawer-destination="history"'), 'root shell does not expose History as a top-level mode');
   t.ok(root.text.includes('function enterDispatch'), 'root shell enters Dispatch through the chat-first route');
-  t.ok(root.text.includes('Projects'), 'root shell includes project selection');
+  t.ok(root.text.includes('id="dispatch-browser-overlay"'), 'root shell keeps saved discussions in an in-Dispatch browser');
+  t.ok(root.text.includes('Pick up a project'), 'root shell includes project re-entry on the Dispatch landing');
+  t.ok(root.text.includes('Continue latest conversation'), 'root shell can continue the latest project discussion');
+  t.ok(root.text.includes('Start fresh with project context'), 'root shell can start a fresh project-context draft');
   t.ok(root.text.includes('Task List'), 'root shell includes mobile task list status');
   t.ok(root.text.includes('renderPhoneTaskList'), 'mobile shell renders the conversation checklist from state');
   t.ok(root.text.includes('data-drawer-destination="settings"'), 'root shell exposes app-level Settings through the drawer');
@@ -369,6 +371,14 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
   const newTask = await request('POST', 1133, '/api/conversations/new', { prompt: 'new task', projectPath: 'C:\\Projects\\OrionTarget' }, session);
   t.equal(newTask.statusCode, 200, 'new task endpoint succeeds');
 
+  const dispatchStart = await request('POST', 1133, '/api/conversations/new', {
+    prompt: 'continue the architecture discussion',
+    mode: 'orion',
+    dispatchProjectPath: 'C:\\Projects\\Chronicle',
+    contextSummary: 'Last discussed expedition progression.'
+  }, session);
+  t.equal(dispatchStart.statusCode, 200, 'first Dispatch message creates its conversation through one request');
+
   const prompt = await request('POST', 1133, '/api/prompt', { prompt: 'hello', projectPath: 'C:\\Projects\\OrionTarget' }, session);
   t.equal(prompt.statusCode, 200, 'prompt submission succeeds');
 
@@ -393,6 +403,7 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
 
   t.ok(!electron.calls.some(call => call.includes('switchPhoneCompanionConversation')), 'desktop bridge no longer switches global active conversation task');
   t.ok(electron.calls.some(call => call.includes('C:\\\\Projects\\\\OrionTarget')), 'new task endpoint forwards selected project path');
+  t.ok(electron.calls.some(call => call.includes('C:\\\\Projects\\\\Chronicle') && call.includes('Last discussed expedition progression.')), 'Dispatch creation forwards project association and compact re-entry context');
   t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt') && call.includes('C:\\\\Projects\\\\OrionTarget')), 'prompt endpoint forwards selected project path');
   t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt')), 'desktop bridge submitted prompt');
   t.ok(electron.calls.some(call => call.includes('approvePhoneCompanionPlan')), 'desktop bridge approved plan');
