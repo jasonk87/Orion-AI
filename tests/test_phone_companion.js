@@ -232,7 +232,9 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
   t.equal(root.statusCode, 200, 'root shell is available without token-in-URL auth');
   t.notOk(root.text.includes('phoneCompanionToken'), 'root shell does not expose legacy token');
   t.ok(root.text.includes('<title>Orion</title>'), 'root shell serves the Orion mobile UI');
-  t.ok(root.text.includes('Recents'), 'root shell includes Codex-style recents');
+  t.ok(root.text.includes('Dispatch History'), 'root shell keeps Dispatch topics behind secondary history');
+  t.ok(root.text.includes('data-drawer-destination="history"'), 'root shell exposes history through the global drawer');
+  t.ok(root.text.includes('function enterDispatch'), 'root shell enters Dispatch through the chat-first route');
   t.ok(root.text.includes('Projects'), 'root shell includes project selection');
   t.ok(root.text.includes('Task List'), 'root shell includes mobile task list status');
   t.ok(root.text.includes('renderPhoneTaskList'), 'mobile shell renders the conversation checklist from state');

@@ -2828,7 +2828,9 @@ function renderConversationList() {
     });
 
     if (standaloneConversations.length === 0) {
-      container.innerHTML = '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No standalone conversations yet</p>';
+      container.innerHTML = mode === 'orion'
+        ? '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No history yet</p>'
+        : '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No standalone conversations yet</p>';
       return;
     }
 

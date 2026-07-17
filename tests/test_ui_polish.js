@@ -47,8 +47,8 @@ test('phone companion finishes with the same dark theme and complete mission hie
   t.ok(companionHtml.includes('#task-list-card { grid-area: mission; }'), 'Task List has an explicit mobile layout area');
   t.ok(companionHtml.includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
   t.ok(companionHtml.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
-  t.ok(companionHtml.includes('ui-polish-v18'), 'phone shell exposes the current UI build version');
-  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v18"), 'phone service worker cache is bumped for the current UI build');
+  t.ok(companionHtml.includes('dispatch-front-door-v19'), 'phone shell exposes the current UI build version');
+  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v19"), 'phone service worker cache is bumped for the current UI build');
   t.ok(companionHtml.includes('window.isSecureContext'), 'phone explains when browser push is blocked by an insecure context');
   t.ok(companionHtml.includes('Phone push needs HTTPS or localhost'), 'phone tells the user that HTTPS is required for push notifications');
   t.ok(companionHtml.includes("companionFetch('/api/push-subscribe'"), 'phone stores push subscriptions through the authenticated fetch path');
@@ -123,6 +123,7 @@ test('phone companion renders approvals and tool calls as first-class mobile UI'
 test('phone companion uses a global drawer and Coder-only operations surfaces', (t) => {
   t.ok(companionHtml.includes('id="app-drawer-overlay"'), 'phone has a global app drawer');
   t.ok(companionHtml.includes('data-drawer-destination="orion"'), 'drawer exposes Dispatch as a top-level destination');
+  t.ok(companionHtml.includes('data-drawer-destination="history"'), 'drawer keeps bounded Dispatch topic history secondary to chat');
   t.ok(companionHtml.includes('data-drawer-destination="coder"'), 'drawer exposes Coder as a top-level destination');
   t.ok(companionHtml.includes('data-drawer-destination="settings"'), 'drawer exposes Settings as an app-level destination');
   t.ok(companionHtml.includes('id="screen-settings"'), 'phone has a dedicated Settings screen');
@@ -150,11 +151,21 @@ test('Dispatch hides Coder-style tool logs behind compact activity', (t) => {
   t.end();
 });
 
-test('Dispatch new chat starts conversationally instead of showing a workspace picker', (t) => {
+test('Dispatch opens as Orion front door while keeping bounded focus history', (t) => {
+  t.ok(companionHtml.includes("let companionMode = 'orion'"), 'each fresh phone launch starts at Dispatch');
+  t.ok(companionHtml.includes('function enterDispatch'), 'phone has one explicit chat-first Dispatch entry path');
+  t.ok(companionHtml.includes("if (companionMode === 'orion') setTimeout(() => enterDispatch({ state }), 0)"), 'the first connected state routes directly into Dispatch chat');
+  t.ok(companionHtml.includes('function resolveDispatchFocus'), 'Dispatch resolves its own running, selected, or remembered focus');
+  t.ok(companionHtml.includes("enterDispatch({ fresh: true })"), 'New creates a clean bounded focus instead of extending one transcript forever');
+  t.ok(companionHtml.includes('function openDispatchHistory'), 'conversation storage remains available as secondary history');
+  t.ok(companionHtml.includes('function renderDispatchEmptyState'), 'an empty Dispatch focus has a quiet front-door state');
+  t.ok(companionHtml.includes('dispatch-running-banner'), 'Dispatch surfaces one compact background Coder status without a dashboard');
+  t.ok(companionHtml.includes("if (resetRequested) {\n      localStorage.removeItem(sessionKey);"), 'ordinary phone UI updates preserve the paired device session');
   t.ok(companionHtml.includes('dispatch-chat-intro'), 'phone has a Dispatch new-chat intro');
   t.ok(companionHtml.includes('coder-workspace-picker'), 'phone keeps the Coder workspace picker');
   t.ok(companionHtml.includes("#screen-new-chat.dispatch-mode .coder-workspace-picker { display: none; }"), 'Dispatch hides the workspace picker on new chat');
   t.ok(companionHtml.includes("newChatPromptEl.placeholder = isDispatchStart ? 'Ask Orion anything...' : 'What should we build?'"), 'new chat placeholder is mode-aware');
+  t.ok(html.includes('New Focus') && html.includes('<span>History</span>'), 'desktop uses the same focus/history language');
   t.end();
 });
 
