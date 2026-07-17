@@ -24,6 +24,30 @@ const main = proxyquire('../main.js', {
 
 global.mainWindow = { webContents: { send: () => {} } };
 
+test('conversation persistence trims oversized generated tool payloads without mutating live history', (t) => {
+  const hugeLog = 'x'.repeat(300000);
+  const hugeResponse = { content: 'y'.repeat(300000) };
+  const conversation = {
+    id: 'large-tool-history',
+    messages: [{
+      role: 'assistant',
+      text: 'Still useful.',
+      logs: [{ tool: 'read_file', result: hugeLog }, { tool: 'grep_search', result: 'small' }],
+      turns: [{ toolResponseParts: [{ functionResponse: { name: 'read_file', response: hugeResponse } }] }]
+    }]
+  };
+  const sanitized = main.sanitizeConversationForPersistence(conversation);
+
+  t.equal(sanitized.changed, true, 'oversized generated payloads trigger persistence cleanup');
+  t.equal(sanitized.trimmedPayloads, 2, 'both visible-log and model-turn copies are trimmed');
+  t.ok(sanitized.conversation.messages[0].logs[0].result.length < 1000, 'persisted log stores a compact receipt');
+  t.equal(sanitized.conversation.messages[0].logs[1].result, 'small', 'small tool output remains intact');
+  t.equal(sanitized.conversation.messages[0].turns[0].toolResponseParts[0].functionResponse.response.persistedPayloadTrimmed, true, 'persisted model turn stores the same cleanup receipt');
+  t.equal(conversation.messages[0].logs[0].result.length, hugeLog.length, 'live in-memory history remains untouched');
+  t.equal(conversation.messages[0].turns[0].toolResponseParts[0].functionResponse.response.content.length, hugeResponse.content.length, 'live tool response remains available during the active run');
+  t.end();
+});
+
 test('startCommandSession runs and killProcessTree kills', (t) => {
   const isWin = process.platform === 'win32';
   const cmd = isWin ? 'ping 127.0.0.1 -n 10' : 'sleep 10';

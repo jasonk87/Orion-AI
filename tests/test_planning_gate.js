@@ -2901,6 +2901,33 @@ test('read_multiple_ranges forwards bundled range requests to IPC', async (t) =>
   t.end();
 });
 
+test('agent file reads use one adaptive character budget instead of unbounded whole-file output', async (t) => {
+  const originalApi = global.window.api;
+  const captured = [];
+  global.window.api = {
+    readFile: async (workspace, filePath, options) => {
+      captured.push({ workspace, filePath, options });
+      return 'source';
+    }
+  };
+  const config = {
+    modelName: 'deepseek-v4-flash',
+    activeRunModelName: 'deepseek-v4-flash',
+    compactThresholdTokens: 100000,
+    modelContextBudgets: { default: 128000 }
+  };
+  const expectedBudget = agent.getAgentReadCharBudget('deepseek-v4-flash', config);
+  await agent.executeTool('read_file', { path: 'large.js', maxChars: 9999999 }, '/test/workspace', config, { id: 'read-budget' });
+  await agent.executeTool('read_multiple_files', { paths: ['a.js', 'b.js'] }, '/test/workspace', config, { id: 'read-budget' });
+
+  t.equal(expectedBudget, 140000, 'the current DeepSeek configuration still allows a generous structural read');
+  t.equal(captured[0].options.maxChars, expectedBudget, 'an explicit oversized read is clamped to the active acquisition budget');
+  t.equal(captured[1].options.maxChars, expectedBudget / 2, 'multi-file reads divide one total budget across the requested files');
+  t.equal(captured[2].options.maxChars, expectedBudget / 2, 'the second file cannot multiply the overall context allowance');
+  global.window.api = originalApi;
+  t.end();
+});
+
 test('inspect_code_context forwards context packet requests to IPC', async (t) => {
   let capturedArgs = null;
   global.window.api = {

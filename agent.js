@@ -148,7 +148,7 @@ function getSystemInstruction(disableTools = false, cachedMemory = '', modelName
   } else {
     base = SYSTEM_INSTRUCTION;
     if (modelName && (modelName.startsWith('deepseek') || modelName.includes('pro') || modelName.includes('claude-3-7'))) {
-      base = `SYSTEM AWARENESS: You are currently running on ${modelName}, which features a massive context window. You have the capacity to read entire files at once if you need full context, saving action loops. However, always prioritize semantic_search or get_symbol_index first to locate exact code instead of blindly reading massive files.\n\n` + base;
+      base = `SYSTEM AWARENESS: You are currently running on ${modelName}, which features a large context window. Read entire files when they fit the active acquisition budget and whole-file structure matters. Oversized reads are capped so one tool result cannot crowd out the task; use inspect_code_context, semantic_search, or get_symbol_index for very large files.\n\n` + base;
     } else if (modelName) {
       base = `SYSTEM AWARENESS: You are currently running on ${modelName}. Use your tools efficiently and prefer targeted reads.\n\n` + base;
     }
@@ -3213,16 +3213,21 @@ async function executeTool(name, args, workspace, config, conversation) {
 
     case 'read_file': {
       if (!args.path) throw new Error("Missing 'path' parameter");
+      const readMaxChars = resolveAgentReadMaxChars(
+        args.maxChars,
+        config.activeRunModelName || config.modelName,
+        config
+      );
       const content = isOrionGovernanceArtifactPath(args.path)
         ? await readOrionGovernanceArtifactText(workspace, conversation, args.path, {
           startLine: args.startLine,
           endLine: args.endLine,
-          maxChars: args.maxChars
+          maxChars: readMaxChars
         })
         : await window.api.readFile(workspace, args.path, {
         startLine: args.startLine,
         endLine: args.endLine,
-        maxChars: args.maxChars
+        maxChars: readMaxChars
       });
       if (content.error) throw new Error(content.error);
       return { content: content };
@@ -3230,17 +3235,23 @@ async function executeTool(name, args, workspace, config, conversation) {
     
     case 'read_multiple_files': {
       if (!args.paths || !Array.isArray(args.paths)) throw new Error("Missing 'paths' array parameter");
-      
-      const readPromises = args.paths.map(async (path) => {
+      const paths = args.paths.map(String).filter(Boolean).slice(0, 50);
+      const totalReadBudget = getAgentReadCharBudget(config.activeRunModelName || config.modelName, config);
+      const perFileMaxChars = Math.max(1000, Math.floor(totalReadBudget / Math.max(1, paths.length)));
+
+      const readPromises = paths.map(async (path) => {
         const content = isOrionGovernanceArtifactPath(path)
-          ? await readOrionGovernanceArtifactText(workspace, conversation, path, { maxChars: 500000 }).catch(e => ({ error: e.message }))
-          : await window.api.readFile(workspace, path, { maxChars: 500000 }).catch(e => ({ error: e.message }));
+          ? await readOrionGovernanceArtifactText(workspace, conversation, path, { maxChars: perFileMaxChars }).catch(e => ({ error: e.message }))
+          : await window.api.readFile(workspace, path, { maxChars: perFileMaxChars }).catch(e => ({ error: e.message }));
         if (content && content.error) throw new Error(`Error reading ${path}: ${content.error}`);
         return `\n\n--- File: ${path} ---\n${content}`;
       });
 
       const results = await Promise.all(readPromises);
-      return { content: results.join("") };
+      const omittedNote = args.paths.length > paths.length
+        ? `\n\n[Orion] ${args.paths.length - paths.length} additional files were omitted. Narrow the file set or use inspect_code_context so the most relevant source fits in one context packet.`
+        : '';
+      return { content: results.join("") + omittedNote };
     }
 
     case 'read_multiple_ranges': {
@@ -4656,6 +4667,19 @@ function getCompactionThreshold(modelName, config) {
     return Math.min(configuredThreshold, modelAwareThreshold);
   }
   return modelAwareThreshold;
+}
+
+function getAgentReadCharBudget(modelName, config = {}) {
+  const thresholdTokens = getCompactionThreshold(modelName || '', config) || 100000;
+  return Math.max(60000, Math.min(500000, Math.floor(thresholdTokens * 4 * 0.35)));
+}
+
+function resolveAgentReadMaxChars(requestedMaxChars, modelName, config = {}) {
+  const safeLimit = getAgentReadCharBudget(modelName, config);
+  const requested = parseInt(requestedMaxChars, 10);
+  return Number.isInteger(requested) && requested > 0
+    ? Math.min(requested, safeLimit)
+    : safeLimit;
 }
 
 function persistCompactedConversation(conversation, summary) {
@@ -7623,6 +7647,7 @@ const DISPATCH_TOOL_ALLOWLIST = new Set([
   'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context', 'list_files', 'get_workspace_info', 'change_workspace',
   'handoff_to_coder',
   'open_url', 'click_element', 'fill_input', 'take_screenshot', 'navigate_back',
+  'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model',
   'grep_search', 'search_embeddings', 'semantic_search',
   'get_symbol_index', 'fetch_page', 'git_diff', 'git_rollback', 'edit_config', 'get_file_symbols', 'find_references',
   'read_notes', 'read_project_memory'
@@ -7792,7 +7817,7 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "read_file",
-            description: "Reads a file located at path relative to the workspace root. Use full-file reads when the file fits the active context budget or whole-file structure matters. For very large files, prefer inspect_code_context, read_multiple_ranges, get_symbol_index, or get_file_symbols so Orion gets complete relevant functions/classes in one turn instead of many arbitrary chunks.",
+            description: "Reads a TEXT file located at path relative to the workspace root. Images and binary assets are rejected; use inspect_screenshot_with_model for visual understanding or inspect_binary_asset for metadata. Use full-file reads when the file fits the active context budget or whole-file structure matters. For very large files, prefer inspect_code_context, read_multiple_ranges, get_symbol_index, or get_file_symbols so Orion gets complete relevant functions/classes in one turn instead of many arbitrary chunks.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -8750,13 +8775,96 @@ function convertGeminiToDeepSeekMessages(geminiMessages) {
   return out;
 }
 
+const DEEPSEEK_CONTEXT_WINDOW_TOKENS = 1048565;
+const DEEPSEEK_SAFE_INPUT_RATIO = 0.90;
+
+function estimateDeepSeekRequestTokens(messages, modelName, systemText, tools) {
+  const request = {
+    model: modelName,
+    messages: [{ role: 'system', content: systemText }, ...convertGeminiToDeepSeekMessages(messages)],
+    thinking: { type: 'enabled' },
+    reasoning_effort: modelName === 'deepseek-v4-pro' ? 'max' : 'high',
+    temperature: 0
+  };
+  if (Array.isArray(tools) && tools.length > 0) request.tools = tools;
+  // One token per UTF-8 byte is a deliberately conservative upper bound. Normal
+  // prose and source are much cheaper, but high-entropy or malformed tool output
+  // can tokenize far more densely than the usual four-characters-per-token rule.
+  return new TextEncoder().encode(JSON.stringify(request)).length;
+}
+
+function fitDeepSeekMessagesToContextWindow(messages, modelName, systemText, tools, options = {}) {
+  const configuredLimit = Number(options.maxInputTokens);
+  const maxInputTokens = Number.isFinite(configuredLimit) && configuredLimit > 0
+    ? configuredLimit
+    : Math.floor(DEEPSEEK_CONTEXT_WINDOW_TOKENS * DEEPSEEK_SAFE_INPUT_RATIO);
+  let fitted = Array.isArray(messages) ? messages : [];
+  let estimatedTokens = estimateDeepSeekRequestTokens(fitted, modelName, systemText, tools);
+  if (estimatedTokens <= maxInputTokens) {
+    return { messages: fitted, estimatedTokens, collapsedToolResults: 0, maxInputTokens };
+  }
+
+  const candidates = [];
+  fitted.forEach((message, messageIndex) => {
+    if (!message || message.role !== 'tool' || !Array.isArray(message.parts)) return;
+    message.parts.forEach((part, partIndex) => {
+      const name = part && part.functionResponse && part.functionResponse.name;
+      if (!name || !TRIMMABLE_TOOL_RESULT_NAMES.has(name)) return;
+      let serialized = '';
+      try {
+        serialized = JSON.stringify(part.functionResponse.response || {});
+      } catch (_) {
+        return;
+      }
+      if (serialized.length > TOOL_RESULT_TRIM_THRESHOLD_CHARS) {
+        candidates.push({ messageIndex, partIndex, name, originalLength: serialized.length });
+      }
+    });
+  });
+
+  let collapsedToolResults = 0;
+  for (const candidate of candidates) {
+    if (estimatedTokens <= maxInputTokens) break;
+    const message = fitted[candidate.messageIndex];
+    const parts = [...message.parts];
+    parts[candidate.partIndex] = {
+      functionResponse: {
+        name: candidate.name,
+        response: {
+          trimmed: true,
+          contextOverflowPrevented: true,
+          originalLength: candidate.originalLength,
+          note: `This ${candidate.name} output was too large to fit safely in the DeepSeek request. Use inspect_code_context, get_file_symbols, grep_search with contextLines, or a narrower read_file range to retrieve the exact relevant source.`
+        }
+      }
+    };
+    fitted = fitted.slice();
+    fitted[candidate.messageIndex] = { ...message, parts };
+    collapsedToolResults += 1;
+    estimatedTokens = estimateDeepSeekRequestTokens(fitted, modelName, systemText, tools);
+  }
+
+  if (estimatedTokens > maxInputTokens) {
+    throw createNonRetryableModelError(
+      `Orion blocked an oversized DeepSeek request locally (${estimatedTokens} estimated input tokens; safe limit ${maxInputTokens}). `
+      + 'The remaining context is not reducible tool output. Start a new task or compact the conversation before retrying.'
+    );
+  }
+  return { messages: fitted, estimatedTokens, collapsedToolResults, maxInputTokens };
+}
+
 async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTools = false, options = {}) {
   if (!apiKey) throw createNonRetryableModelError('DeepSeek API key is not configured. Add it in Settings to use DeepSeek models.');
   const url = 'https://api.deepseek.com/chat/completions';
 
   const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
   const systemText = getSystemInstruction(disableTools, '', modelName);
-  const deepseekMessages = [{ role: 'system', content: systemText }, ...convertGeminiToDeepSeekMessages(processedMessages)];
+  const deepseekTools = disableTools ? undefined : convertGeminiToDeepSeekTools(buildAgentToolDeclarations());
+  const fitted = fitDeepSeekMessagesToContextWindow(processedMessages, modelName, systemText, deepseekTools, options);
+  if (fitted.collapsedToolResults > 0 && onWarning) {
+    onWarning(`Context safety collapsed ${fitted.collapsedToolResults} oversized tool result(s) before calling ${modelName}. Orion will retrieve narrower exact source instead.`);
+  }
+  const deepseekMessages = [{ role: 'system', content: systemText }, ...convertGeminiToDeepSeekMessages(fitted.messages)];
 
   const requestBody = {
     model: modelName,
@@ -8765,9 +8873,7 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
     reasoning_effort: modelName === 'deepseek-v4-pro' ? 'max' : 'high',
     temperature: 0
   };
-  if (!disableTools) {
-    requestBody.tools = convertGeminiToDeepSeekTools(buildAgentToolDeclarations());
-  }
+  if (!disableTools) requestBody.tools = deepseekTools;
 
   const attempts = MODEL_API_MAX_ATTEMPTS;
   let delay = 1500;
@@ -8844,7 +8950,8 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
 const TOOL_RESULT_TRIM_THRESHOLD_CHARS = 4000;
 const TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES = 6;
 const TRIMMABLE_TOOL_RESULT_NAMES = new Set([
-  'list_files', 'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context', 'get_symbol_index', 'read_command_output',
+  'list_files', 'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context',
+  'grep_search', 'semantic_search', 'search_embeddings', 'get_symbol_index', 'get_file_symbols', 'find_references', 'read_command_output',
   'google_search', 'fetch_web_page', 'read_notes', 'read_operational_context',
   'read_project_memory', 'recall_memory', 'discover_skills'
 ]);
@@ -9372,6 +9479,8 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     getEpistemicToolGate,
     buildEpistemicCorrectionPrompt,
     getCompactionThreshold,
+    getAgentReadCharBudget,
+    resolveAgentReadMaxChars,
     classifyAgentFailure,
     recommendedNatureForFailureCategory,
     buildFailureRecoveryGuidance,
@@ -9397,6 +9506,8 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     callAnthropicAPI,
     convertGeminiToDeepSeekTools,
     convertGeminiToDeepSeekMessages,
+    estimateDeepSeekRequestTokens,
+    fitDeepSeekMessagesToContextWindow,
     callDeepSeekAPI,
     getNextModelForHighDemand,
     compactHistory,

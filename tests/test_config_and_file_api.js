@@ -11,12 +11,30 @@ const os = require('os');
 const path = require('path');
 const proxyquire = require('proxyquire').noPreserveCache();
 const http = require('http');
+const { applyReadOptions, getBinaryReadError } = require('../lib/ipc-file-tools');
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 function makeTmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'orion-cfg-test-'));
 }
+
+test('read-file applies maxChars after selecting a line range', (t) => {
+  const source = Array.from({ length: 200 }, (_, index) => `line-${index + 1}-${'x'.repeat(20)}`).join('\n');
+  const result = applyReadOptions(source, { startLine: 25, endLine: 175, maxChars: 300 });
+  t.ok(result.startsWith('25: line-25-'), 'the requested range is still numbered from its real source line');
+  t.ok(result.includes('Read truncated at 300 characters'), 'a large ranged read cannot bypass the context cap');
+  t.ok(result.length < 600, 'the returned range remains bounded after adding the continuation note');
+  t.end();
+});
+
+test('read-file redirects images and binary assets to safe inspection tools', (t) => {
+  t.ok(/inspect_screenshot_with_model/.test(getBinaryReadError('public/concept.png')), 'images are routed to model vision instead of UTF-8 decoding');
+  t.ok(/inspect_binary_asset/.test(getBinaryReadError('assets/model.glb') || getBinaryReadError('assets/archive.zip')), 'binary assets are routed to metadata inspection');
+  t.equal(getBinaryReadError('assets/icon.svg'), '', 'text-based SVG source remains available to code inspection');
+  t.equal(getBinaryReadError('src/app.js'), '', 'ordinary source files remain readable as text');
+  t.end();
+});
 
 function makeConfigModule(tmpDir) {
   return proxyquire('../lib/config', {

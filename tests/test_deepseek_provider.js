@@ -147,6 +147,68 @@ test('callDeepSeekAPI posts to the DeepSeek endpoint with Bearer auth and normal
   t.end();
 });
 
+test('DeepSeek context fitting collapses a giant recent read result without mutating canonical history', (t) => {
+  const giant = 'x'.repeat(40000);
+  const messages = [
+    { role: 'user', parts: [{ text: 'review it' }] },
+    { role: 'model', parts: [{ functionCall: { name: 'read_file', args: { path: 'huge.js' } } }] },
+    { role: 'tool', parts: [{ functionResponse: { name: 'read_file', response: { content: giant } } }] }
+  ];
+  const fitted = agent.fitDeepSeekMessagesToContextWindow(messages, 'deepseek-v4-flash', 'system', [], { maxInputTokens: 3000 });
+  const response = fitted.messages[2].parts[0].functionResponse.response;
+
+  t.equal(fitted.collapsedToolResults, 1, 'the most recent tool result is eligible for emergency fitting');
+  t.equal(response.contextOverflowPrevented, true, 'the replacement explicitly records why exact bytes were omitted');
+  t.ok(/narrower read_file range/.test(response.note), 'DeepSeek is told how to recover exact relevant source');
+  t.equal(messages[2].parts[0].functionResponse.response.content.length, giant.length, 'canonical history is not mutated by the per-call safety copy');
+  t.ok(fitted.estimatedTokens <= fitted.maxInputTokens, 'the fitted request is below the configured safety ceiling');
+  t.end();
+});
+
+test('callDeepSeekAPI fits oversized tool output before fetch and blocks irreducible overflow locally', async (t) => {
+  const originalFetch = global.fetch;
+  let calls = 0;
+  let capturedBody = null;
+  let warning = '';
+  global.fetch = async (url, options) => {
+    calls += 1;
+    capturedBody = JSON.parse(options.body);
+    return { ok: true, json: async () => ({ choices: [{ message: { content: 'Recovered.' } }] }) };
+  };
+  try {
+    const toolMessages = [
+      { role: 'user', parts: [{ text: 'inspect the project' }] },
+      { role: 'model', parts: [{ functionCall: { name: 'read_file', args: { path: 'huge.js' } } }] },
+      { role: 'tool', parts: [{ functionResponse: { name: 'read_file', response: { content: 'x'.repeat(1200000) } } }] }
+    ];
+    await agent.callDeepSeekAPI(toolMessages, 'deepseek-v4-flash', 'sk-test', value => { warning = value; }, false, { maxInputTokens: 200000 });
+    const toolResponse = JSON.parse(capturedBody.messages.find(message => message.role === 'tool').content);
+    t.equal(calls, 1, 'the fitted request reaches DeepSeek once');
+    t.equal(toolResponse.contextOverflowPrevented, true, 'the network payload contains the bounded recovery receipt, not 1.2 million characters');
+    t.ok(/Context safety collapsed/.test(warning), 'the UI receives a quiet explanation of the automatic recovery');
+
+    calls = 0;
+    try {
+      await agent.callDeepSeekAPI(
+        [{ role: 'user', parts: [{ text: 'y'.repeat(1200000) }] }],
+        'deepseek-v4-flash',
+        'sk-test',
+        () => {},
+        false,
+        { maxInputTokens: 200000 }
+      );
+      t.fail('irreducible user context should not be sent');
+    } catch (error) {
+      t.equal(calls, 0, 'an irreducible oversized request is rejected before fetch');
+      t.ok(error.nonRetryable, 'local overflow does not enter a retry loop');
+      t.ok(/blocked an oversized DeepSeek request locally/.test(error.message), 'the local error explains the real blocker');
+    }
+  } finally {
+    global.fetch = originalFetch;
+  }
+  t.end();
+});
+
 test('callDeepSeekAPI throws a clear non-retryable error when no api key is configured', async (t) => {
   try {
     await agent.callDeepSeekAPI([{ role: 'user', parts: [{ text: 'hi' }] }], 'deepseek-v4-flash', '', () => {}, false, {});

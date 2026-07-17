@@ -1004,6 +1004,7 @@ test('token-saving prompt cleanup keeps tool schemas authoritative', (t) => {
   t.ok(agentJs.includes('TOOL USE:'), 'system prompts keep compact tool-use guidance');
   t.ok(agentJs.includes("if (activeConversationMode === 'orion')"), 'tool builder branches for Dispatch conversations');
   t.ok(agentJs.includes('allTools.filter(tool => DISPATCH_TOOL_ALLOWLIST.has(tool.name))'), 'Dispatch receives only allowlisted tool declarations');
+  t.ok(agentJs.includes("'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model'"), 'Dispatch can inspect existing project artwork through read-only visual tools');
   t.ok(agentJs.includes('conversation._systemFactsSignature'), 'stable system facts are tracked by conversation signature');
   t.ok(agentJs.includes('[ORION SYSTEM FACTS - compact]'), 'unchanged system facts use a compact repeat block');
   t.ok(agentJs.includes('if (shouldInjectFullSystemFacts && knownProjectsFacts)'), 'known project paths are only injected with full changed system facts');

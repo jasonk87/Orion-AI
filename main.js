@@ -15,6 +15,74 @@ const symbolIndex = require('./lib/symbol-index');
 const ipcSkill = require('./lib/ipc-skill');
 const ipcMemory = require('./lib/ipc-memory');
 let lastConversationWriteRevision = 0;
+const MAX_PERSISTED_TOOL_PAYLOAD_CHARS = 250000;
+
+function trimPersistedToolPayload(value) {
+  let serialized;
+  try {
+    serialized = typeof value === 'string' ? value : JSON.stringify(value);
+  } catch (_) {
+    return { value, changed: false };
+  }
+  if (serialized.length <= MAX_PERSISTED_TOOL_PAYLOAD_CHARS) return { value, changed: false };
+  const receipt = {
+    trimmed: true,
+    persistedPayloadTrimmed: true,
+    originalLength: serialized.length,
+    note: 'Oversized generated tool output was omitted from persisted conversation history. Re-run the tool with a narrower query or range if exact data is needed.'
+  };
+  return {
+    value: typeof value === 'string' ? JSON.stringify(receipt) : receipt,
+    changed: true
+  };
+}
+
+function sanitizeConversationForPersistence(conversation) {
+  if (!conversation || !Array.isArray(conversation.messages)) {
+    return { conversation, changed: false, trimmedPayloads: 0 };
+  }
+  let changed = false;
+  let trimmedPayloads = 0;
+  const messages = conversation.messages.map(message => {
+    if (!message || typeof message !== 'object') return message;
+    let nextMessage = message;
+    if (Array.isArray(message.logs)) {
+      const logs = message.logs.map(log => {
+        if (!log || !Object.prototype.hasOwnProperty.call(log, 'result')) return log;
+        const trimmed = trimPersistedToolPayload(log.result);
+        if (!trimmed.changed) return log;
+        changed = true;
+        trimmedPayloads += 1;
+        return { ...log, result: trimmed.value };
+      });
+      if (logs.some((log, index) => log !== message.logs[index])) nextMessage = { ...nextMessage, logs };
+    }
+    if (Array.isArray(message.turns)) {
+      const turns = message.turns.map(turn => {
+        if (!turn || !Array.isArray(turn.toolResponseParts)) return turn;
+        const toolResponseParts = turn.toolResponseParts.map(part => {
+          const functionResponse = part && part.functionResponse;
+          if (!functionResponse || !Object.prototype.hasOwnProperty.call(functionResponse, 'response')) return part;
+          const trimmed = trimPersistedToolPayload(functionResponse.response);
+          if (!trimmed.changed) return part;
+          changed = true;
+          trimmedPayloads += 1;
+          return { ...part, functionResponse: { ...functionResponse, response: trimmed.value } };
+        });
+        return toolResponseParts.some((part, index) => part !== turn.toolResponseParts[index])
+          ? { ...turn, toolResponseParts }
+          : turn;
+      });
+      if (turns.some((turn, index) => turn !== message.turns[index])) nextMessage = { ...nextMessage, turns };
+    }
+    return nextMessage;
+  });
+  return {
+    conversation: changed ? { ...conversation, messages } : conversation,
+    changed,
+    trimmedPayloads
+  };
+}
 
 // ── Window creation ────────────────────────────────────────────────────────────
 
@@ -133,7 +201,11 @@ function registerAllHandlers() {
     try {
       if (!fs.existsSync(filePath)) return { success: false, missing: true };
       const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, ''));
-      return { success: true, conversation: parsed };
+      const sanitized = sanitizeConversationForPersistence(parsed);
+      if (sanitized.changed) {
+        atomicWriteFileSync(filePath, `${JSON.stringify(sanitized.conversation, null, 2)}\n`, 'utf8');
+      }
+      return { success: true, conversation: sanitized.conversation, trimmedPayloads: sanitized.trimmedPayloads };
     } catch (error) {
       return { success: false, error: error.message };
     }
@@ -143,8 +215,9 @@ function registerAllHandlers() {
     if (!conv || !conv.id) return { success: false, error: "Missing conv.id" };
     const filePath = path.join(getConversationsDir(), `conv-${conv.id}.json`);
     try {
-      atomicWriteFileSync(filePath, `${JSON.stringify(conv, null, 2)}\n`, 'utf8');
-      return { success: true };
+      const sanitized = sanitizeConversationForPersistence(conv);
+      atomicWriteFileSync(filePath, `${JSON.stringify(sanitized.conversation, null, 2)}\n`, 'utf8');
+      return { success: true, trimmedPayloads: sanitized.trimmedPayloads };
     } catch (error) {
       return { success: false, error: error.message };
     }
@@ -266,6 +339,7 @@ if (process.env.NODE_ENV === 'test') {
     checkLocalSourceUpdates: ipcUi.checkLocalSourceUpdates,
     applyLocalSourceUpdateAndRestart: ipcUi.applyLocalSourceUpdateAndRestart,
     AUTO_UPDATE_FILES: ipcUi.AUTO_UPDATE_FILES,
+    sanitizeConversationForPersistence,
     // safety / shared
     resolveWorkspacePath,
     classifyCommandRequest,
