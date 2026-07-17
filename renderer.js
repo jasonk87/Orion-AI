@@ -4298,7 +4298,7 @@ window.changeActiveWorkspace = function(folderPath, options = {}) {
   }
   refreshOperationalContext();
 };
-window.promoteWorkspaceToCoder = function(options = {}) {
+window.promoteWorkspaceToCoder = async function(options = {}) {
   const folderPath = String(options.path || currentWorkspace || '').trim();
   if (!folderPath) return { success: false, error: 'No workspace path to promote.' };
   addProjectPath(folderPath);
@@ -4311,6 +4311,39 @@ window.promoteWorkspaceToCoder = function(options = {}) {
     select: options.open === true
   });
 
+  const requestedPacketIds = Array.isArray(options.contextPacketIds)
+    ? [...new Set(options.contextPacketIds.map(String).filter(Boolean))].slice(-5)
+    : [];
+  let assignedPacketIds = [];
+  let contextTransferError = '';
+  if (requestedPacketIds.length > 0 && window.api && typeof window.api.assignContextPackets === 'function') {
+    try {
+      const assignment = await window.api.assignContextPackets(folderPath, requestedPacketIds, {
+        sourceConversationId: String(options.sourceConversationId || ''),
+        targetConversationId: conv.id,
+        requestedWork: prompt,
+        findings: Array.isArray(options.findings) ? options.findings : []
+      });
+      assignedPacketIds = assignment && Array.isArray(assignment.assignedPacketIds)
+        ? assignment.assignedPacketIds
+        : [];
+      if (!assignment || assignment.success === false) contextTransferError = (assignment && assignment.error) || 'Context packet assignment failed.';
+    } catch (error) {
+      contextTransferError = error.message || String(error);
+    }
+  }
+  if (assignedPacketIds.length > 0) {
+    conv.inheritedContext = {
+      packetIds: assignedPacketIds,
+      sourceConversationId: String(options.sourceConversationId || ''),
+      workspace: folderPath,
+      assignedAt: Date.now(),
+      active: true
+    };
+  }
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+  saveConversationsToStorage();
+
   if (prompt) {
     window.promptQueue = window.promptQueue || [];
     window.promptQueue.push({
@@ -4319,6 +4352,7 @@ window.promoteWorkspaceToCoder = function(options = {}) {
       modelSelectValue: window.getSelectedModel(),
       conversationId: conv.id,
       source: 'dispatch-handoff',
+      contextPacketIds: assignedPacketIds,
       createdAt: Date.now()
     });
     persistAssistantStatusMessage(conv.id, 'Queued from Dispatch. Coder will start when the current turn finishes.', {
@@ -4334,7 +4368,10 @@ window.promoteWorkspaceToCoder = function(options = {}) {
     projectPath: folderPath,
     conversationId: conv.id,
     title: conv.title,
-    queued: !!prompt
+    queued: !!prompt,
+    contextPacketIds: assignedPacketIds,
+    contextTransferred: assignedPacketIds.length > 0,
+    contextTransferError
   };
 };
 window.getSelectedModel = () => el.modelSelect ? el.modelSelect.value : appConfig.defaultModel;

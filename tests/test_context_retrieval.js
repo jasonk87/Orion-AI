@@ -7,7 +7,7 @@ const {
   inspectCodeContext,
   mergeRanges
 } = require('../lib/context-retrieval');
-const { resetWorkspaceIndexServices } = require('../lib/workspace-index-service');
+const { getWorkspaceIndexService, resetWorkspaceIndexServices } = require('../lib/workspace-index-service');
 
 function makeWorkspace(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-context-'));
@@ -101,5 +101,63 @@ test('inspectCodeContext bundles definitions, imports, callers, and related test
   t.ok(result.content.includes("4:   return targetThing('demo');"), 'caller context is included');
   t.ok(result.content.includes("expect(targetThing(' demo ')).toBe('value:demo');"), 'related test context is included');
   t.ok(result.metrics.sectionCount >= 3, 'metrics capture bundled sections');
+  t.ok(result.contextPacketId, 'inspection creates an immutable context packet receipt');
+  t.end();
+});
+
+test('context packets hand exact source to one Coder conversation and refresh only changed evidence', async (t) => {
+  const workspace = makeWorkspace(t);
+  const inspected = await inspectCodeContext(workspace, {
+    query: 'targetThing input trimming behavior',
+    paths: ['src/app.js'],
+    symbols: ['targetThing'],
+    include: ['imports', 'definitions', 'callers', 'tests'],
+    expand: true,
+    budgetTokens: 12000,
+    conversationId: 'dispatch-1',
+    runId: 'dispatch-run-1'
+  });
+  const service = getWorkspaceIndexService(workspace);
+  const assignment = service.assignContextPackets([inspected.contextPacketId], {
+    sourceConversationId: 'dispatch-1',
+    targetConversationId: 'coder-1',
+    requestedWork: 'Fix the trimming behavior.',
+    findings: ['targetThing owns input normalization.']
+  });
+
+  t.equal(assignment.success, true, 'Dispatch packet is assigned to the target Coder conversation');
+  const first = service.hydrateContextPackets(assignment.assignedPacketIds, { conversationId: 'coder-1', budgetTokens: 12000 });
+  t.equal(first.success, true, 'target Coder conversation hydrates the packet');
+  t.ok(first.content.includes('function targetThing(input)'), 'hydration returns exact numbered source');
+  t.equal(first.metrics.refreshedSectionCount, 0, 'unchanged source is reused without refreshing sections');
+  t.deepEqual(first.findings, ['targetThing owns input normalization.'], 'Dispatch findings accompany exact evidence');
+
+  const denied = service.hydrateContextPackets(assignment.assignedPacketIds, { conversationId: 'coder-2' });
+  t.equal(denied.success, false, 'an unrelated conversation cannot inherit the packet');
+  t.equal(denied.rejected[0].reason, 'conversation_mismatch', 'denial names the conversation boundary');
+
+  fs.writeFileSync(path.join(workspace, 'notes.md'), 'unrelated workspace change', 'utf8');
+  service.markDirty('notes.md');
+  service.flushDirtySync();
+  const afterUnrelatedChange = service.hydrateContextPackets(assignment.assignedPacketIds, { conversationId: 'coder-1', budgetTokens: 12000 });
+  t.equal(afterUnrelatedChange.metrics.refreshedSectionCount, 0, 'an unrelated workspace revision does not invalidate referenced files');
+
+  const appPath = path.join(workspace, 'src', 'app.js');
+  fs.writeFileSync(appPath, fs.readFileSync(appPath, 'utf8').replace('return helper(input.trim());', "return helper(input.trim().toUpperCase());"), 'utf8');
+  service.markDirty('src/app.js');
+  service.flushDirtySync();
+  const afterRelevantChange = service.hydrateContextPackets(assignment.assignedPacketIds, { conversationId: 'coder-1', budgetTokens: 12000 });
+  t.ok(afterRelevantChange.metrics.refreshedSectionCount > 0, 'a changed referenced file refreshes its packet section');
+  t.ok(afterRelevantChange.content.includes('input.trim().toUpperCase()'), 'Coder receives current source rather than stale Dispatch source');
+
+  const persisted = JSON.parse(fs.readFileSync(path.join(workspace, '.orion', 'workspace-intelligence-cache.json'), 'utf8'));
+  const persistedPacket = persisted.contextPackets.find(packet => packet.id === inspected.contextPacketId);
+  t.ok(persistedPacket, 'compact packet descriptor persists with the workspace intelligence cache');
+  t.notOk(Object.prototype.hasOwnProperty.call(persistedPacket.evidence[0], 'content'), 'packet persistence does not duplicate exact source text');
+  resetWorkspaceIndexServices();
+  const reopened = getWorkspaceIndexService(workspace, { watch: false });
+  const afterRestart = reopened.hydrateContextPackets(assignment.assignedPacketIds, { conversationId: 'coder-1', budgetTokens: 12000 });
+  t.equal(afterRestart.success, true, 'assigned receipt survives reopening the workspace intelligence cache');
+  t.ok(afterRestart.content.includes('input.trim().toUpperCase()'), 'reopened receipt still resolves current exact source');
   t.end();
 });

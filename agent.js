@@ -109,6 +109,8 @@ HOW YOU WORK:
 Handle directly: conversation, strategy, planning, research, reading and discussing code or docs, answering questions, web searches. You can look at files and search the web to back up what you say, but you cannot write, edit, run commands, capture screenshots, or operate the desktop yourself — you are read-only by design.
 Route to the coder: anything requiring file changes, writing or debugging code, running tests, building or fixing features, running local commands, capturing the desktop/screen, or producing local files/artifacts for Jason. Before routing, make sure you understand the task well enough to hand it off clearly — ask Jason to clarify if you don't. When you route something, tell him. Don't go quiet. Report back with a clean summary when it's done.
 
+Context ownership: for an obvious build/fix/edit/test request, route early from the known workspace and task description. Do not deeply inspect source merely to decide that Coder should do the work. For a read-only question or architectural opinion, inspect deeply yourself and answer it. If Jason then turns that discussion into implementation, use handoff_to_coder; Orion will transfer the exact validated context packets you already built so Coder can start from that evidence instead of rediscovering the project.
+
 HOW YOU THINK:
 Don't snap-route. Ask yourself first: can I handle this directly? Do I have enough context to give the coder a clear task? Is this a coding problem or a planning conversation first? Think it through, then act.
 
@@ -811,6 +813,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   if (window.onAgentStatusChange) window.onAgentStatusChange(true);
   
   const config = window.getAppConfig();
+  conversation._activeContextRunId = `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   config.modelName = modelName || config.modelName || 'gemini-2.5-flash-lite';
   let activeRunModelName = config.modelName;
   config.activeRunModelName = activeRunModelName;
@@ -899,6 +902,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     if (window.api && window.api.getHomeDir) resolvedHomeDir = await window.api.getHomeDir();
   } catch (_) {}
   let workspacePath = resolveConversationWorkspace(conversation);
+  const inheritedContextReceipt = await loadInheritedContextReceipt(conversation, workspacePath);
 
   const scopedNotes = await readScopedNotes(workspacePath, conversation);
   const operationalContext = await readOperationalContext(workspacePath);
@@ -1243,6 +1247,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     });
   }
 
+  const inheritedContextPrompt = buildInheritedContextPrompt(inheritedContextReceipt);
+  if (inheritedContextPrompt) {
+    messages.push({
+      role: 'user',
+      parts: [{ text: inheritedContextPrompt }]
+    });
+  }
+
   messages.push({
     role: 'user',
     parts: [{
@@ -1404,7 +1416,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // is only guessing at, which is the single biggest source of drift corruption. The gate below
     // requires the file to be here first. (This is the "read before you edit" rule that keeps even
     // a weak model from mangling a file it never looked at.)
-    const filesSeenThisRun = new Set();
+    const filesSeenThisRun = inheritedContextSeenFiles(inheritedContextReceipt);
     // Files that have been fully read this run and NOT edited since — a subsequent full re-read of
     // one of these returns the same bytes the model already has, which is pure waste (a transcript
     // showed a 2600-line file re-read six times in one run). We still deliver the content (safe —
@@ -1424,6 +1436,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const consecutiveEditFailureCounts = new Map(); // path (lowercased) -> streak count
     const toolEvidenceLedger = [];
     const contextAcquisitionLedger = createContextAcquisitionLedger();
+    if (inheritedContextReceipt) {
+      recordContextAcquisitionToolResult(
+        contextAcquisitionLedger,
+        'inspect_code_context',
+        { query: 'inherited Dispatch context packet' },
+        inheritedContextReceipt
+      );
+    }
     let supervisorCorrectionAttempts = 0;
     const maxMalformedToolRetries = 5;
     const canExecuteThisTask = () => !config.planningMode || conversation.planApproved || planningBypassedForTask;
@@ -1969,6 +1989,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           updateWalkthroughItem(walkthroughItem, toolName, args, result, isFailedToolResult(result) ? new Error(getToolFailureSignal(result) || 'error') : null);
           toolEvidenceLedger.push(buildToolEvidenceEntry(toolName, args, result));
           recordContextAcquisitionToolResult(contextAcquisitionLedger, toolName, args, result);
+          rememberContextPacketForConversation(conversation, workspacePath, toolName, result);
 
           // read_file state tracking
           if (toolName === 'read_file' && args.path && !isFailedToolResult(result)) {
@@ -2266,6 +2287,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         const evidenceEntry = buildToolEvidenceEntry(toolName, args, result);
         toolEvidenceLedger.push(evidenceEntry);
         recordContextAcquisitionToolResult(contextAcquisitionLedger, toolName, args, result);
+        rememberContextPacketForConversation(conversation, workspacePath, toolName, result);
 
         if (toolName === 'write_file' && isStrategyPath(args.path) && !isFailedToolResult(result)) {
           try {
@@ -3243,7 +3265,9 @@ async function executeTool(name, args, workspace, config, conversation) {
         include: Array.isArray(args.include) ? args.include : undefined,
         budgetTokens: Number.isFinite(Number(args.budgetTokens)) ? Number(args.budgetTokens) : undefined,
         contextLines: Number.isFinite(Number(args.contextLines)) ? Number(args.contextLines) : undefined,
-        expand: args.expand === true
+        expand: args.expand === true,
+        conversationId: conversation && conversation.id ? conversation.id : '',
+        runId: conversation && conversation._activeContextRunId ? conversation._activeContextRunId : ''
       });
       if (!result || result.success === false) throw new Error((result && result.error) || 'inspect_code_context failed');
       return result;
@@ -3426,11 +3450,15 @@ async function executeTool(name, args, workspace, config, conversation) {
         throw new Error('Coder handoff is not available in this Orion build.');
       }
       const prompt = String(args.prompt || '').trim();
-      const result = window.promoteWorkspaceToCoder({
+      const contextPacketIds = getHandoffContextPacketIds(conversation, resolution.path);
+      const result = await window.promoteWorkspaceToCoder({
         path: resolution.path,
         prompt,
         title: args.title || '',
-        open: args.open === true
+        open: args.open === true,
+        sourceConversationId: conversation.id,
+        contextPacketIds,
+        findings: Array.isArray(args.findings) ? args.findings : []
       });
       if (!result || result.success === false) {
         throw new Error((result && result.error) || 'Coder handoff failed.');
@@ -3451,7 +3479,7 @@ async function executeTool(name, args, workspace, config, conversation) {
         ...result,
         success: true,
         message: prompt
-          ? `Promoted ${resolution.path} to Coder and queued the task for Cody.`
+          ? `Promoted ${resolution.path} to Coder and queued the task for Cody.${result.contextTransferred ? ` Transferred ${result.contextPacketIds.length} validated context packet(s).` : ''}`
           : `Promoted ${resolution.path} to Coder as a project.`,
         fuzzyResolved: !!resolution.fuzzyResolved,
         resolvedFrom: resolution.resolvedFrom,
@@ -6621,6 +6649,86 @@ function getContextSectionsFromToolResult(toolName, args = {}, result = {}) {
   return [];
 }
 
+function normalizeContextWorkspacePath(value) {
+  return String(value || '').replace(/[\\/]+$/, '').toLowerCase();
+}
+
+function rememberContextPacketForConversation(conversation, workspacePath, toolName, result = {}) {
+  if (!conversation || toolName !== 'inspect_code_context' || !result || !result.contextPacketId) return false;
+  const refs = Array.isArray(conversation.contextPacketRefs) ? conversation.contextPacketRefs : [];
+  const next = refs.filter(ref => ref && ref.id !== result.contextPacketId);
+  next.push({
+    id: String(result.contextPacketId),
+    workspace: String(workspacePath || ''),
+    query: String(result.query || ''),
+    workspaceRevision: Number(result.metrics && result.metrics.workspaceRevision) || 0,
+    sectionCount: Array.isArray(result.sections) ? result.sections.length : 0,
+    createdAt: Date.now()
+  });
+  conversation.contextPacketRefs = next.slice(-8);
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conversation.id);
+  return true;
+}
+
+function getHandoffContextPacketIds(conversation, workspacePath) {
+  if (!conversation || !Array.isArray(conversation.contextPacketRefs)) return [];
+  const targetWorkspace = normalizeContextWorkspacePath(workspacePath);
+  return conversation.contextPacketRefs
+    .filter(ref => ref && ref.id && normalizeContextWorkspacePath(ref.workspace) === targetWorkspace)
+    .sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0))
+    .slice(-5)
+    .map(ref => String(ref.id));
+}
+
+async function loadInheritedContextReceipt(conversation, workspacePath) {
+  const inherited = conversation && conversation.inheritedContext;
+  const packetIds = inherited && Array.isArray(inherited.packetIds) ? inherited.packetIds.filter(Boolean) : [];
+  if (!conversation || conversation.mode === 'orion' || !inherited || inherited.active === false || packetIds.length === 0) return null;
+  if (normalizeContextWorkspacePath(inherited.workspace) !== normalizeContextWorkspacePath(workspacePath)) return null;
+  if (!window.api || typeof window.api.hydrateContextPackets !== 'function') return null;
+  try {
+    const receipt = await window.api.hydrateContextPackets(workspacePath, packetIds, {
+      conversationId: conversation.id,
+      budgetTokens: 18000
+    });
+    inherited.lastHydratedAt = Date.now();
+    inherited.lastHydrationError = receipt && receipt.success === false ? String(receipt.error || '') : '';
+    inherited.workspaceRevision = Number(receipt && receipt.workspaceRevision) || inherited.workspaceRevision || 0;
+    inherited.metrics = receipt && receipt.metrics ? receipt.metrics : inherited.metrics;
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conversation.id);
+    return receipt && receipt.success !== false && Array.isArray(receipt.sections) && receipt.sections.length > 0
+      ? receipt
+      : null;
+  } catch (error) {
+    inherited.lastHydratedAt = Date.now();
+    inherited.lastHydrationError = error.message || String(error);
+    return null;
+  }
+}
+
+function buildInheritedContextPrompt(receipt = {}) {
+  if (!receipt || !Array.isArray(receipt.sections) || receipt.sections.length === 0 || !receipt.content) return '';
+  const requestedWork = Array.isArray(receipt.requestedWork) ? receipt.requestedWork.filter(Boolean) : [];
+  const findings = Array.isArray(receipt.findings) ? receipt.findings.filter(Boolean) : [];
+  const refreshed = receipt.sections.filter(section => section && section.refreshed).map(section => section.path);
+  return [
+    '[INHERITED DISPATCH CONTEXT - validated exact source]',
+    `Context packet IDs: ${(receipt.packetIds || []).join(', ')}`,
+    `Current workspace revision: ${Number(receipt.workspaceRevision) || 0}`,
+    requestedWork.length ? `Requested work:\n${requestedWork.map(item => `- ${item}`).join('\n')}` : '',
+    findings.length ? `Dispatch findings:\n${findings.map(item => `- ${item}`).join('\n')}` : '',
+    refreshed.length ? `Changed since Dispatch inspected it; Orion refreshed these sections before this run: ${[...new Set(refreshed)].join(', ')}` : '',
+    'The source below is current and satisfies read-before-edit for the listed files. Do not list, search, or reread these same sections merely to orient yourself. Expand context only when you can name a concrete missing caller, dependency, test, or source section required for the task.',
+    receipt.content
+  ].filter(Boolean).join('\n\n');
+}
+
+function inheritedContextSeenFiles(receipt = {}) {
+  return new Set((receipt && Array.isArray(receipt.sections) ? receipt.sections : [])
+    .filter(section => section && section.current === true && section.path)
+    .map(section => String(section.path).toLowerCase()));
+}
+
 function recordContextAcquisitionToolResult(ledger, toolName, args = {}, result = {}) {
   if (!ledger) return;
   if (toolName === 'grep_search' || toolName === 'semantic_search' || toolName === 'search_embeddings' || toolName === 'get_symbol_index' || toolName === 'get_file_symbols' || toolName === 'find_references') {
@@ -7618,12 +7726,17 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "handoff_to_coder",
-            description: "Promotes a local folder into Coder as an explicit project and optionally queues a Coder prompt to start implementation. Use after Dispatch has inspected/discussed a project and Jason asks to make it a project, move it to Coder, have Cody start, build it, or fix it. This is the explicit promotion path; change_workspace alone must not add folders to Coder.",
+            description: "Promotes a local folder into Coder as an explicit project and optionally queues a Coder prompt to start implementation. For an obvious implementation request, route early without deeply inspecting source first. If Dispatch already inspected the project for a read-only question or architectural opinion, this automatically transfers its validated exact-source context packets so Coder does not rediscover the same files. This is the explicit promotion path; change_workspace alone must not add folders to Coder.",
             parameters: {
               type: "OBJECT",
               properties: {
                 path: { type: "STRING", description: "Optional absolute folder path to promote. Defaults to the current Dispatch workspace." },
                 prompt: { type: "STRING", description: "Optional exact task for Coder to start, such as what to build, fix, or investigate." },
+                findings: {
+                  type: "ARRAY",
+                  items: { type: "STRING" },
+                  description: "Optional concise findings or decisions already established in Dispatch. Do not paste source code here; exact source is transferred through context packets."
+                },
                 title: { type: "STRING", description: "Optional title for the new Coder conversation." },
                 open: { type: "BOOLEAN", description: "Whether to switch the UI to the new Coder conversation immediately. Defaults to false." }
               }
@@ -9248,6 +9361,11 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     invalidateContextAcquisitionForFile,
     buildContextAcquisitionReceipt,
     getContextSectionsFromToolResult,
+    rememberContextPacketForConversation,
+    getHandoffContextPacketIds,
+    loadInheritedContextReceipt,
+    buildInheritedContextPrompt,
+    inheritedContextSeenFiles,
     recordIncidentalIssueCandidate,
     formatIncidentalObservations,
     appendIncidentalObservationsToFinal,

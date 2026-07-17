@@ -25,6 +25,8 @@ contextBridge.exposeInMainWorld('api', {
   readFile: (workspacePath, relativePath, options) => ipcRenderer.invoke('read-file', { workspacePath, relativePath, options }),
   readMultipleRanges: (workspacePath, files, options) => ipcRenderer.invoke('read-multiple-ranges', { workspacePath, files, options }),
   inspectCodeContext: (workspacePath, request) => ipcRenderer.invoke('orion:inspect-code-context', { ...(request || {}), workspacePath }),
+  assignContextPackets: (workspacePath, packetIds, handoff) => ipcRenderer.invoke('orion:assign-context-packets', { workspacePath, packetIds, ...(handoff || {}) }),
+  hydrateContextPackets: (workspacePath, packetIds, options) => ipcRenderer.invoke('orion:hydrate-context-packets', { workspacePath, packetIds, ...(options || {}) }),
   deletePath: (workspacePath, relativePath) => ipcRenderer.invoke('delete-path', { workspacePath, relativePath }),
   movePath: (workspacePath, fromPath, toPath) => ipcRenderer.invoke('move-path', { workspacePath, fromPath, toPath }),
   renamePath: (workspacePath, relativePath, newName) => ipcRenderer.invoke('rename-path', { workspacePath, relativePath, newName }),

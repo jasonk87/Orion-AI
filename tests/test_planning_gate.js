@@ -2922,13 +2922,79 @@ test('inspect_code_context forwards context packet requests to IPC', async (t) =
     budgetTokens: 9000,
     contextLines: 6,
     expand: true
-  }, '/test/workspace', {});
+  }, '/test/workspace', {}, { id: 'dispatch-context-owner', _activeContextRunId: 'run-context-1' });
   t.equal(capturedArgs.workspace, '/test/workspace', 'the active workspace is passed through');
   t.equal(capturedArgs.request.query, 'completion gate loop', 'query is forwarded');
   t.equal(capturedArgs.request.symbols[0], 'buildCompletionGateMessage', 'symbols are forwarded');
   t.equal(capturedArgs.request.budgetTokens, 9000, 'budget is forwarded');
   t.equal(capturedArgs.request.expand, true, 'expand flag is forwarded');
+  t.equal(capturedArgs.request.conversationId, 'dispatch-context-owner', 'packet ownership is scoped to the inspecting conversation');
+  t.equal(capturedArgs.request.runId, 'run-context-1', 'packet records the source run');
   t.equal(result.sections.length, 1, 'sections are returned to the model');
+  t.end();
+});
+
+test('Dispatch context packet helpers retain workspace-scoped receipts for Coder handoff', (t) => {
+  const conversation = { id: 'dispatch-1', contextPacketRefs: [] };
+  global.window.markConversationDirty = () => {};
+  const remembered = agent.rememberContextPacketForConversation(conversation, 'C:\\Projects\\Demo', 'inspect_code_context', {
+    contextPacketId: 'ctx-1',
+    query: 'review demo',
+    sections: [{ path: 'src/app.js', startLine: 1, endLine: 20 }],
+    metrics: { workspaceRevision: 12 }
+  });
+  agent.rememberContextPacketForConversation(conversation, 'C:\\Projects\\Other', 'inspect_code_context', {
+    contextPacketId: 'ctx-other',
+    sections: [{ path: 'src/other.js', startLine: 1, endLine: 10 }]
+  });
+
+  t.equal(remembered, true, 'successful deep inspection is retained as a receipt reference');
+  t.deepEqual(agent.getHandoffContextPacketIds(conversation, 'c:\\projects\\demo\\'), ['ctx-1'], 'handoff selects only packets from the promoted workspace');
+  t.end();
+});
+
+test('inherited Coder context is explicit, current, and accepted as source inspection', async (t) => {
+  let hydrateArgs = null;
+  global.window.api = {
+    hydrateContextPackets: async (workspace, packetIds, options) => {
+      hydrateArgs = { workspace, packetIds, options };
+      return {
+        success: true,
+        packetIds,
+        workspaceRevision: 19,
+        requestedWork: ['Fix the established findings.'],
+        findings: ['The handler drops startup errors.'],
+        sections: [
+          { path: 'lib/server.js', startLine: 10, endLine: 30, content: '10: function start() {}', current: true, refreshed: false },
+          { path: 'lib/stale.js', startLine: 1, endLine: 4, content: '1: old', current: false, refreshed: false }
+        ],
+        content: '--- File: lib/server.js (lines 10-30) ---\n10: function start() {}',
+        metrics: { reusedSectionCount: 1, refreshedSectionCount: 0 }
+      };
+    }
+  };
+  const conversation = {
+    id: 'coder-1',
+    mode: 'coder',
+    inheritedContext: { packetIds: ['ctx-1'], workspace: 'C:\\Projects\\Demo', active: true }
+  };
+  const receipt = await agent.loadInheritedContextReceipt(conversation, 'C:\\Projects\\Demo');
+  const prompt = agent.buildInheritedContextPrompt(receipt);
+  const seen = agent.inheritedContextSeenFiles(receipt);
+
+  t.equal(hydrateArgs.options.conversationId, 'coder-1', 'hydration enforces the target Coder conversation');
+  t.ok(prompt.includes('validated exact source'), 'Coder is told the packet contains validated exact source');
+  t.ok(prompt.includes('Do not list, search, or reread'), 'Coder is instructed not to restart orientation');
+  t.equal(seen.has('lib/server.js'), true, 'current packet source satisfies read-before-edit');
+  t.equal(seen.has('lib/stale.js'), false, 'non-current packet source never satisfies edit safety');
+  t.end();
+});
+
+test('Coder conversations without a Dispatch packet keep the ordinary startup path', async (t) => {
+  global.window.api = {};
+  const receipt = await agent.loadInheritedContextReceipt({ id: 'coder-without-packet', mode: 'coder' }, 'C:\\Projects\\Demo');
+  t.equal(receipt, null, 'missing inherited context is a clean no-op');
+  t.deepEqual([...agent.inheritedContextSeenFiles(receipt)], [], 'missing inherited context seeds no read-before-edit files');
   t.end();
 });
 
