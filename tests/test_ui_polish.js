@@ -143,11 +143,79 @@ test('phone companion uses a global drawer and Coder-only operations surfaces', 
 test('Dispatch hides Coder-style tool logs behind compact activity', (t) => {
   t.ok(renderer.includes('function formatDispatchToolActivity'), 'renderer has a Dispatch-specific compact tool activity renderer');
   t.ok(renderer.includes("conversationMode(activeConv) === 'orion'"), 'Dispatch detection is based on conversation mode');
-  t.ok(renderer.includes("logsHtml = isRunningThisConversation ? formatDispatchToolActivity(logs) : ''"), 'Dispatch only shows compact activity while the run is active');
-  t.ok(styles.includes('.dispatch-tool-activity'), 'compact Dispatch tool activity is styled');
+  // Regression: a delegated Coder transcript viewed while the app is in the Dispatch space used
+  // to render full Coder tool chips (raw JSON params, full result dumps) into Dispatch. The
+  // presentation gate keys off the SPACE (appMode), not only the conversation's own mode.
+  t.ok(renderer.includes("isDispatchConversation || (typeof appMode !== 'undefined' && appMode === 'orion')"), 'the whole Dispatch space gets the compact presentation, including delegated Coder transcripts');
+  t.ok(renderer.includes('formatDispatchToolActivity(logs, isRunningThisConversation)'), 'Dispatch keeps a collapsed activity panel after the run instead of dropping logs entirely');
+  t.ok(renderer.includes('dispatch-activity-log'), 'desktop Dispatch activity renders as a collapsed panel, phone-style');
+  t.ok(renderer.includes('function renderDispatchWalkthroughPanel'), 'desktop condenses Work Walkthrough into a collapsed checklist panel in Dispatch');
+  t.ok(styles.includes('.dispatch-activity-log'), 'compact Dispatch activity panel is styled');
+  t.ok(styles.includes('.dispatch-current-tool'), 'the live current-tool line is styled');
   t.ok(companionHtml.includes('function renderDispatchToolActivity'), 'phone has a Dispatch-specific compact activity renderer');
   t.ok(companionHtml.includes('dispatch-activity-log collapsed'), 'phone Dispatch activity defaults to collapsed');
   t.ok(companionHtml.includes("isDispatchConversation ? renderDispatchToolActivity"), 'phone uses compact activity for Dispatch chat logs');
+  t.end();
+});
+
+test('Dispatch walkthrough condensing parses statuses out of Coder walkthrough bullets', (t) => {
+  const splitFn = renderer.match(/function splitDispatchAssistantText\(text\) \{[\s\S]*?\n\}/);
+  const parseFn = renderer.match(/function parseDispatchWalkthroughRows\(walkthroughText\) \{[\s\S]*?\n\}/);
+  t.ok(splitFn && parseFn, 'walkthrough split/parse helpers are present in renderer.js');
+
+  const sandbox = new Function(`${splitFn[0]}\n${parseFn[0]}\nreturn { splitDispatchAssistantText, parseDispatchWalkthroughRows };`)();
+  const sample = 'All done.\n\n## Work Walkthrough\n- **Done**: Ran the test suite\n- **Failed**: Write `_tmp_check.py` - EDIT BLOCKED';
+  const split = sandbox.splitDispatchAssistantText(sample);
+  t.equal(split.answer, 'All done.', 'the conversational answer is separated from the walkthrough');
+  t.ok(/^## Work Walkthrough/.test(split.walkthrough), 'the walkthrough block is captured intact');
+
+  const rows = sandbox.parseDispatchWalkthroughRows(split.walkthrough);
+  t.equal(rows.length, 2, 'each bullet becomes one row');
+  t.equal(rows[0].status, 'success', '"Done" bullets map to the success chip');
+  t.equal(rows[1].status, 'error', '"Failed" bullets map to the error chip');
+  t.equal(rows[1].detail.includes('EDIT BLOCKED'), true, 'the row keeps its detail text');
+
+  const noWalkthrough = sandbox.splitDispatchAssistantText('Just a plain answer.');
+  t.equal(noWalkthrough.answer, 'Just a plain answer.', 'text without a walkthrough passes through untouched');
+  t.equal(noWalkthrough.walkthrough, '', 'no phantom walkthrough is created');
+  t.end();
+});
+
+// Regression: updating an updateExisting system chip (e.g. "Supervisor requested one bounded
+// correction attempt.") re-rendered the ENTIRE conversation via selectConversation() while the
+// agent was still streaming. The replay orphaned the live assistant bubble — leaving a frozen
+// duplicate of the partial message with a permanently stuck "Working (Step N)…" spinner — and
+// the agent's next render appended a second copy of the same message below the chips.
+test('updating a system chip mid-run does not re-render the transcript or orphan the live bubble', (t) => {
+  t.notOk(renderer.includes('selectConversation(targetId);\n      return;'), 'the updateExisting branch no longer re-renders the whole conversation');
+  t.ok(renderer.includes('data-sys-dedupe'), 'system chips are stamped with their dedupe key');
+  t.ok(renderer.includes('function renderSystemBubble(text, dedupeKey'), 'renderSystemBubble accepts the dedupe key');
+  t.ok(renderer.includes('CSS.escape(dedupeKey)'), 'the rendered chip is updated in place by key');
+  t.ok(renderer.includes('renderSystemBubble(replayMsg.text, replayMsg.dedupeKey'), 'replayed chips keep their key so later updates still find them');
+  t.ok(renderer.includes('Stale-spinner sweep'), 'orphaned running indicators are swept whenever a bubble renders');
+  t.end();
+});
+
+// The four confirmed gaps from a Dispatch self-assessment run (supervisor blind spots and
+// context loss at the Coder handoff), each now closed:
+test('Dispatch supervisor escalates stalls, previews Coder state, and continues unfinished work', (t) => {
+  const agentJs = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8').replace(/\r\n/g, '\n');
+  // Stall escalation (was: monitor polled forever showing "Working…")
+  t.ok(renderer.includes('quietSince'), 'supervisor monitor tracks how long Coder has been quiet');
+  t.ok(renderer.includes("'supervisor-stall'"), 'a stalled run notifies the Dispatch conversation');
+  t.ok(renderer.includes('Went quiet without completing'), 'stalled work is parked as a receipt instead of spinning forever');
+  // Quick peek (was: sub-status and elapsed time only)
+  t.ok(renderer.includes('coder-status-preview'), 'status card carries a last-message preview');
+  t.ok(html.includes('coder-status-preview'), 'status card markup has the preview line');
+  t.ok(styles.includes('.coder-status-preview'), 'preview line is styled');
+  // One-click continuation (was: "you can queue a continuation" with no mechanism)
+  t.ok(renderer.includes('function continueDelegatedWork'), 'unfinished delegated work has a continuation mechanism');
+  t.ok(renderer.includes('data-dispatch-continue-work'), 'the Dispatch landing renders a Continue action');
+  t.ok(styles.includes('.dispatch-desktop-work-continue'), 'the Continue action is styled');
+  // Findings survive packet-less handoffs (was: silently dropped without inspect_code_context)
+  t.ok(renderer.includes("Findings from Dispatch's prior investigation"), 'handoffs without context packets fold findings into the queued prompt');
+  t.ok(agentJs.includes('Evidence discipline:'), 'system facts carry the zero-match-is-weak-evidence rule');
+  t.ok(agentJs.includes('generated ONLY by inspect_code_context') || agentJs.includes('only inspect_code_context produces transferable context packets'), 'handoff schema tells the model when findings are load-bearing');
   t.end();
 });
 

@@ -65,6 +65,30 @@ test('destructive command guard catches audited variants', (t) => {
   t.end();
 });
 
+// Regression: /\bformat\b/ matched ANY occurrence of the word — `ruff check --output-format=concise`
+// was denied as "destructive", and an entire agent run burned its action budget retrying
+// rephrasings of a harmless lint command. The rule now requires command position + a drive target.
+test('destructive command guard only flags actual disk formatting, not the word "format"', (t) => {
+  [
+    'ruff check . --exclude .env,.ruff_cache --output-format=concise',
+    'python -m ruff check --statistics --output-format concise',
+    'git log --format=%H',
+    'Get-Process | Format-Table -AutoSize'
+  ].forEach(command => t.equal(safety.classifyCommandRequest(command).allowed, true, `allows ${command}`));
+
+  [
+    'format C:',
+    'format.com D: /q',
+    'echo y | format e:',
+    'Format-Volume -DriveLetter D',
+    'Clear-Disk -Number 1 -RemoveData'
+  ].forEach(command => t.equal(safety.classifyCommandRequest(command).allowed, false, `blocks ${command}`));
+
+  const denial = safety.classifyCommandRequest('format C:');
+  t.ok(/deny rule/.test(denial.reason) && denial.reason.includes('matched text: "format C:"'), 'denial reason names the rule and the matched text so the agent can diagnose instead of blind-retrying');
+  t.end();
+});
+
 test('renderer and package hardening are wired', (t) => {
   t.ok(rendererJs.includes('function sanitizeRenderedMarkdown(container)'), 'renderer sanitizes markdown links');
   t.ok(rendererJs.includes("!/^(https?:|mailto:|orion-file:|orion-artifact:\\/\\/)/i.test(href)"), 'renderer allowlists markdown protocols');

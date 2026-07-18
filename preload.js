@@ -76,6 +76,9 @@ contextBridge.exposeInMainWorld('api', {
   runLinter: (workspacePath, linterType, targetPath) => ipcRenderer.invoke('orion:run-linter', { workspacePath, linterType, targetPath }),
   findReferences: (workspacePath, symbolName, targetPath) => ipcRenderer.invoke('orion:find-references', { workspacePath, symbolName, targetPath }),
   readProjectMemory: (workspacePath) => ipcRenderer.invoke('orion:read-project-memory', workspacePath),
+  recordFileRead: (workspacePath, relativePath) => ipcRenderer.invoke('orion:record-file-read', { workspacePath, relativePath }),
+  saveFileDigest: (workspacePath, relativePath, digest) => ipcRenderer.invoke('orion:save-file-digest', { workspacePath, relativePath, digest }),
+  getKnowledgeBrief: (workspacePath, maxDigests) => ipcRenderer.invoke('orion:get-knowledge-brief', { workspacePath, maxDigests }),
   writeProjectMemory: (workspacePath, memory) => ipcRenderer.invoke('orion:write-project-memory', { workspacePath, memory }),
   appendProjectMemory: (workspacePath, fact) => ipcRenderer.invoke('orion:append-project-memory', { workspacePath, fact }),
   

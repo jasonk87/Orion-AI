@@ -106,6 +106,8 @@ test('Windows command shell selection does not require PowerShell for plain comm
   const powershell = main.getCommandShellSpec('Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty TotalPhysicalMemory');
   t.ok(powershell.executable.toLowerCase().endsWith('powershell.exe'), 'PowerShell-specific commands still use PowerShell');
   t.ok(powershell.args.includes('-NoProfile'), 'PowerShell shell remains non-profiled');
+  t.ok(powershell.args.includes('-EncodedCommand'), 'PowerShell receives the command base64-encoded so -Command argv parsing cannot strip quotes');
+  t.equal(powershell.encodeCommandUtf16Base64, true, 'shell spec flags the UTF-16LE base64 encoding for the spawner');
 
   t.equal(main.commandLooksPowerShellSpecific('systeminfo'), false, 'systeminfo is not treated as PowerShell-specific');
   t.equal(main.commandLooksPowerShellSpecific('Get-ChildItem | Select-Object Name'), true, 'PowerShell pipelines are detected');
@@ -137,6 +139,34 @@ test('commands with a real unquoted semicolon route to PowerShell instead of sil
   const pythonDashC = main.getCommandShellSpec(`python -c "from x import y; print(y('literal'))"`);
   t.ok(pythonDashC.executable.toLowerCase().endsWith('cmd.exe'), 'a quoted semicolon inside python -c still stays on cmd.exe, unaffected by this change');
   t.end();
+});
+
+// Regression: PowerShell's -Command mode re-splits the raw command line and strips double quotes,
+// so `Get-Content -Path "C:\path with spaces\file"` arrived as unquoted words and failed with
+// "A positional parameter cannot be found that accepts argument ...". With -EncodedCommand the
+// quoted string must survive intact: under the old behavior this command printed three separate
+// lines ("hello", "spaced", "world") instead of one.
+test('PowerShell commands preserve double-quoted arguments containing spaces end-to-end', (t) => {
+  if (process.platform !== 'win32') {
+    t.pass('Windows-only PowerShell quoting test skipped on non-Windows');
+    t.end();
+    return;
+  }
+
+  const session = main.startCommandSession({
+    command: 'Write-Output "hello spaced world"',
+    cwd: __dirname,
+    processId: 'test_ps_quoting',
+    timeoutMs: 30000
+  });
+
+  const poll = setInterval(() => {
+    if (session.status === 'running') return;
+    clearInterval(poll);
+    t.equal(session.exitCode, 0, 'quoted PowerShell command exits cleanly');
+    t.ok(session.stdout.includes('hello spaced world'), 'the quoted string with spaces survived as a single argument');
+    t.end();
+  }, 200);
 });
 
 // Regression: a real auth page had a tab button labeled "Register" (outside any <form>, just
@@ -319,6 +349,41 @@ test('packaged updater tracks all runtime modules required by main process', (t)
 
   for (const file of requiredRuntimeFiles) {
     t.ok(main.AUTO_UPDATE_FILES.includes(file), `auto-update includes ${file}`);
+  }
+  t.end();
+});
+
+// Regression: the auto-updater compared files using only the manifest baked into the RUNNING
+// build. When an update introduced a brand-new lib module, the old manifest didn't list it — the
+// updated files that require() it were copied without the module itself, and the packaged app
+// crashed on the next launch with "Cannot find module './scan-ignore'". The file list is now
+// derived from the SOURCE tree at update time, so new lib modules ride along.
+test('source updater picks up brand-new lib modules missing from the running build manifest', (t) => {
+  const os = require('os');
+  const fsx = require('fs');
+  const pathx = require('path');
+  const ipcUi = proxyquire('../lib/ipc-ui', {
+    electron: { app: { getPath: () => os.tmpdir() }, BrowserWindow: class {} }
+  });
+  const src = fsx.mkdtempSync(pathx.join(os.tmpdir(), 'orion-update-src-'));
+  const dest = fsx.mkdtempSync(pathx.join(os.tmpdir(), 'orion-update-dest-'));
+  try {
+    fsx.mkdirSync(pathx.join(src, 'lib'), { recursive: true });
+    fsx.writeFileSync(pathx.join(src, 'lib', 'brand-new-module.js'), 'module.exports = 1;');
+    fsx.writeFileSync(pathx.join(src, 'agent.js'), 'updated agent');
+
+    const list = ipcUi.resolveUpdateFileList(src);
+    t.ok(list.includes('lib/brand-new-module.js'), 'source-derived file list contains the new module');
+    t.ok(list.includes('agent.js'), 'static manifest entries are preserved in the union');
+
+    const changed = ipcUi.computeSourceUpdates(src, dest);
+    t.ok(changed.includes('lib/brand-new-module.js'), 'the new module is detected as needing sync');
+
+    ipcUi.syncSourceUpdateFiles(src, dest, changed);
+    t.ok(fsx.existsSync(pathx.join(dest, 'lib', 'brand-new-module.js')), 'the new module lands in the packaged app');
+  } finally {
+    fsx.rmSync(src, { recursive: true, force: true });
+    fsx.rmSync(dest, { recursive: true, force: true });
   }
   t.end();
 });

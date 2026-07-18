@@ -1545,6 +1545,10 @@ test('looksLikeLaunchOnlyRequest and hasFailedLaunchAttemptThisRun identify the 
   t.equal(agent.looksLikeLaunchOnlyRequest('yes, please fix it'), false, 'an explicit follow-up authorization is not treated as launch-only');
   t.equal(agent.looksLikeLaunchOnlyRequest('what does this project do'), false, 'a request with no launch verb at all does not match');
   t.equal(agent.looksLikeLaunchOnlyRequest(''), false, 'empty text does not match');
+  // Regression: "Upgrade ruff and run ruff check on the project" was misclassified as
+  // launch-only, blocking harmless scratch-file writes the tooling task needed.
+  t.equal(agent.looksLikeLaunchOnlyRequest('upgrade ruff and run ruff check on the project root'), false, 'package/tooling work (upgrade + run) is not a launch-only request');
+  t.equal(agent.looksLikeLaunchOnlyRequest('install the dependencies and run the linter'), false, 'install + run is not a launch-only request');
 
   const failedLaunch = [{ toolName: 'launch_workspace_app', status: 'error' }];
   t.equal(agent.hasFailedLaunchAttemptThisRun(failedLaunch), true, 'a failed launch_workspace_app is detected');

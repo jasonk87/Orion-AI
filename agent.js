@@ -162,6 +162,30 @@ function getSystemInstruction(disableTools = false, cachedMemory = '', modelName
 // Session continuity: carries a summary of the previous session into the current one
 let orionSessionContinuityContext = '';
 
+// Cached formatted global-memory block, injected into every Orion system prompt.
+// Refreshed at the start of each Orion run so the model already knows Jason's facts/prefs.
+let orionCachedMemoryBlock = '';
+
+async function refreshOrionMemoryBlock() {
+  try {
+    if (!window.api || !window.api.readGlobalMemory) return;
+    const mem = await window.api.readGlobalMemory();
+    const lines = [];
+    if (mem.user && mem.user.name) lines.push(`Name: ${mem.user.name}`);
+    if (mem.user && Array.isArray(mem.user.preferences) && mem.user.preferences.length > 0) {
+      const recent = mem.user.preferences.slice(-15).map(p => p.text);
+      lines.push(`Preferences: ${recent.join('; ')}`);
+    }
+    if (Array.isArray(mem.facts) && mem.facts.length > 0) {
+      const recent = mem.facts.slice(-30).reverse();
+      lines.push(`Facts:\n${recent.map((f, i) => `${i + 1}. [${f.category || 'general'}] ${f.text}`).join('\n')}`);
+    }
+    orionCachedMemoryBlock = lines.join('\n');
+  } catch (_) {
+    orionCachedMemoryBlock = '';
+  }
+}
+
 function buildOrionContinuityContext(conversation) {
   // Only inject on the very first user message in an Orion conversation
   const userMessages = (conversation.messages || []).filter(m => m.role === 'user');
@@ -189,7 +213,7 @@ async function autoSaveOrionMemory(conversation, config) {
   if (orionAutoSummarizedIds.has(convId)) return;
   const msgs = (conversation.messages || []).filter(m => m.role === 'user' || m.role === 'assistant');
   const userMsgCount = msgs.filter(m => m.role === 'user').length;
-  if (userMsgCount < 4) return; // too short — nothing worth summarizing
+  if (userMsgCount < 2) return; // too short — nothing worth summarizing
 
   orionAutoSummarizedIds.add(convId); // mark before async to avoid double-fire
 
@@ -244,6 +268,8 @@ ${transcript}`;
     }
     if (items.length > 0) {
       console.log(`[Orion] Auto-saved ${items.length} memory item(s) from session.`);
+      // Refresh the in-memory block so the next run in this session starts with the new facts
+      await refreshOrionMemoryBlock().catch(() => {});
     }
   } catch (e) { /* silent — memory auto-save is best-effort */ }
 }
@@ -807,8 +833,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   activeConversationMode = isOrionMode ? 'orion' : 'coder';
   if (isOrionMode) {
     orionSessionContinuityContext = buildOrionContinuityContext(conversation);
+    await refreshOrionMemoryBlock(); // pre-load global memory into system prompt
   } else {
     orionSessionContinuityContext = '';
+    orionCachedMemoryBlock = '';
   }
   if (window.onAgentStatusChange) window.onAgentStatusChange(true);
   
@@ -1186,6 +1214,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const workWalkthroughOverride = isDispatchConversation
     ? '\nThis is a Dispatch conversation, not a Coder/implementation task. Do NOT include a "Work Walkthrough" section, a files-touched list, or a step-by-step recap of tool calls in your response, even if you used tools this turn. Just answer directly and conversationally.'
     : '';
+  // Evidence discipline: a real agent run confidently reported a click handler and a CSS block
+  // as nonexistent because piped grep patterns silently matched nothing — zero-match searches
+  // read exactly like genuine absence. This rule makes negative claims require corroboration.
+  const evidenceDisciplineRule = '\nEvidence discipline: a zero-match search is WEAK evidence of absence — it may mean a wrong pattern, wrong mode (literal vs regex), wrong directory, or a truncated scan. Before stating in your answer that code, a handler, a style, or a feature does NOT exist, corroborate with a second differently-shaped check: a simpler single-token grep_search, or read_file of the location where it would live. If you cannot corroborate, say "I could not find it" instead of "it does not exist." Never present an unverified absence as a confirmed finding.';
   const dispatchProjectContext = isDispatchConversation && conversation.dispatchContextSummary
     ? `\nFresh project session context: ${String(conversation.dispatchContextSummary).replace(/\s+/g, ' ').trim().slice(0, 1800)}\nThis is a compact re-entry summary, not current source-code evidence. Preserve established discussion and decisions, but refresh only the files needed by the user's current question before making code claims.`
     : '';
@@ -1202,8 +1234,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const shouldInjectFullSystemFacts = conversation._systemFactsSignature !== systemFactsSignature;
   conversation._systemFactsSignature = systemFactsSignature;
   const systemFactsText = shouldInjectFullSystemFacts
-    ? `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nWeb search: ${webSearchStatus}\nClient: ${promptSource === 'phone' ? 'PHONE COMPANION — the user is on their phone. Prefer descriptions, text output, and copy-pasteable results over actions that require the desktop (launching GUI apps, opening windows, running interactive commands). If you need to show output, describe it clearly rather than suggesting they look at the screen.' : 'DESKTOP — the user is at their computer. You can launch apps, reference screen elements, and run interactive commands normally.'}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.${dispatchProjectContext}${workWalkthroughOverride}`
-    : `[ORION SYSTEM FACTS - compact]\nStable system facts are unchanged from earlier in this conversation. Current workspace: ${workspacePath || '(none)'}. Home: ${resolvedHomeDir}. Web search: ${webSearchLabel}. Client: ${promptSource === 'phone' ? 'phone companion' : 'desktop'}.\nUse the current workspace for self-referential phrases like "this program" or "the project." Do NOT run echo or whoami to discover these paths.${dispatchProjectContext}${workWalkthroughOverride}`;
+    ? `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nWeb search: ${webSearchStatus}\nClient: ${promptSource === 'phone' ? 'PHONE COMPANION — the user is on their phone. Prefer descriptions, text output, and copy-pasteable results over actions that require the desktop (launching GUI apps, opening windows, running interactive commands). If you need to show output, describe it clearly rather than suggesting they look at the screen.' : 'DESKTOP — the user is at their computer. You can launch apps, reference screen elements, and run interactive commands normally.'}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.${evidenceDisciplineRule}${dispatchProjectContext}${workWalkthroughOverride}`
+    : `[ORION SYSTEM FACTS - compact]\nStable system facts are unchanged from earlier in this conversation. Current workspace: ${workspacePath || '(none)'}. Home: ${resolvedHomeDir}. Web search: ${webSearchLabel}. Client: ${promptSource === 'phone' ? 'phone companion' : 'desktop'}.\nUse the current workspace for self-referential phrases like "this program" or "the project." Do NOT run echo or whoami to discover these paths.${evidenceDisciplineRule}${dispatchProjectContext}${workWalkthroughOverride}`;
   messages.splice(2, 0,
     {
       role: 'user',
@@ -1226,6 +1258,34 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         parts: [{ text: 'Understood. I will use the known project paths directly when Jason names one.' }]
       }
     );
+  }
+
+  // File-knowledge brief: cold ingestion (re-reading the whole project every task) is the
+  // dominant startup cost in a known workspace. The ledger binds prior reads and saved notes to
+  // exact content versions, so a new run can trust notes for byte-identical files and re-read
+  // only what actually changed. Digests are hash-gated — they are never surfaced for a file
+  // whose content moved, so "stale notes" cannot occur, only absent ones.
+  if (shouldInjectFullSystemFacts && workspacePath && window.api && typeof window.api.getKnowledgeBrief === 'function') {
+    try {
+      const brief = await window.api.getKnowledgeBrief(workspacePath, 25);
+      if (brief && brief.success && ((brief.knownCurrent || []).length || (brief.changed || []).length || (brief.seenCurrent || []).length)) {
+        const knownLines = (brief.knownCurrent || []).map(f => `- ${f.path}: ${f.digest}`).join('\n');
+        const briefText = [
+          '[FILE KNOWLEDGE — what you already know about this workspace from previous tasks]',
+          knownLines ? `Files UNCHANGED since you last read them, with your saved notes (trust these for orientation; re-read only when making load-bearing claims about exact contents or before editing):\n${knownLines}` : '',
+          (brief.seenCurrent || []).length ? `Files you previously read (still unchanged) but saved no notes for: ${brief.seenCurrent.join(', ')}` : '',
+          (brief.changed || []).length ? `Files CHANGED since you last read them — re-read before relying on any prior understanding: ${brief.changed.join(', ')}` : '',
+          (brief.missing || []).length ? `Previously-tracked files that no longer exist: ${brief.missing.join(', ')}` : '',
+          'Do NOT re-read unchanged files you already have notes for just to re-orient. After substantively reading a file, save or update its notes with remember_file_notes so the next task starts warm.'
+        ].filter(Boolean).join('\n\n');
+        messages.splice(4, 0,
+          { role: 'user', parts: [{ text: briefText }] },
+          { role: 'model', parts: [{ text: 'Understood. I will reuse my current file knowledge, re-read only the changed files, and save notes for files I read this run.' }] }
+        );
+      }
+    } catch (_) {
+      // Ledger problems must never block a run.
+    }
   }
 
   // Strategy gate prep: only a fresh plan-worthy task that has not been approved needs it.
@@ -2010,6 +2070,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
                 result.redundantReadNote = `You already read ${args.path} earlier this run and it hasn't changed.`;
               }
               filesFullyReadUnchanged.add(readKey);
+              // File-knowledge ledger: stamp "the agent has seen this exact content version"
+              // (hash+mtime) so future runs can skip re-reading unchanged files. Fire-and-forget —
+              // ledger bookkeeping must never slow down or fail a read.
+              if (workspacePath && window.api && typeof window.api.recordFileRead === 'function') {
+                window.api.recordFileRead(workspacePath, args.path).catch(() => {});
+              }
             }
           }
           if ((toolName === 'read_multiple_files' || toolName === 'read_multiple_ranges' || toolName === 'inspect_code_context') && !isFailedToolResult(result)) {
@@ -2869,9 +2935,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         const activeConv = conversations.find(c => c.id === targetId);
         if (activeConv) {
           const isInternalQueueItem = nextTask.source === 'followup' || nextTask.source === 'plan-approval' || nextTask.source === 'system';
+          // Quote only a preview of the prompt — the full text is already the next user bubble,
+          // and repeating a multi-paragraph prompt inside a system chip doubles the wall of text.
+          const queuedPromptPreview = String(nextTask.prompt || '').replace(/\s+/g, ' ').trim();
           const queueLabel = nextTask.source === 'followup'
             ? 'Executing scheduled follow-up.'
-            : (nextTask.source === 'plan-approval' ? 'Continuing approved plan.' : `Executing queued prompt: "${nextTask.prompt}"`);
+            : (nextTask.source === 'plan-approval' ? 'Continuing approved plan.' : `Executing queued prompt: "${queuedPromptPreview.length > 140 ? queuedPromptPreview.slice(0, 140).trimEnd() + '…' : queuedPromptPreview}"`);
           
           if (window.appendSystemMessage) {
             window.appendSystemMessage(queueLabel, { conversationId: targetId });
@@ -3549,6 +3618,23 @@ async function executeTool(name, args, workspace, config, conversation) {
       let result = await window.api.runCommand(args.command, workspace, processId, timeoutMs);
       cleanOutput();
 
+      // The command never ran at all (e.g. it matched the destructive deny rules, or the shell
+      // failed to spawn). Previously this fell through to the normal return shape with an
+      // undefined exitCode and the rejection text folded into stderr — the log chip showed
+      // "success" and the model kept retrying near-identical variants instead of treating it as
+      // a hard policy block.
+      if (result.error && result.code == null && !result.timedOut && !result.killed) {
+        return {
+          success: false,
+          error: result.error,
+          exitCode: null,
+          commandNeverRan: true,
+          stdout: '',
+          stderr: '',
+          timeoutMs: result.timeoutMs || timeoutMs
+        };
+      }
+
       // Auto-recovery: if pip install X==version failed with a source-build error, retry without version pin
       const cmdStderr = stderrOutput || result.stderr || result.error || '';
       const isPipBuildFailure = result.code !== 0
@@ -3972,6 +4058,15 @@ async function executeTool(name, args, workspace, config, conversation) {
       const result = await window.api.appendProjectMemory(workspace, { text: args.text, category: args.category || 'general' });
       if (!result || !result.success) throw new Error((result && result.error) || 'Failed to append project memory');
       return { success: true, message: `Memory appended: "${args.text}"` };
+    }
+
+    case 'remember_file_notes': {
+      if (!workspace) throw new Error('No active workspace');
+      if (!args.path) throw new Error("Missing 'path' parameter");
+      if (!args.notes || !String(args.notes).trim()) throw new Error("Missing 'notes' parameter");
+      const result = await window.api.saveFileDigest(workspace, args.path, String(args.notes).trim());
+      if (!result || result.success === false) throw new Error((result && result.error) || 'Failed to save file notes');
+      return { success: true, message: `Notes saved for ${args.path}, bound to its current content version. They will surface in [FILE KNOWLEDGE] on future tasks while the file is unchanged.` };
     }
 
     case 'discover_skills': {
@@ -6291,7 +6386,11 @@ function looksLikeLaunchOnlyRequest(prompt) {
   const text = String(prompt || '').toLowerCase();
   if (!text.trim()) return false;
   const hasLaunchVerb = /\b(launch|run|start|open|boot up|fire up|spin up|execute)\b/.test(text);
-  const hasEditVerb = /\b(fix|edit|change|modify|update|debug|repair|patch|refactor|add|build|implement|create|remove|delete|rewrite)\b/.test(text);
+  // "upgrade/install/lint/audit"-style requests mutate the environment or run tooling over the
+  // codebase — they are not a plain "launch this program" ask, and the model may legitimately
+  // need scratch files to complete them. A transcript showed "Upgrade ruff and run ruff check"
+  // misclassified as launch-only, blocking harmless temp-script writes mid-task.
+  const hasEditVerb = /\b(fix|edit|change|modify|update|debug|repair|patch|refactor|add|build|implement|create|remove|delete|rewrite|upgrade|install|uninstall|reinstall|setup|set up|configure|lint|audit|analyze|analyse)\b/.test(text);
   return hasLaunchVerb && !hasEditVerb;
 }
 
@@ -7660,7 +7759,7 @@ const DISPATCH_TOOL_ALLOWLIST = new Set([
   'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model',
   'grep_search', 'search_embeddings', 'semantic_search',
   'get_symbol_index', 'fetch_page', 'git_diff', 'git_rollback', 'edit_config', 'get_file_symbols', 'find_references',
-  'read_notes', 'read_project_memory'
+  'read_notes', 'read_project_memory', 'remember_file_notes'
 ]);
 
 // Single source of truth for the agent's tool declarations, consumed by every provider
@@ -7761,7 +7860,7 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "handoff_to_coder",
-            description: "Promotes a local folder into Coder as an explicit project and optionally queues a Coder prompt to start implementation. For an obvious implementation request, route early without deeply inspecting source first. If Dispatch already inspected the project for a read-only question or architectural opinion, this automatically transfers its validated exact-source context packets so Coder does not rediscover the same files. This is the explicit promotion path; change_workspace alone must not add folders to Coder.",
+            description: "Promotes a local folder into Coder as an explicit project and optionally queues a Coder prompt to start implementation. For an obvious implementation request, route early without deeply inspecting source first. IMPORTANT — context transfer: exact-source context packets are generated ONLY by inspect_code_context calls. If your investigation used grep_search/read_file instead, no packets exist, so you MUST pass your key conclusions in `findings` — otherwise Coder starts blind and rediscovers everything. This is the explicit promotion path; change_workspace alone must not add folders to Coder.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -7770,7 +7869,7 @@ function buildAgentToolDeclarations() {
                 findings: {
                   type: "ARRAY",
                   items: { type: "STRING" },
-                  description: "Optional concise findings or decisions already established in Dispatch. Do not paste source code here; exact source is transferred through context packets."
+                  description: "Concise findings or decisions already established in Dispatch (file paths, key line references, conclusions). REQUIRED in practice when you explored with grep_search/read_file, since only inspect_code_context produces transferable context packets. Do not paste source code here; exact source is transferred through context packets."
                 },
                 title: { type: "STRING", description: "Optional title for the new Coder conversation." },
                 open: { type: "BOOLEAN", description: "Whether to switch the UI to the new Coder conversation immediately. Defaults to false." }
@@ -8205,12 +8304,12 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "grep_search",
-            description: "Searches file contents across the workspace for a literal string or regex pattern. Returns matching file paths, line numbers, and the matched line text. Use this before writing new code that depends on an existing pattern — e.g. to find how other similar UI elements wire up event listeners before adding one, or to find every call site of a function before renaming it. Prefer this over reading whole files when you just need to locate where something is defined or used.",
+            description: "Searches file contents across the workspace. DEFAULT MODE IS LITERAL SUBSTRING MATCHING, not regex — 'foo|bar' matches lines containing foo OR bar (pipe alternation is supported literally), but \\b, .*, (), [] and other regex syntax are matched as literal characters unless you pass regex: true. Returns matching file paths, line numbers, and the matched line text. Use this before writing new code that depends on an existing pattern — e.g. to find how other similar UI elements wire up event listeners before adding one, or to find every call site of a function before renaming it. Prefer this over reading whole files when you just need to locate where something is defined or used. A zero-match result for a pattern you expected to hit is a signal to re-check your pattern mode and try a simpler single-token search — never conclude code is absent from one zero-match search.",
             parameters: {
               type: "OBJECT",
               properties: {
-                pattern: { type: "STRING", description: "The literal text or regex pattern to search for." },
-                regex: { type: "BOOLEAN", description: "Treat pattern as a regular expression. Defaults to false (literal substring match)." },
+                pattern: { type: "STRING", description: "The text to search for. Literal by default; '|' separates literal alternatives. Set regex: true for real regex syntax." },
+                regex: { type: "BOOLEAN", description: "Treat pattern as a regular expression. Defaults to false (literal substring match with '|' alternation)." },
                 caseSensitive: { type: "BOOLEAN", description: "Case-sensitive match. Defaults to false." },
                 filePattern: { type: "STRING", description: "Optional file extension filter, e.g. '.js' or '.html'. Searches all text files if omitted." },
                 maxResults: { type: "NUMBER", description: "Maximum number of matches to return before truncation. Defaults to 100." },
@@ -8298,6 +8397,18 @@ function buildAgentToolDeclarations() {
                 category: { type: "STRING", description: "Optional category, e.g. architecture, api, gotcha, command, preference." }
               },
               required: ["text"]
+            }
+          },
+          {
+            name: "remember_file_notes",
+            description: "Saves a concise 1-3 line understanding of a workspace file you just read, bound to the file's exact current content version. On future tasks, files whose bytes are unchanged surface these notes in the [FILE KNOWLEDGE] brief so you can skip re-reading them; if the file changes, the notes are dropped automatically. Save notes after substantively reading a file you are likely to work with again (role, key responsibilities, landmark functions/line areas). Do not paste source code.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                path: { type: "STRING", description: "Workspace-relative path of the file the notes describe." },
+                notes: { type: "STRING", description: "1-3 line digest of what the file is and where its important parts live. Max ~400 chars." }
+              },
+              required: ["path", "notes"]
             }
           },
           {
@@ -8446,7 +8557,7 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
   const url = `http://localhost:11434/api/chat`;
   
   // Format standard Orion AI system instruction
-  const systemInstruction = getSystemInstruction(disableTools, '', modelName);
+  const systemInstruction = getSystemInstruction(disableTools, orionCachedMemoryBlock, modelName);
   
   const ollamaTools = convertGeminiToOllamaTools([
     {
@@ -8639,7 +8750,7 @@ async function callAnthropicAPI(messages, modelName, apiKey, onWarning, disableT
   const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
   const anthropicMessages = convertGeminiToAnthropicMessages(processedMessages);
 
-  const systemText = getSystemInstruction(disableTools, '', modelName);
+  const systemText = getSystemInstruction(disableTools, orionCachedMemoryBlock, modelName);
 
   const requestBody = {
     model: modelName,
@@ -8868,7 +8979,7 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
   const url = 'https://api.deepseek.com/chat/completions';
 
   const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
-  const systemText = getSystemInstruction(disableTools, '', modelName);
+  const systemText = getSystemInstruction(disableTools, orionCachedMemoryBlock, modelName);
   const deepseekTools = disableTools ? undefined : convertGeminiToDeepSeekTools(buildAgentToolDeclarations());
   const fitted = fitDeepSeekMessagesToContextWindow(processedMessages, modelName, systemText, deepseekTools, options);
   if (fitted.collapsedToolResults > 0 && onWarning) {
@@ -9209,7 +9320,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
   const requestBody = {
     contents: mergedContents,
     systemInstruction: {
-      parts: [{ text: getSystemInstruction(disableTools, '', modelName) }]
+      parts: [{ text: getSystemInstruction(disableTools, orionCachedMemoryBlock, modelName) }]
     },
     generationConfig: {
       ...(modelName.includes('thinking') || modelName.includes('2.5') ? {

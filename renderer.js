@@ -1031,7 +1031,9 @@ function collectDispatchActiveWork(isGlobalRunning = false, globalRunningId = ''
         status: receipt.status || 'completed',
         subStatus: receipt.subStatus || 'Completed',
         startedAt: receipt.startedAt || 0,
-        completedAt: receipt.completedAt || 0
+        completedAt: receipt.completedAt || 0,
+        // Unfinished delegated work can be resumed with one click instead of a manual re-queue.
+        canContinue: !!receipt.coderConversationId && (receipt.status === 'blocked' || (receipt.pendingCount || 0) > 0)
       });
     }
   });
@@ -1090,13 +1092,62 @@ function renderDesktopDispatchLanding() {
   const visibleWork = activeWork.slice(0, 3);
   activeSection.hidden = visibleWork.length === 0;
   activeSection.innerHTML = visibleWork.length ? `<div class="dispatch-desktop-section-head"><span>Active work</span></div>
-    <div class="dispatch-desktop-work-list">${visibleWork.map(work => `<button class="dispatch-desktop-work-row" type="button" data-dispatch-supervisor="${escapeHtml(work.supervisingConversationId)}">
-      <span class="dispatch-desktop-work-copy">
-        <span class="dispatch-desktop-work-title">${escapeHtml(work.title)}</span>
-        <span class="dispatch-desktop-work-meta">${escapeHtml(work.projectName)} · ${escapeHtml(work.subStatus || work.status)}</span>
-      </span>
-      <span aria-hidden="true">›</span>
-    </button>`).join('')}</div>` : '';
+    <div class="dispatch-desktop-work-list">${visibleWork.map(work => `<div class="dispatch-desktop-work-item">
+      <button class="dispatch-desktop-work-row" type="button" data-dispatch-supervisor="${escapeHtml(work.supervisingConversationId)}">
+        <span class="dispatch-desktop-work-copy">
+          <span class="dispatch-desktop-work-title">${escapeHtml(work.title)}</span>
+          <span class="dispatch-desktop-work-meta">${escapeHtml(work.projectName)} · ${escapeHtml(work.subStatus || work.status)}</span>
+        </span>
+        <span aria-hidden="true">›</span>
+      </button>
+      ${work.canContinue ? `<button class="dispatch-desktop-work-continue" type="button" data-dispatch-continue-work="${escapeHtml(work.id)}" data-dispatch-supervising="${escapeHtml(work.supervisingConversationId)}" title="Queue Coder to finish the remaining work">Continue</button>` : ''}
+    </div>`).join('')}</div>` : '';
+}
+
+// One-click continuation of unfinished delegated work (a completion receipt with pending tasks,
+// or a stalled run). Previously the completion summary said "you can queue a continuation" but
+// there was no mechanism behind it — resuming meant manually re-prompting the Coder conversation.
+async function continueDelegatedWork(coderConvId, supervisingOrionConvId) {
+  const coderConv = conversations.find(c => c.id === coderConvId);
+  if (!coderConv) {
+    showToast('The Coder conversation for this work no longer exists.', 'attention');
+    return;
+  }
+  const prompt = 'Continue the previous task from where it left off. Review the task checklist and the last few messages to see what is done and what remains, then complete the remaining pending work. Do not redo finished work; if you hit the same blocker again, stop and describe it precisely.';
+  const modelValue = window.getSelectedModel ? window.getSelectedModel() : undefined;
+
+  // Re-arm the supervisor so this continuation is tracked like the original handoff.
+  const orionConv = conversations.find(c => c.id === supervisingOrionConvId);
+  if (orionConv) {
+    orionConv.launchedCoderConvId = coderConvId;
+    orionConv.launchedCoderTaskTitle = (orionConv.lastDelegatedWork && orionConv.lastDelegatedWork.title) || coderConv.title || 'Coder task';
+    orionConv.launchedCoderTaskStart = Date.now();
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+    if (typeof window.startCoderTaskMonitor === 'function') window.startCoderTaskMonitor(orionConv.id, coderConvId);
+  }
+
+  coderConv.messages.push({ role: 'user', source: 'dispatch-continue', text: prompt, createdAt: Date.now() });
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(coderConv.id);
+  saveConversationsToStorage();
+  renderDesktopDispatchLanding();
+
+  if (window.isAgentRunning && window.isAgentRunning()) {
+    // Something else is mid-turn — the queue drains when it finishes.
+    window.promptQueue = window.promptQueue || [];
+    window.promptQueue.push({
+      id: createQueuedPromptId(),
+      prompt,
+      modelSelectValue: modelValue,
+      conversationId: coderConvId,
+      source: 'dispatch-continue',
+      alreadyRendered: true,
+      createdAt: Date.now()
+    });
+    showToast('Continuation queued — Coder will pick it up when the current turn finishes.');
+  } else {
+    showToast('Coder is continuing the remaining work.');
+    window.runAgentLoop(prompt, modelValue, coderConv, { source: 'queue' });
+  }
 }
 
 function runCommandPaletteAction(command) {
@@ -1130,6 +1181,14 @@ function setupProgressiveDisclosure() {
 
   // Orion prompt chips — populate input (with focus) so Jason can review/edit before sending
   document.getElementById('orion-welcome-splash')?.addEventListener('click', (e) => {
+    const continueWorkButton = e.target.closest('[data-dispatch-continue-work]');
+    if (continueWorkButton) {
+      continueDelegatedWork(
+        continueWorkButton.getAttribute('data-dispatch-continue-work'),
+        continueWorkButton.getAttribute('data-dispatch-supervising')
+      );
+      return;
+    }
     const continueButton = e.target.closest('[data-dispatch-continue], [data-dispatch-supervisor]');
     if (continueButton) {
       const conversationId = continueButton.getAttribute('data-dispatch-continue')
@@ -2844,16 +2903,114 @@ function latestToolActivity(logs = []) {
   return [...logs].reverse().find(log => log && (log.type === 'tool_call' || log.tool));
 }
 
-function formatDispatchToolActivity(logs = []) {
+// ── Dispatch presentation (phone parity) ─────────────────────────────────────
+// Dispatch is a conversational space, not an engineering console. Tool activity renders as one
+// collapsed line the user can expand into compact, truncated rows — never the Coder-grade chips
+// with full JSON params and raw result dumps.
+
+function formatDispatchValuePreview(value, maxLength) {
+  const text = String(value === undefined || value === null ? '' : (typeof value === 'string' ? value : JSON.stringify(value))).trim();
+  if (!text || text.length <= maxLength) return text;
+  return text.slice(0, maxLength).trimEnd() + '…';
+}
+
+function formatDispatchParamsPreview(params) {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) return '';
+  return Object.entries(params)
+    .filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== '')
+    .slice(0, 4)
+    .map(([key, value]) => `${key}: ${formatDispatchValuePreview(value, 90)}`)
+    .join('  ·  ');
+}
+
+function formatDispatchActivityRows(logs = []) {
+  return logs.slice(-8).map(log => {
+    if (log.type === 'thought' && log.content) {
+      return `<div class="thought-block">${escapeHtml(formatDispatchValuePreview(log.content, 240))}</div>`;
+    }
+    if (!(log.type === 'tool_call' || log.tool)) return '';
+    const status = log.status === 'completed' ? 'success' : (log.status || 'running');
+    const paramsPreview = formatDispatchParamsPreview(log.params);
+    const resultPreview = formatDispatchValuePreview(log.result, 240);
+    return `
+      <div class="tool-run-badge dispatch-activity-row">
+        <div class="tool-call-info">
+          <span class="tool-name">${escapeHtml(log.tool || 'tool')}</span>
+          <span class="tool-status ${escapeHtml(status)}">${escapeHtml(status)}</span>
+        </div>
+        ${paramsPreview ? `<div class="tool-params">${escapeHtml(paramsPreview)}</div>` : ''}
+        ${resultPreview ? `<div class="tool-result-box dispatch-result-preview">${escapeHtml(resultPreview)}</div>` : ''}
+      </div>
+    `;
+  }).join('');
+}
+
+function formatDispatchToolActivity(logs = [], isRunning = false) {
+  const meaningfulLogs = (logs || []).filter(log => log && (log.type === 'tool_call' || log.tool || (log.type === 'thought' && log.content)));
+  if (!meaningfulLogs.length) return '';
   const activity = latestToolActivity(logs);
-  if (!activity) return '';
-  const tool = activity.tool || 'tool';
-  const status = activity.status || 'running';
-  const verb = status === 'error' ? 'Had trouble with' : (status === 'running' ? 'Using' : 'Checked');
+  const status = activity ? (activity.status === 'completed' ? 'success' : (activity.status || 'running')) : 'success';
+  const stepCount = meaningfulLogs.filter(log => log.type === 'tool_call' || log.tool).length;
+  const headerLabel = isRunning && activity
+    ? `${status === 'error' ? 'Had trouble with' : 'Using'} <code>${escapeHtml(activity.tool || 'tool')}</code>`
+    : `Worked through ${stepCount} step${stepCount === 1 ? '' : 's'}`;
   return `
-    <div class="dispatch-tool-activity ${escapeHtml(status)}">
-      <span class="dispatch-tool-pulse"></span>
-      <span>${verb} <code>${escapeHtml(tool)}</code></span>
+    <div class="agent-logs-container dispatch-activity-log${status === 'error' ? ' error' : ''}">
+      <div class="agent-logs-header" onclick="toggleLogs(this)">
+        <span class="dispatch-current-tool${isRunning ? ' running' : ''}"><span class="dispatch-tool-pulse"></span>${headerLabel}</span>
+        <span>▼</span>
+      </div>
+      <div class="agent-logs-body" style="display: none;">${formatDispatchActivityRows(meaningfulLogs)}</div>
+    </div>
+  `;
+}
+
+// A "## Work Walkthrough" block in a delegated Coder response is a wall of markdown bullets on
+// desktop. In the Dispatch space it becomes a tidy collapsed checklist panel, same as the phone.
+function splitDispatchAssistantText(text) {
+  const raw = String(text || '');
+  const match = raw.match(/(?:^|\n)## Work Walkthrough\s*/);
+  if (!match) return { answer: raw, walkthrough: '' };
+  const start = match.index + (raw[match.index] === '\n' ? 1 : 0);
+  return {
+    answer: raw.slice(0, start).trim(),
+    walkthrough: raw.slice(start).trim()
+  };
+}
+
+function parseDispatchWalkthroughRows(walkthroughText) {
+  const body = String(walkthroughText || '').replace(/^## Work Walkthrough\s*/i, '').trim();
+  if (!body) return [];
+  return body.split(/\n+/).map(line => line.trim()).filter(Boolean).map(line => {
+    const cleaned = line.replace(/^[-*]\s*/, '').replace(/\*\*/g, '').trim();
+    const match = cleaned.match(/^([^:]+):\s*(.*)$/);
+    const rawStatus = match ? match[1].trim() : 'Done';
+    const detail = match ? match[2].trim() : cleaned;
+    const status = /^fail/i.test(rawStatus)
+      ? 'error'
+      : (/^done|^complete|^passed/i.test(rawStatus) ? 'success' : rawStatus.toLowerCase().replace(/\s+/g, '-'));
+    return { status, label: rawStatus, detail };
+  });
+}
+
+function renderDispatchWalkthroughPanel(walkthroughText) {
+  const rows = parseDispatchWalkthroughRows(walkthroughText);
+  if (!rows.length) return '';
+  const renderedRows = rows.slice(-20).map(row => `
+    <div class="tool-run-badge dispatch-activity-row walkthrough-row">
+      <div class="tool-call-info">
+        <span class="tool-name">${escapeHtml(formatDispatchValuePreview(row.detail || 'Work item', 180))}</span>
+        <span class="tool-status ${escapeHtml(row.status)}">${escapeHtml(row.label)}</span>
+      </div>
+    </div>
+  `).join('');
+  return `
+    <div class="agent-logs-container dispatch-activity-log">
+      <div class="agent-logs-header" onclick="toggleLogs(this)">
+        <span>Work walkthrough · ${rows.length} item${rows.length === 1 ? '' : 's'}</span>
+        <span>▼</span>
+      </div>
+      <div class="agent-logs-body" style="display: none;">${renderedRows}</div>
     </div>
   `;
 }
@@ -3255,7 +3412,7 @@ async function selectConversation(id) {
             conversationId: activeConversationId
           });
         } else {
-          renderSystemBubble(replayMsg.text);
+          renderSystemBubble(replayMsg.text, replayMsg.dedupeKey || '');
         }
       }
     });
@@ -3570,7 +3727,19 @@ function appendSystemMessage(text, options = {}) {
       existing.updatedAt = Date.now();
       if (options.source) existing.source = options.source;
       saveConversationsToStorage();
-      if (targetId === activeConversationId) selectConversation(targetId);
+      // Update the already-rendered chip in place. The old behavior re-rendered the entire
+      // conversation via selectConversation() — mid-run, that replay orphaned the live
+      // assistant bubble (leaving a frozen duplicate with a stuck "Working…" spinner) and the
+      // agent's next render then appended a second copy of the same message below the chips.
+      if (targetId === activeConversationId && el.messagesContainer) {
+        const chip = el.messagesContainer.querySelector(`[data-sys-dedupe="${CSS.escape(dedupeKey)}"]`);
+        const chipBody = chip && chip.querySelector('.message-body');
+        if (chipBody) {
+          chipBody.textContent = text;
+        } else {
+          renderSystemBubble(text, dedupeKey);
+        }
+      }
       return;
     }
   }
@@ -3592,7 +3761,7 @@ function appendSystemMessage(text, options = {}) {
   window.recentSystemMessages[dedupeKey] = now;
   
   if (targetId === activeConversationId) {
-    renderSystemBubble(text);
+    renderSystemBubble(text, options.dedupeKey || '');
   }
   if (conv) {
     const sysMsg = { role: 'system', text: text };
@@ -3808,13 +3977,16 @@ setInterval(() => {
   }
 }, 4000);
 
-function renderSystemBubble(text) {
+function renderSystemBubble(text, dedupeKey = '') {
   if (isLegacyPhoneCompanionTokenMessage(text)) {
     return;
   }
   const stickToBottom = shouldAutoScrollChat();
   const bubble = document.createElement('div');
   bubble.className = 'message-bubble';
+  // Stamped so updateExisting system messages can refresh the rendered chip in place instead of
+  // re-rendering the whole conversation (see appendSystemMessage).
+  if (dedupeKey) bubble.dataset.sysDedupe = String(dedupeKey);
   bubble.innerHTML = `
     <div class="message-header" style="color: var(--text-muted);">⚙️ System</div>
     <div class="message-body" style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-muted);">${escapeHtml(text)}</div>
@@ -3909,12 +4081,16 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     ? conversations.find(c => c.id === activeConversationId)
     : null;
   const isDispatchConversation = activeConv && conversationMode(activeConv) === 'orion';
+  // The clean presentation belongs to the Dispatch SPACE, not just Dispatch-mode conversations:
+  // a delegated Coder transcript opened while the app is in Dispatch must not dump Coder-grade
+  // tool chips into that space. The same conversation opened from Coder keeps the full console.
+  const isDispatchPresentation = isDispatchConversation || (typeof appMode !== 'undefined' && appMode === 'orion');
   const isRunningThisConversation = !!(window.isAgentRunning && window.isAgentRunning() && runningConversationId === activeConversationId);
-  
+
   let logsHtml = '';
   if (hasLogs) {
-    if (isDispatchConversation) {
-      logsHtml = isRunningThisConversation ? formatDispatchToolActivity(logs) : '';
+    if (isDispatchPresentation) {
+      logsHtml = formatDispatchToolActivity(logs, isRunningThisConversation);
     } else {
     const isRunning = window.isAgentRunning && window.isAgentRunning();
     const displayStyle = isRunning ? 'flex' : 'none';
@@ -3958,8 +4134,17 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   
   // Render markdown text
   const displayText = isThinkingPlaceholder ? '' : String(text || '');
-  const renderedMarkdown = displayText
-    ? (typeof marked !== 'undefined' ? marked.parse(displayText) : escapeHtml(displayText))
+  let bodyText = displayText;
+  let walkthroughHtml = '';
+  if (isDispatchPresentation && displayText) {
+    const split = splitDispatchAssistantText(displayText);
+    if (split.walkthrough) {
+      bodyText = split.answer;
+      walkthroughHtml = renderDispatchWalkthroughPanel(split.walkthrough);
+    }
+  }
+  const renderedMarkdown = bodyText
+    ? (typeof marked !== 'undefined' ? marked.parse(bodyText) : escapeHtml(bodyText))
     : '';
   const inlineArtifactsHtml = renderInlineArtifactCards(logs);
   
@@ -4058,6 +4243,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     ${logsHtml}
     <div class="message-body">
       ${renderedMarkdown}
+      ${walkthroughHtml}
       ${inlineArtifactsHtml}
       ${clarificationHtml}
       ${planApprovalHtml}
@@ -4070,6 +4256,12 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   if (isNew) {
     el.messagesContainer.appendChild(bubble);
   }
+  // Stale-spinner sweep: a running indicator in any bubble other than the one just rendered is
+  // an orphan from an interrupted render path (e.g. a mid-run transcript re-render detaching the
+  // live bubble). A bubble that is not the live bubble cannot be "Working…".
+  el.messagesContainer.querySelectorAll('.agent-running-indicator').forEach(node => {
+    if (!bubble.contains(node)) node.remove();
+  });
   bubble.querySelectorAll('a[href^="orion-file:"]').forEach(link => {
     link.addEventListener('click', (event) => {
       event.preventDefault();
@@ -4629,10 +4821,20 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
   saveConversationsToStorage();
 
   if (prompt) {
+    // Context packets only exist when Dispatch explored with inspect_code_context. If it worked
+    // with grep/read_file instead, its findings would otherwise be silently dropped here (they
+    // only ride inside packets) — fold them into the queued prompt so the investigation isn't
+    // lost at the handoff boundary.
+    const looseFindings = Array.isArray(options.findings)
+      ? options.findings.map(f => String(f || '').trim()).filter(Boolean).slice(0, 12)
+      : [];
+    const queuedPrompt = (assignedPacketIds.length === 0 && looseFindings.length > 0)
+      ? `${prompt}\n\nFindings from Dispatch's prior investigation (verify before relying on them):\n${looseFindings.map(f => `- ${f}`).join('\n')}`
+      : prompt;
     window.promptQueue = window.promptQueue || [];
     window.promptQueue.push({
       id: createQueuedPromptId(),
-      prompt,
+      prompt: queuedPrompt,
       modelSelectValue: window.getSelectedModel(),
       conversationId: conv.id,
       source: 'dispatch-handoff',
@@ -5888,6 +6090,7 @@ window.startCoderTaskMonitor = function(orionConvId, coderConvId) {
     lastRunning: true,        // Coder just started, so it's running
     startTime: Date.now(),
     notifiedClarification: false,
+    quietSince: 0,
   };
 
   _coderTaskMonitorInterval = setInterval(() => {
@@ -5907,10 +6110,49 @@ window.startCoderTaskMonitor = function(orionConvId, coderConvId) {
     const nowAwaitingPlan = !!(coderConv.awaitingPlanApproval && !coderConv.planApproved) && !isCoderRunning;
     const elapsed = Math.round((Date.now() - _coderTaskMonitorMeta.startTime) / 1000);
 
+    // Stall escalation: not running, nothing queued, not waiting on the user, and no completion
+    // receipt ever arrived — the run ended without the completion hook (crash, killed process,
+    // queued-but-never-started). Without this, the monitor polled forever showing "Working…" and
+    // nobody was told; the user discovered the stuck task by accident much later.
+    const isQueuedForCoder = Array.isArray(window.promptQueue)
+      && window.promptQueue.some(item => item && item.conversationId === coderConvId);
+    const isQuiet = !isCoderRunning && !isQueuedForCoder && !nowAwaitingClarification && !nowAwaitingPlan;
+    if (isQuiet) {
+      if (!_coderTaskMonitorMeta.quietSince) _coderTaskMonitorMeta.quietSince = Date.now();
+      if (Date.now() - _coderTaskMonitorMeta.quietSince > 60000) {
+        const stalledTitle = orionConv.launchedCoderTaskTitle || coderConv.title || 'Coder task';
+        const pendingCount = (coderConv.tasks || []).filter(t => t.status !== 'completed' && t.status !== 'x').length;
+        notifyOrionConversation(orionConv, `Coder went quiet on **${stalledTitle}** — the run ended without recording completion (it may have crashed or stalled). The work is parked under Active work; use its Continue action or open the Coder conversation to inspect it.`, 'supervisor-stall');
+        orionConv.lastDelegatedWork = {
+          coderConversationId: coderConvId,
+          title: stalledTitle,
+          projectPath: coderConv.projectPath || inferDispatchProjectPath(orionConv),
+          status: 'blocked',
+          subStatus: 'Went quiet without completing',
+          startedAt: orionConv.launchedCoderTaskStart || 0,
+          completedAt: Date.now(),
+          pendingCount
+        };
+        orionConv.launchedCoderConvId = null;
+        orionConv.launchedCoderTaskTitle = null;
+        orionConv.launchedCoderTaskStart = null;
+        if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+        if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+        renderDesktopDispatchLanding();
+        stopCoderTaskMonitor();
+        return;
+      }
+    } else {
+      _coderTaskMonitorMeta.quietSince = 0;
+    }
+
     // Update the status card if active Orion conv is watching
     if (isCoderRunning && activeConversationId === orionConvId) {
       const subStatus = window.getAgentSubStatus ? window.getAgentSubStatus() : '';
-      showCoderStatusCard(coderConv.title || 'Coder Task', subStatus, elapsed);
+      const lastAssistant = [...(coderConv.messages || [])].reverse().find(m =>
+        (m.role === 'assistant' || m.role === 'model') && String(m.text || '').trim() && String(m.text || '').trim() !== 'Thinking...');
+      const preview = lastAssistant ? String(lastAssistant.text).replace(/\s+/g, ' ').trim().slice(0, 110) : '';
+      showCoderStatusCard(coderConv.title || 'Coder Task', subStatus, elapsed, preview);
     }
 
     // Detect: Coder needs clarification → proxy it into Orion
@@ -5990,7 +6232,8 @@ function notifySupervisorOfCoderCompletion(finishedCoderConvId) {
       ? 'Stopped with a blocker'
       : (pendingTasks.length > 0 ? `${doneTasks.length} complete, ${pendingTasks.length} remaining` : 'Completed'),
     startedAt: orionConv.launchedCoderTaskStart || 0,
-    completedAt: Date.now()
+    completedAt: Date.now(),
+    pendingCount: pendingTasks.length
   };
 
   // Clear the launched coder conv reference so we don't double-notify
@@ -6095,18 +6338,24 @@ function renderCoderClarificationProxy(orionConv, clarData, coderConvId) {
 
 
 // ── Status card ───────────────────────────────────────────────────────────────
-function showCoderStatusCard(taskTitle, subStatus, elapsedSec) {
+function showCoderStatusCard(taskTitle, subStatus, elapsedSec, preview = '') {
   const card = document.getElementById('coder-task-status-card');
   if (!card) return;
   const titleEl = card.querySelector('.coder-status-task-name');
   const subEl = card.querySelector('.coder-status-substatus');
   const elapsedEl = card.querySelector('.coder-status-elapsed');
+  const previewEl = card.querySelector('.coder-status-preview');
   if (titleEl) titleEl.textContent = taskTitle || 'Coder Task';
   if (subEl) subEl.textContent = subStatus || 'Working…';
   if (elapsedEl) {
     const mins = Math.floor(elapsedSec / 60);
     const secs = elapsedSec % 60;
     elapsedEl.textContent = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
+  }
+  // Quick peek at what Coder is actually doing, so following along doesn't require a tab switch.
+  if (previewEl) {
+    previewEl.textContent = preview || '';
+    previewEl.style.display = preview ? '' : 'none';
   }
   card.classList.add('visible');
 }

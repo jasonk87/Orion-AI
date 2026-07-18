@@ -14,7 +14,11 @@ const DESTRUCTIVE_PATTERNS = [
   /\bgit\s+reset\s+--hard\b/i,
   /\bgit\s+clean\s+-fdx\b/i,
   /\bmkfs\b/i,
-  /\bformat\b/i
+  // Disk formatting only: `format` must appear in command position and target a drive letter.
+  // A bare /\bformat\b/ also matched harmless flags like `--output-format=concise` (which blocked
+  // every ruff/linter invocation) and PowerShell display cmdlets like `Format-Table`.
+  /(?:^|[;&|]\s*)format(?:\.com|\.exe)?\s+[a-z]:/i,
+  /\b(?:Format|Clear|Initialize)-(?:Volume|Disk)\b/i
 ];
 
 const INDEXABLE_EXTENSIONS = new Set([
@@ -50,8 +54,13 @@ function resolveWorkspacePath(workspacePath, relativePath = '') {
   return fullPath;
 }
 
+function findDestructivePattern(command) {
+  const text = String(command || '');
+  return DESTRUCTIVE_PATTERNS.find(pattern => pattern.test(text)) || null;
+}
+
 function isDestructiveCommand(command) {
-  return DESTRUCTIVE_PATTERNS.some(pattern => pattern.test(String(command || '')));
+  return !!findDestructivePattern(command);
 }
 
 function classifyCommandRequest(command, options = {}) {
@@ -59,7 +68,17 @@ function classifyCommandRequest(command, options = {}) {
   const source = options.source || 'freeform';
   if (!text.trim()) return { category: source, allowed: false, reason: 'Missing command' };
   if (source === 'internal') return { category: 'internal', allowed: true, reason: 'Internal executable/args command' };
-  if (isDestructiveCommand(text)) return { category: 'destructive', allowed: false, reason: 'Command matches destructive deny rules' };
+  const destructiveMatch = findDestructivePattern(text);
+  if (destructiveMatch) {
+    // Name the exact substring and rule that tripped: an opaque "matches deny rules" left the
+    // agent retrying superficial rephrasings for a whole run without ever finding the trigger.
+    const matched = text.match(destructiveMatch);
+    return {
+      category: 'destructive',
+      allowed: false,
+      reason: `Command matches destructive deny rule ${destructiveMatch} (matched text: "${matched ? matched[0] : ''}"). This command class is blocked; do not attempt to work around the block via wrapper scripts or encodings — choose a non-destructive alternative or ask the user.`
+    };
+  }
   return { category: 'freeform', allowed: true, reason: 'Allowed freeform terminal command' };
 }
 
@@ -71,6 +90,7 @@ function isIndexableWorkspaceFile(fileName) {
 
 module.exports = {
   classifyCommandRequest,
+  findDestructivePattern,
   isDestructiveCommand,
   isIndexableWorkspaceFile,
   resolveWorkspacePath

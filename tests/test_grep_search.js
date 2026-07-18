@@ -113,6 +113,76 @@ test('grep-search respects filePattern and truncates at maxResults', async (t) =
   t.end();
 });
 
+// Regression: an agent run wrote `a|b|c` alternation patterns without regex:true. Literal mode
+// matched the pipe as an ordinary character, silently returned zero matches, and the model
+// concluded — confidently and wrongly — that the searched-for handler and CSS did not exist.
+// Literal mode now treats '|' as OR over literal alternatives.
+test('grep-search literal mode supports pipe alternation instead of silently matching nothing', async (t) => {
+  const grepSearch = getGrepSearchHandler();
+  const root = makeFixtureWorkspace();
+  try {
+    const piped = await grepSearch({}, { workspacePath: root, pattern: 'express|pit_strategy', options: {} });
+    t.equal(piped.success, true, 'search succeeds');
+    t.deepEqual(piped.results.map(r => r.line).sort(), [1, 5], 'both literal alternatives match their own lines');
+
+    const spaced = await grepSearch({}, { workspacePath: root, pattern: 'express | pit_strategy', options: {} });
+    t.equal(spaced.results.length, 2, 'whitespace around the pipe is tolerated');
+
+    const single = await grepSearch({}, { workspacePath: root, pattern: 'express', options: {} });
+    t.equal(single.results.length, 1, 'single-token literal search is unchanged');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+test('grep-search flags a zero-match literal search that looks like a regex', async (t) => {
+  const grepSearch = getGrepSearchHandler();
+  const root = makeFixtureWorkspace();
+  try {
+    const regexLooking = await grepSearch({}, { workspacePath: root, pattern: 'socket\\.on\\(.*input', options: {} });
+    t.equal(regexLooking.results.length, 0, 'the regex-syntax pattern matches nothing literally');
+    t.ok(/regex: true/.test(regexLooking.message || ''), 'the result warns the pattern ran as literal text and suggests regex: true');
+    t.ok(/Do not conclude/.test(regexLooking.message || ''), 'the result explicitly warns against inferring absence');
+
+    const genuineMiss = await grepSearch({}, { workspacePath: root, pattern: 'zebra_unicorn_token', options: {} });
+    t.equal(genuineMiss.results.length, 0, 'a plain literal miss still returns zero');
+    t.equal(genuineMiss.message, undefined, 'a plain literal miss carries no misleading warning');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+// Regression: grep-search's skip list was missing Python environments entirely, so a search
+// rooted at a folder containing venvs synchronously read tens of thousands of interpreter
+// files in the Electron main process — the app froze with an OS "not responding" dialog.
+test('grep-search skips Python environments and caches like every other workspace walk', async (t) => {
+  const grepSearch = getGrepSearchHandler();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-grep-venv-test-'));
+  try {
+    fs.writeFileSync(path.join(root, 'app.py'), 'needle_token = 1');
+    for (const dir of [
+      path.join('venv', 'Lib', 'site-packages', 'somepkg'),
+      path.join('.venv', 'lib'),
+      '__pycache__',
+      '.ruff_cache',
+      '.pytest_cache'
+    ]) {
+      fs.mkdirSync(path.join(root, dir), { recursive: true });
+      fs.writeFileSync(path.join(root, dir, 'mod.py'), 'needle_token = 2');
+    }
+
+    const result = await grepSearch({}, { workspacePath: root, pattern: 'needle_token', options: {} });
+    t.equal(result.success, true, 'search succeeds');
+    t.deepEqual(result.results.map(r => r.path), ['app.py'], 'only real source matches — venvs and caches are excluded');
+    t.equal(result.filesScanned, 1, 'excluded trees are never even read');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+  t.end();
+});
+
 test('grep-search reports a clear error for a missing workspace or pattern, and an invalid regex', async (t) => {
   const grepSearch = getGrepSearchHandler();
   const root = makeFixtureWorkspace();

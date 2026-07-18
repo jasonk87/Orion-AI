@@ -124,6 +124,7 @@ function registerAllHandlers() {
   symbolIndex.registerHandlers(ipcMain);
   ipcSkill.registerHandlers(ipcMain);
   ipcMemory.registerHandlers(ipcMain);
+  require('./lib/file-knowledge').registerHandlers(ipcMain);
 
   const { runLinter } = require('./lib/run-linter');
   const { findReferences } = require('./lib/find-references');
