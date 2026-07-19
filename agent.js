@@ -3773,6 +3773,60 @@ async function executeTool(name, args, workspace, config, conversation) {
       return { success: true, message: "Scratchpad updated successfully." };
     }
 
+    case 'inspect_environment': {
+      if (!args.command) throw new Error("Missing 'command' parameter");
+      const ieCmd = String(args.command).trim();
+
+      // Safety filter: block write/mutating/destructive operations
+      const INSPECT_ENV_BLOCKED = [
+        /\bpip\s+install\b/i, /\bnpm\s+install\b/i, /\byarn\s+add\b/i, /\bpnpm\s+add\b/i,
+        /\bnpm\s+(start|run|build|publish|ci)\b/i,
+        /\bpython\s+-m\s+(http\.server|flask|uvicorn|gunicorn|django)/i,
+        /\bnode\s+(server|app|index)\b/i,
+        /\b(rm|del|rmdir|rd|Remove-Item)\b/i,
+        /\b(cp|copy|mv|move|xcopy|robocopy|Move-Item|Copy-Item)\b/i,
+        /\b(mkdir|md|New-Item)\b/i,
+        /\b(chmod|chown|icacls|Set-Acl)\b/i,
+        /\b(curl|wget|Invoke-WebRequest|Invoke-RestMethod)\s.*(-o\b|-O\b|--output)/i,
+        /\b(git\s+(push|pull|clone|checkout|reset|rebase|merge|commit|add|rm))\b/i,
+        />{1,2}/, // output redirection to files
+        /\|\s*(tee|Out-File|Set-Content|Add-Content)\b/i,
+        /\b(sudo|runas)\b/i,
+        /\b(reboot|shutdown|poweroff|halt)\b/i,
+        /\b(reg\s+(add|delete|import|export|copy))\b/i,
+        /\bSet-ItemProperty\b/i,
+        /\bNew-ItemProperty\b/i,
+      ];
+      const blocked = INSPECT_ENV_BLOCKED.find(re => re.test(ieCmd));
+      if (blocked) {
+        return {
+          success: false,
+          error: `Command blocked: inspect_environment only allows read-only introspection commands. Blocked pattern: ${blocked}. Use handoff_to_coder for write operations or server starts.`,
+          command: ieCmd
+        };
+      }
+
+      const ieWorkspace = args.workspacePath || workspace || null;
+      const ieProcessId = `inspect_${conversation.id}_${Date.now()}`;
+      const ieTimeout = 15000; // 15s max for introspection
+      let ieStdout = '', ieStderr = '';
+      const ieClean = typeof window.api.onCommandOutput === 'function'
+        ? window.api.onCommandOutput(ieProcessId, (data) => {
+            if (data.type === 'stderr') ieStderr += data.text;
+            else ieStdout += data.text;
+          })
+        : () => {};
+      const ieResult = await window.api.runCommand(ieCmd, ieWorkspace, ieProcessId, ieTimeout);
+      ieClean();
+      return {
+        command: ieCmd,
+        exitCode: ieResult.code,
+        stdout: (ieStdout || ieResult.stdout || '').slice(0, 8000),
+        stderr: (ieStderr || ieResult.stderr || '').slice(0, 2000),
+        timedOut: !!ieResult.timedOut
+      };
+    }
+
     case 'run_command': {
       if (!args.command) throw new Error("Missing 'command' parameter");
       const timeoutMs = args.timeoutMs || config.commandTimeoutMs || 120000;
@@ -5454,6 +5508,9 @@ function summarizeToolStart(toolName, args = {}) {
   if (toolName === 'find_references') return { toolName, status: 'running', label: `Found references for \`${args.symbolName || ''}\`` };
   if (toolName === 'run_command' || toolName === 'start_command') {
     return { toolName, kind: 'command', status: 'running', command: args.command, label: `${toolName === 'start_command' ? 'Started' : 'Ran'} \`${args.command || 'command'}\`` };
+  }
+  if (toolName === 'inspect_environment') {
+    return { toolName, kind: 'command', status: 'running', command: args.command, label: `Inspected \`${args.command || 'environment'}\`` };
   }
   if (toolName === 'set_task_checklist') {
     const count = Array.isArray(args.tasks) ? args.tasks.length : 0;
@@ -7943,7 +8000,8 @@ const DISPATCH_TOOL_ALLOWLIST = new Set([
   'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model',
   'grep_search', 'search_embeddings', 'semantic_search',
   'get_symbol_index', 'fetch_page', 'git_diff', 'git_rollback', 'edit_config', 'get_file_symbols', 'find_references',
-  'read_notes', 'read_project_memory', 'remember_file_notes'
+  'read_notes', 'read_project_memory', 'remember_file_notes',
+  'inspect_environment'
 ]);
 
 // Single source of truth for the agent's tool declarations, consumed by every provider
@@ -8682,6 +8740,18 @@ function buildAgentToolDeclarations() {
                 scope: { type: "STRING", description: "global, project, or all (default: project)." },
                 workspacePath: { type: "STRING", description: "Optional workspace path override." }
               }
+            }
+          },
+          {
+            name: "inspect_environment",
+            description: "Run a read-only introspection command against the user's environment — check package versions, running processes, port usage, environment variables, or other system state. Only safe, non-mutating commands are permitted; write operations, package installs, server starts, and destructive commands are blocked. Use this instead of handing off to Coder just to verify a version, check if a port is in use, or confirm a process is running.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                command: { type: "STRING", description: "The shell command to run. Must be read-only / introspection-only. Examples: 'node -v', 'python --version', 'pip show requests', 'lsof -i :3000', 'netstat -an | findstr 5000', 'Get-Process | Where-Object {$_.Name -like \"*node*\"}', 'echo %NODE_ENV%', 'git status', 'dir /b', 'npm list --depth=0'." },
+                workspacePath: { type: "STRING", description: "Optional: path to run the command in. Defaults to the project workspace if set." }
+              },
+              required: ["command"]
             }
           },
           {

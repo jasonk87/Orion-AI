@@ -5352,7 +5352,7 @@ window.submitPhoneCompanionPrompt = async (options) => {
       return { success: true, queued: false, conversationId: targetId, title: conv.title || 'New Conversation' };
     }
 
-    window.promptQueue.push({ prompt: text, modelSelectValue: window.getSelectedModel(), conversationId: targetId, source: 'phone', images: phoneImages });
+    window.promptQueue.push({ prompt: text, modelSelectValue: window.getSelectedModel(), conversationId: targetId, source: 'phone', images: phoneImages, alreadyRendered: true });
     if (conv.messages) {
       conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
       saveConversationsToStorage();
