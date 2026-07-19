@@ -50,6 +50,19 @@ test('empty Thinking placeholders are not rendered as extra chat bubbles', (t) =
   t.end();
 });
 
+test('completed assistant responses are flushed for background phone conversations', (t) => {
+  t.ok(rendererJs.includes('async function flushConversationsToStorage'), 'renderer exposes an awaitable disk flush');
+  t.ok(rendererJs.includes('if (conversationId) dirtyConversationIds.add(conversationId)'), 'explicit flush marks its target dirty');
+  t.ok(/dirtyConversationIds\.add\(c\.id\);\s*console\.error\(`Save failed for conv \$\{c\.id\}`/.test(rendererJs), 'failed conversation writes remain dirty for retry');
+
+  const finalRender = agentJs.indexOf('window.renderAiMessage(lastTextResponse, currentAgentLogs, conversation.id, conversation.messages[aiMessageIndex]);');
+  const dirtyFinal = agentJs.indexOf('window.markConversationDirty(conversation.id);', finalRender);
+  const flushFinal = agentJs.indexOf('await window.flushConversationsToStorage(conversation.id);', finalRender);
+  t.ok(finalRender !== -1 && dirtyFinal > finalRender, 'the completed assistant message is marked dirty after its final render');
+  t.ok(flushFinal > dirtyFinal, 'the completed message is durably flushed before completion continues');
+  t.end();
+});
+
 test('conversation reload normalizes stored assistant message shapes', (t) => {
   t.ok(rendererJs.includes('function normalizeConversationMessageForReplay'), 'renderer normalizes stored messages before replay');
   t.ok(rendererJs.includes("role === 'assistant' || role === 'model' || role === 'ai' || role === 'orion'"), 'model/AI/orion roles replay as assistant answers');

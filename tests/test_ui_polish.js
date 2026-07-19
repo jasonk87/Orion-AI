@@ -47,8 +47,8 @@ test('phone companion finishes with the same dark theme and complete mission hie
   t.ok(companionHtml.includes('#task-list-card { grid-area: mission; }'), 'Task List has an explicit mobile layout area');
   t.ok(companionHtml.includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
   t.ok(companionHtml.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
-  t.ok(companionHtml.includes('dispatch-project-entry-v20'), 'phone shell exposes the current UI build version');
-  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v20"), 'phone service worker cache is bumped for the current UI build');
+  t.ok(companionHtml.includes('dispatch-focus-v21'), 'phone shell exposes the current UI build version');
+  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v21"), 'phone service worker cache is bumped for the current UI build');
   t.ok(companionHtml.includes('window.isSecureContext'), 'phone explains when browser push is blocked by an insecure context');
   t.ok(companionHtml.includes('Phone push needs HTTPS or localhost'), 'phone tells the user that HTTPS is required for push notifications');
   t.ok(companionHtml.includes("companionFetch('/api/push-subscribe'"), 'phone stores push subscriptions through the authenticated fetch path');
@@ -220,7 +220,7 @@ test('Dispatch supervisor escalates stalls, previews Coder state, and continues 
   t.end();
 });
 
-test('Dispatch opens as a fresh front door with project re-entry inside chat', (t) => {
+test('Dispatch opens as a focused front door without project-driven clutter', (t) => {
   t.ok(companionHtml.includes("let companionMode = 'orion'"), 'each fresh phone launch starts at Dispatch');
   t.ok(companionHtml.includes('function enterDispatch'), 'phone has one explicit chat-first Dispatch entry path');
   t.ok(companionHtml.includes("if (companionMode === 'orion') setTimeout(() => startDispatchDraft(), 0)"), 'the first connected state starts a fresh uncommitted Dispatch draft');
@@ -228,10 +228,13 @@ test('Dispatch opens as a fresh front door with project re-entry inside chat', (
   t.notOk(companionHtml.includes('function resolveDispatchFocus'), 'cold launch does not resolve and reopen an old conversation');
   t.ok(companionHtml.includes("enterDispatch({ fresh: true })"), 'New starts a clean Dispatch draft');
   t.ok(companionHtml.includes('function openDispatchBrowser'), 'saved discussions stay accessible inside Dispatch');
-  t.ok(companionHtml.includes('function buildDispatchProjectGroups'), 'Dispatch groups discussions by project');
-  t.ok(companionHtml.includes('Continue latest conversation'), 'project re-entry can continue the latest discussion');
-  t.ok(companionHtml.includes('Start fresh with project context'), 'project re-entry can start a clean contextual draft');
-  t.ok(companionHtml.includes('dispatch-work-row'), 'Dispatch keeps delegated work visible outside history');
+  t.ok(companionHtml.includes(".filter(function(conversation) { return (conversation.mode || 'orion') === 'orion'; })"), 'Dispatch landing only shows Dispatch discussions');
+  t.ok(companionHtml.includes('.slice(0, 3)'), 'Dispatch condenses the landing history to three discussions');
+  t.ok(companionHtml.includes('Your Dispatch history, newest first.'), 'the discussion browser is a flat history rather than project groups');
+  t.notOk(companionHtml.includes('<span>Pick up a project</span>'), 'phone Dispatch landing no longer renders a project section');
+  t.notOk(html.includes('id="dispatch-desktop-project-section"'), 'desktop Dispatch landing no longer renders a project section');
+  t.ok(companionHtml.includes('No task is too large. What are we taking on?'), 'phone Dispatch uses the confident task-forward motto');
+  t.ok(html.includes('No task is too large. What are we taking on?'), 'desktop Dispatch uses the same motto');
   t.ok(renderer.includes('function collectDispatchActiveWork'), 'desktop and phone share one delegated-work status model');
   t.ok(renderer.includes("? 'Queued for Coder'"), 'queued delegated work is waiting rather than falsely blocked');
   t.ok(renderer.includes('function createDispatchConversationFromDraft'), 'desktop creates a Dispatch conversation lazily');
@@ -239,11 +242,20 @@ test('Dispatch opens as a fresh front door with project re-entry inside chat', (
   t.ok(renderer.includes('dispatchProjectPath'), 'Dispatch persists a project association separate from Coder task identity');
   t.ok(renderer.includes("window.markConversationDirty(orionConv.id)"), 'delegated-work completion receipts persist with their Dispatch transcript');
   t.ok(companionHtml.includes("if (resetRequested) {\n      localStorage.removeItem(sessionKey);"), 'ordinary phone UI updates preserve the paired device session');
-  t.ok(companionHtml.includes('Pick up a project'), 'phone landing offers project re-entry without requiring history search');
   t.ok(companionHtml.includes('coder-workspace-picker'), 'phone keeps the Coder workspace picker');
   t.ok(companionHtml.includes("#screen-new-chat.dispatch-mode .coder-workspace-picker { display: none; }"), 'Dispatch hides the workspace picker on new chat');
   t.ok(companionHtml.includes("newChatPromptEl.placeholder = isDispatchStart ? 'Ask Orion anything...' : 'What should we build?'"), 'new chat placeholder is mode-aware');
-  t.ok(html.includes('Pick up a project') && html.includes('<span>Discussions</span>'), 'desktop uses the same project/discussion language');
+  t.end();
+});
+
+test('phone polling preserves landing and Coder navigation scroll', (t) => {
+  t.ok(companionHtml.includes('lastDispatchLandingSignature'), 'Dispatch tracks the last rendered landing model');
+  t.ok(companionHtml.includes('if (signature === lastDispatchLandingSignature)'), 'identical keep-alive state does not rebuild the Dispatch landing');
+  t.ok(companionHtml.includes('else restoreScrollTop(messagesEl, oldScrollTop)'), 'changed Dispatch content preserves its prior scroll position');
+  t.notOk(companionHtml.includes('messagesEl.innerHTML = html;\n    messagesEl.scrollTop = 0;'), 'ordinary Dispatch polling no longer forces the landing to the top');
+  t.ok(companionHtml.includes('if (homeSignature === lastHomeSignature) return;'), 'identical polling state does not rebuild the Coder home lists');
+  t.ok(companionHtml.includes("if (currentScreen === 'screen-home') restoreScrollTop(homeBodyEl, oldHomeScrollTop)"), 'Coder home updates preserve scroll');
+  t.ok(companionHtml.includes("if (currentScreen === 'screen-project') restoreScrollTop(projectScreenBodyEl, oldProjectScrollTop)"), 'Coder project updates preserve scroll');
   t.end();
 });
 

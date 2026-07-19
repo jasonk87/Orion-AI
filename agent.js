@@ -95,7 +95,21 @@ MEMORY PROTOCOL:
 - DESIGN DECISIONS: When a significant architectural or design decision is made, call remember_decision with the decision and why.
 - DURABLE FACTS: When you discover a fact about the project or user that future sessions should know, call remember_fact.
 - SESSION END: When the user indicates they are wrapping up, switching tasks, or says they are done, call save_session_summary with what was accomplished, what was decided, and what remains open.
-- SCOPE: Global memory is for things true across all projects (user identity, habits, people, cross-project preferences). Project memory is for things specific to the current workspace.`;
+- SCOPE: Global memory is for things true across all projects (user identity, habits, people, cross-project preferences). Project memory is for things specific to the current workspace.
+
+PERSISTENT TERMINAL (terminal_exec):
+- Use "terminal_exec" when a sequence of commands needs to share state: directory changes, activated virtual environments, or exported environment variables that must persist between calls.
+- Provide a "sessionId" (string, default: "default") to group related commands into the same session. The session tracks cwd and env vars across calls automatically.
+- Use "resetSession: true" to clear a session and start fresh from the workspace root.
+- For single, stateless commands, continue using "run_command". Only use terminal_exec when state must carry over between steps.
+
+DATABASE QUERIES (db_query):
+- Use "db_query" to inspect or read data from a local SQLite file or a remote Postgres/MySQL database. Do NOT use this for write operations (INSERT/UPDATE/DELETE) without explicit user permission.
+- For SQLite: provide "dbPath" as an absolute path to the .sqlite, .db, or .sqlite3 file.
+- For Postgres: provide "connectionString" (e.g. "postgresql://user:pass@host:5432/dbname"). Optionally set "dbType": "postgres".
+- For MySQL: provide "connectionString" and set "dbType": "mysql".
+- Output is returned as raw CLI JSON/CSV text. Parse with caution — check for error lines mixed into output.`;
+
 
 // ── Dispatcher (Orion Chat) System Instruction ────────────────────────────────
 const DISPATCHER_INSTRUCTION = `You are Orion — Jason's personal AI assistant.
@@ -128,7 +142,17 @@ At the start of a conversation, call recall_memory with scope="global" to orient
 {{user_memory}}
 
 TOOL USE:
-Your callable tools are supplied separately as formal schemas. In Dispatch, use read/search/memory/workspace/handoff tools when available. You still cannot edit files, run commands, capture screenshots, or produce local artifacts yourself; hand those tasks to Coder with a concise task description.`;
+Your callable tools are supplied separately as formal schemas. In Dispatch, use read/search/memory/workspace/handoff tools when available. You still cannot edit files, run commands, capture screenshots, or produce local artifacts yourself; hand those tasks to Coder with a concise task description.
+
+DATABASE QUERIES (db_query):
+- Use "db_query" to read data directly from a local SQLite file or a Postgres/MySQL database without handing off to Coder.
+- For SQLite: provide "dbPath" (absolute path to the .sqlite/.db file). For Postgres/MySQL: provide "connectionString" and optionally "dbType".
+- Read-only by intent — avoid mutations. If Jason asks for data, use this tool rather than routing to Coder just to run a SELECT.
+
+ENVIRONMENT INSPECTION (inspect_environment):
+- Use "inspect_environment" for read-only system checks: package versions, running processes, port availability, env vars, git status.
+- Commands are safety-filtered — writes, installs, server starts, and destructive operations are blocked.`;
+
 
 // Returns the right system instruction for the current mode.
 // Pass cachedMemory (string) to inject into the dispatcher instruction.
@@ -3045,6 +3069,19 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       conversation.messages[aiMessageIndex].isClarificationCard = true;
     }
     window.renderAiMessage(lastTextResponse, currentAgentLogs, conversation.id, conversation.messages[aiMessageIndex]);
+    // A phone-started run can finish in a conversation that is not open on desktop. Once the
+    // running flag above is cleared, the generic debounced saver no longer infers that conversation
+    // as a write target. Explicitly dirty and flush the completed message before reporting success,
+    // otherwise disk can retain only the earlier "Thinking..." checkpoint and reload loses the
+    // answer that was visible live on the phone.
+    if (typeof window.markConversationDirty === 'function') {
+      window.markConversationDirty(conversation.id);
+    }
+    if (typeof window.flushConversationsToStorage === 'function') {
+      await window.flushConversationsToStorage(conversation.id);
+    } else if (window.saveConversationsToStorage) {
+      window.saveConversationsToStorage();
+    }
     if (window.api && window.api.writeRunArtifact && workWalkthrough.length > 0) {
       const artifactPayload = buildRunArtifactPayload({
         conversation,
@@ -3771,6 +3808,135 @@ async function executeTool(name, args, workspace, config, conversation) {
         window.updateScratchpadUI(conversation.scratchpad);
       }
       return { success: true, message: "Scratchpad updated successfully." };
+    }
+
+    case 'terminal_exec': {
+      if (!args.command) throw new Error("Missing 'command' parameter");
+      const teCmd = String(args.command).trim();
+      const teSessionId = String(args.sessionId || 'default');
+      const teReset = !!args.resetSession;
+
+      // Lazy-init the session store on the window object so it persists across tool calls
+      if (!window.orionTerminalSessions) window.orionTerminalSessions = {};
+      if (teReset || !window.orionTerminalSessions[teSessionId]) {
+        window.orionTerminalSessions[teSessionId] = { cwd: workspace || null, env: {} };
+      }
+      const teSession = window.orionTerminalSessions[teSessionId];
+
+      // Build a wrapped command that re-applies tracked state then captures the new cwd
+      const teCdLine = teSession.cwd ? `Set-Location ${JSON.stringify(teSession.cwd)}` : '';
+      const teEnvLines = Object.entries(teSession.env)
+        .map(([k, v]) => `$env:${k} = ${JSON.stringify(String(v))}`)
+        .join('; ');
+      const teWrapped = [
+        teCdLine,
+        teEnvLines,
+        teCmd,
+        `$_te_exit = if ($? -and $LASTEXITCODE -ne $null) { $LASTEXITCODE } else { if ($?) { 0 } else { 1 } }`,
+        `Write-Output "::ORION_CWD::$(Get-Location)"`,
+        `exit $_te_exit`
+      ].filter(Boolean).join('; ');
+
+      const teProcessId = `terminal_${teSessionId}_${conversation.id}_${Date.now()}`;
+      const teTimeout = args.timeoutMs || 60000;
+      let teStdout = '', teStderr = '';
+      const teClean = typeof window.api.onCommandOutput === 'function'
+        ? window.api.onCommandOutput(teProcessId, (data) => {
+            if (data.type === 'stderr') teStderr += data.text;
+            else teStdout += data.text;
+          })
+        : () => {};
+      const teResult = await window.api.runCommand(teWrapped, null, teProcessId, teTimeout);
+      teClean();
+
+      // Parse the cwd sentinel and update tracked session state
+      const teRawStdout = teStdout || teResult.stdout || '';
+      const teCwdMatch = teRawStdout.match(/::ORION_CWD::(.+?)(\r?\n|$)/);
+      if (teCwdMatch) {
+        teSession.cwd = teCwdMatch[1].trim();
+      }
+      const teCleanStdout = teRawStdout.replace(/::ORION_CWD::.+(\r?\n)?/, '').slice(0, 16000);
+
+      return {
+        sessionId: teSessionId,
+        command: teCmd,
+        exitCode: teResult.code,
+        stdout: teCleanStdout,
+        stderr: (teStderr || teResult.stderr || '').slice(0, 4000),
+        cwd: teSession.cwd,
+        timedOut: !!teResult.timedOut
+      };
+    }
+
+    case 'db_query': {
+      if (!args.query) throw new Error("Missing 'query' parameter");
+      const dbQuery = String(args.query).trim();
+      const dbPath = args.dbPath ? String(args.dbPath).trim() : null;
+      const connString = args.connectionString ? String(args.connectionString).trim() : null;
+
+      if (!dbPath && !connString) {
+        return { success: false, error: "Provide either 'dbPath' (for SQLite) or 'connectionString' (for Postgres/MySQL)." };
+      }
+
+      // Auto-detect db type from provided params
+      let dbType = args.dbType ? String(args.dbType).toLowerCase() : null;
+      if (!dbType) {
+        if (dbPath) dbType = 'sqlite';
+        else if (connString && connString.startsWith('postgresql')) dbType = 'postgres';
+        else if (connString && connString.startsWith('mysql')) dbType = 'mysql';
+        else dbType = 'sqlite';
+      }
+
+      let dbCmd;
+      if (dbType === 'sqlite') {
+        if (!dbPath) return { success: false, error: "SQLite requires 'dbPath'." };
+        // sqlite3 CLI: .mode json for structured output, run the query
+        const escapedPath = dbPath.replace(/"/g, '""');
+        // Escape double-quotes inside the query for PowerShell
+        const escapedQuery = dbQuery.replace(/"/g, '""');
+        dbCmd = `sqlite3 "${escapedPath}" ".mode json" ".headers on" "${escapedQuery}" 2>&1`;
+      } else if (dbType === 'postgres' || dbType === 'postgresql') {
+        if (!connString) return { success: false, error: "Postgres requires 'connectionString'." };
+        const escapedQuery = dbQuery.replace(/"/g, '\\"');
+        dbCmd = `psql "${connString}" --no-psqlrc --csv --tuples-only -c "${escapedQuery}" 2>&1`;
+      } else if (dbType === 'mysql') {
+        if (!connString) return { success: false, error: "MySQL requires 'connectionString'." };
+        const escapedQuery = dbQuery.replace(/"/g, '\\"');
+        dbCmd = `mysql --defaults-extra-file=/dev/null -e "${escapedQuery}" "${connString}" 2>&1`;
+      } else {
+        return { success: false, error: `Unknown dbType '${dbType}'. Use 'sqlite', 'postgres', or 'mysql'.` };
+      }
+
+      const dbProcessId = `db_${conversation.id}_${Date.now()}`;
+      const dbTimeout = args.timeoutMs || 30000;
+      let dbStdout = '', dbStderr = '';
+      const dbClean = typeof window.api.onCommandOutput === 'function'
+        ? window.api.onCommandOutput(dbProcessId, (data) => {
+            if (data.type === 'stderr') dbStderr += data.text;
+            else dbStdout += data.text;
+          })
+        : () => {};
+      const dbResult = await window.api.runCommand(dbCmd, workspace, dbProcessId, dbTimeout);
+      dbClean();
+
+      const dbRawOut = (dbStdout || dbResult.stdout || '').slice(0, 16000);
+      const dbRawErr = (dbStderr || dbResult.stderr || '').slice(0, 4000);
+      const dbSuccess = dbResult.code === 0;
+
+      // Try to parse JSON output (sqlite3 .mode json returns a JSON array)
+      let parsedRows = null;
+      if (dbSuccess && dbRawOut.trim().startsWith('[')) {
+        try { parsedRows = JSON.parse(dbRawOut.trim()); } catch (_) { /* leave as raw text */ }
+      }
+
+      return {
+        query: dbQuery,
+        dbType,
+        exitCode: dbResult.code,
+        ...(parsedRows !== null ? { rows: parsedRows, rowCount: parsedRows.length } : { output: dbRawOut }),
+        ...((!dbSuccess || dbRawErr) ? { error: dbRawErr || dbResult.error } : {}),
+        timedOut: !!dbResult.timedOut
+      };
     }
 
     case 'inspect_environment': {
@@ -5508,6 +5674,14 @@ function summarizeToolStart(toolName, args = {}) {
   if (toolName === 'find_references') return { toolName, status: 'running', label: `Found references for \`${args.symbolName || ''}\`` };
   if (toolName === 'run_command' || toolName === 'start_command') {
     return { toolName, kind: 'command', status: 'running', command: args.command, label: `${toolName === 'start_command' ? 'Started' : 'Ran'} \`${args.command || 'command'}\`` };
+  }
+  if (toolName === 'terminal_exec') {
+    const teSession = args.sessionId ? ` [${args.sessionId}]` : '';
+    return { toolName, kind: 'command', status: 'running', command: args.command, label: `Terminal${teSession}: \`${args.command || 'command'}\`` };
+  }
+  if (toolName === 'db_query') {
+    const dbLabel = args.dbPath ? args.dbPath.split(/[\\/]/).pop() : (args.connectionString || 'database');
+    return { toolName, kind: 'command', status: 'running', label: `DB query on ${dbLabel}: \`${(args.query || '').slice(0, 60)}\`` };
   }
   if (toolName === 'inspect_environment') {
     return { toolName, kind: 'command', status: 'running', command: args.command, label: `Inspected \`${args.command || 'environment'}\`` };
@@ -8001,7 +8175,8 @@ const DISPATCH_TOOL_ALLOWLIST = new Set([
   'grep_search', 'search_embeddings', 'semantic_search',
   'get_symbol_index', 'fetch_page', 'git_diff', 'git_rollback', 'edit_config', 'get_file_symbols', 'find_references',
   'read_notes', 'read_project_memory', 'remember_file_notes',
-  'inspect_environment'
+  'inspect_environment',
+  'db_query'
 ]);
 
 // Single source of truth for the agent's tool declarations, consumed by every provider
@@ -8740,6 +8915,35 @@ function buildAgentToolDeclarations() {
                 scope: { type: "STRING", description: "global, project, or all (default: project)." },
                 workspacePath: { type: "STRING", description: "Optional workspace path override." }
               }
+            }
+          },
+          {
+            name: "terminal_exec",
+            description: "Run a shell command in a persistent terminal session that carries cwd and environment variable state between calls. Use when a sequence of commands must share directory context, an activated virtual environment, or exported env vars — e.g., cd into a project, activate a venv, then install or run. For single stateless commands, prefer run_command. Provide a sessionId to group related commands; omit it to use the default session.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                command: { type: "STRING", description: "PowerShell command to run. Executed inside the tracked session cwd with session env vars pre-applied." },
+                sessionId: { type: "STRING", description: "Optional: name of the persistent session (default: 'default'). Use different IDs to maintain separate parallel sessions." },
+                resetSession: { type: "BOOLEAN", description: "If true, clears all session state (cwd resets to workspace root, env vars cleared) before running the command." },
+                timeoutMs: { type: "NUMBER", description: "Optional timeout in milliseconds (default 60000)." }
+              },
+              required: ["command"]
+            }
+          },
+          {
+            name: "db_query",
+            description: "Execute a SQL query against a local SQLite database file or a remote Postgres/MySQL database and return the results. Use for data inspection, schema review, debugging data issues, or answering questions about database contents. Prefer read-only queries (SELECT); avoid mutations unless the user explicitly asks. For SQLite, provide dbPath. For Postgres or MySQL, provide connectionString.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                query: { type: "STRING", description: "SQL query to execute. Examples: 'SELECT * FROM users LIMIT 10', 'PRAGMA table_info(orders)', '.tables'" },
+                dbPath: { type: "STRING", description: "Absolute path to a local SQLite file (e.g. 'C:\\\\Users\\\\Owner\\\\projects\\\\app\\\\db.sqlite'). Use for SQLite databases." },
+                connectionString: { type: "STRING", description: "Connection string for Postgres (e.g. 'postgresql://user:pass@localhost:5432/dbname') or MySQL. Use for remote/server databases." },
+                dbType: { type: "STRING", description: "Optional: 'sqlite', 'postgres', or 'mysql'. Auto-detected from parameters if omitted." },
+                timeoutMs: { type: "NUMBER", description: "Optional timeout in milliseconds (default 30000)." }
+              },
+              required: ["query"]
             }
           },
           {

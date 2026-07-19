@@ -1041,53 +1041,11 @@ function collectDispatchActiveWork(isGlobalRunning = false, globalRunningId = ''
 }
 
 function renderDesktopDispatchLanding() {
-  const projectSection = document.getElementById('dispatch-desktop-project-section');
-  const projectList = document.getElementById('dispatch-desktop-projects');
   const activeSection = document.getElementById('dispatch-desktop-active-work');
-  if (!projectSection || !projectList || !activeSection) return;
-
-  const dispatchConversations = conversations
-    .filter(conversation => conversationMode(conversation) === 'orion')
-    .slice()
-    .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
-  const grouped = new Map();
-  dispatchConversations.forEach(conversation => {
-    const projectPath = inferDispatchProjectPath(conversation);
-    if (!projectPath) return;
-    if (!grouped.has(projectPath)) grouped.set(projectPath, []);
-    grouped.get(projectPath).push(conversation);
-  });
+  if (!activeSection) return;
   const runningConversationId = window.getRunningConversationId ? window.getRunningConversationId() : '';
   const globallyRunning = !!(window.isAgentRunning && window.isAgentRunning());
   const activeWork = collectDispatchActiveWork(globallyRunning, runningConversationId);
-
-  const projectRows = projects.map(projectPath => {
-    const discussions = grouped.get(projectPath) || [];
-    const latest = discussions[0] || null;
-    const updatedAt = latest ? (latest.updatedAt || latest.createdAt || 0) : 0;
-    const delegatedWork = activeWork.find(work =>
-      work.projectPath
-      && normalizePathForComparison(work.projectPath) === normalizePathForComparison(projectPath)
-      && work.status !== 'completed'
-    );
-    return { projectPath, latest, updatedAt, delegatedWork };
-  }).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 4);
-
-  projectSection.hidden = projectRows.length === 0;
-  projectList.innerHTML = projectRows.map(({ projectPath, latest, delegatedWork }) => {
-    const projectName = projectPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || projectPath;
-    const summary = latest ? deriveDispatchDiscussionSummary(latest) : 'Start a new project discussion';
-    return `<div class="dispatch-desktop-project-row">
-      <div class="dispatch-desktop-project-copy">
-        <div class="dispatch-desktop-project-name">${escapeHtml(projectName)}</div>
-        <div class="dispatch-desktop-project-meta">${escapeHtml(summary)}${delegatedWork ? ` · Coder ${escapeHtml(delegatedWork.status)}` : ''}</div>
-      </div>
-      <div class="dispatch-desktop-row-actions">
-        ${latest ? `<button type="button" data-dispatch-continue="${escapeHtml(latest.id)}">Continue</button>` : ''}
-        <button type="button" data-dispatch-fresh-project="${escapeHtml(projectPath)}" data-dispatch-summary="${escapeHtml(summary)}">Start fresh</button>
-      </div>
-    </div>`;
-  }).join('');
 
   const visibleWork = activeWork.slice(0, 3);
   activeSection.hidden = visibleWork.length === 0;
@@ -3057,11 +3015,23 @@ window.markConversationDirty = function(id) {
 function saveConversationsToStorage() {
   if (saveConversationsTimeout) clearTimeout(saveConversationsTimeout);
   saveConversationsTimeout = setTimeout(() => {
-    executeSaveConversationsToStorage();
+    saveConversationsTimeout = null;
+    executeSaveConversationsToStorage().catch(error => {
+      console.error('Failed to save conversations', error);
+    });
   }, 300);
 }
 
-function executeSaveConversationsToStorage() {
+async function flushConversationsToStorage(conversationId = '') {
+  if (conversationId) dirtyConversationIds.add(conversationId);
+  if (saveConversationsTimeout) {
+    clearTimeout(saveConversationsTimeout);
+    saveConversationsTimeout = null;
+  }
+  return executeSaveConversationsToStorage();
+}
+
+async function executeSaveConversationsToStorage() {
   const revision = ++conversationSaveRevision;
   
   // 1. Build the lightweight index
@@ -3104,23 +3074,38 @@ function executeSaveConversationsToStorage() {
     .filter(c => c && !c.isStub); // Only write full payloads
 
   // 3. Dispatch to disk
+  const diskWrites = [];
   if (window.api) {
     if (typeof window.api.writeConversationsIndex === 'function') {
-      window.api.writeConversationsIndex({ revision, index }).then(result => {
+      const indexWrite = window.api.writeConversationsIndex({ revision, index }).then(result => {
         if (result && result.success) {
           lastConversationDiskSaveError = '';
+          return true;
         } else {
           lastConversationDiskSaveError = result && result.error ? result.error : 'Unknown disk index save error';
+          return false;
         }
       }).catch(error => {
         lastConversationDiskSaveError = error.message || String(error);
         console.error("Failed to save conversation index", error);
+        return false;
       });
+      diskWrites.push(indexWrite);
     }
     
     if (typeof window.api.writeConversation === 'function') {
       conversationsToWrite.forEach(c => {
-        window.api.writeConversation(c).catch(e => console.error(`Save failed for conv ${c.id}`, e));
+        const conversationWrite = window.api.writeConversation(c).then(result => {
+          if (result && result.success) return true;
+          const message = result && result.error ? result.error : 'Unknown conversation save error';
+          throw new Error(message);
+        }).catch(error => {
+          // Keep failed payloads dirty so the next scheduled or explicit flush retries them.
+          dirtyConversationIds.add(c.id);
+          console.error(`Save failed for conv ${c.id}`, error);
+          return false;
+        });
+        diskWrites.push(conversationWrite);
       });
     }
   }
@@ -3137,6 +3122,9 @@ function executeSaveConversationsToStorage() {
   if (window.api && typeof window.api.syncPhoneCompanion === 'function') {
     window.api.syncPhoneCompanion();
   }
+
+  const writeResults = await Promise.all(diskWrites);
+  return { success: writeResults.every(Boolean), revision, writtenConversationIds: conversationsToWrite.map(c => c.id) };
 }
 
 function showOrionConfirmDialog({ title = 'Confirm action', message = '', confirmLabel = 'Confirm', danger = false } = {}) {
@@ -4873,6 +4861,7 @@ window.appendSystemMessage = appendSystemMessage;
 window.persistAssistantStatusMessage = persistAssistantStatusMessage;
 window.markQueuedPromptRunning = markQueuedPromptRunning;
 window.saveConversationsToStorage = saveConversationsToStorage;
+window.flushConversationsToStorage = flushConversationsToStorage;
 window.showPhoneCompanionPairingCard = showPhoneCompanionPairingCard;
 window.syncWorkspaceFiles = syncWorkspaceFiles;
 window.refreshWorkspaceEntrypoint = loadWorkspaceEntrypoint;

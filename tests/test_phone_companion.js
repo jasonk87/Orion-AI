@@ -235,9 +235,9 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
   t.notOk(root.text.includes('data-drawer-destination="history"'), 'root shell does not expose History as a top-level mode');
   t.ok(root.text.includes('function enterDispatch'), 'root shell enters Dispatch through the chat-first route');
   t.ok(root.text.includes('id="dispatch-browser-overlay"'), 'root shell keeps saved discussions in an in-Dispatch browser');
-  t.ok(root.text.includes('Pick up a project'), 'root shell includes project re-entry on the Dispatch landing');
-  t.ok(root.text.includes('Continue latest conversation'), 'root shell can continue the latest project discussion');
-  t.ok(root.text.includes('Start fresh with project context'), 'root shell can start a fresh project-context draft');
+  t.notOk(root.text.includes('<span>Pick up a project</span>'), 'root shell keeps project rows off the Dispatch landing');
+  t.ok(root.text.includes('Your Dispatch history, newest first.'), 'root shell presents a flat Dispatch discussion browser');
+  t.ok(root.text.includes('No task is too large. What are we taking on?'), 'root shell uses the focused Dispatch motto');
   t.ok(root.text.includes('Task List'), 'root shell includes mobile task list status');
   t.ok(root.text.includes('renderPhoneTaskList'), 'mobile shell renders the conversation checklist from state');
   t.ok(root.text.includes('data-drawer-destination="settings"'), 'root shell exposes app-level Settings through the drawer');
