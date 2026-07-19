@@ -166,9 +166,10 @@ let orionSessionContinuityContext = '';
 // Refreshed at the start of each Orion run so the model already knows Jason's facts/prefs.
 let orionCachedMemoryBlock = '';
 
-async function refreshOrionMemoryBlock(config, queryText) {
+async function refreshOrionMemoryBlock(config, queryText, mode) {
   try {
     if (!window.api || !window.api.readGlobalMemory) return;
+    const modeTag = mode || 'orion';
     const mem = await window.api.readGlobalMemory();
     const lines = [];
     if (mem.user && mem.user.name) lines.push(`Name: ${mem.user.name}`);
@@ -176,16 +177,18 @@ async function refreshOrionMemoryBlock(config, queryText) {
     // RAG: rank facts/preferences by cosine similarity against the current message instead of
     // dumping the most recent ones unconditionally. Falls back to recency when there's no query
     // to embed against (e.g. the post-session refresh) or the ranking call fails outright.
+    // Preferences are filtered to this mode (or untagged, for backward compat) before ranking, so
+    // coder-mode preferences never bleed into the Orion prompt block and vice versa.
     let ranked = null;
     if (queryText && config && window.api.rankMemoryFacts) {
       try {
-        const result = await window.api.rankMemoryFacts(queryText, config, 10);
+        const result = await window.api.rankMemoryFacts(queryText, config, 10, modeTag);
         if (result && result.success && Array.isArray(result.results)) ranked = result.results;
       } catch (_) { /* fall through to the recency-based fallback below */ }
     }
     if (!ranked) {
       const recentPrefs = (mem.user && Array.isArray(mem.user.preferences))
-        ? mem.user.preferences.slice(-15).map(p => ({ type: 'preference', text: p.text })) : [];
+        ? mem.user.preferences.filter(p => !p.mode || p.mode === modeTag).slice(-15).map(p => ({ type: 'preference', text: p.text })) : [];
       const recentFacts = Array.isArray(mem.facts)
         ? mem.facts.slice(-30).reverse().map(f => ({ type: 'fact', text: f.text, category: f.category })) : [];
       ranked = recentPrefs.concat(recentFacts);
@@ -288,12 +291,12 @@ function findExplicitPreferenceSentence(text) {
   return null;
 }
 
-async function maybeSaveExplicitPreference(text, config) {
+async function maybeSaveExplicitPreference(text, config, mode) {
   if (!config || !window.api || !window.api.appendGlobalPreference) return;
   const sentence = findExplicitPreferenceSentence(text);
   if (!sentence) return;
   try {
-    await window.api.appendGlobalPreference(sentence, config, 'explicit-preference');
+    await window.api.appendGlobalPreference(sentence, config, 'explicit-preference', mode);
     console.log('[Orion] Captured explicit preference signal from message.');
   } catch (_) { /* silent — best-effort fast path; the end-of-session pass is the fallback */ }
 }
@@ -301,7 +304,7 @@ async function maybeSaveExplicitPreference(text, config) {
 // Tracks conversations already auto-summarized to avoid duplicate writes
 const orionAutoSummarizedIds = new Set();
 
-async function autoSaveOrionMemory(conversation, config, workspacePath) {
+async function autoSaveOrionMemory(conversation, config, workspacePath, mode) {
   if (!config) return;
   const convId = conversation.id;
   if (orionAutoSummarizedIds.has(convId)) return;
@@ -353,7 +356,7 @@ ${transcript}`;
     for (const item of items) {
       if (!item.text || item.text.length < 5) continue;
       if (item.type === 'preference') {
-        await window.api.appendGlobalPreference(item.text, config, 'auto-summary');
+        await window.api.appendGlobalPreference(item.text, config, 'auto-summary', mode);
       } else {
         await window.api.appendGlobalFact(item.text, 'auto-summary', config);
       }
@@ -361,7 +364,7 @@ ${transcript}`;
     if (items.length > 0) {
       console.log(`[Orion] Auto-saved ${items.length} memory item(s) from session.`);
       // Refresh the in-memory block so the next run in this session starts with the new facts
-      await refreshOrionMemoryBlock(config).catch(() => {});
+      await refreshOrionMemoryBlock(config, null, mode).catch(() => {});
     }
 
     const session = parsed && parsed.session;
@@ -938,10 +941,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const isOrionMode = conversation.mode === 'orion' ||
     (conversation.mode !== 'coder' && typeof appMode !== 'undefined' && appMode === 'orion');
   activeConversationMode = isOrionMode ? 'orion' : 'coder';
+  // Captured once per run (rather than re-reading the shared activeConversationMode later, e.g. in
+  // the finally block) so a concurrently-started run can't change which bucket this run's
+  // preferences land in.
+  const runMode = activeConversationMode;
   let workspacePath = resolveConversationWorkspace(conversation);
   if (isOrionMode) {
     orionSessionContinuityContext = await buildOrionContinuityContext(conversation, workspacePath);
-    await refreshOrionMemoryBlock(config, userPrompt); // pre-load global memory, ranked against this message
+    await refreshOrionMemoryBlock(config, userPrompt, runMode); // pre-load global memory, ranked against this message
   } else {
     orionSessionContinuityContext = '';
     orionCachedMemoryBlock = '';
@@ -960,7 +967,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const promptSource = options.source || 'user';
   const isInternalPrompt = !!options.internalPrompt || promptSource === 'followup' || promptSource === 'system' || promptSource === 'plan-approval';
   if (!isInternalPrompt) {
-    maybeSaveExplicitPreference(userPrompt, config).catch(() => {});
+    maybeSaveExplicitPreference(userPrompt, config, runMode).catch(() => {});
   }
 
   // Image data attached to this prompt (e.g. from desktop paste or phone file upload)
@@ -2862,7 +2869,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // Auto-save memory insights from this session (silent, best-effort). Runs for coder-mode
     // conversations too — corrections made mid-coding-session are just as worth remembering as
     // ones made in Orion chat.
-    autoSaveOrionMemory(conversation, config, workspacePath).catch(() => {});
+    autoSaveOrionMemory(conversation, config, workspacePath, runMode).catch(() => {});
 
     // Determine whether the run stopped with genuine work still pending. This drives both the
     // auto-continue decision and an honest terminal message instead of a blanket "Task finished".
@@ -4241,13 +4248,13 @@ async function executeTool(name, args, workspace, config, conversation) {
       const text = args.text;
       if (!text) throw new Error("Missing 'text' parameter");
       if (scope === 'global') {
-        const result = await window.api.appendGlobalPreference(text, config);
+        const result = await window.api.appendGlobalPreference(text, config, undefined, activeConversationMode);
         if (!result || !result.success) throw new Error((result && result.error) || 'appendGlobalPreference failed');
         return { success: true, message: `Global preference stored: "${text}"` };
       } else {
         const wp = args.workspacePath || workspace;
         if (!wp) throw new Error('No active workspace');
-        const result = await window.api.appendProjectPreference(wp, text, config);
+        const result = await window.api.appendProjectPreference(wp, text, config, activeConversationMode);
         if (!result || !result.success) throw new Error((result && result.error) || 'appendProjectPreference failed');
         return { success: true, message: `Project preference stored: "${text}"` };
       }
