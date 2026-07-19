@@ -2954,6 +2954,20 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const EDIT_OR_COMMAND_TOOLS = new Set(['write_file', 'modify_file', 'patch_file', 'run_command', 'start_command', 'run_tests', 'run_linter']);
     const hadSuccessfulEditOrCommandThisPass = (workWalkthrough || []).some(item => item && item.status !== 'error' && EDIT_OR_COMMAND_TOOLS.has(item.toolName));
 
+    // A pass whose only file mutations were documentation (STRATEGY.md, implementation_plan.md,
+    // README, etc.) was almost certainly a planning/documentation request, not a build. Auto-queuing
+    // an "[ORION INTERNAL CONTINUATION]" pass after it has no memory of a "do not implement" (or
+    // similar) constraint from the original prompt, so it starts writing source code unprompted.
+    // Note: write_file items for plan/strategy paths carry kind 'plan'/'strategy' rather than
+    // 'file' (see summarizeToolStart), so this checks toolName + path directly instead of relying
+    // on isFileMutationItem's kind === 'file' filter.
+    const FILE_MUTATION_TOOLS = new Set(['write_file', 'modify_file', 'patch_file']);
+    const CODE_EXTENSIONS = /\.(py|js|ts|jsx|tsx|go|java|cs|cpp|c|h|rb|php|swift|kt|rs|html|css|scss|less|sh|bash|ps1|sql|yaml|yml|toml|ini|cfg|conf)$/i;
+    const fileMutationsThisRun = (workWalkthrough || []).filter(item =>
+      item && item.status === 'done' && FILE_MUTATION_TOOLS.has(item.toolName) && item.path);
+    const wroteCodeFilesThisRun = fileMutationsThisRun.some(item => CODE_EXTENSIONS.test(String(item.path)));
+    const docOnlyRun = fileMutationsThisRun.length > 0 && !wroteCodeFilesThisRun;
+
     conversation._planExecAutoContinues = conversation._planExecAutoContinues || 0;
     if (typeof conversation._lastProgressScore !== 'number') conversation._lastProgressScore = -1;
     if (progressScore > conversation._lastProgressScore || hadSuccessfulEditOrCommandThisPass) {
@@ -2974,7 +2988,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const hasResumableWork = hasOperationalMissionState(workingState) || pendingChecklist.length > 0;
     if (!forceYield && !userRequestedStop && canExecuteAtExit && hasPendingWork && madeProgressThisRun && !blockersActive && !stalled
         && hasResumableWork && conversation._planExecAutoContinues < AUTO_CONTINUE_BUDGET
-        && !conversation.awaitingPlanApproval) {
+        && !conversation.awaitingPlanApproval && !docOnlyRun) {
       autoContinueExecution = true;
       conversation._planExecAutoContinues++;
     }
