@@ -3776,8 +3776,6 @@ function appendSystemMessage(text, options = {}) {
   }
 }
 
-const MISSING_ASSISTANT_RESPONSE_TEXT = 'Run ended before Orion saved an assistant response. This transcript only contains your prompt, so there is no assistant answer to replay.';
-
 function persistAssistantStatusMessage(conversationId, text, options = {}) {
   const targetId = conversationId || activeConversationId;
   const conv = conversations.find(c => c.id === targetId);
@@ -3814,6 +3812,10 @@ function persistAssistantStatusMessage(conversationId, text, options = {}) {
 }
 
 function buildMissingAssistantResponseMessage(normalizedMessages, options = {}) {
+  // An orphaned user turn with no assistant reply (run ended before a response was saved) is
+  // skipped silently rather than replaced with a fake error bubble -- the incomplete turn just
+  // doesn't render. The only case worth a status bubble is a legitimate queued follow-up.
+  if (!options.queued) return null;
   if (!Array.isArray(normalizedMessages) || normalizedMessages.length === 0) return null;
   const lastUserIndex = normalizedMessages.map(msg => msg.role).lastIndexOf('user');
   if (lastUserIndex === -1) return null;
@@ -3823,19 +3825,15 @@ function buildMissingAssistantResponseMessage(normalizedMessages, options = {}) 
     return !isEmptyThinkingPlaceholder(msg.text, logs);
   });
   if (hasMeaningfulAssistantAfterUser) return null;
-  const queued = !!options.queued;
-  const text = queued
-    ? 'Queued. Orion will start this after the current task finishes.'
-    : MISSING_ASSISTANT_RESPONSE_TEXT;
+  const text = 'Queued. Orion will start this after the current task finishes.';
   return {
     role: 'assistant',
-    source: queued ? 'queue-status' : 'missing-assistant-recovery',
+    source: 'queue-status',
     text,
     content: text,
     logs: [],
     turns: [],
-    statusOnly: true,
-    recovered: !queued
+    statusOnly: true
   };
 }
 

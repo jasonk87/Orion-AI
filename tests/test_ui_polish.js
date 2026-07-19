@@ -105,7 +105,8 @@ test('phone companion renders approvals and tool calls as first-class mobile UI'
   t.ok(companionHtml.includes('function shouldHideAssistantThinkingPlaceholder'), 'phone has a state-aware placeholder suppression rule');
   t.ok(companionHtml.includes('!!isRunning'), 'phone only hides empty Thinking placeholders while a run is active');
   t.ok(companionHtml.includes('function recoverIdleAssistantPlaceholder'), 'phone recovers stale saved placeholders after reload');
-  t.ok(companionHtml.includes('Run ended before Orion saved an assistant response.'), 'phone shows a reload-safe fallback instead of blanking the agent side');
+  t.ok(companionHtml.includes('Session ended before a response was saved.'), 'phone shows a reload-safe fallback instead of blanking the agent side');
+  t.ok(companionHtml.includes("return '<div class=\"message system\">' + escapeHtml(recoveredAnswer) + '</div>';"), 'phone renders the stale-placeholder fallback as a subtle system note, not an assistant chat bubble');
   t.notOk(companionHtml.includes('if (isThinkingOnly && !hasActivity) return'), 'phone no longer erases idle saved assistant placeholders');
   t.ok(companionHtml.includes("isThinkingOnly ? recoveredAnswer : split.answer"), 'phone keeps tool/log activity while hiding placeholder copy');
   t.ok(companionHtml.includes('function renderInlineTypingIndicator'), 'phone renders active dots inside the transcript');

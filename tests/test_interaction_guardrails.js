@@ -82,9 +82,10 @@ test('accepted prompts cannot leave one-sided user-only transcripts', (t) => {
   t.ok(rendererJs.includes('function buildMissingAssistantResponseMessage'), 'reload path can recover old user-only transcripts');
   t.ok(rendererJs.includes('hasMeaningfulAssistantAfterUser'), 'reload recovery requires a meaningful assistant answer');
   t.ok(rendererJs.includes('!isEmptyThinkingPlaceholder(msg.text, logs)'), 'stale Thinking placeholders do not count as assistant answers');
-  t.ok(rendererJs.includes('MISSING_ASSISTANT_RESPONSE_TEXT'), 'recovery message is explicit instead of blank');
-  t.ok(rendererJs.includes('messages.push(recoveredAssistantMessage)'), 'phone state returns the recovery bubble to mobile clients');
-  t.ok(rendererJs.includes('renderAiMessage(recoveredAssistantMessage.text'), 'desktop reload renders the same recovery bubble');
+  t.ok(rendererJs.includes('if (!options.queued) return null;'), 'an orphaned run with no reply is skipped silently instead of shown as a fake error bubble');
+  t.notOk(rendererJs.includes('Run ended before Orion saved an assistant response'), 'the old error-sounding recovery bubble text is gone');
+  t.ok(rendererJs.includes('messages.push(recoveredAssistantMessage)'), 'phone state still returns a status bubble for legitimate queued follow-ups');
+  t.ok(rendererJs.includes('renderAiMessage(recoveredAssistantMessage.text'), 'desktop reload still renders that same queued-status bubble');
   t.end();
 });
 
