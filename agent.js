@@ -260,6 +260,44 @@ async function buildOrionContinuityContext(conversation, workspacePath) {
   return `\n\nRecent sessions (for context, do not summarize unprompted):\n${lines}`;
 }
 
+// Cheap regex pre-filter for unambiguous explicit-preference phrasing ("I prefer X", "don't do Y",
+// "always/never Z"). Runs on every user message with no LLM call — a match is trusted as-is and
+// saved immediately, instead of waiting for autoSaveOrionMemory's end-of-session LLM pass to
+// (maybe) notice it later.
+const EXPLICIT_PREFERENCE_PATTERNS = [
+  /\bi wish you('?d| would)\b/i,
+  /\bi('?d| would) (rather|prefer)\b/i,
+  /\bi prefer\b/i,
+  /\bplease don'?t\b/i,
+  /\bdon'?t (ever )?(do|use|write|add|call|create|make|say|put)\b/i,
+  /\b(always|never)\s+\w+\s+\w+/i,
+  /\bstop\s+(doing|using|adding|writing|calling|saying|putting)\b/i,
+  /\bcan you remember\b/i,
+  /\bi like it when\b/i
+];
+
+function findExplicitPreferenceSentence(text) {
+  const sentences = String(text || '').split(/(?<=[.!?\n])\s+/);
+  for (const sentence of sentences) {
+    const trimmed = sentence.trim();
+    if (!trimmed) continue;
+    if (EXPLICIT_PREFERENCE_PATTERNS.some(re => re.test(trimmed))) {
+      return trimmed.length > 200 ? trimmed.slice(0, 200) : trimmed;
+    }
+  }
+  return null;
+}
+
+async function maybeSaveExplicitPreference(text, config) {
+  if (!config || !window.api || !window.api.appendGlobalPreference) return;
+  const sentence = findExplicitPreferenceSentence(text);
+  if (!sentence) return;
+  try {
+    await window.api.appendGlobalPreference(sentence, config, 'explicit-preference');
+    console.log('[Orion] Captured explicit preference signal from message.');
+  } catch (_) { /* silent — best-effort fast path; the end-of-session pass is the fallback */ }
+}
+
 // Tracks conversations already auto-summarized to avoid duplicate writes
 const orionAutoSummarizedIds = new Set();
 
@@ -921,6 +959,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let modelEscalatedForEditKey = null;
   const promptSource = options.source || 'user';
   const isInternalPrompt = !!options.internalPrompt || promptSource === 'followup' || promptSource === 'system' || promptSource === 'plan-approval';
+  if (!isInternalPrompt) {
+    maybeSaveExplicitPreference(userPrompt, config).catch(() => {});
+  }
 
   // Image data attached to this prompt (e.g. from desktop paste or phone file upload)
   const promptImages = Array.isArray(options.images) ? options.images.filter(img => img && img.data && img.mimeType) : [];
@@ -2817,9 +2858,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       if (needsSmartTitle) {
         generateOrionSmartTitle(conversation, firstUser.text || '', firstAsst.text || '', config).catch(() => {});
       }
-      // Auto-save memory insights from this session (silent, best-effort)
-      autoSaveOrionMemory(conversation, config, workspacePath).catch(() => {});
     }
+    // Auto-save memory insights from this session (silent, best-effort). Runs for coder-mode
+    // conversations too — corrections made mid-coding-session are just as worth remembering as
+    // ones made in Orion chat.
+    autoSaveOrionMemory(conversation, config, workspacePath).catch(() => {});
 
     // Determine whether the run stopped with genuine work still pending. This drives both the
     // auto-continue decision and an honest terminal message instead of a blanket "Task finished".
