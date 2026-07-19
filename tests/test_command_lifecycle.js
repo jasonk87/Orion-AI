@@ -28,7 +28,7 @@ global.mainWindow = { webContents: { send: () => {} } };
 // controls. Windows can keep a killed child/conhost handle alive briefly on slower CI runners,
 // even after every Tape assertion has finished. Clean up synchronously so the test file cannot
 // linger until the outer runner's timeout and so CI never inherits an orphaned preview process.
-test.onFinish(() => {
+function cleanupSpawnedTestProcesses() {
   const pids = new Set();
   for (const child of Object.values(main.activeProcesses || {})) {
     if (child && child.pid) pids.add(child.pid);
@@ -52,7 +52,7 @@ test.onFinish(() => {
 
   for (const id of Object.keys(main.activeProcesses || {})) delete main.activeProcesses[id];
   if (main.launchedWorkspaceProcesses) main.launchedWorkspaceProcesses.clear();
-});
+}
 
 test('conversation persistence trims oversized generated tool payloads without mutating live history', (t) => {
   const hugeLog = 'x'.repeat(300000);
@@ -704,5 +704,12 @@ test('regression test command is scoped per workspace, not a single global value
     'workspace key normalization is case-insensitive, same as the entry point store'
   );
 
+  t.end();
+});
+
+test('command lifecycle suite leaves no spawned processes behind', (t) => {
+  cleanupSpawnedTestProcesses();
+  t.equal(Object.keys(main.activeProcesses || {}).length, 0, 'all command-session processes are cleared');
+  t.equal((main.launchedWorkspaceProcesses || new Map()).size, 0, 'all detached workspace processes are cleared');
   t.end();
 });
