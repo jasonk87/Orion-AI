@@ -124,6 +124,8 @@ HOW YOU WORK:
 Handle directly: conversation, strategy, planning, research, reading and discussing code or docs, answering questions, web searches. You can look at files and search the web to back up what you say, but you cannot write, edit, run commands, capture screenshots, or operate the desktop yourself — you are read-only by design.
 Route to the coder: anything requiring file changes, writing or debugging code, running tests, building or fixing features, running local commands, capturing the desktop/screen, or producing local files/artifacts for Jason. Before routing, make sure you understand the task well enough to hand it off clearly — ask Jason to clarify if you don't. When you route something, tell him. Don't go quiet. Report back with a clean summary when it's done.
 
+Permission boundary rule: when Jason asks for an executable or mutating operation that Dispatch cannot perform, you MUST call handoff_to_coder. Never refuse the task or tell Jason to perform it manually merely because Dispatch is read-only. If the target is genuinely ambiguous, use inspect_environment for read-only identification or tell Coder to identify it safely as part of the handoff.
+
 Context ownership: for an obvious build/fix/edit/test request, route early from the known workspace and task description. Do not deeply inspect source merely to decide that Coder should do the work. For a read-only question or architectural opinion, inspect deeply yourself and answer it. If Jason then turns that discussion into implementation, use handoff_to_coder; Orion will transfer the exact validated context packets you already built so Coder can start from that evidence instead of rediscovering the project.
 
 HOW YOU THINK:
@@ -1640,6 +1642,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     let skillGateFired = false;
     let skillDiscoveryChecked = false; // true once discover_skills has been called this run
     let blankFinalAnswerNudgeSent = false;
+    let dispatchForcedHandoffSent = false;
     const repeatedToolFailures = new Map();
     const fileEditCounts = new Map();
     const fileNeedsReadBeforeEdit = new Set(); // files that must be read before the next edit
@@ -1870,7 +1873,35 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           functionCalls.push(part.functionCall);
         }
       });
-      
+
+      // Dispatch is intentionally denied execution/mutation tools, but that permission boundary
+      // must never become a reason to return the task to Jason. If an explicit execution request
+      // receives a no-tool permission refusal/manual deflection, synthesize the allowed Coder
+      // handoff as part of this same model turn. Mutating `parts` keeps provider history valid:
+      // the following tool response has a matching functionCall in the assistant message.
+      if (functionCalls.length === 0 && shouldForceDispatchHandoff(userPrompt, textVal, {
+        mode: runMode,
+        alreadyHandedOff: dispatchForcedHandoffSent
+      })) {
+        const handoffText = "I can't execute that from Dispatch, so I'm passing it to Coder.";
+        const forcedCall = {
+          name: 'handoff_to_coder',
+          args: {
+            prompt: buildForcedDispatchHandoffPrompt(userPrompt),
+            title: 'Execute Dispatch request',
+            open: true
+          }
+        };
+        parts.splice(0, parts.length, { text: handoffText }, { functionCall: forcedCall });
+        textVal = handoffText;
+        functionCalls = [forcedCall];
+        dispatchForcedHandoffSent = true;
+        currentAgentLogs.push({
+          type: 'thought',
+          content: 'Dispatch delegation guard: converted a permission refusal into the required Coder handoff.'
+        });
+      }
+
       if (textVal) {
         if (!useBestVisibleAnswerIfGateEcho(textVal)) {
           lastTextResponse = textVal;
@@ -6601,6 +6632,41 @@ function shouldHaveUsedToolsButDidNot(text, workWalkthrough, userPrompt = '', co
   return false;
 }
 
+// Dispatch has no execution/mutation tools by design. These helpers identify a direct request for
+// one of those unavailable actions and the specific failure mode where the model responds by
+// refusing, citing its permissions, promising a handoff without calling it, or returning the work
+// to the user. The main loop then creates the real handoff function call deterministically.
+function dispatchRequestRequiresCoderExecution(userPrompt) {
+  const prompt = String(userPrompt || '').trim();
+  if (!prompt) return false;
+  const action = '(?:kill|terminate|stop|restart|reboot|start|launch|run|execute|install|uninstall|upgrade|update|configure|change|modify|edit|write|create|delete|remove|rename|move|copy|build|fix|repair|test|deploy|package|commit|push|pull|save|generate|produce|capture)';
+  return [
+    new RegExp(`\\b(?:can|could|would|will)\\s+you\\s+(?:please\\s+)?(?:go\\s+ahead\\s+and\\s+)?${action}\\b`, 'i'),
+    new RegExp(`\\b(?:i\\s+(?:need|want|would\\s+like)\\s+you\\s+to)\\s+(?:please\\s+)?${action}\\b`, 'i'),
+    new RegExp(`^\\s*(?:please\\s+)?(?:go\\s+ahead\\s+and\\s+)?${action}\\b`, 'i'),
+    new RegExp(`\\b(?:have|get)\\s+(?:the\\s+)?coder\\s+(?:to\\s+)?${action}\\b`, 'i')
+  ].some(pattern => pattern.test(prompt));
+}
+
+function isDispatchExecutionDeflection(answerText) {
+  const answer = String(answerText || '').trim().replace(/\u2019/g, "'");
+  if (!answer) return false;
+  const limitation = /(?:\b(?:can(?:not|'t)|unable|not\s+able|do(?:n't|\s+not)\s+have|lack(?:ing)?)\b.{0,140}\b(?:permission|access|ability|capability|control|execute|run|command|process|kill|stop|restart|modify|write|perform|do\s+that)\b|\b(?:permission|access|ability|capability|control)\b.{0,100}\b(?:can(?:not|'t)|unable|not\s+able|lack)\b)/i;
+  const manualReturn = /\b(?:you(?:'ll|\s+will)?\s+need\s+to|you\s+have\s+to|do\s+it\s+yourself|perform\s+it\s+manually|from\s+your\s+(?:terminal|command\s+prompt)|run\s+(?:this|the\s+command)\s+yourself|i\s+can\s+(?:only\s+)?(?:guide|tell|show)\s+you)\b/i;
+  const unexecutedHandoffPromise = /\b(?:pass|hand|route|delegate|send)(?:ing|ed)?\s+(?:it|this|the\s+task)?\s*(?:over|off|along)?\s*(?:to\s+)?(?:the\s+)?coder\b/i;
+  return limitation.test(answer) || /\bread[-\s]?only\b/i.test(answer) || manualReturn.test(answer) || unexecutedHandoffPromise.test(answer);
+}
+
+function shouldForceDispatchHandoff(userPrompt, answerText, context = {}) {
+  if (context.mode !== 'orion' || context.alreadyHandedOff) return false;
+  return dispatchRequestRequiresCoderExecution(userPrompt) && isDispatchExecutionDeflection(answerText);
+}
+
+function buildForcedDispatchHandoffPrompt(userPrompt) {
+  const originalRequest = String(userPrompt || '').trim();
+  return `Execute this request from Dispatch in the local environment: "${originalRequest.replace(/"/g, "'").slice(0, 2000)}"\n\nIdentify the intended local target if needed, perform the operation safely using the existing launch/configuration method, and verify the result. Do not return the task to the user merely because Dispatch itself is read-only.`;
+}
+
 // The model_no_tool_use correction tells the model what NOT to do ("don't mention tools,
 // workspace, or this correction") but gives it nothing concrete to redirect toward — a small model
 // frequently just paraphrases the correction back instead of answering the user's actual message.
@@ -8171,7 +8237,7 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "handoff_to_coder",
-            description: "Promotes a local folder into Coder as an explicit project and optionally queues a Coder prompt to start implementation. For an obvious implementation request, route early without deeply inspecting source first. IMPORTANT — context transfer: exact-source context packets are generated ONLY by inspect_code_context calls. If your investigation used grep_search/read_file instead, no packets exist, so you MUST pass your key conclusions in `findings` — otherwise Coder starts blind and rediscovers everything. This is the explicit promotion path; change_workspace alone must not add folders to Coder.",
+            description: "Promotes a local folder into Coder as an explicit project and optionally queues a Coder prompt to start implementation or execution. REQUIRED: when the user asks for an operation outside Dispatch's read-only permissions, call this tool; never refuse or tell the user to perform it manually merely because Dispatch cannot execute it. For an obvious implementation/execution request, route early without deeply inspecting source first. IMPORTANT — context transfer: exact-source context packets are generated ONLY by inspect_code_context calls. If your investigation used grep_search/read_file instead, no packets exist, so you MUST pass your key conclusions in `findings` — otherwise Coder starts blind and rediscovers everything. This is the explicit promotion path; change_workspace alone must not add folders to Coder.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -9962,6 +10028,10 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     hasOnlyInventoryEvidence,
     buildFinalAnswerQualityGatePrompt,
     shouldHaveUsedToolsButDidNot,
+    dispatchRequestRequiresCoderExecution,
+    isDispatchExecutionDeflection,
+    shouldForceDispatchHandoff,
+    buildForcedDispatchHandoffPrompt,
     isFailedToolResult,
     getToolFailureSignal,
     buildToolEvidenceEntry,

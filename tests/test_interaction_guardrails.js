@@ -1013,6 +1013,25 @@ test('Dispatch uses Projects fallback while Coder standalone conversations get i
   t.end();
 });
 
+test('Dispatch permission refusals deterministically require a Coder handoff', (t) => {
+  const request = 'Can you kill Claude and restart it again?';
+  const refusal = "I can't control local processes from this read-only chat. You'll need to restart it manually from your terminal.";
+  t.equal(agent.dispatchRequestRequiresCoderExecution(request), true, 'the exact kill/restart request is classified as executable work');
+  t.equal(agent.isDispatchExecutionDeflection(refusal), true, 'the permission refusal/manual return is detected');
+  t.equal(agent.shouldForceDispatchHandoff(request, refusal, { mode: 'orion' }), true, 'Dispatch must replace the refusal with handoff_to_coder');
+  t.equal(agent.shouldForceDispatchHandoff(request, refusal, { mode: 'coder' }), false, 'Coder mode is not intercepted by the Dispatch guard');
+  t.equal(agent.shouldForceDispatchHandoff(request, refusal, { mode: 'orion', alreadyHandedOff: true }), false, 'one request cannot create duplicate forced handoffs');
+  t.equal(agent.dispatchRequestRequiresCoderExecution('How can I restart Claude myself?'), false, 'an instructional question is not mistaken for a direct execution request');
+  t.equal(agent.shouldForceDispatchHandoff('Can you explain why Claude restarted?', refusal, { mode: 'orion' }), false, 'a read-only explanation request is not handed off');
+  const prompt = agent.buildForcedDispatchHandoffPrompt(request);
+  t.ok(prompt.includes(request), 'the generated Coder prompt preserves the exact user request');
+  t.ok(/identify the intended local target/i.test(prompt), 'the Coder prompt resolves ambiguous process identity safely');
+  t.ok(/verify the result/i.test(prompt), 'the Coder prompt requires outcome verification');
+  t.ok(agentJs.includes('MUST call handoff_to_coder'), 'Dispatch system instructions state the permission-boundary invariant');
+  t.ok(agentJs.includes('synthesize the allowed Coder'), 'the invariant is enforced in code, not only prose');
+  t.end();
+});
+
 test('token-saving prompt cleanup keeps tool schemas authoritative', (t) => {
   t.notOk(agentJs.includes('\nTools available:'), 'system prompts do not duplicate the formal tool schemas as prose lists');
   t.ok(agentJs.includes('TOOL USE:'), 'system prompts keep compact tool-use guidance');

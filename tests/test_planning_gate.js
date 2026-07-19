@@ -2685,16 +2685,91 @@ test('a blank final response after real tool work is nudged to produce an actual
   t.end();
 });
 
-// A user reported the "thinking" UI vanished — the chat area showed nothing at all between
-// hitting send and the final answer appearing, leaving no way to tell the run wasn't stuck.
-// Root cause: renderAiMessage's placeholder guard (renderer.js) unconditionally no-op'd on the
-// very first call of a run (text === 'Thinking...', no bubble yet, no logs yet) so the
-// agent-running-indicator spinner never appeared until either a tool call fired or the whole run
-// finished — for a plain conversational answer with no tool calls, that meant the entire
-// duration of the model's response with zero visible feedback. Fixed by calling renderAiMessage
-// immediately when the placeholder message is created (agent.js), and by only suppressing that
-// placeholder in the renderer when no run is actually in progress (so stale placeholders from a
-// dead run still don't reappear on reload/replay).
+// Dispatch cannot execute process mutations itself, but that boundary must route work rather than
+// return it to the user. A real conversation required the user to explicitly demand Coder after a
+// long permission refusal. The loop now synthesizes the handoff tool call deterministically.
+test('Dispatch converts a kill/restart permission refusal into a real Coder handoff', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalSetTimeout = global.setTimeout;
+  const originalFetch = global.fetch;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: true, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: false });
+  global.window.getCurrentWorkspace = () => '/test/workspace';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.getKnownProjects = () => [];
+  global.window.startCoderTaskMonitor = () => {};
+  global.window.api = {
+    listFiles: async () => ([]),
+    readFile: async () => '',
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null })
+  };
+
+  const handoffs = [];
+  global.window.promoteWorkspaceToCoder = async (payload) => {
+    handoffs.push(payload);
+    return { success: true, conversationId: 'coder-kill-restart', title: payload.title || 'Coder Task' };
+  };
+
+  const request = 'Can you kill Claude and restart it again?';
+  const conversation = {
+    id: 'test-dispatch-forced-handoff',
+    mode: 'orion',
+    workspace: '/test/workspace',
+    messages: [],
+    awaitingPlanApproval: false,
+    planApproved: false
+  };
+
+  let modelTurn = 0;
+  global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const contents = body.contents || [];
+    const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
+    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
+      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"local process operation"}' }] } }] }) };
+    }
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+
+    modelTurn++;
+    if (modelTurn === 1) {
+      return {
+        ok: true,
+        json: async () => ({
+          candidates: [{
+            finishReason: 'STOP',
+            content: { parts: [{ text: "I can't control or restart local processes from Dispatch. You'll need to restart Claude manually from your terminal." }] }
+          }]
+        })
+      };
+    }
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'Coder has the kill/restart task and will verify the replacement process.' }] } }] }) };
+  };
+
+  try {
+    global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
+    await window.runAgentLoop(request, 'gemini-1', conversation);
+
+    t.equal(handoffs.length, 1, 'handoff_to_coder executes exactly once');
+    t.equal(handoffs[0].open, true, 'the generated Coder conversation opens immediately');
+    t.ok(handoffs[0].prompt.includes(request), 'the handoff preserves the exact user request');
+    t.ok(/identify the intended local target/i.test(handoffs[0].prompt), 'Coder is instructed to resolve which Claude process is meant');
+    const aiMessage = conversation.messages.find(m => m.role === 'assistant');
+    const calledTools = (aiMessage?.turns || []).flatMap(turn => turn.modelParts || []).map(part => part.functionCall?.name).filter(Boolean);
+    t.ok(calledTools.includes('handoff_to_coder'), 'the persisted model turn contains a real matching handoff function call');
+    t.notOk(/you(?:'ll| will)? need to|manually from your terminal/i.test(aiMessage?.text || ''), 'the forbidden manual-restart refusal is not accepted as the final answer');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+  }
+  t.end();
+});
+
+// A user reported the "thinking" UI vanished between hitting send and the final answer. The
+// placeholder guard now suppresses only stale idle placeholders, never an actively running turn.
 test('the running-indicator placeholder is rendered immediately at the start of a run, not only after the first tool call', async (t) => {
   const originalRunAgentLoop = global.window.runAgentLoop;
   const originalSetTimeout = global.setTimeout;
