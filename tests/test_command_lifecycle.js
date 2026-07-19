@@ -24,6 +24,36 @@ const main = proxyquire('../main.js', {
 
 global.mainWindow = { webContents: { send: () => {} } };
 
+// These tests deliberately launch detached, long-running processes to verify Orion's lifecycle
+// controls. Windows can keep a killed child/conhost handle alive briefly on slower CI runners,
+// even after every Tape assertion has finished. Clean up synchronously so the test file cannot
+// linger until the outer runner's timeout and so CI never inherits an orphaned preview process.
+test.onFinish(() => {
+  const pids = new Set();
+  for (const child of Object.values(main.activeProcesses || {})) {
+    if (child && child.pid) pids.add(child.pid);
+  }
+  for (const pid of (main.launchedWorkspaceProcesses || new Map()).values()) {
+    if (pid) pids.add(pid);
+  }
+
+  for (const pid of pids) {
+    try {
+      if (process.platform === 'win32') {
+        require('child_process').spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore'
+        });
+      } else {
+        try { process.kill(-pid, 'SIGKILL'); } catch (_) { process.kill(pid, 'SIGKILL'); }
+      }
+    } catch (_) {}
+  }
+
+  for (const id of Object.keys(main.activeProcesses || {})) delete main.activeProcesses[id];
+  if (main.launchedWorkspaceProcesses) main.launchedWorkspaceProcesses.clear();
+});
+
 test('conversation persistence trims oversized generated tool payloads without mutating live history', (t) => {
   const hugeLog = 'x'.repeat(300000);
   const hugeResponse = { content: 'y'.repeat(300000) };
