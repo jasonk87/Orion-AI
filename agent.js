@@ -166,20 +166,38 @@ let orionSessionContinuityContext = '';
 // Refreshed at the start of each Orion run so the model already knows Jason's facts/prefs.
 let orionCachedMemoryBlock = '';
 
-async function refreshOrionMemoryBlock() {
+async function refreshOrionMemoryBlock(config, queryText) {
   try {
     if (!window.api || !window.api.readGlobalMemory) return;
     const mem = await window.api.readGlobalMemory();
     const lines = [];
     if (mem.user && mem.user.name) lines.push(`Name: ${mem.user.name}`);
-    if (mem.user && Array.isArray(mem.user.preferences) && mem.user.preferences.length > 0) {
-      const recent = mem.user.preferences.slice(-15).map(p => p.text);
-      lines.push(`Preferences: ${recent.join('; ')}`);
+
+    // RAG: rank facts/preferences by cosine similarity against the current message instead of
+    // dumping the most recent ones unconditionally. Falls back to recency when there's no query
+    // to embed against (e.g. the post-session refresh) or the ranking call fails outright.
+    let ranked = null;
+    if (queryText && config && window.api.rankMemoryFacts) {
+      try {
+        const result = await window.api.rankMemoryFacts(queryText, config, 10);
+        if (result && result.success && Array.isArray(result.results)) ranked = result.results;
+      } catch (_) { /* fall through to the recency-based fallback below */ }
     }
-    if (Array.isArray(mem.facts) && mem.facts.length > 0) {
-      const recent = mem.facts.slice(-30).reverse();
-      lines.push(`Facts:\n${recent.map((f, i) => `${i + 1}. [${f.category || 'general'}] ${f.text}`).join('\n')}`);
+    if (!ranked) {
+      const recentPrefs = (mem.user && Array.isArray(mem.user.preferences))
+        ? mem.user.preferences.slice(-15).map(p => ({ type: 'preference', text: p.text })) : [];
+      const recentFacts = Array.isArray(mem.facts)
+        ? mem.facts.slice(-30).reverse().map(f => ({ type: 'fact', text: f.text, category: f.category })) : [];
+      ranked = recentPrefs.concat(recentFacts);
     }
+
+    const prefs = ranked.filter(c => c.type === 'preference').map(c => c.text);
+    const facts = ranked.filter(c => c.type === 'fact');
+    if (prefs.length > 0) lines.push(`Preferences: ${prefs.join('; ')}`);
+    if (facts.length > 0) {
+      lines.push(`Facts:\n${facts.map((f, i) => `${i + 1}. [${f.category || 'general'}] ${f.text}`).join('\n')}`);
+    }
+
     orionCachedMemoryBlock = lines.join('\n');
   } catch (_) {
     orionCachedMemoryBlock = '';
@@ -297,12 +315,9 @@ ${transcript}`;
     for (const item of items) {
       if (!item.text || item.text.length < 5) continue;
       if (item.type === 'preference') {
-        const mem = await window.api.readGlobalMemory();
-        const prefs = (mem?.user && Array.isArray(mem.user.preferences)) ? mem.user.preferences : [];
-        prefs.push({ text: item.text, addedAt: new Date().toISOString(), source: 'auto-summary' });
-        await window.api.writeGlobalMemory({ user: Object.assign({}, (mem && mem.user) || {}, { preferences: prefs }) });
+        await window.api.appendGlobalPreference(item.text, config, 'auto-summary');
       } else {
-        await window.api.appendGlobalFact(item.text, 'auto-summary');
+        await window.api.appendGlobalFact(item.text, 'auto-summary', config);
       }
     }
     if (items.length > 0) {
@@ -4159,12 +4174,12 @@ async function executeTool(name, args, workspace, config, conversation) {
       const category = args.category || 'general';
       if (!text) throw new Error("Missing 'text' parameter");
       if (scope === 'global') {
-        const result = await window.api.appendGlobalFact(text, category);
+        const result = await window.api.appendGlobalFact(text, category, config);
         if (!result || !result.success) throw new Error((result && result.error) || 'appendGlobalFact failed');
         return { success: true, message: `Global fact stored: "${text}"` };
       } else {
         if (!workspace) throw new Error('No active workspace');
-        const result = await window.api.appendProjectFact(workspace, text, category);
+        const result = await window.api.appendProjectFact(workspace, text, category, config);
         if (!result || !result.success) throw new Error((result && result.error) || 'appendProjectFact failed');
         return { success: true, message: `Project fact stored: "${text}"` };
       }
@@ -4183,16 +4198,13 @@ async function executeTool(name, args, workspace, config, conversation) {
       const text = args.text;
       if (!text) throw new Error("Missing 'text' parameter");
       if (scope === 'global') {
-        const mem = await window.api.readGlobalMemory();
-        const prefs = (mem && mem.user && Array.isArray(mem.user.preferences)) ? mem.user.preferences : [];
-        prefs.push({ text, addedAt: new Date().toISOString() });
-        const result = await window.api.writeGlobalMemory({ user: Object.assign({}, (mem && mem.user) || {}, { preferences: prefs }) });
-        if (!result || !result.success) throw new Error((result && result.error) || 'writeGlobalMemory failed');
+        const result = await window.api.appendGlobalPreference(text, config);
+        if (!result || !result.success) throw new Error((result && result.error) || 'appendGlobalPreference failed');
         return { success: true, message: `Global preference stored: "${text}"` };
       } else {
         const wp = args.workspacePath || workspace;
         if (!wp) throw new Error('No active workspace');
-        const result = await window.api.appendProjectPreference(wp, text);
+        const result = await window.api.appendProjectPreference(wp, text, config);
         if (!result || !result.success) throw new Error((result && result.error) || 'appendProjectPreference failed');
         return { success: true, message: `Project preference stored: "${text}"` };
       }

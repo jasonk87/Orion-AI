@@ -124,13 +124,15 @@ contextBridge.exposeInMainWorld('api', {
   // Global Memory
   readGlobalMemory: () => ipcRenderer.invoke('orion:read-global-memory'),
   writeGlobalMemory: (updates) => ipcRenderer.invoke('orion:write-global-memory', updates),
-  appendGlobalFact: (text, category) => ipcRenderer.invoke('orion:append-global-fact', { text, category }),
+  appendGlobalFact: (text, category, config) => ipcRenderer.invoke('orion:append-global-fact', { text, category, config }),
+  appendGlobalPreference: (text, config, source) => ipcRenderer.invoke('orion:append-global-preference', { text, config, source }),
   updateUserProfile: (updates) => ipcRenderer.invoke('orion:update-user-profile', { updates }),
+  rankMemoryFacts: (query, config, limit) => ipcRenderer.invoke('orion:rank-memory-facts', { query, config, limit }),
 
   // Project Memory (extended)
-  appendProjectFact: (workspacePath, text, category) => ipcRenderer.invoke('orion:append-project-fact', { workspacePath, text, category }),
+  appendProjectFact: (workspacePath, text, category, config) => ipcRenderer.invoke('orion:append-project-fact', { workspacePath, text, category, config }),
   appendProjectDecision: (workspacePath, text, context) => ipcRenderer.invoke('orion:append-project-decision', { workspacePath, text, context }),
-  appendProjectPreference: (workspacePath, text) => ipcRenderer.invoke('orion:append-project-preference', { workspacePath, text }),
+  appendProjectPreference: (workspacePath, text, config) => ipcRenderer.invoke('orion:append-project-preference', { workspacePath, text, config }),
 
   // Skill Memory
   readSkillMemory: () => ipcRenderer.invoke('orion:read-skill-memory'),
