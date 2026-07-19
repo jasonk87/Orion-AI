@@ -4990,9 +4990,19 @@ window.onAgentStatusChange = (running) => {
 
     // ── Supervisor: notify the Orion conversation that launched this Coder task ──
     // We check all conversations because the finished conv may not be the active one.
-    const justFinishedId = _supervisorLastRunningConvId;
+    // Multi-pass coder tasks auto-continue: this handler can fire with running=false
+    // right before the next pass is queued (via a 500ms setTimeout) and restarts the
+    // run. Defer the notification and skip it if the same conversation is running again.
+    const capturedJustFinishedId = _supervisorLastRunningConvId;
     _supervisorLastRunningConvId = null;
-    if (justFinishedId) notifySupervisorOfCoderCompletion(justFinishedId);
+    if (capturedJustFinishedId) {
+      setTimeout(() => {
+        const stillRunning = window.isAgentRunning && window.isAgentRunning()
+          && window.getRunningConversationId
+          && window.getRunningConversationId() === capturedJustFinishedId;
+        if (!stillRunning) notifySupervisorOfCoderCompletion(capturedJustFinishedId);
+      }, 800);
+    }
     hideCoderStatusCard();
   }
 };
@@ -5328,6 +5338,20 @@ window.submitPhoneCompanionPrompt = async (options) => {
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
 
   if (isGlobalRunning) {
+    const runningConvId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+    const convMode = conv.mode || (typeof conversationMode === 'function' ? conversationMode(conv) : '');
+    const isOrionConv = convMode === 'orion' || (!convMode && conv.mode !== 'coder');
+    const launchedCoderConvId = conv.launchedCoderConvId;
+
+    if (isOrionConv && launchedCoderConvId && runningConvId === launchedCoderConvId) {
+      // Push the user message to history first
+      conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
+      saveConversationsToStorage();
+      if (targetId === activeConversationId) renderUserMessage(text, phoneImages, Date.now());
+      handleSupervisorMessage(conv, text, window.getSelectedModel(), { source: 'phone', images: phoneImages });
+      return { success: true, queued: false, conversationId: targetId, title: conv.title || 'New Conversation' };
+    }
+
     window.promptQueue.push({ prompt: text, modelSelectValue: window.getSelectedModel(), conversationId: targetId, source: 'phone', images: phoneImages });
     if (conv.messages) {
       conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
@@ -5971,14 +5995,17 @@ let _coderTaskMonitorInterval = null;
 let _coderTaskMonitorMeta = null;
 
 // ── Intent classifier ─────────────────────────────────────────────────────────
-// Returns 'checkin' | 'steering' | 'normal'
+// Returns 'checkin' | 'steering' | 'conversational'
 function classifySupervisorIntent(text) {
   const t = text.trim().toLowerCase();
   const checkinPatterns = [
     /\b(how'?s it going|how is it going|any updates?|what'?s happening|what is happening)\b/,
-    /\b(status|progress|update|what'?s (it|cody|the coder) (doing|working on|up to))\b/,
+    /\b(status|progress|update|what'?s? (it|cody|the coder) (doing|working on|up to))\b/,
     /\b(check in|checking in|where are (we|you|things)|what have (you|we|they) done)\b/,
-    /^(how|what|where|any).{0,60}\?$/,
+    /\b(what (all|did|has) it (do|done|finished|completed|changed))\b/,
+    /\b(give me (an? )?update|what('?s| is) (going on|the status|happening))\b/,
+    /\b(how far|how much|how many|almost done|are (you|we|it) done|finished yet)\b/,
+    /^(how|what|where|any|is it|did it|has it).{0,80}\?$/,
   ];
   const steeringPatterns = [
     /\b(also|additionally|on top of that|in addition)\b/,
@@ -5991,10 +6018,13 @@ function classifySupervisorIntent(text) {
   if (steeringPatterns.some(p => p.test(t))) return 'steering';
   // Short imperative sentences are usually steering
   if (t.length < 120 && /^(also|add|skip|use|make|don't|do|change|include|avoid|focus|prioritize)/.test(t)) return 'steering';
-  return 'normal';
+  // Everything else: conversational — Orion answers directly while coder runs
+  return 'conversational';
 }
 
 // ── Build a human-readable status summary from Coder conversation data ────────
+// Returns { text, rawActivity, tasks, doneTasks, pendingTasks } so callers can either
+// show the text directly or hand rawActivity to an LLM for natural-language synthesis.
 function buildCoderStatusSummary(coderConvId) {
   if (typeof window.getCoderConversationSummary !== 'function') return null;
   const data = window.getCoderConversationSummary(coderConvId);
@@ -6008,38 +6038,89 @@ function buildCoderStatusSummary(coderConvId) {
     lines.push(`**Tasks:** ${doneTasks.length}/${tasks.length} done.`);
     const inProg = tasks.find(t => t.status === 'in-progress' || t.status === '/');
     if (inProg) lines.push(`Currently working on: _${inProg.title || inProg.text || 'a task'}_`);
+    if (pendingTasks.length) lines.push(`Pending: ${pendingTasks.slice(0, 3).map(t => t.title || t.text || 'task').join(', ')}`);
   }
 
   // Most recent tool activity
-  const toolCalls = recentActivity.filter(a => a.tool && a.tool !== '_thought').slice(-3);
+  const toolCalls = recentActivity.filter(a => a.tool && a.tool !== '_thought').slice(-10);
   if (toolCalls.length > 0) {
-    const toolNames = toolCalls.map(tc => tc.tool).join(', ');
-    lines.push(`Recent tools: ${toolNames}`);
+    const toolSummary = toolCalls.map(tc => `${tc.tool}${tc.result ? ': ' + tc.result.slice(0, 80) : ''}`).join('\n');
+    lines.push(`Recent tool calls:\n${toolSummary}`);
   }
 
   // Latest thought/text
   const lastThought = [...recentActivity].reverse().find(a => a.tool === '_thought');
   if (lastThought && lastThought.text) {
-    const preview = lastThought.text.slice(0, 160).replace(/\s+/g, ' ');
-    lines.push(`Last update: "${preview}${lastThought.text.length > 160 ? '…' : ''}"`);
+    lines.push(`Last update: "${lastThought.text.slice(0, 200).replace(/\s+/g, ' ')}${lastThought.text.length > 200 ? '…' : ''}"`);
   }
 
   if (subStatus) lines.push(`Currently: ${subStatus}`);
 
-  return lines.length > 0 ? lines.join('\n') : 'Working — no detailed status available yet.';
+  return { text: lines.join('\n'), rawActivity: recentActivity, tasks, doneTasks, pendingTasks };
+}
+
+// ── Orion answers conversationally while Coder runs in the background ─────────
+async function respondOrionConversationally(orionConv, prompt, model, options = {}) {
+  const config = window.getAppConfig ? window.getAppConfig() : {};
+
+  // Build context: recent conversation history (last 10 messages)
+  const recentMsgs = (orionConv.messages || []).slice(-10).map(m => ({
+    role: m.role === 'assistant' || m.role === 'model' ? 'assistant' : 'user',
+    content: String(m.text || m.content || '').slice(0, 500)
+  }));
+
+  // Add coder context if a coder task is running
+  let coderContext = '';
+  const coderConvId = orionConv.launchedCoderConvId;
+  if (coderConvId) {
+    const summary = buildCoderStatusSummary(coderConvId);
+    if (summary && summary.text) {
+      coderContext = `\n\nCoder task status:\n${summary.text}`;
+    }
+  }
+
+  const systemPrompt = `You are Orion, an AI supervisor. You are having a conversation with the user while a separate Coder agent works on a task in the background. Answer the user's question conversationally and helpfully. Do not tell the user to wait for the coder to finish — you can talk freely. Be concise and direct.${coderContext}`;
+
+  if (typeof window.clearActiveAiBubble === 'function') window.clearActiveAiBubble();
+
+  try {
+    const replyText = await window.quickOrionLLMCall(systemPrompt, recentMsgs, config);
+    if (!replyText) return;
+    orionConv.messages.push({ role: 'assistant', text: replyText, source: 'supervisor-conversational', createdAt: Date.now() });
+    orionConv.updatedAt = Date.now();
+    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+    if (activeConversationId === orionConv.id && typeof window.renderAiMessage === 'function') {
+      window.renderAiMessage(replyText, [], orionConv.id);
+    }
+    if (typeof scrollChatToBottom === 'function') scrollChatToBottom();
+  } catch (err) {
+    console.error('respondOrionConversationally error:', err);
+    const fallback = "I'm juggling the coder task right now — ask me again in a moment and I'll have a better answer.";
+    orionConv.messages.push({ role: 'assistant', text: fallback, source: 'supervisor-conversational-error', createdAt: Date.now() });
+    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    if (activeConversationId === orionConv.id && typeof window.renderAiMessage === 'function') {
+      window.renderAiMessage(fallback, [], orionConv.id);
+    }
+  }
 }
 
 // ── Main supervisor message handler ──────────────────────────────────────────
 // Called from submitMessage() when user types in Orion while Coder is running.
-function handleSupervisorMessage(orionConv, prompt, model) {
+function handleSupervisorMessage(orionConv, prompt, model, options = {}) {
   const coderConvId = orionConv.launchedCoderConvId;
   const intent = classifySupervisorIntent(prompt);
 
   if (intent === 'checkin') {
-    // Build a status reply immediately without starting the full agent loop
+    // If there's rich raw activity, let the LLM synthesize a natural-language status update.
     const summary = buildCoderStatusSummary(coderConvId);
-    const replyText = summary
-      ? `Here's what Coder is up to:\n\n${summary}`
+    if (summary && summary.rawActivity && summary.rawActivity.length > 0 && window.quickOrionLLMCall) {
+      respondOrionConversationally(orionConv, prompt, model, options);
+      return;
+    }
+
+    const replyText = (summary && summary.text)
+      ? `Here's what Coder is up to:\n\n${summary.text}`
       : 'Coder is still working — no detailed status available yet.';
 
     // Persist as an assistant message in the Orion conversation
@@ -6063,7 +6144,12 @@ function handleSupervisorMessage(orionConv, prompt, model) {
     return;
   }
 
-  // 'normal' — queue for after Coder finishes
+  if (intent === 'conversational') {
+    respondOrionConversationally(orionConv, prompt, model, options);
+    return;
+  }
+
+  // Fallback — queue for after Coder finishes
   window.promptQueue = window.promptQueue || [];
   window.promptQueue.push({ prompt, modelSelectValue: model, conversationId: orionConv.id, alreadyRendered: true });
   persistAssistantStatusMessage(orionConv.id, 'Queued — Coder is busy. Orion will handle this when it finishes.', {

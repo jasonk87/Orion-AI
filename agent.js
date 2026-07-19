@@ -9457,6 +9457,33 @@ async function inspectScreenshotWithOllama({ imageBase64, path, goal, modelName 
   return normalizeScreenshotInspectionResult({ text, path, goal, providerName: modelName });
 }
 
+// ── Quick single-turn LLM call for Orion's conversational layer (no tools) ─────
+window.quickOrionLLMCall = async function(systemPrompt, userMessages, config) {
+  // userMessages: array of { role: 'user'|'assistant', content: string }
+  // Returns: string response text, or throws
+  const modelName = config.modelName || '';
+  const messages = [
+    { role: 'user', parts: [{ text: systemPrompt }] },
+    { role: 'model', parts: [{ text: 'Understood.' }] },
+    ...userMessages.map(m => ({
+      role: m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: String(m.content || m.text || '') }]
+    }))
+  ];
+
+  let resp;
+  if (/anthropic|claude/i.test(modelName)) {
+    resp = await callAnthropicAPI(messages, modelName, config.anthropicApiKey || '', () => {}, true);
+  } else if (/deepseek/i.test(modelName)) {
+    resp = await callDeepSeekAPI(messages, modelName, config.deepseekApiKey || '', () => {}, true);
+  } else {
+    resp = await callGeminiAPI(messages, modelName || 'gemini-2.5-flash', config.geminiApiKey || '', () => {}, true);
+  }
+
+  const text = resp && (resp.text || (resp.candidates && resp.candidates[0] && resp.candidates[0].content && resp.candidates[0].content.parts && resp.candidates[0].content.parts[0] && resp.candidates[0].content.parts[0].text) || '');
+  return String(text).trim();
+};
+
 // GEMINI API UTILITIES
 async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTools = false, options = {}) {
   let activeModelName = modelName;
