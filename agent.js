@@ -331,8 +331,9 @@ ${transcript}`;
 
   try {
     let rawJson = '';
+    const extractionModel = config.modelName;
     if (config.geminiApiKey) {
-      const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${config.geminiApiKey}`, {
+      const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${extractionModel}:generateContent?key=${config.geminiApiKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -346,10 +347,24 @@ ${transcript}`;
       const resp = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': config.anthropicApiKey, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 512, messages: [{ role: 'user', content: analyzePrompt }] })
+        body: JSON.stringify({ model: extractionModel, max_tokens: 512, messages: [{ role: 'user', content: analyzePrompt }] })
       });
       const data = await resp.json();
       rawJson = data?.content?.[0]?.text?.trim() || '{"items":[]}';
+    } else if (config.deepseekApiKey) {
+      const resp = await fetch('https://api.deepseek.com/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.deepseekApiKey}` },
+        body: JSON.stringify({
+          model: extractionModel,
+          messages: [{ role: 'user', content: analyzePrompt }],
+          max_tokens: 512,
+          temperature: 0.2,
+          response_format: { type: 'json_object' }
+        })
+      });
+      const data = await resp.json();
+      rawJson = data?.choices?.[0]?.message?.content?.trim() || '{"items":[]}';
     }
     const parsed = JSON.parse(rawJson);
     const items = Array.isArray(parsed?.items) ? parsed.items : [];
@@ -381,6 +396,42 @@ ${transcript}`;
       });
     }
   } catch (e) { /* silent — memory auto-save is best-effort */ }
+}
+
+// ── Inactivity-triggered memory auto-save ──────────────────────────────────────
+// Users rarely close a conversation explicitly, so "end of session" is treated instead as a
+// period of inactivity after a response: if no new user message arrives within
+// ORION_MEMORY_INACTIVITY_MS, that idle gap is the trigger. A single timer is enough since only
+// one conversation can be actively running/awaiting-follow-up at a time.
+const ORION_MEMORY_INACTIVITY_MS = 10 * 60 * 1000;
+let orionMemoryInactivityTimer = null;
+let orionMemoryInactivityConvId = null;
+
+function clearOrionMemoryInactivityTimer() {
+  if (orionMemoryInactivityTimer) clearTimeout(orionMemoryInactivityTimer);
+  orionMemoryInactivityTimer = null;
+  orionMemoryInactivityConvId = null;
+}
+window.clearOrionMemoryInactivityTimer = clearOrionMemoryInactivityTimer;
+
+function scheduleOrionMemoryInactivitySave(conversation, config, workspacePath, mode) {
+  clearOrionMemoryInactivityTimer();
+  const convId = conversation.id;
+  orionMemoryInactivityConvId = convId;
+  orionMemoryInactivityTimer = setTimeout(() => {
+    // Guard against firing for a conversation this timer no longer represents (belt-and-braces —
+    // clearOrionMemoryInactivityTimer should already have cancelled it in that case).
+    if (orionMemoryInactivityConvId !== convId) return;
+    orionMemoryInactivityTimer = null;
+    orionMemoryInactivityConvId = null;
+    autoSaveOrionMemory(conversation, config, workspacePath, mode).catch(() => {});
+  }, ORION_MEMORY_INACTIVITY_MS);
+  // In Node (tests, and any non-browser host) setTimeout returns a Timeout that keeps the process
+  // alive; unref it so a pending 10-minute timer never blocks process exit. Browsers return a
+  // plain number with no unref method, so this is a no-op there.
+  if (orionMemoryInactivityTimer && typeof orionMemoryInactivityTimer.unref === 'function') {
+    orionMemoryInactivityTimer.unref();
+  }
 }
 
 async function generateOrionSmartTitle(conversation, userText, assistantText, config) {
@@ -928,6 +979,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     return;
   }
   
+  // A new message means this conversation is no longer idle — cancel any pending
+  // inactivity-triggered memory save (a fresh one is scheduled once this run completes).
+  clearOrionMemoryInactivityTimer();
+
   isAgentRunning = true;
   runningConversationId = conversation.id;
   agentExecutionMode = 'planning';
@@ -2866,10 +2921,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         generateOrionSmartTitle(conversation, firstUser.text || '', firstAsst.text || '', config).catch(() => {});
       }
     }
-    // Auto-save memory insights from this session (silent, best-effort). Runs for coder-mode
-    // conversations too — corrections made mid-coding-session are just as worth remembering as
-    // ones made in Orion chat.
-    autoSaveOrionMemory(conversation, config, workspacePath, runMode).catch(() => {});
+    // Auto-save memory insights once this conversation goes idle (silent, best-effort). Runs for
+    // coder-mode conversations too — corrections made mid-coding-session are just as worth
+    // remembering as ones made in Orion chat.
+    scheduleOrionMemoryInactivitySave(conversation, config, workspacePath, runMode);
 
     // Determine whether the run stopped with genuine work still pending. This drives both the
     // auto-continue decision and an honest terminal message instead of a blanket "Task finished".

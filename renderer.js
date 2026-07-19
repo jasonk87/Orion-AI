@@ -3287,6 +3287,7 @@ function renderConversationList() {
 
 async function selectConversation(id) {
   activeConversationId = id;
+  if (window.clearOrionMemoryInactivityTimer) window.clearOrionMemoryInactivityTimer();
   const conv = conversations.find(c => c.id === id);
   if (!conv) return;
 
