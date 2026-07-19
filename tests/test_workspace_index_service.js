@@ -268,3 +268,53 @@ test('semantic chunks reuse unchanged source and invalidate when source changes'
   service.close();
   t.end();
 });
+
+test('semantic chunk embeddings use bounded concurrency', async (t) => {
+  const workspace = makeWorkspace(t, 'orion-index-concurrency-');
+  for (let index = 0; index < 12; index++) {
+    writeFile(workspace, `src/file${index}.js`, [
+      `function feature${index}() {`,
+      `  return ${index};`,
+      '}',
+      `module.exports = { feature${index} };`
+    ]);
+  }
+  const service = new WorkspaceIndexService(workspace, { watch: false, embeddingConcurrency: 4 });
+  let active = 0;
+  let maxActive = 0;
+  await service.getSemanticChunks({ embeddingBackend: 'test' }, async text => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    active -= 1;
+    return [text.length];
+  });
+  t.ok(maxActive > 1 && maxActive <= 4, `embedding concurrency stayed within the configured bound (max ${maxActive})`);
+  service.close();
+  t.end();
+});
+
+test('persisted workspace cache caps semantic vectors', (t) => {
+  const workspace = makeWorkspace(t, 'orion-index-cap-');
+  const service = new WorkspaceIndexService(workspace, { watch: false });
+  service.records.set('synthetic.js', {
+    path: 'synthetic.js',
+    semanticChunks: Array.from({ length: 2600 }, (_, index) => ({ text: `chunk-${index}`, vector: [index] }))
+  });
+  service.persist();
+  const persisted = JSON.parse(fs.readFileSync(path.join(workspace, '.orion', 'workspace-intelligence-cache.json'), 'utf8'));
+  const total = Object.values(persisted.files).reduce((sum, record) => sum + (record.semanticChunks || []).length, 0);
+  t.ok(total <= 2500, `persisted semantic chunk count is capped (got ${total})`);
+  service.close();
+  t.end();
+});
+
+test('factory defers initial reconciliation until the service is first used', (t) => {
+  const workspace = seedBasicWorkspace(t);
+  const service = getWorkspaceIndexService(workspace, { watch: false, fresh: true });
+  t.equal(service.initialReconcilePending, true, 'factory creation does not synchronously walk the workspace');
+  t.ok(service.getRecord('src/app.js'), 'first real lookup reconciles and returns indexed data');
+  t.equal(service.initialReconcilePending, false, 'initial reconciliation is complete after first use');
+  service.close();
+  t.end();
+});

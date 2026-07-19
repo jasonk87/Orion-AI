@@ -101,6 +101,7 @@ contextBridge.exposeInMainWorld('api', {
   
   // Shell Runner
   runCommand: (command, cwd, processId, timeoutMs) => ipcRenderer.invoke('run-command', { command, cwd, processId, timeoutMs }),
+  runDatabaseQuery: (payload) => ipcRenderer.invoke('orion:db-query', payload),
   startCommand: (command, cwd, processId, timeoutMs) => ipcRenderer.invoke('start-command', { command, cwd, processId, timeoutMs }),
   getCommandStatus: (processId) => ipcRenderer.invoke('get-command-status', processId),
   readCommandOutput: (processId, maxChars) => ipcRenderer.invoke('read-command-output', { processId, maxChars }),
@@ -124,15 +125,15 @@ contextBridge.exposeInMainWorld('api', {
   // Global Memory
   readGlobalMemory: () => ipcRenderer.invoke('orion:read-global-memory'),
   writeGlobalMemory: (updates) => ipcRenderer.invoke('orion:write-global-memory', updates),
-  appendGlobalFact: (text, category, config) => ipcRenderer.invoke('orion:append-global-fact', { text, category, config }),
-  appendGlobalPreference: (text, config, source, mode) => ipcRenderer.invoke('orion:append-global-preference', { text, config, source, mode }),
+  appendGlobalFact: (text, category, config, pinned) => ipcRenderer.invoke('orion:append-global-fact', { text, category, config, pinned }),
+  appendGlobalPreference: (text, config, source, mode, pinned) => ipcRenderer.invoke('orion:append-global-preference', { text, config, source, mode, pinned }),
   updateUserProfile: (updates) => ipcRenderer.invoke('orion:update-user-profile', { updates }),
   rankMemoryFacts: (query, config, limit, mode) => ipcRenderer.invoke('orion:rank-memory-facts', { query, config, limit, mode }),
 
   // Project Memory (extended)
-  appendProjectFact: (workspacePath, text, category, config) => ipcRenderer.invoke('orion:append-project-fact', { workspacePath, text, category, config }),
+  appendProjectFact: (workspacePath, text, category, config, pinned) => ipcRenderer.invoke('orion:append-project-fact', { workspacePath, text, category, config, pinned }),
   appendProjectDecision: (workspacePath, text, context) => ipcRenderer.invoke('orion:append-project-decision', { workspacePath, text, context }),
-  appendProjectPreference: (workspacePath, text, config, mode) => ipcRenderer.invoke('orion:append-project-preference', { workspacePath, text, config, mode }),
+  appendProjectPreference: (workspacePath, text, config, mode, pinned) => ipcRenderer.invoke('orion:append-project-preference', { workspacePath, text, config, mode, pinned }),
 
   // Skill Memory
   readSkillMemory: () => ipcRenderer.invoke('orion:read-skill-memory'),

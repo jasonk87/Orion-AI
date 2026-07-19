@@ -112,7 +112,8 @@ test('phone companion renders approvals and tool calls as first-class mobile UI'
   t.ok(companionHtml.includes('function renderInlineTypingIndicator'), 'phone renders active dots inside the transcript');
   t.ok(companionHtml.includes('message assistant typing-assistant'), 'phone typing dots occupy the next assistant message position');
   t.ok(companionHtml.includes("const typingHtml = state.running ? renderInlineTypingIndicator() : ''"), 'phone appends dots after rendered messages while active');
-  t.ok(companionHtml.includes("typingIndicatorEl.classList.remove('visible')"), 'phone does not show the old bottom typing strip');
+  t.notOk(companionHtml.includes('id="typing-indicator"'), 'phone removes the old bottom typing strip entirely');
+  t.notOk(companionHtml.includes('typingIndicatorEl'), 'phone no longer keeps a dead reference to the old typing strip');
   t.notOk(companionHtml.includes('id="clarification-panel"'), 'phone no longer renders clarification questions as a separate panel outside the transcript');
   t.ok(companionHtml.includes('function renderClarificationMessage'), 'phone renders clarification questions through the chat-message renderer');
   t.ok(companionHtml.includes('data-clarification-card="true"'), 'phone clarification cards are addressable inside the scrollable transcript');

@@ -109,6 +109,32 @@ test('Global memory - writeGlobalMemory merges partial update', (t) => {
   t.end();
 });
 
+test('Pinned global facts remain eligible after normal age filtering', async (t) => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-home-'));
+  const origHome = process.env.HOME;
+  const origUserProfile = process.env.USERPROFILE;
+  process.env.HOME = tmpHome;
+  process.env.USERPROFILE = tmpHome;
+
+  try {
+    const oldDate = '2020-01-01T00:00:00.000Z';
+    mm.writeGlobalMemory({
+      facts: [
+        { text: 'Old transient fact', category: 'general', addedAt: oldDate },
+        { text: 'Jason identity fact', category: 'identity', addedAt: oldDate, pinned: true }
+      ]
+    });
+    const ranked = await mm.rankGlobalFactsByQuery('', null, 10);
+    t.deepEqual(ranked.map(item => item.text), ['Jason identity fact'], 'only the pinned old fact survives age filtering');
+    t.equal(ranked[0].pinned, true, 'pinned state is preserved in recall results');
+  } finally {
+    process.env.HOME = origHome;
+    process.env.USERPROFILE = origUserProfile;
+    cleanup(tmpHome);
+  }
+  t.end();
+});
+
 // ── Project Memory ────────────────────────────────────────────────────────────
 
 test('Project memory - readProjectMemory returns defaults for missing workspace', (t) => {

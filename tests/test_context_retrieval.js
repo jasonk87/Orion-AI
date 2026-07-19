@@ -69,6 +69,20 @@ test('mergeRanges joins overlapping and adjacent retrieval ranges', (t) => {
   t.end();
 });
 
+test('inspectCodeContext falls back to a file overview when the query has no lexical or symbol match', async (t) => {
+  const workspace = makeWorkspace(t);
+  const result = await inspectCodeContext(workspace, {
+    paths: ['src/app.js'],
+    query: 'completely absent search phrase',
+    include: ['definitions'],
+    budgetTokens: 12000
+  });
+
+  t.equal(result.success, true, 'no-match retrieval succeeds instead of throwing');
+  t.ok(result.content.includes('function targetThing'), 'fallback includes the selected file content');
+  t.end();
+});
+
 test('readMultipleRanges returns exact numbered source from several files in one bundle', (t) => {
   const workspace = makeWorkspace(t);
   const result = readMultipleRanges(workspace, [

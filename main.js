@@ -14,6 +14,7 @@ const ipcUi = require('./lib/ipc-ui');
 const symbolIndex = require('./lib/symbol-index');
 const ipcSkill = require('./lib/ipc-skill');
 const ipcMemory = require('./lib/ipc-memory');
+const ipcDatabase = require('./lib/ipc-database');
 let lastConversationWriteRevision = 0;
 const MAX_PERSISTED_TOOL_PAYLOAD_CHARS = 250000;
 
@@ -124,6 +125,7 @@ function registerAllHandlers() {
   symbolIndex.registerHandlers(ipcMain);
   ipcSkill.registerHandlers(ipcMain);
   ipcMemory.registerHandlers(ipcMain);
+  ipcDatabase.registerHandlers(ipcMain);
   require('./lib/file-knowledge').registerHandlers(ipcMain);
 
   const { runLinter } = require('./lib/run-linter');
@@ -257,7 +259,16 @@ if (!isTestRuntime && !gotTheLock) {
 
     registerAllHandlers();
     createWindow();
-    if (!isTestRuntime) ipcServer.startPhoneCompanionServer();
+    if (!isTestRuntime) {
+      try {
+        await ipcServer.startPhoneCompanionServer();
+      } catch (error) {
+        console.error('Phone companion startup failed:', error);
+        if (Notification && Notification.isSupported && Notification.isSupported()) {
+          new Notification({ title: 'Orion phone companion unavailable', body: error.message }).show();
+        }
+      }
+    }
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();

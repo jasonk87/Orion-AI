@@ -1021,7 +1021,10 @@ test('token-saving prompt cleanup keeps tool schemas authoritative', (t) => {
   t.ok(agentJs.includes("'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model'"), 'Dispatch can inspect existing project artwork through read-only visual tools');
   t.ok(agentJs.includes('conversation._systemFactsSignature'), 'stable system facts are tracked by conversation signature');
   t.ok(agentJs.includes('[ORION SYSTEM FACTS - compact]'), 'unchanged system facts use a compact repeat block');
-  t.ok(agentJs.includes('if (shouldInjectFullSystemFacts && knownProjectsFacts)'), 'known project paths are only injected with full changed system facts');
+  t.ok(agentJs.includes('${workWalkthroughOverride}${knownProjectsBlock}`') && agentJs.includes('const knownProjectsBlock = knownProjectsFacts'), 'known project paths are folded into the full system-facts exchange');
+  t.notOk(agentJs.includes('buildToolUseContractPrompt()'), 'the redundant per-turn tool contract is no longer injected');
+  t.ok(agentJs.includes('const TOOL_RESULT_TRIM_THRESHOLD_CHARS = 1500') && agentJs.includes('const TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES = 3'), 'older read-only tool payloads are compacted aggressively');
+  t.ok(agentJs.includes('msgs.slice(-10)') && agentJs.includes("substring(0, 300)"), 'background memory extraction uses a bounded transcript');
   t.end();
 });
 

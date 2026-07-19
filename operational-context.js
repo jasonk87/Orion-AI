@@ -6,7 +6,7 @@
   const MAX_DISCOVERIES = 100;
   const MAX_DISCARDED = 50;
   const MAX_EVIDENCE = 50;
-  const MAX_CHAT_VIEW_MESSAGES = 16;
+  const MAX_CHAT_VIEW_MESSAGES = 8;
   const COMPLETION_STATUSES = ['continue_work', 'ask_clarification', 'blocked', 'ready_for_final'];
 
   function isoNow(now) {
@@ -491,7 +491,7 @@
     const input = cleanText(currentInput, 12000);
     const view = (Array.isArray(messages) ? messages : [])
       .filter(message => message && (message.role === 'user' || message.role === 'assistant'))
-      .map(message => ({ role: message.role, text: cleanText(message.text, 3000) }))
+      .map(message => ({ role: message.role, text: cleanText(message.text, 2000) }))
       .filter(message => message.text && message.text !== 'Thinking...' && !message.text.startsWith('[COMPACTED CONTEXT SUMMARY]'))
       .filter(message => message.role !== 'assistant' || !looksLikeSelfDiagnosisOrPromise(message.text));
     if (view.length && view[view.length - 1].role === 'user' && view[view.length - 1].text === input) view.pop();

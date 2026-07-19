@@ -79,6 +79,7 @@ CRITICAL RULES:
 TOOL USE:
 - Callable tools are supplied separately as formal JSON schemas. Use those schemas as the source of truth for available tool names, parameters, and per-tool behavior.
 - If a needed capability is not present in the supplied schemas, adapt with the available tools or explain the blocker; do not invent undeclared tool names.
+- If a planning gate blocks a tool call, do not paste strategy or implementation-plan prose into chat. State the blocker briefly and ask for the missing clarification.
 
 INCIDENTAL OBSERVATIONS:
 - While inspecting material required for the current task, you may notice a separate serious issue. Do not search for unrelated issues, broaden inspection, interrupt the current task, or spend extra tool calls investigating it.
@@ -98,13 +99,13 @@ MEMORY PROTOCOL:
 - SCOPE: Global memory is for things true across all projects (user identity, habits, people, cross-project preferences). Project memory is for things specific to the current workspace.
 
 PERSISTENT TERMINAL (terminal_exec):
-- Use "terminal_exec" when a sequence of commands needs to share state: directory changes, activated virtual environments, or exported environment variables that must persist between calls.
-- Provide a "sessionId" (string, default: "default") to group related commands into the same session. The session tracks cwd and env vars across calls automatically.
-- Use "resetSession: true" to clear a session and start fresh from the workspace root.
-- For single, stateless commands, continue using "run_command". Only use terminal_exec when state must carry over between steps.
+- Use "terminal_exec" when a sequence of commands needs to retain its working directory between calls.
+- Provide a "sessionId" (string, default: "default") to group related commands. Environment changes and activated shells do not persist; include those in each command when needed.
+- Use "resetSession: true" to clear a session and return to the workspace root.
+- For single, stateless commands, continue using "run_command".
 
 DATABASE QUERIES (db_query):
-- Use "db_query" to inspect or read data from a local SQLite file or a remote Postgres/MySQL database. Do NOT use this for write operations (INSERT/UPDATE/DELETE) without explicit user permission.
+- Use "db_query" to inspect data from a local SQLite file or a remote Postgres/MySQL database. The implementation enforces read-only statements and cannot perform mutations.
 - For SQLite: provide "dbPath" as an absolute path to the .sqlite, .db, or .sqlite3 file.
 - For Postgres: provide "connectionString" (e.g. "postgresql://user:pass@host:5432/dbname"). Optionally set "dbType": "postgres".
 - For MySQL: provide "connectionString" and set "dbType": "mysql".
@@ -147,7 +148,7 @@ Your callable tools are supplied separately as formal schemas. In Dispatch, use 
 DATABASE QUERIES (db_query):
 - Use "db_query" to read data directly from a local SQLite file or a Postgres/MySQL database without handing off to Coder.
 - For SQLite: provide "dbPath" (absolute path to the .sqlite/.db file). For Postgres/MySQL: provide "connectionString" and optionally "dbType".
-- Read-only by intent — avoid mutations. If Jason asks for data, use this tool rather than routing to Coder just to run a SELECT.
+- Read-only is technically enforced. If Jason asks for data, use this tool rather than routing to Coder just to run a SELECT.
 
 ENVIRONMENT INSPECTION (inspect_environment):
 - Use "inspect_environment" for read-only system checks: package versions, running processes, port availability, env vars, git status.
@@ -339,8 +340,8 @@ async function autoSaveOrionMemory(conversation, config, workspacePath, mode) {
   orionAutoSummarizedIds.add(convId); // mark before async to avoid double-fire
 
   // Build a condensed transcript
-  const transcript = msgs.slice(-20).map(m =>
-    `${m.role === 'user' ? 'Jason' : 'Orion'}: ${(m.text || '').substring(0, 400)}`
+  const transcript = msgs.slice(-10).map(m =>
+    `${m.role === 'user' ? 'Jason' : 'Orion'}: ${(m.text || '').substring(0, 300)}`
   ).join('\n');
 
   const analyzePrompt = `You are reviewing a conversation between Jason and Orion (his AI assistant).
@@ -1355,20 +1356,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       messages[0].parts[0].text = OperationalContext.formatForPrompt(workingState) || messages[0].parts[0].text;
     }
   };
-  if (scopedNotes.content && scopedNotes.content.trim()) {
-    messages.splice(2, 0,
-      {
-        role: 'user',
-        parts: [{
-          text: `[ORION DURABLE NOTES - ${scopedNotes.scopeLabel}]\nThese are persistent notes for this scope. Use them as working memory, but verify against files when needed.\n\n${scopedNotes.content}`
-        }]
-      },
-      {
-        role: 'model',
-        parts: [{ text: 'Understood. I will use these durable notes as context for this task.' }]
-      }
-    );
-  }
+  const durableNotesText = scopedNotes.content && scopedNotes.content.trim()
+    ? `[ORION DURABLE NOTES - ${scopedNotes.scopeLabel}]\nThese are persistent notes for this scope. Use them as working memory, but verify against files when needed.\n\n${scopedNotes.content}`
+    : '';
 
   let rulesText = '';
   if (workspacePath && window.api && window.api.readFile) {
@@ -1382,9 +1372,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
   let scratchpadText = conversation.scratchpad || '';
 
-  if ((projectMemory.facts && projectMemory.facts.length > 0) || rulesText || scratchpadText) {
+  if (durableNotesText || (projectMemory.facts && projectMemory.facts.length > 0) || rulesText || scratchpadText) {
     const memText = (projectMemory.facts || []).map((f, i) => `${i + 1}. [${f.category || 'general'}] ${f.text}`).join('\n');
     const combinedText = [
+      durableNotesText,
       memText ? `[ORION PROJECT MEMORY]\nPersistent workspace facts from prior sessions.\n\n${memText}` : '',
       rulesText ? `[PROJECT GOTCHAS & RULES]\nFound in .orion/rules.md. ALWAYS follow these rules for this project:\n\n${rulesText}` : '',
       scratchpadText ? `[CURRENT SCRATCHPAD STATE]\nYour persistent chain-of-thought scratchpad. Update this with update_scratchpad when you need to think through a task.\n\n${scratchpadText}` : ''
@@ -1417,6 +1408,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     ? `\nFresh project session context: ${String(conversation.dispatchContextSummary).replace(/\s+/g, ' ').trim().slice(0, 1800)}\nThis is a compact re-entry summary, not current source-code evidence. Preserve established discussion and decisions, but refresh only the files needed by the user's current question before making code claims.`
     : '';
   const knownProjectsFacts = formatKnownProjectsForSystemFacts();
+  const knownProjectsBlock = knownProjectsFacts
+    ? `\n\n[ORION KNOWN LOCAL PROJECTS]\nUse these registered absolute paths directly when Jason names a project:\n${knownProjectsFacts}`
+    : '';
   const systemFactsSignature = JSON.stringify({
     home: resolvedHomeDir,
     workspace: workspacePath || '',
@@ -1429,7 +1423,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const shouldInjectFullSystemFacts = conversation._systemFactsSignature !== systemFactsSignature;
   conversation._systemFactsSignature = systemFactsSignature;
   const systemFactsText = shouldInjectFullSystemFacts
-    ? `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nWeb search: ${webSearchStatus}\nClient: ${promptSource === 'phone' ? 'PHONE COMPANION — the user is on their phone. Prefer descriptions, text output, and copy-pasteable results over actions that require the desktop (launching GUI apps, opening windows, running interactive commands). If you need to show output, describe it clearly rather than suggesting they look at the screen.' : 'DESKTOP — the user is at their computer. You can launch apps, reference screen elements, and run interactive commands normally.'}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.${evidenceDisciplineRule}${dispatchProjectContext}${workWalkthroughOverride}`
+    ? `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nWeb search: ${webSearchStatus}\nClient: ${promptSource === 'phone' ? 'PHONE COMPANION — the user is on their phone. Prefer descriptions, text output, and copy-pasteable results over actions that require the desktop (launching GUI apps, opening windows, running interactive commands). If you need to show output, describe it clearly rather than suggesting they look at the screen.' : 'DESKTOP — the user is at their computer. You can launch apps, reference screen elements, and run interactive commands normally.'}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.${evidenceDisciplineRule}${dispatchProjectContext}${workWalkthroughOverride}${knownProjectsBlock}`
     : `[ORION SYSTEM FACTS - compact]\nStable system facts are unchanged from earlier in this conversation. Current workspace: ${workspacePath || '(none)'}. Home: ${resolvedHomeDir}. Web search: ${webSearchLabel}. Client: ${promptSource === 'phone' ? 'phone companion' : 'desktop'}.\nUse the current workspace for self-referential phrases like "this program" or "the project." Do NOT run echo or whoami to discover these paths.${evidenceDisciplineRule}${dispatchProjectContext}${workWalkthroughOverride}`;
   messages.splice(2, 0,
     {
@@ -1441,19 +1435,6 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       parts: [{ text: `Understood. System facts loaded (${shouldInjectFullSystemFacts ? 'full' : 'compact'}). Web search: ${webSearchLabel}. Client: ${promptSource === 'phone' ? 'phone companion' : 'desktop'}.${isDispatchConversation ? ' I will skip the Work Walkthrough section for this conversation.' : ''}` }]
     }
   );
-
-  if (shouldInjectFullSystemFacts && knownProjectsFacts) {
-    messages.splice(4, 0,
-      {
-        role: 'user',
-        parts: [{ text: `[ORION KNOWN LOCAL PROJECTS]\nThese are the local projects already registered in the app. When Jason names one of these projects, use the listed absolute path directly.\n${knownProjectsFacts}` }]
-      },
-      {
-        role: 'model',
-        parts: [{ text: 'Understood. I will use the known project paths directly when Jason names one.' }]
-      }
-    );
-  }
 
   // File-knowledge brief: cold ingestion (re-reading the whole project every task) is the
   // dominant startup cost in a known workspace. The ledger binds prior reads and saved notes to
@@ -1513,13 +1494,6 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       parts: [{ text: inheritedContextPrompt }]
     });
   }
-
-  messages.push({
-    role: 'user',
-    parts: [{
-      text: buildToolUseContractPrompt()
-    }]
-  });
 
   if (config.planningMode !== false) {
     const reviewOnlyConstraint = reviewOnly
@@ -3819,18 +3793,15 @@ async function executeTool(name, args, workspace, config, conversation) {
       // Lazy-init the session store on the window object so it persists across tool calls
       if (!window.orionTerminalSessions) window.orionTerminalSessions = {};
       if (teReset || !window.orionTerminalSessions[teSessionId]) {
-        window.orionTerminalSessions[teSessionId] = { cwd: workspace || null, env: {} };
+        window.orionTerminalSessions[teSessionId] = { cwd: workspace || null };
       }
       const teSession = window.orionTerminalSessions[teSessionId];
 
-      // Build a wrapped command that re-applies tracked state then captures the new cwd
+      // Build a wrapped command that reapplies the tracked directory and captures the next cwd.
+      // Each call is a fresh shell process, so environment/activation state is intentionally not claimed.
       const teCdLine = teSession.cwd ? `Set-Location ${JSON.stringify(teSession.cwd)}` : '';
-      const teEnvLines = Object.entries(teSession.env)
-        .map(([k, v]) => `$env:${k} = ${JSON.stringify(String(v))}`)
-        .join('; ');
       const teWrapped = [
         teCdLine,
-        teEnvLines,
         teCmd,
         `$_te_exit = if ($? -and $LASTEXITCODE -ne $null) { $LASTEXITCODE } else { if ($?) { 0 } else { 1 } }`,
         `Write-Output "::ORION_CWD::$(Get-Location)"`,
@@ -3870,73 +3841,16 @@ async function executeTool(name, args, workspace, config, conversation) {
 
     case 'db_query': {
       if (!args.query) throw new Error("Missing 'query' parameter");
-      const dbQuery = String(args.query).trim();
-      const dbPath = args.dbPath ? String(args.dbPath).trim() : null;
-      const connString = args.connectionString ? String(args.connectionString).trim() : null;
-
-      if (!dbPath && !connString) {
-        return { success: false, error: "Provide either 'dbPath' (for SQLite) or 'connectionString' (for Postgres/MySQL)." };
-      }
-
-      // Auto-detect db type from provided params
-      let dbType = args.dbType ? String(args.dbType).toLowerCase() : null;
-      if (!dbType) {
-        if (dbPath) dbType = 'sqlite';
-        else if (connString && connString.startsWith('postgresql')) dbType = 'postgres';
-        else if (connString && connString.startsWith('mysql')) dbType = 'mysql';
-        else dbType = 'sqlite';
-      }
-
-      let dbCmd;
-      if (dbType === 'sqlite') {
-        if (!dbPath) return { success: false, error: "SQLite requires 'dbPath'." };
-        // sqlite3 CLI: .mode json for structured output, run the query
-        const escapedPath = dbPath.replace(/"/g, '""');
-        // Escape double-quotes inside the query for PowerShell
-        const escapedQuery = dbQuery.replace(/"/g, '""');
-        dbCmd = `sqlite3 "${escapedPath}" ".mode json" ".headers on" "${escapedQuery}" 2>&1`;
-      } else if (dbType === 'postgres' || dbType === 'postgresql') {
-        if (!connString) return { success: false, error: "Postgres requires 'connectionString'." };
-        const escapedQuery = dbQuery.replace(/"/g, '\\"');
-        dbCmd = `psql "${connString}" --no-psqlrc --csv --tuples-only -c "${escapedQuery}" 2>&1`;
-      } else if (dbType === 'mysql') {
-        if (!connString) return { success: false, error: "MySQL requires 'connectionString'." };
-        const escapedQuery = dbQuery.replace(/"/g, '\\"');
-        dbCmd = `mysql --defaults-extra-file=/dev/null -e "${escapedQuery}" "${connString}" 2>&1`;
-      } else {
-        return { success: false, error: `Unknown dbType '${dbType}'. Use 'sqlite', 'postgres', or 'mysql'.` };
-      }
-
-      const dbProcessId = `db_${conversation.id}_${Date.now()}`;
-      const dbTimeout = args.timeoutMs || 30000;
-      let dbStdout = '', dbStderr = '';
-      const dbClean = typeof window.api.onCommandOutput === 'function'
-        ? window.api.onCommandOutput(dbProcessId, (data) => {
-            if (data.type === 'stderr') dbStderr += data.text;
-            else dbStdout += data.text;
-          })
-        : () => {};
-      const dbResult = await window.api.runCommand(dbCmd, workspace, dbProcessId, dbTimeout);
-      dbClean();
-
-      const dbRawOut = (dbStdout || dbResult.stdout || '').slice(0, 16000);
-      const dbRawErr = (dbStderr || dbResult.stderr || '').slice(0, 4000);
-      const dbSuccess = dbResult.code === 0;
-
-      // Try to parse JSON output (sqlite3 .mode json returns a JSON array)
-      let parsedRows = null;
-      if (dbSuccess && dbRawOut.trim().startsWith('[')) {
-        try { parsedRows = JSON.parse(dbRawOut.trim()); } catch (_) { /* leave as raw text */ }
-      }
-
-      return {
-        query: dbQuery,
-        dbType,
-        exitCode: dbResult.code,
-        ...(parsedRows !== null ? { rows: parsedRows, rowCount: parsedRows.length } : { output: dbRawOut }),
-        ...((!dbSuccess || dbRawErr) ? { error: dbRawErr || dbResult.error } : {}),
-        timedOut: !!dbResult.timedOut
-      };
+      const result = await window.api.runDatabaseQuery({
+        query: String(args.query).trim(),
+        dbPath: args.dbPath ? String(args.dbPath).trim() : undefined,
+        connectionString: args.connectionString ? String(args.connectionString).trim() : undefined,
+        dbType: args.dbType ? String(args.dbType).trim() : undefined,
+        timeoutMs: args.timeoutMs,
+        workspacePath: workspace
+      });
+      if (!result || !result.success) return result || { success: false, error: 'Database query failed.' };
+      return result;
     }
 
     case 'inspect_environment': {
@@ -4513,12 +4427,12 @@ async function executeTool(name, args, workspace, config, conversation) {
       const category = args.category || 'general';
       if (!text) throw new Error("Missing 'text' parameter");
       if (scope === 'global') {
-        const result = await window.api.appendGlobalFact(text, category, config);
+        const result = await window.api.appendGlobalFact(text, category, config, !!args.pinned);
         if (!result || !result.success) throw new Error((result && result.error) || 'appendGlobalFact failed');
         return { success: true, message: `Global fact stored: "${text}"` };
       } else {
         if (!workspace) throw new Error('No active workspace');
-        const result = await window.api.appendProjectFact(workspace, text, category, config);
+        const result = await window.api.appendProjectFact(workspace, text, category, config, !!args.pinned);
         if (!result || !result.success) throw new Error((result && result.error) || 'appendProjectFact failed');
         return { success: true, message: `Project fact stored: "${text}"` };
       }
@@ -4537,13 +4451,13 @@ async function executeTool(name, args, workspace, config, conversation) {
       const text = args.text;
       if (!text) throw new Error("Missing 'text' parameter");
       if (scope === 'global') {
-        const result = await window.api.appendGlobalPreference(text, config, undefined, activeConversationMode);
+        const result = await window.api.appendGlobalPreference(text, config, undefined, activeConversationMode, !!args.pinned);
         if (!result || !result.success) throw new Error((result && result.error) || 'appendGlobalPreference failed');
         return { success: true, message: `Global preference stored: "${text}"` };
       } else {
         const wp = args.workspacePath || workspace;
         if (!wp) throw new Error('No active workspace');
-        const result = await window.api.appendProjectPreference(wp, text, config, activeConversationMode);
+        const result = await window.api.appendProjectPreference(wp, text, config, activeConversationMode, !!args.pinned);
         if (!result || !result.success) throw new Error((result && result.error) || 'appendProjectPreference failed');
         return { success: true, message: `Project preference stored: "${text}"` };
       }
@@ -5308,12 +5222,6 @@ function normalizeFollowupPurpose(value) {
   if (/(server|localhost|dev server|npm run dev|web app)/.test(text)) return 'server-progress';
   if (/(quota|429|rate|retry)/.test(text)) return 'quota-retry';
   return text.slice(0, 160);
-}
-
-function buildToolUseContractPrompt() {
-  return `[SYSTEM: Before answering, decide whether the user's request requires interacting with the workspace or runtime. If it requires files, commands, tests, external docs, app state, timers, notes, or code changes, use the relevant tools before giving a final answer. Questions about this computer's performance, specs, RAM, CPU, disk, processes, or local environment require local inspection with tools unless fresh evidence is already present. If no tool is needed, answer normally and do not claim that work was performed. Never end with a generic completion message unless the Work Walkthrough shows what actually happened. Remember, for complex tasks, your final summary must explicitly list what planned tests were run, their results, and reasons for any skipped tests.
-
-CRITICAL: If a planning gate blocks a tool call, do NOT paste planning documents (STRATEGY.md content, implementation plan phases, testing plan sections) into your chat response. Instead write one short sentence explaining what is blocking you and ask the user to clarify or rephrase. Planning document prose must only ever go into files — never into the chat bubble.]`;
 }
 
 const STRATEGY_FILE_NAME = 'strategy.md';
@@ -6546,29 +6454,15 @@ Decision guidance:
 
 Examples:
 - "what python environments do i have installed on this computer" -> direct
-- "where is python installed and which one is first on PATH" -> direct
-- "run the tests" -> direct
 - "what is this program about" -> direct
-- "can you tell me what llm-call does" -> direct
 - "tell me about the project in my Desktop/projects folder" -> direct
 - "I have a folder on my desktop called rocket sumo, recommend similar games and improvements" -> direct
-- "what does this file do" -> direct
 - "look through my program and find any bugs" -> direct
-- "can you find typos and structural faults in my project" -> direct
-- "review my code for issues" -> direct
 - "audit this codebase for security problems" -> direct
 - "how could we make this program better?" -> direct
-- "what improvements could we make to this app?" -> direct
-- "can you suggest ways to improve this project?" -> direct
-- "what would you recommend to enhance this?" -> direct
-- "can you walk me through this?" -> direct
-- "what are the next steps?" -> direct
-- "how does this compare to other approaches?" -> direct
-- "elaborate on how that works" -> direct
 - "explain how PATH works on Windows" -> answer
 - "build me a Python desktop app" -> plan
 - "refactor the authentication flow" -> plan
-- "i have a folder on my desktop called rocket sumo, recommend similar games" -> direct
 - "lets add this game to the collection with the others, ensure smooth animated professional performance" -> plan
 - "go ahead and implement the racing game idea we just discussed, with a real 3D physics engine and new controller UI" -> plan
 - "let's build that feature you suggested" -> plan
@@ -8875,7 +8769,8 @@ function buildAgentToolDeclarations() {
               properties: {
                 scope: { type: "STRING", description: "global or project (default: project)." },
                 text: { type: "STRING", description: "The fact to store." },
-                category: { type: "STRING", description: "Optional category, e.g. architecture, api, gotcha, preference." }
+                category: { type: "STRING", description: "Optional category, e.g. architecture, api, gotcha, preference." },
+                pinned: { type: "BOOLEAN", description: "Keep this durable identity fact eligible for recall even after normal age filtering." }
               },
               required: ["text"]
             }
@@ -8901,7 +8796,8 @@ function buildAgentToolDeclarations() {
               properties: {
                 scope: { type: "STRING", description: "global or project (default: project)." },
                 text: { type: "STRING", description: "The preference to store, e.g. 'Always use TypeScript interfaces over type aliases'." },
-                workspacePath: { type: "STRING", description: "Optional workspace path override (project scope only)." }
+                workspacePath: { type: "STRING", description: "Optional workspace path override (project scope only)." },
+                pinned: { type: "BOOLEAN", description: "Keep this durable preference eligible for recall even after normal age filtering." }
               },
               required: ["text"]
             }
@@ -8919,11 +8815,11 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "terminal_exec",
-            description: "Run a shell command in a persistent terminal session that carries cwd and environment variable state between calls. Use when a sequence of commands must share directory context, an activated virtual environment, or exported env vars — e.g., cd into a project, activate a venv, then install or run. For single stateless commands, prefer run_command. Provide a sessionId to group related commands; omit it to use the default session.",
+            description: "Run a shell command in a terminal session that retains its working directory between calls. Environment variables and activated shells do not persist because each call starts a fresh process; include those setup steps in each command when needed. For single stateless commands, prefer run_command.",
             parameters: {
               type: "OBJECT",
               properties: {
-                command: { type: "STRING", description: "PowerShell command to run. Executed inside the tracked session cwd with session env vars pre-applied." },
+                command: { type: "STRING", description: "PowerShell command to run inside the tracked session working directory." },
                 sessionId: { type: "STRING", description: "Optional: name of the persistent session (default: 'default'). Use different IDs to maintain separate parallel sessions." },
                 resetSession: { type: "BOOLEAN", description: "If true, clears all session state (cwd resets to workspace root, env vars cleared) before running the command." },
                 timeoutMs: { type: "NUMBER", description: "Optional timeout in milliseconds (default 60000)." }
@@ -8933,11 +8829,11 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "db_query",
-            description: "Execute a SQL query against a local SQLite database file or a remote Postgres/MySQL database and return the results. Use for data inspection, schema review, debugging data issues, or answering questions about database contents. Prefer read-only queries (SELECT); avoid mutations unless the user explicitly asks. For SQLite, provide dbPath. For Postgres or MySQL, provide connectionString.",
+            description: "Execute one technically enforced read-only SQL query against SQLite, Postgres, or MySQL. Mutating keywords and multiple statements are blocked; SQLite opens in read-only mode and remote queries run inside read-only transactions. Connection passwords are passed through child-process environment variables, not command-line arguments.",
             parameters: {
               type: "OBJECT",
               properties: {
-                query: { type: "STRING", description: "SQL query to execute. Examples: 'SELECT * FROM users LIMIT 10', 'PRAGMA table_info(orders)', '.tables'" },
+                query: { type: "STRING", description: "One read-only SQL statement. Examples: 'SELECT * FROM users LIMIT 10' or 'PRAGMA table_info(orders)'." },
                 dbPath: { type: "STRING", description: "Absolute path to a local SQLite file (e.g. 'C:\\\\Users\\\\Owner\\\\projects\\\\app\\\\db.sqlite'). Use for SQLite databases." },
                 connectionString: { type: "STRING", description: "Connection string for Postgres (e.g. 'postgresql://user:pass@localhost:5432/dbname') or MySQL. Use for remote/server databases." },
                 dbType: { type: "STRING", description: "Optional: 'sqlite', 'postgres', or 'mysql'. Auto-detected from parameters if omitted." },
@@ -9526,8 +9422,8 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
 // needed the data again. Only read-only/inventory tools are eligible: never trim edit/write/test
 // results (patch_file, write_file, modify_file, run_tests, etc.), since those carry the actual
 // evidence the completion gate and verification logic depend on.
-const TOOL_RESULT_TRIM_THRESHOLD_CHARS = 4000;
-const TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES = 6;
+const TOOL_RESULT_TRIM_THRESHOLD_CHARS = 1500;
+const TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES = 3;
 const TRIMMABLE_TOOL_RESULT_NAMES = new Set([
   'list_files', 'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context',
   'grep_search', 'semantic_search', 'search_embeddings', 'get_symbol_index', 'get_file_symbols', 'find_references', 'read_command_output',
