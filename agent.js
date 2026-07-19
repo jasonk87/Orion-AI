@@ -186,28 +186,66 @@ async function refreshOrionMemoryBlock() {
   }
 }
 
-function buildOrionContinuityContext(conversation) {
+// Small stopword list used only to keep the recency/topic-overlap scoring below from treating
+// common filler words as a topic match — it does not need to be linguistically complete.
+const CONTINUITY_STOPWORDS = new Set([
+  'the', 'and', 'for', 'are', 'but', 'not', 'you', 'with', 'this', 'that', 'from', 'have', 'has',
+  'had', 'was', 'were', 'will', 'can', 'could', 'would', 'should', 'about', 'into', 'your', 'their',
+  'they', 'them', 'what', 'when', 'where', 'which', 'how', 'why', 'just', 'like', 'also', 'than',
+  'then', 'some', 'any', 'all', 'get', 'got', 'make', 'made', 'use', 'used', 'using'
+]);
+
+function extractContinuityWords(text) {
+  return new Set(
+    String(text || '')
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(w => w.length > 2 && !CONTINUITY_STOPWORDS.has(w))
+  );
+}
+
+async function buildOrionContinuityContext(conversation, workspacePath) {
   // Only inject on the very first user message in an Orion conversation
   const userMessages = (conversation.messages || []).filter(m => m.role === 'user');
   if (userMessages.length !== 1) return '';
-  const allConvs = window.conversations || [];
-  // Find the previous Orion conversation (not this one, not project-scoped)
-  const prev = allConvs.find(c => c.id !== conversation.id && !c.projectPath && c.messages && c.messages.some(m => m.role === 'assistant'));
-  if (!prev) return '';
-  const title = prev.title && prev.title !== 'New Conversation' ? prev.title : null;
-  const msgs = (prev.messages || []).filter(m => m.role === 'user' || m.role === 'assistant');
-  // Last 4 turns (up to 2 user + 2 assistant)
-  const tail = msgs.slice(-4);
-  if (!tail.length) return '';
-  const lines = tail.map(m => `${m.role === 'user' ? 'Jason' : 'Orion'}: ${(m.text || '').substring(0, 200)}`).join('\n');
-  const header = title ? `Last session — "${title}"` : 'Last session';
-  return `\n\n${header} (for context, do not summarize unprompted):\n${lines}`;
+  if (!workspacePath || !window.api || !window.api.listSessions) return '';
+
+  let sessions;
+  try {
+    const result = await window.api.listSessions(workspacePath, 10);
+    sessions = (result && Array.isArray(result.sessions)) ? result.sessions : [];
+  } catch (_) {
+    return '';
+  }
+  sessions = sessions.filter(s => s.sessionId !== conversation.id && s.summary && s.summary.trim());
+  if (!sessions.length) return '';
+
+  // Score by recency (sessions are already newest-first) plus topic overlap with the first
+  // message of this conversation, so a relevant older session can outrank a generic recent one.
+  const queryWords = extractContinuityWords(userMessages[0].text || '');
+  const scored = sessions.map((session, index) => {
+    const summaryWords = extractContinuityWords(session.summary);
+    let overlap = 0;
+    for (const w of queryWords) if (summaryWords.has(w)) overlap++;
+    const recencyScore = 1 / (index + 1);
+    return { session, score: overlap * 1.5 + recencyScore };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  const top = scored.slice(0, 3).map(s => s.session);
+  if (!top.length) return '';
+
+  const lines = top.map(s => {
+    const when = s.endedAt ? new Date(s.endedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
+    return `- ${s.summary}${when ? ` (${when})` : ''}`;
+  }).join('\n');
+
+  return `\n\nRecent sessions (for context, do not summarize unprompted):\n${lines}`;
 }
 
 // Tracks conversations already auto-summarized to avoid duplicate writes
 const orionAutoSummarizedIds = new Set();
 
-async function autoSaveOrionMemory(conversation, config) {
+async function autoSaveOrionMemory(conversation, config, workspacePath) {
   if (!config) return;
   const convId = conversation.id;
   if (orionAutoSummarizedIds.has(convId)) return;
@@ -223,10 +261,11 @@ async function autoSaveOrionMemory(conversation, config) {
   ).join('\n');
 
   const analyzePrompt = `You are reviewing a conversation between Jason and Orion (his AI assistant).
-Extract ONLY facts and preferences worth remembering in future sessions — things Jason expressed clearly or decided.
-Return JSON: {"items": [{"type": "fact"|"preference", "text": "..."}]}
-Return {"items": []} if nothing is worth saving.
-Keep each item under 120 characters. Do not save trivial details, greetings, or task steps.
+Extract facts/preferences worth remembering in future sessions, and a short session summary for a session log.
+Return JSON: {"items": [{"type": "fact"|"preference", "text": "..."}], "session": {"summary": "...", "decisions": ["..."], "discoveries": ["..."], "tasksCompleted": ["..."], "openItems": ["..."]}}
+"items" are durable facts/preferences Jason expressed clearly or decided. Keep each under 120 characters. Do not include trivial details, greetings, or task steps. Return [] if none.
+"session.summary" is a concise 1-2 sentence description of what this session covered — return "" if the conversation had no durable content worth logging.
+"session.decisions"/"discoveries"/"tasksCompleted"/"openItems" are short bullet strings (under 150 characters each) — omit or leave empty where nothing applies.
 
 Conversation:
 ${transcript}`;
@@ -239,7 +278,7 @@ ${transcript}`;
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: analyzePrompt }] }],
-          generationConfig: { maxOutputTokens: 256, temperature: 0.2, responseMimeType: 'application/json' }
+          generationConfig: { maxOutputTokens: 512, temperature: 0.2, responseMimeType: 'application/json' }
         })
       });
       const data = await resp.json();
@@ -248,7 +287,7 @@ ${transcript}`;
       const resp = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': config.anthropicApiKey, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 256, messages: [{ role: 'user', content: analyzePrompt }] })
+        body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 512, messages: [{ role: 'user', content: analyzePrompt }] })
       });
       const data = await resp.json();
       rawJson = data?.content?.[0]?.text?.trim() || '{"items":[]}';
@@ -269,7 +308,21 @@ ${transcript}`;
     if (items.length > 0) {
       console.log(`[Orion] Auto-saved ${items.length} memory item(s) from session.`);
       // Refresh the in-memory block so the next run in this session starts with the new facts
-      await refreshOrionMemoryBlock().catch(() => {});
+      await refreshOrionMemoryBlock(config).catch(() => {});
+    }
+
+    const session = parsed && parsed.session;
+    const summary = session && typeof session.summary === 'string' ? session.summary.trim() : '';
+    if (summary && workspacePath && window.api && window.api.saveSession) {
+      await window.api.saveSession(workspacePath, {
+        sessionId: convId,
+        startedAt: conversation.createdAt ? new Date(conversation.createdAt).toISOString() : new Date().toISOString(),
+        summary,
+        decisions: Array.isArray(session.decisions) ? session.decisions : [],
+        discoveries: Array.isArray(session.discoveries) ? session.discoveries : [],
+        tasksCompleted: Array.isArray(session.tasksCompleted) ? session.tasksCompleted : [],
+        openItems: Array.isArray(session.openItems) ? session.openItems : []
+      });
     }
   } catch (e) { /* silent — memory auto-save is best-effort */ }
 }
@@ -827,20 +880,21 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   activeRunController = new AbortController();
   window.currentLoopCount = 0;
   currentAgentLogs = [];
+  const config = window.getAppConfig();
   // Session continuity: build prev-session context on first message, clear otherwise
   const isOrionMode = conversation.mode === 'orion' ||
     (conversation.mode !== 'coder' && typeof appMode !== 'undefined' && appMode === 'orion');
   activeConversationMode = isOrionMode ? 'orion' : 'coder';
+  let workspacePath = resolveConversationWorkspace(conversation);
   if (isOrionMode) {
-    orionSessionContinuityContext = buildOrionContinuityContext(conversation);
-    await refreshOrionMemoryBlock(); // pre-load global memory into system prompt
+    orionSessionContinuityContext = await buildOrionContinuityContext(conversation, workspacePath);
+    await refreshOrionMemoryBlock(config, userPrompt); // pre-load global memory, ranked against this message
   } else {
     orionSessionContinuityContext = '';
     orionCachedMemoryBlock = '';
   }
   if (window.onAgentStatusChange) window.onAgentStatusChange(true);
-  
-  const config = window.getAppConfig();
+
   conversation._activeContextRunId = `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   config.modelName = modelName || config.modelName || 'gemini-2.5-flash-lite';
   let activeRunModelName = config.modelName;
@@ -929,7 +983,6 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   try {
     if (window.api && window.api.getHomeDir) resolvedHomeDir = await window.api.getHomeDir();
   } catch (_) {}
-  let workspacePath = resolveConversationWorkspace(conversation);
   const inheritedContextReceipt = await loadInheritedContextReceipt(conversation, workspacePath);
 
   const scopedNotes = await readScopedNotes(workspacePath, conversation);
@@ -2750,7 +2803,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         generateOrionSmartTitle(conversation, firstUser.text || '', firstAsst.text || '', config).catch(() => {});
       }
       // Auto-save memory insights from this session (silent, best-effort)
-      autoSaveOrionMemory(conversation, config).catch(() => {});
+      autoSaveOrionMemory(conversation, config, workspacePath).catch(() => {});
     }
 
     // Determine whether the run stopped with genuine work still pending. This drives both the
