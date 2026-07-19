@@ -32,6 +32,9 @@ function cleanupSpawnedTestProcesses() {
   const pids = new Set();
   for (const child of Object.values(main.activeProcesses || {})) {
     if (child && child.pid) pids.add(child.pid);
+    if (child && child.stdout && !child.stdout.destroyed) child.stdout.destroy();
+    if (child && child.stderr && !child.stderr.destroyed) child.stderr.destroy();
+    if (child && typeof child.unref === 'function') child.unref();
   }
   for (const pid of (main.launchedWorkspaceProcesses || new Map()).values()) {
     if (pid) pids.add(pid);
@@ -52,6 +55,14 @@ function cleanupSpawnedTestProcesses() {
 
   for (const id of Object.keys(main.activeProcesses || {})) delete main.activeProcesses[id];
   if (main.launchedWorkspaceProcesses) main.launchedWorkspaceProcesses.clear();
+
+  // A detached Windows child can be fully terminated while its libuv pipe/conhost handle remains
+  // referenced. At this point every test has completed, so release any remaining non-stdio test
+  // handles instead of letting the outer per-file runner mistake teardown latency for a timeout.
+  const standardHandles = new Set([process.stdin, process.stdout, process.stderr]);
+  for (const handle of process._getActiveHandles()) {
+    if (!standardHandles.has(handle) && handle && typeof handle.unref === 'function') handle.unref();
+  }
 }
 
 test('conversation persistence trims oversized generated tool payloads without mutating live history', (t) => {
