@@ -412,16 +412,24 @@ test('source updater picks up brand-new lib modules missing from the running bui
     fsx.mkdirSync(pathx.join(src, 'lib'), { recursive: true });
     fsx.writeFileSync(pathx.join(src, 'lib', 'brand-new-module.js'), 'module.exports = 1;');
     fsx.writeFileSync(pathx.join(src, 'agent.js'), 'updated agent');
+    // Root-level modules missed by the lib-only scan crashed the packaged app with
+    // "Cannot find module '../task-orchestration'" — cover them explicitly.
+    fsx.writeFileSync(pathx.join(src, 'brand-new-root-module.js'), 'module.exports = 2;');
+    fsx.writeFileSync(pathx.join(src, 'test-runner.js'), 'tooling, never shipped');
 
     const list = ipcUi.resolveUpdateFileList(src);
     t.ok(list.includes('lib/brand-new-module.js'), 'source-derived file list contains the new module');
     t.ok(list.includes('agent.js'), 'static manifest entries are preserved in the union');
+    t.ok(list.includes('brand-new-root-module.js'), 'source-derived file list contains new root-level runtime modules');
+    t.notOk(list.includes('test-runner.js'), 'build/test tooling stays out of the update file list');
 
     const changed = ipcUi.computeSourceUpdates(src, dest);
     t.ok(changed.includes('lib/brand-new-module.js'), 'the new module is detected as needing sync');
+    t.ok(changed.includes('brand-new-root-module.js'), 'the new root module is detected as needing sync');
 
     ipcUi.syncSourceUpdateFiles(src, dest, changed);
     t.ok(fsx.existsSync(pathx.join(dest, 'lib', 'brand-new-module.js')), 'the new module lands in the packaged app');
+    t.ok(fsx.existsSync(pathx.join(dest, 'brand-new-root-module.js')), 'the new root module lands in the packaged app');
   } finally {
     fsx.rmSync(src, { recursive: true, force: true });
     fsx.rmSync(dest, { recursive: true, force: true });
