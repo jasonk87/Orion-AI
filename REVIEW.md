@@ -22,6 +22,20 @@ This review describes the active development branch. It does not claim to descri
 | Generated personal artifacts | Unrelated Wi-Fi help and personal review files were removed from the application branch. |
 | Branch verification | A Windows GitHub Actions workflow now runs `npm ci` and `npm test` for PRs and pushes to the active development/default branches. |
 
+## Resolved in the orchestration-correctness pass
+
+This pass corrects the connected orchestration failures exposed by the live GRITLIFE conversation. All items are structural (code-enforced contracts with regression tests), not prompt-only reminders.
+
+| Area | Resolution |
+|---|---|
+| Evidence-backed memory claims | `orchestration-contracts.js` defines a typed response basis (conversation evidence / project knowledge / general inference). The agent loop records retrieved conversation evidence, validates explicit recall claims ("I remember", "we discussed") against it, and rewrites unsupported recall into an honest could-not-retrieve statement instead of a fabricated conversation. |
+| Conversation-memory retrieval | `lib/conversation-memory.js` searches persisted conversations and session memory before project summaries, expands queries with entities from the recent exchange, and applies recency weighting for phrases like "earlier"/"we talked about". Same-millisecond session memories persist distinctly and remain retrievable in deterministic order. |
+| Resolved task packets | `task-orchestration.js` converts context-dependent utterances ("Let's do it", "Continue") into self-contained task packets (title, resolved objective, conversation summary, workspace, requirements, provenance identifiers, lifecycle status) before queuing or handoff. Unresolvable references ("Use the second one" with no context) produce a targeted clarifying question, not a queued raw phrase. |
+| Task ownership and cancellation | `lib/orchestration-task-store.js` persists tasks atomically with unique IDs and a strict lifecycle (pending/active/completed/cancelled/failed). Handoffs return the task ID; Dispatch can inspect and cancel tasks it launched, scoped by conversation provenance. Cancellation reuses the existing AbortController path, pending tasks are removable, and cancelled tasks cannot emit stale success notifications. Phone New Focus cancels only pending tasks owned by the selected conversation. |
+| Quoted-example protection | `dispatch-intent.js` classifies executable intent only for active user instructions. Command-like text inside blockquotes, fenced/inline code, quoted strings, pasted transcripts, test descriptions, and status reports does not trigger a handoff, while the genuine direct request still produces exactly one `handoff_to_coder` call. |
+| Workspace resolution | `workspace-resolution.js` distinguishes active project workspace, generic Projects search root, standalone Coder workspace, and unresolved. Named projects resolve through registered projects, conversation context, and filesystem search; the search root is never described as the selected workspace, and resolved workspaces ride along in task packets. |
+| Factual status accuracy | Structured status facts (e.g., PR open/mergeable) are carried through the response contract; a validator rejects wording that upgrades "mergeable" to "merged", "queued" to "running", or "cancelled" to "completed", and restores the accurate structured state. |
+
 ## Verified phone push infrastructure
 
 The current branch includes:
