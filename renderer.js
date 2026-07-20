@@ -85,8 +85,8 @@ let dispatchDraft = {
   projectPath: '',
   contextSummary: ''
 };
-const TaskOrchestration = window.OrionTaskOrchestration;
-const WorkspaceResolution = window.OrionWorkspaceResolution;
+const RendererTaskOrchestration = window.OrionTaskOrchestration;
+const RendererWorkspaceResolution = window.OrionWorkspaceResolution;
 let orchestrationTasksReady = Promise.resolve();
 const orchestrationTaskCache = new Map();
 
@@ -1010,8 +1010,8 @@ function collectDispatchActiveWork(isGlobalRunning = false, globalRunningId = ''
       const status = durableTask
         ? durableTask.status
         : (running ? 'active' : ((queued || waitingForInput || waitingForReview) ? 'pending' : 'failed'));
-      const subStatus = durableTask && TaskOrchestration
-        ? TaskOrchestration.describeTaskStatus(durableTask)
+      const subStatus = durableTask && RendererTaskOrchestration
+        ? RendererTaskOrchestration.describeTaskStatus(durableTask)
         : (running && window.getAgentSubStatus
           ? window.getAgentSubStatus()
           : (queued
@@ -2005,7 +2005,7 @@ function structuredWorkspaceForConversation(conv, explicitPath = '') {
   const searchRoot = getDispatchWorkspaceRoot();
   const mode = conversationMode(conv);
   const workspacePath = String(explicitPath || (conv && (conv.workspace || conv.projectPath || conv.dispatchProjectPath)) || '').trim();
-  if (!WorkspaceResolution) {
+  if (!RendererWorkspaceResolution) {
     return {
       role: workspacePath ? (mode === 'coder' ? 'standalone_coder' : 'active_project') : 'unresolved',
       path: workspacePath,
@@ -2014,7 +2014,7 @@ function structuredWorkspaceForConversation(conv, explicitPath = '') {
       resolved: !!workspacePath
     };
   }
-  const resolution = WorkspaceResolution.classifyWorkspace({
+  const resolution = RendererWorkspaceResolution.classifyWorkspace({
     mode,
     workspacePath,
     projectPath: conv && conv.projectPath,
@@ -2031,7 +2031,7 @@ function structuredWorkspaceForConversation(conv, explicitPath = '') {
       path: resolution.projectPath || ''
     },
     source: resolution.source || '',
-    resolved: resolution.kind !== WorkspaceResolution.KINDS.UNRESOLVED && !!resolution.path
+    resolved: resolution.kind !== RendererWorkspaceResolution.KINDS.UNRESOLVED && !!resolution.path
   };
 }
 
@@ -2067,7 +2067,7 @@ function persistTaskClarification(conv, clarification) {
 }
 
 async function enqueueOrchestrationTask(options = {}) {
-  if (!TaskOrchestration || !window.api || typeof window.api.createOrchestrationTask !== 'function') {
+  if (!RendererTaskOrchestration || !window.api || typeof window.api.createOrchestrationTask !== 'function') {
     return { success: false, error: 'Durable task orchestration is unavailable.' };
   }
   const targetConversationId = String(options.targetConversationId || options.conversationId || activeConversationId || '');
@@ -2079,7 +2079,7 @@ async function enqueueOrchestrationTask(options = {}) {
   const workspace = options.workspace && typeof options.workspace === 'object'
     ? options.workspace
     : structuredWorkspaceForConversation(originConv, options.workspacePath || '');
-  const packetResult = TaskOrchestration.buildTaskPacket({
+  const packetResult = RendererTaskOrchestration.buildTaskPacket({
     originalUserMessage,
     resolvedObjective: options.resolvedObjective || '',
     title: options.title || '',
@@ -2113,7 +2113,7 @@ async function enqueueOrchestrationTask(options = {}) {
   }
   const task = persisted.task;
   orchestrationTaskCache.set(task.taskId, task);
-  const runtimePrompt = TaskOrchestration.renderTaskPrompt(task);
+  const runtimePrompt = RendererTaskOrchestration.renderTaskPrompt(task);
   window.promptQueue = Array.isArray(window.promptQueue) ? window.promptQueue : [];
   const queueItem = {
     id: options.queueId || createQueuedPromptId(),
@@ -2160,7 +2160,7 @@ async function initializeOrchestrationTasks() {
       window.promptQueue.push({
         id: createQueuedPromptId(),
         taskId: task.taskId,
-        prompt: TaskOrchestration.renderTaskPrompt(task),
+        prompt: RendererTaskOrchestration.renderTaskPrompt(task),
         originalUserMessage: task.originalUserMessage,
         taskTitle: task.title,
         conversationId: targetId,
@@ -2186,7 +2186,7 @@ window.claimOrchestrationTask = async function(taskId) {
   if (!claimed || claimed.success === false || !claimed.task) return { success: false, reason: (claimed && claimed.error) || 'Task could not be claimed.' };
   task = claimed.task;
   orchestrationTaskCache.set(task.taskId, task);
-  return { success: true, task, prompt: TaskOrchestration.renderTaskPrompt(task) };
+  return { success: true, task, prompt: RendererTaskOrchestration.renderTaskPrompt(task) };
 };
 
 window.finalizeOrchestrationTask = async function(taskId, status, details = {}) {
@@ -2220,7 +2220,7 @@ window.getOrchestrationTaskStatus = async function(taskId, requesterConversation
   const result = await window.api.getOrchestrationTask(taskId);
   if (!result || result.success === false || !result.task) return result || { success: false, error: 'Task not found.' };
   orchestrationTaskCache.set(result.task.taskId, result.task);
-  if (requesterConversationId && TaskOrchestration && !TaskOrchestration.canRequesterControlTask(result.task, { conversationId: requesterConversationId })) {
+  if (requesterConversationId && RendererTaskOrchestration && !RendererTaskOrchestration.canRequesterControlTask(result.task, { conversationId: requesterConversationId })) {
     return { success: false, error: 'This conversation does not own that task.', code: 'TASK_CONTROL_FORBIDDEN' };
   }
   return {
@@ -2228,7 +2228,7 @@ window.getOrchestrationTaskStatus = async function(taskId, requesterConversation
     task: result.task,
     taskId: result.task.taskId,
     status: result.task.status,
-    description: TaskOrchestration ? TaskOrchestration.describeTaskStatus(result.task) : result.task.status
+    description: RendererTaskOrchestration ? RendererTaskOrchestration.describeTaskStatus(result.task) : result.task.status
   };
 };
 
@@ -5178,7 +5178,7 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
     const originConv = conversations.find(item => item.id === String(options.sourceConversationId || ''));
     const handoffTask = await enqueueOrchestrationTask({
       prompt: queuedPrompt,
-      resolvedObjective: TaskOrchestration && TaskOrchestration.isContextDependentRequest(prompt) ? '' : queuedPrompt,
+      resolvedObjective: RendererTaskOrchestration && RendererTaskOrchestration.isContextDependentRequest(prompt) ? '' : queuedPrompt,
       title,
       targetConversationId: conv.id,
       originConversationId: String(options.sourceConversationId || conv.id),
@@ -5543,8 +5543,8 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     activeWork: activeWork.slice(0, 6),
     workspace: companionWorkspace,
     workspaceKind: companionWorkspaceResolution.role,
-    workspaceDescription: WorkspaceResolution
-      ? WorkspaceResolution.describeWorkspace({
+    workspaceDescription: RendererWorkspaceResolution
+      ? RendererWorkspaceResolution.describeWorkspace({
           kind: companionWorkspaceResolution.role,
           path: companionWorkspaceResolution.path,
           searchRoot: getDispatchWorkspaceRoot(),
