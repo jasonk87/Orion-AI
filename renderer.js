@@ -2941,6 +2941,11 @@ function mergeConversationSets(...sets) {
   return [...byId.values()].sort((a, b) => conversationSortTime(b) - conversationSortTime(a));
 }
 
+// True only after the on-disk index has been read successfully this session. If startup
+// crashes before that read, the in-memory list holds at most a freshly created conversation,
+// and writing the index from it would clobber every persisted conversation stub.
+let diskConversationIndexLoaded = false;
+
 async function loadConversationsFromStorage() {
   const local = parseConversationStorageCandidate(localStorage.getItem('ag2_conversations'), 'ag2_conversations');
   const backup = parseConversationStorageCandidate(localStorage.getItem('ag2_conversations_backup'), 'ag2_conversations_backup');
@@ -2950,6 +2955,7 @@ async function loadConversationsFromStorage() {
       const result = await window.api.readConversationsIndex();
       if (result && result.success && Array.isArray(result.index)) {
         disk = result.index;
+        diskConversationIndexLoaded = true;
       } else if (result && result.error) {
         console.warn('Failed to read disk conversation index', result.error);
       }
@@ -3412,7 +3418,7 @@ async function executeSaveConversationsToStorage() {
   // 3. Dispatch to disk
   const diskWrites = [];
   if (window.api) {
-    if (typeof window.api.writeConversationsIndex === 'function') {
+    if (typeof window.api.writeConversationsIndex === 'function' && diskConversationIndexLoaded) {
       const indexWrite = window.api.writeConversationsIndex({ revision, index }).then(result => {
         if (result && result.success) {
           lastConversationDiskSaveError = '';
@@ -4578,7 +4584,11 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     `;
   }
   
-  const aiMsgTime = isNew ? formatMsgTime(Date.now()) : '';
+  // Prefer the message's stored send time; replayed transcripts must not restamp every bubble
+  // with the render-time clock. Date.now() is correct only for a brand-new bubble with no
+  // persisted message behind it (ad-hoc status replies).
+  const aiMsgTs = msgMeta ? Number(msgMeta.createdAt || msgMeta.timestamp || msgMeta.updatedAt) || 0 : 0;
+  const aiMsgTime = aiMsgTs ? formatMsgTime(aiMsgTs) : (isNew && !msgMeta ? formatMsgTime(Date.now()) : '');
   bubble.innerHTML = `
     <div class="message-header ai">
       <span>✦ Orion AI</span>

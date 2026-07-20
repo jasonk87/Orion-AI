@@ -1029,6 +1029,11 @@ test('Dispatch permission refusals deterministically require a Coder handoff', (
   t.ok(/verify the result/i.test(prompt), 'the Coder prompt requires outcome verification');
   t.ok(agentJs.includes('MUST call handoff_to_coder'), 'Dispatch system instructions state the permission-boundary invariant');
   t.ok(agentJs.includes('synthesize the allowed Coder'), 'the invariant is enforced in code, not only prose');
+  // Regression: the instruction guard once read `instructionAnalysis.executionRequested`, a
+  // property analyzeDispatchInstruction never returns, so `!undefined` blocked EVERY model-initiated
+  // handoff and Dispatch could only loop on re-confirmation prompts.
+  t.ok(agentJs.includes('instructionAnalysis.requiresCoderExecution'), 'the instruction guard reads the property analyzeDispatchInstruction actually returns');
+  t.ok(!agentJs.includes('instructionAnalysis.executionRequested'), 'the phantom executionRequested property is gone');
   t.end();
 });
 

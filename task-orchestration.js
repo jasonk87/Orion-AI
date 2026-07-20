@@ -137,6 +137,12 @@
     const request = compactInline(value);
     if (!request || request.length > 220) return false;
     const normalized = request.toLowerCase().replace(/[.!?]+$/g, '').trim();
+    // A bare affirmation ("Yes", "yeah, do it") answers a pending assistant question, so the real
+    // request lives entirely in the preceding context.
+    if (/^(?:yes|yeah|yep|yup|sure|absolutely|definitely|correct|confirmed|affirmative|please\s+do|go\s+for\s+it|send\s+it|route\s+it)(?:[,!. ]+(?:please|now|do\s+it|go\s+ahead|route\s+it|send\s+it))*$/.test(normalized)) {
+      return true;
+    }
+    const withoutLeadingAffirmation = normalized.replace(/^(?:yes|yeah|yep|yup|ok(?:ay)?|sure|alright)[,!. ]+/, '');
     const directPatterns = [
       /^(?:okay[, ]*)?(?:let['’]?s|lets)\s+(?:do|build|implement|ship|make)\s+(?:it|that|this)$/,
       /^(?:okay[, ]*)?go\s+ahead(?:\s+(?:with\s+)?(?:it|that|this))?$/,
@@ -146,7 +152,7 @@
       /^(?:please\s+)?continue(?:\s+(?:that|it|this|from\s+there|with\s+that))?$/,
       /^(?:please\s+)?(?:proceed|do\s+it|ship\s+it|make\s+that\s+change|carry\s+on)$/
     ];
-    if (directPatterns.some(pattern => pattern.test(normalized))) return true;
+    if (directPatterns.some(pattern => pattern.test(normalized) || pattern.test(withoutLeadingAffirmation))) return true;
     return /^(?:please\s+)?(?:fix|use|change|update|remove|add|build|implement|make|continue)\b/.test(normalized)
       && /\b(?:it|that|this|those|them|one|ones|earlier|above|discussed)\b/.test(normalized);
   }
@@ -238,7 +244,7 @@
     if (corpus.length < 45) return false;
     const meaningfulTokens = new Set((corpus.toLowerCase().match(/[a-z0-9][a-z0-9_-]{2,}/g) || [])
       .filter(token => !/^(the|and|that|this|with|from|have|will|would|could|should|about|what|when|where|then|just|into|like|user|assistant|context)$/.test(token)));
-    const hasActionableDetail = /\b(?:build|implement|design|fix|replace|evolve|merge|derive|create|change|add|remove|enroll|subscribe|system|feature|workflow|option|approach|plan|require|allow|organize)\b/i.test(corpus);
+    const hasActionableDetail = /\b(?:build|implement|design|fix|replace|evolve|merge|derive|create|change|add|remove|enroll|subscribe|system|feature|workflow|option|approach|plan|require|allow|organize|restart|relaunch|reboot|kill|stop|start|launch|run|execute|install|uninstall|delete|deploy)\b/i.test(corpus);
     return messages.length > 0 && meaningfulTokens.size >= 6 && hasActionableDetail;
   }
 
@@ -283,7 +289,7 @@
     const scored = messages.map(message => {
       const value = compactWhitespace(message.value);
       let score = Math.min(value.length, 1200) / 100;
-      if (/\b(?:build|implement|design|fix|replace|evolve|merge|derive|create|change|system|feature|workflow|subscription|enrollment|commitment)\b/i.test(value)) score += 8;
+      if (/\b(?:build|implement|design|fix|replace|evolve|merge|derive|create|change|system|feature|workflow|subscription|enrollment|commitment|restart|relaunch|reboot|kill|stop|launch|execute|install|uninstall|delete|deploy)\b/i.test(value)) score += 8;
       if (/\b(?:must|should|need|require|include|allow|support|evaluate)\b/i.test(value)) score += 4;
       if (/user/i.test(message.role)) score += 1;
       return { value, score, index: message.index };
