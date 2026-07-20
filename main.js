@@ -15,6 +15,8 @@ const symbolIndex = require('./lib/symbol-index');
 const ipcSkill = require('./lib/ipc-skill');
 const ipcMemory = require('./lib/ipc-memory');
 const ipcDatabase = require('./lib/ipc-database');
+const ipcOrchestration = require('./lib/ipc-orchestration');
+const conversationMemory = require('./lib/conversation-memory');
 let lastConversationWriteRevision = 0;
 const MAX_PERSISTED_TOOL_PAYLOAD_CHARS = 250000;
 
@@ -126,6 +128,9 @@ function registerAllHandlers() {
   ipcSkill.registerHandlers(ipcMain);
   ipcMemory.registerHandlers(ipcMain);
   ipcDatabase.registerHandlers(ipcMain);
+  ipcOrchestration.registerHandlers(ipcMain, {
+    filePath: () => path.join(app.getPath('userData'), 'orchestration-tasks.json')
+  });
   require('./lib/file-knowledge').registerHandlers(ipcMain);
 
   const { runLinter } = require('./lib/run-linter');
@@ -146,6 +151,23 @@ function registerAllHandlers() {
   };
   const getConversationsIndexPath = () => path.join(app.getPath('userData'), 'conversations-index.json');
   const getLegacyConversationsPath = () => path.join(app.getPath('userData'), 'conversations.json');
+
+  ipcMain.handle('orion:search-conversation-evidence', (event, payload = {}) => {
+    try {
+      const result = conversationMemory.searchPersistedConversationEvidence({
+        query: String(payload.query || '').slice(0, 10000),
+        recentContext: Array.isArray(payload.recentContext) ? payload.recentContext.slice(-12) : [],
+        currentConversation: payload.currentConversation && typeof payload.currentConversation === 'object'
+          ? payload.currentConversation : null,
+        workspacePaths: Array.isArray(payload.workspacePaths) ? payload.workspacePaths.slice(0, 50) : [],
+        conversationsDir: getConversationsDir(),
+        limit: Math.max(1, Math.min(Number(payload.limit) || 8, 20))
+      });
+      return { success: true, ...result };
+    } catch (error) {
+      return { success: false, evidence: [], results: [], queryTerms: [], error: error.message };
+    }
+  });
 
   function migrateLegacyConversations() {
     const legacyPath = getLegacyConversationsPath();

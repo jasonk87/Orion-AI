@@ -65,7 +65,8 @@ function makeElectronMock(handlers = {}) {
       app: {
         whenReady: () => ({ then: (cb) => { cb(); } }),
         on: () => {},
-        setAppUserModelId: () => {}
+        setAppUserModelId: () => {},
+        getPath: () => require('os').tmpdir()
       },
       Notification: NotificationMock,
       BrowserWindow: class {
@@ -91,6 +92,7 @@ function makeElectronMock(handlers = {}) {
               };
               if (script.includes('switchPhoneCompanionConversation')) return { success: true, conversationId: 'conv2' };
               if (script.includes('startPhoneCompanionTask')) return { success: true, conversationId: 'new' };
+              if (script.includes('beginNewFocus')) return handlers.newFocus || { cancelled: ['task-pending'], count: 1 };
               if (script.includes('submitPhoneCompanionPrompt')) return { success: true, queued: false };
               if (script.includes('steerPhoneCompanionTask')) return { success: true, steered: true };
               if (script.includes('approvePhoneCompanionPlan')) return { success: true, queued: false };
@@ -234,6 +236,8 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
   t.ok(root.text.includes('<title>Orion</title>'), 'root shell serves the Orion mobile UI');
   t.notOk(root.text.includes('data-drawer-destination="history"'), 'root shell does not expose History as a top-level mode');
   t.ok(root.text.includes('function enterDispatch'), 'root shell enters Dispatch through the chat-first route');
+  t.ok(root.text.includes("companionFetch('/api/new-focus'"), 'phone New Focus asks the desktop to cancel pending owned work');
+  t.ok(root.text.includes('await cancelPendingTasksForNewFocus();'), 'phone waits for cancellation before opening a fresh Dispatch draft');
   t.ok(root.text.includes('id="dispatch-browser-overlay"'), 'root shell keeps saved discussions in an in-Dispatch browser');
   t.notOk(root.text.includes('<span>Pick up a project</span>'), 'root shell keeps project rows off the Dispatch landing');
   t.ok(root.text.includes('Your Dispatch history, newest first.'), 'root shell presents a flat Dispatch discussion browser');
@@ -407,6 +411,27 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
   t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt') && call.includes('C:\\\\Projects\\\\OrionTarget')), 'prompt endpoint forwards selected project path');
   t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt')), 'desktop bridge submitted prompt');
   t.ok(electron.calls.some(call => call.includes('approvePhoneCompanionPlan')), 'desktop bridge approved plan');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion New Focus cancels only pending tasks owned by the selected conversation', async (t) => {
+  const { main, electron } = await startMainWithConfig(1148, {}, {
+    newFocus: { cancelled: ['task-old-focus'], count: 1 }
+  });
+  const pair = await request('POST', 1148, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
+  const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+
+  await request('POST', 1148, '/api/conversations/switch', { conversationId: 'dispatch-owned' }, session);
+  const result = await request('POST', 1148, '/api/new-focus', { conversationId: 'unrelated-conversation' }, session);
+
+  t.equal(result.statusCode, 200, 'new-focus endpoint succeeds');
+  t.same(result.json.cancelled, ['task-old-focus'], 'returns the renderer cancellation result');
+  t.equal(result.json.count, 1, 'reports the number of cancelled pending tasks');
+  const bridgeCall = electron.calls.find(call => call.includes('beginNewFocus'));
+  t.ok(bridgeCall, 'new-focus endpoint invokes the renderer cancellation primitive');
+  t.ok(bridgeCall.includes('dispatch-owned'), 'cancellation is scoped to the phone selected conversation');
+  t.notOk(bridgeCall.includes('unrelated-conversation'), 'caller cannot cancel another conversation by supplying an id');
 
   await closeServer(main.getCompanionServer());
 });
@@ -675,4 +700,3 @@ test('Phone Companion v2 pairing pending and denied states', async (t) => {
   t.equal(resDenied.json.error, 'Pairing denied', 'pairing denied carries pairing denied error message');
   await closeServer(mainDenied.getCompanionServer());
 });
-

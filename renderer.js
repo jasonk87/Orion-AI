@@ -85,6 +85,10 @@ let dispatchDraft = {
   projectPath: '',
   contextSummary: ''
 };
+const TaskOrchestration = window.OrionTaskOrchestration;
+const WorkspaceResolution = window.OrionWorkspaceResolution;
+let orchestrationTasksReady = Promise.resolve();
+const orchestrationTaskCache = new Map();
 
 // DOM ELEMENTS
 const el = {
@@ -275,6 +279,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   
   // Load conversations from local storage
   await loadConversationsFromStorage();
+  orchestrationTasksReady = initializeOrchestrationTasks();
+  await orchestrationTasksReady;
   
   // Migrate any project conversations that accumulated in standalone list
   migrateConversations();
@@ -994,30 +1000,38 @@ function collectDispatchActiveWork(isGlobalRunning = false, globalRunningId = ''
     const coderId = dispatchConversation.launchedCoderConvId;
     const coderConversation = coderId ? conversations.find(conversation => conversation.id === coderId) : null;
     if (coderConversation) {
+      const taskId = dispatchConversation.launchedCoderTaskId || dispatchConversation.lastOwnedTaskId || '';
+      const durableTask = taskId ? orchestrationTaskCache.get(taskId) : null;
       const running = isGlobalRunning && globalRunningId === coderConversation.id;
       const queued = Array.isArray(window.promptQueue)
-        && window.promptQueue.some(item => item && item.conversationId === coderConversation.id);
+        && window.promptQueue.some(item => item && (item.taskId === taskId || item.conversationId === coderConversation.id));
       const waitingForInput = !!coderConversation.awaitingClarification;
       const waitingForReview = !!(coderConversation.awaitingPlanApproval && !coderConversation.planApproved);
-      const status = running ? 'running' : ((queued || waitingForInput || waitingForReview) ? 'waiting' : 'blocked');
-      const subStatus = running && window.getAgentSubStatus
-        ? window.getAgentSubStatus()
-        : (queued
-          ? 'Queued for Coder'
-          : (waitingForInput
-            ? 'Waiting for your input'
-            : (waitingForReview ? 'Plan ready for review' : 'Needs attention')));
-      const projectPath = coderConversation.projectPath || inferDispatchProjectPath(dispatchConversation);
+      const status = durableTask
+        ? durableTask.status
+        : (running ? 'active' : ((queued || waitingForInput || waitingForReview) ? 'pending' : 'failed'));
+      const subStatus = durableTask && TaskOrchestration
+        ? TaskOrchestration.describeTaskStatus(durableTask)
+        : (running && window.getAgentSubStatus
+          ? window.getAgentSubStatus()
+          : (queued
+            ? 'Queued for Coder'
+            : (waitingForInput
+              ? 'Waiting for your input'
+              : (waitingForReview ? 'Plan ready for review' : 'Needs attention'))));
+      const projectPath = (durableTask && durableTask.workspacePath) || coderConversation.projectPath || inferDispatchProjectPath(dispatchConversation);
       activeWork.push({
         id: coderConversation.id,
+        taskId,
         supervisingConversationId: dispatchConversation.id,
-        title: dispatchConversation.launchedCoderTaskTitle || coderConversation.title || 'Coder task',
+        title: (durableTask && durableTask.title) || dispatchConversation.launchedCoderTaskTitle || coderConversation.title || 'Coder task',
         projectPath,
         projectName: (projectPath || 'Standalone').replace(/[\\\/]+$/, '').split(/[\\\/]/).pop(),
         status,
         subStatus,
-        startedAt: dispatchConversation.launchedCoderTaskStart || coderConversation.createdAt || 0,
-        completedAt: 0
+        startedAt: (durableTask && durableTask.startedAt) || dispatchConversation.launchedCoderTaskStart || coderConversation.createdAt || 0,
+        completedAt: (durableTask && (durableTask.completedAt || durableTask.cancelledAt || durableTask.failedAt)) || 0,
+        canContinue: status === 'failed'
       });
     } else if (dispatchConversation.lastDelegatedWork) {
       const receipt = dispatchConversation.lastDelegatedWork;
@@ -1074,37 +1088,57 @@ async function continueDelegatedWork(coderConvId, supervisingOrionConvId) {
   const prompt = 'Continue the previous task from where it left off. Review the task checklist and the last few messages to see what is done and what remains, then complete the remaining pending work. Do not redo finished work; if you hit the same blocker again, stop and describe it precisely.';
   const modelValue = window.getSelectedModel ? window.getSelectedModel() : undefined;
 
-  // Re-arm the supervisor so this continuation is tracked like the original handoff.
   const orionConv = conversations.find(c => c.id === supervisingOrionConvId);
-  if (orionConv) {
-    orionConv.launchedCoderConvId = coderConvId;
-    orionConv.launchedCoderTaskTitle = (orionConv.lastDelegatedWork && orionConv.lastDelegatedWork.title) || coderConv.title || 'Coder task';
-    orionConv.launchedCoderTaskStart = Date.now();
-    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
-    if (typeof window.startCoderTaskMonitor === 'function') window.startCoderTaskMonitor(orionConv.id, coderConvId);
+  if (!orionConv) {
+    showToast('The supervising Dispatch conversation no longer exists.', 'attention');
+    return;
+  }
+  const messageId = createConversationMessageId(coderConv.id);
+  coderConv.messages.push({ id: messageId, role: 'user', source: 'dispatch-continue', text: prompt, createdAt: Date.now() });
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(coderConv.id);
+  const taskTitle = (orionConv.lastDelegatedWork && orionConv.lastDelegatedWork.title) || coderConv.title || 'Continue Coder task';
+  const queued = await enqueueOrchestrationTask({
+    prompt,
+    originalUserMessage: prompt,
+    resolvedObjective: prompt,
+    title: taskTitle,
+    modelSelectValue: modelValue,
+    originConversationId: orionConv.id,
+    originMessageId: messageId,
+    targetConversationId: coderConv.id,
+    workspace: structuredWorkspaceForConversation(coderConv),
+    precedingMessages: taskContextMessages(coderConv),
+    constraints: ['Do not redo completed work.', 'Stop and report precisely if the same blocker recurs.'],
+    source: 'dispatch-continue',
+    alreadyRendered: true
+  });
+  if (!queued.success) {
+    showToast(queued.error || queued.clarification || 'Could not queue the continuation.', 'attention');
+    return;
   }
 
-  coderConv.messages.push({ role: 'user', source: 'dispatch-continue', text: prompt, createdAt: Date.now() });
-  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(coderConv.id);
-  saveConversationsToStorage();
+  orionConv.launchedCoderConvId = coderConvId;
+  orionConv.launchedCoderTaskId = queued.task.taskId;
+  orionConv.lastOwnedTaskId = queued.task.taskId;
+  orionConv.launchedCoderTaskTitle = taskTitle;
+  orionConv.launchedCoderTaskStart = Date.now();
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+  await flushConversationsToStorage();
+  if (typeof window.startCoderTaskMonitor === 'function') {
+    window.startCoderTaskMonitor(orionConv.id, coderConvId, queued.task.taskId);
+  }
   renderDesktopDispatchLanding();
 
   if (window.isAgentRunning && window.isAgentRunning()) {
     // Something else is mid-turn — the queue drains when it finishes.
-    window.promptQueue = window.promptQueue || [];
-    window.promptQueue.push({
-      id: createQueuedPromptId(),
-      prompt,
-      modelSelectValue: modelValue,
-      conversationId: coderConvId,
-      source: 'dispatch-continue',
-      alreadyRendered: true,
-      createdAt: Date.now()
-    });
     showToast('Continuation queued — Coder will pick it up when the current turn finishes.');
   } else {
     showToast('Coder is continuing the remaining work.');
-    window.runAgentLoop(prompt, modelValue, coderConv, { source: 'queue' });
+    window.promptQueue = window.promptQueue.filter(item => item.taskId !== queued.task.taskId);
+    window.runAgentLoop(queued.queueItem.prompt, modelValue, coderConv, {
+      source: 'queue',
+      taskId: queued.task.taskId
+    });
   }
 }
 
@@ -1138,7 +1172,7 @@ function setupProgressiveDisclosure() {
   setAppMode(appMode, false); // Initialize from stored preference
 
   // Orion prompt chips — populate input (with focus) so Jason can review/edit before sending
-  document.getElementById('orion-welcome-splash')?.addEventListener('click', (e) => {
+  document.getElementById('orion-welcome-splash')?.addEventListener('click', async (e) => {
     const continueWorkButton = e.target.closest('[data-dispatch-continue-work]');
     if (continueWorkButton) {
       continueDelegatedWork(
@@ -1156,6 +1190,7 @@ function setupProgressiveDisclosure() {
     }
     const freshProjectButton = e.target.closest('[data-dispatch-fresh-project]');
     if (freshProjectButton) {
+      await window.beginNewFocus(activeConversationId);
       startDispatchDraft({
         projectPath: freshProjectButton.getAttribute('data-dispatch-fresh-project') || '',
         contextSummary: freshProjectButton.getAttribute('data-dispatch-summary') || ''
@@ -1962,22 +1997,307 @@ function triggerSteer() {
   document.getElementById('btn-queue').style.display = 'none';
 }
 
-function triggerQueue() {
+function createConversationMessageId(conversationId = activeConversationId) {
+  return `msg_${String(conversationId || 'conversation')}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function structuredWorkspaceForConversation(conv, explicitPath = '') {
+  const searchRoot = getDispatchWorkspaceRoot();
+  const mode = conversationMode(conv);
+  const workspacePath = String(explicitPath || (conv && (conv.workspace || conv.projectPath || conv.dispatchProjectPath)) || '').trim();
+  if (!WorkspaceResolution) {
+    return {
+      role: workspacePath ? (mode === 'coder' ? 'standalone_coder' : 'active_project') : 'unresolved',
+      path: workspacePath,
+      project: { name: workspacePath.split(/[\\/]/).pop() || '', path: (conv && (conv.projectPath || conv.dispatchProjectPath)) || '' },
+      source: 'legacy',
+      resolved: !!workspacePath
+    };
+  }
+  const resolution = WorkspaceResolution.classifyWorkspace({
+    mode,
+    workspacePath,
+    projectPath: conv && conv.projectPath,
+    dispatchProjectPath: conv && conv.dispatchProjectPath,
+    searchRoot,
+    standaloneRoot: getStandaloneWorkspaceRoot(),
+    knownProjects: projects
+  });
+  return {
+    role: resolution.kind,
+    path: resolution.path || '',
+    project: {
+      name: resolution.projectName || '',
+      path: resolution.projectPath || ''
+    },
+    source: resolution.source || '',
+    resolved: resolution.kind !== WorkspaceResolution.KINDS.UNRESOLVED && !!resolution.path
+  };
+}
+
+function taskContextMessages(conv) {
+  return (conv && Array.isArray(conv.messages) ? conv.messages : [])
+    .filter(message => message && ['user', 'assistant', 'model', 'orion'].includes(String(message.role || '').toLowerCase()))
+    .slice(-16)
+    .map(message => ({
+      id: String(message.id || message.messageId || ''),
+      role: String(message.role || ''),
+      text: String(message.text || message.content || '').slice(0, 5000),
+      createdAt: message.createdAt || 0
+    }));
+}
+
+function persistTaskClarification(conv, clarification) {
+  if (!conv || !clarification) return;
+  conv.messages = Array.isArray(conv.messages) ? conv.messages : [];
+  conv.messages.push({
+    id: createConversationMessageId(conv.id),
+    role: 'assistant',
+    source: 'task-resolution-clarification',
+    text: clarification,
+    createdAt: Date.now()
+  });
+  conv.updatedAt = Date.now();
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+  saveConversationsToStorage();
+  if (conv.id === activeConversationId) {
+    window.clearActiveAiBubble?.();
+    renderAiMessage(clarification, [], conv.id);
+  }
+}
+
+async function enqueueOrchestrationTask(options = {}) {
+  if (!TaskOrchestration || !window.api || typeof window.api.createOrchestrationTask !== 'function') {
+    return { success: false, error: 'Durable task orchestration is unavailable.' };
+  }
+  const targetConversationId = String(options.targetConversationId || options.conversationId || activeConversationId || '');
+  const originConversationId = String(options.originConversationId || targetConversationId || '');
+  const targetConv = conversations.find(conv => conv.id === targetConversationId);
+  const originConv = conversations.find(conv => conv.id === originConversationId) || targetConv;
+  if (!targetConv || !originConv) return { success: false, error: 'Task conversation could not be resolved.' };
+  const originalUserMessage = String(options.originalUserMessage || options.prompt || '').trim();
+  const workspace = options.workspace && typeof options.workspace === 'object'
+    ? options.workspace
+    : structuredWorkspaceForConversation(originConv, options.workspacePath || '');
+  const packetResult = TaskOrchestration.buildTaskPacket({
+    originalUserMessage,
+    resolvedObjective: options.resolvedObjective || '',
+    title: options.title || '',
+    precedingMessages: options.precedingMessages || taskContextMessages(originConv),
+    precedingConversationSummary: options.precedingConversationSummary || '',
+    workspace,
+    requirements: options.requirements || [],
+    constraints: options.constraints || [],
+    unresolvedDecisions: options.unresolvedDecisions || [],
+    origin: {
+      conversationId: originConversationId,
+      sessionId: String(options.originSessionId || originConv.sessionId || originConversationId),
+      messageId: String(options.originMessageId || '')
+    },
+    target: {
+      conversationId: targetConversationId,
+      sessionId: String(options.targetSessionId || targetConv.sessionId || targetConversationId),
+      mode: conversationMode(targetConv)
+    },
+    source: options.source || 'user-queue',
+    timestamp: options.createdAt || Date.now()
+  });
+  if (!packetResult.success || !packetResult.task) {
+    persistTaskClarification(originConv, packetResult.clarification || 'What specific work should I queue?');
+    return { success: false, needsClarification: true, clarification: packetResult.clarification, task: null };
+  }
+
+  const persisted = await window.api.createOrchestrationTask(packetResult.task);
+  if (!persisted || persisted.success === false || !persisted.task) {
+    return { success: false, error: (persisted && persisted.error) || 'Task could not be persisted.' };
+  }
+  const task = persisted.task;
+  orchestrationTaskCache.set(task.taskId, task);
+  const runtimePrompt = TaskOrchestration.renderTaskPrompt(task);
+  window.promptQueue = Array.isArray(window.promptQueue) ? window.promptQueue : [];
+  const queueItem = {
+    id: options.queueId || createQueuedPromptId(),
+    taskId: task.taskId,
+    prompt: runtimePrompt,
+    originalUserMessage: task.originalUserMessage,
+    taskTitle: task.title,
+    modelSelectValue: options.modelSelectValue || (el.modelSelect && el.modelSelect.value),
+    conversationId: targetConversationId,
+    originConversationId,
+    source: options.source || task.source,
+    createdAt: task.createdAt,
+    alreadyRendered: !!options.alreadyRendered,
+    images: Array.isArray(options.images) ? options.images : [],
+    contextPacketIds: Array.isArray(options.contextPacketIds) ? options.contextPacketIds : []
+  };
+  window.promptQueue.push(queueItem);
+  targetConv.lastOrchestrationTaskId = task.taskId;
+  originConv.lastOwnedTaskId = task.taskId;
+  if (typeof window.markConversationDirty === 'function') {
+    window.markConversationDirty(targetConv.id);
+    window.markConversationDirty(originConv.id);
+  }
+  await flushConversationsToStorage();
+  return { success: true, task, queueItem };
+}
+window.enqueueOrchestrationTask = enqueueOrchestrationTask;
+
+async function initializeOrchestrationTasks() {
+  if (!window.api || typeof window.api.listOrchestrationTasks !== 'function') return;
+  try {
+    await window.api.migrateOrchestrationTasks?.();
+    await window.api.reconcileOrchestrationTasks?.({ reason: 'Orion restarted before the active task recorded a terminal result.' });
+    const listed = await window.api.listOrchestrationTasks({ sort: 'desc' });
+    const tasks = listed && Array.isArray(listed.tasks) ? listed.tasks : [];
+    tasks.forEach(task => {
+      if (task && task.taskId) orchestrationTaskCache.set(task.taskId, task);
+    });
+    window.promptQueue = Array.isArray(window.promptQueue) ? window.promptQueue : [];
+    for (const task of tasks.filter(item => item && item.status === 'pending')) {
+      if (!task || !task.taskId || window.promptQueue.some(item => item && item.taskId === task.taskId)) continue;
+      const targetId = task.target && task.target.conversationId;
+      if (!targetId || !conversations.some(conv => conv.id === targetId)) continue;
+      window.promptQueue.push({
+        id: createQueuedPromptId(),
+        taskId: task.taskId,
+        prompt: TaskOrchestration.renderTaskPrompt(task),
+        originalUserMessage: task.originalUserMessage,
+        taskTitle: task.title,
+        conversationId: targetId,
+        originConversationId: task.origin && task.origin.conversationId,
+        source: task.source || 'restored-queue',
+        createdAt: task.createdAt,
+        alreadyRendered: true
+      });
+    }
+  } catch (error) {
+    console.error('Could not initialize durable task queue:', error);
+  }
+}
+
+window.claimOrchestrationTask = async function(taskId) {
+  if (!taskId || !window.api || typeof window.api.getOrchestrationTask !== 'function') return { success: true, task: null };
+  await orchestrationTasksReady;
+  const read = await window.api.getOrchestrationTask(taskId);
+  if (!read || read.success === false || !read.task) return { success: false, reason: (read && read.error) || 'Task no longer exists.' };
+  let task = read.task;
+  if (task.status !== 'pending') return { success: false, reason: `Task is ${task.status}.`, task };
+  const claimed = await window.api.transitionOrchestrationTask(taskId, 'active', { startedBy: 'agent-loop' });
+  if (!claimed || claimed.success === false || !claimed.task) return { success: false, reason: (claimed && claimed.error) || 'Task could not be claimed.' };
+  task = claimed.task;
+  orchestrationTaskCache.set(task.taskId, task);
+  return { success: true, task, prompt: TaskOrchestration.renderTaskPrompt(task) };
+};
+
+window.finalizeOrchestrationTask = async function(taskId, status, details = {}) {
+  if (!taskId || !window.api || typeof window.api.getOrchestrationTask !== 'function') return null;
+  const read = await window.api.getOrchestrationTask(taskId);
+  if (!read || read.success === false || !read.task) return null;
+  if (read.task.status === 'cancelled') return read.task;
+  if (read.task.status === status) return read.task;
+  const transitioned = await window.api.transitionOrchestrationTask(taskId, status, details);
+  if (transitioned && transitioned.success && transitioned.task) {
+    orchestrationTaskCache.set(transitioned.task.taskId, transitioned.task);
+    return transitioned.task;
+  }
+  return null;
+};
+
+window.getOwnedOrchestrationTasks = async function(conversationId, statuses = []) {
+  if (!window.api || typeof window.api.listOrchestrationTasks !== 'function') return [];
+  const result = await window.api.listOrchestrationTasks({
+    originConversationId: String(conversationId || ''),
+    ...(statuses.length ? { status: statuses } : {}),
+    sort: 'desc'
+  });
+  return result && Array.isArray(result.tasks) ? result.tasks : [];
+};
+
+window.getOrchestrationTaskStatus = async function(taskId, requesterConversationId = '') {
+  if (!taskId || !window.api || typeof window.api.getOrchestrationTask !== 'function') {
+    return { success: false, error: 'Task status is unavailable.' };
+  }
+  const result = await window.api.getOrchestrationTask(taskId);
+  if (!result || result.success === false || !result.task) return result || { success: false, error: 'Task not found.' };
+  orchestrationTaskCache.set(result.task.taskId, result.task);
+  if (requesterConversationId && TaskOrchestration && !TaskOrchestration.canRequesterControlTask(result.task, { conversationId: requesterConversationId })) {
+    return { success: false, error: 'This conversation does not own that task.', code: 'TASK_CONTROL_FORBIDDEN' };
+  }
+  return {
+    success: true,
+    task: result.task,
+    taskId: result.task.taskId,
+    status: result.task.status,
+    description: TaskOrchestration ? TaskOrchestration.describeTaskStatus(result.task) : result.task.status
+  };
+};
+
+window.cancelOwnedOrchestrationTask = async function(taskId, requesterConversationId, reason = 'Cancelled by user.') {
+  if (!taskId || !window.api || typeof window.api.cancelOrchestrationTask !== 'function') {
+    return { success: false, error: 'Task cancellation is unavailable.' };
+  }
+  const result = await window.api.cancelOrchestrationTask(taskId, { conversationId: requesterConversationId }, reason);
+  if (!result || result.success === false || !result.task) return result || { success: false, error: 'Cancellation failed.' };
+  orchestrationTaskCache.set(result.task.taskId, result.task);
+  window.promptQueue = (Array.isArray(window.promptQueue) ? window.promptQueue : []).filter(item => item && item.taskId !== taskId);
+  const targetId = result.task.target && result.task.target.conversationId;
+  const originId = result.task.origin && result.task.origin.conversationId;
+  setQueuedPromptMessageState(taskId, targetId, 'cancelled');
+  if (result.wasActive && window.getActiveRunTaskId && window.getActiveRunTaskId() === taskId && window.stopAgentExecution) {
+    window.stopAgentExecution({ mode: 'hard', taskId });
+  }
+  const originConv = conversations.find(conv => conv.id === originId);
+  if (originConv) {
+    originConv.lastDelegatedWork = {
+      taskId,
+      coderConversationId: targetId || '',
+      title: result.task.title,
+      projectPath: result.task.workspacePath || '',
+      status: 'cancelled',
+      subStatus: 'Cancelled',
+      startedAt: result.task.startedAt || 0,
+      completedAt: result.task.cancelledAt || Date.now(),
+      pendingCount: 0
+    };
+    originConv.launchedCoderConvId = null;
+    originConv.launchedCoderTaskId = null;
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(originConv.id);
+  }
+  saveConversationsToStorage();
+  renderDesktopDispatchLanding();
+  return { ...result, stopped: !!result.wasActive };
+};
+
+async function cancelPendingTasksForNewFocus(conversationId) {
+  const ownerId = String(conversationId || '');
+  if (!ownerId) return { cancelled: [], count: 0 };
+  const tasks = await window.getOwnedOrchestrationTasks(ownerId, ['pending']);
+  const cancelled = [];
+  for (const task of tasks) {
+    const result = await window.cancelOwnedOrchestrationTask(task.taskId, ownerId, 'Cancelled when a new focus was started.');
+    if (result && result.success) cancelled.push(task.taskId);
+  }
+  return { cancelled, count: cancelled.length };
+}
+
+window.beginNewFocus = async function(conversationId = activeConversationId) {
+  return cancelPendingTasksForNewFocus(conversationId);
+};
+
+async function triggerQueue() {
   const text = el.chatInput.value.trim();
   if (!text) return;
-  
-  if (window.promptQueue) {
-    const queueItem = {
-      id: createQueuedPromptId(),
-      prompt: text,
-      modelSelectValue: el.modelSelect.value,
-      conversationId: activeConversationId,
-      source: 'user-queue',
-      createdAt: Date.now()
-    };
-    window.promptQueue.push(queueItem);
-    appendQueuedMessage(text, queueItem);
-  }
+  const queueId = createQueuedPromptId();
+  const result = await enqueueOrchestrationTask({
+    queueId,
+    prompt: text,
+    modelSelectValue: el.modelSelect.value,
+    targetConversationId: activeConversationId,
+    originConversationId: activeConversationId,
+    source: 'user-queue'
+  });
+  if (result.success) appendQueuedMessage(result.task.objective, result.queueItem, result.task);
+  else if (!result.needsClarification) showToast(result.error || 'Could not queue that task.', 'attention');
   el.chatInput.value = '';
   document.getElementById('btn-steer').style.display = 'none';
   document.getElementById('btn-queue').style.display = 'none';
@@ -2041,14 +2361,16 @@ function createQueuedPromptId() {
   return 'queue_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
 }
 
-function appendQueuedMessage(text, queueItem = {}) {
+function appendQueuedMessage(text, queueItem = {}, task = null) {
   const item = {
     id: queueItem.id || createQueuedPromptId(),
     prompt: text,
     modelSelectValue: queueItem.modelSelectValue || (el.modelSelect && el.modelSelect.value),
     conversationId: queueItem.conversationId || activeConversationId,
     source: queueItem.source || 'user-queue',
-    createdAt: queueItem.createdAt || Date.now()
+    createdAt: queueItem.createdAt || Date.now(),
+    taskId: queueItem.taskId || (task && task.taskId) || '',
+    taskTitle: queueItem.taskTitle || (task && task.title) || ''
   };
   if (item.conversationId === activeConversationId) {
     el.welcomeSplash.style.display = 'none';
@@ -2062,6 +2384,8 @@ function appendQueuedMessage(text, queueItem = {}) {
       source: 'queued-prompt',
       text: `Prompt queued: "${text}"`,
       queueId: item.id,
+      taskId: item.taskId,
+      taskTitle: item.taskTitle,
       queuedPrompt: text,
       queueState: 'queued',
       modelSelectValue: item.modelSelectValue,
@@ -2088,7 +2412,7 @@ function removePromptQueueItem(queueId, conversationId) {
 function findQueuedPromptMessage(queueId, conversationId) {
   const conv = conversations.find(c => c.id === conversationId);
   if (!conv || !Array.isArray(conv.messages)) return { conv: null, message: null };
-  const message = conv.messages.find(msg => msg && msg.queueId === queueId);
+  const message = conv.messages.find(msg => msg && (msg.queueId === queueId || msg.taskId === queueId));
   return { conv, message };
 }
 
@@ -2099,6 +2423,7 @@ function getQueuedPromptStatus(item) {
   const queueState = item.queueState || 'queued';
   if (queueState === 'steered') return 'Converted to steering';
   if (queueState === 'sent') return 'Sent to Orion';
+  if (queueState === 'cancelled') return 'Cancelled';
   if (queueIndex === 0) return 'Runs next';
   if (queueIndex > 0) return `Queued #${queueIndex + 1}`;
   return 'No longer queued';
@@ -2108,6 +2433,7 @@ function buildQueuedPromptBubble(item) {
   const queueId = String(item.id || item.queueId || '');
   const conversationId = String(item.conversationId || activeConversationId || '');
   const prompt = String(item.prompt || item.queuedPrompt || '');
+  const taskTitle = String(item.taskTitle || '');
   const queueIndex = getPromptQueueIndex(queueId, conversationId);
   const isPending = queueIndex !== -1;
   const runningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
@@ -2130,6 +2456,7 @@ function buildQueuedPromptBubble(item) {
   bubble.innerHTML = `
     <div class="message-header queued">Queued Prompt</div>
     <div class="message-body queued-prompt-body">
+      ${taskTitle ? `<div class="queued-prompt-title">${escapeHtml(taskTitle)}</div>` : ''}
       <div class="queued-prompt-copy">${escapeHtml(prompt).replace(/\n/g, '<br>')}</div>
       <div class="queued-prompt-footer">
         <span class="queued-prompt-status">${escapeHtml(statusText)}</span>
@@ -2176,6 +2503,8 @@ function setQueuedPromptMessageState(queueId, conversationId, queueState) {
       message.text = `Queued prompt converted to steering: "${message.queuedPrompt || ''}"`;
     } else if (queueState === 'sent') {
       message.text = `Queued prompt sent: "${message.queuedPrompt || ''}"`;
+    } else if (queueState === 'cancelled') {
+      message.text = `Queued task cancelled: "${message.taskTitle || message.queuedPrompt || ''}"`;
     }
   }
   if (conv) saveConversationsToStorage();
@@ -2195,7 +2524,7 @@ function handleQueuedPromptActionClick(event) {
   }
 }
 
-function promoteQueuedPromptToSteering(queueId, conversationId) {
+async function promoteQueuedPromptToSteering(queueId, conversationId) {
   const runningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
   const isThisConversationRunning = !!(window.isAgentRunning && window.isAgentRunning() && runningId === conversationId);
   if (!isThisConversationRunning) {
@@ -2209,9 +2538,14 @@ function promoteQueuedPromptToSteering(queueId, conversationId) {
     setQueuedPromptMessageState(queueId, conversationId, 'sent');
     return;
   }
-  if (enqueueSteeringForConversation(item.prompt, conversationId)) {
+  if (item.taskId) {
+    const requesterId = item.originConversationId || conversationId;
+    await window.cancelOwnedOrchestrationTask(item.taskId, requesterId, 'Converted from a pending task into steering.');
+  }
+  const steeringText = item.originalUserMessage || item.prompt;
+  if (enqueueSteeringForConversation(steeringText, conversationId)) {
     setQueuedPromptMessageState(queueId, conversationId, 'steered');
-    checkpointSteeringInstruction(item.prompt, conversationId);
+    checkpointSteeringInstruction(steeringText, conversationId);
     showToast('Queued prompt changed to steering.', 'success');
   }
 }
@@ -2252,6 +2586,7 @@ function sendQueuedPromptNow(queueId, conversationId) {
   }
   window.runAgentLoop(item.prompt, item.modelSelectValue || (el.modelSelect && el.modelSelect.value), conv, {
     source: item.source || 'queue',
+    taskId: item.taskId || '',
     ...(queuedImages.length ? { images: queuedImages } : {})
   }).catch(error => {
     console.error('Queued prompt send-now run failed:', error);
@@ -2367,8 +2702,9 @@ function startDispatchDraft(options = {}) {
   el.chatInput.focus();
 }
 
-function createNewConversation(mode = appMode) {
+async function createNewConversation(mode = appMode) {
   if (mode !== 'coder') {
+    await window.beginNewFocus(activeConversationId);
     startDispatchDraft();
     return null;
   }
@@ -3527,7 +3863,7 @@ async function submitMessage() {
   
   // Update messages history (store compact image refs for replay)
   const msgImages = imagesToSend.map(i => ({ data: i.data, mimeType: i.mimeType }));
-  conv.messages.push({ role: 'user', text: prompt, createdAt: userMsgTs, ...(msgImages.length ? { images: msgImages } : {}) });
+  conv.messages.push({ id: createConversationMessageId(conv.id), role: 'user', text: prompt, createdAt: userMsgTs, ...(msgImages.length ? { images: msgImages } : {}) });
   if (conversationMode(conv) === 'orion') {
     conv.dispatchProjectPath = inferDispatchProjectPath(conv);
     conv.dispatchDiscussionSummary = compactDispatchDiscussionText(prompt, conv.title);
@@ -3559,11 +3895,26 @@ async function submitMessage() {
       }
 
       // Default: queue as normal
-      window.promptQueue.push({ prompt, modelSelectValue: selectedModel, conversationId: conv.id, alreadyRendered: true, images: imagesToSend });
-      persistAssistantStatusMessage(conv.id, "Queued. Orion will start this after the current task finishes.", {
-        source: 'queue-status',
-        dedupeKey: `queued-${conv.id}-${prompt}`
+      const queued = await enqueueOrchestrationTask({
+        prompt,
+        modelSelectValue: selectedModel,
+        targetConversationId: conv.id,
+        originConversationId: conv.id,
+        source: 'user-queue',
+        alreadyRendered: true,
+        images: imagesToSend,
+        originMessageId: conv.messages[conv.messages.length - 1]?.id || ''
       });
+      if (queued.success) {
+        persistAssistantStatusMessage(conv.id, `Queued as ${queued.task.title}. Orion will start it after the current task finishes.`, {
+          source: 'queue-status',
+          dedupeKey: `queued-${queued.task.taskId}`
+        });
+      } else if (!queued.needsClarification) {
+        persistAssistantStatusMessage(conv.id, `Could not queue the task: ${queued.error || 'unknown error'}`, {
+          source: 'queue-status', dedupeKey: `queue-error-${conv.id}-${Date.now()}`
+        });
+      }
     } else {
       await window.runAgentLoop(prompt, selectedModel, conv, runOptions);
       loadRunArtifacts();
@@ -3577,10 +3928,16 @@ async function submitMessage() {
         clearInterval(waitForEngine);
         const selectedModel = el.modelSelect.value;
         if (window.isAgentRunning && window.isAgentRunning()) {
-          window.promptQueue.push({ prompt: pendingPrompt, modelSelectValue: selectedModel, conversationId: pendingConv.id, alreadyRendered: true });
-          persistAssistantStatusMessage(pendingConv.id, "Queued. Orion will start this after the current task finishes.", {
-            source: 'queue-status',
-            dedupeKey: `queued-${pendingConv.id}-${pendingPrompt}`
+          const queued = await enqueueOrchestrationTask({
+            prompt: pendingPrompt,
+            modelSelectValue: selectedModel,
+            targetConversationId: pendingConv.id,
+            originConversationId: pendingConv.id,
+            source: 'user-queue',
+            alreadyRendered: true
+          });
+          if (queued.success) persistAssistantStatusMessage(pendingConv.id, `Queued as ${queued.task.title}.`, {
+            source: 'queue-status', dedupeKey: `queued-${queued.task.taskId}`
           });
         } else {
           await window.runAgentLoop(pendingPrompt, selectedModel, pendingConv);
@@ -4818,20 +5175,37 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
     const queuedPrompt = (assignedPacketIds.length === 0 && looseFindings.length > 0)
       ? `${prompt}\n\nFindings from Dispatch's prior investigation (verify before relying on them):\n${looseFindings.map(f => `- ${f}`).join('\n')}`
       : prompt;
-    window.promptQueue = window.promptQueue || [];
-    window.promptQueue.push({
-      id: createQueuedPromptId(),
+    const originConv = conversations.find(item => item.id === String(options.sourceConversationId || ''));
+    const handoffTask = await enqueueOrchestrationTask({
       prompt: queuedPrompt,
-      modelSelectValue: window.getSelectedModel(),
-      conversationId: conv.id,
+      resolvedObjective: TaskOrchestration && TaskOrchestration.isContextDependentRequest(prompt) ? '' : queuedPrompt,
+      title,
+      targetConversationId: conv.id,
+      originConversationId: String(options.sourceConversationId || conv.id),
+      originSessionId: String(options.sourceSessionId || ''),
+      originMessageId: String(options.sourceMessageId || ''),
+      precedingMessages: taskContextMessages(originConv || conv),
+      workspace: structuredWorkspaceForConversation(conv, folderPath),
+      requirements: looseFindings,
       source: 'dispatch-handoff',
+      modelSelectValue: window.getSelectedModel(),
       contextPacketIds: assignedPacketIds,
       createdAt: Date.now()
     });
-    persistAssistantStatusMessage(conv.id, 'Queued from Dispatch. Coder will start when the current turn finishes.', {
+    if (!handoffTask.success) {
+      return {
+        success: false,
+        needsClarification: !!handoffTask.needsClarification,
+        error: handoffTask.clarification || handoffTask.error || 'The handoff task could not be resolved.'
+      };
+    }
+    conv.lastOrchestrationTaskId = handoffTask.task.taskId;
+    if (originConv) originConv.lastOwnedTaskId = handoffTask.task.taskId;
+    persistAssistantStatusMessage(conv.id, `Queued from Dispatch as ${handoffTask.task.title}. Coder will start when the current turn finishes.`, {
       source: 'queue-status',
-      dedupeKey: `dispatch-handoff-${conv.id}`
+      dedupeKey: `dispatch-handoff-${handoffTask.task.taskId}`
     });
+    options._createdTask = handoffTask.task;
   }
 
   renderProjectsList();
@@ -4842,6 +5216,8 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
     conversationId: conv.id,
     title: conv.title,
     queued: !!prompt,
+    taskId: options._createdTask ? options._createdTask.taskId : '',
+    status: options._createdTask ? options._createdTask.status : (prompt ? 'pending' : 'completed'),
     contextPacketIds: assignedPacketIds,
     contextTransferred: assignedPacketIds.length > 0,
     contextTransferError
@@ -5120,6 +5496,24 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   const activeWork = collectDispatchActiveWork(isGlobalRunning, globalRunningId);
   
   const companionWorkspace = conv ? getConversationRunWorkspace(conv) : currentWorkspace;
+  const companionWorkspaceResolution = conv
+    ? structuredWorkspaceForConversation(conv, companionWorkspace)
+    : { role: 'unresolved', path: '', project: { name: '', path: '' }, resolved: false };
+  const orchestrationTasks = [...orchestrationTaskCache.values()]
+    .filter(task => task && ((task.origin && task.origin.conversationId === resolvedId)
+      || (task.target && task.target.conversationId === resolvedId)))
+    .sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0))
+    .slice(0, 12)
+    .map(task => ({
+      taskId: task.taskId,
+      title: task.title,
+      objective: task.objective,
+      status: task.status,
+      workspacePath: task.workspacePath || '',
+      originConversationId: task.origin && task.origin.conversationId,
+      targetConversationId: task.target && task.target.conversationId,
+      updatedAt: task.updatedAt || task.createdAt || 0
+    }));
   const operationalResult = companionWorkspace && window.readOperationalContext
     ? await window.readOperationalContext(companionWorkspace)
     : null;
@@ -5148,16 +5542,29 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     projects: projectSummaries,
     activeWork: activeWork.slice(0, 6),
     workspace: companionWorkspace,
+    workspaceKind: companionWorkspaceResolution.role,
+    workspaceDescription: WorkspaceResolution
+      ? WorkspaceResolution.describeWorkspace({
+          kind: companionWorkspaceResolution.role,
+          path: companionWorkspaceResolution.path,
+          searchRoot: getDispatchWorkspaceRoot(),
+          projectName: companionWorkspaceResolution.project && companionWorkspaceResolution.project.name
+        })
+      : companionWorkspace,
     running: isActiveTargetRunning,
     globalRunning: isGlobalRunning,
     runningConversationId: globalRunningId,
     queuedPrompts: window.promptQueue ? window.promptQueue.filter(q => q.conversationId === resolvedId).length : 0,
-    queuedPromptPreview: window.promptQueue ? window.promptQueue.filter(q => q.conversationId === resolvedId).map(q => q.prompt).slice(0, 3) : [],
+    queuedPromptPreview: window.promptQueue ? window.promptQueue.filter(q => q.conversationId === resolvedId).map(q => q.taskTitle || q.originalUserMessage || q.prompt).slice(0, 3) : [],
     subStatus: isActiveTargetRunning && window.getAgentSubStatus ? window.getAgentSubStatus() : '',
     executionMode: isActiveTargetRunning && window.getAgentExecutionMode ? window.getAgentExecutionMode() : 'idle',
     awaitingPlanApproval: !!(conv && conv.awaitingPlanApproval && !conv.planApproved),
     awaitingClarification: (conv && conv.awaitingClarification) ? conv.awaitingClarification : null,
     tasks: conv && Array.isArray(conv.tasks) ? conv.tasks : [],
+    orchestrationTasks,
+    activeTaskId: orchestrationTasks.find(task => task.status === 'active')?.taskId
+      || orchestrationTasks.find(task => task.status === 'pending')?.taskId
+      || '',
     model: window.getSelectedModel(),
     messages,
     latestOutput: latestOutput ? latestOutput.text : '',

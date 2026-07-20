@@ -519,11 +519,16 @@ function computeBrowserPageSignature(result) {
 let isStopRequested = false;
 let activeRunController = null;
 let stopRequestMode = 'none';
+let activeRunTaskId = null;
 const GEMINI_THINKING_BUDGET = 24576;
 const MODEL_API_REQUEST_TIMEOUT_MS = 600000;
 const MODEL_API_MAX_RETRY_WAIT_MS = 45000;
 const MODEL_API_MAX_ATTEMPTS = 15;
 const OperationalContext = window.OrionOperationalContext || (typeof require === 'function' ? require('./operational-context') : null);
+const WorkspaceResolution = window.OrionWorkspaceResolution || (typeof require === 'function' ? require('./workspace-resolution') : null);
+const OrchestrationContracts = window.OrionOrchestrationContracts || (typeof require === 'function' ? require('./orchestration-contracts') : null);
+const DispatchIntent = window.OrionDispatchIntent || (typeof require === 'function' ? require('./dispatch-intent') : null);
+const TaskOrchestration = window.OrionTaskOrchestration || (typeof require === 'function' ? require('./task-orchestration') : null);
 
 const OPERATIONAL_CONTEXT_TOOL_DECLARATIONS = [
   {
@@ -708,6 +713,7 @@ window.followupTimers = window.followupTimers || {};
 window.followupTimerMeta = window.followupTimerMeta || {};
 window.isAgentRunning = () => isAgentRunning;
 window.getRunningConversationId = () => runningConversationId;
+window.getActiveRunTaskId = () => activeRunTaskId;
 window.getAgentSubStatus = () => agentSubStatus;
 window.getAgentExecutionMode = () => agentExecutionMode;
 
@@ -761,6 +767,10 @@ function getActiveRunSignal() {
 
 function requestAgentStop(options = {}) {
   const mode = options.mode === 'soft' ? 'soft' : 'hard';
+  const requestedTaskId = String(options.taskId || '');
+  if (requestedTaskId && activeRunTaskId && requestedTaskId !== activeRunTaskId) {
+    return { success: false, stopped: false, reason: 'The requested task is not the active run.' };
+  }
   isStopRequested = true;
   stopRequestMode = mode;
   if (mode === 'hard' && activeRunController && !activeRunController.signal.aborted) {
@@ -787,10 +797,80 @@ function requestAgentStop(options = {}) {
     dedupeKey: `stop-requested-${mode}-${targetConversationId || 'global'}`,
     windowMs: 3000
   });
+  return { success: true, stopped: !!targetConversationId, taskId: activeRunTaskId || '' };
+}
+
+function compactConversationForEvidenceSearch(conversation, excludedMessageIds = []) {
+  if (!conversation || typeof conversation !== 'object') return null;
+  const excluded = new Set((Array.isArray(excludedMessageIds) ? excludedMessageIds : []).map(String));
+  return {
+    id: String(conversation.id || ''),
+    title: String(conversation.title || ''),
+    mode: String(conversation.mode || ''),
+    workspace: String(conversation.workspace || ''),
+    projectPath: String(conversation.projectPath || conversation.dispatchProjectPath || ''),
+    updatedAt: conversation.updatedAt || conversation.createdAt || 0,
+    messages: (Array.isArray(conversation.messages) ? conversation.messages : [])
+      .filter(message => !excluded.has(String(message && (message.id || message.messageId) || '')))
+      .slice(-30).map((message, index) => ({
+      id: String(message.id || `${conversation.id || 'conversation'}-${index}`),
+      role: String(message.role || ''),
+      text: String(message.text || message.content || '').slice(0, 5000),
+      createdAt: message.createdAt || 0
+    }))
+  };
+}
+
+async function searchConversationEvidenceForRun(conversation, userPrompt, workspaceResolution) {
+  if (!window.api || typeof window.api.searchConversationEvidence !== 'function') {
+    return { success: false, evidence: [], queryTerms: [], reason: 'conversation_search_unavailable' };
+  }
+  const recentContext = (Array.isArray(conversation.messages) ? conversation.messages : [])
+    .slice(-12)
+    .map(message => String(message.text || message.content || ''))
+    .filter(Boolean);
+  const workspacePaths = getKnownWorkspaceCandidates(conversation).map(item => item.path);
+  const currentPromptMessage = [...(Array.isArray(conversation.messages) ? conversation.messages : [])]
+    .reverse()
+    .find(message => String(message && message.role || '').toLowerCase() === 'user'
+      && String(message && (message.text || message.content) || '').trim() === String(userPrompt || '').trim());
+  const excludedMessageIds = currentPromptMessage && (currentPromptMessage.id || currentPromptMessage.messageId)
+    ? [String(currentPromptMessage.id || currentPromptMessage.messageId)]
+    : [];
+  if (workspaceResolution && workspaceResolution.path && workspaceResolution.kind === WorkspaceResolution.KINDS.ACTIVE_PROJECT) {
+    workspacePaths.unshift(workspaceResolution.path);
+  }
+  try {
+    const result = await window.api.searchConversationEvidence({
+      query: String(userPrompt || ''),
+      recentContext,
+      currentConversation: compactConversationForEvidenceSearch(conversation, excludedMessageIds),
+      excludeConversationId: String(conversation.id || ''),
+      excludeMessageIds,
+      excludeUserPrompt: String(userPrompt || ''),
+      workspacePaths: [...new Set(workspacePaths.filter(Boolean))],
+      limit: 8
+    });
+    return result && typeof result === 'object'
+      ? { ...result, evidence: Array.isArray(result.evidence) ? result.evidence : [] }
+      : { success: false, evidence: [], queryTerms: [], reason: 'invalid_conversation_search_result' };
+  } catch (error) {
+    return { success: false, evidence: [], queryTerms: [], reason: error.message || String(error) };
+  }
+}
+
+function formatRetrievedConversationEvidence(searchResult) {
+  const evidence = searchResult && Array.isArray(searchResult.evidence) ? searchResult.evidence : [];
+  if (!evidence.length) return '';
+  const lines = evidence.slice(0, 8).map((item, index) => {
+    const provenance = [item.sourceKind || 'conversation', item.role || '', item.timestamp || ''].filter(Boolean).join('/');
+    return `${index + 1}. [${provenance}] ${String(item.excerpt || item.text || item.summary || '').replace(/\s+/g, ' ').trim().slice(0, 1400)}`;
+  });
+  return `[RETRIEVED CONVERSATION EVIDENCE]\nThese are typed excerpts retrieved from persisted conversations/session records. They license recall only to the extent of their exact content; do not invent missing details. Exact conversation messages outrank session summaries.\nSearch terms: ${(searchResult.queryTerms || []).join(', ')}\n\n${lines.join('\n')}`;
 }
 
 window.stopAgentExecution = (options = {}) => {
-  requestAgentStop({ mode: options.mode || 'hard' });
+  return requestAgentStop({ mode: options.mode || 'hard', taskId: options.taskId || '' });
 };
 window.softStopAgentExecution = () => requestAgentStop({ mode: 'soft' });
 
@@ -993,6 +1073,8 @@ async function evaluateLoopStateWithSupervisor(modelName, workWalkthrough, disab
 
 // EXPOSE AGENT LOOP TO RENDERER
 window.runAgentLoop = async function(userPrompt, modelName, conversation, options = {}) {
+  const runTaskId = String(options.taskId || '');
+  let runTaskExecutionId = '';
   if (isAgentRunning) {
     const statusText = "Another Orion task is already running. This request needs to be queued or retried after the active task finishes.";
     if (window.persistAssistantStatusMessage && conversation && conversation.id) {
@@ -1003,7 +1085,23 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     } else if (window.appendSystemMessage) {
       window.appendSystemMessage(statusText);
     }
-    return;
+    return { success: false, queued: false, reason: 'agent_busy', taskId: runTaskId };
+  }
+  if (runTaskId && typeof window.claimOrchestrationTask === 'function') {
+    const claimed = await window.claimOrchestrationTask(runTaskId);
+    if (!claimed || claimed.success === false) {
+      if (window.appendSystemMessage) {
+        window.appendSystemMessage(`Skipped queued task ${runTaskId}: ${(claimed && claimed.reason) || 'it is no longer pending.'}`, {
+          conversationId: conversation && conversation.id,
+          source: 'task-status',
+          dedupeKey: `task-skipped-${runTaskId}`
+        });
+      }
+      scheduleSkippedQueueRecovery(0);
+      return { success: false, skipped: true, taskId: runTaskId };
+    }
+    runTaskExecutionId = String(claimed.task && claimed.task.execution && claimed.task.execution.executionId || '');
+    if (claimed.prompt) userPrompt = claimed.prompt;
   }
   
   // A new message means this conversation is no longer idle — cancel any pending
@@ -1012,6 +1110,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
   isAgentRunning = true;
   runningConversationId = conversation.id;
+  activeRunTaskId = runTaskId;
   agentExecutionMode = 'planning';
   isStopRequested = false;
   stopRequestMode = 'none';
@@ -1027,9 +1126,48 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   // the finally block) so a concurrently-started run can't change which bucket this run's
   // preferences land in.
   const runMode = activeConversationMode;
-  let workspacePath = resolveConversationWorkspace(conversation);
+  let workspaceResolution = isOrionMode
+    ? await resolveDispatchWorkspaceForRun(conversation, userPrompt)
+    : (WorkspaceResolution ? WorkspaceResolution.classifyWorkspace({
+        mode: 'coder',
+        workspacePath: resolveConversationWorkspace(conversation),
+        projectPath: conversation.projectPath,
+        searchRoot: getDispatchWorkspaceRoot(),
+        knownProjects: getKnownWorkspaceCandidates(conversation)
+      }) : { kind: 'standalone_coder', path: resolveConversationWorkspace(conversation) });
+  let workspacePath = workspaceResolution.path || resolveConversationWorkspace(conversation);
+  const contextualTaskResolution = (isOrionMode && TaskOrchestration && TaskOrchestration.isContextDependentRequest(userPrompt))
+    ? TaskOrchestration.buildTaskPacket({
+        originalUserMessage: userPrompt,
+        precedingMessages: (conversation.messages || []).slice(0, -1),
+        workspace: {
+          role: workspaceResolution.kind,
+          path: workspaceResolution.path || '',
+          project: { name: workspaceResolution.projectName || '', path: workspaceResolution.projectPath || '' },
+          source: workspaceResolution.source || '',
+          resolved: workspaceResolution.kind !== (WorkspaceResolution && WorkspaceResolution.KINDS.UNRESOLVED)
+        },
+        originConversationId: conversation.id,
+        targetConversationId: conversation.id,
+        targetMode: 'orion'
+      })
+    : null;
+  const resolvedRequestForRouting = contextualTaskResolution && contextualTaskResolution.success
+    ? contextualTaskResolution.task.objective : userPrompt;
+  const recallRequested = !!(isOrionMode && OrchestrationContracts && OrchestrationContracts.isRecallRequest(userPrompt));
+  const conversationEvidenceSearch = recallRequested
+    ? await searchConversationEvidenceForRun(conversation, userPrompt, workspaceResolution)
+    : { success: true, evidence: [], queryTerms: [] };
+  const retrievedConversationEvidence = Array.isArray(conversationEvidenceSearch.evidence)
+    ? conversationEvidenceSearch.evidence : [];
+  const structuredStatusFacts = OrchestrationContracts
+    ? OrchestrationContracts.extractStructuredStatusFacts(userPrompt)
+    : [];
   if (isOrionMode) {
-    orionSessionContinuityContext = await buildOrionContinuityContext(conversation, workspacePath);
+    // Recall-oriented requests use the typed exact-evidence search above. The older continuity
+    // summary remains useful for ordinary first-turn orientation, but it must never be the only
+    // basis for an explicit "I remember" claim.
+    orionSessionContinuityContext = recallRequested ? '' : await buildOrionContinuityContext(conversation, workspacePath);
     await refreshOrionMemoryBlock(config, userPrompt, runMode); // pre-load global memory, ranked against this message
   } else {
     orionSessionContinuityContext = '';
@@ -1079,6 +1217,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let userRequestedStop = false;
   let finalAnswerQualityPrompts = 0;
   let finalAnswerQualityLoopExtensions = 0;
+  let memoryConfidenceCorrections = 0;
+  let statusAccuracyCorrections = 0;
+  let criticalRunError = null;
+  let finalizedTaskState = runTaskId ? 'active' : '';
   // Set right after the main while loop exits, in the outer function scope so the `finally` block
   // below (which runs in a separate block from the `try` that declares loopCount/maxLoops) can see
   // whether the loop stopped because it hit its raw per-turn ceiling rather than because the model
@@ -1339,6 +1481,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   // old model and tool turns are deliberately not replayed as task truth.
   let messages = OperationalContext.buildReasoningMessages(workingState, conversation.messages, promptForModel, promptImages);
 
+  if (recallRequested) {
+    const retrievedEvidenceText = formatRetrievedConversationEvidence(conversationEvidenceSearch);
+    const recallContractText = retrievedEvidenceText || `[RETRIEVED CONVERSATION EVIDENCE]\nNo relevant prior-conversation evidence passed the retrieval threshold for this request. You must not say "I remember," "we discussed," "you said earlier," or reconstruct a plausible prior exchange. Say naturally that the specific conversation could not be retrieved. Project/source knowledge and a new inference are still allowed only when labeled as such.`;
+    messages.splice(2, 0,
+      { role: 'user', parts: [{ text: recallContractText }] },
+      { role: 'model', parts: [{ text: retrievedEvidenceText
+        ? 'Understood. I will base any recall claim only on these retrieved conversational excerpts.'
+        : 'Understood. I will not claim to remember a conversation that was not retrieved.' }] }
+    );
+  }
+
   // OC injection optimization: subsequent turns inject a short header instead of full OC state
   const OC_SHORT_HEADER = '[Operational context on file — request specific sections if needed: goals, current_task, do_not_touch, notes]';
   let useOCShortHeader = false;
@@ -1416,6 +1569,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const systemFactsSignature = JSON.stringify({
     home: resolvedHomeDir,
     workspace: workspacePath || '',
+    workspaceKind: workspaceResolution && workspaceResolution.kind,
     webSearch: webSearchLabel,
     promptSource: promptSource === 'phone' ? 'phone' : 'desktop',
     knownProjectsFacts,
@@ -1424,9 +1578,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   });
   const shouldInjectFullSystemFacts = conversation._systemFactsSignature !== systemFactsSignature;
   conversation._systemFactsSignature = systemFactsSignature;
+  const workspaceFactText = WorkspaceResolution
+    ? WorkspaceResolution.describeWorkspace(workspaceResolution, (WorkspaceResolution.extractProjectReferences(userPrompt) || [])[0] || '')
+    : `Active conversation workspace: ${workspacePath || '(none)'}.`;
   const systemFactsText = shouldInjectFullSystemFacts
-    ? `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\nActive conversation workspace (resolved): ${workspacePath || '(none)'}\nWeb search: ${webSearchStatus}\nClient: ${promptSource === 'phone' ? 'PHONE COMPANION — the user is on their phone. Prefer descriptions, text output, and copy-pasteable results over actions that require the desktop (launching GUI apps, opening windows, running interactive commands). If you need to show output, describe it clearly rather than suggesting they look at the screen.' : 'DESKTOP — the user is at their computer. You can launch apps, reference screen elements, and run interactive commands normally.'}\nIf the user's latest message says "this program", "the program", "read through it", "where do we go from here", or otherwise follows up on the same project, use the active conversation workspace above as the target. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.${evidenceDisciplineRule}${dispatchProjectContext}${workWalkthroughOverride}${knownProjectsBlock}`
-    : `[ORION SYSTEM FACTS - compact]\nStable system facts are unchanged from earlier in this conversation. Current workspace: ${workspacePath || '(none)'}. Home: ${resolvedHomeDir}. Web search: ${webSearchLabel}. Client: ${promptSource === 'phone' ? 'phone companion' : 'desktop'}.\nUse the current workspace for self-referential phrases like "this program" or "the project." Do NOT run echo or whoami to discover these paths.${evidenceDisciplineRule}${dispatchProjectContext}${workWalkthroughOverride}`;
+    ? `[ORION SYSTEM FACTS]\nUser home directory (resolved): ${resolvedHomeDir}\nDesktop projects folder: ${resolvedHomeDir}\\Desktop\\projects\n${workspaceFactText}\nWeb search: ${webSearchStatus}\nClient: ${promptSource === 'phone' ? 'PHONE COMPANION — the user is on their phone. Prefer descriptions, text output, and copy-pasteable results over actions that require the desktop (launching GUI apps, opening windows, running interactive commands). If you need to show output, describe it clearly rather than suggesting they look at the screen.' : 'DESKTOP — the user is at their computer. You can launch apps, reference screen elements, and run interactive commands normally.'}\nUse self-referential phrases such as "this program" only when the workspace role above is an active project or standalone Coder workspace. A project search root is a directory to search, not a selected project. Do not re-run change_workspace for an older dictated/autocorrected folder phrase after a real workspace has already been resolved.\nDo NOT run echo or whoami to discover these paths — use the values above directly.${evidenceDisciplineRule}${dispatchProjectContext}${workWalkthroughOverride}${knownProjectsBlock}`
+    : `[ORION SYSTEM FACTS - compact]\nStable system facts are unchanged from earlier in this conversation. ${workspaceFactText} Home: ${resolvedHomeDir}. Web search: ${webSearchLabel}. Client: ${promptSource === 'phone' ? 'phone companion' : 'desktop'}.\nUse self-referential workspace phrases only for an active project or standalone Coder workspace. Do NOT run echo or whoami to discover these paths.${evidenceDisciplineRule}${dispatchProjectContext}${workWalkthroughOverride}`;
   messages.splice(2, 0,
     {
       role: 'user',
@@ -1553,7 +1710,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   }
 
   const incidentalIssueBuffer = [];
-  
+  // Declared outside the try so the finally-block response-basis computation can see it.
+  const toolEvidenceLedger = [];
+
   try {
     if (approvalIntent && approvalIntent.intent === 'deny') {
       lastTextResponse = `Understood. I will not proceed with that implementation plan.\n\nReason interpreted: ${approvalIntent.reason || 'The message was a denial or rejection of the plan.'}`;
@@ -1643,6 +1802,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     let skillDiscoveryChecked = false; // true once discover_skills has been called this run
     let blankFinalAnswerNudgeSent = false;
     let dispatchForcedHandoffSent = false;
+    let blockedDispatchHandoffAttempts = 0;
     const repeatedToolFailures = new Map();
     const fileEditCounts = new Map();
     const fileNeedsReadBeforeEdit = new Set(); // files that must be read before the next edit
@@ -1670,7 +1830,6 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // four consecutive replace_range attempts on the same file each reintroduce a fresh syntax
     // error (miscalculated line ranges drifting after each edit) with zero escalation ever firing.
     const consecutiveEditFailureCounts = new Map(); // path (lowercased) -> streak count
-    const toolEvidenceLedger = [];
     const contextAcquisitionLedger = createContextAcquisitionLedger();
     if (inheritedContextReceipt) {
       recordContextAcquisitionToolResult(
@@ -1874,12 +2033,40 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         }
       });
 
+      // A handoff is an executable side effect. The model may not turn commands that appear only
+      // inside a quoted status report, transcript, test case, or code sample into a real Coder
+      // task. This gate runs before tool execution, so it protects model-originated calls as well
+      // as the synthetic refusal-recovery path below.
+      if (runMode === 'orion' && functionCalls.some(call => call && call.name === 'handoff_to_coder') && DispatchIntent) {
+        const instructionAnalysis = DispatchIntent.analyzeDispatchInstruction(
+          contextualTaskResolution && contextualTaskResolution.success ? resolvedRequestForRouting : userPrompt
+        );
+        if (!instructionAnalysis.executionRequested) {
+          blockedDispatchHandoffAttempts++;
+          for (let index = parts.length - 1; index >= 0; index--) {
+            if (parts[index] && parts[index].functionCall && parts[index].functionCall.name === 'handoff_to_coder') parts.splice(index, 1);
+          }
+          functionCalls = functionCalls.filter(call => call && call.name !== 'handoff_to_coder');
+          currentAgentLogs.push({
+            type: 'thought',
+            content: `Dispatch instruction guard: ignored a handoff derived only from ${instructionAnalysis.reason || 'reported/quoted material'}.`
+          });
+          if (functionCalls.length === 0 && blockedDispatchHandoffAttempts <= 2 && loopCount < maxLoops) {
+            messages.push({
+              role: 'user',
+              parts: [{ text: '[SYSTEM: The attempted Coder handoff was blocked because the latest user message reports, quotes, transcribes, or tests executable wording rather than actively requesting that operation. Analyze or acknowledge the surrounding message. Do not execute the quoted example and do not call handoff_to_coder unless the user explicitly asks to run/apply that quoted content.]' }]
+            });
+            continue;
+          }
+        }
+      }
+
       // Dispatch is intentionally denied execution/mutation tools, but that permission boundary
       // must never become a reason to return the task to Jason. If an explicit execution request
       // receives a no-tool permission refusal/manual deflection, synthesize the allowed Coder
       // handoff as part of this same model turn. Mutating `parts` keeps provider history valid:
       // the following tool response has a matching functionCall in the assistant message.
-      if (functionCalls.length === 0 && shouldForceDispatchHandoff(userPrompt, textVal, {
+      if (functionCalls.length === 0 && shouldForceDispatchHandoff(resolvedRequestForRouting, textVal, {
         mode: runMode,
         alreadyHandedOff: dispatchForcedHandoffSent
       })) {
@@ -1887,7 +2074,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         const forcedCall = {
           name: 'handoff_to_coder',
           args: {
-            prompt: buildForcedDispatchHandoffPrompt(userPrompt),
+            prompt: buildForcedDispatchHandoffPrompt(resolvedRequestForRouting),
             title: 'Execute Dispatch request',
             open: true
           }
@@ -1944,6 +2131,37 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             }]
           });
           continue;
+        }
+        if (OrchestrationContracts && (recallRequested || OrchestrationContracts.hasExplicitRecallClaim(textVal))) {
+          const memoryValidation = OrchestrationContracts.validateMemoryResponse(textVal, {
+            conversationEvidence: retrievedConversationEvidence
+          });
+          if (!memoryValidation.valid && memoryConfidenceCorrections < 1 && loopCount < maxLoops) {
+            memoryConfidenceCorrections++;
+            currentAgentLogs.push({ type: 'thought', content: `Memory-confidence guard: ${memoryValidation.reason}.` });
+            messages.push({
+              role: 'user',
+              parts: [{ text: OrchestrationContracts.buildMemoryCorrectionPrompt(userPrompt, retrievedConversationEvidence, memoryValidation.reason) }]
+            });
+            continue;
+          }
+          if (!memoryValidation.valid) {
+            lastTextResponse = OrchestrationContracts.buildEvidenceBackedRecallFallback(retrievedConversationEvidence);
+            break;
+          }
+        }
+        if (structuredStatusFacts.length > 0 && OrchestrationContracts) {
+          const statusValidation = OrchestrationContracts.validateStatusResponse(textVal, structuredStatusFacts);
+          if (!statusValidation.valid && statusAccuracyCorrections < 1 && loopCount < maxLoops) {
+            statusAccuracyCorrections++;
+            currentAgentLogs.push({ type: 'thought', content: `Structured-status guard: ${statusValidation.reason}.` });
+            messages.push({ role: 'user', parts: [{ text: OrchestrationContracts.buildStatusCorrectionPrompt(statusValidation) }] });
+            continue;
+          }
+          if (!statusValidation.valid) {
+            lastTextResponse = OrchestrationContracts.enforceStatusFallback(textVal, structuredStatusFacts);
+            break;
+          }
         }
         const pendingTasks = conversation.tasks ? conversation.tasks.filter(t => t.status !== 'completed' && t.status !== 'x') : [];
         if (config.planningMode && !canExecuteThisTask() && !hasAnyChecklist(conversation) &&
@@ -2556,6 +2774,22 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
         const evidenceEntry = buildToolEvidenceEntry(toolName, args, result);
         toolEvidenceLedger.push(evidenceEntry);
+        if (result && Array.isArray(result.conversationEvidence)) {
+          for (const item of result.conversationEvidence) {
+            const evidenceId = item && item.id;
+            if (item && !retrievedConversationEvidence.some(existing => existing && existing.id === evidenceId)) {
+              retrievedConversationEvidence.push(item);
+            }
+          }
+        }
+        if (Array.isArray(evidenceEntry.structuredStatuses)) {
+          for (const fact of evidenceEntry.structuredStatuses) {
+            const signature = JSON.stringify(fact);
+            if (!structuredStatusFacts.some(existing => JSON.stringify(existing) === signature)) {
+              structuredStatusFacts.push(fact);
+            }
+          }
+        }
         recordContextAcquisitionToolResult(contextAcquisitionLedger, toolName, args, result);
         rememberContextPacketForConversation(conversation, workspacePath, toolName, result);
 
@@ -2925,6 +3159,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       lastTextResponse = stopRequestMode === 'soft' ? "Task stopped by user after the current step." : "Task aborted by user.";
       currentAgentLogs.push({ type: 'thought', content: stopRequestMode === 'soft' ? "Stop requested by user; the run was halted cleanly." : "Task execution stopped by user." });
     } else {
+      criticalRunError = error;
       console.error("Critical error in agent loop:", error);
       window.appendSystemMessage(`Critical error in agent: ${error.message}`);
       lastTextResponse = `An error occurred: ${error.message}`;
@@ -3037,6 +3272,20 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     if (bestVisibleAnswer && looksLikeLeakedNoToolCorrection(lastTextResponse)) {
       lastTextResponse = bestVisibleAnswer;
     }
+    if (OrchestrationContracts && (recallRequested || OrchestrationContracts.hasExplicitRecallClaim(lastTextResponse))) {
+      const finalMemoryValidation = OrchestrationContracts.validateMemoryResponse(lastTextResponse, {
+        conversationEvidence: retrievedConversationEvidence
+      });
+      if (!finalMemoryValidation.valid) {
+        lastTextResponse = OrchestrationContracts.buildEvidenceBackedRecallFallback(retrievedConversationEvidence);
+      }
+    }
+    if (structuredStatusFacts.length > 0 && OrchestrationContracts) {
+      const finalStatusValidation = OrchestrationContracts.validateStatusResponse(lastTextResponse, structuredStatusFacts);
+      if (!finalStatusValidation.valid) {
+        lastTextResponse = OrchestrationContracts.enforceStatusFallback(lastTextResponse, structuredStatusFacts);
+      }
+    }
     // A run that exhausted its raw per-turn ceiling while thrashing on legitimate-but-circuitous
     // tool calls (e.g. repeatedly retrying broken shell escaping) and never reached a checklist —
     // so autoContinueExecution never engaged — otherwise leaves whatever stale mid-task sentence
@@ -3064,6 +3313,18 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // Ensure the final text and logs are written and rendered
     conversation.messages[aiMessageIndex].text = lastTextResponse;
     conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
+    if (OrchestrationContracts) {
+      const projectKnowledgeTools = new Set([
+        'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context', 'list_files',
+        'grep_search', 'semantic_search', 'get_symbol_index', 'read_project_memory', 'recall_memory'
+      ]);
+      conversation.messages[aiMessageIndex].responseBasis = OrchestrationContracts.createResponseBasis({
+        conversationEvidence: retrievedConversationEvidence,
+        projectKnowledge: toolEvidenceLedger.some(item => item && projectKnowledgeTools.has(item.toolName)),
+        generalInference: retrievedConversationEvidence.length === 0 && !toolEvidenceLedger.some(item => item && projectKnowledgeTools.has(item.toolName)),
+        structuredStatuses: structuredStatusFacts
+      });
+    }
     // Permanently mark the bubble that carries the plan-approval card so it can be re-rendered
     // with a persistent "Implementation started" state after approval, instead of vanishing on
     // the next reload and looking like the button was never pressed.
@@ -3110,6 +3371,27 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       String(lastTextResponse || 'Agent run finished.').replace(/\s+/g, ' ').slice(0, 1000),
       pendingOperationalTask ? pendingOperationalTask.title : ''
     );
+
+    if (runTaskId && typeof window.finalizeOrchestrationTask === 'function') {
+      const desiredTaskState = userRequestedStop
+        ? 'cancelled'
+        : (criticalRunError
+          ? 'failed'
+          : ((autoContinueExecution || forceYield || ranOutOfLoopBudget || hasPendingWork || conversation.awaitingPlanApproval || conversation.awaitingClarification)
+            ? 'pending'
+            : 'completed'));
+      const finalizedTask = await window.finalizeOrchestrationTask(runTaskId, desiredTaskState, {
+        reason: userRequestedStop
+          ? 'Cancelled by user.'
+          : (criticalRunError ? String(criticalRunError.message || criticalRunError) : ''),
+        summary: String(lastTextResponse || '').replace(/\s+/g, ' ').slice(0, 1000),
+        conversationId: conversation.id,
+        pendingWork: !!hasPendingWork,
+        awaitingUser: !!(forceYield || conversation.awaitingPlanApproval || conversation.awaitingClarification),
+        expectedExecutionId: runTaskExecutionId
+      });
+      finalizedTaskState = finalizedTask && finalizedTask.status ? finalizedTask.status : desiredTaskState;
+    }
     
     // Clear the active bubble tracking ONLY after the final render has updated it (removing the spinner)
     window.clearActiveAiBubble();
@@ -3139,6 +3421,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     if (window.renderConversationList) window.renderConversationList();
     if (window.renderProjectsList) window.renderProjectsList();
   }
+
+  if (activeRunTaskId === runTaskId) activeRunTaskId = null;
   
   // If the run stopped mid-plan with real progress and pending work, queue an internal
   // continuation so a multi-phase build keeps going instead of falsely ending. Real user
@@ -3148,6 +3432,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       prompt: '[ORION INTERNAL CONTINUATION - not a user message] The approved plan is still in progress. Continue executing the remaining checklist items and subplan steps now: write and edit the actual source files for the next pending tasks, then verify. Do not restate the plan or stop until the work is genuinely complete or you hit a real blocker. Do not quote this as something the user said.',
       modelSelectValue: modelName,
       conversationId: conversation.id,
+      taskId: activeRunTaskId || '',
       alreadyRendered: true,
       source: 'system'
     });
@@ -3188,13 +3473,31 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           }
           await window.runAgentLoop(nextTask.prompt, nextTask.modelSelectValue, activeConv, {
             source: nextTask.source || 'queue',
-            internalPrompt: isInternalQueueItem
+            internalPrompt: isInternalQueueItem,
+            taskId: nextTask.taskId || ''
           });
         }
       }
     }
   }, 500);
 };
+
+function scheduleSkippedQueueRecovery(delayMs = 0) {
+  setTimeout(async () => {
+    if (isAgentRunning || !Array.isArray(window.promptQueue) || window.promptQueue.length === 0) return;
+    const nextTask = window.promptQueue.shift();
+    const targetId = nextTask && (nextTask.conversationId || (window.getActiveConversationId && window.getActiveConversationId()));
+    if (!targetId || typeof conversations === 'undefined') return;
+    const targetConversation = conversations.find(item => item.id === targetId);
+    if (!targetConversation) return;
+    const internal = ['followup', 'plan-approval', 'system'].includes(nextTask.source);
+    await window.runAgentLoop(nextTask.prompt, nextTask.modelSelectValue, targetConversation, {
+      source: nextTask.source || 'queue',
+      internalPrompt: internal,
+      taskId: nextTask.taskId || ''
+    });
+  }, Math.max(0, Number(delayMs) || 0));
+}
 
 const DEFAULT_LIST_FILES_MAX = 250;
 const HIDDEN_DIRECTORY_REASONS = new Map([
@@ -3349,13 +3652,23 @@ async function executeTool(name, args, workspace, config, conversation) {
   switch (name) {
     case 'get_workspace_info': {
       const entryResult = await window.api.getWorkspaceEntrypoint(workspace);
+      const resolution = WorkspaceResolution ? WorkspaceResolution.classifyWorkspace({
+        mode: conversation.mode === 'coder' ? 'coder' : 'orion',
+        workspacePath: workspace,
+        projectPath: conversation.projectPath,
+        dispatchProjectPath: conversation.dispatchProjectPath,
+        searchRoot: getDispatchWorkspaceRoot(),
+        knownProjects: getKnownWorkspaceCandidates(conversation)
+      }) : null;
       return {
         success: true,
         workspace,
+        workspaceKind: resolution ? resolution.kind : (conversation.projectPath ? 'active_project' : 'unresolved'),
+        workspaceDescription: resolution ? WorkspaceResolution.describeWorkspace(resolution) : '',
         conversationId: conversation.id,
         title: conversation.title,
-        projectPath: conversation.projectPath || '',
-        scope: conversation.projectPath ? 'project' : 'standalone',
+        projectPath: (resolution && resolution.projectPath) || conversation.projectPath || conversation.dispatchProjectPath || '',
+        scope: resolution ? resolution.kind : (conversation.projectPath ? 'active_project' : 'standalone_coder'),
         entrypoint: entryResult && entryResult.success ? entryResult.entrypoint : null
       };
     }
@@ -3768,6 +4081,25 @@ async function executeTool(name, args, workspace, config, conversation) {
       if (typeof window.promoteWorkspaceToCoder !== 'function') {
         throw new Error('Coder handoff is not available in this Orion build.');
       }
+      let handoffWorkspace = WorkspaceResolution ? WorkspaceResolution.classifyWorkspace({
+        mode: 'orion',
+        workspacePath: resolution.path,
+        dispatchProjectPath: conversation.dispatchProjectPath,
+        searchRoot: getDispatchWorkspaceRoot(),
+        knownProjects: getKnownWorkspaceCandidates(conversation)
+      }) : { kind: 'active_project', path: resolution.path };
+      if (WorkspaceResolution && handoffWorkspace.kind === WorkspaceResolution.KINDS.UNRESOLVED
+          && !WorkspaceResolution.samePath(resolution.path, getDispatchWorkspaceRoot())) {
+        handoffWorkspace = WorkspaceResolution.bindResolvedProject(handoffWorkspace, {
+          path: resolution.path,
+          name: resolution.matchedName || getLocalPathBaseName(resolution.path),
+          source: args.path ? 'explicit_verified_handoff_path' : 'resolved_conversation_workspace'
+        });
+      }
+      const handoffPermission = WorkspaceResolution ? WorkspaceResolution.canHandoffWorkspace(handoffWorkspace) : { allowed: true };
+      if (!handoffPermission.allowed) {
+        throw new Error(handoffPermission.reason || 'Resolve a concrete project workspace before handing work to Coder.');
+      }
       const prompt = String(args.prompt || '').trim();
       const contextPacketIds = getHandoffContextPacketIds(conversation, resolution.path);
       const result = await window.promoteWorkspaceToCoder({
@@ -3776,6 +4108,8 @@ async function executeTool(name, args, workspace, config, conversation) {
         title: args.title || '',
         open: args.open === true,
         sourceConversationId: conversation.id,
+        sourceSessionId: conversation.sessionId || conversation.id,
+        sourceMessageId: (conversation.messages || []).slice().reverse().find(message => message.role === 'user')?.id || '',
         contextPacketIds,
         findings: Array.isArray(args.findings) ? args.findings : []
       });
@@ -3785,6 +4119,8 @@ async function executeTool(name, args, workspace, config, conversation) {
 
       // ── Supervisor: track the launched Coder conversation ──────────────────
       conversation.launchedCoderConvId = result.conversationId;
+      conversation.launchedCoderTaskId = result.taskId || '';
+      conversation.lastOwnedTaskId = result.taskId || conversation.lastOwnedTaskId || '';
       conversation.launchedCoderTaskTitle = result.title || 'Coder Task';
       conversation.launchedCoderTaskStart = Date.now();
       if (window.saveConversationsToStorage) window.saveConversationsToStorage();
@@ -3798,11 +4134,44 @@ async function executeTool(name, args, workspace, config, conversation) {
         ...result,
         success: true,
         message: prompt
-          ? `Promoted ${resolution.path} to Coder and queued the task for Cody.${result.contextTransferred ? ` Transferred ${result.contextPacketIds.length} validated context packet(s).` : ''}`
+          ? `Promoted ${resolution.path} to Coder and queued task ${result.taskId || '(pending ID)'} with state ${result.status || 'pending'}.${result.contextTransferred ? ` Transferred ${result.contextPacketIds.length} validated context packet(s).` : ''}`
           : `Promoted ${resolution.path} to Coder as a project.`,
         fuzzyResolved: !!resolution.fuzzyResolved,
         resolvedFrom: resolution.resolvedFrom,
         matchedName: resolution.matchedName || getLocalPathBaseName(resolution.path)
+      };
+    }
+
+    case 'get_coder_task_status': {
+      const taskId = String(args.taskId || conversation.launchedCoderTaskId || conversation.lastOwnedTaskId || '').trim();
+      if (!taskId) throw new Error('No task ID is associated with this Dispatch conversation.');
+      if (typeof window.getOrchestrationTaskStatus !== 'function') throw new Error('Task status service is unavailable.');
+      const result = await window.getOrchestrationTaskStatus(taskId, conversation.id);
+      if (!result || result.success === false) throw new Error((result && result.error) || 'Task status lookup failed.');
+      return {
+        success: true,
+        taskId: result.taskId,
+        status: result.status,
+        description: result.description,
+        workspacePath: result.task && result.task.workspacePath,
+        targetConversationId: result.task && result.task.target && result.task.target.conversationId
+      };
+    }
+
+    case 'cancel_coder_task': {
+      const taskId = String(args.taskId || conversation.launchedCoderTaskId || conversation.lastOwnedTaskId || '').trim();
+      if (!taskId) throw new Error('No task ID is associated with this Dispatch conversation.');
+      if (typeof window.cancelOwnedOrchestrationTask !== 'function') throw new Error('Task cancellation service is unavailable.');
+      const result = await window.cancelOwnedOrchestrationTask(taskId, conversation.id, args.reason || 'Cancelled at the user\'s request.');
+      if (!result || result.success === false) throw new Error((result && result.error) || 'Task cancellation failed.');
+      return {
+        success: true,
+        taskId,
+        status: result.task.status,
+        stoppedActiveRun: !!result.stopped,
+        message: result.task.status === 'cancelled'
+          ? `Task ${taskId} is cancelled. It will not be reported as completed.`
+          : `Cancellation requested for task ${taskId}.`
       };
     }
 
@@ -4506,6 +4875,23 @@ async function executeTool(name, args, workspace, config, conversation) {
         const p = await window.api.readProjectMemory(wp);
         output.project = p || {};
       }
+      if (scope === 'conversation' || ((scope === 'all' || scope === 'recent') && args.query)) {
+        const query = String(args.query || '').trim();
+        if (!query) throw new Error("recall_memory requires 'query' for conversation evidence.");
+        const resolution = WorkspaceResolution ? WorkspaceResolution.classifyWorkspace({
+          mode: conversation && conversation.mode,
+          workspacePath: wp,
+          projectPath: conversation && (conversation.projectPath || conversation.dispatchProjectPath),
+          searchRoot: getDispatchWorkspaceRoot(),
+          knownProjects: getKnownWorkspaceCandidates(conversation)
+        }) : { path: wp, kind: wp ? 'active_project' : 'unresolved' };
+        const search = await searchConversationEvidenceForRun(conversation, query, resolution);
+        output.conversationEvidence = search.evidence || [];
+        output.queryTerms = search.queryTerms || [];
+        output.responseBasis = OrchestrationContracts
+          ? OrchestrationContracts.createResponseBasis({ conversationEvidence: output.conversationEvidence })
+          : { conversationEvidence: output.conversationEvidence.length > 0 };
+      }
       return output;
     }
 
@@ -5167,7 +5553,7 @@ function persistCompactedConversation(conversation, summary) {
 function scheduleAgentFollowup(args = {}) {
   const delaySeconds = Math.min(Math.max(Number(args.delaySeconds || 60), 1), 3600);
   const prompt = args.prompt || 'Continue the previous task. Check any long-running command or training progress, inspect output, fix issues if needed, and keep working until the task is complete.';
-  const targetConversationId = (typeof activeConversationId !== 'undefined') ? activeConversationId : null;
+  const targetConversationId = runningConversationId || ((typeof activeConversationId !== 'undefined') ? activeConversationId : null);
   const modelSelectValue = window.getSelectedModel ? window.getSelectedModel() : undefined;
   const purpose = normalizeFollowupPurpose(args.purpose || prompt);
   const existingTimerId = Object.keys(window.followupTimerMeta || {}).find((id) => {
@@ -5194,19 +5580,23 @@ function scheduleAgentFollowup(args = {}) {
     delete window.followupTimers[timerId];
     delete window.followupTimerMeta[timerId];
     
-    if (window.isAgentRunning && window.isAgentRunning()) {
-      const alreadyQueued = window.promptQueue && window.promptQueue.some(item =>
-        item.conversationId === targetConversationId && item.prompt === prompt
-      );
-      if (!alreadyQueued) {
-        window.promptQueue.push({ prompt, modelSelectValue, conversationId: targetConversationId, source: 'followup' });
-      }
-      return;
-    }
-    
     if (typeof conversations === 'undefined') return;
     const targetConv = conversations.find(c => c.id === targetConversationId);
     if (!targetConv) return;
+    if (typeof window.enqueueOrchestrationTask !== 'function') return;
+    const queued = await window.enqueueOrchestrationTask({
+      prompt,
+      resolvedObjective: prompt,
+      title: `Scheduled follow-up: ${purpose}`,
+      modelSelectValue,
+      targetConversationId,
+      originConversationId: targetConversationId,
+      source: 'followup',
+      alreadyRendered: true
+    });
+    if (!queued || !queued.success) return;
+    if (window.isAgentRunning && window.isAgentRunning()) return;
+    window.promptQueue = (window.promptQueue || []).filter(item => item && item.taskId !== queued.task.taskId);
     
     if (window.appendSystemMessage) {
       window.appendSystemMessage(`Scheduled follow-up running after ${delaySeconds} seconds.`, { conversationId: targetConversationId });
@@ -5215,7 +5605,7 @@ function scheduleAgentFollowup(args = {}) {
       prompt,
       modelSelectValue || (window.getSelectedModel ? window.getSelectedModel() : 'gemini-2.5-flash-lite'),
       targetConv,
-      { source: 'followup', internalPrompt: true }
+      { source: 'followup', internalPrompt: true, taskId: queued.task.taskId }
     );
   }, delaySeconds * 1000);
   
@@ -6637,6 +7027,9 @@ function shouldHaveUsedToolsButDidNot(text, workWalkthrough, userPrompt = '', co
 // refusing, citing its permissions, promising a handoff without calling it, or returning the work
 // to the user. The main loop then creates the real handoff function call deterministically.
 function dispatchRequestRequiresCoderExecution(userPrompt) {
+  if (DispatchIntent && typeof DispatchIntent.dispatchRequestRequiresCoderExecution === 'function') {
+    return DispatchIntent.dispatchRequestRequiresCoderExecution(userPrompt);
+  }
   const prompt = String(userPrompt || '').trim();
   if (!prompt) return false;
   const action = '(?:kill|terminate|stop|restart|reboot|start|launch|run|execute|install|uninstall|upgrade|update|configure|change|modify|edit|write|create|delete|remove|rename|move|copy|build|fix|repair|test|deploy|package|commit|push|pull|save|generate|produce|capture)';
@@ -6900,13 +7293,20 @@ function getToolFailureSignal(result) {
 function buildToolEvidenceEntry(toolName, args = {}, result = {}) {
   const failure = getToolFailureSignal(result);
   const command = args && args.command ? String(args.command) : '';
+  const conversationEvidence = result && Array.isArray(result.conversationEvidence) ? result.conversationEvidence : [];
+  const structuredStatuses = OrchestrationContracts && result && typeof result === 'object'
+    ? OrchestrationContracts.extractStructuredStatusFacts(JSON.stringify(result))
+    : [];
   return {
     toolName,
     command,
     failed: !!failure,
     failure,
     category: failure ? classifyAgentFailure({ toolName, args, result, errorText: failure }).category : 'success',
-    summary: summarizeToolOutcome(toolName, args, result).summary
+    summary: summarizeToolOutcome(toolName, args, result).summary,
+    evidenceKind: conversationEvidence.length ? 'retrieved_conversation' : 'tool_result',
+    provenance: conversationEvidence.map(item => item && item.provenance).filter(Boolean),
+    structuredStatuses
   };
 }
 
@@ -7608,6 +8008,76 @@ function resolveConversationWorkspace(conversation) {
   return conv.workspace || conv.projectPath || (window.getCurrentWorkspace ? window.getCurrentWorkspace() : '');
 }
 
+function getKnownWorkspaceCandidates(conversation) {
+  const candidates = [];
+  const add = (value, source) => {
+    const projectPath = String(value || '').trim();
+    if (!projectPath || candidates.some(item => WorkspaceResolution && WorkspaceResolution.samePath(item.path, projectPath))) return;
+    candidates.push({ path: projectPath, source });
+  };
+  try {
+    const known = window.getKnownProjects ? window.getKnownProjects() : [];
+    (Array.isArray(known) ? known : []).forEach(value => add(value, 'registered_project'));
+  } catch (_) {}
+  add(conversation && conversation.dispatchProjectPath, 'dispatch_binding');
+  add(conversation && conversation.projectPath, 'conversation_project');
+  if (window.getRecentProjectCandidates) {
+    try {
+      (window.getRecentProjectCandidates() || []).forEach(value => add(value.path || value, value.source || 'recent_conversation'));
+    } catch (_) {}
+  }
+  return candidates;
+}
+
+async function resolveDispatchWorkspaceForRun(conversation, userPrompt) {
+  const searchRoot = getDispatchWorkspaceRoot();
+  if (!WorkspaceResolution) {
+    return { kind: 'unresolved', path: resolveConversationWorkspace(conversation), projectPath: '', projectName: '', source: 'legacy' };
+  }
+  const knownProjects = getKnownWorkspaceCandidates(conversation);
+  let resolution = WorkspaceResolution.classifyWorkspace({
+    mode: 'orion',
+    workspacePath: conversation && conversation.workspace,
+    dispatchProjectPath: conversation && conversation.dispatchProjectPath,
+    searchRoot,
+    knownProjects
+  });
+  const named = WorkspaceResolution.findNamedProject(userPrompt, knownProjects);
+  if (named) {
+    resolution = WorkspaceResolution.bindResolvedProject(resolution, named, named.source || 'registered_project');
+  } else if (resolution.kind !== WorkspaceResolution.KINDS.ACTIVE_PROJECT) {
+    // A bounded filesystem lookup covers named projects that have not yet been registered. The
+    // search starts from entity-like names (for example an all-caps app name) and never treats the
+    // generic Projects directory itself as the selected project.
+    const references = WorkspaceResolution.extractProjectReferences(userPrompt);
+    for (const reference of references) {
+      const candidatePath = joinLocalPath(searchRoot, reference);
+      const candidate = await resolveWorkspacePathForChange(candidatePath);
+      if (!candidate || !candidate.success || WorkspaceResolution.samePath(candidate.path, searchRoot)) continue;
+      resolution = WorkspaceResolution.bindResolvedProject(resolution, {
+        path: candidate.path,
+        name: candidate.matchedName || getLocalPathBaseName(candidate.path),
+        source: candidate.fuzzyResolved ? 'filesystem_fuzzy_match' : 'filesystem_match'
+      });
+      break;
+    }
+  }
+
+  if (resolution.kind === WorkspaceResolution.KINDS.ACTIVE_PROJECT) {
+    const didChange = !WorkspaceResolution.samePath(conversation.workspace, resolution.path)
+      || !WorkspaceResolution.samePath(conversation.dispatchProjectPath, resolution.path);
+    conversation.workspace = resolution.path;
+    conversation.dispatchProjectPath = resolution.path;
+    conversation.projectPath = '';
+    resolution.changed = didChange;
+    if (didChange && typeof window.changeActiveWorkspace === 'function') {
+      window.changeActiveWorkspace(resolution.path, { conversationId: conversation.id, promoteProject: false });
+    }
+    if (didChange && window.saveConversationsToStorage) window.saveConversationsToStorage();
+  }
+  return resolution;
+}
+
 function expandCommonWindowsPath(rawPath) {
   return String(rawPath || '')
     .trim()
@@ -8130,6 +8600,7 @@ const DISPATCH_TOOL_ALLOWLIST = new Set([
   'google_search', 'fetch_web_page', 'fetch_api_docs', 'search_api_docs',
   'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context', 'list_files', 'get_workspace_info', 'change_workspace',
   'handoff_to_coder',
+  'get_coder_task_status', 'cancel_coder_task',
   'open_url', 'click_element', 'fill_input', 'take_screenshot', 'navigate_back',
   'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model',
   'grep_search', 'search_embeddings', 'semantic_search',
@@ -8250,6 +8721,27 @@ function buildAgentToolDeclarations() {
                 },
                 title: { type: "STRING", description: "Optional title for the new Coder conversation." },
                 open: { type: "BOOLEAN", description: "Whether to switch the UI to the new Coder conversation immediately. Defaults to false." }
+              }
+            }
+          },
+          {
+            name: "get_coder_task_status",
+            description: "Reads the canonical state of a task launched by this Dispatch conversation. Use the task ID returned by handoff_to_coder; omit it to inspect this conversation's latest launched task.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                taskId: { type: "STRING", description: "Optional task ID. Defaults to the latest task owned by this Dispatch conversation." }
+              }
+            }
+          },
+          {
+            name: "cancel_coder_task",
+            description: "Cancels a pending or active Coder task owned by this Dispatch conversation. Pending work is removed from the scheduler; active work uses the existing cooperative abort and command cleanup path. It cannot cancel unrelated tasks.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                taskId: { type: "STRING", description: "Optional owned task ID. Defaults to this Dispatch conversation's latest launched task." },
+                reason: { type: "STRING", description: "Short user-facing cancellation reason." }
               }
             }
           },
@@ -8870,11 +9362,12 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "recall_memory",
-            description: "Read memory for the given scope. Call at the start of a session with an active workspace to orient yourself with prior context.",
+            description: "Read typed memory for the given scope. Use scope=conversation with a focused query when the user asks what was said earlier; returned conversationEvidence is the only memory source that licenses explicit recall claims.",
             parameters: {
               type: "OBJECT",
               properties: {
-                scope: { type: "STRING", description: "global, project, or all (default: project)." },
+                scope: { type: "STRING", description: "global, project, conversation, recent, or all (default: project)." },
+                query: { type: "STRING", description: "Focused retrieval query. Required for conversation scope and useful with recent/all." },
                 workspacePath: { type: "STRING", description: "Optional workspace path override." }
               }
             }

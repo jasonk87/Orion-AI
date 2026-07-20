@@ -520,7 +520,7 @@ test('local system fact failures do not become fake blockers or web research', (
     ).includes('File names alone are not enough'),
     'read-through-program requests cannot be answered from path search and filenames only'
   );
-  t.ok(agentJs.includes('Active conversation workspace (resolved):'), 'run prompt surfaces the resolved conversation workspace');
+  t.ok(agentJs.includes('WorkspaceResolution.describeWorkspace(workspaceResolution'), 'run prompt surfaces the resolved conversation workspace');
   t.ok(agentJs.includes('Do not re-run change_workspace for an older dictated/autocorrected folder phrase'), 'run prompt prevents repeated guessed workspace changes after resolution');
   t.ok(
     agent.buildFinalAnswerQualityGatePrompt(
@@ -771,7 +771,7 @@ test('model API calls cannot sit indefinitely without visible cooldown status', 
   t.ok(agentJs.includes('fetchWithTimeout(url'), 'Gemini generateContent uses timeout-aware fetch');
   t.ok(agentJs.includes('activeRunController = new AbortController()'), 'each agent run owns a cancellation controller');
   t.ok(agentJs.includes("window.stopAgentExecution = (options = {})"), 'stop API accepts cancellation options');
-  t.ok(agentJs.includes("requestAgentStop({ mode: options.mode || 'hard' })"), 'default stop path is hard cancellation');
+  t.ok(agentJs.includes("requestAgentStop({ mode: options.mode || 'hard', taskId: options.taskId || '' })"), 'default stop path is hard cancellation');
   t.ok(agentJs.includes('window.softStopAgentExecution'), 'soft stop is available for graceful stop-before-next-turn behavior');
   t.ok(agentJs.includes('activeRunController.abort()'), 'hard stop aborts the active model request controller');
   t.ok(agentJs.includes('signal: getActiveRunSignal()'), 'model calls receive the active run cancellation signal');
