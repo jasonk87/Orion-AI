@@ -65,7 +65,8 @@ async function captureRejection(promise) {
 
 test('context-dependent request detection covers durable-reference phrases', t => {
   ['Let\'s do it', 'Go ahead', 'Fix that', 'Use the second one', 'Make it like we discussed', 'Continue', 'Ship it',
-    'Yes', 'yes.', 'Yeah, do it', 'Yes, go ahead', 'Route it', 'Confirmed']
+    'Yes', 'yes.', 'Yeah, do it', 'Yes, go ahead', 'Route it', 'Confirmed',
+    'Yes, let\'s go ahead and get this updated', 'yes, go ahead and update it', 'go ahead and do that', 'get it done']
     .forEach(value => t.equal(isContextDependentRequest(value), true, `${value} depends on earlier context`));
   t.equal(isContextDependentRequest('Implement a CSV export for account reports.'), false, 'self-contained work is not marked contextual');
   t.equal(isContextDependentRequest('How do I fix that kind of error in general?'), false, 'a general instructional question is not mistaken for a queued reference');

@@ -1037,6 +1037,31 @@ test('Dispatch permission refusals deterministically require a Coder handoff', (
   t.end();
 });
 
+test('Dispatch forces a handoff when the model announces one but emits no tool call', (t) => {
+  // Regression from a real GRITLIFE transcript: the model wrote "Let me route this to Coder now"
+  // and "Let me execute it now" across two turns, each time ending with no handoff_to_coder call.
+  // The old safety net only caught permission refusals, so both announcements fell through and the
+  // user was left re-confirming an action that never ran.
+  const routeAnnounce = 'Understood, that is an active request. Let me route this to Coder now with a clear task description.';
+  const execAnnounce = 'Understood. "Fix it" is your explicit request. Let me execute it now.';
+  const conditionalOffer = 'I could hand this to Coder if you want, or we can keep discussing the design.';
+
+  t.equal(agent.looksLikeIntendedCoderHandoff(routeAnnounce), true, 'a committed "route this to Coder" announcement is recognized');
+  t.equal(agent.looksLikeIntendedCoderHandoff(conditionalOffer), false, 'a conditional "I could hand this to Coder if you want" offer is not treated as a committed handoff');
+  t.equal(agent.looksLikeUnexecutedDispatchAction(execAnnounce), true, 'a generic "let me execute it now" announcement is recognized');
+  t.equal(agent.looksLikeUnexecutedDispatchAction('Let me know if that works for you.'), false, '"let me know" carries no execution verb and is ignored');
+
+  // 4:34 — the affirmation itself does not classify as execution, but the model's self-declared
+  // Coder handoff is a strong enough signal to force the call.
+  t.equal(agent.shouldForceDispatchHandoff("Yes, let's go ahead and get this updated", routeAnnounce, { mode: 'orion' }), true, 'a self-declared Coder handoff forces the call even when the request is a bare affirmation');
+  // 4:37 — "Fix it" classifies as execution, and the generic announcement now counts as a deflection.
+  t.equal(agent.shouldForceDispatchHandoff('Fix it', execAnnounce, { mode: 'orion' }), true, 'an execution request plus a "let me do it now" announcement forces the handoff');
+  t.equal(agent.shouldForceDispatchHandoff('Fix it', execAnnounce, { mode: 'orion', alreadyHandedOff: true }), false, 'the announcement path still cannot double-fire within one request');
+  t.equal(agent.shouldForceDispatchHandoff('Fix it', execAnnounce, { mode: 'coder' }), false, 'Coder mode is never intercepted by the announcement guard');
+  t.equal(agent.shouldForceDispatchHandoff('What did we decide about subscriptions?', 'We decided to replace the intent system with behavioral tracking.', { mode: 'orion' }), false, 'a normal answer with no handoff announcement is not forced');
+  t.end();
+});
+
 test('token-saving prompt cleanup keeps tool schemas authoritative', (t) => {
   t.notOk(agentJs.includes('\nTools available:'), 'system prompts do not duplicate the formal tool schemas as prose lists');
   t.ok(agentJs.includes('TOOL USE:'), 'system prompts keep compact tool-use guidance');

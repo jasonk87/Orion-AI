@@ -145,7 +145,8 @@
     const withoutLeadingAffirmation = normalized.replace(/^(?:yes|yeah|yep|yup|ok(?:ay)?|sure|alright)[,!. ]+/, '');
     const directPatterns = [
       /^(?:okay[, ]*)?(?:let['’]?s|lets)\s+(?:do|build|implement|ship|make)\s+(?:it|that|this)$/,
-      /^(?:okay[, ]*)?go\s+ahead(?:\s+(?:with\s+)?(?:it|that|this))?$/,
+      /^(?:okay[, ]*)?(?:let['’]?s\s+)?go\s+ahead\b(?:.*\b(?:it|that|this|them|those)\b)?/,
+      /^(?:okay[, ]*)?(?:let['’]?s\s+)?(?:go\s+ahead\s+and\s+)?get\s+(?:it|that|this)\s+(?:done|updated|fixed|going|started|changed|handled|sorted)\b/,
       /^(?:please\s+)?(?:fix|change|update|remove|add|build|implement|ship|do|make)\s+(?:it|that|this|those|them)$/,
       /^(?:please\s+)?use\s+(?:the\s+)?(?:first|second|third|fourth|fifth|last|option\s*\d+|\d+(?:st|nd|rd|th)?)(?:\s+(?:one|option))?$/,
       /^(?:please\s+)?make\s+it\s+(?:like|how|the\s+way)\s+(?:we|you)\s+(?:discussed|described|said|planned)$/,

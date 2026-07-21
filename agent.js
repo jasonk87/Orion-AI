@@ -7047,13 +7047,47 @@ function isDispatchExecutionDeflection(answerText) {
   if (!answer) return false;
   const limitation = /(?:\b(?:can(?:not|'t)|unable|not\s+able|do(?:n't|\s+not)\s+have|lack(?:ing)?)\b.{0,140}\b(?:permission|access|ability|capability|control|execute|run|command|process|kill|stop|restart|modify|write|perform|do\s+that)\b|\b(?:permission|access|ability|capability|control)\b.{0,100}\b(?:can(?:not|'t)|unable|not\s+able|lack)\b)/i;
   const manualReturn = /\b(?:you(?:'ll|\s+will)?\s+need\s+to|you\s+have\s+to|do\s+it\s+yourself|perform\s+it\s+manually|from\s+your\s+(?:terminal|command\s+prompt)|run\s+(?:this|the\s+command)\s+yourself|i\s+can\s+(?:only\s+)?(?:guide|tell|show)\s+you)\b/i;
-  const unexecutedHandoffPromise = /\b(?:pass|hand|route|delegate|send)(?:ing|ed)?\s+(?:it|this|the\s+task)?\s*(?:over|off|along)?\s*(?:to\s+)?(?:the\s+)?coder\b/i;
-  return limitation.test(answer) || /\bread[-\s]?only\b/i.test(answer) || manualReturn.test(answer) || unexecutedHandoffPromise.test(answer);
+  return limitation.test(answer) || /\bread[-\s]?only\b/i.test(answer) || manualReturn.test(answer)
+    || looksLikeIntendedCoderHandoff(answer) || looksLikeUnexecutedDispatchAction(answer);
+}
+
+// The model committed to handing this task to Coder ("let me route this to Coder", "passing it to
+// Coder now") but \u2014 since this is only consulted when the turn produced no tool call \u2014 never
+// emitted the handoff_to_coder call. A weak model frequently narrates the handoff instead of
+// performing it; that self-declared intent is a strong enough signal to synthesize the call even
+// when our own request classifier is unsure the request needed execution. Conditional offers
+// ("I could hand this to Coder if you want") are excluded.
+function looksLikeIntendedCoderHandoff(answerText) {
+  const answer = String(answerText || '').replace(/\u2019/g, "'");
+  if (!answer) return false;
+  if (/\b(?:could|would|can|might|may)\b[^.?!]{0,40}\b(?:pass|hand|route|delegate|send)\b[^.?!]{0,40}\bcoder\b/i.test(answer)
+    && !/\b(?:let me|i'?ll|i will|i'?m|going to|now)\b/i.test(answer)) {
+    return false;
+  }
+  const committal = /\b(?:let me|i'?ll|i will|i'?m going to|i am going to|going to|now)\b[^.?!]{0,60}\b(?:pass|hand|route|delegate|send)\b[^.?!]{0,40}\bcoder\b/i;
+  const continuous = /\b(?:passing|handing|routing|delegating|sending)\b[^.?!]{0,40}\bcoder\b/i;
+  return committal.test(answer) || continuous.test(answer);
+}
+
+// A generic "let me execute it now" / "I'll do it now" announcement with no accompanying tool call.
+// Weaker than an explicit Coder handoff, so the caller pairs it with an execution-classified
+// request before forcing the handoff. Excludes benign "let me know" / "let me explain" openers,
+// which carry no execution verb.
+function looksLikeUnexecutedDispatchAction(answerText) {
+  const answer = String(answerText || '').replace(/\u2019/g, "'");
+  if (!answer) return false;
+  return /\b(?:let me|let's|i'?ll|i will|i'?m going to|i am going to|i'?m about to)\b[^.?!]{0,40}\b(?:execute|run|do it|do that|do this|perform|carry out|apply|make|update|handle|fix|create|write|build|deploy|install|launch|restart)\b/i.test(answer);
 }
 
 function shouldForceDispatchHandoff(userPrompt, answerText, context = {}) {
   if (context.mode !== 'orion' || context.alreadyHandedOff) return false;
-  return dispatchRequestRequiresCoderExecution(userPrompt) && isDispatchExecutionDeflection(answerText);
+  // Strong signal: the model itself declared it is handing the task to Coder yet emitted no tool
+  // call. Trust that declaration regardless of our own request classification.
+  if (looksLikeIntendedCoderHandoff(answerText)) return true;
+  // Weaker signals \u2014 permission refusals, manual returns, or a generic "let me do it now"
+  // announcement \u2014 only force a handoff when the request independently needed execution.
+  return dispatchRequestRequiresCoderExecution(userPrompt)
+    && (isDispatchExecutionDeflection(answerText) || looksLikeUnexecutedDispatchAction(answerText));
 }
 
 function buildForcedDispatchHandoffPrompt(userPrompt) {
@@ -10524,6 +10558,8 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     shouldHaveUsedToolsButDidNot,
     dispatchRequestRequiresCoderExecution,
     isDispatchExecutionDeflection,
+    looksLikeIntendedCoderHandoff,
+    looksLikeUnexecutedDispatchAction,
     shouldForceDispatchHandoff,
     buildForcedDispatchHandoffPrompt,
     isFailedToolResult,
