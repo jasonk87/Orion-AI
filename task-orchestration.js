@@ -76,6 +76,37 @@
     return output;
   }
 
+  function normalizeImageAttachments(inputValue, limit = 4) {
+    const values = Array.isArray(inputValue) ? inputValue : [];
+    const output = [];
+    for (const value of values) {
+      if (!value || typeof value !== 'object') continue;
+      const data = text(value.data);
+      const mimeType = compactInline(value.mimeType || value.mime_type || value.type);
+      if (!data || !mimeType || !/^image\//i.test(mimeType)) continue;
+      const image = { data, mimeType };
+      const name = compactInline(value.name || value.fileName || value.filename);
+      if (name) image.name = name;
+      output.push(image);
+      if (output.length >= limit) break;
+    }
+    return output;
+  }
+
+  function taskImageInput(record) {
+    if (Array.isArray(record && record.images)) return record.images;
+    if (Array.isArray(record && record.imageAttachments)) return record.imageAttachments;
+    if (Array.isArray(record && record.attachments)) return record.attachments;
+    return [];
+  }
+
+  function taskContextPacketIds(record) {
+    const values = Array.isArray(record && record.contextPacketIds)
+      ? record.contextPacketIds
+      : (record && record.contextPacketId ? [record.contextPacketId] : []);
+    return uniqueStrings(values, 5);
+  }
+
   function resolveNow(value) {
     const candidate = typeof value === 'function' ? value() : value;
     const numeric = Number(candidate);
@@ -324,13 +355,71 @@
     return compactInline(pathValue).replace(/[\\/]+$/g, '').split(/[\\/]/).pop() || '';
   }
 
-  function normalizeWorkspace(input) {
+  function localPathKey(pathValue) {
+    return compactInline(pathValue).replace(/[\\/]+$/g, '').replace(/[\\/]+/g, '\\').toLowerCase();
+  }
+
+  function sameLocalPath(left, right) {
+    return !!localPathKey(left) && localPathKey(left) === localPathKey(right);
+  }
+
+  function normalizedProjectName(value) {
+    return compactInline(value).toLowerCase().replace(/&/g, 'and').replace(/[^a-z0-9]+/g, '');
+  }
+
+  function projectMentionIndex(contextText, projectName) {
+    const parts = compactInline(projectName).match(/[a-z0-9]+/gi) || [];
+    if (!parts.length) return -1;
+    const escaped = parts.map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const pattern = new RegExp(`(?:^|[^a-z0-9])${escaped.join('(?:[^a-z0-9]+|\\s*)')}(?=$|[^a-z0-9])`, 'gi');
+    let lastIndex = -1;
+    let match;
+    while ((match = pattern.exec(String(contextText || ''))) !== null) {
+      lastIndex = match.index;
+      if (pattern.lastIndex === match.index) pattern.lastIndex += 1;
+    }
+    return lastIndex;
+  }
+
+  function resolveKnownProjectFromContext(input, contextText, searchRoot) {
+    const values = input.knownProjects || input.registeredProjects || input.projectCandidates || [];
+    const projects = [];
+    const seen = new Set();
+    for (const value of Array.isArray(values) ? values : []) {
+      const item = typeof value === 'string' ? { path: value } : (value || {});
+      const projectPath = compactInline(item.path || item.projectPath || item.workspace || '');
+      if (!projectPath || (searchRoot && sameLocalPath(projectPath, searchRoot))) continue;
+      const key = localPathKey(projectPath);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      projects.push({
+        path: projectPath,
+        name: compactInline(item.name || item.projectName || baseName(projectPath)),
+        source: compactInline(item.source || 'registered_project')
+      });
+    }
+    let best = null;
+    for (const project of projects) {
+      const nameKey = normalizedProjectName(project.name || baseName(project.path));
+      if (!nameKey || nameKey.length < 3) continue;
+      const index = projectMentionIndex(contextText, project.name || baseName(project.path));
+      if (index < 0) continue;
+      if (!best || index > best.index || (index === best.index && nameKey.length > best.nameKey.length)) {
+        best = { ...project, index, nameKey };
+      }
+    }
+    return best;
+  }
+
+  function normalizeWorkspace(input, contextText = '') {
     const supplied = input && typeof input.workspace === 'object' ? input.workspace : {};
-    const path = compactInline(supplied.path || input.workspacePath || input.path || '');
+    const searchRoot = compactInline(input.searchRoot || input.projectSearchRoot || '');
+    let path = compactInline(supplied.path || input.workspacePath || input.path || '');
     const projectValue = supplied.project && typeof supplied.project === 'object' ? supplied.project : {};
-    const projectPath = compactInline(projectValue.path || supplied.projectPath || input.projectPath || '');
-    const projectName = compactInline(projectValue.name || supplied.projectName || input.projectName || baseName(projectPath));
+    let projectPath = compactInline(projectValue.path || supplied.projectPath || input.projectPath || input.dispatchProjectPath || '');
+    let projectName = compactInline(projectValue.name || supplied.projectName || input.projectName || baseName(projectPath));
     let role = compactInline(supplied.role || supplied.kind || input.workspaceRole || input.workspaceKind || '').toLowerCase();
+    let workspaceSource = compactInline(supplied.source || input.workspaceSource || '');
     const aliases = {
       project: 'active_project',
       active: 'active_project',
@@ -343,6 +432,24 @@
       unknown: 'unresolved'
     };
     role = aliases[role] || role;
+    const pathIsSearchRoot = !!searchRoot && sameLocalPath(path, searchRoot);
+    const projectIsSearchRoot = !!searchRoot && sameLocalPath(projectPath, searchRoot);
+    if (pathIsSearchRoot || projectIsSearchRoot) {
+      path = searchRoot;
+      projectPath = '';
+      projectName = '';
+      role = 'project_search_root';
+    }
+    if (role === 'project_search_root' || role === 'unresolved' || !role) {
+      const project = resolveKnownProjectFromContext(input, contextText, searchRoot);
+      if (project) {
+        path = project.path;
+        projectPath = project.path;
+        projectName = project.name;
+        role = 'active_project';
+        workspaceSource = workspaceSource || project.source;
+      }
+    }
     if (!['active_project', 'project_search_root', 'standalone_coder', 'unresolved'].includes(role)) {
       if (projectPath && path) role = 'active_project';
       else if (/standalone-workspaces/i.test(path)) role = 'standalone_coder';
@@ -355,8 +462,8 @@
         name: projectName,
         path: projectPath
       },
-      source: compactInline(supplied.source || input.workspaceSource || ''),
-      resolved: role !== 'unresolved' && !!path
+      source: workspaceSource,
+      resolved: (role === 'active_project' || role === 'standalone_coder') && !!path
     };
   }
 
@@ -418,7 +525,18 @@
       };
     }
 
-    const workspace = normalizeWorkspace(input);
+    const workspace = normalizeWorkspace(
+      input,
+      [precedingConversationSummary, originalUserMessage].filter(Boolean).join('\n')
+    );
+    if (contextDependent && workspace.role === 'project_search_root') {
+      return {
+        success: false,
+        needsClarification: true,
+        clarification: 'Which specific project workspace should I use? The Projects directory is only a search root, so I will not queue this context-dependent task until the project is resolved.',
+        task: null
+      };
+    }
     const objective = contextDependent
       ? deriveContextObjective(input, precedingMessages, precedingConversationSummary, selectedOption)
       : (explicitObjective || originalUserMessage);
@@ -462,6 +580,8 @@
       requirements,
       constraints,
       unresolvedDecisions,
+      images: normalizeImageAttachments(taskImageInput(input)),
+      contextPacketIds: taskContextPacketIds(input),
       origin,
       target,
       source: compactInline(input.source || 'user'),
@@ -510,6 +630,9 @@
     const createdAt = resolveNow(record.createdAt || record.timestamp || now);
     const updatedAt = resolveNow(record.updatedAt || createdAt);
     const rawStatus = record.status == null ? record.state : record.status;
+    const continuationRecord = record.continuation && typeof record.continuation === 'object'
+      ? record.continuation
+      : null;
     let status = TASK_STATES.PENDING;
     let invalidStatus = '';
     if (compactInline(rawStatus)) {
@@ -535,6 +658,16 @@
       requirements: uniqueStrings(record.requirements || record.knownRequirements || []),
       constraints: uniqueStrings(record.constraints || []),
       unresolvedDecisions: uniqueStrings(record.unresolvedDecisions || []),
+      images: normalizeImageAttachments(taskImageInput(record)),
+      contextPacketIds: taskContextPacketIds(record),
+      continuation: continuationRecord && compactWhitespace(continuationRecord.input || continuationRecord.prompt || '')
+        ? {
+            input: compactWhitespace(continuationRecord.input || continuationRecord.prompt || ''),
+            source: compactInline(continuationRecord.source || 'task-continuation'),
+            messageId: compactInline(continuationRecord.messageId || ''),
+            createdAt: resolveNow(continuationRecord.createdAt || updatedAt)
+          }
+        : null,
       origin,
       target,
       source: compactInline(record.source || 'unknown'),
@@ -614,6 +747,9 @@
         state: TASK_STATES.ACTIVE,
         startedAt: now
       };
+      if (details.consumeContinuation === true && next.continuation) {
+        next.continuation = null;
+      }
     }
     if (nextState === TASK_STATES.PENDING && currentState === TASK_STATES.ACTIVE) {
       next.pendingAt = now;
@@ -684,7 +820,7 @@
     const task = normalizeTaskRecord(taskValue);
     const workspace = task.workspace || normalizeWorkspace({});
     const project = workspace.project || {};
-    return [
+    const sections = [
       `Task: ${task.title}`,
       `Task ID: ${task.taskId}`,
       '',
@@ -710,7 +846,17 @@
       `Origin conversation: ${task.origin.conversationId || '(unknown)'}`,
       `Origin session: ${task.origin.sessionId || '(unknown)'}`,
       `Origin message: ${task.origin.messageId || '(unknown)'}`
-    ].join('\n').trim();
+    ];
+    if (task.continuation && task.continuation.input) {
+      sections.push(
+        '',
+        'Latest continuation input:',
+        task.continuation.input,
+        `Continuation source: ${task.continuation.source || 'task-continuation'}`,
+        `Continuation message: ${task.continuation.messageId || '(unknown)'}`
+      );
+    }
+    return sections.join('\n').trim();
   }
 
   function describeTaskStatus(taskOrStatus) {
@@ -728,6 +874,54 @@
     return failure ? `Failed — ${failure}` : 'Failed.';
   }
 
+  async function cancelPendingOwnedTasks(input = {}, dependencies = {}) {
+    const conversationId = compactInline(input.conversationId || input.ownerConversationId || '');
+    if (!conversationId) return { success: true, cancelled: [], failures: [], count: 0 };
+    if (typeof dependencies.listTasks !== 'function' || typeof dependencies.cancelTask !== 'function') {
+      return {
+        success: false,
+        cancelled: [],
+        failures: [{ taskId: '', error: 'Task-store cancellation services are unavailable.' }],
+        count: 0
+      };
+    }
+    let tasks;
+    try {
+      tasks = await dependencies.listTasks(conversationId, [TASK_STATES.PENDING]);
+      if (!Array.isArray(tasks)) throw new Error('Task-store listing returned an invalid result.');
+    } catch (error) {
+      return {
+        success: false,
+        cancelled: [],
+        failures: [{ taskId: '', error: error.message || String(error) }],
+        count: 0
+      };
+    }
+    const cancelled = [];
+    const failures = [];
+    for (const task of tasks) {
+      const taskId = compactInline(task && task.taskId);
+      if (!taskId || !canRequesterControlTask(task, { conversationId })) {
+        failures.push({ taskId, error: 'The pending task is not owned by this conversation.' });
+        continue;
+      }
+      try {
+        const result = await dependencies.cancelTask(taskId, conversationId);
+        if (result && result.success && result.task && result.task.status === TASK_STATES.CANCELLED) {
+          cancelled.push(taskId);
+        } else {
+          failures.push({
+            taskId,
+            error: (result && (result.error || result.reason)) || 'Cancellation was not confirmed.'
+          });
+        }
+      } catch (error) {
+        failures.push({ taskId, error: error.message || String(error) });
+      }
+    }
+    return { success: failures.length === 0, cancelled, failures, count: cancelled.length };
+  }
+
   return {
     SCHEMA_VERSION,
     TASK_STATES,
@@ -737,6 +931,7 @@
     normalizeTaskRecord,
     transitionTask,
     canRequesterControlTask,
+    cancelPendingOwnedTasks,
     renderTaskPrompt,
     describeTaskStatus
   };

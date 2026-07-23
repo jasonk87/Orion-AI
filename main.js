@@ -159,6 +159,9 @@ function registerAllHandlers() {
         recentContext: Array.isArray(payload.recentContext) ? payload.recentContext.slice(-12) : [],
         currentConversation: payload.currentConversation && typeof payload.currentConversation === 'object'
           ? payload.currentConversation : null,
+        excludeConversationId: String(payload.excludeConversationId || ''),
+        excludeMessageIds: Array.isArray(payload.excludeMessageIds) ? payload.excludeMessageIds.slice(0, 20) : [],
+        excludeUserPrompt: String(payload.excludeUserPrompt || '').slice(0, 10000),
         workspacePaths: Array.isArray(payload.workspacePaths) ? payload.workspacePaths.slice(0, 50) : [],
         conversationsDir: getConversationsDir(),
         limit: Math.max(1, Math.min(Number(payload.limit) || 8, 20))

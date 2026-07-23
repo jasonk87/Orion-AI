@@ -2,7 +2,7 @@
   'use strict';
 
   const EXECUTION_VERBS = [
-    'kill', 'terminate', 'stop', 'restart', 'reboot', 'start', 'launch',
+    'kill', 'terminate', 'stop', 'cancel', 'abort', 'restart', 'reboot', 'start', 'launch',
     'run', 'execute', 'apply', 'install', 'uninstall', 'upgrade', 'update',
     'configure', 'change', 'modify', 'edit', 'write', 'create', 'delete',
     'remove', 'rename', 'move', 'copy', 'build', 'fix', 'repair', 'test',
@@ -35,6 +35,7 @@
   function isReportFramingLine(line, documentHasReportFraming) {
     const value = String(line || '').trim();
     if (!value) return false;
+    if (/^(?:(?:pasted|quoted|reported)\s+)?(?:transcript|status\s+report|test\s+case)\s*:?\s*$/i.test(value)) return true;
     if (/^(?:here(?:'s|\s+is)|this\s+is|the\s+following\s+is)\s+(?:an?\s+)?(?:example|test(?:\s+case)?|status\s+report|report|transcript|quoted?\s+(?:request|command|example))/i.test(value)) return true;
     if (/^(?:the\s+)?(?:user|customer|tester|assistant|model)\s+(?:had\s+)?(?:previously\s+)?(?:asked|said|requested|reported|wrote|told\s+us)\b/i.test(value)) return true;
     if (/\b(?:exact\s+)?(?:request|prompt|command|example|test(?:\s+case)?)\b.{0,120}\b(?:is|was|has\s+been)\s+(?:now\s+)?(?:covered|tested|fixed|pushed|reported|quoted|documented)\b/i.test(value)) return true;
@@ -45,11 +46,21 @@
 
   function startsReportedBlock(line) {
     const value = String(line || '').trim();
-    return /(?:^|\b)(?:the\s+)?(?:exact\s+)?(?:request|prompt|command|example|test(?:\s+case)?|transcript|status\s+report)\s*:\s*$/i.test(value);
+    return /(?:^|\b)(?:the\s+)?(?:exact\s+)?(?:(?:pasted|quoted|reported)\s+)?(?:request|prompt|command|example|test(?:\s+case)?|transcript|status\s+report)\s*:?\s*$/i.test(value);
   }
 
   function hasExplicitExecutionFollowup(line) {
     return /\b(?:now|then)\s+(?:please\s+)?(?:run|execute|apply|perform|do|restart|kill|modify|edit|install|test)\b/i.test(String(line || ''));
+  }
+
+  function endsTranscriptContinuation(line) {
+    const value = String(line || '').trim();
+    if (!value) return true;
+    if (hasExplicitExecutionFollowup(value)) return true;
+    // A pasted speaker turn may span multiple lines, but surrounding analysis or an
+    // explicitly signposted next instruction belongs to the live user request.
+    return /^(?:please\s+)?(?:analyze|explain|summarize|review|compare|diagnose|tell\s+me\s+(?:why|what|how)|what\s+(?:went|is)\s+wrong)\b/i.test(value)
+      || /^(?:outside|after|based\s+on)\s+(?:the|this)\s+transcript\b/i.test(value);
   }
 
   function collectStructuralSegments(text) {
@@ -86,7 +97,10 @@
       const line = record.text;
       const trimmed = line.trim();
       if (!trimmed) {
-        reportedBlock = false;
+        // Pasted reports commonly put a blank line between their heading and
+        // body. Whitespace is not an instruction boundary; keep protecting the
+        // reported block until an explicit analysis/execution follow-up or a
+        // different structural boundary appears.
         continue;
       }
       if (/^\s{0,3}>/.test(line)) {
@@ -94,11 +108,19 @@
         continue;
       }
       if (SPEAKER_LINE_RE.test(line)) {
-        addSegment(record.start, record.end, 'transcript');
+        let turnEndIndex = index;
+        for (let candidate = index + 1; candidate < records.length; candidate++) {
+          if (fenceLines.has(candidate)) break;
+          const continuation = records[candidate].text;
+          if (!continuation.trim() || SPEAKER_LINE_RE.test(continuation) || endsTranscriptContinuation(continuation)) break;
+          turnEndIndex = candidate;
+        }
+        addSegment(record.start, records[turnEndIndex].end, 'transcript');
+        index = turnEndIndex;
         continue;
       }
       const reportLine = isReportFramingLine(line, documentHasReportFraming);
-      if ((reportLine || reportedBlock) && !hasExplicitExecutionFollowup(line)) {
+      if ((reportLine || reportedBlock) && !endsTranscriptContinuation(line)) {
         addSegment(record.start, record.end, reportLine ? 'reported_material' : 'reported_block');
         reportedBlock = reportLine && startsReportedBlock(line) ? true : reportedBlock;
         continue;
@@ -169,7 +191,7 @@
     }
     if (action === 'run' && /^(?:me\s+through|through|over)\b/.test(object)) return false;
     if (action === 'start' && /^(?:by\s+)?(?:explain|explaining|tell|telling|summarize|summarizing|a\s+discussion|a\s+conversation)\b/.test(object)) return false;
-    if (action === 'stop' && /^(?:saying|calling|using|phrasing|answering|responding|referring)\b/.test(object)) return false;
+    if (action === 'stop' && /^(?:saying|telling|instructing|asking|calling|using|phrasing|answering|responding|referring)\b/.test(object)) return false;
     if (action === 'test' && /^(?:my|our)\s+(?:knowledge|understanding)\b/.test(object)) return false;
     if ((action === 'write' || action === 'create') && /^(?:me\s+)?(?:an?\s+)?(?:answer|summary|explanation|story|list\s+of\s+ideas|draft\s+reply)\b/.test(object)) return false;
     if (action === 'save' && /^(?:this|that|my)\s+(?:preference|memory|fact)\b/.test(object)) return false;
@@ -184,7 +206,7 @@
     const patterns = [
       new RegExp(`\\b(?:can|could|would|will)\\s+you\\s+(?:please\\s+)?(?:go\\s+ahead\\s+and\\s+)?(${ACTION_PATTERN})\\b(.*)$`, 'i'),
       new RegExp(`\\bi\\s+(?:need|want|would\\s+like)\\s+you\\s+to\\s+(?:please\\s+)?(${ACTION_PATTERN})\\b(.*)$`, 'i'),
-      new RegExp(`^(?:please\\s+)?(?:go\\s+ahead\\s+and\\s+)?(${ACTION_PATTERN})\\b(.*)$`, 'i'),
+      new RegExp(`^(?:(?:now|then)\\s+)?(?:please\\s+)?(?:go\\s+ahead\\s+and\\s+)?(${ACTION_PATTERN})\\b(.*)$`, 'i'),
       new RegExp(`\\b(?:have|get)\\s+(?:the\\s+)?coder\\s+(?:to\\s+)?(${ACTION_PATTERN})\\b(.*)$`, 'i'),
       new RegExp(`^(?:let['’]?s|lets)\\s+(${ACTION_PATTERN})\\b(.*)$`, 'i')
     ];
@@ -238,7 +260,43 @@
     return analyzeDispatchInstruction(text).requiresCoderExecution;
   }
 
-  const api = { analyzeDispatchInstruction, dispatchRequestRequiresCoderExecution };
+  function isStandaloneSystemExecutionRequest(value) {
+    const analysis = value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, 'requiresCoderExecution')
+      ? value
+      : analyzeDispatchInstruction(value);
+    if (!analysis.requiresCoderExecution) return false;
+    const action = String(analysis.action || '').toLowerCase();
+    const object = String(analysis.actionObject || '').toLowerCase();
+    const lifecycleAction = ['kill', 'terminate', 'stop', 'restart', 'reboot', 'start', 'launch', 'run', 'execute'].includes(action);
+    if (!lifecycleAction) return false;
+    if (isOwnedTaskCancellationRequest(analysis.originalText || analysis.activeText || '')) return false;
+    // These targets are machine-level operations that do not require a selected source project.
+    // Project builds/tests/dependency installs and file mutations intentionally do not match.
+    return /\b(?:claude(?:\s+code|\s+desktop)?|process(?:es)?|service|daemon|desktop\s+app|local\s+app|preview\s+server|server\s+process|shell\s+command|system\s+command|command\s+unavailable\s+to\s+dispatch|node\s+process|python\s+process|electron\s+process)\b/i.test(object);
+  }
+
+  function isOwnedTaskCancellationRequest(text) {
+    const analysis = analyzeDispatchInstruction(text);
+    if (!analysis.requiresCoderExecution || !['stop', 'cancel', 'abort', 'kill', 'terminate'].includes(analysis.action)) {
+      return false;
+    }
+    const active = String(analysis.activeText || '').toLowerCase();
+    const object = String(analysis.actionObject || '').toLowerCase();
+    if (/\b(?:restart|relaunch|start\s+(?:it|that|the\s+\w+)\s+again|and\s+(?:then\s+)?start)\b/.test(active)) {
+      return false;
+    }
+    const hasTaskReferent = /\b(?:task|work|job|run|queue(?:d)?|coder(?:\s+task)?|delegat(?:ed|ion)|it|this|that|current|active|pending)\b/.test(object);
+    const hasExternalTarget = /\b(?:process|server|service|daemon|desktop|application|app|preview|database|command|claude|node|python|electron)\b/.test(object);
+    if (hasExternalTarget && !/\b(?:task|work|job|run|queue(?:d)?|coder\s+task)\b/.test(object)) return false;
+    return !object || hasTaskReferent;
+  }
+
+  const api = {
+    analyzeDispatchInstruction,
+    dispatchRequestRequiresCoderExecution,
+    isStandaloneSystemExecutionRequest,
+    isOwnedTaskCancellationRequest
+  };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   if (globalScope) globalScope.OrionDispatchIntent = api;
 })(typeof window !== 'undefined' ? window : globalThis);

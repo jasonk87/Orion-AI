@@ -11,6 +11,7 @@ const {
   normalizeTaskRecord,
   transitionTask,
   canRequesterControlTask,
+  cancelPendingOwnedTasks,
   renderTaskPrompt,
   describeTaskStatus
 } = require('../task-orchestration');
@@ -74,6 +75,55 @@ test('context-dependent request detection covers durable-reference phrases', t =
   t.end();
 });
 
+test('durable continuation input survives restart and is consumed by one claim', t => {
+  const pending = normalizeTaskRecord(baseTask({
+    continuation: {
+      input: 'Here are my answers: Billing: monthly; Venue: gym.',
+      source: 'clarification-answers',
+      messageId: 'message-answer',
+      createdAt: 1050
+    }
+  }));
+  const prompt = renderTaskPrompt(pending);
+  t.match(prompt, /Latest continuation input:/, 'the persisted continuation is rendered into the executable packet');
+  t.match(prompt, /Billing: monthly; Venue: gym/, 'the exact follow-up input survives normalization');
+  const active = transitionTask(pending, TASK_STATES.ACTIVE, {
+    timestamp: 1100,
+    consumeContinuation: true
+  });
+  t.equal(active.continuation, null, 'claiming the task consumes the continuation exactly once');
+  t.notOk(/Latest continuation input:/.test(renderTaskPrompt(active)), 'later task passes do not replay an already-consumed answer');
+  t.end();
+});
+
+test('New Focus fails closed when owned-task listing or cancellation is unverified', async t => {
+  let cancelCalls = 0;
+  const listFailure = await cancelPendingOwnedTasks({ conversationId: 'dispatch-1' }, {
+    listTasks: async () => {
+      throw new Error('store unavailable');
+    },
+    cancelTask: async () => {
+      cancelCalls += 1;
+    }
+  });
+  t.equal(listFailure.success, false, 'a list failure is not mistaken for an empty queue');
+  t.match(listFailure.failures[0].error, /store unavailable/i, 'the real store failure is reported');
+  t.equal(cancelCalls, 0, 'no guessed cancellation is attempted without a verified list');
+
+  const task = normalizeTaskRecord(baseTask({ taskId: 'task-new-focus' }));
+  const success = await cancelPendingOwnedTasks({ conversationId: 'dispatch-1' }, {
+    listTasks: async () => [task],
+    cancelTask: async taskId => ({
+      success: true,
+      task: { ...task, taskId, status: TASK_STATES.CANCELLED }
+    })
+  });
+  t.equal(success.success, true, 'verified owned pending work can be cancelled');
+  t.deepEqual(success.cancelled, ['task-new-focus'], 'the exact task ID is returned');
+  t.equal(success.count, 1, 'the cancellation count is explicit');
+  t.end();
+});
+
 test('GRITLIFE contextual approval resolves to a self-contained task packet', t => {
   const projectPath = 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE';
   const result = buildTaskPacket({
@@ -122,6 +172,105 @@ test('GRITLIFE contextual approval resolves to a self-contained task packet', t 
   t.ok(prompt.includes(projectPath), 'Coder prompt carries the exact workspace');
   t.ok(prompt.indexOf('Objective:') < prompt.indexOf("Let's do it"), 'raw utterance appears only after the resolved task content');
   t.ok(/Original user message \(provenance only\)/.test(prompt), 'raw utterance is clearly labeled as provenance');
+  t.end();
+});
+
+test('contextual task resolves a named registered project instead of queuing against Projects root', t => {
+  const searchRoot = 'C:\\Users\\Owner\\Desktop\\Projects';
+  const projectPath = `${searchRoot}\\GRITLIFE`;
+  const context = [{
+    role: 'user',
+    text: 'For GRITLIFE, implement recurring paid subscriptions and enrollments organized by locations such as gyms, yoga, massage, therapy, and classes.'
+  }];
+  const resolved = buildTaskPacket({
+    originalUserMessage: "Let's do it",
+    precedingMessages: context,
+    workspace: {
+      role: 'active_project',
+      path: searchRoot,
+      project: { name: 'Projects', path: searchRoot },
+      source: 'stale_dispatch_binding'
+    },
+    searchRoot,
+    knownProjects: [
+      { name: 'Projects', path: searchRoot, source: 'stale_registration' },
+      { name: 'LIFE', path: `${searchRoot}\\LIFE`, source: 'registered_project' },
+      { name: 'GRITLIFE', path: projectPath, source: 'registered_project' }
+    ],
+    originConversationId: 'dispatch-gritlife-root'
+  });
+
+  t.equal(resolved.success, true, 'the known project name in preceding context resolves the task');
+  t.equal(resolved.task.workspace.role, 'active_project', 'the resolved task has a concrete project role');
+  t.equal(resolved.task.workspace.path, projectPath, 'the packet carries the exact GRITLIFE workspace');
+  t.equal(resolved.task.selectedProject.name, 'GRITLIFE', 'the stale Projects pseudo-project is discarded');
+  t.notEqual(resolved.task.workspace.path, `${searchRoot}\\LIFE`, 'a shorter project name embedded inside GRITLIFE cannot steal the match');
+
+  const unresolved = buildTaskPacket({
+    originalUserMessage: "Let's do it",
+    precedingMessages: context,
+    workspace: {
+      role: 'project_search_root',
+      path: searchRoot,
+      project: { name: '', path: '' }
+    },
+    searchRoot,
+    knownProjects: [],
+    originConversationId: 'dispatch-unresolved-root'
+  });
+  t.equal(unresolved.success, false, 'a contextual executable task cannot target only the search root');
+  t.equal(unresolved.needsClarification, true, 'the caller receives a targeted project clarification');
+  t.equal(unresolved.task, null, 'no ambiguous root-scoped task is created');
+  t.match(unresolved.clarification, /specific project workspace/i, 'the clarification explains the missing scope');
+  t.end();
+});
+
+test('task image attachments and context packet references survive a durable store reload', async t => {
+  const { filePath, store } = makeTempStore(t, { now: () => 123456790 });
+  const image = {
+    data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB',
+    mimeType: 'image/png',
+    name: 'storm-damage.png',
+    previewUrl: 'blob:renderer-only-preview'
+  };
+  const packet = buildTaskPacket({
+    taskId: 'task_durable_context',
+    originalUserMessage: 'Inspect the attached storm photo and use the selected source context.',
+    images: [image],
+    contextPacketIds: ['context-2', 'context-1', 'context-2'],
+    workspacePath: 'C:\\Projects\\Storm',
+    projectPath: 'C:\\Projects\\Storm',
+    projectName: 'Storm',
+    originConversationId: 'dispatch-storm',
+    targetConversationId: 'coder-storm',
+    timestamp: 123456790
+  });
+
+  t.equal(packet.success, true, 'task packet is created');
+  t.deepEqual(packet.task.images, [{
+    data: image.data,
+    mimeType: image.mimeType,
+    name: image.name
+  }], 'the durable packet retains image data and strips renderer-only preview state');
+  t.deepEqual(packet.task.contextPacketIds, ['context-2', 'context-1'], 'context packet IDs are retained and de-duplicated');
+
+  await store.create(packet.task);
+  const reloaded = new OrchestrationTaskStore({ filePath, now: () => 123456791 });
+  const task = await reloaded.get('task_durable_context');
+  t.deepEqual(task.images, packet.task.images, 'image attachment survives JSON persistence and a fresh store instance');
+  t.deepEqual(task.contextPacketIds, packet.task.contextPacketIds, 'context packet references survive JSON persistence and reload');
+
+  const legacyWithoutAttachments = normalizeTaskRecord(baseTask({ taskId: 'task_legacy_without_attachments' }));
+  t.deepEqual(legacyWithoutAttachments.images, [], 'legacy records without images receive a safe empty default');
+  t.deepEqual(legacyWithoutAttachments.contextPacketIds, [], 'legacy records without context references receive a safe empty default');
+
+  const legacyImageAlias = normalizeTaskRecord(baseTask({
+    taskId: 'task_legacy_image_alias',
+    attachments: [image],
+    contextPacketId: 'context-legacy'
+  }));
+  t.deepEqual(legacyImageAlias.images, packet.task.images, 'legacy image-attachment aliases migrate into the canonical images field');
+  t.deepEqual(legacyImageAlias.contextPacketIds, ['context-legacy'], 'a legacy singular context reference migrates into the canonical list');
   t.end();
 });
 

@@ -2231,6 +2231,7 @@ test('completion gate fires for any execution mode with mission state, not only 
   t.ok(agentSource.includes('STALL_LIMIT'), 'auto-continue stops when no goal-level progress is made across passes');
   t.ok(agentSource.includes('progressScore'), 'stall detection is based on completed-work progress, not just activity');
   t.ok(agentSource.includes('const hasResumableWork = hasOperationalMissionState(workingState) || pendingChecklist.length > 0'), 'auto-continue falls back to the checklist when mission state is absent');
+  t.ok(agentSource.includes("taskId: runTaskId || ''"), 'an internal continuation retains the same durable task ID after the active-run pointer is cleared');
   t.end();
 });
 
@@ -3113,8 +3114,10 @@ test('grep_search is declared in the shared tool-declaration source consumed by 
   const declarationMatches = agentSource.match(/name: "grep_search"/g) || [];
   t.equal(declarationMatches.length, 1, 'grep_search is declared exactly once in the shared tool source');
   t.ok(agentSource.includes('function buildAgentToolDeclarations()'), 'the shared tool-declaration builder exists');
-  const consumers = agentSource.match(/functionDeclarations: buildAgentToolDeclarations\(\)/g) || [];
-  t.equal(consumers.length, 2, 'both the Gemini and Ollama providers consume the shared builder');
+  const rawConsumers = agentSource.match(/functionDeclarations: buildAgentToolDeclarations\(\)/g) || [];
+  const geminiConsumers = agentSource.match(/functionDeclarations: buildGeminiToolDeclarations\(\)/g) || [];
+  t.equal(rawConsumers.length, 1, 'Ollama consumes the canonical shared declarations');
+  t.equal(geminiConsumers.length, 1, 'Gemini consumes the provider-safe view of the same declarations');
   t.ok(agentSource.includes("case 'grep_search'"), 'the executor has a grep_search case');
   t.end();
 });

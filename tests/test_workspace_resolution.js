@@ -28,9 +28,37 @@ test('generic Projects root is classified and described as a search root, not a 
   t.end();
 });
 
+test('stale project binding fields cannot promote the generic Projects root', (t) => {
+  for (const staleField of ['projectPath', 'dispatchProjectPath']) {
+    const resolution = workspace.classifyWorkspace({
+      mode: 'orion',
+      searchRoot: SEARCH_ROOT,
+      workspacePath: SEARCH_ROOT,
+      [staleField]: SEARCH_ROOT,
+      knownProjects: [
+        { name: 'Projects', path: SEARCH_ROOT, source: 'stale_registration' },
+        { name: 'GRITLIFE', path: GRITLIFE, source: 'registered_project' }
+      ]
+    });
+    t.equal(resolution.kind, workspace.KINDS.PROJECT_SEARCH_ROOT, `${staleField} remains a search-root marker`);
+    t.equal(resolution.projectPath, '', `${staleField} is cleared as a selected project`);
+    t.equal(workspace.canHandoffWorkspace(resolution).allowed, false, `${staleField} cannot authorize a handoff`);
+  }
+
+  const searchRoot = workspace.classifyWorkspace({
+    mode: 'orion',
+    searchRoot: SEARCH_ROOT,
+    workspacePath: SEARCH_ROOT
+  });
+  const rebound = workspace.bindResolvedProject(searchRoot, { name: 'Projects', path: SEARCH_ROOT });
+  t.equal(rebound.kind, workspace.KINDS.PROJECT_SEARCH_ROOT, 'binding the search root to itself cannot manufacture an active project');
+  t.end();
+});
+
 test('named registered project resolves from the search root to its exact workspace', (t) => {
   const projects = [
     { name: 'OrionAI', path: `${SEARCH_ROOT}\\OrionAI`, source: 'registered_project' },
+    { name: 'LIFE', path: `${SEARCH_ROOT}\\LIFE`, source: 'registered_project' },
     { name: 'GRITLIFE', path: GRITLIFE, source: 'registered_project' }
   ];
   const searchRoot = workspace.classifyWorkspace({
@@ -51,6 +79,11 @@ test('named registered project resolves from the search root to its exact worksp
   t.equal(resolution.changed, true, 'reports that a real workspace change occurred');
   t.ok(workspace.describeWorkspace(resolution).includes(GRITLIFE), 'active-workspace wording includes the exact path');
   t.equal(workspace.canHandoffWorkspace(resolution).allowed, true, 'a resolved project can be handed to Coder');
+  t.equal(
+    workspace.findNamedProject('Continue the Gritlife intent work.', projects).path,
+    GRITLIFE,
+    'a shorter project name embedded inside the requested project cannot steal the match'
+  );
   t.end();
 });
 

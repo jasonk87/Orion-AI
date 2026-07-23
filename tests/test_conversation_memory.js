@@ -122,6 +122,57 @@ test('exact conversational evidence outranks a session summary with the same rel
   t.end();
 });
 
+test('an eligible exact message outranks a newer, more detailed session summary', (t) => {
+  const exact = candidate({
+    id: 'conversation:exact-weaker:1',
+    conversationId: 'exact-weaker',
+    timestamp: '2026-07-10T15:00:00.000Z',
+    text: 'The intent direction used recurring subscriptions.'
+  });
+  const summary = candidate({
+    id: 'session:stronger-summary:1',
+    sourceKind: 'session',
+    conversationId: null,
+    sessionId: 'stronger-summary',
+    messageId: null,
+    role: 'summary',
+    timestamp: '2026-07-19T17:59:00.000Z',
+    text: 'The intent direction used recurring subscriptions and enrollments organized by locations, including gym, yoga, massage, therapy, and classes.'
+  });
+
+  const result = memory.searchConversationEvidence([summary, exact], {
+    query: 'Do you recall our earlier intent subscription discussion?',
+    nowMs: Date.parse('2026-07-19T18:00:00.000Z')
+  });
+
+  t.equal(result.evidence[0].id, exact.id, 'typed message evidence stays ahead of a more recent generic summary');
+  t.equal(result.evidence[1].id, summary.id, 'the summary remains available as secondary evidence');
+  t.end();
+});
+
+test('candidate-derived query expansion cannot increase its own retrieval score', (t) => {
+  const misleading = candidate({
+    id: 'conversation:misleading-intent:1',
+    conversationId: 'misleading-intent',
+    text: 'The intent discussion focused on character traits, combat colors, stamina streaks, Grind, Connect, and Survive.'
+  });
+  const options = {
+    query: 'Do you recall our earlier intent discussion?',
+    nowMs: Date.parse('2026-07-19T18:00:00.000Z'),
+    relevanceThreshold: 0
+  };
+  const initial = memory.rankConversationEvidence([misleading], options);
+  const expanded = memory.searchConversationEvidence([misleading], options);
+
+  t.ok(expanded.expandedTerms.includes('traits'), 'the candidate can still contribute useful expansion vocabulary');
+  t.equal(
+    expanded.evidence[0].scores.total,
+    Number(initial[0].totalScore.toFixed(6)),
+    'terms sourced only from a candidate do not boost that same candidate'
+  );
+  t.end();
+});
+
 test('unrelated recent material does not cross the relevance threshold', (t) => {
   const result = memory.searchConversationEvidence([
     candidate({ text: 'The renderer changed its color palette and button spacing.' }),
@@ -198,5 +249,49 @@ test('persisted search includes unsaved current-conversation context', (t) => {
   t.equal(result.evidence.length, 1, 'the live message is searchable before a debounced disk flush');
   t.equal(result.evidence[0].provenance.conversationId, 'live-conversation', 'live provenance is stable');
   t.equal(result.evidence[0].provenance.file, 'current-conversation', 'the source is identified as current in-memory state');
+  t.end();
+});
+
+test('the active recall question cannot qualify as its own conversation evidence', (t) => {
+  const prompt = 'Do you remember our earlier conversation about the intent system?';
+  const currentConversation = {
+    id: 'current-recall',
+    title: 'Current chat',
+    messages: [{
+      id: 'current-question',
+      role: 'user',
+      text: prompt,
+      createdAt: Date.now()
+    }]
+  };
+  const result = memory.searchPersistedConversationEvidence({
+    query: prompt,
+    currentConversation,
+    excludeConversationId: currentConversation.id,
+    excludeMessageIds: ['current-question'],
+    excludeUserPrompt: prompt,
+    limit: 8
+  });
+
+  t.equal(result.evidence.length, 0, 'the current question is excluded rather than licensing an I-remember claim');
+  t.end();
+});
+
+test('recent context cannot make a candidate relevant without the recalled subject', (t) => {
+  const result = memory.searchConversationEvidence([{
+    id: 'generic-gritlife',
+    sourceKind: 'conversation',
+    conversationId: 'generic',
+    messageId: 'generic-1',
+    role: 'assistant',
+    timestamp: Date.now(),
+    text: 'GRITLIFE currently uses Grind, Connect, and Survive traits.'
+  }], {
+    query: 'Do you remember our earlier conversation about the intent system?',
+    recentContext: 'GRITLIFE Grind Connect Survive traits',
+    limit: 8
+  });
+
+  t.equal(result.evidence.length, 0, 'context-only overlap cannot substitute for an intent subject match');
   t.end();
 });

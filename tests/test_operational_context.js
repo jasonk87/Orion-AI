@@ -494,7 +494,9 @@ test('agent and renderer wire operational context into both providers and Missio
   // every provider, so the operational-context spread appears once (in the builder) rather than
   // being duplicated per provider — and both providers consume that shared builder.
   t.equal((agent.match(/\? OPERATIONAL_CONTEXT_TOOL_DECLARATIONS :/g) || []).length, 1, 'operational-context tools are gated once in the shared tool builder');
-  t.equal((agent.match(/functionDeclarations: buildAgentToolDeclarations\(\)/g) || []).length, 2, 'both Gemini and Ollama providers consume the shared tool builder');
+  t.equal((agent.match(/functionDeclarations: buildAgentToolDeclarations\(\)/g) || []).length, 1, 'Ollama consumes the canonical tool builder directly');
+  t.ok(/function buildGeminiToolDeclarations\(\)[\s\S]{0,250}buildAgentToolDeclarations\(\)/.test(agent), 'Gemini provider projection derives from the same canonical builder');
+  t.ok(agent.includes('functionDeclarations: buildGeminiToolDeclarations()'), 'Gemini requests use the provider-safe projection');
   t.ok(agent.includes('OperationalContext.buildReasoningMessages(workingState'), 'builds provider input from working state first');
   t.notOk(agent.includes('conversation.messages.forEach(msg =>'), 'does not reconstruct task state from full chat transcript');
   t.ok(agent.includes('evaluateWorkingStateCompletion'), 'uses a single completion gate before finalizing');

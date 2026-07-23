@@ -1,8 +1,12 @@
 const test = require('tape');
 const http = require('http');
 const vm = require('vm');
+const fs = require('fs');
+const path = require('path');
 const proxyquire = require('proxyquire').noPreserveCache();
 const companionHtml = require('../lib/companion-html');
+
+const rendererSource = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8').replace(/\r\n/g, '\n');
 
 function request(method, port, path, body, session) {
   return new Promise((resolve, reject) => {
@@ -436,6 +440,30 @@ test('Phone Companion New Focus cancels only pending tasks owned by the selected
   await closeServer(main.getCompanionServer());
 });
 
+test('Phone Companion New Focus reports cancellation failure and preserves the selected focus', async (t) => {
+  const { main, electron } = await startMainWithConfig(1149, {}, {
+    newFocus: {
+      success: false,
+      cancelled: [],
+      failures: [{ taskId: 'task-still-pending', error: 'store unavailable' }],
+      count: 0
+    }
+  });
+  const pair = await request('POST', 1149, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
+  const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+
+  await request('POST', 1149, '/api/conversations/switch', { conversationId: 'dispatch-owned' }, session);
+  const result = await request('POST', 1149, '/api/new-focus', {}, session);
+
+  t.equal(result.statusCode, 200, 'the bridge returns the structured renderer result');
+  t.equal(result.json.success, false, 'the phone is told not to open a fresh focus');
+  t.equal(result.json.failures[0].taskId, 'task-still-pending', 'the failed pending task remains identifiable');
+  const bridgeCall = electron.calls.find(call => call.includes('beginNewFocus'));
+  t.ok(bridgeCall && bridgeCall.includes('dispatch-owned'), 'the failed attempt remains scoped to the selected conversation');
+
+  await closeServer(main.getCompanionServer());
+});
+
 // Regression: ask_clarifying_questions' interactive card (conversation.awaitingClarification —
 // intro + questions[].header/question/options[].label/description/recommended) was stored on the
 // desktop conversation object but never included in the phone's /api/state payload at all, and
@@ -699,4 +727,31 @@ test('Phone Companion v2 pairing pending and denied states', async (t) => {
   t.equal(resDenied.json.pending, false, 'pairing denied carries pending: false');
   t.equal(resDenied.json.error, 'Pairing denied', 'pairing denied carries pairing denied error message');
   await closeServer(mainDenied.getCompanionServer());
+});
+
+test('phone Dispatch cancellation and supervisor failures preserve truthful outcomes', (t) => {
+  const submitStart = rendererSource.indexOf('window.submitPhoneCompanionPrompt = async');
+  const submitEnd = rendererSource.indexOf('\nwindow.steerPhoneCompanionTask', submitStart);
+  const submitPath = rendererSource.slice(submitStart, submitEnd);
+  const cancelIndex = submitPath.indexOf(
+    "await cancelOwnedTaskRequestedInPrompt(conv, text, 'phone-task-cancellation')"
+  );
+  const clarificationIndex = submitPath.indexOf('if (conv.awaitingClarification && pendingReplyTaskId)');
+  const busyIndex = submitPath.indexOf('if (isGlobalRunning)');
+
+  t.ok(cancelIndex >= 0, 'phone prompt recognizes an owned-task cancellation');
+  t.ok(
+    cancelIndex < clarificationIndex && cancelIndex < busyIndex,
+    'phone cancellation runs before continuation or global busy routing'
+  );
+  t.ok(
+    submitPath.includes('if (supervisorResult && supervisorResult.success === false)'),
+    'phone does not turn a structured supervisor failure into success'
+  );
+  t.ok(
+    submitPath.includes('activeRunTaskId === launchedTaskId')
+      || rendererSource.includes('activeRunTaskId === launchedTaskId'),
+    'phone supervision is gated by the exact active task identity'
+  );
+  t.end();
 });

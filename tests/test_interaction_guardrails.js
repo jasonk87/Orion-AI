@@ -630,6 +630,22 @@ test('local system fact failures do not become fake blockers or web research', (
     agent.buildToolEvidenceEntry('run_command', { command: 'systeminfo' }, failedCommand)
   ];
 
+  const verifiedTestEvidence = agent.buildToolEvidenceEntry(
+    'run_tests',
+    {},
+    { success: true, output: '124 tests passed' }
+  );
+  t.equal(
+    verifiedTestEvidence.structuredStatuses[0].outcome,
+    'verified_passing',
+    'successful run_tests evidence carries a verified structured test status into the agent ledger'
+  );
+  t.equal(
+    verifiedTestEvidence.structuredStatuses[0].source,
+    'tool_result',
+    'structured test status preserves tool-result provenance'
+  );
+
   const webGate = agent.getEpistemicToolGate(
     'how much memory does my computer have left?',
     ledger,
@@ -1051,9 +1067,11 @@ test('Dispatch forces a handoff when the model announces one but emits no tool c
   t.equal(agent.looksLikeUnexecutedDispatchAction(execAnnounce), true, 'a generic "let me execute it now" announcement is recognized');
   t.equal(agent.looksLikeUnexecutedDispatchAction('Let me know if that works for you.'), false, '"let me know" carries no execution verb and is ignored');
 
-  // 4:34 — the affirmation itself does not classify as execution, but the model's self-declared
-  // Coder handoff is a strong enough signal to force the call.
-  t.equal(agent.shouldForceDispatchHandoff("Yes, let's go ahead and get this updated", routeAnnounce, { mode: 'orion' }), true, 'a self-declared Coder handoff forces the call even when the request is a bare affirmation');
+  // A model-authored announcement is not authority by itself. The live loop first resolves a
+  // contextual affirmation to its self-contained objective, then applies this guard.
+  t.equal(agent.shouldForceDispatchHandoff("Yes, let's go ahead and get this updated", routeAnnounce, { mode: 'orion' }), false, 'a bare affirmation cannot be executed solely because the model announces a handoff');
+  t.equal(agent.shouldForceDispatchHandoff('Update the GRITLIFE subscription system now.', routeAnnounce, { mode: 'orion' }), true, 'the resolved executable objective plus the announcement forces the call');
+  t.equal(agent.shouldForceDispatchHandoff('The exact request "restart Claude" is covered by tests.', routeAnnounce, { mode: 'orion' }), false, 'a handoff announcement cannot bypass quoted-status protection');
   // 4:37 — "Fix it" classifies as execution, and the generic announcement now counts as a deflection.
   t.equal(agent.shouldForceDispatchHandoff('Fix it', execAnnounce, { mode: 'orion' }), true, 'an execution request plus a "let me do it now" announcement forces the handoff');
   t.equal(agent.shouldForceDispatchHandoff('Fix it', execAnnounce, { mode: 'orion', alreadyHandedOff: true }), false, 'the announcement path still cannot double-fire within one request');

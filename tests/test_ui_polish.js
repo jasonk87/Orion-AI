@@ -314,6 +314,119 @@ test('agent presence communicates meaningful execution phases', (t) => {
   t.end();
 });
 
+test('task lifecycle UI waits for canonical state and protects queue ownership', (t) => {
+  const finalizingIndex = renderer.indexOf("details.status === 'finalizing'");
+  const canonicalFinalizerIndex = renderer.indexOf('window.onAgentRunFinalized = async function');
+  t.ok(finalizingIndex >= 0, 'the generic running=false event enters a non-terminal finalizing state');
+  t.ok(canonicalFinalizerIndex > finalizingIndex, 'terminal UI is driven by a separate canonical finalization callback');
+  t.ok(renderer.includes("canonicalStatus === 'completed'"), 'only an explicit completed state renders success');
+  t.ok(renderer.includes("canonicalStatus === 'cancelled'"), 'cancelled runs have a distinct non-success state');
+  t.ok(renderer.includes("canonicalStatus === 'failed'"), 'failed runs have a distinct attention state');
+  t.ok(renderer.includes("canonicalStatus === 'pending'"), 'pending work is not called complete');
+  t.notOk(renderer.includes('Orion finished the current run.'), 'legacy unconditional completion toast is removed');
+
+  t.ok(renderer.includes("const existingTaskId = String(options.taskId || '')"), 'continuations reuse only an explicitly bound task ID');
+  t.ok(renderer.includes('conversation.awaitingPlanApprovalTaskId') || fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8').includes('conversation.awaitingPlanApprovalTaskId'), 'plan approval records the exact durable task');
+  t.ok(renderer.includes('const clarificationTaskId = String(clarData.taskId ||'), 'clarification continuation captures its exact task before clearing UI state');
+  t.ok(renderer.includes('images: Array.isArray(task.images) ? task.images : []'), 'restored queue items retain durable images');
+  t.ok(renderer.includes('contextPacketIds: Array.isArray(task.contextPacketIds) ? task.contextPacketIds : []'), 'restored queue items retain context packets');
+
+  const preflightIndex = renderer.indexOf('const preflight = RendererTaskOrchestration.buildTaskPacket');
+  const coderCreationIndex = renderer.indexOf('const conv = standalone', preflightIndex);
+  t.ok(preflightIndex >= 0 && coderCreationIndex > preflightIndex, 'ambiguous handoffs are resolved before creating a Coder conversation');
+  t.ok(renderer.includes('conversations = conversations.filter(item => item.id !== conv.id)'), 'failed handoff persistence rolls back the provisional conversation');
+  t.ok(renderer.includes('committedWithWarning: true'), 'an unverified rollback preserves the one committed task instead of inviting a duplicate retry');
+  t.ok(renderer.includes('Orion retained the original task instead of retrying it'), 'committed setup failures carry an explicit non-duplication warning');
+  t.ok(renderer.includes('presentation/persistence warning must not turn'), 'post-commit handoff UI failures remain nonfatal');
+
+  t.ok(renderer.includes('monitorMeta.inFlight = true'), 'async supervisor polling cannot overlap itself');
+  t.ok(renderer.includes("stalledTask.status !== 'failed'"), 'stall reporting checks the canonical transition result');
+  t.ok(renderer.includes('const read = await window.getOrchestrationTaskStatus(taskId, orionConv.id)'), 'completion notifications refresh canonical task state instead of trusting cache');
+  t.ok(renderer.includes('const focusResult = await window.beginNewFocus(activeConversationId)'), 'desktop New Focus waits for pending-task cancellation');
+  t.ok(renderer.includes('The current focus was preserved.'), 'desktop preserves focus when cancellation fails');
+  t.ok(
+    renderer.includes("String(originConv.launchedCoderTaskId || '') === String(taskId)")
+      && renderer.includes('if (originConv && cancelledLaunchedTask)'),
+    'cancelling a different owned pending task cannot erase the active supervised task'
+  );
+  const directResponseStopIndex = renderer.indexOf("runningId === requesterId && !activeTaskId");
+  const retainedTaskCandidateIndex = renderer.indexOf('const candidates = [activeTaskId');
+  t.ok(
+    directResponseStopIndex >= 0 && retainedTaskCandidateIndex > directResponseStopIndex,
+    'Stop aborts the visible unbound response before considering older retained task IDs'
+  );
+  t.end();
+});
+
+test('Dispatch routes cancellation and supervision by exact active task ownership', (t) => {
+  const submitStart = renderer.indexOf('async function submitMessage()');
+  const submitEnd = renderer.indexOf('\nfunction slugify(', submitStart);
+  const submitPath = renderer.slice(submitStart, submitEnd);
+  const desktopCancelIndex = submitPath.indexOf(
+    "await cancelOwnedTaskRequestedInPrompt(conv, prompt, 'dispatch-task-cancellation')"
+  );
+  const clarificationIndex = submitPath.indexOf('if (conv.awaitingClarification && pendingReplyTaskId)');
+  const busyIndex = submitPath.indexOf('if (window.isAgentRunning && window.isAgentRunning())');
+  t.ok(desktopCancelIndex >= 0, 'desktop submit recognizes owned-task cancellation directly');
+  t.ok(
+    desktopCancelIndex < clarificationIndex && desktopCancelIndex < busyIndex,
+    'desktop cancellation runs before clarification, busy queueing, or model dispatch'
+  );
+
+  const ownershipStart = renderer.indexOf('function ownsActiveSupervisedRun(conv)');
+  const ownershipEnd = renderer.indexOf('\nasync function cancelOwnedTaskRequestedInPrompt', ownershipStart);
+  const ownershipPath = renderer.slice(ownershipStart, ownershipEnd);
+  t.ok(
+    ownershipPath.includes('runningConversationId === launchedConversationId'),
+    'supervisor interception requires the launched Coder conversation to be active'
+  );
+  t.ok(
+    ownershipPath.includes('activeRunTaskId === launchedTaskId'),
+    'supervisor interception also requires the exact durable task ID'
+  );
+  t.ok(
+    (renderer.match(/if \(ownsActiveSupervisedRun\(conv\)\)/g) || []).length >= 2,
+    'desktop and phone submit paths share the same exact-run ownership guard'
+  );
+
+  const cancelStart = renderer.indexOf('window.cancelOwnedOrchestrationTask = async function');
+  const cancelEnd = renderer.indexOf('\nasync function cancelPendingTasksForNewFocus', cancelStart);
+  const cancelPath = renderer.slice(cancelStart, cancelEnd);
+  const matchingReceiptGuard = cancelPath.indexOf('if (originConv && cancelledLaunchedTask)');
+  t.ok(
+    matchingReceiptGuard >= 0
+      && cancelPath.indexOf('originConv.lastDelegatedWork =', matchingReceiptGuard) > matchingReceiptGuard
+      && cancelPath.indexOf('originConv.launchedCoderTaskId = null', matchingReceiptGuard) > matchingReceiptGuard,
+    'cancelling pending task B cannot clear active task A pointers or receipt'
+  );
+  t.end();
+});
+
+test('supervisor conversational failures persist honestly and propagate to phone callers', (t) => {
+  const responseStart = renderer.indexOf('async function respondOrionConversationally');
+  const responseEnd = renderer.indexOf('\nasync function handleSupervisorMessage', responseStart);
+  const responsePath = renderer.slice(responseStart, responseEnd);
+  const catchIndex = responsePath.indexOf('} catch (err) {');
+  const catchPath = responsePath.slice(catchIndex);
+  t.ok(catchPath.includes('window.markConversationDirty(orionConv.id)'), 'failure fallback marks the conversation dirty');
+  t.ok(catchPath.includes('window.saveConversationsToStorage()'), 'failure fallback is durably persisted');
+  t.ok(catchPath.includes('success: false'), 'failure fallback returns structured failure instead of undefined');
+  t.ok(catchPath.includes('responsePersisted: true'), 'failure result distinguishes a persisted fallback from successful generation');
+
+  const phoneStart = renderer.indexOf('window.submitPhoneCompanionPrompt = async');
+  const phoneEnd = renderer.indexOf('\nwindow.steerPhoneCompanionTask', phoneStart);
+  const phonePath = renderer.slice(phoneStart, phoneEnd);
+  t.ok(
+    phonePath.includes('if (supervisorResult && supervisorResult.success === false)'),
+    'phone submit checks the supervisor result before reporting success'
+  );
+  t.ok(
+    phonePath.includes("error: supervisorResult.error || 'Supervisor response failed.'"),
+    'phone submit returns the real supervisor failure'
+  );
+  t.end();
+});
+
 test('window maximize control uses the correct Electron fullscreen API', (t) => {
   t.ok(ipcUiJs.includes('mainWindow.isFullScreen()'), 'main process uses BrowserWindow.isFullScreen()');
   t.notOk(ipcUiJs.includes('mainWindow.isFullscreen()'), 'main process does not call the non-existent isFullscreen() API');
@@ -444,5 +557,48 @@ test('agent status messages update in place instead of spamming transcript tails
   t.ok(agentJsSource.includes("source: 'planning-mode'"), 'planning/direct mode status is marked as a status source');
   t.ok(agentJsSource.includes("dedupeKey: `planning-mode-${conversation.id}`"), 'planning/direct mode status uses one stable key per conversation');
   t.ok(agentJsSource.includes('updateExisting: true'), 'agent status system messages request in-place updates');
+  t.end();
+});
+
+test('durable task finalization drives the supervisor completion receipt', (t) => {
+  const agentJsSource = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8').replace(/\r\n/g, '\n');
+  t.ok(agentJsSource.includes('window.onOrchestrationTaskFinalized(runTaskId, conversation.id, finalizedTaskState)'),
+    'agent loop reports the canonical terminal task state after persistence');
+  t.ok(renderer.includes('window.onOrchestrationTaskFinalized = async function'),
+    'renderer exposes a terminal-state completion hook');
+  t.ok(renderer.includes('await notifySupervisorOfCoderCompletion(targetConversationId, taskId)'),
+    'the hook routes through the canonical-state supervisor notifier with the exact task ID');
+  t.ok(renderer.includes('const result = await stopExpectedTaskForConversation(resolvedId)'),
+    'phone Stop reuses the same ownership-aware cancellation path as desktop Stop');
+  t.end();
+});
+
+test('proxied clarification answers resume the exact pending Coder task', (t) => {
+  const relayStart = renderer.indexOf('const relayConvId = clarData._relayToConvId;');
+  const relayEnd = renderer.indexOf('\n  conv.awaitingClarification = null;', relayStart);
+  const relayBranch = relayStart >= 0 && relayEnd > relayStart
+    ? renderer.slice(relayStart, relayEnd)
+    : '';
+  t.ok(relayBranch.includes('await queueTaskContinuation({'),
+    'the Dispatch clarification proxy creates a real durable continuation');
+  t.ok(relayBranch.includes('taskId: clarificationTaskId'),
+    'the continuation is bound to the exact task that asked the question');
+  t.ok(relayBranch.includes('targetConversationId: relayConvId'),
+    'the continuation targets the originating Coder conversation');
+  t.ok(relayBranch.includes('window.runAgentLoop(continuation.queueItem.prompt'),
+    'an idle Coder run is actively resumed after the answer is accepted');
+  t.notOk(relayBranch.includes('window.steeringQueue[relayConvId].push'),
+    'answers are not stranded in a steering queue after the Coder run has gone idle');
+  t.end();
+});
+
+test('plan and clarification continuations do not fall back to a stale task ID', (t) => {
+  const agentJsSource = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8').replace(/\r\n/g, '\n');
+  t.notOk(agentJsSource.includes('activeRunTaskId || conversation.lastOrchestrationTaskId'),
+    'agent-side continuation state records only the task that actually owns the current run');
+  t.ok(renderer.includes("const existingTaskId = String(options.taskId || '');"),
+    'renderer continuation resolution requires the explicitly supplied task ID');
+  t.notOk(renderer.includes('options.taskId || targetConv.lastOrchestrationTaskId'),
+    'renderer never silently resumes whichever task happened to run most recently');
   t.end();
 });

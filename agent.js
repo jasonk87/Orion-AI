@@ -498,6 +498,9 @@ async function generateOrionSmartTitle(conversation, userText, assistantText, co
 
 // Keep track of active agent running state
 let isAgentRunning = false;
+let isAgentStarting = false;
+let startingRunTaskId = null;
+let startupStopRequest = null;
 let runningConversationId = null;
 let agentSubStatus = '';
 let agentExecutionMode = 'idle';
@@ -521,6 +524,11 @@ let isStopRequested = false;
 let activeRunController = null;
 let stopRequestMode = 'none';
 let activeRunTaskId = null;
+let startupCancellationRecovery = null;
+let queueDrainTimer = null;
+let queueDrainInFlight = false;
+const STARTUP_CANCELLATION_RETRY_BASE_MS = 250;
+const STARTUP_CANCELLATION_RETRY_MAX_MS = 5000;
 const GEMINI_THINKING_BUDGET = 24576;
 const MODEL_API_REQUEST_TIMEOUT_MS = 600000;
 const MODEL_API_MAX_RETRY_WAIT_MS = 45000;
@@ -712,11 +720,12 @@ window.steeringQueue = {};
 window.promptQueue = [];
 window.followupTimers = window.followupTimers || {};
 window.followupTimerMeta = window.followupTimerMeta || {};
-window.isAgentRunning = () => isAgentRunning;
+window.isAgentRunning = () => isAgentRunning || isAgentStarting;
 window.getRunningConversationId = () => runningConversationId;
-window.getActiveRunTaskId = () => activeRunTaskId;
+window.getActiveRunTaskId = () => activeRunTaskId || startingRunTaskId;
 window.getAgentSubStatus = () => agentSubStatus;
 window.getAgentExecutionMode = () => agentExecutionMode;
+window.getStartupCancellationRecoveryState = () => getStartupCancellationRecoveryState();
 
 // ── Supervisor: expose a snapshot of a Coder conversation for status summaries ──
 window.getCoderConversationSummary = function(coderConvId) {
@@ -769,8 +778,18 @@ function getActiveRunSignal() {
 function requestAgentStop(options = {}) {
   const mode = options.mode === 'soft' ? 'soft' : 'hard';
   const requestedTaskId = String(options.taskId || '');
-  if (requestedTaskId && activeRunTaskId && requestedTaskId !== activeRunTaskId) {
+  const ownedRunTaskId = String(activeRunTaskId || startingRunTaskId || '');
+  if (requestedTaskId && ownedRunTaskId && requestedTaskId !== ownedRunTaskId) {
     return { success: false, stopped: false, reason: 'The requested task is not the active run.' };
+  }
+  if (isAgentStarting) {
+    startupStopRequest = { mode, taskId: requestedTaskId || ownedRunTaskId };
+    return {
+      success: true,
+      stopped: true,
+      starting: true,
+      taskId: requestedTaskId || ownedRunTaskId
+    };
   }
   isStopRequested = true;
   stopRequestMode = mode;
@@ -788,7 +807,10 @@ function requestAgentStop(options = {}) {
     }
     cancelFollowupsForConversation(targetConversationId);
     if (window.promptQueue) {
-      window.promptQueue = window.promptQueue.filter(item => item.conversationId !== targetConversationId);
+      window.promptQueue = window.promptQueue.filter(item => {
+        if (requestedTaskId) return item.taskId !== requestedTaskId;
+        return !(item.conversationId === targetConversationId && ['system', 'followup'].includes(item.source));
+      });
     }
   }
   const message = mode === 'soft'
@@ -847,7 +869,7 @@ async function searchConversationEvidenceForRun(conversation, userPrompt, worksp
       recentContext,
       currentConversation: compactConversationForEvidenceSearch(conversation, excludedMessageIds),
       excludeConversationId: String(conversation.id || ''),
-      excludeMessageIds,
+      excludeMessageIds: excludedMessageIds,
       excludeUserPrompt: String(userPrompt || ''),
       workspacePaths: [...new Set(workspacePaths.filter(Boolean))],
       limit: 8
@@ -874,6 +896,217 @@ window.stopAgentExecution = (options = {}) => {
   return requestAgentStop({ mode: options.mode || 'hard', taskId: options.taskId || '' });
 };
 window.softStopAgentExecution = () => requestAgentStop({ mode: 'soft' });
+
+function getStartupCancellationRecoveryState() {
+  if (!startupCancellationRecovery) return null;
+  return {
+    taskId: startupCancellationRecovery.taskId,
+    conversationId: startupCancellationRecovery.conversationId,
+    executionId: startupCancellationRecovery.executionId,
+    status: 'stopping',
+    canonicalStatus: startupCancellationRecovery.canonicalStatus || 'active',
+    attempt: startupCancellationRecovery.attempt,
+    lastError: startupCancellationRecovery.lastError || '',
+    nextRetryAt: startupCancellationRecovery.nextRetryAt || 0
+  };
+}
+
+function clearStartupCancellationRecovery(state, terminalStatus) {
+  if (!state || startupCancellationRecovery !== state) return;
+  if (state.timer !== null && state.timer !== undefined) {
+    clearTimeout(state.timer);
+    state.timer = null;
+  }
+  startupCancellationRecovery = null;
+  if (startingRunTaskId === state.taskId) {
+    isAgentStarting = false;
+    startingRunTaskId = null;
+    startupStopRequest = null;
+  }
+  agentExecutionMode = 'idle';
+  agentSubStatus = '';
+  if (window.onAgentStatusChange) {
+    try {
+      window.onAgentStatusChange(false, {
+        status: terminalStatus || 'unknown',
+        conversationId: state.conversationId,
+        taskId: state.taskId,
+        cancellationRecovery: false
+      });
+    } catch (error) {
+      console.error('Could not publish terminal startup cancellation state:', error);
+    }
+  }
+  scheduleSkippedQueueRecovery(0);
+}
+
+async function reconcileStartupCancellation(state) {
+  if (!state || startupCancellationRecovery !== state) return;
+  state.attempt += 1;
+  let canonicalStatus = '';
+  let lastError = null;
+  const remember = value => {
+    const status = readTaskStatusValue(value);
+    if (status) canonicalStatus = status;
+  };
+
+  try {
+    if (typeof window.finalizeOrchestrationTask === 'function') {
+      remember(await window.finalizeOrchestrationTask(state.taskId, 'cancelled', {
+        reason: 'Retrying cancellation for a task stopped while it was starting.',
+        reasonCode: 'startup_cancellation_recovery',
+        conversationId: state.conversationId,
+        expectedExecutionId: state.executionId
+      }));
+    }
+  } catch (error) {
+    lastError = error;
+  }
+
+  if (!['cancelled', 'completed', 'failed'].includes(canonicalStatus)
+      && typeof window.cancelOwnedOrchestrationTask === 'function') {
+    try {
+      remember(await window.cancelOwnedOrchestrationTask(
+        state.taskId,
+        state.conversationId,
+        'Retrying cancellation for a task stopped while it was starting.'
+      ));
+    } catch (error) {
+      lastError = lastError || error;
+    }
+  }
+
+  if (!['cancelled', 'completed', 'failed'].includes(canonicalStatus)
+      && typeof window.getOrchestrationTaskStatus === 'function') {
+    try {
+      remember(await window.getOrchestrationTaskStatus(state.taskId, state.conversationId));
+    } catch (error) {
+      lastError = lastError || error;
+    }
+  }
+
+  state.canonicalStatus = canonicalStatus || state.canonicalStatus || 'active';
+  state.lastError = lastError ? String(lastError.message || lastError) : '';
+  if (['cancelled', 'completed', 'failed'].includes(state.canonicalStatus)) {
+    if (typeof window.onOrchestrationTaskFinalized === 'function') {
+      try {
+        await window.onOrchestrationTaskFinalized(
+          state.taskId,
+          state.conversationId,
+          state.canonicalStatus
+        );
+      } catch (error) {
+        console.error('Could not publish recovered startup cancellation state:', error);
+      }
+    }
+    if (window.appendSystemMessage) {
+      const reconciledText = state.canonicalStatus === 'cancelled'
+        ? `Cancellation of task ${state.taskId} is now confirmed.`
+        : `The stop recovery for task ${state.taskId} finished with canonical state ${state.canonicalStatus}; Orion did not overwrite that terminal state.`;
+      try {
+        window.appendSystemMessage(reconciledText, {
+          conversationId: state.conversationId,
+          source: 'task-status',
+          dedupeKey: `task-startup-cancel-reconciled-${state.taskId}`
+        });
+      } catch (error) {
+        console.error('Could not present recovered startup cancellation state:', error);
+      }
+    }
+    clearStartupCancellationRecovery(state, state.canonicalStatus);
+    return;
+  }
+
+  agentExecutionMode = 'stopping';
+  agentSubStatus = `Recovering cancellation for task ${state.taskId}`;
+  if (window.onAgentStatusChange) {
+    try {
+      window.onAgentStatusChange(true, {
+        status: 'stopping',
+        conversationId: state.conversationId,
+        taskId: state.taskId,
+        cancellationRecovery: true,
+        attempt: state.attempt,
+        canonicalStatus: state.canonicalStatus
+      });
+    } catch (error) {
+      console.error('Could not publish startup cancellation retry state:', error);
+    }
+  }
+  const delay = Math.min(
+    STARTUP_CANCELLATION_RETRY_BASE_MS * (2 ** Math.min(state.attempt, 5)),
+    STARTUP_CANCELLATION_RETRY_MAX_MS
+  );
+  state.nextRetryAt = Date.now() + delay;
+  state.timer = setTimeout(async () => {
+    if (startupCancellationRecovery !== state) return;
+    state.timer = null;
+    try {
+      await reconcileStartupCancellation(state);
+    } catch (error) {
+      state.lastError = String(error.message || error);
+      if (startupCancellationRecovery === state) {
+        agentSubStatus = `Cancellation recovery paused after an error for task ${state.taskId}`;
+        scheduleStartupCancellationRecovery(state);
+      }
+    }
+  }, delay);
+  if (state.timer && typeof state.timer.unref === 'function') state.timer.unref();
+}
+
+function scheduleStartupCancellationRecovery(details = {}) {
+  const taskId = String(details.taskId || '');
+  if (!taskId) return null;
+  let state = startupCancellationRecovery;
+  if (state && state.taskId !== taskId) return state;
+  if (!state) {
+    state = {
+      taskId,
+      conversationId: String(details.conversationId || ''),
+      executionId: String(details.executionId || ''),
+      canonicalStatus: String(details.canonicalStatus || 'active'),
+      lastError: String(details.lastError || ''),
+      attempt: 0,
+      nextRetryAt: 0,
+      timer: null
+    };
+    startupCancellationRecovery = state;
+  }
+  isAgentStarting = true;
+  startingRunTaskId = taskId;
+  startupStopRequest = { mode: 'hard', taskId };
+  agentExecutionMode = 'stopping';
+  agentSubStatus = `Recovering cancellation for task ${taskId}`;
+  if (window.onAgentStatusChange) {
+    try {
+      window.onAgentStatusChange(true, {
+        status: 'stopping',
+        conversationId: state.conversationId,
+        taskId,
+        cancellationRecovery: true,
+        attempt: state.attempt,
+        canonicalStatus: state.canonicalStatus
+      });
+    } catch (error) {
+      console.error('Could not publish startup cancellation recovery state:', error);
+    }
+  }
+  if (state.timer === null) {
+    state.nextRetryAt = Date.now() + STARTUP_CANCELLATION_RETRY_BASE_MS;
+    state.timer = setTimeout(async () => {
+      if (startupCancellationRecovery !== state) return;
+      state.timer = null;
+      try {
+        await reconcileStartupCancellation(state);
+      } catch (error) {
+        state.lastError = String(error.message || error);
+        if (startupCancellationRecovery === state) scheduleStartupCancellationRecovery(state);
+      }
+    }, STARTUP_CANCELLATION_RETRY_BASE_MS);
+    if (state.timer && typeof state.timer.unref === 'function') state.timer.unref();
+  }
+  return state;
+}
 
 function buildSupervisorEvidencePacket(workWalkthrough = [], contextReceipt = {}) {
   const recentTools = (workWalkthrough || []).slice(-20).map((w, index) => {
@@ -1075,8 +1308,12 @@ async function evaluateLoopStateWithSupervisor(modelName, workWalkthrough, disab
 // EXPOSE AGENT LOOP TO RENDERER
 window.runAgentLoop = async function(userPrompt, modelName, conversation, options = {}) {
   const runTaskId = String(options.taskId || '');
+  const liveUserPrompt = String(userPrompt || '');
+  let claimedTaskPrompt = '';
   let runTaskExecutionId = '';
-  if (isAgentRunning) {
+  let finalizedTaskState = runTaskId ? 'active' : '';
+  let durableTaskStateCommitted = false;
+  if (isAgentRunning || isAgentStarting) {
     const statusText = "Another Orion task is already running. This request needs to be queued or retried after the active task finishes.";
     if (window.persistAssistantStatusMessage && conversation && conversation.id) {
       window.persistAssistantStatusMessage(conversation.id, statusText, {
@@ -1088,9 +1325,33 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     }
     return { success: false, queued: false, reason: 'agent_busy', taskId: runTaskId };
   }
+  // Reserve the single global runner before awaiting a durable task claim. Without this
+  // synchronous reservation, two distinct pending tasks could both pass the busy check, claim
+  // separate records, and then start concurrently.
+  isAgentStarting = true;
+  startingRunTaskId = runTaskId;
+  startupStopRequest = null;
   if (runTaskId && typeof window.claimOrchestrationTask === 'function') {
-    const claimed = await window.claimOrchestrationTask(runTaskId);
+    let claimed;
+    try {
+      claimed = await window.claimOrchestrationTask(runTaskId);
+    } catch (error) {
+      isAgentStarting = false;
+      startingRunTaskId = null;
+      startupStopRequest = null;
+      scheduleSkippedQueueRecovery(0);
+      return {
+        success: false,
+        skipped: true,
+        reason: 'task_claim_error',
+        error: error.message || String(error),
+        taskId: runTaskId
+      };
+    }
     if (!claimed || claimed.success === false) {
+      isAgentStarting = false;
+      startingRunTaskId = null;
+      startupStopRequest = null;
       if (window.appendSystemMessage) {
         window.appendSystemMessage(`Skipped queued task ${runTaskId}: ${(claimed && claimed.reason) || 'it is no longer pending.'}`, {
           conversationId: conversation && conversation.id,
@@ -1102,7 +1363,140 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       return { success: false, skipped: true, taskId: runTaskId };
     }
     runTaskExecutionId = String(claimed.task && claimed.task.execution && claimed.task.execution.executionId || '');
-    if (claimed.prompt) userPrompt = claimed.prompt;
+    claimedTaskPrompt = String(claimed.prompt || '');
+    // Durable queue executions normally use the canonical self-contained task prompt. A typed
+    // reply to a claimed plan/clarification task is different: the task ID supplies ownership, but
+    // the live reply supplies the decision. The renderer opts into preserving that exact message so
+    // "deny" cannot be overwritten by the original implementation objective before classification.
+    if (claimedTaskPrompt && options.preserveUserPrompt !== true) userPrompt = claimedTaskPrompt;
+    if (startupStopRequest && (!startupStopRequest.taskId || startupStopRequest.taskId === runTaskId)) {
+      let cancellationError = null;
+      let canonicalStatus = '';
+
+      const rememberCanonicalTask = (task) => {
+        if (!task || typeof task !== 'object') return;
+        canonicalStatus = String(task.status || '');
+      };
+
+      const refreshCanonicalTask = async () => {
+        if (typeof window.getOrchestrationTaskStatus !== 'function') return;
+        try {
+          const read = await window.getOrchestrationTaskStatus(runTaskId, conversation && conversation.id);
+          if (read && read.success && read.task) rememberCanonicalTask(read.task);
+          else if (read && read.status) canonicalStatus = String(read.status);
+        } catch (error) {
+          cancellationError = cancellationError || error;
+        }
+      };
+
+      try {
+        if (typeof window.finalizeOrchestrationTask === 'function') {
+          rememberCanonicalTask(await window.finalizeOrchestrationTask(runTaskId, 'cancelled', {
+            reason: 'Cancelled while the task was starting.',
+            expectedExecutionId: runTaskExecutionId
+          }));
+        }
+      } catch (error) {
+        cancellationError = error;
+      }
+
+      if (canonicalStatus !== 'cancelled') {
+        await refreshCanonicalTask();
+      }
+
+      // The ordinary finalizer can fail independently of the ownership-aware cancellation
+      // primitive (for example, a transient stale-execution read). Make one bounded fallback
+      // attempt before giving up, then verify the store again. Never label an unverified active
+      // record as cancelled merely because a stop was requested.
+      if (!['cancelled', 'completed', 'failed'].includes(canonicalStatus)
+          && typeof window.cancelOwnedOrchestrationTask === 'function') {
+        try {
+          const fallback = await window.cancelOwnedOrchestrationTask(
+            runTaskId,
+            conversation && conversation.id,
+            'Cancelled while the task was starting.'
+          );
+          if (fallback && fallback.task) rememberCanonicalTask(fallback.task);
+          else if (fallback && fallback.status) canonicalStatus = String(fallback.status);
+        } catch (error) {
+          cancellationError = cancellationError || error;
+        }
+        await refreshCanonicalTask();
+      }
+
+      if (['cancelled', 'completed', 'failed'].includes(canonicalStatus)
+          && typeof window.onOrchestrationTaskFinalized === 'function') {
+        try {
+          await window.onOrchestrationTaskFinalized(
+            runTaskId,
+            conversation && conversation.id,
+            canonicalStatus
+          );
+        } catch (error) {
+          console.error('Could not publish startup task cancellation state:', error);
+        }
+      }
+
+      const startupStateIsTerminal = ['cancelled', 'completed', 'failed'].includes(canonicalStatus);
+      let cancellationRecovery = null;
+      if (!startupStateIsTerminal) {
+        cancellationRecovery = scheduleStartupCancellationRecovery({
+          taskId: runTaskId,
+          conversationId: conversation && conversation.id,
+          executionId: runTaskExecutionId,
+          canonicalStatus: canonicalStatus || 'active',
+          lastError: cancellationError ? String(cancellationError.message || cancellationError) : ''
+        });
+      }
+
+      if (canonicalStatus !== 'cancelled' && window.appendSystemMessage) {
+        const detail = cancellationError && cancellationError.message
+          ? ` ${cancellationError.message}`
+          : '';
+        window.appendSystemMessage(
+          startupStateIsTerminal
+            ? `Stop was requested while task ${runTaskId} was starting. Its canonical state is already ${canonicalStatus}, so Orion preserved that terminal state.${detail}`
+            : `Stop was requested while task ${runTaskId} was starting. Cancellation is not confirmed yet, so Orion is retaining ownership and retrying reconciliation in the background.${detail}`,
+          {
+            conversationId: conversation && conversation.id,
+            source: 'task-status',
+            dedupeKey: `task-startup-cancel-unverified-${runTaskId}`
+          }
+        );
+      }
+
+      try {
+        if (canonicalStatus === 'cancelled') {
+          return { success: false, cancelled: true, reason: 'cancelled_while_starting', status: canonicalStatus, taskId: runTaskId };
+        }
+        if (startupStateIsTerminal) {
+          return {
+            success: false,
+            cancelled: false,
+            reason: 'startup_stop_reconciled_terminal',
+            status: canonicalStatus,
+            taskId: runTaskId
+          };
+        }
+        return {
+              success: false,
+              cancelled: false,
+              reason: 'startup_cancellation_recovering',
+              status: 'stopping',
+              canonicalStatus: canonicalStatus || 'active',
+              recovery: !!cancellationRecovery,
+              error: cancellationError ? String(cancellationError.message || cancellationError) : '',
+              taskId: runTaskId
+            };
+      } finally {
+        if (!cancellationRecovery) {
+          isAgentStarting = false;
+          startingRunTaskId = null;
+          startupStopRequest = null;
+          scheduleSkippedQueueRecovery(0);
+        }
+      }
+    }
   }
   
   // A new message means this conversation is no longer idle — cancel any pending
@@ -1110,6 +1504,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   clearOrionMemoryInactivityTimer();
 
   isAgentRunning = true;
+  isAgentStarting = false;
+  startingRunTaskId = null;
+  startupStopRequest = null;
   runningConversationId = conversation.id;
   activeRunTaskId = runTaskId;
   agentExecutionMode = 'planning';
@@ -1118,6 +1515,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   activeRunController = new AbortController();
   window.currentLoopCount = 0;
   currentAgentLogs = [];
+  try {
   const config = window.getAppConfig();
   // Session continuity: build prev-session context on first message, clear otherwise
   const isOrionMode = conversation.mode === 'orion' ||
@@ -1148,6 +1546,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           source: workspaceResolution.source || '',
           resolved: workspaceResolution.kind !== (WorkspaceResolution && WorkspaceResolution.KINDS.UNRESOLVED)
         },
+        searchRoot: getDispatchWorkspaceRoot(),
+        knownProjects: getKnownWorkspaceCandidates(conversation),
         originConversationId: conversation.id,
         targetConversationId: conversation.id,
         targetMode: 'orion'
@@ -1174,7 +1574,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     orionSessionContinuityContext = '';
     orionCachedMemoryBlock = '';
   }
-  if (window.onAgentStatusChange) window.onAgentStatusChange(true);
+  if (window.onAgentStatusChange) window.onAgentStatusChange(true, {
+    status: 'active',
+    conversationId: conversation.id,
+    taskId: runTaskId
+  });
 
   conversation._activeContextRunId = `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   config.modelName = modelName || config.modelName || 'gemini-2.5-flash-lite';
@@ -1216,12 +1620,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let forceYield = false;
   let autoContinueExecution = false;
   let userRequestedStop = false;
+  let deniedPlanTaskId = '';
   let finalAnswerQualityPrompts = 0;
   let finalAnswerQualityLoopExtensions = 0;
   let memoryConfidenceCorrections = 0;
   let statusAccuracyCorrections = 0;
   let criticalRunError = null;
-  let finalizedTaskState = runTaskId ? 'active' : '';
   // Set right after the main while loop exits, in the outer function scope so the `finally` block
   // below (which runs in a separate block from the `try` that declares loopCount/maxLoops) can see
   // whether the loop stopped because it hit its raw per-turn ceiling rather than because the model
@@ -1262,9 +1666,16 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   // A small AI classifier is used ONLY where intent is genuinely ambiguous:
   //   classifyPlanApprovalIntent — a plan is pending and the user typed a free-form reply.
   //   classifyPlanningNeed       — a fresh task needs a plan/direct/answer decision.
+  // A task-bound live reply has two different jobs. Intent routing must see the exact raw reply
+  // ("approve", "deny", a clarification answer), while execution must retain the durable,
+  // self-contained task packet that survives restart/compaction. Never choose one at the expense
+  // of the other.
+  const taskBoundExecutionPrompt = options.preserveUserPrompt === true && claimedTaskPrompt
+    ? `[CANONICAL DURABLE TASK PACKET]\n${claimedTaskPrompt}\n\n[EXACT LIVE TASK-BOUND USER INPUT]\n${liveUserPrompt}`
+    : String(userPrompt || '');
   const promptForModel = isInternalPrompt
-    ? `[ORION INTERNAL FOLLOW-UP - not a user message]\n${userPrompt}\n\nContinue from the saved conversation/task state. Do not quote this as something the user said.`
-    : userPrompt;
+    ? `[ORION INTERNAL FOLLOW-UP - not a user message]\n${taskBoundExecutionPrompt}\n\nContinue from the saved conversation/task state. Do not quote this as something the user said.`
+    : taskBoundExecutionPrompt;
 
   // Resolve the user's home directory once so the model never needs to discover it
   resolvedHomeDir = 'C:\\Users\\Owner';
@@ -1299,12 +1710,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     agentExecutionMode = 'executing';
   } else if (conversation.awaitingPlanApproval && !conversation.planApproved) {
     // The user is replying to a pending plan. The model classifies their reply.
+    // With preserveUserPrompt, `userPrompt` is deliberately still the exact live reply; the
+    // canonical packet is carried separately in promptForModel for execution.
     approvalIntent = await classifyPlanApprovalIntent(userPrompt, resolveUtilityModelName(modelName), config);
     if (approvalIntent.intent === 'approve') {
       const planText = await readImplementationPlanText(workspacePath, conversation);
       if (hasRequiredTestingPlanSection(planText)) {
         conversation.planApproved = true;
         conversation.awaitingPlanApproval = false;
+        conversation.awaitingPlanApprovalTaskId = '';
         if (window.appendSystemMessage) window.appendSystemMessage("Plan approved. Continuing implementation.", { conversationId: conversation.id });
         planningDecision = { mode: 'direct', reason: 'Implementation plan approved.' };
         planningBypassedForTask = true;
@@ -1316,10 +1730,25 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       }
       if (window.saveConversationsToStorage) window.saveConversationsToStorage();
     } else if (approvalIntent.intent === 'deny') {
-      conversation.awaitingPlanApproval = false;
-      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
-      planningDecision = { mode: 'answer', reason: 'User declined the pending plan.' };
-      agentExecutionMode = 'answer';
+      deniedPlanTaskId = String(conversation.awaitingPlanApprovalTaskId || runTaskId || '');
+      if (deniedPlanTaskId && deniedPlanTaskId !== runTaskId) {
+        // Never let a free-text reply bound to one claimed task cancel whichever task happened to
+        // be most recent in the same conversation. Renderer callers must pass the task ID attached
+        // to the approval card; a mismatch fails closed and leaves the plan pending.
+        approvalIntent = {
+          intent: 'unclear',
+          reason: `The denial reply is bound to ${runTaskId ? `task ${runTaskId}` : 'no claimed task'}, but the pending plan belongs to ${deniedPlanTaskId}.`
+        };
+        deniedPlanTaskId = '';
+        planningDecision = { mode: 'answer', reason: 'Plan denial task ownership could not be verified.' };
+        agentExecutionMode = 'answer';
+      } else {
+        conversation.awaitingPlanApproval = false;
+        conversation.awaitingPlanApprovalTaskId = '';
+        if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+        planningDecision = { mode: 'answer', reason: 'User declined the pending plan.' };
+        agentExecutionMode = 'answer';
+      }
     } else if (approvalIntent.intent === 'other') {
       suppressPlanApprovalCardThisTurn = true;
       const decision = config.planningMode === false
@@ -2062,6 +2491,27 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         }
       }
 
+      // A genuine model-authored handoff that survives the quoted/transcript guard is already the
+      // one authorized delegation for this run. Remember it before the next model turn so a later
+      // no-tool sentence such as "I can't do that here, so I'll pass it to Coder" cannot synthesize
+      // a second durable task after the first call has already executed.
+      const standaloneEnvironmentRequest = isStandaloneCoderOperationRequest(liveUserPrompt);
+      const atGenericSearchRoot = WorkspaceResolution
+        ? WorkspaceResolution.samePath(workspacePath, getDispatchWorkspaceRoot())
+        : String(workspacePath || '').toLowerCase() === String(getDispatchWorkspaceRoot() || '').toLowerCase();
+      if (runMode === 'orion' && functionCalls.some(call => call && call.name === 'handoff_to_coder')) {
+        for (const call of functionCalls) {
+          if (!call || call.name !== 'handoff_to_coder') continue;
+          call.args = call.args && typeof call.args === 'object' ? call.args : {};
+          // The durable handoff prompt may be expanded from context. Preserve the exact current
+          // utterance as separate provenance instead of making downstream code reverse-engineer it
+          // from the resolved objective.
+          call.args.originalUserMessage = liveUserPrompt;
+          call.args.standalone = standaloneEnvironmentRequest && atGenericSearchRoot;
+        }
+        dispatchForcedHandoffSent = true;
+      }
+
       // Dispatch is intentionally denied execution/mutation tools, but that permission boundary
       // must never become a reason to return the task to Jason. If an explicit execution request
       // receives a no-tool permission refusal/manual deflection, synthesize the allowed Coder
@@ -2077,7 +2527,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           args: {
             prompt: buildForcedDispatchHandoffPrompt(resolvedRequestForRouting),
             title: 'Execute Dispatch request',
-            open: true
+            open: true,
+            standalone: standaloneEnvironmentRequest && atGenericSearchRoot,
+            originalUserMessage: liveUserPrompt
           }
         };
         parts.splice(0, parts.length, { text: handoffText }, { functionCall: forcedCall });
@@ -2088,6 +2540,25 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           type: 'thought',
           content: 'Dispatch delegation guard: converted a permission refusal into the required Coder handoff.'
         });
+      }
+
+      if (functionCalls.length === 0 && runMode === 'orion' && DispatchIntent
+          && looksLikeIntendedCoderHandoff(textVal)
+          && !DispatchIntent.dispatchRequestRequiresCoderExecution(resolvedRequestForRouting)) {
+        blockedDispatchHandoffAttempts++;
+        currentAgentLogs.push({
+          type: 'thought',
+          content: 'Dispatch instruction guard: rejected a narrated handoff because the active user instruction did not authorize execution.'
+        });
+        if (blockedDispatchHandoffAttempts <= 2 && loopCount < maxLoops) {
+          messages.push({
+            role: 'user',
+            parts: [{ text: '[SYSTEM: You announced a Coder handoff, but the active user instruction does not request execution; command-like text appears only as quoted, reported, transcript, test, or status material. Do not narrate or perform a handoff. Analyze or acknowledge the surrounding message directly.]' }]
+          });
+          continue;
+        }
+        textVal = 'I understand this as a report about a covered scenario, not a request to execute the quoted command.';
+        parts.splice(0, parts.length, { text: textVal });
       }
 
       if (textVal) {
@@ -2135,7 +2606,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         }
         if (OrchestrationContracts && (recallRequested || OrchestrationContracts.hasExplicitRecallClaim(textVal))) {
           const memoryValidation = OrchestrationContracts.validateMemoryResponse(textVal, {
-            conversationEvidence: retrievedConversationEvidence
+            conversationEvidence: retrievedConversationEvidence,
+            recallRequested
           });
           if (!memoryValidation.valid && memoryConfidenceCorrections < 1 && loopCount < maxLoops) {
             memoryConfidenceCorrections++;
@@ -2470,7 +2942,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           currentAgentLogs[logIndex].result = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
           currentAgentLogs[logIndex].elapsed = elapsed;
           updateWalkthroughItem(walkthroughItem, toolName, args, result, isFailedToolResult(result) ? new Error(getToolFailureSignal(result) || 'error') : null);
-          toolEvidenceLedger.push(buildToolEvidenceEntry(toolName, args, result));
+          const evidenceEntry = buildToolEvidenceEntry(toolName, args, result);
+          toolEvidenceLedger.push(evidenceEntry);
+          mergeRunStructuredStatusFacts(structuredStatusFacts, evidenceEntry.structuredStatuses);
           recordContextAcquisitionToolResult(contextAcquisitionLedger, toolName, args, result);
           rememberContextPacketForConversation(conversation, workspacePath, toolName, result);
 
@@ -2783,14 +3257,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             }
           }
         }
-        if (Array.isArray(evidenceEntry.structuredStatuses)) {
-          for (const fact of evidenceEntry.structuredStatuses) {
-            const signature = JSON.stringify(fact);
-            if (!structuredStatusFacts.some(existing => JSON.stringify(existing) === signature)) {
-              structuredStatusFacts.push(fact);
-            }
-          }
-        }
+        mergeRunStructuredStatusFacts(structuredStatusFacts, evidenceEntry.structuredStatuses);
         recordContextAcquisitionToolResult(contextAcquisitionLedger, toolName, args, result);
         rememberContextPacketForConversation(conversation, workspacePath, toolName, result);
 
@@ -3066,6 +3533,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               window.appendSystemMessage("Approval rejected: The implementation plan is missing a valid '## Testing Plan' section. Please revise the plan first.", { conversationId: conversation.id });
             }
             conversation.awaitingPlanApproval = true;
+            conversation.awaitingPlanApprovalTaskId = runTaskId || '';
             conversation.planApproved = false;
             if (window.saveConversationsToStorage) {
               window.saveConversationsToStorage();
@@ -3079,6 +3547,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
         console.log("Plan written. Forcing yield to wait for user approval.");
         conversation.awaitingPlanApproval = true;
+        conversation.awaitingPlanApprovalTaskId = runTaskId || '';
         const planItem = workWalkthrough.find(item => item.kind === 'plan');
         lastTextResponse = buildPlanApprovalMessage(planItem, lastTextResponse);
         forceYield = true;  // prevent auto-continue from bypassing plan approval gate
@@ -3167,13 +3636,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       currentAgentLogs.push({ type: 'thought', content: `Critical Error: ${error.message}` });
     }
   } finally {
-    activeRunController = null;
-    stopRequestMode = 'none';
-    isAgentRunning = false;
-    runningConversationId = null;
-    agentExecutionMode = 'idle';
-    agentSubStatus = '';
-    if (window.onAgentStatusChange) window.onAgentStatusChange(false);
+    // Keep the global run reservation until every durable checkpoint and task-state
+    // transition below has finished. Releasing it here lets a queued run start while
+    // this run is still flushing/finalizing, and an exception during those awaits can
+    // then strand the old task ID or allow competing completion receipts.
+    agentExecutionMode = 'finalizing';
+    agentSubStatus = 'Finalizing';
+    if (window.onAgentStatusChange) window.onAgentStatusChange(false, {
+      status: 'finalizing',
+      conversationId: conversation.id,
+      taskId: runTaskId
+    });
 
     // Smart Orion title: generate a better title after the first response
     if (isOrionMode) {
@@ -3275,7 +3748,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     }
     if (OrchestrationContracts && (recallRequested || OrchestrationContracts.hasExplicitRecallClaim(lastTextResponse))) {
       const finalMemoryValidation = OrchestrationContracts.validateMemoryResponse(lastTextResponse, {
-        conversationEvidence: retrievedConversationEvidence
+        conversationEvidence: retrievedConversationEvidence,
+        recallRequested
       });
       if (!finalMemoryValidation.valid) {
         lastTextResponse = OrchestrationContracts.buildEvidenceBackedRecallFallback(retrievedConversationEvidence);
@@ -3321,8 +3795,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       ]);
       conversation.messages[aiMessageIndex].responseBasis = OrchestrationContracts.createResponseBasis({
         conversationEvidence: retrievedConversationEvidence,
-        projectKnowledge: toolEvidenceLedger.some(item => item && projectKnowledgeTools.has(item.toolName)),
-        generalInference: retrievedConversationEvidence.length === 0 && !toolEvidenceLedger.some(item => item && projectKnowledgeTools.has(item.toolName)),
+        projectKnowledge: toolEvidenceLedger.some(item => item && !item.failed && projectKnowledgeTools.has(item.toolName)),
+        generalInference: retrievedConversationEvidence.length === 0 && !toolEvidenceLedger.some(item => item && !item.failed && projectKnowledgeTools.has(item.toolName)),
         structuredStatuses: structuredStatusFacts
       });
     }
@@ -3373,8 +3847,30 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       pendingOperationalTask ? pendingOperationalTask.title : ''
     );
 
+    // A stop can arrive after the model loop has finished while the final transcript write or
+    // operational checkpoint is still awaiting persistence. Reconcile that request before the
+    // durable task transition instead of recording a successful completion just because the model
+    // had already produced its last sentence.
+    if (isStopRequested) {
+      userRequestedStop = true;
+      isStopRequested = false;
+      currentAgentLogs.push({
+        type: 'thought',
+        content: stopRequestMode === 'soft'
+          ? 'Stop requested by user during finalization; the task was cancelled after the current persistence boundary.'
+          : 'Task cancellation requested by user during finalization.'
+      });
+    }
+    const currentTaskDeniedByPlanDecision = !!(
+      runTaskId
+      && deniedPlanTaskId
+      && deniedPlanTaskId === runTaskId
+      && approvalIntent
+      && approvalIntent.intent === 'deny'
+    );
+
     if (runTaskId && typeof window.finalizeOrchestrationTask === 'function') {
-      const desiredTaskState = userRequestedStop
+      const desiredTaskState = (userRequestedStop || currentTaskDeniedByPlanDecision)
         ? 'cancelled'
         : (criticalRunError
           ? 'failed'
@@ -3382,16 +3878,92 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             ? 'pending'
             : 'completed'));
       const finalizedTask = await window.finalizeOrchestrationTask(runTaskId, desiredTaskState, {
-        reason: userRequestedStop
-          ? 'Cancelled by user.'
-          : (criticalRunError ? String(criticalRunError.message || criticalRunError) : ''),
+        reason: currentTaskDeniedByPlanDecision
+          ? 'The user denied the pending implementation plan.'
+          : (userRequestedStop
+            ? 'Cancelled by user.'
+            : (criticalRunError ? String(criticalRunError.message || criticalRunError) : '')),
         summary: String(lastTextResponse || '').replace(/\s+/g, ' ').slice(0, 1000),
         conversationId: conversation.id,
         pendingWork: !!hasPendingWork,
         awaitingUser: !!(forceYield || conversation.awaitingPlanApproval || conversation.awaitingClarification),
         expectedExecutionId: runTaskExecutionId
       });
-      finalizedTaskState = finalizedTask && finalizedTask.status ? finalizedTask.status : desiredTaskState;
+      if (finalizedTask && finalizedTask.status) {
+        finalizedTaskState = finalizedTask.status;
+      } else if (typeof window.getOrchestrationTaskStatus === 'function') {
+        const canonicalTask = await window.getOrchestrationTaskStatus(runTaskId, conversation.id);
+        finalizedTaskState = canonicalTask && canonicalTask.success && canonicalTask.status
+          ? canonicalTask.status
+          : 'unknown';
+      } else {
+        finalizedTaskState = 'unknown';
+      }
+      durableTaskStateCommitted = ['pending', 'completed', 'cancelled', 'failed'].includes(finalizedTaskState);
+      if (typeof window.onOrchestrationTaskFinalized === 'function') {
+        try {
+          await window.onOrchestrationTaskFinalized(runTaskId, conversation.id, finalizedTaskState);
+        } catch (error) {
+          console.error('Could not publish the finalized orchestration task state:', error);
+        }
+      }
+    }
+    if (!finalizedTaskState) {
+      finalizedTaskState = (userRequestedStop || currentTaskDeniedByPlanDecision)
+        ? 'cancelled'
+        : (criticalRunError
+          ? 'failed'
+          : ((autoContinueExecution || forceYield || ranOutOfLoopBudget || hasPendingWork
+              || conversation.awaitingPlanApproval || conversation.awaitingClarification)
+            ? 'pending'
+            : 'completed'));
+    }
+
+    const persistReconciledTaskMessage = async (text) => {
+      lastTextResponse = text;
+      conversation.messages[aiMessageIndex].text = text;
+      conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
+      window.renderAiMessage(text, currentAgentLogs, conversation.id, conversation.messages[aiMessageIndex]);
+      if (typeof window.markConversationDirty === 'function') {
+        window.markConversationDirty(conversation.id);
+      }
+      if (typeof window.flushConversationsToStorage === 'function') {
+        await window.flushConversationsToStorage(conversation.id);
+      } else if (window.saveConversationsToStorage) {
+        window.saveConversationsToStorage();
+      }
+    };
+
+    // The task registry is canonical. A cancellation may win concurrently while Orion is flushing
+    // the final assistant message, so replace any stale success prose and persist the reconciled
+    // message before publishing lifecycle or phone notifications.
+    if (currentTaskDeniedByPlanDecision && finalizedTaskState !== 'cancelled') {
+      if (['active', 'pending', 'unknown'].includes(finalizedTaskState)) {
+        conversation.awaitingPlanApproval = true;
+        conversation.awaitingPlanApprovalTaskId = deniedPlanTaskId;
+        conversation.planApproved = false;
+      }
+      await persistReconciledTaskMessage(
+        `I understood the plan denial, but Orion could not verify cancellation of task ${deniedPlanTaskId}. `
+        + `Its recorded state is ${finalizedTaskState || 'unknown'}, so I will not claim that it was cancelled.`
+      );
+    } else if (finalizedTaskState === 'cancelled') {
+      const cancellationText = currentTaskDeniedByPlanDecision
+        ? 'Implementation plan denied. The associated task was cancelled and will not execute.'
+        : 'Task cancelled by user. Any work completed before cancellation remains in the workspace, but this task was not recorded as completed.';
+      await persistReconciledTaskMessage(cancellationText);
+    }
+
+    if (typeof window.onAgentRunFinalized === 'function') {
+      try {
+        await window.onAgentRunFinalized(conversation.id, finalizedTaskState, {
+          taskId: runTaskId,
+          pendingWork: !!hasPendingWork,
+          awaitingUser: !!(forceYield || conversation.awaitingPlanApproval || conversation.awaitingClarification)
+        });
+      } catch (error) {
+        console.error('Could not publish the finalized agent-run state:', error);
+      }
     }
     
     // Clear the active bubble tracking ONLY after the final render has updated it (removing the spinner)
@@ -3400,18 +3972,22 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // Notify phone companion whenever the agent stops — different messages by exit reason
     if (window.api && typeof window.api.notifyPhone === 'function') {
       let notifBody;
-      if (userRequestedStop) {
+      if (finalizedTaskState === 'cancelled') {
         notifBody = 'Agent stopped.';
-      } else if (autoContinueExecution) {
+      } else if (finalizedTaskState === 'failed' || criticalRunError) {
+        notifBody = 'Task failed. Open Orion for the recorded error.';
+      } else if (finalizedTaskState === 'pending' || autoContinueExecution) {
         // Mid-plan continuation queued — skip, phone will get notified when it truly finishes
         notifBody = null;
       } else if (ranOutOfLoopBudget) {
         notifBody = 'Hit action limit — ask Orion to continue.';
       } else if (forceYield) {
         notifBody = 'Paused — needs your input.';
-      } else {
+      } else if (finalizedTaskState === 'completed') {
         const shortResponse = String(lastTextResponse || '').replace(/\s+/g, ' ').slice(0, 120);
         notifBody = shortResponse || 'Task complete';
+      } else {
+        notifBody = 'Task ended without a verified completion state. Open Orion to inspect its recorded status.';
       }
       if (notifBody) {
         window.api.notifyPhone('Orion AI', notifBody).catch(() => {});
@@ -3423,81 +3999,371 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     if (window.renderProjectsList) window.renderProjectsList();
   }
 
-  if (activeRunTaskId === runTaskId) activeRunTaskId = null;
-  
   // If the run stopped mid-plan with real progress and pending work, queue an internal
-  // continuation so a multi-phase build keeps going instead of falsely ending. Real user
-  // queue items take priority, so only enqueue when nothing else is waiting.
-  if (autoContinueExecution && window.promptQueue && window.promptQueue.length === 0 && !conversation.awaitingPlanApproval) {
-    window.promptQueue.push({
-      prompt: '[ORION INTERNAL CONTINUATION - not a user message] The approved plan is still in progress. Continue executing the remaining checklist items and subplan steps now: write and edit the actual source files for the next pending tasks, then verify. Do not restate the plan or stop until the work is genuinely complete or you hit a real blocker. Do not quote this as something the user said.',
-      modelSelectValue: modelName,
-      conversationId: conversation.id,
-      taskId: activeRunTaskId || '',
-      alreadyRendered: true,
-      source: 'system'
-    });
+  // continuation so a multi-phase build keeps going instead of falsely ending. Existing user work
+  // keeps priority, but the originating task must retain its continuation behind that work rather
+  // than being silently stranded whenever the queue is non-empty.
+  if (autoContinueExecution && !conversation.awaitingPlanApproval) {
+    if (!Array.isArray(window.promptQueue)) window.promptQueue = [];
+    const continuationAlreadyQueued = window.promptQueue.some(item =>
+      item
+      && item.source === 'system'
+      && item.conversationId === conversation.id
+      && String(item.prompt || '').includes('[ORION INTERNAL CONTINUATION')
+      && (!runTaskId || String(item.taskId || '') === runTaskId));
+    if (!continuationAlreadyQueued) {
+      window.promptQueue.push({
+        prompt: '[ORION INTERNAL CONTINUATION - not a user message] The approved plan is still in progress. Continue executing the remaining checklist items and subplan steps now: write and edit the actual source files for the next pending tasks, then verify. Do not restate the plan or stop until the work is genuinely complete or you hit a real blocker. Do not quote this as something the user said.',
+        modelSelectValue: modelName,
+        conversationId: conversation.id,
+        taskId: runTaskId || '',
+        alreadyRendered: true,
+        source: 'system'
+      });
+    }
   }
 
-  // Check for queued prompts
-  setTimeout(async () => {
-    if (window.promptQueue && window.promptQueue.length > 0) {
-      const nextTask = window.promptQueue.shift();
-      // Look up current or targeted conversation reference
-      if (typeof conversations !== 'undefined') {
-        const targetId = nextTask.conversationId || (typeof activeConversationId !== 'undefined' ? activeConversationId : null);
-        if (!targetId) return;
-        const activeConv = conversations.find(c => c.id === targetId);
-        if (activeConv) {
-          const isInternalQueueItem = nextTask.source === 'followup' || nextTask.source === 'plan-approval' || nextTask.source === 'system';
-          // Quote only a preview of the prompt — the full text is already the next user bubble,
-          // and repeating a multi-paragraph prompt inside a system chip doubles the wall of text.
-          const queuedPromptPreview = String(nextTask.prompt || '').replace(/\s+/g, ' ').trim();
-          const queueLabel = nextTask.source === 'followup'
-            ? 'Executing scheduled follow-up.'
-            : (nextTask.source === 'plan-approval' ? 'Continuing approved plan.' : `Executing queued prompt: "${queuedPromptPreview.length > 140 ? queuedPromptPreview.slice(0, 140).trimEnd() + '…' : queuedPromptPreview}"`);
-          
-          if (window.appendSystemMessage) {
-            window.appendSystemMessage(queueLabel, { conversationId: targetId });
-          }
-          if (nextTask.id && window.markQueuedPromptRunning) {
-            window.markQueuedPromptRunning(nextTask.id, targetId);
-          }
-          
-          const isActive = window.getActiveConversationId && targetId === window.getActiveConversationId();
-          if (!isInternalQueueItem && !nextTask.alreadyRendered && isActive && window.renderUserMessageInChat) {
-            window.renderUserMessageInChat(nextTask.prompt);
-          }
-          if (!isInternalQueueItem && !nextTask.alreadyRendered && activeConv.messages) {
-            activeConv.messages.push({ role: 'user', source: nextTask.source || 'queue', text: nextTask.prompt, createdAt: Date.now() });
-            if (window.saveConversationsToStorage) window.saveConversationsToStorage();
-          }
-          await window.runAgentLoop(nextTask.prompt, nextTask.modelSelectValue, activeConv, {
-            source: nextTask.source || 'queue',
-            internalPrompt: isInternalQueueItem,
-            taskId: nextTask.taskId || ''
-          });
+  scheduleQueueDrain(500);
+  } catch (lifecycleError) {
+    console.error('Agent lifecycle failed outside the guarded model loop:', lifecycleError);
+
+    // Once the task registry has accepted a canonical end-of-pass state, presentation work is
+    // downstream of that commit. A renderer/list/save exception must not attempt a second
+    // transition to `failed` or publish a false failure for work that is already pending,
+    // completed, cancelled, or failed for its original reason.
+    let preservedCanonicalState = durableTaskStateCommitted ? finalizedTaskState : '';
+    if (!preservedCanonicalState && runTaskId && typeof window.getOrchestrationTaskStatus === 'function') {
+      try {
+        const canonical = await window.getOrchestrationTaskStatus(
+          runTaskId,
+          conversation && conversation.id
+        );
+        const observedStatus = String(
+          canonical && canonical.task && canonical.task.status
+            ? canonical.task.status
+            : (canonical && canonical.status) || ''
+        );
+        if (['pending', 'completed', 'cancelled', 'failed'].includes(observedStatus)) {
+          preservedCanonicalState = observedStatus;
+          finalizedTaskState = observedStatus;
+          durableTaskStateCommitted = true;
         }
+      } catch (statusReadError) {
+        console.error('Could not read canonical task state after lifecycle failure:', statusReadError);
       }
     }
-  }, 500);
+
+    if (preservedCanonicalState) {
+      const warning = `Task ${runTaskId} remains ${preservedCanonicalState}, but post-finalization presentation failed: ${lifecycleError.message || lifecycleError}`;
+      if (window.appendSystemMessage) {
+        try {
+          window.appendSystemMessage(warning, {
+            conversationId: conversation && conversation.id,
+            source: 'post-finalization-warning',
+            dedupeKey: `post-finalization-warning-${runTaskId}`
+          });
+        } catch (presentationError) {
+          console.error('Could not present post-finalization warning:', presentationError);
+        }
+      }
+      if (typeof window.onAgentRunFinalized === 'function') {
+        try {
+          await window.onAgentRunFinalized(conversation && conversation.id, preservedCanonicalState, {
+            taskId: runTaskId,
+            postFinalizationWarning: true
+          });
+        } catch (statusError) {
+          console.error('Could not publish preserved post-finalization task state:', statusError);
+        }
+      }
+      return {
+        success: preservedCanonicalState === 'completed' || preservedCanonicalState === 'pending',
+        reason: 'post_finalization_warning',
+        warning,
+        taskId: runTaskId,
+        status: preservedCanonicalState,
+        canonicalStatusPreserved: true
+      };
+    }
+
+    let lifecycleStatus = 'failed';
+    if (window.appendSystemMessage) {
+      window.appendSystemMessage(`Agent lifecycle failed: ${lifecycleError.message || lifecycleError}`, {
+        conversationId: conversation && conversation.id,
+        source: 'agent-lifecycle-error',
+        dedupeKey: `agent-lifecycle-error-${runTaskId || (conversation && conversation.id) || 'run'}`
+      });
+    }
+    if (window.persistAssistantStatusMessage && conversation && conversation.id) {
+      window.persistAssistantStatusMessage(
+        conversation.id,
+        `Orion could not complete this run: ${lifecycleError.message || lifecycleError}`,
+        {
+          source: 'agent-lifecycle-error',
+          dedupeKey: `agent-lifecycle-assistant-${runTaskId || conversation.id}`
+        }
+      );
+    }
+    if (runTaskId && typeof window.finalizeOrchestrationTask === 'function') {
+      try {
+        const failedTask = await window.finalizeOrchestrationTask(runTaskId, 'failed', {
+          reason: String(lifecycleError.message || lifecycleError),
+          conversationId: conversation && conversation.id,
+          expectedExecutionId: runTaskExecutionId
+        });
+        if (failedTask && failedTask.status) lifecycleStatus = failedTask.status;
+        if (failedTask && typeof window.onOrchestrationTaskFinalized === 'function') {
+          await window.onOrchestrationTaskFinalized(runTaskId, conversation && conversation.id, failedTask.status || 'failed');
+        }
+      } catch (finalizationError) {
+        console.error('Could not persist lifecycle failure for the orchestration task:', finalizationError);
+      }
+    }
+    if (window.onAgentStatusChange) {
+      window.onAgentStatusChange(false, {
+        status: 'finalizing',
+        conversationId: conversation && conversation.id,
+        taskId: runTaskId
+      });
+    }
+    if (typeof window.onAgentRunFinalized === 'function') {
+      try {
+        await window.onAgentRunFinalized(conversation && conversation.id, lifecycleStatus, {
+          taskId: runTaskId,
+          lifecycleError: true
+        });
+      } catch (statusError) {
+        console.error('Could not publish the lifecycle failure UI state:', statusError);
+      }
+    }
+    return {
+      success: false,
+      reason: 'lifecycle_error',
+      error: String(lifecycleError.message || lifecycleError),
+      taskId: runTaskId
+    };
+  } finally {
+    // Release each reservation independently. The task ID still needs clearing if a
+    // finalization await threw after the conversation reservation was altered.
+    if (activeRunTaskId === runTaskId) {
+      activeRunTaskId = null;
+    }
+    if (runningConversationId === (conversation && conversation.id)) {
+      activeRunController = null;
+      isAgentRunning = false;
+      runningConversationId = null;
+      agentExecutionMode = 'idle';
+      agentSubStatus = '';
+      stopRequestMode = 'none';
+    }
+    if (startingRunTaskId === runTaskId) {
+      isAgentStarting = false;
+      startingRunTaskId = null;
+      startupStopRequest = null;
+    }
+    if (!isAgentRunning && !isAgentStarting && Array.isArray(window.promptQueue) && window.promptQueue.length > 0) {
+      scheduleQueueDrain(100);
+    }
+  }
 };
 
-function scheduleSkippedQueueRecovery(delayMs = 0) {
-  setTimeout(async () => {
-    if (isAgentRunning || !Array.isArray(window.promptQueue) || window.promptQueue.length === 0) return;
-    const nextTask = window.promptQueue.shift();
-    const targetId = nextTask && (nextTask.conversationId || (window.getActiveConversationId && window.getActiveConversationId()));
-    if (!targetId || typeof conversations === 'undefined') return;
+function scheduleQueueDrain(delayMs = 0) {
+  if (queueDrainTimer !== null) return;
+  queueDrainTimer = setTimeout(async () => {
+    queueDrainTimer = null;
+    await drainNextQueuedTask();
+  }, Math.max(0, Number(delayMs) || 0));
+}
+
+function requeueExactPromptQueueItem(nextTask) {
+  if (!nextTask || !Array.isArray(window.promptQueue)) return false;
+  const alreadyQueued = window.promptQueue.some(item => item && (
+    (nextTask.taskId && item.taskId === nextTask.taskId)
+    || (!nextTask.taskId && nextTask.id && item.id === nextTask.id)
+    || item === nextTask
+  ));
+  if (!alreadyQueued) window.promptQueue.unshift(nextTask);
+  return !alreadyQueued;
+}
+
+function readTaskStatusValue(result) {
+  return String(
+    result && result.task && result.task.status
+      ? result.task.status
+      : (result && result.status) || ''
+  );
+}
+
+async function handleMissingQueuedTaskTarget(nextTask, targetId) {
+  const taskId = String(nextTask && nextTask.taskId || '');
+  if (!taskId) {
+    return {
+      success: false,
+      reason: 'queued_task_target_missing',
+      taskId: '',
+      status: 'untracked'
+    };
+  }
+
+  let canonicalStatus = '';
+  let failureError = null;
+  if (typeof window.finalizeOrchestrationTask === 'function') {
+    try {
+      canonicalStatus = readTaskStatusValue(await window.finalizeOrchestrationTask(taskId, 'failed', {
+        reason: 'The queued task target conversation no longer exists.',
+        reasonCode: 'queued_task_target_missing',
+        conversationId: targetId || nextTask.conversationId || ''
+      }));
+    } catch (error) {
+      failureError = error;
+    }
+  }
+  if (!['failed', 'completed', 'cancelled'].includes(canonicalStatus)
+      && typeof window.getOrchestrationTaskStatus === 'function') {
+    try {
+      canonicalStatus = readTaskStatusValue(await window.getOrchestrationTaskStatus(
+        taskId,
+        nextTask.originConversationId || nextTask.conversationId || ''
+      ));
+    } catch (error) {
+      failureError = failureError || error;
+    }
+  }
+
+  const terminal = ['failed', 'completed', 'cancelled'].includes(canonicalStatus);
+  if (!terminal) requeueExactPromptQueueItem(nextTask);
+
+  if (terminal && typeof window.onOrchestrationTaskFinalized === 'function') {
+    try {
+      await window.onOrchestrationTaskFinalized(taskId, targetId || '', canonicalStatus);
+    } catch (error) {
+      console.error('Could not publish missing-target task state:', error);
+    }
+  }
+  if (window.persistAssistantStatusMessage && nextTask.originConversationId) {
+    try {
+      const statusText = terminal
+        ? `Queued task ${taskId} could not start because its target conversation no longer exists. Its recorded state is ${canonicalStatus}.`
+        : `Queued task ${taskId} could not start because its target conversation no longer exists. It remains queued because Orion could not record a terminal state.${failureError ? ` ${failureError.message || failureError}` : ''}`;
+      window.persistAssistantStatusMessage(nextTask.originConversationId, statusText, {
+        source: 'queue-target-missing',
+        dedupeKey: `queue-target-missing-${taskId}`
+      });
+    } catch (error) {
+      console.error('Could not present missing-target queue status:', error);
+    }
+  }
+  return {
+    success: false,
+    reason: 'queued_task_target_missing',
+    taskId,
+    status: terminal ? canonicalStatus : (canonicalStatus || 'pending'),
+    requeued: !terminal,
+    error: failureError ? String(failureError.message || failureError) : ''
+  };
+}
+
+async function drainNextQueuedTask() {
+  if (queueDrainInFlight || isAgentRunning || isAgentStarting
+      || !Array.isArray(window.promptQueue) || window.promptQueue.length === 0) return;
+  queueDrainInFlight = true;
+  const nextTask = window.promptQueue.shift();
+  try {
+    const targetId = nextTask && (nextTask.conversationId
+      || (window.getActiveConversationId && window.getActiveConversationId()));
+    if (!targetId || typeof conversations === 'undefined') {
+      return await handleMissingQueuedTaskTarget(nextTask, targetId);
+    }
     const targetConversation = conversations.find(item => item.id === targetId);
-    if (!targetConversation) return;
+    if (!targetConversation) {
+      return await handleMissingQueuedTaskTarget(nextTask, targetId);
+    }
     const internal = ['followup', 'plan-approval', 'system'].includes(nextTask.source);
-    await window.runAgentLoop(nextTask.prompt, nextTask.modelSelectValue, targetConversation, {
+    const queueLabel = nextTask.source === 'followup'
+      ? 'Executing scheduled follow-up.'
+      : (nextTask.source === 'plan-approval' ? 'Continuing approved plan.' : 'Executing queued task.');
+    if (window.appendSystemMessage) {
+      window.appendSystemMessage(queueLabel, { conversationId: targetId });
+    }
+    if (nextTask.id && window.markQueuedPromptRunning) {
+      window.markQueuedPromptRunning(nextTask.id, targetId);
+    }
+    const isActive = window.getActiveConversationId && targetId === window.getActiveConversationId();
+    if (!internal && !nextTask.alreadyRendered && isActive && window.renderUserMessageInChat) {
+      window.renderUserMessageInChat(nextTask.prompt);
+    }
+    if (!internal && !nextTask.alreadyRendered && Array.isArray(targetConversation.messages)) {
+      targetConversation.messages.push({
+        role: 'user',
+        source: nextTask.source || 'queue',
+        text: nextTask.prompt,
+        createdAt: Date.now()
+      });
+      nextTask.alreadyRendered = true;
+      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    }
+    const result = await window.runAgentLoop(nextTask.prompt, nextTask.modelSelectValue, targetConversation, {
       source: nextTask.source || 'queue',
       internalPrompt: internal,
-      taskId: nextTask.taskId || ''
+      taskId: nextTask.taskId || '',
+      preserveUserPrompt: nextTask.preserveUserPrompt === true,
+      images: Array.isArray(nextTask.images) ? nextTask.images : [],
+      contextPacketIds: Array.isArray(nextTask.contextPacketIds) ? nextTask.contextPacketIds : []
     });
-  }, Math.max(0, Number(delayMs) || 0));
+    if (result && (result.reason === 'agent_busy' || result.reason === 'task_claim_error')) {
+      requeueExactPromptQueueItem(nextTask);
+      if (result.reason === 'task_claim_error'
+          && window.persistAssistantStatusMessage
+          && nextTask.conversationId) {
+        window.persistAssistantStatusMessage(
+          nextTask.conversationId,
+          `Queued task ${nextTask.taskId || nextTask.id || ''} could not be claimed yet: ${result.error || 'the task store rejected the claim'}. It remains pending.`,
+          {
+            source: 'queue-claim-error',
+            dedupeKey: `queue-claim-error-${nextTask.taskId || nextTask.id || nextTask.conversationId}`
+          }
+        );
+      }
+    }
+    return result;
+  } catch (error) {
+    console.error('Queued task launch failed before ownership was confirmed:', error);
+    let shouldRequeue = true;
+    if (nextTask && nextTask.taskId && typeof window.getOrchestrationTaskStatus === 'function') {
+      try {
+        const status = await window.getOrchestrationTaskStatus(
+          nextTask.taskId,
+          nextTask.originConversationId || nextTask.conversationId || ''
+        );
+        shouldRequeue = !status || status.success === false || status.status === 'pending';
+      } catch (_) {
+        // A transient read failure must not make a durable pending item disappear.
+        shouldRequeue = true;
+      }
+    }
+    if (shouldRequeue && nextTask) {
+      requeueExactPromptQueueItem(nextTask);
+    }
+    if (window.persistAssistantStatusMessage && nextTask && nextTask.conversationId) {
+      window.persistAssistantStatusMessage(
+        nextTask.conversationId,
+        `Queued work could not start yet: ${error.message || error}. It remains pending.`,
+        {
+          source: 'queue-start-error',
+          dedupeKey: `queue-start-error-${nextTask.taskId || nextTask.id || nextTask.conversationId}`
+        }
+      );
+    }
+  } finally {
+    queueDrainInFlight = false;
+    if (!isAgentRunning && !isAgentStarting && Array.isArray(window.promptQueue) && window.promptQueue.length > 0) {
+      scheduleQueueDrain(100);
+    }
+  }
+}
+
+function scheduleSkippedQueueRecovery(delayMs = 0) {
+  scheduleQueueDrain(delayMs);
 }
 
 const DEFAULT_LIST_FILES_MAX = 250;
@@ -3791,8 +4657,8 @@ async function executeTool(name, args, workspace, config, conversation) {
 
     case 'edit_config': {
       if (!args.path) throw new Error("Missing 'path' parameter");
-      if (!args.updates) throw new Error("Missing 'updates' parameter");
-      const result = await window.api.editConfig(workspace, args.path, args.updates);
+      const updates = normalizeEditConfigUpdates(args.updates);
+      const result = await window.api.editConfig(workspace, args.path, updates);
       if (!result.success) throw new Error(result.error || 'Failed to edit config');
       return { success: true, message: `Updated config at ${args.path}` };
     }
@@ -4075,6 +4941,17 @@ async function executeTool(name, args, workspace, config, conversation) {
     case 'handoff_to_coder': {
       const requestedPath = String(args.path || workspace || conversation.workspace || '').trim();
       if (!requestedPath) throw new Error("Missing workspace path to hand off to Coder");
+      const prompt = String(args.prompt || '').trim();
+      const originalUserMessage = String(
+        args.originalUserMessage
+        || [...(conversation.messages || [])].reverse().find(message => message && message.role === 'user')?.text
+        || prompt
+      ).trim();
+      const standaloneHandoff = args.standalone === true
+        && isStandaloneCoderOperationRequest(originalUserMessage);
+      if (args.standalone === true && !standaloneHandoff) {
+        throw new Error('Standalone Coder handoff is limited to an explicit local process/application operation. Resolve a project workspace for file, test, build, or dependency work.');
+      }
       const resolution = await resolveWorkspacePathForChange(requestedPath);
       if (!resolution.success) {
         throw new Error(`Coder handoff path "${resolution.path}" is invalid or does not exist: ${resolution.error}`);
@@ -4098,14 +4975,15 @@ async function executeTool(name, args, workspace, config, conversation) {
         });
       }
       const handoffPermission = WorkspaceResolution ? WorkspaceResolution.canHandoffWorkspace(handoffWorkspace) : { allowed: true };
-      if (!handoffPermission.allowed) {
+      if (!handoffPermission.allowed && !standaloneHandoff) {
         throw new Error(handoffPermission.reason || 'Resolve a concrete project workspace before handing work to Coder.');
       }
-      const prompt = String(args.prompt || '').trim();
       const contextPacketIds = getHandoffContextPacketIds(conversation, resolution.path);
       const result = await window.promoteWorkspaceToCoder({
         path: resolution.path,
         prompt,
+        originalUserMessage,
+        standalone: standaloneHandoff,
         title: args.title || '',
         open: args.open === true,
         sourceConversationId: conversation.id,
@@ -4124,10 +5002,25 @@ async function executeTool(name, args, workspace, config, conversation) {
       conversation.lastOwnedTaskId = result.taskId || conversation.lastOwnedTaskId || '';
       conversation.launchedCoderTaskTitle = result.title || 'Coder Task';
       conversation.launchedCoderTaskStart = Date.now();
-      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+      const committedHandoffWarnings = result.warning ? [String(result.warning)] : [];
+      try {
+        if (typeof window.markConversationDirty === 'function') {
+          window.markConversationDirty(conversation.id);
+        }
+        if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+      } catch (error) {
+        // promoteWorkspaceToCoder already returned a durable task ID. Treating a local
+        // conversation-save failure as a failed tool call would invite the model to hand off the
+        // same work again and create a duplicate.
+        committedHandoffWarnings.push(`The task was queued, but Dispatch could not save its supervisor pointer: ${error.message || error}`);
+      }
       // Kick off the supervisor monitor in the renderer
       if (typeof window.startCoderTaskMonitor === 'function') {
-        window.startCoderTaskMonitor(conversation.id, result.conversationId);
+        try {
+          window.startCoderTaskMonitor(conversation.id, result.conversationId, result.taskId || '');
+        } catch (error) {
+          committedHandoffWarnings.push(`The task was queued, but its live supervisor monitor did not start: ${error.message || error}`);
+        }
       }
       // ───────────────────────────────────────────────────────────────────────
 
@@ -4135,11 +5028,15 @@ async function executeTool(name, args, workspace, config, conversation) {
         ...result,
         success: true,
         message: prompt
-          ? `Promoted ${resolution.path} to Coder and queued task ${result.taskId || '(pending ID)'} with state ${result.status || 'pending'}.${result.contextTransferred ? ` Transferred ${result.contextPacketIds.length} validated context packet(s).` : ''}`
+          ? `${standaloneHandoff ? 'Opened a standalone Coder task from' : 'Promoted'} ${resolution.path} and queued task ${result.taskId || '(pending ID)'} with state ${result.status || 'pending'}.${result.contextTransferred ? ` Transferred ${result.contextPacketIds.length} validated context packet(s).` : ''}`
           : `Promoted ${resolution.path} to Coder as a project.`,
+        originalUserMessage,
+        standalone: standaloneHandoff,
         fuzzyResolved: !!resolution.fuzzyResolved,
         resolvedFrom: resolution.resolvedFrom,
-        matchedName: resolution.matchedName || getLocalPathBaseName(resolution.path)
+        matchedName: resolution.matchedName || getLocalPathBaseName(resolution.path),
+        committedWithWarning: committedHandoffWarnings.length > 0,
+        warning: committedHandoffWarnings.join(' ')
       };
     }
 
@@ -4738,7 +5635,8 @@ async function executeTool(name, args, workspace, config, conversation) {
       }
       conversation.awaitingClarification = {
         intro: args.intro || 'A few quick design questions before I proceed:',
-        questions: args.questions
+        questions: args.questions,
+        taskId: activeRunTaskId || ''
       };
       if (window.saveConversationsToStorage) window.saveConversationsToStorage();
       return { success: true, status: 'questions_presented', _forceYield: true };
@@ -7081,13 +7979,32 @@ function looksLikeUnexecutedDispatchAction(answerText) {
 
 function shouldForceDispatchHandoff(userPrompt, answerText, context = {}) {
   if (context.mode !== 'orion' || context.alreadyHandedOff) return false;
-  // Strong signal: the model itself declared it is handing the task to Coder yet emitted no tool
-  // call. Trust that declaration regardless of our own request classification.
-  if (looksLikeIntendedCoderHandoff(answerText)) return true;
-  // Weaker signals \u2014 permission refusals, manual returns, or a generic "let me do it now"
-  // announcement \u2014 only force a handoff when the request independently needed execution.
+  // A model-authored announcement is not authority to execute quoted or reported material. Every
+  // synthetic handoff must be independently licensed by the active-instruction classifier.
   return dispatchRequestRequiresCoderExecution(userPrompt)
-    && (isDispatchExecutionDeflection(answerText) || looksLikeUnexecutedDispatchAction(answerText));
+    && (isDispatchExecutionDeflection(answerText)
+      || looksLikeIntendedCoderHandoff(answerText)
+      || looksLikeUnexecutedDispatchAction(answerText));
+}
+
+function isStandaloneCoderOperationRequest(value) {
+  if (DispatchIntent && typeof DispatchIntent.isStandaloneSystemExecutionRequest === 'function') {
+    return DispatchIntent.isStandaloneSystemExecutionRequest(value);
+  }
+  // Backward-compatible fallback for builds that load an older dispatch-intent bundle.
+  const analysis = DispatchIntent && typeof DispatchIntent.analyzeDispatchInstruction === 'function'
+    ? DispatchIntent.analyzeDispatchInstruction(value)
+    : null;
+  if (!analysis || !analysis.requiresCoderExecution) return false;
+  const action = String(analysis.action || '').toLowerCase();
+  const activeText = String(analysis.activeText || '').toLowerCase();
+  const target = String(analysis.actionObject || '').toLowerCase();
+  if (!['kill', 'terminate', 'stop', 'restart', 'reboot', 'start', 'launch'].includes(action)) return false;
+  if (/\b(?:file|folder|project|workspace|repository|repo|source|code|test|tests|dependency|dependencies|package|build|compile|edit|modify|patch|install|uninstall|upgrade)\b/.test(activeText)) {
+    return false;
+  }
+  if (/\b(?:task|work|job|queue|queued|coder\s+task|delegated)\b/.test(target)) return false;
+  return /\b(?:claude(?:\s+code)?|codex|electron|node(?:\.js)?|python|process|service|daemon|desktop\s+(?:app|application)|local\s+(?:app|application|program))\b/.test(target);
 }
 
 function buildForcedDispatchHandoffPrompt(userPrompt) {
@@ -7330,7 +8247,12 @@ function buildToolEvidenceEntry(toolName, args = {}, result = {}) {
   const command = args && args.command ? String(args.command) : '';
   const conversationEvidence = result && Array.isArray(result.conversationEvidence) ? result.conversationEvidence : [];
   const structuredStatuses = OrchestrationContracts && result && typeof result === 'object'
-    ? OrchestrationContracts.extractStructuredStatusFacts(JSON.stringify(result))
+    ? OrchestrationContracts.extractStructuredStatusFacts(result, {
+        source: 'tool_result',
+        toolName,
+        args,
+        failed: !!failure
+      })
     : [];
   return {
     toolName,
@@ -7343,6 +8265,15 @@ function buildToolEvidenceEntry(toolName, args = {}, result = {}) {
     provenance: conversationEvidence.map(item => item && item.provenance).filter(Boolean),
     structuredStatuses
   };
+}
+
+function mergeRunStructuredStatusFacts(target, incoming) {
+  if (!Array.isArray(target) || !Array.isArray(incoming) || incoming.length === 0) return target;
+  const merged = OrchestrationContracts && typeof OrchestrationContracts.mergeStructuredStatusFacts === 'function'
+    ? OrchestrationContracts.mergeStructuredStatusFacts(target, incoming)
+    : [...target, ...incoming];
+  target.splice(0, target.length, ...merged);
+  return target;
 }
 
 function estimateTextTokens(text) {
@@ -8045,9 +8976,12 @@ function resolveConversationWorkspace(conversation) {
 
 function getKnownWorkspaceCandidates(conversation) {
   const candidates = [];
+  const searchRoot = getDispatchWorkspaceRoot();
   const add = (value, source) => {
     const projectPath = String(value || '').trim();
-    if (!projectPath || candidates.some(item => WorkspaceResolution && WorkspaceResolution.samePath(item.path, projectPath))) return;
+    if (!projectPath
+        || (WorkspaceResolution && WorkspaceResolution.samePath(projectPath, searchRoot))
+        || candidates.some(item => WorkspaceResolution && WorkspaceResolution.samePath(item.path, projectPath))) return;
     candidates.push({ path: projectPath, source });
   };
   try {
@@ -8077,14 +9011,24 @@ async function resolveDispatchWorkspaceForRun(conversation, userPrompt) {
     searchRoot,
     knownProjects
   });
-  const named = WorkspaceResolution.findNamedProject(userPrompt, knownProjects);
+  const contextDependent = !!(TaskOrchestration && TaskOrchestration.isContextDependentRequest(userPrompt));
+  const recentConversationContext = contextDependent
+    ? (Array.isArray(conversation && conversation.messages) ? conversation.messages : [])
+      .filter(message => message && /^(?:user|assistant|model|orion)$/i.test(String(message.role || '')))
+      .slice(-10)
+      .map(message => String(message.text || message.content || ''))
+      .filter(Boolean)
+      .join('\n')
+    : '';
+  const projectReferenceText = [recentConversationContext, userPrompt].filter(Boolean).join('\n');
+  const named = WorkspaceResolution.findNamedProject(projectReferenceText, knownProjects);
   if (named) {
     resolution = WorkspaceResolution.bindResolvedProject(resolution, named, named.source || 'registered_project');
   } else if (resolution.kind !== WorkspaceResolution.KINDS.ACTIVE_PROJECT) {
     // A bounded filesystem lookup covers named projects that have not yet been registered. The
     // search starts from entity-like names (for example an all-caps app name) and never treats the
     // generic Projects directory itself as the selected project.
-    const references = WorkspaceResolution.extractProjectReferences(userPrompt);
+    const references = WorkspaceResolution.extractProjectReferences(projectReferenceText);
     for (const reference of references) {
       const candidatePath = joinLocalPath(searchRoot, reference);
       const candidate = await resolveWorkspacePathForChange(candidatePath);
@@ -8743,12 +9687,14 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "handoff_to_coder",
-            description: "Promotes a local folder into Coder as an explicit project and optionally queues a Coder prompt to start implementation or execution. REQUIRED: when the user asks for an operation outside Dispatch's read-only permissions, call this tool; never refuse or tell the user to perform it manually merely because Dispatch cannot execute it. For an obvious implementation/execution request, route early without deeply inspecting source first. IMPORTANT — context transfer: exact-source context packets are generated ONLY by inspect_code_context calls. If your investigation used grep_search/read_file instead, no packets exist, so you MUST pass your key conclusions in `findings` — otherwise Coder starts blind and rediscovers everything. This is the explicit promotion path; change_workspace alone must not add folders to Coder.",
+            description: "Promotes a resolved local project into Coder and optionally queues implementation/execution. A named local process/application operation may instead use standalone=true from the generic Projects search root. File, test, build, install, and dependency work still requires an exact project workspace. REQUIRED: when the user asks for an operation outside Dispatch's read-only permissions, call this tool; never refuse or tell the user to perform it manually merely because Dispatch cannot execute it. For an obvious implementation/execution request, route early without deeply inspecting source first. IMPORTANT — context transfer: exact-source context packets are generated ONLY by inspect_code_context calls. If your investigation used grep_search/read_file instead, no packets exist, so you MUST pass your key conclusions in `findings` — otherwise Coder starts blind and rediscovers everything. This is the explicit promotion path; change_workspace alone must not add folders to Coder.",
             parameters: {
               type: "OBJECT",
               properties: {
                 path: { type: "STRING", description: "Optional absolute folder path to promote. Defaults to the current Dispatch workspace." },
                 prompt: { type: "STRING", description: "Optional exact task for Coder to start, such as what to build, fix, or investigate." },
+                originalUserMessage: { type: "STRING", description: "Exact latest user utterance retained separately when prompt is expanded. Orion injects this provenance; do not paraphrase it." },
+                standalone: { type: "BOOLEAN", description: "True only for a named local process/application operation that is not project-bound. Never use for file edits, tests, builds, installs, or dependency work." },
                 findings: {
                   type: "ARRAY",
                   items: { type: "STRING" },
@@ -9469,6 +10415,74 @@ function buildAgentToolDeclarations() {
     return allTools.filter(tool => DISPATCH_TOOL_ALLOWLIST.has(tool.name));
   }
   return allTools;
+}
+
+const GEMINI_SCHEMA_FIELDS = new Set([
+  'type', 'format', 'description', 'nullable', 'enum', 'items', 'properties', 'required',
+  'minimum', 'maximum', 'minItems', 'maxItems', 'minLength', 'maxLength', 'example'
+]);
+
+function sanitizeGeminiFunctionSchema(schema) {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return schema;
+
+  // Gemini rejects JSON Schema's `additionalProperties` keyword. Simply dropping it
+  // turns a free-form object into an object that cannot carry any values, so project
+  // maps to a JSON string at this provider boundary and decode them in the executor.
+  // The canonical declaration remains unchanged for providers that support maps.
+  const isArbitraryObject = String(schema.type || '').toUpperCase() === 'OBJECT' &&
+    Object.prototype.hasOwnProperty.call(schema, 'additionalProperties') &&
+    schema.additionalProperties !== false;
+  if (isArbitraryObject) {
+    const baseDescription = String(schema.description || '').trim();
+    return {
+      type: 'STRING',
+      description: [
+        baseDescription,
+        'Provide this object as a JSON-encoded string; it will be decoded before the tool runs.'
+      ].filter(Boolean).join(' ')
+    };
+  }
+
+  const output = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (!GEMINI_SCHEMA_FIELDS.has(key)) continue;
+    if (key === 'properties' && value && typeof value === 'object' && !Array.isArray(value)) {
+      output.properties = Object.fromEntries(Object.entries(value)
+        .map(([propertyName, propertySchema]) => [propertyName, sanitizeGeminiFunctionSchema(propertySchema)]));
+    } else if (key === 'items') {
+      output.items = sanitizeGeminiFunctionSchema(value);
+    } else {
+      output[key] = value;
+    }
+  }
+  return output;
+}
+
+function normalizeEditConfigUpdates(updates) {
+  let normalized = updates;
+  if (typeof normalized === 'string') {
+    const serialized = normalized.trim();
+    if (!serialized) {
+      throw new Error("Missing 'updates' parameter");
+    }
+    try {
+      normalized = JSON.parse(serialized);
+    } catch {
+      throw new Error("'updates' must be a valid JSON object string");
+    }
+  }
+  if (!normalized || typeof normalized !== 'object' || Array.isArray(normalized)) {
+    throw new Error("'updates' must be an object or a JSON-encoded object string");
+  }
+  return normalized;
+}
+
+function buildGeminiToolDeclarations() {
+  return buildAgentToolDeclarations().map(declaration => ({
+    name: declaration.name,
+    description: declaration.description,
+    parameters: sanitizeGeminiFunctionSchema(declaration.parameters || { type: 'OBJECT', properties: {} })
+  }));
 }
 
 
@@ -10332,7 +11346,7 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
     ],
     tools: [
       {
-        functionDeclarations: buildAgentToolDeclarations()
+        functionDeclarations: buildGeminiToolDeclarations()
       }
     ]
   };
@@ -10520,6 +11534,8 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     classifyPlanningNeed,
     tokenizeIntentText,
     buildLocalMemoryAnswer,
+    compactConversationForEvidenceSearch,
+    searchConversationEvidenceForRun,
     getPlanningToolGate,
     getReviewOnlyToolGate,
     buildRemainingWorkSummary,
@@ -10603,6 +11619,10 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     getNextGeminiModelForHighDemand,
     resolveUtilityModelName,
     trimAgedToolResultsFromMessages,
+    buildAgentToolDeclarations,
+    sanitizeGeminiFunctionSchema,
+    normalizeEditConfigUpdates,
+    buildGeminiToolDeclarations,
     convertGeminiToAnthropicTools,
     convertGeminiToAnthropicMessages,
     callAnthropicAPI,
@@ -10654,6 +11674,10 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
 function diagnoseModelApiFailure(errorText) {
   const text = String(errorText || '').toLowerCase();
   if (!text) return '';
+  if (text.includes('invalid json payload') && text.includes('function_declarations')
+      && (text.includes('additionalproperties') || text.includes('cannot find field'))) {
+    return 'Diagnosis: Gemini rejected an unsupported tool-schema field before model execution. Orion should use the provider-safe schema projection and must not retry the unchanged payload.';
+  }
   if (text.includes('monthly spending cap') || text.includes('project spend cap') || text.includes('ai.studio/spend')) {
     return 'Diagnosis: the Gemini project has hit a monthly spend cap. This is a hard billing limit, not a temporary model rate limit; retries or model escalation will not continue until the AI Studio spend cap or billing configuration is changed.';
   }
@@ -10672,5 +11696,7 @@ function diagnoseModelApiFailure(errorText) {
 if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
   module.exports.executeTool = executeTool; // So we can test it specifically
   module.exports.runAgentLoop = window.runAgentLoop;
+  module.exports.drainNextQueuedTask = drainNextQueuedTask;
   module.exports.evaluateLoopStateWithSupervisor = evaluateLoopStateWithSupervisor;
+  module.exports.getStartupCancellationRecoveryState = getStartupCancellationRecoveryState;
 }

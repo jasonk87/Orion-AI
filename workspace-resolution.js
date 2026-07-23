@@ -58,9 +58,14 @@
     const mode = input.mode === 'coder' ? 'coder' : 'orion';
     const searchRoot = cleanPath(input.searchRoot);
     const standaloneRoot = cleanPath(input.standaloneRoot);
-    const projectPath = cleanPath(input.projectPath || input.dispatchProjectPath);
-    const workspacePath = cleanPath(input.workspacePath || input.workspace || projectPath);
-    const knownProjects = normalizeProjectList(input.knownProjects);
+    const declaredProjectPath = cleanPath(input.projectPath || input.dispatchProjectPath);
+    // Older conversations sometimes persisted the generic Projects directory in projectPath or
+    // dispatchProjectPath. Treat that value as an obsolete search-root marker, never as proof that
+    // a real project was selected.
+    const projectPath = searchRoot && samePath(declaredProjectPath, searchRoot) ? '' : declaredProjectPath;
+    const workspacePath = cleanPath(input.workspacePath || input.workspace || projectPath || declaredProjectPath);
+    const knownProjects = normalizeProjectList(input.knownProjects)
+      .filter(project => !(searchRoot && samePath(project.path, searchRoot)));
     const known = knownProjects.find(project => samePath(project.path, projectPath || workspacePath));
 
     if (mode === 'coder' && workspacePath && standaloneRoot && isWithinPath(workspacePath, standaloneRoot) && !projectPath) {
@@ -156,30 +161,53 @@
     return candidates.slice(0, 8);
   }
 
+  function projectMentionIndex(text, projectName) {
+    const parts = String(projectName || '').match(/[a-z0-9]+/gi) || [];
+    if (!parts.length) return -1;
+    const escaped = parts.map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const pattern = new RegExp(`(?:^|[^a-z0-9])${escaped.join('(?:[^a-z0-9]+|\\s*)')}(?=$|[^a-z0-9])`, 'gi');
+    let index = -1;
+    let match;
+    while ((match = pattern.exec(String(text || ''))) !== null) {
+      index = match.index;
+      if (pattern.lastIndex === match.index) pattern.lastIndex += 1;
+    }
+    return index;
+  }
+
   function findNamedProject(text, projectSources = []) {
     const projects = normalizeProjectList(projectSources);
     if (!projects.length) return null;
-    const normalizedText = normalizeName(text);
     const references = extractProjectReferences(text);
     let best = null;
     for (const project of projects) {
       const nameKey = normalizeName(project.name || baseName(project.path));
       if (!nameKey) continue;
       let score = 0;
+      const mentionIndex = projectMentionIndex(text, project.name || baseName(project.path));
       if (references.some(reference => normalizeName(reference) === nameKey)) score = 100;
-      else if (normalizedText.includes(nameKey)) score = 80;
+      else if (mentionIndex >= 0) score = 80;
       else if (references.some(reference => {
         const refKey = normalizeName(reference);
         return refKey.length >= 4 && (nameKey.includes(refKey) || refKey.includes(nameKey));
       })) score = 60;
-      if (!best || score > best.score) best = { ...project, score };
+      if (!best || score > best.score
+          || (score === best.score && nameKey.length > best.nameKey.length)
+          || (score === best.score && nameKey.length === best.nameKey.length && mentionIndex > best.mentionIndex)) {
+        best = { ...project, score, nameKey, mentionIndex };
+      }
     }
-    return best && best.score > 0 ? best : null;
+    if (!best || best.score <= 0) return null;
+    const { nameKey, mentionIndex, ...project } = best;
+    return project;
   }
 
   function bindResolvedProject(resolution, project, source = '') {
     if (!project || !cleanPath(project.path || project.projectPath)) return resolution;
     const projectPath = cleanPath(project.path || project.projectPath);
+    if (resolution && resolution.kind === KINDS.PROJECT_SEARCH_ROOT && samePath(resolution.path, projectPath)) {
+      return resolution;
+    }
     return {
       kind: KINDS.ACTIVE_PROJECT,
       path: projectPath,
