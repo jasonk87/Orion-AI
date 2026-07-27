@@ -13,7 +13,9 @@ const {
   canRequesterControlTask,
   cancelPendingOwnedTasks,
   renderTaskPrompt,
-  describeTaskStatus
+  describeTaskStatus,
+  selectSupervisedTask,
+  describeSupervisedTaskPresentation
 } = require('../task-orchestration');
 const { OrchestrationTaskStore } = require('../lib/orchestration-task-store');
 const { registerHandlers } = require('../lib/ipc-orchestration');
@@ -351,6 +353,38 @@ test('task transitions and status descriptions preserve factual state', t => {
   t.ok(/^Cancelled/.test(describeTaskStatus(cancelled)), 'cancelled is not described as completed');
   t.throws(() => transitionTask(cancelled, TASK_STATES.COMPLETED), /Invalid task transition/, 'cancelled work cannot later complete');
   t.throws(() => transitionTask(pending, 'mystery'), /Unknown task state/, 'unknown states cannot silently become pending');
+  t.end();
+});
+
+test('Dispatch task presentation follows one durable task from queued through planning and review', t => {
+  const pending = normalizeTaskRecord(baseTask({
+    taskId: 'task_dispatch_phone_lifecycle',
+    origin: { conversationId: 'dispatch-1', sessionId: 'dispatch-1', messageId: 'message-1' },
+    target: { conversationId: 'coder-1', sessionId: 'coder-1', mode: 'coder' }
+  }));
+  const selectedPending = selectSupervisedTask([pending], 'dispatch-1', pending.taskId);
+  const queued = describeSupervisedTaskPresentation(selectedPending);
+  t.equal(selectedPending.taskId, pending.taskId, 'Dispatch selects the durable task by task ID');
+  t.equal(queued.label, 'Coder queued', 'pending is presented as Coder queued');
+
+  const active = transitionTask(pending, TASK_STATES.ACTIVE, { timestamp: 1100 });
+  const selectedActive = selectSupervisedTask([active], 'dispatch-1', active.taskId);
+  const planning = describeSupervisedTaskPresentation(selectedActive);
+  t.equal(selectedActive.taskId, pending.taskId, 'claiming work preserves the task identity');
+  t.equal(planning.label, 'Coder planning', 'active pre-approval work is presented as Coder planning');
+
+  const yieldedForReview = transitionTask(active, TASK_STATES.PENDING, {
+    timestamp: 1200,
+    expectedExecutionId: active.execution.executionId,
+    reason: 'Waiting for plan approval.'
+  });
+  const selectedReview = selectSupervisedTask([yieldedForReview], 'dispatch-1', yieldedForReview.taskId);
+  const review = describeSupervisedTaskPresentation(selectedReview, { awaitingReview: true });
+  t.equal(selectedReview.taskId, pending.taskId, 'review remains attached to the original task');
+  t.equal(review.label, 'Review', 'the same task transitions to Review when the plan arrives');
+
+  const implementing = describeSupervisedTaskPresentation(active, { planApproved: true });
+  t.equal(implementing.label, 'Coder implementing', 'approved active work is presented as Coder implementing');
   t.end();
 });
 

@@ -1000,24 +1000,86 @@ function updateOrionGreeting() {
   nameEl.textContent = `${tod}, Jason.`;
 }
 
+function supervisedTaskContext(task, isGlobalRunning = false, globalRunningId = '') {
+  const taskId = String(task && task.taskId || '');
+  const originConversationId = String(task && task.origin && task.origin.conversationId || '');
+  const targetConversationId = String(task && task.target && task.target.conversationId || '');
+  const originConversation = conversations.find(conversation => conversation.id === originConversationId);
+  const targetConversation = conversations.find(conversation => conversation.id === targetConversationId);
+  const activeRunTaskId = window.getActiveRunTaskId ? String(window.getActiveRunTaskId() || '') : '';
+  const live = !!(
+    isGlobalRunning
+    && globalRunningId === targetConversationId
+    && (!activeRunTaskId || activeRunTaskId === taskId)
+  );
+  const awaitingReview = !!(
+    (originConversation
+      && originConversation.awaitingDelegatedPlan
+      && String(originConversation.awaitingDelegatedPlan.taskId || '') === taskId)
+    || (targetConversation
+      && targetConversation.awaitingPlanApproval
+      && !targetConversation.planApproved
+      && (!targetConversation.awaitingPlanApprovalTaskId
+        || String(targetConversation.awaitingPlanApprovalTaskId) === taskId))
+  );
+  return {
+    originConversation,
+    targetConversation,
+    originConversationId,
+    targetConversationId,
+    awaitingReview,
+    planApproved: !!(targetConversation && targetConversation.planApproved),
+    executionMode: live && window.getAgentExecutionMode ? window.getAgentExecutionMode() : '',
+    subStatus: live && window.getAgentSubStatus ? window.getAgentSubStatus() : '',
+    live
+  };
+}
+
+function getSupervisedTaskForConversation(conversationId, activeTaskId = '') {
+  if (!RendererTaskOrchestration || typeof RendererTaskOrchestration.selectSupervisedTask !== 'function') return null;
+  return RendererTaskOrchestration.selectSupervisedTask(
+    [...orchestrationTaskCache.values()],
+    conversationId,
+    activeTaskId
+  );
+}
+
+function getSupervisedTaskPresentation(task, isGlobalRunning = false, globalRunningId = '') {
+  if (!task || !RendererTaskOrchestration
+      || typeof RendererTaskOrchestration.describeSupervisedTaskPresentation !== 'function') return null;
+  const context = supervisedTaskContext(task, isGlobalRunning, globalRunningId);
+  return {
+    ...RendererTaskOrchestration.describeSupervisedTaskPresentation(task, context),
+    ...context
+  };
+}
+
 function collectDispatchActiveWork(isGlobalRunning = false, globalRunningId = '') {
   const activeWork = [];
   conversations.filter(conversation => conversationMode(conversation) === 'orion').forEach(dispatchConversation => {
-    const coderId = dispatchConversation.launchedCoderConvId;
+    const preferredTaskId = dispatchConversation.launchedCoderTaskId || dispatchConversation.lastOwnedTaskId || '';
+    const durableTask = getSupervisedTaskForConversation(dispatchConversation.id, preferredTaskId);
+    const coderId = String(
+      (durableTask && durableTask.target && durableTask.target.conversationId)
+      || dispatchConversation.launchedCoderConvId
+      || ''
+    );
     const coderConversation = coderId ? conversations.find(conversation => conversation.id === coderId) : null;
-    if (coderConversation) {
-      const taskId = dispatchConversation.launchedCoderTaskId || dispatchConversation.lastOwnedTaskId || '';
-      const durableTask = taskId ? orchestrationTaskCache.get(taskId) : null;
-      const running = isGlobalRunning && globalRunningId === coderConversation.id;
+    if (durableTask || coderConversation) {
+      const taskId = String((durableTask && durableTask.taskId) || preferredTaskId);
+      const running = isGlobalRunning && !!coderId && globalRunningId === coderId;
       const queued = Array.isArray(window.promptQueue)
-        && window.promptQueue.some(item => item && (item.taskId === taskId || item.conversationId === coderConversation.id));
-      const waitingForInput = !!coderConversation.awaitingClarification;
-      const waitingForReview = !!(coderConversation.awaitingPlanApproval && !coderConversation.planApproved);
+        && window.promptQueue.some(item => item && (item.taskId === taskId || item.conversationId === coderId));
+      const waitingForInput = !!(coderConversation && coderConversation.awaitingClarification);
+      const waitingForReview = !!(coderConversation && coderConversation.awaitingPlanApproval && !coderConversation.planApproved);
       const status = durableTask
         ? durableTask.status
         : (running ? 'active' : ((queued || waitingForInput || waitingForReview) ? 'pending' : 'failed'));
-      const subStatus = durableTask && RendererTaskOrchestration
-        ? RendererTaskOrchestration.describeTaskStatus(durableTask)
+      const presentation = durableTask
+        ? getSupervisedTaskPresentation(durableTask, isGlobalRunning, globalRunningId)
+        : null;
+      const subStatus = presentation
+        ? presentation.label
         : (running && window.getAgentSubStatus
           ? window.getAgentSubStatus()
           : (queued
@@ -1025,17 +1087,19 @@ function collectDispatchActiveWork(isGlobalRunning = false, globalRunningId = ''
             : (waitingForInput
               ? 'Waiting for your input'
               : (waitingForReview ? 'Plan ready for review' : 'Needs attention'))));
-      const projectPath = (durableTask && durableTask.workspacePath) || coderConversation.projectPath || inferDispatchProjectPath(dispatchConversation);
+      const projectPath = (durableTask && durableTask.workspacePath)
+        || (coderConversation && coderConversation.projectPath)
+        || inferDispatchProjectPath(dispatchConversation);
       activeWork.push({
-        id: coderConversation.id,
+        id: coderId,
         taskId,
         supervisingConversationId: dispatchConversation.id,
-        title: (durableTask && durableTask.title) || dispatchConversation.launchedCoderTaskTitle || coderConversation.title || 'Coder task',
+        title: (durableTask && durableTask.title) || dispatchConversation.launchedCoderTaskTitle || (coderConversation && coderConversation.title) || 'Coder task',
         projectPath,
         projectName: (projectPath || 'Standalone').replace(/[\\\/]+$/, '').split(/[\\\/]/).pop(),
         status,
         subStatus,
-        startedAt: (durableTask && durableTask.startedAt) || dispatchConversation.launchedCoderTaskStart || coderConversation.createdAt || 0,
+        startedAt: (durableTask && durableTask.startedAt) || dispatchConversation.launchedCoderTaskStart || (coderConversation && coderConversation.createdAt) || 0,
         completedAt: (durableTask && (durableTask.completedAt || durableTask.cancelledAt || durableTask.failedAt)) || 0,
         canContinue: status === 'failed'
       });
@@ -1080,6 +1144,9 @@ function renderDesktopDispatchLanding() {
       </button>
       ${work.canContinue ? `<button class="dispatch-desktop-work-continue" type="button" data-dispatch-continue-work="${escapeHtml(work.id)}" data-dispatch-supervising="${escapeHtml(work.supervisingConversationId)}" title="Queue Coder to finish the remaining work">Continue</button>` : ''}
     </div>`).join('')}</div>` : '';
+  if (!syncDispatchCoderStatusCard(activeConversationId, globallyRunning, runningConversationId)) {
+    hideCoderStatusCard();
+  }
 }
 
 // One-click continuation of unfinished delegated work (a completion receipt with pending tasks,
@@ -6193,7 +6260,10 @@ window.onAgentStatusChange = (running, details = {}) => {
     } else {
       renderAgentPresence('idle', 'Ready', '');
     }
-    if (details.status !== 'finalizing') hideCoderStatusCard();
+    if (details.status !== 'finalizing'
+        && !syncDispatchCoderStatusCard(activeConversationId, false, '')) {
+      hideCoderStatusCard();
+    }
   }
 };
 
@@ -6251,6 +6321,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   const resolvedId = conv ? conv.id : '';
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
   const globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+  const globalActiveTaskId = window.getActiveRunTaskId ? String(window.getActiveRunTaskId() || '') : '';
   const isActiveTargetRunning = isGlobalRunning && globalRunningId === resolvedId;
   const queuedForResolvedConversation = Array.isArray(window.promptQueue)
     && window.promptQueue.some(q => q && q.conversationId === resolvedId);
@@ -6361,16 +6432,43 @@ window.getPhoneCompanionState = async (targetConversationId) => {
       || (task.target && task.target.conversationId === resolvedId)))
     .sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0))
     .slice(0, 12)
-    .map(task => ({
-      taskId: task.taskId,
-      title: task.title,
-      objective: task.objective,
-      status: task.status,
-      workspacePath: task.workspacePath || '',
-      originConversationId: task.origin && task.origin.conversationId,
-      targetConversationId: task.target && task.target.conversationId,
-      updatedAt: task.updatedAt || task.createdAt || 0
-    }));
+    .map(task => {
+      const presentation = getSupervisedTaskPresentation(task, isGlobalRunning, globalRunningId);
+      return {
+        taskId: task.taskId,
+        title: task.title,
+        objective: task.objective,
+        status: task.status,
+        workspacePath: task.workspacePath || '',
+        originConversationId: task.origin && task.origin.conversationId,
+        targetConversationId: task.target && task.target.conversationId,
+        updatedAt: task.updatedAt || task.createdAt || 0,
+        awaitingReview: !!(presentation && presentation.awaitingReview),
+        planApproved: !!(presentation && presentation.planApproved),
+        executionMode: presentation && presentation.executionMode || '',
+        subStatus: presentation && presentation.subStatus || '',
+        presentation: presentation ? {
+          taskId: presentation.taskId,
+          status: presentation.status,
+          phase: presentation.phase,
+          label: presentation.label,
+          detail: presentation.detail,
+          agentState: presentation.agentState,
+          badgeClass: presentation.badgeClass,
+          isOngoing: presentation.isOngoing
+        } : null
+      };
+    });
+  const selectedSupervisedTask = RendererTaskOrchestration
+    && typeof RendererTaskOrchestration.selectSupervisedTask === 'function'
+    ? RendererTaskOrchestration.selectSupervisedTask(
+        orchestrationTasks,
+        resolvedId,
+        globalActiveTaskId
+      )
+    : orchestrationTasks.find(task => task.status === 'active')
+      || orchestrationTasks.find(task => task.status === 'pending')
+      || null;
   const operationalResult = companionWorkspace && window.readOperationalContext
     ? await window.readOperationalContext(companionWorkspace)
     : null;
@@ -6419,9 +6517,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     awaitingClarification: (conv && conv.awaitingClarification) ? conv.awaitingClarification : null,
     tasks: conv && Array.isArray(conv.tasks) ? conv.tasks : [],
     orchestrationTasks,
-    activeTaskId: orchestrationTasks.find(task => task.status === 'active')?.taskId
-      || orchestrationTasks.find(task => task.status === 'pending')?.taskId
-      || '',
+    activeTaskId: selectedSupervisedTask ? selectedSupervisedTask.taskId : '',
     model: window.getSelectedModel(),
     messages,
     latestOutput: latestOutput ? latestOutput.text : '',
@@ -7909,13 +8005,10 @@ window.startCoderTaskMonitor = function(orionConvId, coderConvId, taskId = '') {
       monitorMeta.quietSince = 0;
     }
 
-    // Update the status card if active Orion conv is watching
-    if (isCoderRunning && activeConversationId === orionConvId) {
-      const subStatus = window.getAgentSubStatus ? window.getAgentSubStatus() : '';
-      const lastAssistant = [...(coderConv.messages || [])].reverse().find(m =>
-        (m.role === 'assistant' || m.role === 'model') && String(m.text || '').trim() && String(m.text || '').trim() !== 'Thinking...');
-      const preview = lastAssistant ? String(lastAssistant.text).replace(/\s+/g, ' ').trim().slice(0, 110) : '';
-      showCoderStatusCard(coderConv.title || 'Coder Task', subStatus, elapsed, preview);
+    // The durable task drives presentation across the queued gap and Coder execution. Live
+    // conversation activity only enriches the detail; it is not proof that the task exists.
+    if (activeConversationId === orionConvId) {
+      syncDispatchCoderStatusCard(orionConvId, isCoderRunning, isCoderRunning ? coderConvId : '');
     }
 
     // Detect: Coder needs clarification → proxy it into Orion
@@ -7939,6 +8032,8 @@ window.startCoderTaskMonitor = function(orionConvId, coderConvId, taskId = '') {
           `Coder is waiting for plan approval, but Dispatch could not load the saved plan: ${relayed.error}`,
           'supervisor-plan-error'
         );
+      } else if (activeConversationId === orionConvId) {
+        syncDispatchCoderStatusCard(orionConvId, false, '');
       }
     }
     if (!nowAwaitingPlan) monitorMeta.lastAwaitingPlanApproval = false;
@@ -8221,13 +8316,15 @@ function renderCoderClarificationProxy(orionConv, clarData, coderConvId) {
 
 
 // ── Status card ───────────────────────────────────────────────────────────────
-function showCoderStatusCard(taskTitle, subStatus, elapsedSec, preview = '') {
+function showCoderStatusCard(taskTitle, subStatus, elapsedSec, preview = '', statusLabel = 'Coder working on') {
   const card = document.getElementById('coder-task-status-card');
   if (!card) return;
+  const labelEl = card.querySelector('.coder-status-label');
   const titleEl = card.querySelector('.coder-status-task-name');
   const subEl = card.querySelector('.coder-status-substatus');
   const elapsedEl = card.querySelector('.coder-status-elapsed');
   const previewEl = card.querySelector('.coder-status-preview');
+  if (labelEl) labelEl.textContent = statusLabel || 'Coder working on';
   if (titleEl) titleEl.textContent = taskTitle || 'Coder Task';
   if (subEl) subEl.textContent = subStatus || 'Working…';
   if (elapsedEl) {
@@ -8241,6 +8338,46 @@ function showCoderStatusCard(taskTitle, subStatus, elapsedSec, preview = '') {
     previewEl.style.display = preview ? '' : 'none';
   }
   card.classList.add('visible');
+}
+
+function syncDispatchCoderStatusCard(
+  conversationId = activeConversationId,
+  isGlobalRunning = !!(window.isAgentRunning && window.isAgentRunning()),
+  globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : ''
+) {
+  const dispatchConversation = conversations.find(conversation =>
+    conversation.id === conversationId && conversationMode(conversation) === 'orion');
+  if (!dispatchConversation) return false;
+  const preferredTaskId = dispatchConversation.launchedCoderTaskId
+    || dispatchConversation.lastOwnedTaskId
+    || '';
+  const task = getSupervisedTaskForConversation(dispatchConversation.id, preferredTaskId);
+  const presentation = getSupervisedTaskPresentation(task, isGlobalRunning, globalRunningId);
+  if (!task || !presentation || !presentation.isOngoing) return false;
+  const targetConversation = presentation.targetConversation;
+  const lastAssistant = targetConversation && [...(targetConversation.messages || [])].reverse().find(message =>
+    (message.role === 'assistant' || message.role === 'model')
+    && String(message.text || '').trim()
+    && String(message.text || '').trim() !== 'Thinking...');
+  const preview = lastAssistant
+    ? String(lastAssistant.text).replace(/\s+/g, ' ').trim().slice(0, 110)
+    : '';
+  const startedAt = Number(task.startedAt || task.createdAt || Date.now());
+  const elapsed = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+  showCoderStatusCard(
+    task.title || (targetConversation && targetConversation.title) || 'Coder task',
+    presentation.detail,
+    elapsed,
+    preview,
+    presentation.label
+  );
+  const card = document.getElementById('coder-task-status-card');
+  if (card) {
+    card.dataset.taskId = String(task.taskId || '');
+    card.dataset.taskStatus = presentation.status;
+    card.dataset.taskPhase = presentation.phase;
+  }
+  return true;
 }
 
 function hideCoderStatusCard() {

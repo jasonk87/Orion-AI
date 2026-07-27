@@ -874,6 +874,129 @@
     return failure ? `Failed — ${failure}` : 'Failed.';
   }
 
+  function taskConversationId(task, role) {
+    if (!task || typeof task !== 'object') return '';
+    const nested = task[role] && typeof task[role] === 'object'
+      ? task[role].conversationId : '';
+    return compactInline(nested || task[`${role}ConversationId`] || '');
+  }
+
+  function selectSupervisedTask(tasksValue, viewingConversationIdValue, activeTaskIdValue = '') {
+    const viewingConversationId = compactInline(viewingConversationIdValue);
+    const activeTaskId = compactInline(activeTaskIdValue);
+    const tasks = (Array.isArray(tasksValue) ? tasksValue : [])
+      .filter(task => task && typeof task === 'object')
+      .filter(task => {
+        if (!viewingConversationId) return false;
+        const originConversationId = taskConversationId(task, 'origin');
+        const targetConversationId = taskConversationId(task, 'target');
+        return targetConversationId === viewingConversationId
+          || (originConversationId === viewingConversationId
+            && !!targetConversationId
+            && targetConversationId !== viewingConversationId);
+      });
+    const byNewest = (a, b) => Number(b.updatedAt || b.createdAt || 0)
+      - Number(a.updatedAt || a.createdAt || 0)
+      || compactInline(a.taskId).localeCompare(compactInline(b.taskId));
+    const exactActive = activeTaskId
+      ? tasks.find(task => compactInline(task.taskId) === activeTaskId)
+      : null;
+    if (exactActive) return exactActive;
+    return tasks.filter(task => task.status === TASK_STATES.ACTIVE).sort(byNewest)[0]
+      || tasks.filter(task => task.status === TASK_STATES.PENDING).sort(byNewest)[0]
+      || tasks.sort(byNewest)[0]
+      || null;
+  }
+
+  function describeSupervisedTaskPresentation(taskValue, context = {}) {
+    if (!taskValue || typeof taskValue !== 'object') {
+      return {
+        taskId: '',
+        status: '',
+        phase: 'idle',
+        label: 'Idle',
+        detail: '',
+        agentState: 'Ready',
+        badgeClass: 'muted',
+        isOngoing: false
+      };
+    }
+    let status;
+    try {
+      status = normalizeTransitionStatus(taskValue.status);
+    } catch (_) {
+      status = TASK_STATES.FAILED;
+    }
+    const awaitingReview = context.awaitingReview === true || taskValue.awaitingReview === true;
+    const planApproved = context.planApproved === true || taskValue.planApproved === true;
+    const executionMode = compactInline(context.executionMode || taskValue.executionMode).toLowerCase();
+    const subStatus = compactWhitespace(context.subStatus || taskValue.subStatus || '');
+    const verifying = status === TASK_STATES.ACTIVE
+      && (/verif|test/.test(executionMode) || /run_tests|test|verif/i.test(subStatus));
+
+    let phase = status;
+    let label;
+    let detail = subStatus;
+    let agentState;
+    let badgeClass;
+    if (awaitingReview && (status === TASK_STATES.PENDING || status === TASK_STATES.ACTIVE)) {
+      phase = 'review';
+      label = 'Review';
+      detail = detail || 'Coder’s implementation plan is ready for approval.';
+      agentState = 'Review';
+      badgeClass = 'warning';
+    } else if (status === TASK_STATES.PENDING) {
+      phase = 'queued';
+      label = 'Coder queued';
+      detail = detail || 'Waiting for Coder to claim this task.';
+      agentState = 'Coder queued';
+      badgeClass = 'warning';
+    } else if (status === TASK_STATES.ACTIVE && verifying) {
+      phase = 'verifying';
+      label = 'Coder verifying';
+      detail = detail || 'Coder is verifying the implementation.';
+      agentState = 'Coder verifying';
+      badgeClass = 'success';
+    } else if (status === TASK_STATES.ACTIVE && planApproved) {
+      phase = 'implementing';
+      label = 'Coder implementing';
+      detail = detail || 'Coder is implementing the approved plan.';
+      agentState = 'Coder implementing';
+      badgeClass = 'success';
+    } else if (status === TASK_STATES.ACTIVE) {
+      phase = 'planning';
+      label = 'Coder planning';
+      detail = detail || 'Coder is inspecting the workspace and preparing the plan.';
+      agentState = 'Coder planning';
+      badgeClass = 'success';
+    } else if (status === TASK_STATES.COMPLETED) {
+      label = 'Completed';
+      detail = detail || 'Coder recorded this task as completed.';
+      agentState = 'Complete';
+      badgeClass = 'success';
+    } else if (status === TASK_STATES.CANCELLED) {
+      label = 'Cancelled';
+      detail = detail || 'This Coder task was cancelled.';
+      agentState = 'Cancelled';
+      badgeClass = 'muted';
+    } else {
+      label = 'Failed';
+      detail = detail || 'Coder recorded this task as failed.';
+      agentState = 'Failed';
+      badgeClass = 'danger';
+    }
+    return {
+      taskId: compactInline(taskValue.taskId),
+      status,
+      phase,
+      label,
+      detail,
+      agentState,
+      badgeClass,
+      isOngoing: status === TASK_STATES.PENDING || status === TASK_STATES.ACTIVE
+    };
+  }
+
   async function cancelPendingOwnedTasks(input = {}, dependencies = {}) {
     const conversationId = compactInline(input.conversationId || input.ownerConversationId || '');
     if (!conversationId) return { success: true, cancelled: [], failures: [], count: 0 };
@@ -933,6 +1056,8 @@
     canRequesterControlTask,
     cancelPendingOwnedTasks,
     renderTaskPrompt,
-    describeTaskStatus
+    describeTaskStatus,
+    selectSupervisedTask,
+    describeSupervisedTaskPresentation
   };
 });

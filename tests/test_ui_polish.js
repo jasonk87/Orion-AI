@@ -47,8 +47,8 @@ test('phone companion finishes with the same dark theme and complete mission hie
   t.ok(companionHtml.includes('#task-list-card { grid-area: mission; }'), 'Task List has an explicit mobile layout area');
   t.ok(companionHtml.includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
   t.ok(companionHtml.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
-  t.ok(companionHtml.includes('dispatch-focus-v21'), 'phone shell exposes the current UI build version');
-  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v21"), 'phone service worker cache is bumped for the current UI build');
+  t.ok(companionHtml.includes('dispatch-focus-v22'), 'phone shell exposes the current UI build version');
+  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v22"), 'phone service worker cache is bumped for the current UI build');
   t.ok(companionHtml.includes('window.isSecureContext'), 'phone explains when browser push is blocked by an insecure context');
   t.ok(companionHtml.includes('Phone push needs HTTPS or localhost'), 'phone tells the user that HTTPS is required for push notifications');
   t.ok(companionHtml.includes("companionFetch('/api/push-subscribe'"), 'phone stores push subscriptions through the authenticated fetch path');
@@ -570,6 +570,29 @@ test('durable task finalization drives the supervisor completion receipt', (t) =
     'the hook routes through the canonical-state supervisor notifier with the exact task ID');
   t.ok(renderer.includes('const result = await stopExpectedTaskForConversation(resolvedId)'),
     'phone Stop reuses the same ownership-aware cancellation path as desktop Stop');
+  t.end();
+});
+
+test('Dispatch Coder progress presentation survives queued and conversation-running gaps', t => {
+  t.ok(renderer.includes('function getSupervisedTaskForConversation'), 'desktop resolves supervised work from the durable task cache');
+  t.ok(renderer.includes('selectSupervisedTask('), 'desktop and phone share canonical task selection');
+  t.ok(renderer.includes('function syncDispatchCoderStatusCard'), 'desktop can rebuild the status card from durable state');
+  t.ok(
+    renderer.includes("!syncDispatchCoderStatusCard(activeConversationId, false, '')"),
+    'ending the Dispatch handoff run does not hide a pending Coder task'
+  );
+  t.ok(
+    renderer.includes('syncDispatchCoderStatusCard(orionConvId, isCoderRunning'),
+    'Coder monitoring refreshes durable presentation even when live running state is false'
+  );
+  t.ok(
+    renderer.includes('presentation: presentation ? {'),
+    'phone state carries a structured presentation beside the canonical task'
+  );
+  t.ok(
+    companionHtml.includes('supervisedPresentation.isOngoing'),
+    'phone keeps pending and active Coder work visible from durable lifecycle state'
+  );
   t.end();
 });
 

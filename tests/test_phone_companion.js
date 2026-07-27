@@ -259,6 +259,10 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
   t.equal(marked.statusCode, 200, 'Markdown parser asset is available before phone auth');
   t.ok(/marked/i.test(marked.text), 'Markdown parser asset returns JavaScript content');
 
+  const taskPresentation = await request('GET', 1131, '/task-orchestration.js');
+  t.equal(taskPresentation.statusCode, 200, 'shared durable-task presentation contract is available before phone auth');
+  t.ok(taskPresentation.text.includes('selectSupervisedTask'), 'shared task asset includes canonical task selection');
+
   const state = await request('GET', 1131, '/api/state');
   t.equal(state.statusCode, 401, 'state API rejects unpaired phones');
 
@@ -783,5 +787,24 @@ test('new phone Coder conversations submit their initial prompt exactly once', t
   t.equal((flow.match(/companionFetch\('\/api\/prompt'/g) || []).length, 0,
     'new Coder flow does not post the same prompt again');
   t.ok(flow.includes('requestId:'), 'new chat supplies an idempotency key');
+  t.end();
+});
+
+test('phone Dispatch status derives queued, active, and review presentation from the durable task', t => {
+  const html = companionHtml();
+  const stateRenderStart = html.indexOf('const supervisedTask = activeConversationMode');
+  const stateRenderEnd = html.indexOf('// Needs-attention cards', stateRenderStart);
+  const stateRender = html.slice(stateRenderStart, stateRenderEnd);
+  t.ok(stateRender.includes('selectSupervisedTask('), 'phone selects the supervised task from orchestrationTasks');
+  t.ok(stateRender.includes('state.activeTaskId'), 'phone preserves taskId as the presentation identity');
+  t.ok(stateRender.includes('describeSupervisedTaskPresentation'), 'phone uses the shared lifecycle presentation contract');
+  t.ok(stateRender.includes('supervisedPresentation.agentState'), 'header state follows the durable task presentation');
+  t.ok(stateRender.includes('supervisedPresentation.label'), 'current task card follows the durable task presentation');
+  t.ok(stateRender.includes('supervisedTask.targetConversationId'), 'Coder navigation is enriched from the durable task target');
+  t.notOk(stateRender.includes('coderTaskStillOwned'), 'background Coder visibility no longer requires a fragile launched-conversation pointer');
+  t.ok(
+    stateRender.includes('supervisedPresentation.isOngoing'),
+    'queued and active tasks remain visible even when globalRunning briefly becomes false'
+  );
   t.end();
 });
