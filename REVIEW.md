@@ -14,7 +14,7 @@ This review describes the active development branch. It does not claim to descri
 | Terminal session contract | `terminal_exec` now accurately promises persistent working-directory state only. It no longer claims that environment variables or activated shells survive a fresh process. |
 | Memory/file-knowledge write races | JSON stores use unique sibling temp files and per-file IPC write queues. File knowledge is persisted in the workspace-intelligence cache rather than a second independently hashed ledger. |
 | Workspace startup load | Factory-created index services defer reconciliation until the next event-loop turn or first real lookup, so service construction no longer performs an immediate recursive walk. |
-| Embedding throughput/cache growth | Workspace chunks and fact embeddings use bounded concurrency. Persisted workspace vectors are capped, and stale fact vectors are removed during full ranking passes. |
+| Embedding throughput/cache growth | Workspace chunks and fact embeddings use bounded concurrency. Persisted workspace vectors are count-capped and the complete workspace-intelligence cache has an explicit total byte ceiling; records are retained deterministically within that budget. Stale fact vectors are removed during full ranking passes. |
 | Durable identity memory | Facts and preferences can be pinned so age filtering cannot remove stable identity/preferences from recall ranking. |
 | Prompt/token overhead | Dispatch receives only its executable tool schemas; the redundant per-turn tool contract is gone; recent chat, background memory extraction, classifier examples, and aged read-only tool payloads are bounded more tightly. |
 | Phone reliability | Completed responses are explicitly flushed, unchanged polling no longer rebuilds/scans the current screen, phone-server startup is awaited and reports bind failures, and the unused standalone typing-indicator DOM was removed in favor of the active inline indicator. |
@@ -41,6 +41,10 @@ This pass corrects the connected orchestration failures exposed by the live GRIT
 | Workspace resolution | `workspace-resolution.js` distinguishes active project workspace, generic Projects search root, standalone Coder workspace, and unresolved. Named projects resolve through registered projects, conversation context, and filesystem search; the search root is never described as the selected workspace, and resolved workspaces ride along in task packets. |
 | Factual status accuracy | Structured PR/task/test/process facts are carried through the response contract; a validator rejects wording that upgrades "mergeable" to "merged", "queued" to "running", "cancelled" to "completed", user-reported tests to independently verified tests, or a simulated restart to a real one, and restores the accurate structured state. |
 | Provider-safe Gemini tools | Gemini receives a provider-specific projection of the canonical tool declarations. Free-form object maps that rely on unsupported `additionalProperties` become documented JSON strings at the Gemini boundary and are decoded/validated before execution. This prevents the live `function_declarations[24]` HTTP 400 without weakening the canonical schemas used by Ollama/Anthropic/DeepSeek. |
+| Non-blocking workspace intelligence | Runtime workspace inspection, semantic search, symbol/reference lookups, context-packet hydration, and file-knowledge operations now run through one lazy worker-thread service instead of reconciling and parsing repositories on Electron's main/UI path. Existing direct service APIs remain available for tests and compatibility. |
+| Idempotent prompt submission | Phone and desktop submissions now have single-flight/idempotency protection. Starting a phone Coder conversation executes its initial prompt once instead of creating the conversation and posting the same prompt a second time. |
+| Lean Dispatch handoff | Direct executable requests are routed into one resolved Coder task packet before a full Dispatch model turn. Dispatch stops after the durable handoff receipt, so it does not independently solve the implementation and then ask Coder to repeat it. Quoted/transcript protections and ambiguity resolution still run before this route. |
+| Plan and completion relay | Coder implementation plans are persisted and relayed into the originating Dispatch conversation for approval or revision. On completion, Dispatch receives the durable task summary, changed files, and real verification evidence rather than a generic "Coder finished" notice. |
 
 ## Verified phone push infrastructure
 
@@ -56,9 +60,8 @@ The current branch includes:
 
 These are maintainability/performance follow-ups, not known correctness or data-safety blockers for PR #9:
 
-1. A first cold workspace lookup still performs the reconciliation work synchronously. Deferring it removes startup-constructor stalls, but a worker-thread index builder remains the right long-term boundary for very large repositories.
-2. `agent.js`, `renderer.js`, and `lib/companion-html.js` remain large. This pass extracted database execution and consolidated knowledge persistence; provider adapters, planning/classification, Dispatch supervision, conversation persistence, and phone rendering should continue moving into focused modules.
-3. The persisted workspace cache is bounded by semantic-chunk count rather than a total byte budget. A future schema can use an explicit on-disk byte ceiling and compact binary/vector storage.
+1. `agent.js`, `renderer.js`, and `lib/companion-html.js` remain large. Monolith decomposition was explicitly deferred for a later pass; provider adapters, planning/classification, Dispatch supervision, conversation persistence, and phone rendering remain the clearest extraction boundaries.
+2. The worker keeps the existing JSON index format and synchronous filesystem/parser implementation inside the worker. This protects UI responsiveness, but very large repositories may still benefit from incremental binary persistence and finer-grained cancellation inside a single indexing request.
 
 ## Merge position
 

@@ -413,7 +413,7 @@ test('supervisor conversational failures persist honestly and propagate to phone
   t.ok(catchPath.includes('success: false'), 'failure fallback returns structured failure instead of undefined');
   t.ok(catchPath.includes('responsePersisted: true'), 'failure result distinguishes a persisted fallback from successful generation');
 
-  const phoneStart = renderer.indexOf('window.submitPhoneCompanionPrompt = async');
+  const phoneStart = renderer.indexOf('async function submitPhoneCompanionPromptOnce');
   const phoneEnd = renderer.indexOf('\nwindow.steerPhoneCompanionTask', phoneStart);
   const phonePath = renderer.slice(phoneStart, phoneEnd);
   t.ok(
@@ -600,5 +600,21 @@ test('plan and clarification continuations do not fall back to a stale task ID',
     'renderer continuation resolution requires the explicitly supplied task ID');
   t.notOk(renderer.includes('options.taskId || targetConv.lastOrchestrationTaskId'),
     'renderer never silently resumes whichever task happened to run most recently');
+  t.end();
+});
+
+test('Dispatch relays delegated plans and completion evidence without forcing a Coder tab switch', t => {
+  t.ok(renderer.includes('await relayCoderPlanToDispatch(orionConv, coderConv, taskId)'),
+    'the supervisor loads a Coder plan into Dispatch');
+  t.ok(renderer.includes('isDelegatedPlanCard: true'),
+    'the relayed plan is persisted as an actionable Dispatch card');
+  t.ok(renderer.includes('approveDelegatedPlanAndContinue(delegatedPlan'),
+    'approval from Dispatch resumes the exact delegated plan');
+  t.notOk(renderer.includes('Switch to the Coder conversation to review it.'),
+    'Dispatch no longer tells the user to switch conversations for plan review');
+  t.ok(renderer.includes('const completion = summarizeCoderCompletion(durableTask, coderConv)'),
+    'completion notices use the durable Coder result');
+  t.ok(renderer.includes('completion.changedFiles') && renderer.includes('completion.verification'),
+    'completion relay includes changed files and verification evidence');
   t.end();
 });

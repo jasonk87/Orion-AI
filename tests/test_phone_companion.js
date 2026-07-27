@@ -748,7 +748,7 @@ test('Phone Companion v2 pairing pending and denied states', async (t) => {
 });
 
 test('phone Dispatch cancellation and supervisor failures preserve truthful outcomes', (t) => {
-  const submitStart = rendererSource.indexOf('window.submitPhoneCompanionPrompt = async');
+  const submitStart = rendererSource.indexOf('async function submitPhoneCompanionPromptOnce');
   const submitEnd = rendererSource.indexOf('\nwindow.steerPhoneCompanionTask', submitStart);
   const submitPath = rendererSource.slice(submitStart, submitEnd);
   const cancelIndex = submitPath.indexOf(
@@ -771,5 +771,17 @@ test('phone Dispatch cancellation and supervisor failures preserve truthful outc
       || rendererSource.includes('activeRunTaskId === launchedTaskId'),
     'phone supervision is gated by the exact active task identity'
   );
+  t.end();
+});
+
+test('new phone Coder conversations submit their initial prompt exactly once', t => {
+  const html = companionHtml();
+  const start = html.indexOf('async function startNewPhoneChat');
+  const end = html.indexOf('// New Chat: send', start);
+  const flow = html.slice(start, end);
+  t.ok(flow.includes("companionFetch('/api/conversations/new'"), 'new chat sends through the create endpoint');
+  t.equal((flow.match(/companionFetch\('\/api\/prompt'/g) || []).length, 0,
+    'new Coder flow does not post the same prompt again');
+  t.ok(flow.includes('requestId:'), 'new chat supplies an idempotency key');
   t.end();
 });

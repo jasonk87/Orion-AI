@@ -2250,6 +2250,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     let skillDiscoveryChecked = false; // true once discover_skills has been called this run
     let blankFinalAnswerNudgeSent = false;
     let dispatchForcedHandoffSent = false;
+    let dispatchHandoffCommitted = false;
     let blockedDispatchHandoffAttempts = 0;
     const repeatedToolFailures = new Map();
     const fileEditCounts = new Map();
@@ -2291,6 +2292,34 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     let supervisorWrapupExtensions = 0;
     const maxMalformedToolRetries = 5;
     const canExecuteThisTask = () => !config.planningMode || conversation.planApproved || planningBypassedForTask;
+    const dispatchPreflightAnalysis = runMode === 'orion'
+      && conversation.mode === 'orion'
+      && !runTaskId
+      && !isInternalPrompt
+      && DispatchIntent
+      ? DispatchIntent.analyzeDispatchInstruction(resolvedRequestForRouting)
+      : null;
+    const dispatchPreflightStandalone = isStandaloneCoderOperationRequest(liveUserPrompt);
+    const dispatchPreflightAtGenericRoot = WorkspaceResolution
+      ? WorkspaceResolution.samePath(workspacePath, getDispatchWorkspaceRoot())
+      : String(workspacePath || '').toLowerCase() === String(getDispatchWorkspaceRoot() || '').toLowerCase();
+    const dispatchPreflightWorkspacePermission = WorkspaceResolution
+      ? WorkspaceResolution.canHandoffWorkspace(workspaceResolution)
+      : { allowed: !!workspacePath };
+    const dispatchPreflightIsCancellation = !!(
+      DispatchIntent
+      && typeof DispatchIntent.isOwnedTaskCancellationRequest === 'function'
+      && DispatchIntent.isOwnedTaskCancellationRequest(liveUserPrompt)
+    );
+    const shouldPreflightDispatchHandoff = !!(
+      dispatchPreflightAnalysis
+      && dispatchPreflightAnalysis.requiresCoderExecution
+      && !dispatchPreflightIsCancellation
+      && (dispatchPreflightWorkspacePermission.allowed
+        || !dispatchPreflightAtGenericRoot
+        || (dispatchPreflightStandalone && dispatchPreflightAtGenericRoot))
+      && (!contextualTaskResolution || contextualTaskResolution.success)
+    );
 
     while (loopCount < maxLoops) {
       loopCount++;
@@ -2336,7 +2365,37 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
           window.renderAiMessage(lastTextResponse, currentAgentLogs);
         };
-        if (activeRunModelName.startsWith('gemini-')) {
+        if (shouldPreflightDispatchHandoff && loopCount === 1 && !dispatchForcedHandoffSent) {
+          const taskTitle = contextualTaskResolution && contextualTaskResolution.success
+            ? contextualTaskResolution.task.title
+            : 'Execute Dispatch request';
+          const handoffCall = {
+            name: 'handoff_to_coder',
+            args: {
+              prompt: buildForcedDispatchHandoffPrompt(resolvedRequestForRouting),
+              title: taskTitle,
+              open: false,
+              standalone: dispatchPreflightStandalone && dispatchPreflightAtGenericRoot,
+              originalUserMessage: liveUserPrompt
+            }
+          };
+          response = {
+            candidates: [{
+              finishReason: 'STOP',
+              content: {
+                parts: [
+                  { text: "This needs Coder's execution tools, so I've handed it off with the project context and requirements intact." },
+                  { functionCall: handoffCall }
+                ]
+              }
+            }]
+          };
+          dispatchForcedHandoffSent = true;
+          currentAgentLogs.push({
+            type: 'thought',
+            content: 'Dispatch preflight routed executable work directly to Coder without spending a Dispatch model turn.'
+          });
+        } else if (activeRunModelName.startsWith('gemini-')) {
           response = await callGeminiAPI(messagesForApiCall, activeRunModelName, config.geminiApiKey, onApiWarning, false, { signal: getActiveRunSignal() });
         } else if (activeRunModelName.startsWith('claude')) {
           response = await callAnthropicAPI(messagesForApiCall, activeRunModelName, config.anthropicApiKey, onApiWarning, false, { signal: getActiveRunSignal() });
@@ -2546,7 +2605,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           args: {
             prompt: buildForcedDispatchHandoffPrompt(resolvedRequestForRouting),
             title: 'Execute Dispatch request',
-            open: true,
+            open: false,
             standalone: standaloneEnvironmentRequest && atGenericSearchRoot,
             originalUserMessage: liveUserPrompt
           }
@@ -3217,6 +3276,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               if (cleared) workingState = cleared;
             }
           }
+          if (toolName === 'handoff_to_coder' && result && result.success && !isFailedToolResult(result)) {
+            dispatchHandoffCommitted = true;
+            lastTextResponse = `Coder has task ${result.taskId || ''} queued for **${result.title || args.title || 'the requested work'}**. I’ll keep this Dispatch conversation updated with the plan, questions, and verified result.`;
+          }
           currentAgentLogs[logIndex].status = isFailedToolResult(result) ? 'error' : 'success';
           currentAgentLogs[logIndex].result = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
           currentAgentLogs[logIndex].elapsed = Date.now() - _toolStartTime;
@@ -3500,6 +3563,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       conversation.messages[aiMessageIndex].logs = [...currentAgentLogs];
       window.saveConversationsToStorage();
       if (userRequestedStop) {
+        break;
+      }
+      if (dispatchHandoffCommitted) {
         break;
       }
       
@@ -3935,6 +4001,24 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             ? 'Cancelled by user.'
             : (criticalRunError ? String(criticalRunError.message || criticalRunError) : '')),
         summary: String(lastTextResponse || '').replace(/\s+/g, ' ').slice(0, 1000),
+        result: {
+          summary: String(lastTextResponse || '').trim().slice(0, 5000),
+          changedFiles: [...new Set(
+            (workWalkthrough || [])
+              .filter(item => isFileMutationItem(item) && item.path)
+              .map(item => String(item.path))
+          )].slice(0, 40),
+          verification: (workWalkthrough || [])
+            .filter(item => item && (
+              item.toolName === 'run_tests'
+              || ['open_url', 'capture_screen', 'inspect_screenshot_with_model'].includes(item.toolName)
+              || (item.toolName === 'run_command' && isRealVerificationCommand(item.command || item.args?.command || ''))
+            ))
+            .filter(item => item.status !== 'error')
+            .map(item => String(item.label || item.detail || item.toolName).replace(/\s+/g, ' ').trim())
+            .filter(Boolean)
+            .slice(-20)
+        },
         conversationId: conversation.id,
         pendingWork: !!hasPendingWork,
         awaitingUser: !!(forceYield || conversation.awaitingPlanApproval || conversation.awaitingClarification),

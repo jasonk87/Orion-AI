@@ -65,6 +65,10 @@ let appConfig = {
 };
 
 let currentWorkspace = '';
+let desktopPromptSubmissionInFlight = false;
+const promptSubmissionRegistry = window.OrionPromptSubmission
+  ? new window.OrionPromptSubmission.SubmissionRegistry({ ttlMs: 30000 })
+  : null;
 let currentWorkspaceTestCommand = null; // { command, autoDetected, updatedAt } | null — per-workspace override
 let cachedUserDataPath = '';
 let activeConversationId = null;
@@ -4329,7 +4333,10 @@ async function selectConversation(id) {
 async function submitMessage() {
   const prompt = el.chatInput.value.trim();
   if (!prompt) return;
-  
+  if (desktopPromptSubmissionInFlight) return;
+  desktopPromptSubmissionInFlight = true;
+  try {
+
   if (!appConfig.geminiApiKey) {
     el.settingsModal.classList.add('active');
     appendSystemMessage("Please enter and save your Gemini API Key first.");
@@ -4433,6 +4440,31 @@ async function submitMessage() {
   // steering so an owned pending/running task is deterministically stopped.
   const cancellation = await cancelOwnedTaskRequestedInPrompt(conv, prompt, 'dispatch-task-cancellation');
   if (cancellation.handled) return;
+
+  // A reply beneath a relayed Coder plan is plan feedback, not a fresh Dispatch task. Keep the
+  // user in Dispatch while binding the revision to the exact Coder conversation/task.
+  if (conversationMode(conv) === 'orion' && conv.awaitingDelegatedPlan) {
+    const delegatedPlan = conv.awaitingDelegatedPlan;
+    const revision = await window.revisePhoneCompanionPlan({
+      conversationId: delegatedPlan.coderConversationId,
+      feedback: prompt
+    });
+    if (revision && revision.success !== false) {
+      conv.awaitingDelegatedPlan = null;
+      notifyOrionConversation(
+        conv,
+        `I sent your plan feedback to Coder for **${delegatedPlan.title || 'the delegated task'}**. I’ll bring the revised plan back here.`,
+        'supervisor-plan-revision'
+      );
+    } else {
+      persistAssistantStatusMessage(
+        conv.id,
+        `Could not relay that plan revision: ${(revision && revision.error) || 'unknown error'}`,
+        { source: 'supervisor-plan-error', dedupeKey: `plan-revision-error-${delegatedPlan.taskId}` }
+      );
+    }
+    return;
+  }
 
   // ── Supervisor interception: Orion message while a supervised Coder task runs ──
   if (window.runAgentLoop) {
@@ -4560,6 +4592,9 @@ async function submitMessage() {
       }
     }, 500);
     setTimeout(() => clearInterval(waitForEngine), 30000);
+  }
+  } finally {
+    desktopPromptSubmissionInFlight = false;
   }
 }
 
@@ -5113,11 +5148,19 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   // object is not threaded in, so fall back to conversation state (the active bubble during a
   // planning yield is the plan bubble). On reloads the persisted msgMeta.isPlanApprovalCard
   // identifies the exact bubble so the card does not bleed onto execution bubbles.
+  const delegatedPlan = msgMeta && msgMeta.delegatedPlan;
   const isPlanBubble = msgMeta
-    ? !!msgMeta.isPlanApprovalCard
+    ? !!(msgMeta.isPlanApprovalCard || msgMeta.isDelegatedPlanCard)
     : !!(activeConv && activeConv.awaitingPlanApproval && !activeConv.planApproved);
   if (isPlanBubble) {
-    if (activeConv && activeConv.planApproved) {
+    const delegatedPlanApproved = !!(delegatedPlan && msgMeta.delegatedPlanApproved);
+    const delegatedPlanPending = !!(
+      delegatedPlan
+      && activeConv
+      && activeConv.awaitingDelegatedPlan
+      && activeConv.awaitingDelegatedPlan.taskId === delegatedPlan.taskId
+    );
+    if ((activeConv && activeConv.planApproved) || delegatedPlanApproved) {
       // The plan was approved — show a persistent "started" state instead of removing the card,
       // so the chat clearly reflects that the button was pressed.
       planApprovalHtml = `
@@ -5129,14 +5172,15 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
           <button class="btn-approve-plan approved" type="button" disabled>✓ Implementation Started</button>
         </div>
       `;
-    } else if (activeConv && activeConv.awaitingPlanApproval && !(window.isAgentRunning && window.isAgentRunning())) {
+    } else if ((delegatedPlanPending || (activeConv && activeConv.awaitingPlanApproval))
+        && !(window.isAgentRunning && window.isAgentRunning())) {
       planApprovalHtml = `
         <div class="plan-approval-actions">
           <div class="plan-approval-copy">
             <span class="plan-approval-title">Plan ready for review</span>
             <span class="plan-approval-subtitle">Start when the direction looks right.</span>
           </div>
-          <button class="btn-approve-plan" type="button">Start Implementation</button>
+          <button class="btn-approve-plan" type="button">${delegatedPlan ? 'Approve & Continue' : 'Start Implementation'}</button>
         </div>
       `;
     }
@@ -5247,7 +5291,13 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   wireInlineArtifactOpeners(bubble);
   const approveButton = bubble.querySelector('.btn-approve-plan');
   if (approveButton) {
-    approveButton.addEventListener('click', () => approveCurrentPlanAndContinue({ button: approveButton }));
+    approveButton.addEventListener('click', () => {
+      if (delegatedPlan) {
+        approveDelegatedPlanAndContinue(delegatedPlan, msgMeta, { button: approveButton });
+      } else {
+        approveCurrentPlanAndContinue({ button: approveButton });
+      }
+    });
   }
   // Wire clarification option rows for selection highlight
   bubble.querySelectorAll('.clarification-option, .clarification-other-row').forEach(row => {
@@ -6273,7 +6323,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
       lastOwnedTaskId: c.lastOwnedTaskId || '',
       active: c.id === resolvedId,
       isDesktopActive: c.id === activeConversationId,
-      awaitingPlanApproval: !!(c.awaitingPlanApproval && !c.planApproved),
+      awaitingPlanApproval: !!((c.awaitingPlanApproval && !c.planApproved) || c.awaitingDelegatedPlan),
       awaitingClarification: !!c.awaitingClarification,
       taskCount,
       messageCount,
@@ -6365,7 +6415,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     queuedPromptPreview: window.promptQueue ? window.promptQueue.filter(q => q.conversationId === resolvedId).map(q => q.taskTitle || q.originalUserMessage || q.prompt).slice(0, 3) : [],
     subStatus: isActiveTargetRunning && window.getAgentSubStatus ? window.getAgentSubStatus() : '',
     executionMode: isActiveTargetRunning && window.getAgentExecutionMode ? window.getAgentExecutionMode() : 'idle',
-    awaitingPlanApproval: !!(conv && conv.awaitingPlanApproval && !conv.planApproved),
+    awaitingPlanApproval: !!(conv && ((conv.awaitingPlanApproval && !conv.planApproved) || conv.awaitingDelegatedPlan)),
     awaitingClarification: (conv && conv.awaitingClarification) ? conv.awaitingClarification : null,
     tasks: conv && Array.isArray(conv.tasks) ? conv.tasks : [],
     orchestrationTasks,
@@ -6458,6 +6508,7 @@ window.startPhoneCompanionTask = async (options = {}) => {
       await window.submitPhoneCompanionPrompt({
         prompt,
         conversationId: conv.id,
+        requestId: options.requestId,
         imageData: options.imageData,
         imageMimeType: options.imageMimeType,
         fileContent: options.fileContent,
@@ -6484,7 +6535,7 @@ window.startPhoneCompanionTask = async (options = {}) => {
   };
 };
 
-window.submitPhoneCompanionPrompt = async (options) => {
+async function submitPhoneCompanionPromptOnce(options) {
   // Can be called with either a string or an options object
   const text = typeof options === 'string' ? options.trim() : String(options.prompt || '').trim();
   let targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
@@ -6705,6 +6756,18 @@ window.submitPhoneCompanionPrompt = async (options) => {
     });
 
   return { success: true, queued: false, conversationId: targetId, title: conv.title || 'New Conversation' };
+}
+
+window.submitPhoneCompanionPrompt = function(options) {
+  const normalizedOptions = typeof options === 'string' ? { prompt: options } : (options || {});
+  if (!promptSubmissionRegistry) return submitPhoneCompanionPromptOnce(normalizedOptions);
+  return promptSubmissionRegistry.run({
+    requestId: normalizedOptions.requestId,
+    conversationId: normalizedOptions.conversationId || activeConversationId,
+    source: normalizedOptions.source || 'phone',
+    prompt: normalizedOptions.prompt,
+    imageCount: normalizedOptions.imageData ? 1 : 0
+  }, () => submitPhoneCompanionPromptOnce(normalizedOptions));
 };
 
 window.steerPhoneCompanionTask = async (options) => {
@@ -6731,6 +6794,19 @@ window.steerPhoneCompanionTask = async (options) => {
 window.approvePhoneCompanionPlan = async (targetId) => {
   const resolvedId = targetId || activeConversationId;
   const conv = conversations.find(c => c.id === resolvedId);
+  if (conv && conv.awaitingDelegatedPlan) {
+    const delegatedPlan = conv.awaitingDelegatedPlan;
+    const result = await window.approvePhoneCompanionPlan(delegatedPlan.coderConversationId);
+    if (result && result.success !== false) {
+      conv.awaitingDelegatedPlan = null;
+      notifyOrionConversation(
+        conv,
+        `Plan approved for **${delegatedPlan.title || 'the Coder task'}**. Coder is continuing implementation; I’ll report the verified result here.`,
+        'supervisor-plan-approved'
+      );
+    }
+    return result;
+  }
   if (!conv || !conv.awaitingPlanApproval) return { success: false, error: 'No plan waiting for approval' };
 
   if (!appConfig.geminiApiKey) {
@@ -6813,6 +6889,12 @@ window.approvePhoneCompanionPlan = async (targetId) => {
 window.denyPhoneCompanionPlan = async (targetId) => {
   const resolvedId = targetId || activeConversationId;
   const conv = conversations.find(c => c.id === resolvedId);
+  if (conv && conv.awaitingDelegatedPlan) {
+    const delegatedPlan = conv.awaitingDelegatedPlan;
+    const result = await window.denyPhoneCompanionPlan(delegatedPlan.coderConversationId);
+    if (result && result.success !== false) conv.awaitingDelegatedPlan = null;
+    return result;
+  }
   if (!conv) return { success: false, error: 'No active conversation' };
   const deniedTaskId = String(conv.awaitingPlanApprovalTaskId || '');
   if (deniedTaskId) {
@@ -6844,7 +6926,12 @@ window.denyPhoneCompanionPlan = async (targetId) => {
 
 window.revisePhoneCompanionPlan = async (options) => {
   const text = typeof options === 'string' ? options.trim() : String(options.feedback || 'Revise the pending plan before implementing.').trim();
-  const targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
+  let targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
+  const targetConv = conversations.find(c => c.id === targetId);
+  if (targetConv && targetConv.awaitingDelegatedPlan) {
+    targetId = targetConv.awaitingDelegatedPlan.coderConversationId;
+    targetConv.awaitingDelegatedPlan = null;
+  }
   if (!text) return { success: false, error: 'Missing revision feedback' };
   return await window.submitPhoneCompanionPrompt({ prompt: `[Plan revision] ${text}`, conversationId: targetId });
 };
@@ -7140,6 +7227,41 @@ async function approveCurrentPlanAndContinue(options = {}) {
     return { success: true, queued: false, taskId: continuation.task.taskId };
   }
   return { success: false, error: 'Agent engine is not ready' };
+}
+
+async function approveDelegatedPlanAndContinue(delegatedPlan, message, options = {}) {
+  const button = options.button || null;
+  const orionConv = conversations.find(c => c.id === activeConversationId);
+  if (!orionConv || !delegatedPlan || !delegatedPlan.coderConversationId) {
+    return { success: false, error: 'Delegated plan ownership could not be resolved.' };
+  }
+  const pending = orionConv.awaitingDelegatedPlan;
+  if (!pending || String(pending.taskId || '') !== String(delegatedPlan.taskId || '')) {
+    return { success: false, error: 'This delegated plan is no longer pending.' };
+  }
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Starting…';
+  }
+  const result = await window.approvePhoneCompanionPlan(delegatedPlan.coderConversationId);
+  if (!result || result.success === false) {
+    if (button) {
+      button.disabled = false;
+      button.textContent = 'Approve & Continue';
+    }
+    showToast((result && result.error) || 'Could not approve the delegated plan.', 'attention');
+    return result || { success: false };
+  }
+  orionConv.awaitingDelegatedPlan = null;
+  if (message) message.delegatedPlanApproved = true;
+  notifyOrionConversation(
+    orionConv,
+    `Plan approved for **${delegatedPlan.title || 'the Coder task'}**. Coder is continuing implementation; I’ll report the verified result here.`,
+    'supervisor-plan-approved'
+  );
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+  saveConversationsToStorage();
+  return result;
 }
 
 function deleteConversation(id) {
@@ -7810,7 +7932,14 @@ window.startCoderTaskMonitor = function(orionConvId, coderConvId, taskId = '') {
     // Detect: Coder is awaiting plan approval → notify Orion
     if (nowAwaitingPlan && !monitorMeta.lastAwaitingPlanApproval) {
       monitorMeta.lastAwaitingPlanApproval = true;
-      notifyOrionConversation(orionConv, `Coder has written an implementation plan and is waiting for your approval. Switch to the Coder conversation to review it.`, 'supervisor-plan');
+      const relayed = await relayCoderPlanToDispatch(orionConv, coderConv, taskId);
+      if (!relayed.success) {
+        notifyOrionConversation(
+          orionConv,
+          `Coder is waiting for plan approval, but Dispatch could not load the saved plan: ${relayed.error}`,
+          'supervisor-plan-error'
+        );
+      }
     }
     if (!nowAwaitingPlan) monitorMeta.lastAwaitingPlanApproval = false;
 
@@ -7832,6 +7961,62 @@ function stopCoderTaskMonitor(expectedMeta = null) {
   return true;
 }
 window.stopCoderTaskMonitor = stopCoderTaskMonitor;
+
+async function relayCoderPlanToDispatch(orionConv, coderConv, taskId) {
+  if (!orionConv || !coderConv) return { success: false, error: 'Plan relay conversations are missing.' };
+  let planText = '';
+  try {
+    planText = await readConversationTextArtifact(coderConv, 'implementation_plan.md', { maxChars: 50000 });
+  } catch (error) {
+    return { success: false, error: error.message || String(error) };
+  }
+  if (!String(planText || '').trim()) {
+    return { success: false, error: 'Coder did not save a readable implementation plan.' };
+  }
+  const delegatedPlan = {
+    taskId: String(taskId || coderConv.awaitingPlanApprovalTaskId || ''),
+    coderConversationId: coderConv.id,
+    title: orionConv.launchedCoderTaskTitle || coderConv.title || 'Coder task',
+    createdAt: Date.now()
+  };
+  orionConv.awaitingDelegatedPlan = delegatedPlan;
+  notifyOrionConversation(
+    orionConv,
+    `Coder prepared this implementation plan for **${delegatedPlan.title}**:\n\n${String(planText).trim()}\n\nApprove it here to continue. If you want changes, reply in this Dispatch conversation and I’ll relay the revision to Coder.`,
+    'supervisor-plan',
+    {
+      isDelegatedPlanCard: true,
+      delegatedPlan
+    }
+  );
+  return { success: true, delegatedPlan };
+}
+
+function summarizeCoderCompletion(durableTask, coderConv) {
+  const result = durableTask && durableTask.result && typeof durableTask.result === 'object'
+    ? durableTask.result : {};
+  let summary = String(result.summary || '').trim();
+  if (!summary && coderConv && Array.isArray(coderConv.messages)) {
+    const finalMessage = [...coderConv.messages].reverse().find(message =>
+      message
+      && (message.role === 'assistant' || message.role === 'model')
+      && String(message.text || '').trim()
+      && String(message.text || '').trim() !== 'Thinking...'
+      && !message.isPlanApprovalCard
+    );
+    summary = finalMessage ? String(finalMessage.text || '').trim() : '';
+  }
+  summary = summary
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/\n*## Work Walkthrough[\s\S]*$/i, '')
+    .trim()
+    .slice(0, 5000);
+  return {
+    summary,
+    changedFiles: Array.isArray(result.changedFiles) ? result.changedFiles.slice(0, 20) : [],
+    verification: Array.isArray(result.verification) ? result.verification.slice(0, 12) : []
+  };
+}
 
 // ── Supervisor completion notification ────────────────────────────────────────
 async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTaskId = '') {
@@ -7860,6 +8045,7 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
     orionConv.launchedCoderTaskId = null;
     orionConv.launchedCoderTaskTitle = null;
     orionConv.launchedCoderTaskStart = null;
+    orionConv.awaitingDelegatedPlan = null;
     if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
     if (window.saveConversationsToStorage) window.saveConversationsToStorage();
     return;
@@ -7883,13 +8069,21 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
   // Determine outcome
   const blockedFlag = coderConv && Array.isArray(coderConv.messages)
     && coderConv.messages.slice(-3).some(m => /blocked|cannot|error|failed/i.test(m.text || ''));
+  const completion = summarizeCoderCompletion(durableTask, coderConv);
 
   let summaryText;
   if (durableTask && durableTask.status === 'failed') {
     summaryText = `Coder failed **${taskTitle}**. The task state is failed; check the Coder conversation for the recorded error before retrying.`;
   } else if (durableTask && durableTask.status === 'completed') {
     const elapsed_str = elapsed ? ` (${elapsed}m)` : '';
-    summaryText = `Coder completed **${taskTitle}**${elapsed_str}. Ready for your next direction.`;
+    summaryText = `Coder completed **${taskTitle}**${elapsed_str}.`;
+    if (completion.summary) summaryText += `\n\n${completion.summary}`;
+    if (completion.changedFiles.length) {
+      summaryText += `\n\nChanged: ${completion.changedFiles.map(file => `\`${file}\``).join(', ')}`;
+    }
+    if (completion.verification.length) {
+      summaryText += `\n\nVerified:\n${completion.verification.map(item => `- ${item}`).join('\n')}`;
+    }
   } else if (pendingTasks.length > 0 && doneTasks.length === 0) {
     summaryText = `Coder stopped on **${taskTitle}** — ${pendingTasks.length} task${pendingTasks.length > 1 ? 's' : ''} still pending. It may have hit a blocker. Check the Coder conversation for details.`;
   } else if (pendingTasks.length > 0) {
@@ -7922,6 +8116,7 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
   orionConv.launchedCoderTaskId = null;
   orionConv.launchedCoderTaskTitle = null;
   orionConv.launchedCoderTaskStart = null;
+  orionConv.awaitingDelegatedPlan = null;
   orionConv.updatedAt = Date.now();
   if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
   if (window.saveConversationsToStorage) window.saveConversationsToStorage();
@@ -7933,15 +8128,16 @@ window.onOrchestrationTaskFinalized = async function(taskId, targetConversationI
 };
 
 // Appends a message to an Orion conversation, rendering it if active.
-function notifyOrionConversation(orionConv, text, source) {
+function notifyOrionConversation(orionConv, text, source, metadata = {}) {
   if (!orionConv || !text) return;
-  orionConv.messages.push({ role: 'assistant', text, source, createdAt: Date.now() });
+  const message = { ...metadata, role: 'assistant', text, source, createdAt: Date.now() };
+  orionConv.messages.push(message);
   orionConv.updatedAt = Date.now();
   if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
   if (window.saveConversationsToStorage) window.saveConversationsToStorage();
   if (activeConversationId === orionConv.id && typeof window.renderAiMessage === 'function') {
     window.clearActiveAiBubble();
-    window.renderAiMessage(text, [], orionConv.id);
+    window.renderAiMessage(text, [], orionConv.id, message);
   }
 }
 

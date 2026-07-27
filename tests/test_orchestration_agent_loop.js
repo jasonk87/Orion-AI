@@ -315,7 +315,7 @@ test('Dispatch loop analyzes a pasted transcript without executing commands in i
   t.end();
 });
 
-test('a genuine model-authored handoff cannot be duplicated by a later no-tool announcement', async t => {
+test('a direct executable request preflights once and preserves durable handoff provenance', async t => {
   const originalFetch = global.fetch;
   const workspace = 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE';
   const handoffs = [];
@@ -359,7 +359,8 @@ test('a genuine model-authored handoff cannot be duplicated by a later no-tool a
       conv
     );
     t.equal(handoffs.length, 1, 'the genuine handoff creates exactly one durable Coder task');
-    t.equal(handoffs[0].prompt, 'Identify the running Claude process, restart it safely, and verify the replacement.', 'the original model-authored handoff packet is retained');
+    t.match(handoffs[0].prompt, /identify the intended local target/i, 'the deterministic packet requires safe target identification');
+    t.match(handoffs[0].prompt, /verify the result/i, 'the deterministic packet requires verification');
     t.equal(handoffs[0].originalUserMessage, 'Can you kill Claude and restart it again?', 'the exact raw user utterance is retained separately from the expanded handoff prompt');
   } finally {
     restoreGlobals(originalFetch);

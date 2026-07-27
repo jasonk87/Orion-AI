@@ -2689,7 +2689,7 @@ test('a blank final response after real tool work is nudged to produce an actual
 // Dispatch cannot execute process mutations itself, but that boundary must route work rather than
 // return it to the user. A real conversation required the user to explicitly demand Coder after a
 // long permission refusal. The loop now synthesizes the handoff tool call deterministically.
-test('Dispatch converts a kill/restart permission refusal into a real Coder handoff', async (t) => {
+test('Dispatch preflights a kill/restart request into one Coder handoff without a Dispatch model pass', async (t) => {
   const originalRunAgentLoop = global.window.runAgentLoop;
   const originalSetTimeout = global.setTimeout;
   const originalFetch = global.fetch;
@@ -2754,7 +2754,8 @@ test('Dispatch converts a kill/restart permission refusal into a real Coder hand
     await window.runAgentLoop(request, 'gemini-1', conversation);
 
     t.equal(handoffs.length, 1, 'handoff_to_coder executes exactly once');
-    t.equal(handoffs[0].open, true, 'the generated Coder conversation opens immediately');
+    t.equal(modelTurn, 0, 'the full Dispatch model is never called before delegation');
+    t.equal(handoffs[0].open, false, 'Dispatch remains visible to supervise the Coder task');
     t.ok(handoffs[0].prompt.includes(request), 'the handoff preserves the exact user request');
     t.ok(/identify the intended local target/i.test(handoffs[0].prompt), 'Coder is instructed to resolve which Claude process is meant');
     const aiMessage = conversation.messages.find(m => m.role === 'assistant');
