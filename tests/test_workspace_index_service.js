@@ -8,6 +8,10 @@ const {
   resetWorkspaceIndexServices
 } = require('../lib/workspace-index-service');
 const { inspectCodeContext } = require('../lib/context-retrieval');
+const {
+  requestWorkspaceIndex,
+  closeWorkspaceIndexWorker
+} = require('../lib/workspace-index-client');
 
 function makeWorkspace(t, prefix = 'orion-index-') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -309,6 +313,46 @@ test('persisted workspace cache caps semantic vectors', (t) => {
   t.end();
 });
 
+test('persisted workspace cache obeys an explicit total byte budget', (t) => {
+  const workspace = makeWorkspace(t, 'orion-index-byte-cap-');
+  const maxBytes = 4096;
+  const service = new WorkspaceIndexService(workspace, {
+    watch: false,
+    persistedCacheMaxBytes: maxBytes
+  });
+  service.records.clear();
+  service.records.set('large.js', {
+    path: 'large.js',
+    mtimeMs: 2,
+    hash: 'large',
+    lexicalTerms: ['large'],
+    semanticChunks: Array.from({ length: 100 }, (_, index) => ({
+      text: `chunk-${index}-${'x'.repeat(160)}`,
+      vector: Array.from({ length: 32 }, () => index)
+    }))
+  });
+  service.records.set('small.js', {
+    path: 'small.js',
+    mtimeMs: 1,
+    hash: 'small',
+    lexicalTerms: ['small']
+  });
+  service.persist();
+
+  const persistedPath = path.join(workspace, '.orion', 'workspace-intelligence-cache.json');
+  const size = fs.statSync(persistedPath).size;
+  const persisted = JSON.parse(fs.readFileSync(persistedPath, 'utf8'));
+  t.ok(size <= maxBytes, `persisted cache stays within ${maxBytes} bytes (got ${size})`);
+  t.ok(Object.keys(persisted.files).length >= 1, 'the bounded cache retains useful structural records');
+  t.ok(service.getTelemetry().persistedCacheBytes <= maxBytes, 'telemetry reports the bounded persisted size');
+  t.ok(
+    (persisted.files['large.js']?.semanticChunks || []).length < 100,
+    'semantic vectors are trimmed before the byte ceiling is exceeded'
+  );
+  service.close();
+  t.end();
+});
+
 test('factory defers initial reconciliation until the service is first used', (t) => {
   const workspace = seedBasicWorkspace(t);
   const service = getWorkspaceIndexService(workspace, { watch: false, fresh: true });
@@ -316,5 +360,23 @@ test('factory defers initial reconciliation until the service is first used', (t
   t.ok(service.getRecord('src/app.js'), 'first real lookup reconciles and returns indexed data');
   t.equal(service.initialReconcilePending, false, 'initial reconciliation is complete after first use');
   service.close();
+  t.end();
+});
+
+test('runtime workspace intelligence executes through the worker boundary', async t => {
+  const workspace = seedBasicWorkspace(t);
+  const result = await requestWorkspaceIndex('inspectCodeContext', {
+    workspacePath: workspace,
+    query: 'greet input',
+    symbols: ['greet'],
+    include: ['definitions'],
+    conversationId: 'worker-test-conversation'
+  });
+  t.equal(result.success, true, 'worker returns a successful context inspection');
+  t.ok(result.sections.some(section => section.path === 'src/app.js'), 'worker returns exact indexed source');
+  const telemetry = await requestWorkspaceIndex('telemetry', { workspacePath: workspace });
+  t.equal(telemetry.success, true, 'worker exposes its index telemetry');
+  t.ok(telemetry.telemetry.workspaceFilesIndexed > 0, 'index reconciliation happened inside the worker service');
+  await closeWorkspaceIndexWorker();
   t.end();
 });

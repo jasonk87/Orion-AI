@@ -19,6 +19,22 @@ test('atomic JSON writes use unique temporary siblings and leave valid data', (t
   t.end();
 });
 
+test('atomic JSON writes support compact serialization for bounded caches', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-atomic-json-compact-'));
+  const file = path.join(dir, 'cache.json');
+  try {
+    atomicWriteJsonSync(file, { revision: 1, files: {} }, { trailingNewline: true, space: 0 });
+    t.equal(
+      fs.readFileSync(file, 'utf8'),
+      '{"revision":1,"files":{}}\n',
+      'compact output remains valid and includes the requested trailing newline'
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  t.end();
+});
+
 test('per-file queue serializes overlapping mutations', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-write-queue-'));
   const file = path.join(dir, 'memory.json');

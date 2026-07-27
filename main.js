@@ -134,14 +134,18 @@ function registerAllHandlers() {
   require('./lib/file-knowledge').registerHandlers(ipcMain);
 
   const { runLinter } = require('./lib/run-linter');
-  const { findReferences } = require('./lib/find-references');
+  const { requestWorkspaceIndex } = require('./lib/workspace-index-client');
 
   ipcMain.handle('orion:run-linter', async (event, args) => {
     return await runLinter(args.workspacePath, args.linterType, args.targetPath);
   });
   
   ipcMain.handle('orion:find-references', async (event, args) => {
-    return await findReferences(args.workspacePath, args.symbolName, args.targetPath);
+    return await requestWorkspaceIndex('findReferences', {
+      workspacePath: args.workspacePath,
+      symbolName: args.symbolName,
+      targetPath: args.targetPath
+    });
   });
 
   const getConversationsDir = () => {
