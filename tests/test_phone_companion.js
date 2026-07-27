@@ -357,6 +357,24 @@ test('Phone Companion v2 pairing creates reusable sessions and revoked sessions 
   await closeServer(main.getCompanionServer());
 });
 
+test('Phone Companion page traffic does not consume the pairing-attempt budget', async (t) => {
+  const { main } = await startMainWithConfig(1150);
+
+  for (let index = 0; index < 8; index += 1) {
+    const asset = await request('GET', 1150, index % 2 === 0 ? '/icon.svg' : '/manifest.webmanifest');
+    t.equal(asset.statusCode, 200, `ordinary page request ${index + 1} succeeds`);
+  }
+
+  const pair = await request('POST', 1150, '/api/pair', {
+    pairingCode: 'pair-code-123456',
+    deviceName: 'Phone'
+  });
+  t.equal(pair.statusCode, 200, 'the first real pairing attempt retains its separate rate-limit budget');
+  t.ok(pair.json.sessionSecret, 'successful pairing still creates a reusable session');
+
+  await closeServer(main.getCompanionServer());
+});
+
 test('Phone Companion v2 auto-pairs valid LAN pairing links by default', async (t) => {
   const { main, electron } = await startMainWithConfig(1142);
 

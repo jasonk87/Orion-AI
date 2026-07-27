@@ -241,3 +241,20 @@ test('standalone system execution is distinct from project-bound executable work
   ].forEach(value => t.equal(dispatchIntent.isStandaloneSystemExecutionRequest(value), false, value));
   t.end();
 });
+
+test('implementation verbs are treated as active executable work only outside quoted reports', (t) => {
+  [
+    'Implement the approved design.',
+    'Wire the new cancellation handler into Dispatch.',
+    'Integrate the workspace resolver.',
+    'Scaffold the new task module.',
+    'Refactor the agent loop.'
+  ].forEach(value => t.equal(dispatchIntent.dispatchRequestRequiresCoderExecution(value), true, value));
+
+  [
+    'Status report:\n\nImplement the approved design.',
+    'The user previously asked us to refactor the agent loop.',
+    'Here is a test case that says scaffold the module.'
+  ].forEach(value => t.equal(dispatchIntent.dispatchRequestRequiresCoderExecution(value), false, value));
+  t.end();
+});

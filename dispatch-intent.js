@@ -7,7 +7,8 @@
     'configure', 'change', 'modify', 'edit', 'write', 'create', 'delete',
     'remove', 'rename', 'move', 'copy', 'build', 'fix', 'repair', 'test',
     'deploy', 'package', 'commit', 'push', 'pull', 'save', 'generate',
-    'produce', 'capture', 'patch'
+    'produce', 'capture', 'patch',
+    'implement', 'wire', 'extend', 'integrate', 'scaffold', 'refactor'
   ];
   const ACTION_PATTERN = `(?:${EXECUTION_VERBS.join('|')})`;
   const REFERENCE_VERB_PATTERN = '(?:run|execute|apply|perform|carry\\s+out|do|follow|use)';

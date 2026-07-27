@@ -417,7 +417,11 @@ test('local system fact failures do not become fake blockers or web research', (
   t.ok(agentJs.includes('TOP-LEVEL FOLDER LISTS'), 'system prompt distinguishes top-level listings from recursive searches');
   t.ok(agentJs.includes('EVIDENCE CONTINUITY'), 'system prompt tells Orion to connect later filesystem evidence to prior path failures');
   t.ok(agentJs.includes('do not add -Depth/-Recurse unless nested folders are explicitly requested') || agentJs.includes('Do not add -Depth or -Recurse for a top-level list request'), 'run_command contract blocks recursive top-level folder dumps');
-  t.ok(agentJs.includes('Do not use this as a substitute for inspecting an existing local folder/project/program'), 'clarifying tool contract blocks premature clarification');
+  t.ok(
+    agentJs.includes('Do not use as a substitute for inspecting an existing local folder/project/program')
+      || agentJs.includes('Do not use this as a substitute for inspecting an existing local folder/project/program'),
+    'clarifying tool contract blocks premature clarification'
+  );
   t.equal(
     agent.shouldHaveUsedToolsButDidNot('I do not know your name yet.', [], 'do you know my name?'),
     false,
@@ -1104,6 +1108,7 @@ test('incidental observations are bounded Coder-only run notes', (t) => {
   const allowlistEnd = agentJs.indexOf(']);', allowlistStart);
   const allowlistBlock = agentJs.slice(allowlistStart, allowlistEnd);
   t.notOk(allowlistBlock.includes('note_incidental_issue'), 'Dispatch allowlist does not include note_incidental_issue');
+  t.ok(allowlistBlock.includes('ask_clarifying_questions'), 'Dispatch can pause ambiguous handoffs with the structured clarification tool');
   t.end();
 });
 

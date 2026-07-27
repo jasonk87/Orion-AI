@@ -3121,3 +3121,34 @@ test('grep_search is declared in the shared tool-declaration source consumed by 
   t.ok(agentSource.includes("case 'grep_search'"), 'the executor has a grep_search case');
   t.end();
 });
+
+test('supervisor decisions cannot silently finalize or emit unsupported recovery actions', (t) => {
+  const deprecatedFinalize = agent.normalizeSupervisorDecision(JSON.stringify({
+    status: 'finalize',
+    pattern: 'enough_work',
+    recommendedAction: { type: 'finalize' }
+  }));
+  t.equal(deprecatedFinalize.status, 'continue', 'deprecated finalize status becomes continued work');
+  t.equal(deprecatedFinalize.recommendedAction.type, 'continue', 'deprecated finalize action becomes a supported continuation');
+  t.equal(deprecatedFinalize.boundedExtension, true, 'deprecated status can receive only the bounded wrap-up path');
+
+  const unsupportedStuckAction = agent.normalizeSupervisorDecision(JSON.stringify({
+    status: 'stuck',
+    pattern: 'repeated_failure',
+    recommendedAction: { type: 'ask_user' }
+  }));
+  t.equal(unsupportedStuckAction.status, 'stuck', 'real stuck evidence remains a stuck decision');
+  t.equal(unsupportedStuckAction.recommendedAction.type, 'change_tool_strategy', 'unsupported stuck recovery maps to a bounded tool-strategy correction');
+
+  const supportedVerification = agent.normalizeSupervisorDecision(JSON.stringify({
+    status: 'stuck',
+    pattern: 'missing_verification',
+    recommendedAction: { type: 'run_verification', tool: 'run_command' }
+  }));
+  t.equal(supportedVerification.recommendedAction.type, 'run_verification', 'supported recovery actions are preserved');
+  t.equal(supportedVerification.recommendedAction.tool, 'run_command', 'supported recovery metadata is preserved');
+
+  const emptyLegacyReply = agent.normalizeSupervisorDecision('');
+  t.equal(emptyLegacyReply.boundedExtension, true, 'an empty legacy supervisor reply cannot renew the loop indefinitely');
+  t.end();
+});

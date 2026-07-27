@@ -1144,18 +1144,28 @@ function normalizeSupervisorDecision(responseText) {
   const parsed = parseModelJsonObject(responseText);
   if (parsed && typeof parsed === 'object' && Object.keys(parsed).length > 0) {
     const rawStatus = String(parsed.status || '').toLowerCase();
-    const status = rawStatus === 'stuck' || rawStatus === 'continue' || rawStatus === 'finalize'
-      ? rawStatus
+    const recognizedStatus = ['continue', 'stuck', 'blocked'].includes(rawStatus);
+    // 'finalize' is no longer a valid status (it caused silent halts) — treat as 'continue'
+    const status = rawStatus === 'stuck'
+      ? 'stuck'
       : (rawStatus === 'blocked' ? 'stuck' : 'continue');
     return {
       status,
       pattern: String(parsed.pattern || ''),
       evidence: Array.isArray(parsed.evidence) ? parsed.evidence.map(String).slice(0, 8) : [],
-      recommendedAction: parsed.recommendedAction && typeof parsed.recommendedAction === 'object'
-        ? parsed.recommendedAction
-        : { type: status === 'stuck' ? 'change_tool_strategy' : 'continue' },
+      recommendedAction: (() => {
+        const ra = parsed.recommendedAction && typeof parsed.recommendedAction === 'object' ? parsed.recommendedAction : null;
+        if (!ra) return { type: status === 'stuck' ? 'change_tool_strategy' : 'continue' };
+        const validTypes = new Set(['continue', 'consolidate_context', 'change_tool_strategy', 'run_verification']);
+        // Map deprecated/unhandled action types to safe equivalents so they don't cause silent halts
+        const safeType = validTypes.has(String(ra.type || '')) ? ra.type : (status === 'stuck' ? 'change_tool_strategy' : 'continue');
+        return { ...ra, type: safeType };
+      })(),
       avoid: Array.isArray(parsed.avoid) ? parsed.avoid.map(String).slice(0, 8) : [],
-      confidence: Number.isFinite(Number(parsed.confidence)) ? Number(parsed.confidence) : 0
+      confidence: Number.isFinite(Number(parsed.confidence)) ? Number(parsed.confidence) : 0,
+      // A deprecated/malformed supervisor response may receive one short wrap-up extension, but
+      // it must not renew the main loop forever merely because it was normalized to "continue".
+      boundedExtension: !recognizedStatus
     };
   }
 
@@ -1176,18 +1186,19 @@ function normalizeSupervisorDecision(responseText) {
     evidence: [],
     recommendedAction: { type: 'continue' },
     avoid: [],
-    confidence: 0.5
+    confidence: 0.5,
+    boundedExtension: true
   };
 }
 
 function buildSupervisorDecisionPrompt(evidencePacket) {
-  return `You are a bounded supervisor for an autonomous local coding agent. Decide whether the run is healthy or stuck.
+  return `You are a bounded supervisor for an autonomous local coding agent. Your PRIMARY role is to approve continued work. Only return "stuck" when you have clear, specific evidence of a genuine repetitive loop that is producing no new information.
 
 Evidence:
 Recent tool calls:
 ${evidencePacket.recentTools || '(none)'}
 
-Repeated signatures:
+Repeated signatures (same tool+target combinations seen multiple times):
 ${JSON.stringify(evidencePacket.repeated || [], null, 2)}
 
 Context acquisition receipt:
@@ -1196,15 +1207,22 @@ ${JSON.stringify(evidencePacket.context || {}, null, 2)}
 File mutations this run: ${evidencePacket.fileMutations || 0}
 Verification calls this run: ${evidencePacket.verificationCount || 0}
 
-Judge patterns, not a single call. Healthy progress includes reading different relevant files/ranges, running new verification, or making file mutations. Stuck patterns include repeated unchanged reads, repeated identical failures, fragmented context acquisition, identical completion-gate blocks, command loops with no new evidence, or tool oscillation.
+Judge patterns, not a single call.
+CRITICAL GUIDANCE — read before deciding:
+- Large tasks REQUIRE many tool calls. A high call count alone is NOT stuck.
+- read_file and grep_search are always exploratory — they NEVER indicate a loop on their own.
+- "Repeated signatures" counts tool+target pairs, NOT content. Reading the same file at different line ranges shows as "repeated" but is HEALTHY progress exploring a large file.
+- Only return "stuck" if you see: (1) the exact same grep/search returning empty or error results 3+ times in a row with no variation in approach, OR (2) identical failed tool calls (same error, same target) repeating with no change.
+- If file mutations > 0, or recent calls show different search targets or files, return "continue".
+- When uncertain, return "continue". A false "stuck" that kills a valid run is far worse than a false "continue" that extends it by a few turns.
 
 Return compact JSON only:
 {
-  "status": "continue" | "stuck" | "finalize",
+  "status": "continue" | "stuck",
   "pattern": "short_pattern_name",
   "evidence": ["specific evidence from the packet"],
   "recommendedAction": {
-    "type": "continue" | "consolidate_context" | "change_tool_strategy" | "run_verification" | "finalize" | "ask_user",
+    "type": "continue" | "consolidate_context" | "change_tool_strategy" | "run_verification",
     "tool": "optional tool name",
     "target": "optional file/symbol/query target"
   },
@@ -2270,6 +2288,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       );
     }
     let supervisorCorrectionAttempts = 0;
+    let supervisorWrapupExtensions = 0;
     const maxMalformedToolRetries = 5;
     const canExecuteThisTask = () => !config.planningMode || conversation.planApproved || planningBypassedForTask;
 
@@ -3573,9 +3592,26 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         const recommendedAction = supervisorDecision && supervisorDecision.recommendedAction ? supervisorDecision.recommendedAction : { type: 'continue' };
         const actionType = String(recommendedAction.type || '').toLowerCase();
         if (!supervisorDecision || supervisorDecision.status === 'continue') {
-          maxLoops += 15;
-          if (window.appendSystemMessage) {
-            window.appendSystemMessage("Supervisor approved +15 turn extension.", {
+          const boundedExtension = !supervisorDecision || supervisorDecision.boundedExtension === true;
+          if (!boundedExtension || supervisorWrapupExtensions < 1) {
+            const extension = boundedExtension ? 5 : 15;
+            maxLoops += extension;
+            if (boundedExtension) supervisorWrapupExtensions += 1;
+            if (window.appendSystemMessage) {
+              window.appendSystemMessage(
+                boundedExtension
+                  ? "Supervisor response was incomplete; granted one final +5 turn wrap-up."
+                  : "Supervisor approved +15 turn extension.",
+                {
+                  conversationId: conversation.id,
+                  source: 'supervisor-extension',
+                  dedupeKey: `supervisor-extension-${conversation.id}`,
+                  updateExisting: true
+                }
+              );
+            }
+          } else if (window.appendSystemMessage) {
+            window.appendSystemMessage("Supervisor wrap-up extension exhausted; ending at the current action limit.", {
               conversationId: conversation.id,
               source: 'supervisor-extension',
               dedupeKey: `supervisor-extension-${conversation.id}`,
@@ -3605,8 +3641,23 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             });
           }
         } else {
-          if (window.appendSystemMessage) {
-            window.appendSystemMessage("Supervisor halted run due to looping.", {
+          // Supervisor returned stuck with an unhandled action type (e.g. 'finalize'), or this is
+          // a second correction attempt. Grant a small extension so the agent can wrap up rather
+          // than hard-stopping mid-work, and show a neutral status message.
+          if (supervisorWrapupExtensions < 1) {
+            supervisorWrapupExtensions += 1;
+            maxLoops += 5;
+            if (window.appendSystemMessage) {
+              const patternNote = supervisorDecision && supervisorDecision.pattern ? ` (${supervisorDecision.pattern})` : '';
+              window.appendSystemMessage(`Supervisor granted one final +5 turn wrap-up${patternNote}.`, {
+                conversationId: conversation.id,
+                source: 'supervisor-extension',
+                dedupeKey: `supervisor-extension-${conversation.id}`,
+                updateExisting: true
+              });
+            }
+          } else if (window.appendSystemMessage) {
+            window.appendSystemMessage("Supervisor wrap-up extension exhausted; ending at the current action limit.", {
               conversationId: conversation.id,
               source: 'supervisor-extension',
               dedupeKey: `supervisor-extension-${conversation.id}`,
@@ -9586,7 +9637,8 @@ const DISPATCH_TOOL_ALLOWLIST = new Set([
   'get_symbol_index', 'fetch_page', 'git_diff', 'git_rollback', 'edit_config', 'get_file_symbols', 'find_references',
   'read_notes', 'read_project_memory', 'remember_file_notes',
   'inspect_environment',
-  'db_query'
+  'db_query',
+  'ask_clarifying_questions'
 ]);
 
 // Single source of truth for the agent's tool declarations, consumed by every provider
@@ -10182,7 +10234,7 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "ask_clarifying_questions",
-            description: "Pauses and presents 2-3 structured clarifying questions to the user when key design decisions are unspecified. Use BEFORE writing STRATEGY.md when the request leaves critical choices open (visual style, core mechanic, scale/performance strategy, framework). Do not use this as a substitute for inspecting an existing local folder/project/program; if the user named one, call local tools first and ask only for ambiguities that remain after inspection. IMPORTANT: Do NOT say 'Task finished' or any completion text when calling this tool — the task is paused awaiting answers, not done. The user sees an interactive card with radio options, recommended badges, and a free-text 'Other' fallback. Their answers resume the agent automatically.",
+            description: "Pauses and presents 2-3 structured clarifying questions to the user when key design decisions are unspecified. Use when the request leaves critical choices open (visual style, core mechanic, scale/performance strategy, framework, scope, priority). In Coder mode, use BEFORE writing STRATEGY.md. In Dispatch mode, use before routing work to Coder when the design intent is ambiguous. Do not use as a substitute for inspecting an existing local folder/project/program — read first, ask only for ambiguities that remain after inspection. IMPORTANT: Do NOT say 'Task finished' or any completion text when calling this tool — the task is paused awaiting answers, not done. The user sees an interactive card with radio options, recommended badges, and a free-text 'Other' fallback. Their answers resume the agent automatically.",
             parameters: {
               type: "OBJECT",
               properties: {
