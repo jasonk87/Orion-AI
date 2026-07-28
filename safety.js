@@ -4,6 +4,7 @@ const path = require('path');
 const DESTRUCTIVE_PATTERNS = [
   /\brm\s+-r[fF]?\b/i,
   /\bdel\s+\/s\s+\/q\b/i,
+  /(?:^|[;&|]\s*|\bcmd(?:\.exe)?\s+\/[cd]\s+)del\s+/i,
   /\bRemove-Item\s+-Recurse\b/i,
   /\bRemove-Item\b[^\r\n;|&]*\s-(?:Force|LiteralPath|Path)\b/i,
   /\brmdir\b[^\r\n;|&]*(?:\/s|-[rR])\b/i,

@@ -2263,6 +2263,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // requires the file to be here first. (This is the "read before you edit" rule that keeps even
     // a weak model from mangling a file it never looked at.)
     const filesSeenThisRun = inheritedContextSeenFiles(inheritedContextReceipt);
+    // Only files that did not exist before this agent run may be removed through the cleanup
+    // tool. This lets Coder delete scratch scripts it authored without granting a general-purpose
+    // delete primitive over user files or weakening the shell command deny list.
+    const filesCreatedThisRun = new Set();
+    const toolExecutionContext = { filesCreatedThisRun };
     // Files that have been fully read this run and NOT edited since — a subsequent full re-read of
     // one of these returns the same bytes the model already has, which is pure waste (a transcript
     // showed a 2600-line file re-read six times in one run). We still deliver the content (safe —
@@ -3006,7 +3011,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             if (!epistemicGate.allowed) {
               result = { error: epistemicGate.reason, failureCategory: 'unsupported_inference', recoveryGuidance: epistemicGate.guidance };
             } else {
-              result = await executeTool(toolName, args, workspacePath, config, conversation);
+              result = await executeTool(toolName, args, workspacePath, config, conversation, toolExecutionContext);
             }
           } catch (err) {
             result = { error: err.message };
@@ -3261,7 +3266,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         let result;
         const _toolStartTime = Date.now();
         try {
-          result = await executeTool(toolName, args, workspacePath, config, conversation);
+          result = await executeTool(toolName, args, workspacePath, config, conversation, toolExecutionContext);
           if (result && result._forceYield) {
             forceYield = true;
             delete result._forceYield;
@@ -3493,6 +3498,16 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               modelEscalatedForEditKey = null;
             }
           }
+        }
+        if (toolName === 'delete_created_file' && args.path && !isFailedToolResult(result)) {
+          const deletedKey = normalizeInventoryPath(args.path).toLowerCase();
+          filesSeenThisRun.delete(deletedKey);
+          filesFullyReadUnchanged.delete(deletedKey);
+          fileNeedsReadBeforeEdit.delete(deletedKey);
+          fileEditCounts.delete(deletedKey);
+          brokenFiles.delete(deletedKey);
+          consecutiveEditFailureCounts.delete(deletedKey);
+          invalidateContextAcquisitionForFile(contextAcquisitionLedger, args.path, toolName);
         }
         // A successful read_file clears the read-required gate for that file. When the gate was
         // actually blocking an edit, tell the model to retry that edit now instead of stopping or
@@ -4667,7 +4682,7 @@ function buildCuratedFileInventory(files, options = {}) {
 }
 
 // TOOL EXECUTOR HUB
-async function executeTool(name, args, workspace, config, conversation) {
+async function executeTool(name, args, workspace, config, conversation, executionContext = {}) {
   console.log(`Executing tool ${name} with args:`, args);
   
   switch (name) {
@@ -4929,6 +4944,11 @@ async function executeTool(name, args, workspace, config, conversation) {
       const existingContent = isGovernanceArtifact
         ? await readOrionGovernanceArtifactText(workspace, conversation, args.path, { maxChars: 200000 }).catch(error => ({ error: error.message }))
         : await window.api.readFile(workspace, args.path, { maxChars: 200000 });
+      const fileDidNotExist = !isGovernanceArtifact
+        && existingContent
+        && typeof existingContent === 'object'
+        && !Array.isArray(existingContent)
+        && /(?:does not exist|not found|enoent)/i.test(String(existingContent.error || ''));
       if (!isGovernanceArtifact && !isPlanFile && !isStrategyFile && existingContent && !existingContent.error && args.allowOverwrite !== true) {
         throw new Error("write_file refused to overwrite an existing file. Use patch_file for surgical edits, or set allowOverwrite=true with overwriteReason when a full rewrite is explicitly required.");
       }
@@ -4947,6 +4967,9 @@ async function executeTool(name, args, workspace, config, conversation) {
         ? await writeOrionGovernanceArtifactText(workspace, conversation, args.path, args.content)
         : await window.api.writeFile(workspace, args.path, args.content);
       if (writeRes.error) throw new Error(writeRes.error);
+      if (fileDidNotExist && executionContext.filesCreatedThisRun instanceof Set) {
+        executionContext.filesCreatedThisRun.add(normalizeInventoryPath(args.path).toLowerCase());
+      }
       
       // Refresh directory UI
       if (!isGovernanceArtifact && window.syncWorkspaceFiles) window.syncWorkspaceFiles();
@@ -4973,6 +4996,33 @@ async function executeTool(name, args, workspace, config, conversation) {
         success: true,
         message: `File written to ${args.path} successfully.${testFeedback}`,
         backupPath: writeRes.backupPath || null
+      };
+    }
+
+    case 'delete_created_file': {
+      if (!args.path) throw new Error("Missing 'path' parameter");
+      const createdFiles = executionContext.filesCreatedThisRun;
+      const cleanupKey = normalizeInventoryPath(args.path).toLowerCase();
+      if (!(createdFiles instanceof Set) || !createdFiles.has(cleanupKey)) {
+        return {
+          success: false,
+          error: `Cleanup refused: ${args.path} was not created by Orion during this run. The safe cleanup tool cannot delete pre-existing user files; ask the user to remove it or use the file explorer with confirmation.`
+        };
+      }
+      if (!window.api || typeof window.api.deletePath !== 'function') {
+        return { success: false, error: 'Safe workspace cleanup is unavailable in this app version.' };
+      }
+      const deleteResult = await window.api.deletePath(workspace, args.path);
+      if (!deleteResult || deleteResult.success === false || deleteResult.error) {
+        return deleteResult || { success: false, error: `Failed to delete ${args.path}.` };
+      }
+      createdFiles.delete(cleanupKey);
+      if (window.syncWorkspaceFiles) window.syncWorkspaceFiles();
+      return {
+        success: true,
+        path: args.path,
+        backupPath: deleteResult.backupPath || null,
+        message: `Removed Orion-created temporary file ${args.path}.${deleteResult.backupPath ? ` A recoverable backup is stored at ${deleteResult.backupPath}.` : ''}`
       };
     }
     
@@ -6887,7 +6937,7 @@ function getPlanningToolGate(config, canExecute, toolName, args = {}, options = 
   if (!config || !config.planningMode || canExecute) {
     return { allowed: true, forceYield: false, reason: '' };
   }
-  const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'start_command', 'run_tests', 'run_linter', 'sync_workspace_env', 'launch_workspace_app', 'preview_app', 'git_push', 'download_file', 'download_from_page', 'extract_archive', 'take_screenshot'];
+  const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'delete_created_file', 'start_command', 'run_tests', 'run_linter', 'sync_workspace_env', 'launch_workspace_app', 'preview_app', 'git_push', 'download_file', 'download_from_page', 'extract_archive', 'take_screenshot'];
   const completionTools = ['complete_subplan', 'evaluate_win_conditions'];
   const strategyStatus = options.strategyStatus || {};
   const executionMode = options.agentExecutionMode || '';
@@ -6958,6 +7008,7 @@ function getReviewOnlyToolGate(toolName, args = {}) {
   const blockedTools = new Set([
     'modify_file',
     'patch_file',
+    'delete_created_file',
     'sync_workspace_env',
     'set_workspace_entrypoint',
     'start_command',
@@ -7051,6 +7102,9 @@ function summarizeToolStart(toolName, args = {}) {
     const opDetail = op.type && opLabels[op.type] ? ` (${opLabels[op.type]})` : '';
     return { toolName, kind: 'file', status: 'running', path: args.path, operationType: op.type, label: `Patched \`${args.path || 'file'}\`${opDetail}` };
   }
+  if (toolName === 'delete_created_file') {
+    return { toolName, kind: 'cleanup', status: 'running', path: args.path, label: `Removed Orion-created temporary file \`${args.path || 'file'}\`` };
+  }
   if (toolName === 'run_tests') return { toolName, kind: 'test', status: 'running', label: 'Ran regression tests' };
   if (toolName === 'run_linter') return { toolName, kind: 'test', status: 'running', label: `Ran ${args.linterType || 'linter'} on ${args.targetPath || 'workspace'}` };
   if (toolName === 'find_references') return { toolName, status: 'running', label: `Found references for \`${args.symbolName || ''}\`` };
@@ -7099,6 +7153,8 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
     item.detail = item.regressionDetected
       ? `${backupDetail ? `${backupDetail} — ` : ''}⚠ ${hasSyntaxError ? 'Syntax error introduced by this change.' : 'Regression detected: tests failed after this change.'}`
       : backupDetail;
+  } else if (toolName === 'delete_created_file') {
+    item.detail = result && result.backupPath ? `Backup: \`${result.backupPath}\`` : '';
   } else if (toolName === 'set_task_checklist') {
     item.detail = result && result.skipped ? result.message : '';
   } else if (toolName === 'get_workspace_info') {
@@ -10017,6 +10073,17 @@ function buildAgentToolDeclarations() {
                 overwriteReason: { type: "STRING", description: "Required when allowOverwrite is true; explain why a full rewrite is necessary." }
               },
               required: ["path", "content"]
+            }
+          },
+          {
+            name: "delete_created_file",
+            description: "Safely removes a temporary workspace file that Orion itself created with write_file during this run. Use this to clean up one-off diagnostic, counting, conversion, or smoke-test scripts after use. It cannot delete directories or files that existed before the run; never work around a refusal with Remove-Item, del, rm, wrapper scripts, or encoded commands.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                path: { type: "STRING", description: "Relative path of the Orion-created temporary file to remove." }
+              },
+              required: ["path"]
             }
           },
           {

@@ -2905,6 +2905,57 @@ test('grep_search requires a pattern argument', async (t) => {
   t.end();
 });
 
+test('Coder can clean up only files it created during the current run', async (t) => {
+  const deleted = [];
+  global.window.syncWorkspaceFiles = () => {};
+  global.window.api = {
+    readFile: async () => ({ error: 'File not found' }),
+    writeFile: async () => ({ success: true, backupPath: null }),
+    deletePath: async (workspace, relativePath) => {
+      deleted.push({ workspace, relativePath });
+      return { success: true, backupPath: `.orion/backups/${relativePath}.bak` };
+    }
+  };
+  const executionContext = { filesCreatedThisRun: new Set() };
+  const conversation = { id: 'cleanup-owned-file', mode: 'coder' };
+
+  const writeResult = await agent.executeTool(
+    'write_file',
+    { path: '_count_check.py', content: 'print(1)' },
+    '/test/workspace',
+    { autoTest: false },
+    conversation,
+    executionContext
+  );
+  t.equal(writeResult.success, true, 'scratch file creation succeeds');
+  t.ok(executionContext.filesCreatedThisRun.has('_count_check.py'), 'new scratch file is recorded as Orion-owned for this run');
+
+  const deleteResult = await agent.executeTool(
+    'delete_created_file',
+    { path: '_count_check.py' },
+    '/test/workspace',
+    { autoTest: false },
+    conversation,
+    executionContext
+  );
+  t.equal(deleteResult.success, true, 'owned scratch file cleanup succeeds through the safe path API');
+  t.deepEqual(deleted, [{ workspace: '/test/workspace', relativePath: '_count_check.py' }], 'cleanup uses the contained workspace deletion API instead of a shell command');
+  t.notOk(executionContext.filesCreatedThisRun.has('_count_check.py'), 'ownership receipt is consumed after cleanup');
+
+  const refused = await agent.executeTool(
+    'delete_created_file',
+    { path: 'important.py' },
+    '/test/workspace',
+    { autoTest: false },
+    conversation,
+    executionContext
+  );
+  t.equal(refused.success, false, 'pre-existing user file cleanup is refused');
+  t.match(refused.error, /not created by Orion during this run/i, 'refusal explains the ownership boundary');
+  t.equal(deleted.length, 1, 'refused cleanup never reaches the deletion API');
+  t.end();
+});
+
 test('grep_search passes the workspace, pattern, and options through to window.api.grepSearch with sane defaults', async (t) => {
   let capturedArgs = null;
   global.window.api = {

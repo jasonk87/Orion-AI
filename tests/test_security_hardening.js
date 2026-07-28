@@ -55,6 +55,8 @@ test('semantic indexing excludes environment files', (t) => {
 test('destructive command guard catches audited variants', (t) => {
   [
     'Remove-Item -LiteralPath .\\important.txt -Force',
+    'cmd /c del _count_check.py',
+    'del temporary-script.py',
     'cmd /c rmdir /s /q build',
     'node -e "require(\'fs\').rmSync(\'build\',{recursive:true,force:true})"',
     'git checkout -- .',
