@@ -427,6 +427,40 @@ test('supervisor conversational failures persist honestly and propagate to phone
   t.end();
 });
 
+test('Dispatch status check-ins are naturally summarized without raw Coder internals', (t) => {
+  const summaryStart = renderer.indexOf('function buildCoderStatusSummary(coderConvId)');
+  const summaryEnd = renderer.indexOf('\nfunction bindNamedProjectForSupervisor', summaryStart);
+  const summaryPath = renderer.slice(summaryStart, summaryEnd);
+  t.ok(summaryStart >= 0, 'Coder progress has a bounded Dispatch status snapshot');
+  t.notOk(summaryPath.includes('recentActivity'), 'status snapshot does not ingest raw activity records');
+  t.notOk(summaryPath.includes('Recent tool calls:'), 'status snapshot does not print tool calls');
+  t.notOk(summaryPath.includes("tool === '_thought'"), 'status snapshot does not expose model thoughts');
+  t.ok(summaryPath.includes('Checklist progress:'), 'status snapshot retains useful checklist progress');
+  t.ok(summaryPath.includes('Current step:'), 'status snapshot retains the active step');
+
+  const handlerStart = renderer.indexOf('async function handleSupervisorMessage');
+  const handlerEnd = renderer.indexOf('\nwindow.startCoderTaskMonitor', handlerStart);
+  const handlerPath = renderer.slice(handlerStart, handlerEnd);
+  const checkinStart = handlerPath.indexOf('respondCheckin: async () =>');
+  const checkinEnd = handlerPath.indexOf('\n    respondConversationally:', checkinStart);
+  const checkinPath = handlerPath.slice(checkinStart, checkinEnd);
+  t.ok(
+    checkinPath.includes('return respondOrionConversationally(orionConv, prompt, model'),
+    'a recognized check-in uses the normal conversational response path'
+  );
+  t.ok(checkinPath.includes('statusCheckin: true'), 'the conversational model receives focused status guidance');
+  t.notOk(checkinPath.includes("Here's what Coder is up to:"), 'the old mechanical canned response is gone');
+  t.ok(
+    renderer.includes('Do not print raw JSON, tool-call payloads, internal thoughts, or a mechanical field dump.'),
+    'status synthesis explicitly excludes internal payloads'
+  );
+  t.ok(
+    renderer.includes("!String(message && message.source || '').startsWith('supervisor-checkin')"),
+    'an older mechanical check-in cannot leak back through conversational history'
+  );
+  t.end();
+});
+
 test('window maximize control uses the correct Electron fullscreen API', (t) => {
   t.ok(ipcUiJs.includes('mainWindow.isFullScreen()'), 'main process uses BrowserWindow.isFullScreen()');
   t.notOk(ipcUiJs.includes('mainWindow.isFullscreen()'), 'main process does not call the non-existent isFullscreen() API');

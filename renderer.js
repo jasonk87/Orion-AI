@@ -7688,40 +7688,33 @@ function classifySupervisorIntent(text) {
 }
 
 // ── Build a human-readable status summary from Coder conversation data ────────
-// Returns { text, rawActivity, tasks, doneTasks, pendingTasks } so callers can either
-// show the text directly or hand rawActivity to an LLM for natural-language synthesis.
+// Raw tool results and model thoughts are deliberately excluded; Dispatch only needs a bounded
+// progress snapshot to produce a natural user-facing answer.
 function buildCoderStatusSummary(coderConvId) {
   if (typeof window.getCoderConversationSummary !== 'function') return null;
   const data = window.getCoderConversationSummary(coderConvId);
   if (!data) return null;
 
   const lines = [];
-  const { tasks, doneTasks, pendingTasks, recentActivity, subStatus } = data;
+  const {
+    tasks = [],
+    doneTasks = [],
+    pendingTasks = [],
+    subStatus = ''
+  } = data;
 
-  // Task progress
   if (tasks.length > 0) {
-    lines.push(`**Tasks:** ${doneTasks.length}/${tasks.length} done.`);
+    lines.push(`Checklist progress: ${doneTasks.length} of ${tasks.length} complete.`);
     const inProg = tasks.find(t => t.status === 'in-progress' || t.status === '/');
-    if (inProg) lines.push(`Currently working on: _${inProg.title || inProg.text || 'a task'}_`);
-    if (pendingTasks.length) lines.push(`Pending: ${pendingTasks.slice(0, 3).map(t => t.title || t.text || 'task').join(', ')}`);
+    if (inProg) lines.push(`Current step: ${inProg.title || inProg.text || 'Working through the active task'}.`);
+    if (pendingTasks.length) {
+      lines.push(`Next steps: ${pendingTasks.slice(0, 3).map(t => t.title || t.text || 'Pending task').join('; ')}.`);
+    }
   }
 
-  // Most recent tool activity
-  const toolCalls = recentActivity.filter(a => a.tool && a.tool !== '_thought').slice(-10);
-  if (toolCalls.length > 0) {
-    const toolSummary = toolCalls.map(tc => `${tc.tool}${tc.result ? ': ' + tc.result.slice(0, 80) : ''}`).join('\n');
-    lines.push(`Recent tool calls:\n${toolSummary}`);
-  }
+  if (subStatus) lines.push(`Live status: ${String(subStatus).replace(/\s+/g, ' ').trim().slice(0, 240)}.`);
 
-  // Latest thought/text
-  const lastThought = [...recentActivity].reverse().find(a => a.tool === '_thought');
-  if (lastThought && lastThought.text) {
-    lines.push(`Last update: "${lastThought.text.slice(0, 200).replace(/\s+/g, ' ')}${lastThought.text.length > 200 ? '…' : ''}"`);
-  }
-
-  if (subStatus) lines.push(`Currently: ${subStatus}`);
-
-  return { text: lines.join('\n'), rawActivity: recentActivity, tasks, doneTasks, pendingTasks };
+  return { text: lines.join('\n'), tasks, doneTasks, pendingTasks, subStatus };
 }
 
 function bindNamedProjectForSupervisor(orionConv, prompt) {
@@ -7756,10 +7749,13 @@ async function respondOrionConversationally(orionConv, prompt, model, options = 
   const config = window.getAppConfig ? window.getAppConfig() : {};
 
   // Build context: recent conversation history (last 10 messages)
-  const recentMsgs = (orionConv.messages || []).slice(-10).map(m => ({
-    role: m.role === 'assistant' || m.role === 'model' ? 'assistant' : 'user',
-    content: String(m.text || m.content || '').slice(0, 500)
-  }));
+  const recentMsgs = (orionConv.messages || [])
+    .filter(message => !options.statusCheckin || !String(message && message.source || '').startsWith('supervisor-checkin'))
+    .slice(-10)
+    .map(m => ({
+      role: m.role === 'assistant' || m.role === 'model' ? 'assistant' : 'user',
+      content: String(m.text || m.content || '').slice(0, 500)
+    }));
 
   // Add coder context if a coder task is running
   let coderContext = '';
@@ -7781,7 +7777,10 @@ async function respondOrionConversationally(orionConv, prompt, model, options = 
         source: workspace.source
       }, (RendererWorkspaceResolution.extractProjectReferences(prompt) || [])[0] || '')
     : '';
-  const systemPrompt = `You are Orion, an AI supervisor. You are having a conversation with the user while a separate Coder agent works on a task in the background. Answer the user's question conversationally and helpfully. Do not tell the user to wait for the coder to finish — you can talk freely. Be concise and direct. Never invent a remembered conversation or upgrade a reported status.${workspaceDescription ? `\n\nWorkspace state: ${workspaceDescription}` : ''}${coderContext}`;
+  const statusGuidance = options.statusCheckin
+    ? '\n\nThe user is checking on Coder. Answer naturally in one short progress update using only the Coder task status supplied below. Summarize what is complete, what is happening now, and what remains when those facts are available. Do not print raw JSON, tool-call payloads, internal thoughts, or a mechanical field dump. Do not guess percentages or claim completion that is not recorded.'
+    : '';
+  const systemPrompt = `You are Orion, an AI supervisor. You are having a conversation with the user while a separate Coder agent works on a task in the background. Answer the user's question conversationally and helpfully. Do not tell the user to wait for the coder to finish — you can talk freely. Be concise and direct. Never invent a remembered conversation or upgrade a reported status.${statusGuidance}${workspaceDescription ? `\n\nWorkspace state: ${workspaceDescription}` : ''}${coderContext}`;
 
   if (typeof window.clearActiveAiBubble === 'function') window.clearActiveAiBubble();
 
@@ -7815,7 +7814,7 @@ async function respondOrionConversationally(orionConv, prompt, model, options = 
       id: createConversationMessageId(orionConv.id),
       role: 'assistant',
       text: replyText,
-      source: 'supervisor-conversational',
+      source: options.statusCheckin ? 'supervisor-checkin' : 'supervisor-conversational',
       createdAt: Date.now(),
       responseBasis: result.responseBasis
     });
@@ -7833,12 +7832,12 @@ async function respondOrionConversationally(orionConv, prompt, model, options = 
     };
   } catch (err) {
     console.error('respondOrionConversationally error:', err);
-    const fallback = "I'm juggling the coder task right now — ask me again in a moment and I'll have a better answer.";
+    const fallback = String(options.fallbackText || "I'm juggling the coder task right now — ask me again in a moment and I'll have a better answer.");
     orionConv.messages.push({
       id: createConversationMessageId(orionConv.id),
       role: 'assistant',
       text: fallback,
-      source: 'supervisor-conversational-error',
+      source: options.statusCheckin ? 'supervisor-checkin-error' : 'supervisor-conversational-error',
       createdAt: Date.now()
     });
     orionConv.updatedAt = Date.now();
@@ -7925,26 +7924,14 @@ async function handleSupervisorMessage(orionConv, prompt, model, options = {}) {
     },
     respondCheckin: async () => {
       const summary = buildCoderStatusSummary(coderConvId);
-      const replyText = (summary && summary.text)
-        ? `Here's what Coder is up to:\n\n${summary.text}`
-        : 'Coder is active, but no detailed status is available yet.';
-      orionConv.messages.push({
-        id: createConversationMessageId(orionConv.id),
-        role: 'assistant',
-        text: replyText,
-        source: 'supervisor-checkin',
-        createdAt: Date.now(),
-        responseBasis: RendererOrchestrationContracts
-          ? RendererOrchestrationContracts.createResponseBasis({ generalInference: false })
-          : null
+      const fallbackText = (summary && summary.text)
+        ? `Coder is still working. ${summary.text.replace(/\n+/g, ' ')}`
+        : 'Coder is active, but it has not recorded a detailed progress update yet.';
+      return respondOrionConversationally(orionConv, prompt, model, {
+        ...options,
+        statusCheckin: true,
+        fallbackText
       });
-      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
-      if (typeof window.renderAiMessage === 'function') {
-        if (typeof window.clearActiveAiBubble === 'function') window.clearActiveAiBubble();
-        window.renderAiMessage(replyText, [], orionConv.id);
-      }
-      if (typeof scrollChatToBottom === 'function') scrollChatToBottom();
-      return { success: true, status: 'active', replyText };
     },
     respondConversationally: () => respondOrionConversationally(orionConv, prompt, model, options)
   });
