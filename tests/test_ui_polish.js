@@ -643,7 +643,7 @@ test('Dispatch relays delegated plans and completion evidence without forcing a 
 });
 
 test('delegated plan approval survives conversation reload on desktop and phone', t => {
-  const hydrationStart = renderer.indexOf('function hydrateConversationRecord(');
+  const hydrationStart = renderer.indexOf('function findDelegatedPlanMessage(');
   const hydrationEnd = renderer.indexOf('// True only after the on-disk index', hydrationStart);
   const hydrationSource = renderer.slice(hydrationStart, hydrationEnd);
   const hydrateConversationRecord = Function(
@@ -672,14 +672,21 @@ test('delegated plan approval survives conversation reload on desktop and phone'
       delegatedPlan
     }],
     tasks: [],
-    awaitingDelegatedPlan: delegatedPlan,
     awaitingPlanApprovalTaskId: delegatedPlan.taskId
   };
+  const durableTasks = new Map([[
+    delegatedPlan.taskId,
+    {
+      taskId: delegatedPlan.taskId,
+      status: 'pending',
+      origin: { conversationId: stub.id }
+    }
+  ]]);
 
-  const hydrated = hydrateConversationRecord(stub, persisted);
+  const hydrated = hydrateConversationRecord(stub, persisted, durableTasks);
   t.equal(hydrated, stub, 'hydration preserves the index object used by active UI references');
   t.deepEqual(hydrated.awaitingDelegatedPlan, delegatedPlan,
-    'the actionable delegated-plan ownership is restored with the transcript');
+    'an older affected record rebuilds actionable approval from its plan card and exact pending task');
   t.equal(hydrated.awaitingPlanApprovalTaskId, delegatedPlan.taskId,
     'the exact approval task ID survives hydration');
   t.equal(hydrated.messages[0].isDelegatedPlanCard, true,
@@ -694,5 +701,9 @@ test('delegated plan approval survives conversation reload on desktop and phone'
     'the lightweight conversation index retains pending delegated-plan state across restart');
   t.ok(renderer.includes("awaitingPlanApprovalTaskId: c.awaitingPlanApprovalTaskId || ''"),
     'the lightweight index retains exact approval ownership');
+  t.ok(renderer.includes('delegatedPlanRevisionRequested')
+      && renderer.includes('delegatedPlanApproved')
+      && renderer.includes('delegatedPlanDenied'),
+    'resolved or superseded plan messages cannot be resurrected during later reloads');
   t.end();
 });

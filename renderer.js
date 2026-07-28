@@ -3556,7 +3556,27 @@ function mergeConversationSets(...sets) {
 // Rehydrate the complete persisted record in place so callers holding the lightweight index
 // object keep a valid reference. Actionable state such as delegated-plan approval ownership must
 // survive a restart just as reliably as transcript messages.
-function hydrateConversationRecord(conversation, persistedConversation) {
+function findDelegatedPlanMessage(conversation, taskId = '') {
+  const expectedTaskId = String(taskId || '');
+  return [...(Array.isArray(conversation && conversation.messages) ? conversation.messages : [])]
+    .reverse()
+    .find(message => message
+      && message.isDelegatedPlanCard
+      && message.delegatedPlan
+      && (!expectedTaskId || String(message.delegatedPlan.taskId || '') === expectedTaskId)) || null;
+}
+
+function markDelegatedPlanMessageState(conversation, taskId, stateField) {
+  const message = findDelegatedPlanMessage(conversation, taskId);
+  if (message && stateField) message[stateField] = true;
+  return message;
+}
+
+function hydrateConversationRecord(
+  conversation,
+  persistedConversation,
+  durableTasks = orchestrationTaskCache
+) {
   if (!conversation || !persistedConversation || typeof persistedConversation !== 'object') {
     return conversation;
   }
@@ -3567,6 +3587,25 @@ function hydrateConversationRecord(conversation, persistedConversation) {
   conversation.tasks = Array.isArray(persistedConversation.tasks) ? persistedConversation.tasks : [];
   conversation.isStub = false;
   conversation.hasMessages = conversation.messages.length > 0;
+  if (!conversation.awaitingDelegatedPlan) {
+    const planMessage = findDelegatedPlanMessage(conversation);
+    const delegatedPlan = planMessage && planMessage.delegatedPlan;
+    const taskId = String(delegatedPlan && delegatedPlan.taskId || '');
+    const durableTask = taskId && durableTasks && typeof durableTasks.get === 'function'
+      ? durableTasks.get(taskId)
+      : null;
+    const taskStatus = String(durableTask && durableTask.status || '');
+    const originConversationId = String(durableTask && durableTask.origin && durableTask.origin.conversationId || '');
+    if (delegatedPlan
+        && !planMessage.delegatedPlanApproved
+        && !planMessage.delegatedPlanDenied
+        && !planMessage.delegatedPlanRevisionRequested
+        && (taskStatus === 'pending' || taskStatus === 'active')
+        && (!originConversationId || originConversationId === conversation.id)) {
+      conversation.awaitingDelegatedPlan = delegatedPlan;
+      conversation.awaitingPlanApprovalTaskId = taskId;
+    }
+  }
   return conversation;
 }
 
@@ -4530,6 +4569,7 @@ async function submitMessage() {
       feedback: prompt
     });
     if (revision && revision.success !== false) {
+      markDelegatedPlanMessageState(conv, delegatedPlan.taskId, 'delegatedPlanRevisionRequested');
       conv.awaitingDelegatedPlan = null;
       notifyOrionConversation(
         conv,
@@ -6901,6 +6941,7 @@ window.approvePhoneCompanionPlan = async (targetId) => {
     const delegatedPlan = conv.awaitingDelegatedPlan;
     const result = await window.approvePhoneCompanionPlan(delegatedPlan.coderConversationId);
     if (result && result.success !== false) {
+      markDelegatedPlanMessageState(conv, delegatedPlan.taskId, 'delegatedPlanApproved');
       conv.awaitingDelegatedPlan = null;
       notifyOrionConversation(
         conv,
@@ -6995,7 +7036,10 @@ window.denyPhoneCompanionPlan = async (targetId) => {
   if (conv && conv.awaitingDelegatedPlan) {
     const delegatedPlan = conv.awaitingDelegatedPlan;
     const result = await window.denyPhoneCompanionPlan(delegatedPlan.coderConversationId);
-    if (result && result.success !== false) conv.awaitingDelegatedPlan = null;
+    if (result && result.success !== false) {
+      markDelegatedPlanMessageState(conv, delegatedPlan.taskId, 'delegatedPlanDenied');
+      conv.awaitingDelegatedPlan = null;
+    }
     return result;
   }
   if (!conv) return { success: false, error: 'No active conversation' };
