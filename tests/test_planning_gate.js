@@ -2083,14 +2083,14 @@ test('editing a different file while an earlier one has an unresolved syntax err
 });
 
 // Regression: stall detection previously only counted completed checklist items + satisfied win
-// conditions as "progress". A model that made real file edits/commands but forgot to check off a
-// task looked identical to a pass that only produced failures, and both got flagged as stalled
-// after enough passes — stopping a run that was actually still making progress.
-test('stall detection also treats successful file edits/commands as progress, not just checklist completion', (t) => {
+// conditions as "progress". Real edits or newly acquired evidence must reset it, while repeating
+// the same successful no-op command forever must not.
+test('stall detection treats successful edits and newly acquired evidence as progress', (t) => {
   const agentSource = require('fs').readFileSync(require('path').join(__dirname, '../agent.js'), 'utf8');
-  t.ok(agentSource.includes('hadSuccessfulEditOrCommandThisPass'), 'stall detection tracks successful edits/commands this pass');
-  t.ok(agentSource.includes('progressScore > conversation._lastProgressScore || hadSuccessfulEditOrCommandThisPass'),
-    'a pass resets stall tracking on either checklist progress or a successful edit/command, not checklist progress alone');
+  t.ok(agentSource.includes('hadSuccessfulFileMutationThisPass'), 'stall detection tracks successful source mutations');
+  t.ok(agentSource.includes('hadNewEvidenceThisPass'), 'stall detection tracks new bounded tool evidence across passes');
+  t.ok(agentSource.includes('progressScore > conversation._lastProgressScore || hadSuccessfulFileMutationThisPass || hadNewEvidenceThisPass'),
+    'checklist progress, real edits, or new evidence can reset stall tracking');
   t.end();
 });
 
@@ -2231,11 +2231,11 @@ test('completion gate fires for any execution mode with mission state, not only 
   );
   t.ok(agentSource.includes('if (executingApprovedPlan && !reviewOnly) maxLoops = 100'), 'approved plan execution gets a large loop budget for long tasks');
   t.ok(agentSource.includes('autoContinueExecution = true'), 'auto-continue path exists for unfinished plan execution');
-  t.ok(agentSource.includes('AUTO_CONTINUE_BUDGET'), 'auto-continue is bounded by an absolute ceiling to prevent runaway loops');
+  t.notOk(agentSource.includes('AUTO_CONTINUE_BUDGET'), 'healthy durable tasks are not stopped by an arbitrary total-pass ceiling');
   t.ok(agentSource.includes('STALL_LIMIT'), 'auto-continue stops when no goal-level progress is made across passes');
-  t.ok(agentSource.includes('progressScore'), 'stall detection is based on completed-work progress, not just activity');
-  t.ok(agentSource.includes('const hasResumableWork = hasOperationalMissionState(workingState) || pendingChecklist.length > 0'), 'auto-continue falls back to the checklist when mission state is absent');
-  t.ok(agentSource.includes("taskId: runTaskId || ''"), 'an internal continuation retains the same durable task ID after the active-run pointer is cleared');
+  t.ok(agentSource.includes('_seenWorkProgressSignatures'), 'stall detection recognizes bounded, newly acquired evidence across passes');
+  t.ok(agentSource.includes('durableBoundaryWork'), 'a pass-boundary durable task remains resumable without checklist bookkeeping');
+  t.ok(agentSource.includes('taskId: normalizedTaskId'), 'an internal continuation retains the same durable task ID after the active-run pointer is cleared');
   t.end();
 });
 

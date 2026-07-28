@@ -6400,7 +6400,9 @@ window.onAgentRunFinalized = async function(conversationId, status, details = {}
     renderAgentPresence('attention', 'Failed', 'Open the transcript for the recorded error');
     showToast('The task failed.', 'error');
   } else if (canonicalStatus === 'pending') {
-    if (conv && conv.awaitingPlanApproval && !conv.planApproved) {
+    if (details.automaticContinuation) {
+      renderAgentPresence('working', 'Continuing', 'Orion checkpointed this pass and is continuing the same task');
+    } else if (conv && conv.awaitingPlanApproval && !conv.planApproved) {
       revealAgentPanel('A plan is ready for review.');
       renderAgentPresence('attention', 'Review needed', 'Implementation plan is waiting for approval');
     } else if (conv && conv.awaitingClarification) {

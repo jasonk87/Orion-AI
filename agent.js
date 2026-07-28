@@ -1645,6 +1645,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let memoryConfidenceCorrections = 0;
   let statusAccuracyCorrections = 0;
   let criticalRunError = null;
+  let lastBoundarySupervisorStatus = '';
+  let automaticContinuationQueued = false;
   // Set right after the main while loop exits, in the outer function scope so the `finally` block
   // below (which runs in a separate block from the `try` that declares loopCount/maxLoops) can see
   // whether the loop stopped because it hit its raw per-turn ceiling rather than because the model
@@ -3679,6 +3681,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         );
         const recommendedAction = supervisorDecision && supervisorDecision.recommendedAction ? supervisorDecision.recommendedAction : { type: 'continue' };
         const actionType = String(recommendedAction.type || '').toLowerCase();
+        lastBoundarySupervisorStatus = supervisorDecision && supervisorDecision.status
+          ? String(supervisorDecision.status).toLowerCase()
+          : 'continue';
         if (!supervisorDecision || supervisorDecision.status === 'continue') {
           const boundedExtension = !supervisorDecision || supervisorDecision.boundedExtension === true;
           if (!boundedExtension || supervisorWrapupExtensions < 1) {
@@ -3699,7 +3704,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               );
             }
           } else if (window.appendSystemMessage) {
-            window.appendSystemMessage("Supervisor wrap-up extension exhausted; ending at the current action limit.", {
+            window.appendSystemMessage("Execution pass extension exhausted; closing this pass at the current action boundary.", {
               conversationId: conversation.id,
               source: 'supervisor-extension',
               dedupeKey: `supervisor-extension-${conversation.id}`,
@@ -3745,7 +3750,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               });
             }
           } else if (window.appendSystemMessage) {
-            window.appendSystemMessage("Supervisor wrap-up extension exhausted; ending at the current action limit.", {
+            window.appendSystemMessage("Execution pass extension exhausted; closing this pass at the current action boundary.", {
               conversationId: conversation.id,
               source: 'supervisor-extension',
               dedupeKey: `supervisor-extension-${conversation.id}`,
@@ -3823,13 +3828,33 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       ? workingState.winConditions.filter(condition => condition.status === 'satisfied').length : 0;
     const progressScore = completedChecklist + satisfiedWins;
 
-    // Real workspace edits/commands this pass are also genuine progress, even if the model never
-    // called set_task_checklist to check anything off. Checklist bookkeeping is a courtesy the
-    // model can forget to do — it must not be the only signal stall detection trusts, or a pass
-    // that made real file edits (but no checklist update) looks identical to a pass that thrashed
-    // on nothing but failed tool calls, and both get stopped prematurely as "stalled."
-    const EDIT_OR_COMMAND_TOOLS = new Set(['write_file', 'modify_file', 'patch_file', 'run_command', 'start_command', 'run_tests', 'run_linter']);
-    const hadSuccessfulEditOrCommandThisPass = (workWalkthrough || []).some(item => item && item.status !== 'error' && EDIT_OR_COMMAND_TOOLS.has(item.toolName));
+    // Real workspace edits and newly acquired tool evidence are also genuine progress, even if the
+    // model never updates a checklist. Persist bounded evidence signatures across passes so reading
+    // new files/ranges or running a new verification resets the stall detector, while repeating the
+    // same successful no-op command forever does not.
+    const EDIT_TOOLS = new Set(['write_file', 'modify_file', 'patch_file']);
+    const hadSuccessfulFileMutationThisPass = (workWalkthrough || []).some(item =>
+      item && item.status !== 'error' && EDIT_TOOLS.has(item.toolName));
+    const successfulProgressSignatures = [...new Set((workWalkthrough || [])
+      .filter(item => item && item.status === 'done')
+      .map(item => [
+        item.toolName || '',
+        item.path || '',
+        item.command || '',
+        item.label || '',
+        item.detail || ''
+      ].join('|').toLowerCase()))];
+    const priorProgressSignatures = new Set(
+      Array.isArray(conversation._seenWorkProgressSignatures)
+        ? conversation._seenWorkProgressSignatures
+        : []
+    );
+    const hadNewEvidenceThisPass = successfulProgressSignatures.some(signature =>
+      signature && !priorProgressSignatures.has(signature));
+    for (const signature of successfulProgressSignatures) {
+      if (signature) priorProgressSignatures.add(signature);
+    }
+    conversation._seenWorkProgressSignatures = [...priorProgressSignatures].slice(-500);
 
     // A pass whose only file mutations were documentation (STRATEGY.md, implementation_plan.md,
     // README, etc.) was almost certainly a planning/documentation request, not a build. Auto-queuing
@@ -3847,31 +3872,50 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
     conversation._planExecAutoContinues = conversation._planExecAutoContinues || 0;
     if (typeof conversation._lastProgressScore !== 'number') conversation._lastProgressScore = -1;
-    if (progressScore > conversation._lastProgressScore || hadSuccessfulEditOrCommandThisPass) {
+    if (progressScore > conversation._lastProgressScore || hadSuccessfulFileMutationThisPass || hadNewEvidenceThisPass) {
       conversation._stallPasses = 0;
       conversation._lastProgressScore = Math.max(progressScore, conversation._lastProgressScore);
     } else {
       conversation._stallPasses = (conversation._stallPasses || 0) + 1;
     }
 
-    // The goal is to run very long tasks to completion unattended. Continue as long as the plan
-    // is mid-execution, this pass did real work, nothing is blocked, and we are neither stalled
-    // (no goal-level progress for STALL_LIMIT passes) nor past the absolute ceiling.
-    const AUTO_CONTINUE_BUDGET = 100;  // absolute ceiling so a runaway can never loop forever
+    // Do not impose an arbitrary size limit on the durable task. When a bounded fallback closes a
+    // still-healthy pass, the work rolls into a fresh pass under the same task ID. Cancellation,
+    // approval gates, blockers, and repeated no-progress passes remain the stopping controls.
     const STALL_LIMIT = 8;             // consecutive passes with no completed-work progress before stopping
     const stalled = (conversation._stallPasses || 0) >= STALL_LIMIT;
-    // Continue when there is a real mission in flight OR an outstanding checklist — the checklist
-    // fallback keeps long work going even if operational mission state is unexpectedly absent.
-    const hasResumableWork = hasOperationalMissionState(workingState) || pendingChecklist.length > 0;
-    if (!forceYield && !userRequestedStop && canExecuteAtExit && hasPendingWork && madeProgressThisRun && !blockersActive && !stalled
-        && hasResumableWork && conversation._planExecAutoContinues < AUTO_CONTINUE_BUDGET
+    // Reaching the pass boundary means a durable task is unfinished even when the model omitted
+    // checklist/mission bookkeeping. This closes the direct-task gap that used to park healthy
+    // work and require the user to type "continue".
+    const durableBoundaryWork = !!(
+      runTaskId
+      && ranOutOfLoopBudget
+      && madeProgressThisRun
+      && lastBoundarySupervisorStatus !== 'stuck'
+    );
+    const hasResumableWork = hasOperationalMissionState(workingState)
+      || pendingChecklist.length > 0
+      || durableBoundaryWork;
+    const unfinishedExecution = hasPendingWork || durableBoundaryWork;
+    if (!forceYield && !userRequestedStop && canExecuteAtExit && unfinishedExecution && madeProgressThisRun && !blockersActive && !stalled
+        && hasResumableWork
         && !conversation.awaitingPlanApproval && !docOnlyRun) {
       autoContinueExecution = true;
       conversation._planExecAutoContinues++;
+      if (ranOutOfLoopBudget && window.appendSystemMessage) {
+        window.appendSystemMessage("Execution pass checkpointed after verified progress; continuing the same task automatically.", {
+          conversationId: conversation.id,
+          source: 'supervisor-extension',
+          dedupeKey: `supervisor-extension-${conversation.id}`,
+          updateExisting: true
+        });
+      }
     }
 
-    const stoppedShort = conversation._planExecAutoContinues >= AUTO_CONTINUE_BUDGET || stalled;
-    if (lastTextResponse === "Thinking...") {
+    const stoppedShort = stalled;
+    if (autoContinueExecution && ranOutOfLoopBudget) {
+      lastTextResponse = 'This execution pass reached its action boundary after making progress. Orion checkpointed the work and is continuing the same task automatically.';
+    } else if (lastTextResponse === "Thinking...") {
       if (autoContinueExecution) {
         lastTextResponse = 'Completed the next batch of implementation steps. Continuing automatically with the remaining plan…';
       } else if (hasPendingWork && canExecuteAtExit && !forceYield) {
@@ -3989,7 +4033,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const pendingOperationalTask = (conversation.tasks || []).find(task => task.status !== 'completed' && task.status !== 'x');
     await checkpointOperationalContext(
       workspacePath,
-      forceYield ? 'agent_yield' : 'agent_run_complete',
+      forceYield ? 'agent_yield' : (autoContinueExecution ? 'agent_pass_checkpoint' : 'agent_run_complete'),
       String(lastTextResponse || 'Agent run finished.').replace(/\s+/g, ' ').slice(0, 1000),
       pendingOperationalTask ? pendingOperationalTask.title : ''
     );
@@ -4031,9 +4075,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             ? 'Cancelled by user.'
             : (criticalRunError
               ? String(criticalRunError.message || criticalRunError)
-              : (forcedYieldFailure
-                ? `Paused after ${forcedYieldFailure.failureCount || 3} repeated ${forcedYieldFailure.toolName || 'tool'} failures.`
-                : ''))),
+              : (autoContinueExecution
+                ? 'Execution pass checkpointed after verified progress; the same task will continue automatically.'
+                : (forcedYieldFailure
+                  ? `Paused after ${forcedYieldFailure.failureCount || 3} repeated ${forcedYieldFailure.toolName || 'tool'} failures.`
+                  : '')))),
         summary: String(lastTextResponse || '').replace(/\s+/g, ' ').slice(0, 1000),
         result: {
           summary: String(lastTextResponse || '').trim().slice(0, 5000),
@@ -4087,6 +4133,16 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             ? 'pending'
             : 'completed'));
     }
+    if (autoContinueExecution
+        && finalizedTaskState === 'pending'
+        && !conversation.awaitingPlanApproval) {
+      automaticContinuationQueued = enqueueAutomaticTaskContinuation({
+        conversation,
+        modelName,
+        taskId: runTaskId,
+        structuredPlan: hasOperationalMissionState(workingState) || pendingChecklist.length > 0
+      });
+    }
 
     const persistReconciledTaskMessage = async (text) => {
       lastTextResponse = text;
@@ -4127,8 +4183,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       try {
         await window.onAgentRunFinalized(conversation.id, finalizedTaskState, {
           taskId: runTaskId,
-          pendingWork: !!hasPendingWork,
-          awaitingUser: !!(forceYield || conversation.awaitingPlanApproval || conversation.awaitingClarification)
+          pendingWork: !!(hasPendingWork || autoContinueExecution),
+          awaitingUser: !!(forceYield || conversation.awaitingPlanApproval || conversation.awaitingClarification),
+          automaticContinuation: !!(autoContinueExecution && automaticContinuationQueued)
         });
       } catch (error) {
         console.error('Could not publish the finalized agent-run state:', error);
@@ -4166,30 +4223,6 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     window.saveConversationsToStorage();
     if (window.renderConversationList) window.renderConversationList();
     if (window.renderProjectsList) window.renderProjectsList();
-  }
-
-  // If the run stopped mid-plan with real progress and pending work, queue an internal
-  // continuation so a multi-phase build keeps going instead of falsely ending. Existing user work
-  // keeps priority, but the originating task must retain its continuation behind that work rather
-  // than being silently stranded whenever the queue is non-empty.
-  if (autoContinueExecution && !conversation.awaitingPlanApproval) {
-    if (!Array.isArray(window.promptQueue)) window.promptQueue = [];
-    const continuationAlreadyQueued = window.promptQueue.some(item =>
-      item
-      && item.source === 'system'
-      && item.conversationId === conversation.id
-      && String(item.prompt || '').includes('[ORION INTERNAL CONTINUATION')
-      && (!runTaskId || String(item.taskId || '') === runTaskId));
-    if (!continuationAlreadyQueued) {
-      window.promptQueue.push({
-        prompt: '[ORION INTERNAL CONTINUATION - not a user message] The approved plan is still in progress. Continue executing the remaining checklist items and subplan steps now: write and edit the actual source files for the next pending tasks, then verify. Do not restate the plan or stop until the work is genuinely complete or you hit a real blocker. Do not quote this as something the user said.',
-        modelSelectValue: modelName,
-        conversationId: conversation.id,
-        taskId: runTaskId || '',
-        alreadyRendered: true,
-        source: 'system'
-      });
-    }
   }
 
   scheduleQueueDrain(500);
@@ -4335,6 +4368,33 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     }
   }
 };
+
+function enqueueAutomaticTaskContinuation({ conversation, modelName, taskId = '', structuredPlan = false } = {}) {
+  if (!conversation || !conversation.id || conversation.awaitingPlanApproval) return false;
+  if (!Array.isArray(window.promptQueue)) window.promptQueue = [];
+  const normalizedTaskId = String(taskId || '');
+  const continuationAlreadyQueued = window.promptQueue.some(item =>
+    item
+    && item.source === 'system'
+    && item.conversationId === conversation.id
+    && String(item.prompt || '').includes('[ORION INTERNAL CONTINUATION')
+    && (!normalizedTaskId || String(item.taskId || '') === normalizedTaskId));
+  if (continuationAlreadyQueued) return true;
+
+  const directive = structuredPlan
+    ? 'The approved task is still in progress. Continue from the durable checklist, operational state, and completed work. Execute the next unfinished steps and verify them.'
+    : 'The durable task reached a per-pass action boundary while making progress. Continue from the existing conversation, tool evidence, and workspace state. Perform the next unfinished action and verify the complete objective.';
+  window.promptQueue.push({
+    prompt: `[ORION INTERNAL CONTINUATION - not a user message] ${directive} Do not restart completed work, restate the plan, or stop merely because this is a fresh execution pass. Stop only for completion, cancellation, required user input, a real blocker, or repeated work that produces no new evidence. Do not quote this as something the user said.`,
+    modelSelectValue: modelName,
+    conversationId: conversation.id,
+    taskId: normalizedTaskId,
+    alreadyRendered: true,
+    preserveUserPrompt: true,
+    source: 'system'
+  });
+  return true;
+}
 
 function scheduleQueueDrain(delayMs = 0) {
   if (queueDrainTimer !== null) return;

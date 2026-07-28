@@ -72,6 +72,10 @@ function installHarness(modelTurns, options = {}) {
     if (serialized.includes('Classify whether this Orion AI request should require an implementation plan')) {
       return geminiResponse([{ text: '{"mode":"direct","reason":"test"}' }]);
     }
+    if (serialized.includes('bounded supervisor for an autonomous local coding agent')
+        && Object.prototype.hasOwnProperty.call(options, 'supervisorResponse')) {
+      return geminiResponse([{ text: String(options.supervisorResponse || '') }]);
+    }
     const next = modelTurns[Math.min(turnIndex, modelTurns.length - 1)];
     turnIndex += 1;
     return geminiResponse(typeof next === 'function' ? next(body) : next);
@@ -1344,6 +1348,92 @@ test('automatic continuation stays queued behind existing user work instead of b
   t.end();
 });
 
+test('healthy durable direct task checkpoints and automatically continues when a pass hits its action boundary', async t => {
+  const originalFetch = global.fetch;
+  const originalNodeEnv = process.env.NODE_ENV;
+  const finalized = [];
+  const finalizedRuns = [];
+  const turns = Array.from({ length: 25 }, (_, index) => ([
+    ...(index === 0 ? [{ text: 'I am updating the requested implementation now.' }] : []),
+    {
+      functionCall: {
+        name: 'run_command',
+        args: { command: `node -e "console.log(${index})"` }
+      }
+    }
+  ]));
+  installHarness(turns, {
+    supervisorResponse: '',
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE',
+    api: {
+      runCommand: async () => ({ success: true, exitCode: 0, stdout: 'ok', stderr: '' })
+    },
+    window: {
+      claimOrchestrationTask: async taskId => ({
+        success: true,
+        task: { taskId, status: 'active', execution: { executionId: 'exec-boundary-rollover' } },
+        prompt: 'Finish the durable direct task and verify the result.'
+      }),
+      finalizeOrchestrationTask: async (taskId, status, details) => {
+        finalized.push({ taskId, status, details });
+        return { taskId, status };
+      },
+      onOrchestrationTaskFinalized: async () => {},
+      onAgentRunFinalized: async (conversationId, status, details) => {
+        finalizedRuns.push({ conversationId, status, details });
+      }
+    }
+  });
+  const waitingUserTask = {
+    taskId: 'task-user-waiting',
+    conversationId: 'another-conversation',
+    prompt: 'Keep this user work ahead of internal continuation.',
+    source: 'queue'
+  };
+  global.window.promptQueue = [waitingUserTask];
+  global.setTimeout = (fn, delay, ...args) => {
+    if (delay === 100 || delay === 500) return null;
+    return nativeSetTimeout(fn, delay, ...args);
+  };
+  const conv = conversation('durable-boundary-rollover', {
+    mode: 'coder',
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE',
+    _planExecAutoContinues: 100
+  });
+  try {
+    // Exercise the real provider/supervisor path. An empty supervisor reply reproduces the live
+    // malformed-response fallback that grants one +5 wrap-up before the pass boundary closes.
+    process.env.NODE_ENV = 'production';
+    await global.window.runAgentLoop(
+      'Finish the durable direct task and verify the result.',
+      'gemini-1',
+      conv,
+      { taskId: 'task-boundary-rollover' }
+    );
+
+    t.equal(finalized.length, 1, 'the execution pass records one canonical transition');
+    t.equal(finalized[0].taskId, 'task-boundary-rollover', 'the original durable task identity is preserved');
+    t.equal(finalized[0].status, 'pending', 'the unfinished pass checkpoints as pending, not completed or failed');
+    t.match(finalized[0].details.reason, /continue automatically/i, 'the pending reason records automatic continuation');
+    t.equal(global.window.promptQueue.length, 2, 'existing user work and the internal continuation both remain queued');
+    t.equal(global.window.promptQueue[0], waitingUserTask, 'existing user work retains queue priority');
+    const continuation = global.window.promptQueue[1];
+    t.equal(continuation.taskId, 'task-boundary-rollover', 'the next pass reuses the same task ID');
+    t.equal(continuation.conversationId, conv.id, 'the next pass reuses the same Coder conversation');
+    t.equal(continuation.preserveUserPrompt, true, 'the continuation directive is not replaced by the original task prompt');
+    t.match(continuation.prompt, /per-pass action boundary/i, 'the next pass receives an explicit checkpoint continuation directive');
+    const answer = conv.messages.find(message => message.role === 'assistant').text;
+    t.match(answer, /continuing the same task automatically/i, 'the transcript explains that this is a checkpoint, not a final answer');
+    t.notOk(/ask me to continue/i.test(answer), 'the user is not asked to babysit a healthy durable task');
+    t.equal(finalizedRuns.length, 1, 'the renderer receives one end-of-pass lifecycle update');
+    t.equal(finalizedRuns[0].details.automaticContinuation, true, 'the UI is told the same task is continuing');
+  } finally {
+    process.env.NODE_ENV = originalNodeEnv;
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
 test('repeated execution failure parks the same task pending with an honest final message', async t => {
   const originalFetch = global.fetch;
   const finalized = [];
@@ -1396,6 +1486,7 @@ test('repeated execution failure parks the same task pending with an honest fina
       /^Let me update project memory and finalize\.$/i.test(finalized[0].details.result.summary),
       'the transitional promise is not accepted as final'
     );
+    t.equal((global.window.promptQueue || []).length, 0, 'repeated failures do not create an automatic continuation loop');
   } finally {
     restoreGlobals(originalFetch);
   }
