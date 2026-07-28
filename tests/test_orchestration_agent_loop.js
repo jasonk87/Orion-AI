@@ -1344,6 +1344,64 @@ test('automatic continuation stays queued behind existing user work instead of b
   t.end();
 });
 
+test('repeated execution failure parks the same task pending with an honest final message', async t => {
+  const originalFetch = global.fetch;
+  const finalized = [];
+  installHarness([
+    [
+      { text: 'Let me update project memory and finalize.' },
+      { functionCall: { name: 'run_command', args: { command: 'python broken_validation.py' } } }
+    ],
+    [{ functionCall: { name: 'run_command', args: { command: 'python broken_validation.py' } } }],
+    [{ functionCall: { name: 'run_command', args: { command: 'python broken_validation.py' } } }]
+  ], {
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE',
+    api: {
+      runCommand: async () => {
+        throw new Error('SyntaxError: invalid validation expression');
+      }
+    },
+    window: {
+      claimOrchestrationTask: async taskId => ({
+        success: true,
+        task: { taskId, status: 'active', execution: { executionId: 'exec-repeated-failure' } },
+        prompt: 'Finish the implementation and verify it.'
+      }),
+      finalizeOrchestrationTask: async (taskId, status, details) => {
+        finalized.push({ taskId, status, details });
+        return { taskId, status };
+      },
+      onOrchestrationTaskFinalized: async () => {}
+    }
+  });
+  const conv = conversation('repeated-failure-task', {
+    mode: 'coder',
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE',
+    planApproved: true,
+    tasks: [{ title: 'Verify the implementation', status: 'in-progress' }]
+  });
+  try {
+    await global.window.runAgentLoop(
+      'Finish the implementation and verify it.',
+      'gemini-1',
+      conv,
+      { taskId: 'task-repeated-failure' }
+    );
+    t.equal(finalized.length, 1, 'one canonical end-of-pass transition is recorded');
+    t.equal(finalized[0].taskId, 'task-repeated-failure', 'the original durable task identity is retained');
+    t.equal(finalized[0].status, 'pending', 'the repeated failure parks work as pending rather than failed');
+    t.match(finalized[0].details.reason, /repeated run_command failures/i, 'the durable pending reason records the failure boundary');
+    t.match(finalized[0].details.result.summary, /paused before completion/i, 'the durable result replaces the stale pre-tool sentence');
+    t.notOk(
+      /^Let me update project memory and finalize\.$/i.test(finalized[0].details.result.summary),
+      'the transitional promise is not accepted as final'
+    );
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
 test('Dispatch loop preserves open and mergeable PR status without claiming merged', async t => {
   const originalFetch = global.fetch;
   installHarness([

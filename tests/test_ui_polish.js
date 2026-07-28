@@ -325,7 +325,11 @@ test('task lifecycle UI waits for canonical state and protects queue ownership',
   t.ok(renderer.includes("canonicalStatus === 'pending'"), 'pending work is not called complete');
   t.notOk(renderer.includes('Orion finished the current run.'), 'legacy unconditional completion toast is removed');
 
-  t.ok(renderer.includes("const existingTaskId = String(options.taskId || '')"), 'continuations reuse only an explicitly bound task ID');
+  t.ok(
+    renderer.includes("let existingTaskId = String(options.taskId || '')")
+      && renderer.includes('if (!existingTaskId && options.requireExistingTask)'),
+    'continuations use the supplied task ID or uniquely recover the target conversation pending task'
+  );
   t.ok(renderer.includes('conversation.awaitingPlanApprovalTaskId') || fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8').includes('conversation.awaitingPlanApprovalTaskId'), 'plan approval records the exact durable task');
   t.ok(renderer.includes('const clarificationTaskId = String(clarData.taskId ||'), 'clarification continuation captures its exact task before clearing UI state');
   t.ok(renderer.includes('images: Array.isArray(task.images) ? task.images : []'), 'restored queue items retain durable images');
@@ -457,6 +461,66 @@ test('Dispatch status check-ins are naturally summarized without raw Coder inter
   t.ok(
     renderer.includes("!String(message && message.source || '').startsWith('supervisor-checkin')"),
     'an older mechanical check-in cannot leak back through conversational history'
+  );
+  t.end();
+});
+
+test('paused Coder work stays pending and resumes the same durable task', (t) => {
+  const queueStart = renderer.indexOf('async function queueTaskContinuation(options = {})');
+  const queueEnd = renderer.indexOf('\nwindow.queueTaskContinuation = queueTaskContinuation', queueStart);
+  const queuePath = renderer.slice(queueStart, queueEnd);
+  t.ok(
+    queuePath.includes('if (!existingTaskId && options.requireExistingTask)'),
+    'a missing continuation ID is recovered only from the target conversation pending tasks'
+  );
+  t.ok(
+    queuePath.includes('candidates.length !== 1'),
+    'ambiguous pending-task ownership is rejected instead of guessed'
+  );
+  t.ok(
+    queuePath.includes('Orion did not create a second task'),
+    'required continuations cannot silently fall through to new-task creation'
+  );
+
+  const phoneApprovalStart = renderer.indexOf('window.approvePhoneCompanionPlan = async');
+  const phoneApprovalEnd = renderer.indexOf('\nwindow.denyPhoneCompanionPlan', phoneApprovalStart);
+  const phoneApprovalPath = renderer.slice(phoneApprovalStart, phoneApprovalEnd);
+  t.ok(phoneApprovalPath.includes('requireExistingTask: true'), 'phone plan approval must resume its existing task');
+
+  const desktopApprovalStart = renderer.indexOf('async function approveCurrentPlanAndContinue');
+  const desktopApprovalEnd = renderer.indexOf('\nasync function approveDelegatedPlanAndContinue', desktopApprovalStart);
+  const desktopApprovalPath = renderer.slice(desktopApprovalStart, desktopApprovalEnd);
+  t.ok(desktopApprovalPath.includes('requireExistingTask: true'), 'desktop plan approval must resume its existing task');
+
+  const continueStart = renderer.indexOf('async function continueDelegatedWork');
+  const continueEnd = renderer.indexOf('\nfunction runCommandPaletteAction', continueStart);
+  const continuePath = renderer.slice(continueStart, continueEnd);
+  t.ok(
+    continuePath.includes("resumableTask && resumableTask.status === 'pending'"),
+    'Continue detects a canonically pending delegated task'
+  );
+  t.ok(
+    continuePath.includes('await queueTaskContinuation({'),
+    'Continue attaches input to the same pending task rather than always creating another'
+  );
+
+  const monitorStart = renderer.indexOf('window.startCoderTaskMonitor = function');
+  const monitorEnd = renderer.indexOf('\nfunction stopCoderTaskMonitor', monitorStart);
+  const monitorPath = renderer.slice(monitorStart, monitorEnd);
+  const pendingGuard = monitorPath.indexOf("canonicalTask && canonicalTask.status === 'pending'");
+  const failedTransition = monitorPath.indexOf("window.finalizeOrchestrationTask(taskId, 'failed'");
+  t.ok(pendingGuard >= 0, 'quiet monitoring refreshes and recognizes canonical pending state');
+  t.ok(
+    pendingGuard < failedTransition,
+    'the pending-state guard runs before watchdog failure reconciliation'
+  );
+  t.ok(
+    monitorPath.includes("canonicalTask.status === 'active'"),
+    'only an abandoned active execution is eligible for watchdog failure'
+  );
+  t.ok(
+    monitorPath.includes("status: 'pending'"),
+    'the Dispatch receipt preserves pending rather than relabeling it failed'
   );
   t.end();
 });
@@ -653,8 +717,11 @@ test('plan and clarification continuations do not fall back to a stale task ID',
   const agentJsSource = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8').replace(/\r\n/g, '\n');
   t.notOk(agentJsSource.includes('activeRunTaskId || conversation.lastOrchestrationTaskId'),
     'agent-side continuation state records only the task that actually owns the current run');
-  t.ok(renderer.includes("const existingTaskId = String(options.taskId || '');"),
-    'renderer continuation resolution requires the explicitly supplied task ID');
+  t.ok(
+    renderer.includes("let existingTaskId = String(options.taskId || '');")
+      && renderer.includes("String(task.target.conversationId || '') === targetConversationId"),
+    'renderer continuation resolution uses the supplied ID or an exact target-conversation recovery'
+  );
   t.notOk(renderer.includes('options.taskId || targetConv.lastOrchestrationTaskId'),
     'renderer never silently resumes whichever task happened to run most recently');
   t.end();

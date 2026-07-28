@@ -1636,6 +1636,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let workWalkthrough = [];
   const persistedVisualArtifactKeys = new Set();
   let forceYield = false;
+  let forcedYieldFailure = null;
   let autoContinueExecution = false;
   let userRequestedStop = false;
   let deniedPlanTaskId = '';
@@ -3377,6 +3378,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           }
           if (failureCount >= 3) {
             const errMsg = `Repeated failure guard paused ${toolName} after ${failureCount} identical failures. ${guidance}`;
+            forcedYieldFailure = {
+              toolName,
+              failureCount,
+              category: failure.category,
+              error: String(resultError || '').replace(/\s+/g, ' ').trim().slice(0, 700)
+            };
             await checkpointOperationalContext(workspacePath, 'repeated_tool_failure', `${toolName} failed ${failureCount} times: ${String(resultError).slice(0, 500)}`, guidance);
             currentAgentLogs.push({ type: 'thought', content: errMsg });
             toolResponseParts.push({
@@ -3863,6 +3870,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     if (bestVisibleAnswer && looksLikeLeakedNoToolCorrection(lastTextResponse)) {
       lastTextResponse = bestVisibleAnswer;
     }
+    if (forceYield && forcedYieldFailure
+        && !conversation.awaitingPlanApproval && !conversation.awaitingClarification) {
+      const failureLabel = forcedYieldFailure.toolName || 'A tool';
+      const failureDetail = forcedYieldFailure.error
+        ? ` The latest recorded error was: ${forcedYieldFailure.error}`
+        : '';
+      lastTextResponse = `I paused before completion because \`${failureLabel}\` failed ${forcedYieldFailure.failureCount || 3} times in the same way.${failureDetail}\n\nWork already completed remains in the workspace. This task is still pending, not completed; continue it after changing the failing command or verification approach.`;
+    }
     if (OrchestrationContracts && (recallRequested || OrchestrationContracts.hasExplicitRecallClaim(lastTextResponse))) {
       const finalMemoryValidation = OrchestrationContracts.validateMemoryResponse(lastTextResponse, {
         conversationEvidence: retrievedConversationEvidence,
@@ -3999,7 +4014,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           ? 'The user denied the pending implementation plan.'
           : (userRequestedStop
             ? 'Cancelled by user.'
-            : (criticalRunError ? String(criticalRunError.message || criticalRunError) : '')),
+            : (criticalRunError
+              ? String(criticalRunError.message || criticalRunError)
+              : (forcedYieldFailure
+                ? `Paused after ${forcedYieldFailure.failureCount || 3} repeated ${forcedYieldFailure.toolName || 'tool'} failures.`
+                : ''))),
         summary: String(lastTextResponse || '').replace(/\s+/g, ' ').slice(0, 1000),
         result: {
           summary: String(lastTextResponse || '').trim().slice(0, 5000),

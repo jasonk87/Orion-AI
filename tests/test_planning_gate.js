@@ -646,6 +646,10 @@ test('repeated tool failures during execution do not re-trigger plan approval UI
     // The fix ensures it does NOT set awaitingPlanApproval or revoke planApproved.
     t.equal(conversation.awaitingPlanApproval, false, 'execution-mode tool failures do not re-show plan approval card');
     t.equal(conversation.planApproved, true, 'planApproved is not revoked by execution-mode tool failures');
+    const finalAssistant = [...conversation.messages].reverse().find(message => message.role === 'assistant');
+    t.match(finalAssistant && finalAssistant.text, /paused before completion/i, 'the repeated-failure pause replaces stale transitional prose');
+    t.match(finalAssistant && finalAssistant.text, /still pending, not completed/i, 'the user sees the truthful resumable task state');
+    t.match(finalAssistant && finalAssistant.text, /run_command/, 'the final pause identifies the tool that repeatedly failed');
   } finally {
     global.window.runAgentLoop = originalRunAgentLoop;
     global.fetch = originalFetch;

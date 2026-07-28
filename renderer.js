@@ -1169,22 +1169,46 @@ async function continueDelegatedWork(coderConvId, supervisingOrionConvId) {
   const messageId = createConversationMessageId(coderConv.id);
   coderConv.messages.push({ id: messageId, role: 'user', source: 'dispatch-continue', text: prompt, createdAt: Date.now() });
   if (typeof window.markConversationDirty === 'function') window.markConversationDirty(coderConv.id);
-  const taskTitle = (orionConv.lastDelegatedWork && orionConv.lastDelegatedWork.title) || coderConv.title || 'Continue Coder task';
-  const queued = await enqueueOrchestrationTask({
-    prompt,
-    originalUserMessage: prompt,
-    resolvedObjective: prompt,
-    title: taskTitle,
-    modelSelectValue: modelValue,
-    originConversationId: orionConv.id,
-    originMessageId: messageId,
-    targetConversationId: coderConv.id,
-    workspace: structuredWorkspaceForConversation(coderConv),
-    precedingMessages: taskContextMessages(coderConv),
-    constraints: ['Do not redo completed work.', 'Stop and report precisely if the same blocker recurs.'],
-    source: 'dispatch-continue',
-    alreadyRendered: true
-  });
+  const delegatedReceipt = orionConv.lastDelegatedWork || {};
+  const taskTitle = delegatedReceipt.title || coderConv.title || 'Continue Coder task';
+  const resumableTaskId = String(delegatedReceipt.taskId || '');
+  let resumableTask = resumableTaskId ? orchestrationTaskCache.get(resumableTaskId) : null;
+  if (resumableTaskId && (!resumableTask || resumableTask.status !== 'pending')
+      && typeof window.getOrchestrationTaskStatus === 'function') {
+    const read = await window.getOrchestrationTaskStatus(resumableTaskId, orionConv.id);
+    resumableTask = read && read.success ? read.task : null;
+  }
+  if (resumableTaskId && !resumableTask) {
+    showToast('Orion could not verify the existing task state, so it did not create a duplicate continuation.', 'attention');
+    return;
+  }
+  const queued = resumableTask && resumableTask.status === 'pending'
+    ? await queueTaskContinuation({
+        taskId: resumableTaskId,
+        prompt,
+        modelSelectValue: modelValue,
+        originConversationId: orionConv.id,
+        originMessageId: messageId,
+        targetConversationId: coderConv.id,
+        workspace: structuredWorkspaceForConversation(coderConv),
+        source: 'dispatch-continue',
+        requireExistingTask: true
+      })
+    : await enqueueOrchestrationTask({
+        prompt,
+        originalUserMessage: prompt,
+        resolvedObjective: prompt,
+        title: taskTitle,
+        modelSelectValue: modelValue,
+        originConversationId: orionConv.id,
+        originMessageId: messageId,
+        targetConversationId: coderConv.id,
+        workspace: structuredWorkspaceForConversation(coderConv),
+        precedingMessages: taskContextMessages(coderConv),
+        constraints: ['Do not redo completed work.', 'Stop and report precisely if the same blocker recurs.'],
+        source: 'dispatch-continue',
+        alreadyRendered: true
+      });
   if (!queued.success) {
     showToast(queued.error || queued.clarification || 'Could not queue the continuation.', 'attention');
     return;
@@ -2445,7 +2469,40 @@ async function queueTaskContinuation(options = {}) {
   const targetConversationId = String(options.targetConversationId || options.conversationId || '');
   const targetConv = conversations.find(conv => conv.id === targetConversationId);
   if (!targetConv) return { success: false, error: 'Task conversation could not be resolved.' };
-  const existingTaskId = String(options.taskId || '');
+  let existingTaskId = String(options.taskId || '');
+  if (!existingTaskId && options.requireExistingTask) {
+    let candidates = [...orchestrationTaskCache.values()].filter(task =>
+      task
+      && task.status === 'pending'
+      && task.target
+      && String(task.target.conversationId || '') === targetConversationId);
+    if (window.api && typeof window.api.listOrchestrationTasks === 'function') {
+      const listed = await window.api.listOrchestrationTasks({
+        status: 'pending',
+        targetConversationId,
+        sort: 'desc'
+      });
+      if (listed && listed.success !== false && Array.isArray(listed.tasks)) {
+        listed.tasks.forEach(task => {
+          if (task && task.taskId) orchestrationTaskCache.set(task.taskId, task);
+        });
+        candidates = listed.tasks.filter(task =>
+          task
+          && task.status === 'pending'
+          && task.target
+          && String(task.target.conversationId || '') === targetConversationId);
+      }
+    }
+    if (candidates.length !== 1) {
+      return {
+        success: false,
+        error: candidates.length
+          ? 'More than one pending task belongs to this conversation, so Orion cannot safely guess which task to resume.'
+          : 'The pending task ID could not be recovered, so Orion did not create a duplicate continuation task.'
+      };
+    }
+    existingTaskId = String(candidates[0].taskId || '');
+  }
   let existingTask = existingTaskId ? orchestrationTaskCache.get(existingTaskId) : null;
   if (existingTaskId && (!existingTask || existingTask.status !== 'pending') && window.api && typeof window.api.getOrchestrationTask === 'function') {
     const read = await window.api.getOrchestrationTask(existingTaskId);
@@ -2509,6 +2566,12 @@ async function queueTaskContinuation(options = {}) {
       .filter(item => item && item.taskId !== existingTask.taskId);
     window.promptQueue.push(queueItem);
     return { success: true, task: existingTask, queueItem, resumed: true };
+  }
+  if (options.requireExistingTask) {
+    return {
+      success: false,
+      error: 'The existing pending task could not be resumed, so Orion did not create a second task.'
+    };
   }
   return enqueueOrchestrationTask({
     ...options,
@@ -7006,7 +7069,8 @@ window.approvePhoneCompanionPlan = async (targetId) => {
     targetConversationId: resolvedId,
     originConversationId: supervisingConversation ? supervisingConversation.id : resolvedId,
     workspace: structuredWorkspaceForConversation(conv),
-    source: 'plan-approval'
+    source: 'plan-approval',
+    requireExistingTask: true
   });
   if (!continuation.success) {
     conv.planApproved = false;
@@ -7348,7 +7412,8 @@ async function approveCurrentPlanAndContinue(options = {}) {
       targetConversationId: conv.id,
       originConversationId: supervisingConversation ? supervisingConversation.id : conv.id,
       workspace: structuredWorkspaceForConversation(conv),
-      source: 'plan-approval'
+      source: 'plan-approval',
+      requireExistingTask: true
     });
     if (!continuation.success) {
       conv.planApproved = false;
@@ -7995,11 +8060,57 @@ window.startCoderTaskMonitor = function(orionConvId, coderConvId, taskId = '') {
       if (Date.now() - monitorMeta.quietSince > 60000) {
         const stalledTitle = orionConv.launchedCoderTaskTitle || coderConv.title || 'Coder task';
         const pendingCount = (coderConv.tasks || []).filter(t => t.status !== 'completed' && t.status !== 'x').length;
+        let canonicalTask = durableTask;
+        if (taskId && typeof window.getOrchestrationTaskStatus === 'function') {
+          const statusRead = await window.getOrchestrationTaskStatus(taskId, orionConv.id);
+          if (_coderTaskMonitorMeta !== monitorMeta) return;
+          if (statusRead && statusRead.success && statusRead.task) canonicalTask = statusRead.task;
+        }
+        // Pending is an intentional, durable pause boundary. It must never be rewritten to failed
+        // merely because no renderer loop is currently running. Park it with a Continue action;
+        // only an abandoned ACTIVE execution is eligible for watchdog failure reconciliation.
+        if (canonicalTask && canonicalTask.status === 'pending') {
+          if (String(orionConv.launchedCoderTaskId || '') !== taskId) return;
+          const pendingReason = String(
+            canonicalTask.execution && canonicalTask.execution.reason || ''
+          ).trim();
+          notifyOrionConversation(
+            orionConv,
+            `Coder paused **${stalledTitle}** before completion. The durable task remains pending${pendingReason ? `: ${pendingReason}.` : '.'} Use Continue to resume it without treating the work as completed or failed.`,
+            'supervisor-pending'
+          );
+          orionConv.lastDelegatedWork = {
+            taskId,
+            coderConversationId: coderConvId,
+            title: stalledTitle,
+            projectPath: coderConv.projectPath || inferDispatchProjectPath(orionConv),
+            status: 'pending',
+            subStatus: pendingReason || 'Paused before completion',
+            startedAt: orionConv.launchedCoderTaskStart || 0,
+            completedAt: canonicalTask.pendingAt || canonicalTask.updatedAt || Date.now(),
+            pendingCount: Math.max(1, pendingCount)
+          };
+          orionConv.launchedCoderConvId = null;
+          orionConv.launchedCoderTaskId = null;
+          orionConv.launchedCoderTaskTitle = null;
+          orionConv.launchedCoderTaskStart = null;
+          if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+          if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+          renderDesktopDispatchLanding();
+          stopCoderTaskMonitor(monitorMeta);
+          return;
+        }
+        if (canonicalTask && ['completed', 'cancelled', 'failed'].includes(canonicalTask.status)) {
+          await notifySupervisorOfCoderCompletion(coderConvId, taskId);
+          if (_coderTaskMonitorMeta === monitorMeta) stopCoderTaskMonitor(monitorMeta);
+          return;
+        }
         let stalledTask = null;
-        if (taskId && typeof window.finalizeOrchestrationTask === 'function') {
+        if (taskId && canonicalTask && canonicalTask.status === 'active'
+            && typeof window.finalizeOrchestrationTask === 'function') {
           stalledTask = await window.finalizeOrchestrationTask(taskId, 'failed', {
             reason: 'The Coder run went quiet without recording completion.',
-            expectedExecutionId: durableTask && durableTask.execution && durableTask.execution.executionId
+            expectedExecutionId: canonicalTask.execution && canonicalTask.execution.executionId
           });
           if (_coderTaskMonitorMeta !== monitorMeta) return;
         }
