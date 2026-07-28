@@ -3553,6 +3553,23 @@ function mergeConversationSets(...sets) {
   return [...byId.values()].sort((a, b) => conversationSortTime(b) - conversationSortTime(a));
 }
 
+// Rehydrate the complete persisted record in place so callers holding the lightweight index
+// object keep a valid reference. Actionable state such as delegated-plan approval ownership must
+// survive a restart just as reliably as transcript messages.
+function hydrateConversationRecord(conversation, persistedConversation) {
+  if (!conversation || !persistedConversation || typeof persistedConversation !== 'object') {
+    return conversation;
+  }
+  const stableId = conversation.id;
+  Object.assign(conversation, persistedConversation);
+  conversation.id = stableId;
+  conversation.messages = Array.isArray(persistedConversation.messages) ? persistedConversation.messages : [];
+  conversation.tasks = Array.isArray(persistedConversation.tasks) ? persistedConversation.tasks : [];
+  conversation.isStub = false;
+  conversation.hasMessages = conversation.messages.length > 0;
+  return conversation;
+}
+
 // True only after the on-disk index has been read successfully this session. If startup
 // crashes before that read, the in-memory list holds at most a freshly created conversation,
 // and writing the index from it would clobber every persisted conversation stub.
@@ -4008,6 +4025,8 @@ async function executeSaveConversationsToStorage() {
       lastDelegatedWork: c.lastDelegatedWork || null,
       planApproved: c.planApproved,
       awaitingPlanApproval: c.awaitingPlanApproval,
+      awaitingPlanApprovalTaskId: c.awaitingPlanApprovalTaskId || '',
+      awaitingDelegatedPlan: c.awaitingDelegatedPlan || null,
       updatedAt: c.updatedAt || Date.now(),
       createdAt: c.createdAt || Date.now(),
       isStub: true, // index always represents stubs
@@ -4254,13 +4273,7 @@ async function selectConversation(id) {
         if (activeConversationId !== id) return;
         
         if (result && result.success && result.conversation) {
-          const loadedConv = result.conversation;
-          conv.messages = Array.isArray(loadedConv.messages) ? loadedConv.messages : [];
-          conv.tasks = Array.isArray(loadedConv.tasks) ? loadedConv.tasks : [];
-          conv.testResults = loadedConv.testResults;
-          conv.fileTree = loadedConv.fileTree;
-          conv.scratchpad = loadedConv.scratchpad;
-          conv.isStub = false;
+          hydrateConversationRecord(conv, result.conversation);
         } else {
           el.messagesContainer.innerHTML = `<div class="error-state" style="text-align:center; padding:20px; color:var(--red);">Failed to load conversation</div>`;
           return;
@@ -6306,13 +6319,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     try {
       const result = await window.api.readConversation(conv.id);
       if (result && result.success && result.conversation) {
-        const loadedConv = result.conversation;
-        conv.messages = Array.isArray(loadedConv.messages) ? loadedConv.messages : [];
-        conv.tasks = Array.isArray(loadedConv.tasks) ? loadedConv.tasks : [];
-        conv.testResults = loadedConv.testResults;
-        conv.fileTree = loadedConv.fileTree;
-        conv.scratchpad = loadedConv.scratchpad;
-        conv.isStub = false;
+        hydrateConversationRecord(conv, result.conversation);
       }
     } catch (err) {
       console.error('Phone companion stub hydration failed', err);

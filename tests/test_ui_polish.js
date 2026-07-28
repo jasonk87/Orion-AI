@@ -641,3 +641,58 @@ test('Dispatch relays delegated plans and completion evidence without forcing a 
     'completion relay includes changed files and verification evidence');
   t.end();
 });
+
+test('delegated plan approval survives conversation reload on desktop and phone', t => {
+  const hydrationStart = renderer.indexOf('function hydrateConversationRecord(');
+  const hydrationEnd = renderer.indexOf('// True only after the on-disk index', hydrationStart);
+  const hydrationSource = renderer.slice(hydrationStart, hydrationEnd);
+  const hydrateConversationRecord = Function(
+    `${hydrationSource}\nreturn hydrateConversationRecord;`
+  )();
+  const delegatedPlan = {
+    taskId: 'task-reload-plan',
+    coderConversationId: 'coder-reload-plan',
+    title: 'Reload-safe implementation',
+    createdAt: 123
+  };
+  const stub = {
+    id: 'dispatch-reload-plan',
+    title: 'Index title',
+    isStub: true,
+    messages: [],
+    tasks: []
+  };
+  const persisted = {
+    id: 'dispatch-reload-plan',
+    title: 'Full title',
+    messages: [{
+      role: 'assistant',
+      text: 'Approve it here to continue.',
+      isDelegatedPlanCard: true,
+      delegatedPlan
+    }],
+    tasks: [],
+    awaitingDelegatedPlan: delegatedPlan,
+    awaitingPlanApprovalTaskId: delegatedPlan.taskId
+  };
+
+  const hydrated = hydrateConversationRecord(stub, persisted);
+  t.equal(hydrated, stub, 'hydration preserves the index object used by active UI references');
+  t.deepEqual(hydrated.awaitingDelegatedPlan, delegatedPlan,
+    'the actionable delegated-plan ownership is restored with the transcript');
+  t.equal(hydrated.awaitingPlanApprovalTaskId, delegatedPlan.taskId,
+    'the exact approval task ID survives hydration');
+  t.equal(hydrated.messages[0].isDelegatedPlanCard, true,
+    'the persisted plan message remains an actionable plan card');
+  t.equal(hydrated.isStub, false, 'the fully restored record is no longer treated as a stub');
+  t.equal(
+    (renderer.match(/hydrateConversationRecord\(conv, result\.conversation\)/g) || []).length,
+    2,
+    'desktop selection and phone state hydration both restore the complete record'
+  );
+  t.ok(renderer.includes('awaitingDelegatedPlan: c.awaitingDelegatedPlan || null'),
+    'the lightweight conversation index retains pending delegated-plan state across restart');
+  t.ok(renderer.includes("awaitingPlanApprovalTaskId: c.awaitingPlanApprovalTaskId || ''"),
+    'the lightweight index retains exact approval ownership');
+  t.end();
+});
