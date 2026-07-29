@@ -224,7 +224,9 @@ test('Dispatch supervisor escalates stalls, previews Coder state, and continues 
 test('Dispatch opens as a focused front door without project-driven clutter', (t) => {
   t.ok(companionHtml.includes("let companionMode = 'orion'"), 'each fresh phone launch starts at Dispatch');
   t.ok(companionHtml.includes('function enterDispatch'), 'phone has one explicit chat-first Dispatch entry path');
-  t.ok(companionHtml.includes("if (companionMode === 'orion') setTimeout(() => startDispatchDraft(), 0)"), 'the first connected state starts a fresh uncommitted Dispatch draft');
+  t.ok(companionHtml.includes('const restoreSelectedDispatchConversation = !!('), 'phone distinguishes an actionable selected conversation from a blank Dispatch draft');
+  t.ok(companionHtml.includes("state.awaitingPlanApproval || state.awaitingClarification"), 'pending input restores the exact selected conversation after reload');
+  t.ok(companionHtml.includes("if (companionMode === 'orion' && !restoreSelectedDispatchConversation)"), 'only an idle cold launch falls back to a fresh uncommitted Dispatch draft');
   t.ok(companionHtml.includes('let dispatchDraftActive = true'), 'cold-launch Dispatch begins as a local draft');
   t.notOk(companionHtml.includes('function resolveDispatchFocus'), 'cold launch does not resolve and reopen an old conversation');
   t.ok(companionHtml.includes("enterDispatch({ fresh: true })"), 'New starts a clean Dispatch draft');
@@ -246,6 +248,17 @@ test('Dispatch opens as a focused front door without project-driven clutter', (t
   t.ok(companionHtml.includes('coder-workspace-picker'), 'phone keeps the Coder workspace picker');
   t.ok(companionHtml.includes("#screen-new-chat.dispatch-mode .coder-workspace-picker { display: none; }"), 'Dispatch hides the workspace picker on new chat');
   t.ok(companionHtml.includes("newChatPromptEl.placeholder = isDispatchStart ? 'Ask Orion anything...' : 'What should we build?'"), 'new chat placeholder is mode-aware');
+  t.end();
+});
+
+test('phone landing and plan controls share one conversation identity', (t) => {
+  t.ok(companionHtml.includes("const viewingId = preserveDispatchDraft ? '' : state.conversationId"), 'a Dispatch draft has no viewed conversation identity');
+  t.ok(companionHtml.includes('const viewingAwaitingPlanApproval = !!('), 'plan visibility is derived from the viewed conversation');
+  t.ok(companionHtml.includes("planPanelEl.dataset.conversationId = viewingAwaitingPlanApproval ? String(viewingId) : ''"), 'approval controls retain their exact owning conversation');
+  t.ok(companionHtml.includes("planPanelEl.classList.toggle('visible', viewingAwaitingPlanApproval)"), 'the blank landing can never inherit a selected conversation plan panel');
+  t.ok(companionHtml.includes('renderPhoneTaskList(preserveDispatchDraft ? [] : (state.tasks || []))'), 'the blank landing does not inherit another conversation checklist');
+  t.ok(companionHtml.includes("body: JSON.stringify({ conversationId })"), 'approve and deny requests carry their visible conversation identity');
+  t.ok(companionHtml.includes('conversationId: formTargetConversationId'), 'plan revision remains bound to the conversation that opened revision mode');
   t.end();
 });
 
@@ -334,6 +347,10 @@ test('task lifecycle UI waits for canonical state and protects queue ownership',
   t.ok(renderer.includes('const clarificationTaskId = String(clarData.taskId ||'), 'clarification continuation captures its exact task before clearing UI state');
   t.ok(renderer.includes('images: Array.isArray(task.images) ? task.images : []'), 'restored queue items retain durable images');
   t.ok(renderer.includes('contextPacketIds: Array.isArray(task.contextPacketIds) ? task.contextPacketIds : []'), 'restored queue items retain context packets');
+  t.ok(renderer.includes('tasks.filter(pendingTaskNeedsRuntimeQueue)'), 'restart recovery restores only fresh work and durable automatic checkpoints');
+  t.ok(renderer.includes('window.resumeDurableTaskQueue(100)'), 'restored durable work actually starts instead of remaining stranded in memory');
+  t.ok(renderer.includes('pendingTaskNeedsRuntimeQueue(canonicalTask)'), 'the watchdog distinguishes recoverable checkpoints from user pauses');
+  t.ok(renderer.includes("'automatic-action-boundary-recovery'"), 'a lost automatic queue entry is repaired under the existing task lifecycle');
 
   const preflightIndex = renderer.indexOf('const preflight = RendererTaskOrchestration.buildTaskPacket');
   const coderCreationIndex = renderer.indexOf('const conv = standalone', preflightIndex);
@@ -366,12 +383,16 @@ test('Dispatch routes cancellation and supervision by exact active task ownershi
   const submitStart = renderer.indexOf('async function submitMessage()');
   const submitEnd = renderer.indexOf('\nfunction slugify(', submitStart);
   const submitPath = renderer.slice(submitStart, submitEnd);
-  const desktopCancelIndex = submitPath.indexOf(
-    "await cancelOwnedTaskRequestedInPrompt(conv, prompt, 'dispatch-task-cancellation')"
-  );
+  const classifyIndex = submitPath.indexOf('const semanticIntent = await classifyCurrentConversationIntent');
+  const desktopCancelIndex = submitPath.indexOf('await cancelOwnedTaskRequestedInPrompt(');
   const clarificationIndex = submitPath.indexOf('if (conv.awaitingClarification && pendingReplyTaskId)');
   const busyIndex = submitPath.indexOf('if (window.isAgentRunning && window.isAgentRunning())');
-  t.ok(desktopCancelIndex >= 0, 'desktop submit recognizes owned-task cancellation directly');
+  t.ok(classifyIndex >= 0, 'desktop submit obtains one structured semantic classification for the turn');
+  t.ok(
+    desktopCancelIndex > classifyIndex
+      && submitPath.slice(desktopCancelIndex, desktopCancelIndex + 220).includes('semanticIntent'),
+    'desktop cancellation consumes that structured classification instead of phrase matching'
+  );
   t.ok(
     desktopCancelIndex < clarificationIndex && desktopCancelIndex < busyIndex,
     'desktop cancellation runs before clarification, busy queueing, or model dispatch'
@@ -522,6 +543,47 @@ test('paused Coder work stays pending and resumes the same durable task', (t) =>
     monitorPath.includes("status: 'pending'"),
     'the Dispatch receipt preserves pending rather than relabeling it failed'
   );
+  t.end();
+});
+
+test('Dispatch/Coder navigation is user-owned and stale background state cannot flip it', (t) => {
+  const selectionStart = renderer.indexOf('async function selectConversation(id, options = {})');
+  const selectionEnd = renderer.indexOf('\n// Submits User prompt', selectionStart);
+  const selectionPath = renderer.slice(selectionStart, selectionEnd);
+  t.ok(selectionPath.includes('conversationSelectionEpoch'), 'desktop selection uses a monotonic navigation token');
+  t.ok(
+    selectionPath.includes('activeConversationId !== id || conversationSelectionEpoch !== selectionEpoch'),
+    'a late stub hydration cannot repaint an older selection'
+  );
+  t.ok(selectionPath.includes('setAppMode(targetMode)'), 'opening a conversation atomically opens its matching mode');
+
+  t.ok(companionHtml.includes('pendingConversationSelectionId = taskId'), 'phone locks the requested destination before switching');
+  t.ok(
+    companionHtml.includes('stateSelectionRevision < acceptedSelectionRevision'),
+    'phone rejects a stale poll or SSE selection revision'
+  );
+  t.ok(
+    companionHtml.includes("String(state && state.conversationId || '') !== pendingConversationSelectionId"),
+    'an in-flight old conversation update cannot override the requested destination'
+  );
+  t.end();
+});
+
+test('typed Dispatch continuation reuses owned Coder work before model routing', (t) => {
+  const continuationStart = renderer.indexOf('async function resumeOwnedCoderTaskFromDispatch');
+  const continuationEnd = renderer.indexOf('\nwindow.resumeOwnedCoderTaskFromDispatch', continuationStart);
+  const continuationPath = renderer.slice(continuationStart, continuationEnd);
+  t.ok(continuationPath.includes('selectOwnedContinuationTask'), 'continuation uses the shared canonical task selector');
+  t.ok(continuationPath.includes('await queueTaskContinuation({'), 'paused work resumes through the existing task path');
+  t.ok(continuationPath.includes('requireExistingTask: true'), 'a continuation cannot fall through to a new task');
+  t.ok(continuationPath.includes('No new task was created.'), 'the user receives explicit same-task confirmation');
+
+  const submitStart = renderer.indexOf('async function submitMessage()');
+  const submitEnd = renderer.indexOf('\nfunction slugify', submitStart);
+  const submitPath = renderer.slice(submitStart, submitEnd);
+  const lifecycleGuard = submitPath.indexOf('resumeOwnedCoderTaskFromDispatch');
+  const modelRoute = submitPath.indexOf('if (window.runAgentLoop)');
+  t.ok(lifecycleGuard >= 0 && lifecycleGuard < modelRoute, 'desktop resolves continuation before the model can hand off again');
   t.end();
 });
 

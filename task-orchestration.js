@@ -165,28 +165,13 @@
   }
 
   function isContextDependentRequest(value) {
-    const request = compactInline(value);
-    if (!request || request.length > 220) return false;
-    const normalized = request.toLowerCase().replace(/[.!?]+$/g, '').trim();
-    // A bare affirmation ("Yes", "yeah, do it") answers a pending assistant question, so the real
-    // request lives entirely in the preceding context.
-    if (/^(?:yes|yeah|yep|yup|sure|absolutely|definitely|correct|confirmed|affirmative|please\s+do|go\s+for\s+it|send\s+it|route\s+it)(?:[,!. ]+(?:please|now|do\s+it|go\s+ahead|route\s+it|send\s+it))*$/.test(normalized)) {
-      return true;
-    }
-    const withoutLeadingAffirmation = normalized.replace(/^(?:yes|yeah|yep|yup|ok(?:ay)?|sure|alright)[,!. ]+/, '');
-    const directPatterns = [
-      /^(?:okay[, ]*)?(?:let['’]?s|lets)\s+(?:do|build|implement|ship|make)\s+(?:it|that|this)$/,
-      /^(?:okay[, ]*)?(?:let['’]?s\s+)?go\s+ahead\b(?:.*\b(?:it|that|this|them|those)\b)?/,
-      /^(?:okay[, ]*)?(?:let['’]?s\s+)?(?:go\s+ahead\s+and\s+)?get\s+(?:it|that|this)\s+(?:done|updated|fixed|going|started|changed|handled|sorted)\b/,
-      /^(?:please\s+)?(?:fix|change|update|remove|add|build|implement|ship|do|make)\s+(?:it|that|this|those|them)$/,
-      /^(?:please\s+)?use\s+(?:the\s+)?(?:first|second|third|fourth|fifth|last|option\s*\d+|\d+(?:st|nd|rd|th)?)(?:\s+(?:one|option))?$/,
-      /^(?:please\s+)?make\s+it\s+(?:like|how|the\s+way)\s+(?:we|you)\s+(?:discussed|described|said|planned)$/,
-      /^(?:please\s+)?continue(?:\s+(?:that|it|this|from\s+there|with\s+that))?$/,
-      /^(?:please\s+)?(?:proceed|do\s+it|ship\s+it|make\s+that\s+change|carry\s+on)$/
-    ];
-    if (directPatterns.some(pattern => pattern.test(normalized) || pattern.test(withoutLeadingAffirmation))) return true;
-    return /^(?:please\s+)?(?:fix|use|change|update|remove|add|build|implement|make|continue)\b/.test(normalized)
-      && /\b(?:it|that|this|those|them|one|ones|earlier|above|discussed)\b/.test(normalized);
+    return !!(value && typeof value === 'object' && value.contextDependent === true);
+  }
+
+  function isContinuationRequest(value) {
+    return !!(value && typeof value === 'object'
+      && value.intent === 'context_followup'
+      && value.target === 'active_owned_task');
   }
 
   function messageText(message) {
@@ -211,8 +196,8 @@
       }))
       .filter(message => {
         if (!message.value) return false;
-        if (/^(system|tool|function)$/i.test(message.role)) return false;
-        if (/^(queue-status|queued-prompt|agent-start-blocked)$/i.test(message.source)) return false;
+        if (['system', 'tool', 'function'].includes(compactInline(message.role).toLowerCase())) return false;
+        if (['queue-status', 'queued-prompt', 'agent-start-blocked'].includes(compactInline(message.source).toLowerCase())) return false;
         return true;
       });
 
@@ -229,7 +214,10 @@
     const lines = [];
     let characters = 0;
     for (const message of messages.slice().reverse()) {
-      const role = /assistant|model/i.test(message.role) ? 'Assistant' : (/user/i.test(message.role) ? 'User' : 'Context');
+      const normalizedRole = compactInline(message.role).toLowerCase();
+      const role = ['assistant', 'model', 'orion'].includes(normalizedRole)
+        ? 'Assistant'
+        : (normalizedRole === 'user' ? 'User' : 'Context');
       const line = `${role}: ${message.value}`;
       if (characters + line.length > 8000) break;
       lines.unshift(line);
@@ -238,108 +226,8 @@
     return lines.join('\n').trim();
   }
 
-  function normalizeOptions(input, messages) {
-    const explicit = Array.isArray(input.options) ? input.options : [];
-    const options = explicit.map((option, index) => {
-      if (typeof option === 'string') return { index, label: compactWhitespace(option) };
-      const label = compactWhitespace(option && (option.description || option.objective || option.title || option.label));
-      return { index, label };
-    }).filter(option => option.label);
-    if (options.length) return options;
-
-    const ordinalMap = { first: 0, second: 1, third: 2, fourth: 3, fifth: 4 };
-    const discovered = new Map();
-    const lines = messages.flatMap(message => message.value.split(/\n/));
-    for (const line of lines) {
-      const match = line.match(/^\s*(?:option\s*)?(\d+|first|second|third|fourth|fifth)\s*[).:\-]\s*(.+?)\s*$/i);
-      if (!match) continue;
-      const parsedIndex = /^\d+$/.test(match[1]) ? Number(match[1]) - 1 : ordinalMap[match[1].toLowerCase()];
-      if (parsedIndex < 0 || !Number.isFinite(parsedIndex)) continue;
-      discovered.set(parsedIndex, compactWhitespace(match[2]));
-    }
-    return [...discovered.entries()].sort((a, b) => a[0] - b[0]).map(([index, label]) => ({ index, label }));
-  }
-
-  function requestedOptionIndex(request) {
-    const normalized = compactInline(request).toLowerCase();
-    const words = { first: 0, second: 1, third: 2, fourth: 3, fifth: 4, last: -1 };
-    for (const [word, index] of Object.entries(words)) {
-      if (new RegExp(`\\b${word}\\b`).test(normalized)) return index;
-    }
-    const numeric = normalized.match(/\b(?:option\s*)?(\d+)(?:st|nd|rd|th)?\b/);
-    return numeric ? Number(numeric[1]) - 1 : null;
-  }
-
-  function hasEnoughContext(summary, messages, explicitRequirements) {
-    if (Array.isArray(explicitRequirements) && explicitRequirements.some(value => compactInline(value))) return true;
-    const corpus = compactInline(summary);
-    if (corpus.length < 45) return false;
-    const meaningfulTokens = new Set((corpus.toLowerCase().match(/[a-z0-9][a-z0-9_-]{2,}/g) || [])
-      .filter(token => !/^(the|and|that|this|with|from|have|will|would|could|should|about|what|when|where|then|just|into|like|user|assistant|context)$/.test(token)));
-    const hasActionableDetail = /\b(?:build|implement|design|fix|replace|evolve|merge|derive|create|change|add|remove|enroll|subscribe|system|feature|workflow|option|approach|plan|require|allow|organize|restart|relaunch|reboot|kill|stop|start|launch|run|execute|install|uninstall|delete|deploy)\b/i.test(corpus);
-    return messages.length > 0 && meaningfulTokens.size >= 6 && hasActionableDetail;
-  }
-
-  function splitCandidateStatements(values) {
-    const output = [];
-    for (const value of values) {
-      const normalized = compactWhitespace(value);
-      if (!normalized) continue;
-      const lines = normalized.split(/\n+/).flatMap(line => line.split(/(?<=[.!?])\s+(?=[A-Z0-9])/));
-      lines.forEach(line => {
-        const statement = compactInline(line.replace(/^[-*]\s*/, ''));
-        if (statement.length >= 18) output.push(statement);
-      });
-    }
-    return output;
-  }
-
-  function extractRequirements(input, messages, selectedOption) {
-    const explicit = uniqueStrings(input.requirements || input.knownRequirements || []);
-    if (explicit.length) return explicit;
-    const statements = splitCandidateStatements(messages.map(message => message.value));
-    const requirementSignals = /\b(?:must|should|need(?:s|ed)?|require(?:s|d)?|include|allow|support|organize|browse|enroll|subscribe|carry|cost|benefit|replace|merge|derive|implement|design|build|category|location|recurring)\b/i;
-    const inferred = statements.filter(statement => requirementSignals.test(statement));
-    if (selectedOption) inferred.unshift(`Use the selected option: ${selectedOption}`);
-    return uniqueStrings(inferred, 20);
-  }
-
-  function extractUnresolvedDecisions(input, messages) {
-    const explicit = uniqueStrings(input.unresolvedDecisions || []);
-    if (explicit.length) return explicit;
-    const statements = splitCandidateStatements(messages.map(message => message.value));
-    return uniqueStrings(statements.filter(statement =>
-      /\?|\b(?:decide|evaluate|determine|choose)\s+(?:whether|how|which)|\bwhether\b.+\bor\b/i.test(statement)
-    ), 12);
-  }
-
-  function deriveContextObjective(input, messages, summary, selectedOption) {
-    const explicit = compactWhitespace(input.objective || input.resolvedObjective || '');
-    if (explicit) return explicit;
-    if (selectedOption) return `Implement the selected option from the preceding discussion: ${selectedOption}`;
-
-    const scored = messages.map(message => {
-      const value = compactWhitespace(message.value);
-      let score = Math.min(value.length, 1200) / 100;
-      if (/\b(?:build|implement|design|fix|replace|evolve|merge|derive|create|change|system|feature|workflow|subscription|enrollment|commitment|restart|relaunch|reboot|kill|stop|launch|execute|install|uninstall|delete|deploy)\b/i.test(value)) score += 8;
-      if (/\b(?:must|should|need|require|include|allow|support|evaluate)\b/i.test(value)) score += 4;
-      if (/user/i.test(message.role)) score += 1;
-      return { value, score, index: message.index };
-    }).filter(item => item.value);
-    scored.sort((a, b) => b.score - a.score || b.index - a.index);
-    const selected = scored.slice(0, 4).sort((a, b) => a.index - b.index).map(item => item.value);
-    const detail = uniqueStrings(selected, 4).join('\n');
-    const resolvedDetail = detail || compactWhitespace(summary);
-    return resolvedDetail
-      ? `Implement the agreed direction from the preceding conversation:\n${resolvedDetail}`
-      : '';
-  }
-
   function titleFromObjective(objective, projectName) {
-    let candidate = compactInline(objective)
-      .replace(/^implement the (?:agreed direction|selected option) from the preceding (?:conversation|discussion):?\s*/i, '')
-      .replace(/^(?:i think\s+)?(?:we\s+should\s+|please\s+)?/i, '')
-      .replace(/^(?:design and implement|design|implement|build|create|fix|change|replace)\s+/i, '');
+    let candidate = compactInline(objective);
     if (!candidate) candidate = 'New task';
     const sentenceEnd = candidate.search(/[.!?](?:\s|$)/);
     if (sentenceEnd > 20) candidate = candidate.slice(0, sentenceEnd);
@@ -476,12 +364,11 @@
     };
   }
 
-  function clarificationForRequest(request, reason) {
+  function clarificationForRequest(request, reason, classifierQuestion) {
+    const supplied = compactWhitespace(classifierQuestion);
+    if (supplied) return supplied;
     const normalized = compactInline(request);
-    if (/\b(?:first|second|third|fourth|fifth|last|option\s*\d+)\b/i.test(normalized)) {
-      return `Which option do you mean by “${normalized}”? I do not have the referenced choices in the available conversation context.`;
-    }
-    return `What specific work should I carry out? I do not have enough preceding context to resolve “${normalized}” into a durable task${reason ? ` (${reason})` : ''}.`;
+    return `What specific work should I carry out? I could not safely resolve “${normalized}” into a durable task${reason ? ` (${reason})` : ''}.`;
   }
 
   function buildTaskPacket(inputValue) {
@@ -496,31 +383,34 @@
       };
     }
 
+    const semanticIntent = input.semanticIntent && typeof input.semanticIntent === 'object'
+      ? input.semanticIntent
+      : (input.intentClassification && typeof input.intentClassification === 'object'
+          ? input.intentClassification
+          : {});
+    const taskResolution = semanticIntent.taskResolution && typeof semanticIntent.taskResolution === 'object'
+      ? semanticIntent.taskResolution
+      : {};
     const precedingMessages = normalizePrecedingMessages(input, originalUserMessage);
     const precedingConversationSummary = buildPrecedingSummary(input, precedingMessages);
-    const contextDependent = isContextDependentRequest(originalUserMessage);
-    const options = normalizeOptions(input, precedingMessages);
-    const optionIndex = requestedOptionIndex(originalUserMessage);
-    const selectedOptionRecord = optionIndex == null
-      ? null
-      : (optionIndex === -1 ? options[options.length - 1] : options.find(option => option.index === optionIndex));
-    const selectedOption = selectedOptionRecord ? selectedOptionRecord.label : '';
-    const explicitObjective = compactWhitespace(input.objective || input.resolvedObjective || '');
+    const contextDependent = semanticIntent.contextDependent === true;
+    const explicitObjective = compactWhitespace(
+      input.objective
+      || input.resolvedObjective
+      || semanticIntent.resolvedRequest
+      || ''
+    );
 
-    if (contextDependent && optionIndex != null && !selectedOption) {
+    if (semanticIntent.needsClarification === true || semanticIntent.intent === 'clarification_required'
+      || (contextDependent && !explicitObjective)) {
       return {
         success: false,
         needsClarification: true,
-        clarification: clarificationForRequest(originalUserMessage, 'the referenced option is unavailable'),
-        task: null
-      };
-    }
-    if (contextDependent && !explicitObjective && !selectedOption
-      && !hasEnoughContext(precedingConversationSummary, precedingMessages, input.requirements || input.knownRequirements)) {
-      return {
-        success: false,
-        needsClarification: true,
-        clarification: clarificationForRequest(originalUserMessage, 'the referenced discussion is unavailable'),
+        clarification: clarificationForRequest(
+          originalUserMessage,
+          'the referenced discussion is unavailable',
+          semanticIntent.clarificationQuestion
+        ),
         task: null
       };
     }
@@ -537,14 +427,12 @@
         task: null
       };
     }
-    const objective = contextDependent
-      ? deriveContextObjective(input, precedingMessages, precedingConversationSummary, selectedOption)
-      : (explicitObjective || originalUserMessage);
+    const objective = explicitObjective || originalUserMessage;
     if (!objective) {
       return {
         success: false,
         needsClarification: true,
-        clarification: clarificationForRequest(originalUserMessage, 'no objective could be established'),
+        clarification: clarificationForRequest(originalUserMessage, 'no objective could be established', semanticIntent.clarificationQuestion),
         task: null
       };
     }
@@ -561,10 +449,16 @@
       messageId: ''
     });
     target.mode = compactInline((input.target && input.target.mode) || input.targetMode || 'coder') || 'coder';
-    const requirements = extractRequirements(input, precedingMessages, selectedOption);
-    const constraints = uniqueStrings(input.constraints || []);
-    const unresolvedDecisions = extractUnresolvedDecisions(input, precedingMessages);
-    const title = compactInline(input.title) || titleFromObjective(objective, workspace.project.name);
+    const requirements = uniqueStrings([
+      ...(input.requirements || input.knownRequirements || []),
+      ...(taskResolution.requirements || [])
+    ]);
+    const constraints = uniqueStrings([...(input.constraints || []), ...(taskResolution.constraints || [])]);
+    const unresolvedDecisions = uniqueStrings([
+      ...(input.unresolvedDecisions || []),
+      ...(taskResolution.unresolvedDecisions || [])
+    ]);
+    const title = compactInline(input.title || taskResolution.title) || titleFromObjective(objective, workspace.project.name);
     const taskId = compactInline(input.taskId || input.id) || generateTaskId(now, input.idFactory);
 
     const task = {
@@ -644,11 +538,15 @@
         invalidStatus = compactInline(rawStatus);
       }
     }
+    const persistedTitle = compactInline(record.title);
+    const title = !persistedTitle || persistedTitle.toLowerCase() === 'execute dispatch request'
+      ? titleFromObjective(objective || originalUserMessage, workspace.project.name)
+      : persistedTitle;
     const normalized = {
       ...record,
       schemaVersion: SCHEMA_VERSION,
       taskId,
-      title: compactInline(record.title) || titleFromObjective(objective || originalUserMessage, workspace.project.name),
+      title,
       objective,
       originalUserMessage,
       precedingConversationSummary: compactWhitespace(record.precedingConversationSummary || record.contextSummary || ''),
@@ -753,12 +651,28 @@
     }
     if (nextState === TASK_STATES.PENDING && currentState === TASK_STATES.ACTIVE) {
       next.pendingAt = now;
+      const resumePolicy = ['automatic', 'user', 'manual'].includes(compactInline(details.resumePolicy).toLowerCase())
+        ? compactInline(details.resumePolicy).toLowerCase()
+        : 'manual';
       next.execution = {
         ...currentExecution,
         state: TASK_STATES.PENDING,
         yieldedAt: now,
-        reason: compactWhitespace(details.reason || details.pendingReason || '')
+        reason: compactWhitespace(details.reason || details.pendingReason || ''),
+        reasonCode: compactInline(details.reasonCode || ''),
+        resumePolicy
       };
+      if (details.continuation && typeof details.continuation === 'object') {
+        const continuationInput = compactWhitespace(details.continuation.input || details.continuation.prompt || '');
+        if (continuationInput) {
+          next.continuation = {
+            input: continuationInput,
+            source: compactInline(details.continuation.source || 'task-continuation'),
+            messageId: compactInline(details.continuation.messageId || ''),
+            createdAt: Number(details.continuation.createdAt || now)
+          };
+        }
+      }
     }
     if (nextState === TASK_STATES.COMPLETED) {
       next.completedAt = now;
@@ -809,6 +723,38 @@
     }
     const sessionId = compactInline(requester.sessionId || '');
     return !conversationId && !!sessionId && !!task.origin.sessionId && sessionId === task.origin.sessionId;
+  }
+
+  function selectOwnedContinuationTask(tasksValue, requesterConversationIdValue, preferredTaskIdsValue = []) {
+    const requesterConversationId = compactInline(requesterConversationIdValue);
+    const preferredTaskIds = uniqueStrings(preferredTaskIdsValue).map(compactInline).filter(Boolean);
+    const tasks = (Array.isArray(tasksValue) ? tasksValue : [])
+      .map(normalizeTaskRecord)
+      .filter(task =>
+        task.taskId
+        && [TASK_STATES.PENDING, TASK_STATES.ACTIVE].includes(task.status)
+        && compactInline(task.target && task.target.mode).toLowerCase() === 'coder'
+        && canRequesterControlTask(task, { conversationId: requesterConversationId }))
+      .sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0));
+    if (!tasks.length) return { action: 'none', task: null, candidates: [] };
+
+    const active = tasks.filter(task => task.status === TASK_STATES.ACTIVE);
+    const pending = tasks.filter(task => task.status === TASK_STATES.PENDING);
+    const preferredActive = preferredTaskIds
+      .map(taskId => active.find(task => task.taskId === taskId))
+      .find(Boolean);
+    if (preferredActive || active.length === 1) {
+      return { action: 'already_active', task: preferredActive || active[0], candidates: active };
+    }
+    if (active.length > 1) return { action: 'ambiguous_active', task: null, candidates: active };
+
+    const preferredPending = preferredTaskIds
+      .map(taskId => pending.find(task => task.taskId === taskId))
+      .find(Boolean);
+    if (preferredPending || pending.length === 1) {
+      return { action: 'resume_pending', task: preferredPending || pending[0], candidates: pending };
+    }
+    return { action: 'ambiguous_pending', task: null, candidates: pending };
   }
 
   function renderList(label, values) {
@@ -908,6 +854,16 @@
       || null;
   }
 
+  function pendingTaskNeedsRuntimeQueue(taskValue) {
+    if (!taskValue || taskValue.status !== TASK_STATES.PENDING) return false;
+    const execution = taskValue.execution && typeof taskValue.execution === 'object'
+      ? taskValue.execution
+      : {};
+    const attempt = Math.max(0, Number(execution.attempt) || 0);
+    if (attempt === 0) return true;
+    return compactInline(execution.resumePolicy).toLowerCase() === 'automatic';
+  }
+
   function describeSupervisedTaskPresentation(taskValue, context = {}) {
     if (!taskValue || typeof taskValue !== 'object') {
       return {
@@ -929,6 +885,11 @@
     }
     const awaitingReview = context.awaitingReview === true || taskValue.awaitingReview === true;
     const planApproved = context.planApproved === true || taskValue.planApproved === true;
+    const resumePolicy = compactInline(
+      context.resumePolicy
+      || taskValue.execution && taskValue.execution.resumePolicy
+      || ''
+    ).toLowerCase();
     const executionMode = compactInline(context.executionMode || taskValue.executionMode).toLowerCase();
     const subStatus = compactWhitespace(context.subStatus || taskValue.subStatus || '');
     const verifying = status === TASK_STATES.ACTIVE
@@ -945,6 +906,12 @@
       detail = detail || 'Coder’s implementation plan is ready for approval.';
       agentState = 'Review';
       badgeClass = 'warning';
+    } else if (status === TASK_STATES.PENDING && resumePolicy === 'automatic') {
+      phase = 'continuing';
+      label = 'Coder continuing';
+      detail = detail || 'Coder checkpointed its progress and is starting the next pass automatically.';
+      agentState = 'Coder continuing';
+      badgeClass = 'success';
     } else if (status === TASK_STATES.PENDING) {
       phase = 'queued';
       label = 'Coder queued';
@@ -1050,13 +1017,17 @@
     TASK_STATES,
     normalizeTransitionStatus,
     isContextDependentRequest,
+    isContinuationRequest,
+    deriveTaskTitle: titleFromObjective,
     buildTaskPacket,
     normalizeTaskRecord,
     transitionTask,
     canRequesterControlTask,
+    selectOwnedContinuationTask,
     cancelPendingOwnedTasks,
     renderTaskPrompt,
     describeTaskStatus,
+    pendingTaskNeedsRuntimeQueue,
     selectSupervisedTask,
     describeSupervisedTaskPresentation
   };

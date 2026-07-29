@@ -1,7 +1,7 @@
 (function initOperationalContext(globalScope) {
   'use strict';
 
-  const VERSION = 1;
+  const VERSION = 2;
   const MAX_RESOLVED_BLOCKERS = 100;
   const MAX_DISCOVERIES = 100;
   const MAX_DISCARDED = 50;
@@ -15,6 +15,45 @@
 
   function cleanText(value, maxLength = 4000) {
     return String(value || '').trim().slice(0, maxLength);
+  }
+
+  function uniqueText(values, limit = 100) {
+    const output = [];
+    const seen = new Set();
+    for (const value of Array.isArray(values) ? values : []) {
+      const normalized = cleanText(value, 500);
+      const key = normalized.toLowerCase();
+      if (!normalized || seen.has(key)) continue;
+      seen.add(key);
+      output.push(normalized);
+      if (output.length >= limit) break;
+    }
+    return output;
+  }
+
+  function normalizeCoverageFrontier(value) {
+    if (!value || typeof value !== 'object') return null;
+    const requiredSurfaces = uniqueText(value.requiredSurfaces);
+    const risk = normalizeStatus(value.risk, ['low', 'medium', 'high'], 'medium');
+    return {
+      required: value.required !== false,
+      risk,
+      requiredSurfaces,
+      inspected: uniqueText(value.inspected),
+      verified: uniqueText(value.verified),
+      inferredOnly: uniqueText(value.inferredOnly),
+      notInspected: uniqueText(value.notInspected),
+      outOfScope: uniqueText(value.outOfScope),
+      adversarialReviewRequired: value.adversarialReviewRequired === true || risk === 'high',
+      adversarialReview: value.adversarialReview && typeof value.adversarialReview === 'object'
+        ? {
+            status: normalizeStatus(value.adversarialReview.status, ['pending', 'passed', 'failed'], 'pending'),
+            summary: cleanText(value.adversarialReview.summary, 3000),
+            evidence: uniqueText(value.adversarialReview.evidence, 30),
+            at: value.adversarialReview.at || null
+          }
+        : null
+    };
   }
 
   function makeId(prefix, text, now) {
@@ -35,6 +74,7 @@
       discoveries: [],
       discarded: [],
       latestEvidence: [],
+      coverageFrontier: null,
       lastDistillation: null,
       lastCheckpoint: null,
       createdAt: at,
@@ -155,6 +195,7 @@
         checkpoint: cleanText(item && item.checkpoint, 500),
         at: item && item.at || at
       })).filter(item => item.summary).slice(-MAX_EVIDENCE) : [],
+      coverageFrontier: normalizeCoverageFrontier(source.coverageFrontier),
       lastDistillation: source.lastDistillation && typeof source.lastDistillation === 'object' ? {
         subplanId: cleanText(source.lastDistillation.subplanId, 100),
         subplanTitle: cleanText(source.lastDistillation.subplanTitle, 1000),
@@ -194,6 +235,63 @@
             : null;
         }
         event.summary = `Mission updated: ${statement}`;
+        break;
+      }
+      case 'set_coverage_frontier': {
+        const coverage = normalizeCoverageFrontier({ ...args, required: args.required !== false });
+        if (!coverage || coverage.requiredSurfaces.length === 0) {
+          throw new Error('Coverage frontier requires at least one required surface');
+        }
+        state.coverageFrontier = coverage;
+        event.summary = `Coverage frontier set for ${coverage.requiredSurfaces.length} surface(s)`;
+        break;
+      }
+      case 'update_coverage_frontier': {
+        if (!state.coverageFrontier) throw new Error('No coverage frontier exists');
+        const newlyInspected = new Set(uniqueText(args.inspected).map(value => value.toLowerCase()));
+        const newlyVerified = new Set(uniqueText(args.verified).map(value => value.toLowerCase()));
+        const newlyOutOfScope = new Set(uniqueText(args.outOfScope).map(value => value.toLowerCase()));
+        const merged = {};
+        ['inspected', 'verified', 'inferredOnly', 'notInspected', 'outOfScope'].forEach(key => {
+          merged[key] = uniqueText([
+            ...(state.coverageFrontier[key] || []),
+            ...(Array.isArray(args[key]) ? args[key] : [])
+          ]);
+        });
+        merged.inspected = uniqueText([
+          ...merged.inspected,
+          ...merged.verified
+        ]).filter(value => !newlyOutOfScope.has(value.toLowerCase()));
+        merged.notInspected = merged.notInspected.filter(value =>
+          !newlyInspected.has(value.toLowerCase())
+          && !newlyVerified.has(value.toLowerCase())
+          && !newlyOutOfScope.has(value.toLowerCase())
+        );
+        merged.inferredOnly = merged.inferredOnly.filter(value =>
+          !newlyInspected.has(value.toLowerCase())
+          && !newlyVerified.has(value.toLowerCase())
+          && !newlyOutOfScope.has(value.toLowerCase())
+        );
+        merged.verified = merged.verified.filter(value => !newlyOutOfScope.has(value.toLowerCase()));
+        state.coverageFrontier = normalizeCoverageFrontier({
+          ...state.coverageFrontier,
+          ...merged,
+          ...(args.risk ? { risk: args.risk } : {})
+        });
+        event.summary = 'Coverage frontier updated';
+        break;
+      }
+      case 'record_adversarial_review': {
+        if (!state.coverageFrontier) throw new Error('No coverage frontier exists');
+        const status = normalizeStatus(args.status, ['passed', 'failed'], '');
+        if (!status) throw new Error('Adversarial review status must be passed or failed');
+        state.coverageFrontier.adversarialReview = {
+          status,
+          summary: requireText(args, 'summary', 'adversarial review summary'),
+          evidence: uniqueText(args.evidence, 30),
+          at
+        };
+        event.summary = `Adversarial review ${status}`;
         break;
       }
       case 'start_subplan': {
@@ -453,6 +551,19 @@
       lines.push('Latest evidence/checkpoints:');
       state.latestEvidence.slice(-8).forEach(item => lines.push(`- [${item.outcome}] ${item.toolName}: ${item.summary}`));
     }
+    if (state.coverageFrontier) {
+      const coverage = state.coverageFrontier;
+      lines.push(`Coverage frontier (${coverage.risk} risk):`);
+      lines.push(`- Required surfaces: ${coverage.requiredSurfaces.join('; ') || 'None'}`);
+      lines.push(`- Inspected: ${coverage.inspected.join('; ') || 'None'}`);
+      lines.push(`- Verified: ${coverage.verified.join('; ') || 'None'}`);
+      lines.push(`- Inferred only: ${coverage.inferredOnly.join('; ') || 'None'}`);
+      lines.push(`- Not inspected: ${coverage.notInspected.join('; ') || 'None'}`);
+      lines.push(`- Out of scope: ${coverage.outOfScope.join('; ') || 'None'}`);
+      if (coverage.adversarialReviewRequired) {
+        lines.push(`- Adversarial review: ${coverage.adversarialReview ? coverage.adversarialReview.status : 'pending'}`);
+      }
+    }
     if (state.lastCheckpoint) {
       lines.push(`Latest checkpoint: ${state.lastCheckpoint.summary || state.lastCheckpoint.reason}`);
       if (state.lastCheckpoint.nextAction) lines.push(`Checkpoint next action: ${state.lastCheckpoint.nextAction}`);
@@ -461,59 +572,48 @@
     return lines.join('\n');
   }
 
-  // Assistant text that narrates the agent's own operational status (auth/tool failures,
-  // "I will now do X" promises) must not be replayed as if it were still current — the
-  // operational context above is the canonical source for that. A substantive answer to the
-  // user's actual question (e.g. a list of suggestions) is not self-diagnosis and is safe to
-  // replay so later turns can resolve references like "number 1" or "that idea" back to it.
-  //
-  // This also covers agent.js's own canned run-status fallback templates (e.g. "I inspected the
-  // workspace but did not produce the requested answer", "Task finished.", the completion-gate
-  // "blocked" message). Those are scaffolding narration about the run itself, not an answer —
-  // replaying one back to the model caused it to literally continue/echo its own prior status
-  // line instead of treating the next turn as fresh, once assistant messages started being kept
-  // in the chat view for conversational continuity.
-  function looksLikeSelfDiagnosisOrPromise(text) {
-    const normalized = String(text || '').toLowerCase();
-    return /\bi (?:encountered|previously|will now|cannot|can't|couldn't|could not|am unable|was unable)\b/.test(normalized) ||
-      /\b(prevents? me from|blocked me from|api (?:key|authentication) error|access (?:is|was) denied)\b/.test(normalized) ||
-      /did not produce the requested answer/.test(normalized) ||
-      /cannot honestly mark this complete yet/.test(normalized) ||
-      /completed the next batch of implementation steps/.test(normalized) ||
-      /i paused after several automatic continuation passes/.test(normalized) ||
-      /did not verify the change with a real test/.test(normalized) ||
-      /regression test check that ran after one of these edits failed/.test(normalized) ||
-      /i made progress but the plan is not finished yet/.test(normalized) ||
-      normalized.trim().startsWith('task finished.');
-  }
-
-  function buildRecentChatView(messages, currentInput = '', limit = MAX_CHAT_VIEW_MESSAGES) {
+  function buildRecentChatView(messages, currentInput = '', limit = MAX_CHAT_VIEW_MESSAGES, options = {}) {
+    const contextScope = cleanText(options.contextScope || 'task', 40).toLowerCase();
+    if (contextScope === 'none') return [];
     const input = cleanText(currentInput, 12000);
+    const excludedSources = new Set([
+      'queue-status',
+      'queued-prompt',
+      'agent-start-blocked',
+      'agent-status',
+      'assistant-status',
+      'completion-gate-status',
+      'automatic-continuation-status',
+      'supervisor-checkin-error',
+      'supervisor-conversational-error',
+      'task-resolution-clarification'
+    ]);
     const view = (Array.isArray(messages) ? messages : [])
       .filter(message => message && (message.role === 'user' || message.role === 'assistant'))
-      .map(message => ({ role: message.role, text: cleanText(message.text, 2000) }))
+      .filter(message => !excludedSources.has(cleanText(message.source, 120)))
+      .map(message => ({ role: message.role, text: cleanText(message.text, 2000), source: cleanText(message.source, 120) }))
       .filter(message => message.text && message.text !== 'Thinking...' && !message.text.startsWith('[COMPACTED CONTEXT SUMMARY]'))
-      .filter(message => message.role !== 'assistant' || !looksLikeSelfDiagnosisOrPromise(message.text));
+      .filter(message => message.role !== 'assistant' || !message.source.endsWith('-error'));
     if (view.length && view[view.length - 1].role === 'user' && view[view.length - 1].text === input) view.pop();
-    return view.slice(-Math.max(0, Number(limit) || MAX_CHAT_VIEW_MESSAGES));
+    const scopeLimit = contextScope === 'recent' ? 4 : (contextScope === 'historical' ? 16 : Math.max(0, Number(limit) || MAX_CHAT_VIEW_MESSAGES));
+    return view.slice(-scopeLimit);
   }
 
-  function buildReasoningMessages(input, conversationMessages, currentInput, images = []) {
+  function buildReasoningMessages(input, conversationMessages, currentInput, images = [], options = {}) {
     const state = normalizeContext(input);
-    const statePrompt = formatForPrompt(state) || [
-      '[ORION OPERATIONAL CONTEXT - canonical working state]',
-      'Mission: Not defined',
-      'Win conditions: Not defined',
-      'Establish the mission and evidence-backed win conditions before treating chat as task state.'
-    ].join('\n');
-    const messages = [
-      { role: 'user', parts: [{ text: statePrompt }] },
-      { role: 'model', parts: [{ text: 'Working state loaded. I will reason from it and treat chat as an input/view channel.' }] }
-    ];
-    const chatView = buildRecentChatView(conversationMessages, currentInput);
+    const contextScope = cleanText(options.contextScope || 'task', 40).toLowerCase();
+    const statePrompt = formatForPrompt(state);
+    const messages = [];
+    if (contextScope !== 'none' && statePrompt) {
+      messages.push(
+        { role: 'user', parts: [{ text: statePrompt }] },
+        { role: 'model', parts: [{ text: 'Working state loaded. I will reason from it and treat chat as an input/view channel.' }] }
+      );
+    }
+    const chatView = buildRecentChatView(conversationMessages, currentInput, MAX_CHAT_VIEW_MESSAGES, { contextScope });
     if (chatView.length) {
-      messages.push({ role: 'user', parts: [{ text: `[RECENT USER CHAT VIEW - non-canonical]\nThis carries the user's recent intent plus your own recent substantive replies, so you can resolve references like "number 1" or "that idea" back to what you actually said. Self-diagnosis of your own past errors/blockers and "I will now..." promises are deliberately excluded from this view — those are not replayed, so use operational context, notes, files, and tool results for task facts, blockers, and completion evidence, not this chat view.\n\n${chatView.map(item => `${item.role}: ${item.text}`).join('\n\n')}` }] });
-      messages.push({ role: 'model', parts: [{ text: 'Recent chat (including my own prior replies, excluding self-diagnosis/promises) received as non-canonical context.' }] });
+      messages.push({ role: 'user', parts: [{ text: `[RECENT CHAT VIEW - non-canonical]\nThis carries only the context scope selected for this phase. Messages marked as runtime status/error scaffolding are excluded by source; substantive replies remain available for references such as "number 1" or "that idea". Use operational context, notes, files, and tool results for task facts, blockers, and completion evidence.\n\n${chatView.map(item => `${item.role}: ${item.text}`).join('\n\n')}` }] });
+      messages.push({ role: 'model', parts: [{ text: 'Relevant recent chat received as a non-canonical view; durable task and evidence state remain authoritative.' }] });
     }
     // Build the final user message, including any attached images as inline_data parts
     const userParts = [];
@@ -573,6 +673,9 @@
       backlogCandidates: details.backlogCandidates || [],
       pendingWinConditions: details.pendingWinConditions || [],
       pendingRequirements: details.pendingRequirements || []
+      ,
+      missingCoverage: details.missingCoverage || [],
+      coverageFrontier: details.coverageFrontier || null
     };
   }
 
@@ -644,8 +747,38 @@
       reasons.push('No test/smoke/manual verification evidence is recorded.');
     }
 
-    if (reasons.length || missingEvidence.length || pendingWinConditions.length || pendingRequirements.length) {
-      return makeGate('continue_work', reasons, { missingEvidence, pendingWinConditions, pendingRequirements });
+    const coverage = state.coverageFrontier;
+    const missingCoverage = [];
+    if (coverage && coverage.required !== false) {
+      const inspected = new Set(coverage.inspected.map(value => value.toLowerCase()));
+      const verified = new Set(coverage.verified.map(value => value.toLowerCase()));
+      const inferredOnly = new Set(coverage.inferredOnly.map(value => value.toLowerCase()));
+      const notInspected = new Set(coverage.notInspected.map(value => value.toLowerCase()));
+      const outOfScope = new Set(coverage.outOfScope.map(value => value.toLowerCase()));
+      coverage.requiredSurfaces.forEach(surface => {
+        const key = surface.toLowerCase();
+        if (outOfScope.has(key)) return;
+        if (!inspected.has(key) || inferredOnly.has(key) || notInspected.has(key)) {
+          missingCoverage.push(`${surface}: not directly inspected`);
+          return;
+        }
+        if (!verified.has(key)) missingCoverage.push(`${surface}: inspected but not verified`);
+      });
+      if (coverage.adversarialReviewRequired
+        && (!coverage.adversarialReview || coverage.adversarialReview.status !== 'passed')) {
+        missingCoverage.push('bounded adversarial review');
+      }
+      if (missingCoverage.length) reasons.push('Required impact surfaces remain inferred, uninspected, unverified, or lack adversarial review.');
+    }
+
+    if (reasons.length || missingEvidence.length || pendingWinConditions.length || pendingRequirements.length || missingCoverage.length) {
+      return makeGate('continue_work', reasons, {
+        missingEvidence,
+        pendingWinConditions,
+        pendingRequirements,
+        missingCoverage,
+        coverageFrontier: coverage
+      });
     }
 
     return makeGate('ready_for_final', [

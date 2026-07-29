@@ -19,7 +19,7 @@ function missionState() {
 
 test('operational context creates a mission and preserves win-condition progress', (t) => {
   let state = missionState();
-  t.equal(state.version, 1, 'uses the current schema version');
+  t.equal(state.version, 2, 'uses the current schema version');
   t.equal(state.mission.statement, 'Build a deep colony simulation.', 'stores mission');
   t.equal(state.winConditions.length, 2, 'stores measurable win conditions');
 
@@ -330,6 +330,72 @@ test('completion gate ignores chat trimming and judges operational state', (t) =
   t.end();
 });
 
+test('coverage frontier prevents a broad end-to-end completion claim until required surfaces are verified', (t) => {
+  let state = missionState();
+  state = operational.applyAction(state, 'evaluate_win_conditions', {
+    evaluations: [
+      { id: 'economy', status: 'satisfied', evidence: ['economy.test.js passed'] },
+      { id: 'npcs', status: 'satisfied', evidence: ['npc autonomy smoke test passed'] }
+    ]
+  }, T0).state;
+  state = operational.applyAction(state, 'record_tool_result', {
+    toolName: 'run_tests',
+    success: true,
+    summary: 'npm test passed'
+  }, T0).state;
+  state = operational.applyAction(state, 'set_coverage_frontier', {
+    required: true,
+    risk: 'high',
+    requiredSurfaces: [
+      'State producers',
+      'State consumers',
+      'Persistence and reload',
+      'Stale actions'
+    ],
+    inspected: ['State producers'],
+    verified: ['State producers'],
+    inferredOnly: ['State consumers'],
+    notInspected: ['Persistence and reload', 'Stale actions'],
+    adversarialReviewRequired: true
+  }, T0).state;
+
+  let gate = operational.evaluateCompletionGate(state);
+  t.equal(gate.status, 'continue_work', 'passing win conditions cannot bypass incomplete impact coverage');
+  t.ok(gate.missingCoverage.some(item => /State consumers/.test(item)), 'an inferred consumer remains visible');
+  t.ok(gate.missingCoverage.some(item => /Persistence and reload/.test(item)), 'an uninspected reload path remains visible');
+  t.ok(gate.missingCoverage.some(item => /adversarial review/i.test(item)), 'the required challenge pass remains visible');
+
+  state = operational.applyAction(state, 'update_coverage_frontier', {
+    inspected: ['State consumers', 'Persistence and reload', 'Stale actions'],
+    verified: ['State consumers', 'Persistence and reload', 'Stale actions']
+  }, T0).state;
+  gate = operational.evaluateCompletionGate(state);
+  t.equal(gate.status, 'continue_work', 'surface verification alone cannot skip the required adversarial review');
+  t.deepEqual(gate.missingCoverage, ['bounded adversarial review'], 'only the challenge pass remains');
+
+  state = operational.applyAction(state, 'record_adversarial_review', {
+    status: 'passed',
+    summary: 'Tried stale plan actions after reload; server ownership and revision checks rejected them.',
+    evidence: ['stale-plan-action integration test passed']
+  }, T0).state;
+  gate = operational.evaluateCompletionGate(state);
+  t.equal(gate.status, 'ready_for_final', 'verified surfaces plus a passed bounded review allow completion');
+  t.end();
+});
+
+test('simple tasks remain lightweight without a coverage frontier', (t) => {
+  let state = operational.applyAction(operational.createEmptyContext(T0), 'update_mission_context', {
+    mission: 'Correct one display label.',
+    winConditions: [{ id: 'label', title: 'Label is corrected.' }]
+  }, T0).state;
+  state = operational.applyAction(state, 'evaluate_win_conditions', {
+    evaluations: [{ id: 'label', status: 'satisfied', evidence: ['render assertion passed'] }]
+  }, T0).state;
+  t.equal(state.coverageFrontier, null, 'trivial work does not receive a synthetic coverage matrix');
+  t.equal(operational.evaluateCompletionGate(state).status, 'ready_for_final', 'the ordinary evidence gate remains sufficient');
+  t.end();
+});
+
 test('discoveries deduplicate and discarded noise stays bounded', (t) => {
   let state = missionState();
   state = operational.applyAction(state, 'promote_discovery', { text: 'Tests run with npm test.', category: 'command' }, T0).state;
@@ -407,22 +473,22 @@ test('new model turn receives mission state even when old chat is reduced', (t) 
   t.equal(messages[0].role, 'user', 'state envelope is first');
   t.ok(messages[0].parts[0].text.includes('Mission: Build a deep colony simulation.'), 'first provider turn carries mission');
   t.ok(messages[0].parts[0].text.includes('Win conditions'), 'first provider turn carries win conditions');
-  t.ok(messages.some(message => JSON.stringify(message).includes('[RECENT USER CHAT VIEW - non-canonical]')), 'user chat is present only as view context');
+  t.ok(messages.some(message => JSON.stringify(message).includes('[RECENT CHAT VIEW - non-canonical]')), 'user chat is present only as view context');
   t.end();
 });
 
-test('recent chat view excludes stale assistant self-diagnoses and promises', (t) => {
+test('recent chat view excludes runtime scaffolding by structured source', (t) => {
   const state = missionState();
   const priorChat = [
     { role: 'user', text: 'Can you review this program?' },
-    { role: 'assistant', text: 'I encountered an API authentication error previously, which prevents me from accessing tools.' },
-    { role: 'assistant', text: 'I will now read files.' },
+    { role: 'assistant', source: 'assistant-status', text: 'I encountered an API authentication error previously, which prevents me from accessing tools.' },
+    { role: 'assistant', source: 'agent-status', text: 'I will now read files.' },
     { role: 'user', text: 'Please actually inspect it.' }
   ];
   const view = operational.buildRecentChatView(priorChat, 'Start now.');
   const messages = operational.buildReasoningMessages(state, priorChat, 'Start now.');
   const joined = JSON.stringify(messages);
-  t.deepEqual(view.map(item => item.role), ['user', 'user'], 'self-diagnostic/promise assistant turns are filtered out');
+  t.deepEqual(view.map(item => item.role), ['user', 'user'], 'runtime-status assistant turns are filtered out');
   t.ok(joined.includes('Please actually inspect it.'), 'latest user intent remains visible');
   t.notOk(joined.includes('API authentication error'), 'assistant auth self-diagnosis is not replayed');
   t.notOk(joined.includes('I will now read files'), 'assistant promises are not replayed as evidence');
@@ -460,10 +526,10 @@ test('recent chat view retains substantive assistant answers so later turns can 
 test('recent chat view filters out the agent\'s own canned run-status fallback text', (t) => {
   const priorChat = [
     { role: 'user', text: 'add an army to the game' },
-    { role: 'assistant', text: 'I inspected the workspace but did not produce the requested answer. This run is not complete; ask me to continue and I should use the gathered context to answer the actual request instead of stopping after file listing.' },
-    { role: 'assistant', text: 'Task finished.\n\n## Work Walkthrough\n- Done: Read file' },
-    { role: 'assistant', text: 'I cannot honestly mark this complete yet because the operational state is blocked.\n\nCompletion gate status: blocked.' },
-    { role: 'assistant', text: 'Completed the next batch of implementation steps. Continuing automatically with the remaining plan…' },
+    { role: 'assistant', source: 'agent-status', text: 'I inspected the workspace but did not produce the requested answer. This run is not complete; ask me to continue and I should use the gathered context to answer the actual request instead of stopping after file listing.' },
+    { role: 'assistant', source: 'assistant-status', text: 'Task finished.\n\n## Work Walkthrough\n- Done: Read file' },
+    { role: 'assistant', source: 'completion-gate-status', text: 'I cannot honestly mark this complete yet because the operational state is blocked.\n\nCompletion gate status: blocked.' },
+    { role: 'assistant', source: 'automatic-continuation-status', text: 'Completed the next batch of implementation steps. Continuing automatically with the remaining plan…' },
     { role: 'user', text: 'ok continue' }
   ];
   const view = operational.buildRecentChatView(priorChat, 'go on');
@@ -478,11 +544,18 @@ test('orphan blockers are not injected as canonical task state', (t) => {
     details: 'Old spawn powershell.exe ENOENT failure.'
   }, T0).state;
   const prompt = operational.formatForPrompt(state);
-  const messages = operational.buildReasoningMessages(state, [], 'how much system memory do i have?');
+  const messages = operational.buildReasoningMessages(
+    state,
+    [],
+    'how much system memory do i have?',
+    [],
+    { contextScope: 'none' }
+  );
   const joined = JSON.stringify(messages);
   t.equal(prompt, '', 'blocker-only context is treated as stale/orphaned');
   t.notOk(joined.includes('Command Execution Environment Issue'), 'stale blocker is not injected into the next direct task');
-  t.ok(joined.includes('Mission: Not defined'), 'model still receives a neutral state envelope');
+  t.notOk(joined.includes('Mission:'), 'a context-free turn receives no unrelated state envelope');
+  t.ok(joined.includes('how much system memory do i have?'), 'the exact current request is still present');
   t.end();
 });
 
@@ -497,7 +570,7 @@ test('agent and renderer wire operational context into both providers and Missio
   t.equal((agent.match(/functionDeclarations: buildAgentToolDeclarations\(\)/g) || []).length, 1, 'Ollama consumes the canonical tool builder directly');
   t.ok(/function buildGeminiToolDeclarations\(\)[\s\S]{0,250}buildAgentToolDeclarations\(\)/.test(agent), 'Gemini provider projection derives from the same canonical builder');
   t.ok(agent.includes('functionDeclarations: buildGeminiToolDeclarations()'), 'Gemini requests use the provider-safe projection');
-  t.ok(agent.includes('OperationalContext.buildReasoningMessages(workingState'), 'builds provider input from working state first');
+  t.ok(/OperationalContext\.buildReasoningMessages\(\s*workingState/.test(agent), 'builds provider input from working state first');
   t.notOk(agent.includes('conversation.messages.forEach(msg =>'), 'does not reconstruct task state from full chat transcript');
   t.ok(agent.includes('evaluateWorkingStateCompletion'), 'uses a single completion gate before finalizing');
   t.ok(agent.includes('Completion gate held final response'), 'completion gate can force continued work instead of final summaries');

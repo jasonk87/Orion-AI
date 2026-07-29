@@ -6,6 +6,7 @@ const rendererJs = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8
 const agentJs = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
 const preloadJs = fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8');
 const semanticSearchJs = fs.readFileSync(path.join(__dirname, '../lib/semantic-search.js'), 'utf8');
+const SemanticIntentRouter = require('../semantic-intent-router.js');
 global.window = {};
 global.fetch = async () => ({ ok: false });
 const agent = require('../agent.js');
@@ -55,7 +56,7 @@ test('completed assistant responses are flushed for background phone conversatio
   t.ok(rendererJs.includes('if (conversationId) dirtyConversationIds.add(conversationId)'), 'explicit flush marks its target dirty');
   t.ok(/dirtyConversationIds\.add\(c\.id\);\s*console\.error\(`Save failed for conv \$\{c\.id\}`/.test(rendererJs), 'failed conversation writes remain dirty for retry');
 
-  const finalRender = agentJs.indexOf('window.renderAiMessage(lastTextResponse, currentAgentLogs, conversation.id, conversation.messages[aiMessageIndex]);');
+  const finalRender = agentJs.indexOf('window.renderAiMessage(lastTextResponse, currentAgentLogs, conversation.id, finalizedRunMessage);');
   const dirtyFinal = agentJs.indexOf('window.markConversationDirty(conversation.id);', finalRender);
   const flushFinal = agentJs.indexOf('await window.flushConversationsToStorage(conversation.id);', finalRender);
   t.ok(finalRender !== -1 && dirtyFinal > finalRender, 'the completed assistant message is marked dirty after its final render');
@@ -75,14 +76,23 @@ test('conversation reload normalizes stored assistant message shapes', (t) => {
   t.ok(rendererJs.includes('responseLooksFailed'), 'replay preserves error status from saved tool responses');
   t.ok(agentJs.includes('function persistCurrentAgentLogs'), 'agent has a single persistence helper for live logs');
   t.ok(agentJs.includes('persistCurrentAgentLogs({ render: true });'), 'agent persists tool logs while rendering live activity');
-  t.ok(
-    /conversation\.messages\.push\(\{ role: 'assistant', text: 'Thinking\.\.\.', logs: \[\], turns: \[\], createdAt: Date\.now\(\) \}\);\s*if \(window\.saveConversationsToStorage\)/.test(agentJs),
-    'agent immediately persists the assistant placeholder so reloads keep the agent side coherent'
-  );
+  t.ok(agentJs.includes('function ensureActiveRunMessage'), 'agent owns one repairable live assistant message per run');
+  t.ok(agentJs.includes('if (!Array.isArray(activeRunMessage.turns)) activeRunMessage.turns = [];'), 'a partially hydrated run message repairs its turns before appending');
+  t.ok(agentJs.includes('ensureActiveRunMessage();\n  if (window.saveConversationsToStorage)'), 'agent immediately persists the assistant placeholder so reloads keep the agent side coherent');
   const loopStart = agentJs.indexOf('window.runAgentLoop = async function');
-  const placeholderIndex = agentJs.indexOf("conversation.messages.push({ role: 'assistant', text: 'Thinking...'", loopStart);
+  const placeholderIndex = agentJs.indexOf('ensureActiveRunMessage();', loopStart);
   const routingIndex = agentJs.indexOf('if (isInternalPrompt)', loopStart);
   t.ok(placeholderIndex > loopStart && placeholderIndex < routingIndex, 'assistant placeholder is saved before async routing/classification can fail');
+  t.end();
+});
+
+test('durable task presentation repairs legacy generic titles and missed terminal notifications', (t) => {
+  t.ok(rendererJs.includes("const LEGACY_DISPATCH_TASK_TITLE = 'Execute Dispatch request'"), 'the old internal placeholder is recognized only as a migration value');
+  t.ok(rendererJs.includes('function reconcileConversationTaskPresentation'), 'task titles are reconciled from the canonical durable task');
+  t.ok(rendererJs.includes('message.text.includes(String(task.taskId))'), 'legacy transcript text is rewritten only when bound to the exact task');
+  t.ok(rendererJs.includes('scheduleTerminalDelegatedTaskReconciliation(conversation, durableTasks);'), 'hydrating a Dispatch conversation reconciles a terminal task missed during restart');
+  t.ok(rendererJs.includes("await notifySupervisorOfCoderCompletion(coderConvId, taskId);"), 'the live monitor publishes the canonical terminal outcome instead of silently stopping');
+  t.ok(rendererJs.includes('orchestrationTaskId: taskId'), 'terminal notifications carry a durable dedupe identity');
   t.end();
 });
 
@@ -359,31 +369,20 @@ test('workspace resolution carries evidence forward from later desktop listings'
   t.end();
 });
 
-test('local system fact failures do not become fake blockers or web research', (t) => {
-  t.equal(agent.isLocalSystemFactRequest('how much memory does my computer have left?'), true, 'recognizes local memory query');
-  t.equal(agent.isLocalSystemFactRequest('what do you think about my computer performance wise?'), true, 'recognizes local performance assessment query');
-  t.equal(agent.isLocalSystemFactRequest('look up Gemini API docs'), false, 'does not classify docs research as local system fact');
-  t.equal(agent.isGenericNonAnswer('Understood.'), true, 'recognizes generic acknowledgement as a non-answer');
-  t.equal(agent.requestNeedsLocalInspection('what do you think about my computer performance wise?'), true, 'performance assessment requires local inspection');
-  t.equal(
-    agent.isLocalProjectOrFolderRequest('I have a folder on my desktop called rocket sumo, recommend similar games and improvements'),
-    true,
-    'local project recommendations require filesystem inspection before advice'
-  );
-  t.equal(
-    agent.requestNeedsLocalInspection('I have a folder on my desktop called rocket sumo, recommend similar games and improvements'),
-    true,
-    'local project recommendations are local inspection requests'
-  );
+test('local inspection enforcement consumes structured intent instead of response keywords', (t) => {
+  t.equal(agent.isLocalSystemFactRequest, undefined, 'the local-system phrase classifier is removed');
+  t.equal(agent.requestNeedsLocalInspection, undefined, 'the local-inspection phrase classifier is removed');
+  t.equal(agent.isLocalProjectOrFolderRequest, undefined, 'the local-project phrase classifier is removed');
+  t.equal(agent.isGenericNonAnswer('Understood.'), false, 'natural acknowledgements are not rejected by a phrase gate');
   t.equal(
     agent.isLocalAccessDeflection("I can only access file system locations that are explicitly provided to me or are within the defined workspace."),
-    true,
-    'recognizes false local-access disclaimers'
+    false,
+    'natural-language access disclaimers are not reclassified after the semantic preflight'
   );
   t.equal(
     agent.shouldHaveUsedToolsButDidNot('Understood.', [], 'what do you think about my computer performance wise?'),
-    true,
-    'generic acknowledgement cannot satisfy a local performance request without tools'
+    false,
+    'a non-empty answer is not reinterpreted by a second language classifier'
   );
   t.equal(
     agent.shouldHaveUsedToolsButDidNot(
@@ -391,10 +390,10 @@ test('local system fact failures do not become fake blockers or web research', (
       [],
       'I have a folder on my desktop called rocket sumo, recommend similar games and improvements'
     ),
-    true,
-    'local project recommendations cannot be answered with access disclaimers instead of tools'
+    false,
+    'response wording does not drive a second local-project route'
   );
-  const localFolderGuidance = agent.buildLocalInspectionNoToolGuidance('I have a folder on my desktop called rocket sumo, recommend similar games and improvements');
+  const localFolderGuidance = agent.buildLocalInspectionNoToolGuidance({ inspectionTarget: 'project' });
   t.ok(
     localFolderGuidance.includes('Get-ChildItem') && localFolderGuidance.includes('change_workspace'),
     'local project no-tool recovery tells Orion to try change_workspace then fall back to a directory search'
@@ -651,7 +650,7 @@ test('local system fact failures do not become fake blockers or web research', (
   );
 
   const webGate = agent.getEpistemicToolGate(
-    'how much memory does my computer have left?',
+    { inspectionTarget: 'local_system' },
     ledger,
     'google_search',
     { query: 'how to get system memory information without powershell or wmic' }
@@ -660,7 +659,7 @@ test('local system fact failures do not become fake blockers or web research', (
   t.ok(webGate.reason.includes('local machine'), 'web gate explains local-state boundary');
 
   const blockerGate = agent.getEpistemicToolGate(
-    'how much memory does my computer have left?',
+    { inspectionTarget: 'local_system' },
     ledger,
     'record_blocker',
     { title: 'Cannot check memory' }
@@ -669,7 +668,7 @@ test('local system fact failures do not become fake blockers or web research', (
   t.ok(blockerGate.reason.includes('failed local-inspection commands alone'), 'blocker gate explains evidence problem');
 
   const correction = agent.buildEpistemicCorrectionPrompt({
-    userPrompt: 'how much memory does my computer have left?',
+    semanticIntent: { inspectionTarget: 'local_system' },
     answerText: 'I cannot proceed without a configured Google Search API key.',
     toolEvidenceLedger: ledger
   });
@@ -1033,54 +1032,69 @@ test('Dispatch uses Projects fallback while Coder standalone conversations get i
   t.end();
 });
 
-test('Dispatch permission refusals deterministically require a Coder handoff', (t) => {
+test('Dispatch execution authority comes from structured intent, not request/refusal phrases', (t) => {
   const request = 'Can you kill Claude and restart it again?';
-  const refusal = "I can't control local processes from this read-only chat. You'll need to restart it manually from your terminal.";
-  t.equal(agent.dispatchRequestRequiresCoderExecution(request), true, 'the exact kill/restart request is classified as executable work');
-  t.equal(agent.isDispatchExecutionDeflection(refusal), true, 'the permission refusal/manual return is detected');
-  t.equal(agent.shouldForceDispatchHandoff(request, refusal, { mode: 'orion' }), true, 'Dispatch must replace the refusal with handoff_to_coder');
-  t.equal(agent.shouldForceDispatchHandoff(request, refusal, { mode: 'coder' }), false, 'Coder mode is not intercepted by the Dispatch guard');
-  t.equal(agent.shouldForceDispatchHandoff(request, refusal, { mode: 'orion', alreadyHandedOff: true }), false, 'one request cannot create duplicate forced handoffs');
-  t.equal(agent.dispatchRequestRequiresCoderExecution('How can I restart Claude myself?'), false, 'an instructional question is not mistaken for a direct execution request');
-  t.equal(agent.shouldForceDispatchHandoff('Can you explain why Claude restarted?', refusal, { mode: 'orion' }), false, 'a read-only explanation request is not handed off');
+  t.equal(agent.dispatchRequestRequiresCoderExecution, undefined, 'ordinary-English execution is no longer inferred by a phrase helper');
+  t.equal(agent.isDispatchExecutionDeflection, undefined, 'model response prose is no longer classified as a permission refusal');
+  t.equal(agent.shouldForceDispatchHandoff, undefined, 'narrated handoffs are not inferred after the model response');
+  const structured = SemanticIntentRouter.normalizeClassification({
+    intent: 'new_task',
+    requiresExecution: true,
+    target: 'current_conversation',
+    resolvedRequest: request,
+    confidence: 1,
+    reasoningPolicyHint: { complexity: 'medium', risk: 'high', contextNeed: 'none' },
+    executionScope: 'mutating',
+    inspectionTarget: 'local_system',
+    standaloneSystemOperation: true
+  }, SemanticIntentRouter.buildInput({ userMessage: request, mode: 'orion' }));
+  t.equal(structured.requiresExecution, true, 'the shared result carries execution need');
+  t.equal(structured.inspectionTarget, 'local_system', 'the shared result carries the evidence target');
+  t.equal(structured.standaloneSystemOperation, true, 'the shared result identifies standalone process work');
   const prompt = agent.buildForcedDispatchHandoffPrompt(request);
   t.ok(prompt.includes(request), 'the generated Coder prompt preserves the exact user request');
   t.ok(/identify the intended local target/i.test(prompt), 'the Coder prompt resolves ambiguous process identity safely');
   t.ok(/verify the result/i.test(prompt), 'the Coder prompt requires outcome verification');
   t.ok(agentJs.includes('MUST call handoff_to_coder'), 'Dispatch system instructions state the permission-boundary invariant');
   t.ok(agentJs.includes('synthesize the allowed Coder'), 'the invariant is enforced in code, not only prose');
-  // Regression: the instruction guard once read `instructionAnalysis.executionRequested`, a
-  // property analyzeDispatchInstruction never returns, so `!undefined` blocked EVERY model-initiated
-  // handoff and Dispatch could only loop on re-confirmation prompts.
-  t.ok(agentJs.includes('instructionAnalysis.requiresCoderExecution'), 'the instruction guard reads the property analyzeDispatchInstruction actually returns');
-  t.ok(!agentJs.includes('instructionAnalysis.executionRequested'), 'the phantom executionRequested property is gone');
+  t.ok(agentJs.includes('semanticIntent.requiresExecution === true'), 'the runtime consumes structured execution authority');
+  t.notOk(agentJs.includes('instructionAnalysis.requiresCoderExecution'), 'the old phrase-analysis execution property is gone');
   t.end();
 });
 
-test('Dispatch forces a handoff when the model announces one but emits no tool call', (t) => {
-  // Regression from a real GRITLIFE transcript: the model wrote "Let me route this to Coder now"
-  // and "Let me execute it now" across two turns, each time ending with no handoff_to_coder call.
-  // The old safety net only caught permission refusals, so both announcements fell through and the
-  // user was left re-confirming an action that never ran.
-  const routeAnnounce = 'Understood, that is an active request. Let me route this to Coder now with a clear task description.';
-  const execAnnounce = 'Understood. "Fix it" is your explicit request. Let me execute it now.';
-  const conditionalOffer = 'I could hand this to Coder if you want, or we can keep discussing the design.';
+test('Dispatch handoff recovery no longer derives authority from narrated response prose', (t) => {
+  t.equal(agent.looksLikeIntendedCoderHandoff, undefined, 'narrated Coder intent has no phrase classifier');
+  t.equal(agent.looksLikeUnexecutedDispatchAction, undefined, 'generic action narration has no phrase classifier');
+  t.ok(agentJs.includes("['new_task', 'context_followup', 'steer_active_task'].includes(semanticIntent.intent)"),
+    'forced Dispatch preflight is restricted to structured executable intents');
+  t.ok(agentJs.includes('dispatchPreflightAuthorized') && agentJs.includes('dispatchPreflightStandalone'),
+    'preflight uses typed execution and standalone-operation fields');
+  t.notOk(agentJs.includes('looksLikeIntendedCoderHandoff('), 'the agent loop never scans response prose for handoff language');
+  t.notOk(agentJs.includes('looksLikeUnexecutedDispatchAction('), 'the agent loop never scans response prose for action narration');
+  t.end();
+});
 
-  t.equal(agent.looksLikeIntendedCoderHandoff(routeAnnounce), true, 'a committed "route this to Coder" announcement is recognized');
-  t.equal(agent.looksLikeIntendedCoderHandoff(conditionalOffer), false, 'a conditional "I could hand this to Coder if you want" offer is not treated as a committed handoff');
-  t.equal(agent.looksLikeUnexecutedDispatchAction(execAnnounce), true, 'a generic "let me execute it now" announcement is recognized');
-  t.equal(agent.looksLikeUnexecutedDispatchAction('Let me know if that works for you.'), false, '"let me know" carries no execution verb and is ignored');
-
-  // A model-authored announcement is not authority by itself. The live loop first resolves a
-  // contextual affirmation to its self-contained objective, then applies this guard.
-  t.equal(agent.shouldForceDispatchHandoff("Yes, let's go ahead and get this updated", routeAnnounce, { mode: 'orion' }), false, 'a bare affirmation cannot be executed solely because the model announces a handoff');
-  t.equal(agent.shouldForceDispatchHandoff('Update the GRITLIFE subscription system now.', routeAnnounce, { mode: 'orion' }), true, 'the resolved executable objective plus the announcement forces the call');
-  t.equal(agent.shouldForceDispatchHandoff('The exact request "restart Claude" is covered by tests.', routeAnnounce, { mode: 'orion' }), false, 'a handoff announcement cannot bypass quoted-status protection');
-  // 4:37 — "Fix it" classifies as execution, and the generic announcement now counts as a deflection.
-  t.equal(agent.shouldForceDispatchHandoff('Fix it', execAnnounce, { mode: 'orion' }), true, 'an execution request plus a "let me do it now" announcement forces the handoff');
-  t.equal(agent.shouldForceDispatchHandoff('Fix it', execAnnounce, { mode: 'orion', alreadyHandedOff: true }), false, 'the announcement path still cannot double-fire within one request');
-  t.equal(agent.shouldForceDispatchHandoff('Fix it', execAnnounce, { mode: 'coder' }), false, 'Coder mode is never intercepted by the announcement guard');
-  t.equal(agent.shouldForceDispatchHandoff('What did we decide about subscriptions?', 'We decided to replace the intent system with behavioral tracking.', { mode: 'orion' }), false, 'a normal answer with no handoff announcement is not forced');
+test('Dispatch semantic routing retains terminal task context for retry approvals', (t) => {
+  t.ok(
+    rendererJs.includes("['pending', 'active', 'completed', 'failed', 'cancelled']"),
+    'semantic routing loads terminal owned tasks as context in addition to controllable work'
+  );
+  t.ok(
+    rendererJs.includes('const recentOwnedTask = ownedTasks'),
+    'the newest terminal owned task is distinguished from active and pending authority'
+  );
+  t.ok(
+    rendererJs.includes('recentOwnedTask,') && rendererJs.includes('(boundTask || recentOwnedTask)'),
+    'the shared classifier receives the terminal task and its durable objective'
+  );
+  t.ok(
+    agentJs.includes('candidateAction: {') && agentJs.includes('Dispatch semantic adjudication confirmed'),
+    'a clean contextual handoff disagreement receives one structured semantic adjudication'
+  );
+  t.ok(
+    agentJs.includes('authorizedDispatchHandoffIntent'),
+    'the adjudicated intent is carried into durable task creation without a second contradictory classification'
+  );
   t.end();
 });
 

@@ -2,23 +2,9 @@
   'use strict';
 
   function classifySupervisorIntent(value) {
-    const text = String(value || '').trim().toLowerCase();
-    const checkinPatterns = [
-      /\b(how'?s it going|how is it going|any updates?|what'?s happening|what is happening)\b/,
-      /\b(status|progress|update|what'?s? (it|cody|the coder) (doing|working on|up to))\b/,
-      /\b(check in|checking in|where are (we|you|things)|what have (you|we|they) done)\b/,
-      /\b(what (all|did|has) it (do|done|finished|completed|changed))\b/,
-      /\b(give me (an? )?update|what('?s| is) (going on|the status|happening))\b/,
-      /\b(how far|how much|how many|almost done|are (you|we|it) done|finished yet)\b/
-    ];
-    const steeringPatterns = [
-      /\b(also|additionally|on top of that|in addition|while you'?re at it)\b/,
-      /\b(for|to)\s+(?:this|the|that|current|active)\s+(?:task|work|implementation|build)\b/,
-      /\b(make sure|be sure)\s+(?:you|coder|it)\b/,
-      /^(?:instead|skip|drop|avoid|prioritize|focus on)\b/
-    ];
-    if (checkinPatterns.some(pattern => pattern.test(text))) return 'checkin';
-    if (steeringPatterns.some(pattern => pattern.test(text))) return 'steering';
+    const classification = value && typeof value === 'object' ? value : {};
+    if (classification.intent === 'status_check') return 'checkin';
+    if (classification.intent === 'steer_active_task') return 'steering';
     return 'conversational';
   }
 
@@ -224,7 +210,11 @@
     const contracts = dependencies.contracts;
     const conversation = input.conversation || {};
     const prompt = String(input.prompt || '');
-    const recallRequested = !!(contracts && contracts.isRecallRequest(prompt));
+    const semanticIntent = input.semanticIntent && typeof input.semanticIntent === 'object'
+      ? input.semanticIntent
+      : {};
+    const recallRequested = semanticIntent.reasoningPolicyHint
+      && semanticIntent.reasoningPolicyHint.contextNeed === 'historical';
     const suppliedStatuses = Array.isArray(input.structuredStatuses) ? input.structuredStatuses : [];
     const extractedStatuses = contracts
       ? contracts.extractStructuredStatusFacts([prompt, input.statusText || ''].filter(Boolean).join('\n'))
@@ -285,30 +275,43 @@
 
   async function handleSupervisorMessage(input = {}, dependencies = {}) {
     const prompt = String(input.prompt || '');
-    const taskContracts = dependencies.taskContracts;
-    const dispatchIntent = dependencies.dispatchIntent;
-    const contextDependent = !!(taskContracts && taskContracts.isContextDependentRequest(prompt));
+    const classification = input.semanticIntent && typeof input.semanticIntent === 'object'
+      ? input.semanticIntent
+      : (typeof dependencies.classifyIntent === 'function'
+          ? await dependencies.classifyIntent(input)
+          : {
+              intent: 'clarification_required',
+              needsClarification: true,
+              clarificationQuestion: 'What would you like me to do with the active task?'
+            });
 
-    if (dispatchIntent && dispatchIntent.isOwnedTaskCancellationRequest(prompt)) {
-      return dependencies.cancelOwnedTask();
+    if (classification.intent === 'clarification_required' || classification.needsClarification === true) {
+      return typeof dependencies.askClarification === 'function'
+        ? dependencies.askClarification(classification.clarificationQuestion)
+        : { success: false, needsClarification: true, clarification: classification.clarificationQuestion };
     }
-    // Resolve a context-dependent utterance into a durable packet before any
-    // steering or handoff. If it cannot be resolved, enqueueTask is responsible
-    // for asking a targeted question without persisting an invented task.
-    if (contextDependent) {
-      return dependencies.enqueueTask();
+    if (classification.intent === 'cancel_active_task') {
+      return dependencies.cancelOwnedTask(classification);
     }
-
-    const instruction = dispatchIntent
-      ? dispatchIntent.analyzeDispatchInstruction(prompt)
-      : { requiresCoderExecution: false };
-    if (instruction.requiresCoderExecution) {
-      return dependencies.steerActiveTask({ prompt, instruction, reason: 'executable_instruction' });
+    if (classification.intent === 'new_task') {
+      return dependencies.enqueueTask(classification);
     }
-
-    const intent = classifySupervisorIntent(prompt);
+    if (classification.intent === 'context_followup') {
+      if (classification.target === 'active_owned_task') {
+        return dependencies.steerActiveTask({ prompt, classification, reason: 'context_followup' });
+      }
+      return dependencies.enqueueTask(classification);
+    }
+    if (classification.intent === 'steer_active_task') {
+      return dependencies.steerActiveTask({ prompt, classification, reason: 'explicit_steering' });
+    }
+    if (['approve_plan', 'deny_plan', 'revise_plan'].includes(classification.intent)
+      && typeof dependencies.handlePlanIntent === 'function') {
+      return dependencies.handlePlanIntent(classification);
+    }
+    const intent = classifySupervisorIntent(classification);
     if (intent === 'checkin') return dependencies.respondCheckin();
-    if (intent === 'steering') return dependencies.steerActiveTask({ prompt, instruction, reason: 'explicit_steering' });
+    if (intent === 'steering') return dependencies.steerActiveTask({ prompt, classification, reason: 'explicit_steering' });
     return dependencies.respondConversationally();
   }
 

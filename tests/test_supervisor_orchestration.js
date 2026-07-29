@@ -1,14 +1,12 @@
 const test = require('tape');
 const supervisor = require('../supervisor-orchestration');
 const taskContracts = require('../task-orchestration');
-const dispatchIntent = require('../dispatch-intent');
 const contracts = require('../orchestration-contracts');
 const workspaceResolution = require('../workspace-resolution');
 
 function handlerDependencies(overrides = {}) {
   return {
     taskContracts,
-    dispatchIntent,
     cancelOwnedTask: async () => ({ success: true, status: 'cancelled' }),
     enqueueTask: async () => ({ success: true, status: 'pending' }),
     steerActiveTask: async () => ({ success: true, steered: true }),
@@ -32,12 +30,28 @@ test('supervised Dispatch resolves a contextual approval through the durable tas
       text: 'That can merge or derive the existing Grind, Connect, and Survive intent behavior. I can implement this direction.'
     }
   ];
+  const semanticIntent = {
+    intent: 'context_followup',
+    target: 'current_conversation',
+    requiresExecution: true,
+    contextDependent: true,
+    resolvedRequest: 'Design and implement recurring GRITLIFE subscriptions and enrollments organized by Body & Physical, Medical, Community, Education, and Work locations. Include gyms, yoga, massages, therapy, clubs, classes, recurring costs, and benefits. Evaluate how this replaces, merges with, or derives Grind, Connect, and Survive.',
+    needsClarification: false,
+    taskResolution: {
+      title: 'GRITLIFE location enrollments',
+      requirements: ['Support recurring costs and benefits.'],
+      constraints: [],
+      unresolvedDecisions: ['Evaluate the relationship to Grind, Connect, and Survive.']
+    }
+  };
   const result = await supervisor.handleSupervisorMessage({
-    prompt: "Let's do it"
+    prompt: "Let's do it",
+    semanticIntent
   }, handlerDependencies({
-    enqueueTask: async () => {
+    enqueueTask: async classification => {
       packetResult = taskContracts.buildTaskPacket({
         originalUserMessage: "Let's do it",
+        semanticIntent: classification,
         precedingMessages,
         workspace: {
           role: 'active_project',
@@ -73,7 +87,16 @@ test('supervised Dispatch resolves a contextual approval through the durable tas
 test('unresolvable contextual supervised requests clarify instead of steering', async t => {
   let steerCalls = 0;
   const result = await supervisor.handleSupervisorMessage({
-    prompt: 'Use the second one'
+    prompt: 'Use the second one',
+    semanticIntent: {
+      intent: 'clarification_required',
+      target: 'current_conversation',
+      contextDependent: true,
+      requiresExecution: false,
+      resolvedRequest: '',
+      needsClarification: true,
+      clarificationQuestion: 'Which second option do you mean?'
+    }
   }, handlerDependencies({
     enqueueTask: async () => taskContracts.buildTaskPacket({
       originalUserMessage: 'Use the second one',
@@ -110,10 +133,26 @@ test('supervised Dispatch distinguishes direct execution from quoted status mate
     }
   });
   await supervisor.handleSupervisorMessage({
-    prompt: 'Can you kill Claude and restart it again?'
+    prompt: 'Can you kill Claude and restart it again?',
+    semanticIntent: {
+      intent: 'steer_active_task',
+      target: 'active_owned_task',
+      requiresExecution: true,
+      resolvedRequest: 'Identify the correct Claude process, restart it, and verify the replacement.',
+      contextDependent: false,
+      needsClarification: false
+    }
   }, deps);
   await supervisor.handleSupervisorMessage({
-    prompt: 'The exact request:\n> Can you kill Claude and restart it again?\nis now covered by tests and the fix was pushed.'
+    prompt: 'The exact request:\n> Can you kill Claude and restart it again?\nis now covered by tests and the fix was pushed.',
+    semanticIntent: {
+      intent: 'conversation',
+      target: 'current_conversation',
+      requiresExecution: false,
+      resolvedRequest: '',
+      contextDependent: false,
+      needsClarification: false
+    }
   }, deps);
 
   t.equal(steeringCalls, 1, 'only the genuine direct request reaches Coder');
@@ -136,6 +175,12 @@ test('supervised conversational recall uses retrieved evidence and records its b
     prompt: 'Do you remember our earlier conversation about the GRITLIFE intent system?',
     messageId: 'current-message',
     workspacePaths: ['C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE'],
+    semanticIntent: {
+      intent: 'conversation',
+      target: 'current_conversation',
+      requiresExecution: false,
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' }
+    },
     systemPrompt: 'Answer conversationally.',
     messages: []
   }, {
@@ -158,6 +203,12 @@ test('supervised conversational recall cannot invent a missing conversation', as
   const result = await supervisor.buildContractedConversationalReply({
     conversation: { id: 'dispatch-live', mode: 'orion', messages: [] },
     prompt: 'Do you remember our earlier conversation about intent?',
+    semanticIntent: {
+      intent: 'conversation',
+      target: 'current_conversation',
+      requiresExecution: false,
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' }
+    },
     systemPrompt: 'Answer conversationally.',
     messages: []
   }, {

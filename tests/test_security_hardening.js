@@ -157,10 +157,9 @@ test('conversation rename is not defeated by project workspace normalization run
   t.end();
 });
 
-// Regression: generateConversationTitle() itself (the actual text-cleanup logic) must keep
-// stripping filler phrases and truncating sensibly — this only tests the function's own behavior,
-// not the gating bug above.
-test('generateConversationTitle strips filler phrases and truncates sensibly', (t) => {
+// The synchronous title fallback is deliberately mechanical. Semantic shortening belongs to the
+// existing utility-model title pass, not another phrase table in the renderer.
+test('generateConversationTitle preserves wording and truncates sensibly without semantic regex', (t) => {
   const titleFn = rendererJs.match(/function generateConversationTitle\(prompt\) \{[\s\S]*?\n\}/);
   const caseFn = rendererJs.match(/function toTitleCase\(str\) \{[\s\S]*?\n\}/);
   t.ok(titleFn, 'generateConversationTitle function body is present in renderer.js');
@@ -168,8 +167,8 @@ test('generateConversationTitle strips filler phrases and truncates sensibly', (
 
   const sandbox = new Function(`${caseFn[0]}\n${titleFn[0]}\nreturn generateConversationTitle;`)();
 
-  t.equal(sandbox('can you help me build a snake game'), 'Build a Snake Game', 'strips leading filler like "can you help me"');
-  t.equal(sandbox('please launch the rocket sumo server'), 'Launch the Rocket Sumo Server', 'strips leading "please"');
+  t.equal(sandbox('can you help me build a snake game'), 'Can You Help Me Build a Snake Game', 'ordinary wording is not semantically stripped by a phrase rule');
+  t.equal(sandbox('please launch the rocket sumo server'), 'Please Launch the Rocket Sumo Server', 'polite wording is preserved until the model title pass');
   t.equal(sandbox(''), 'New Conversation', 'empty input falls back to the default title');
   t.ok(sandbox('a'.repeat(80)).length <= 48, 'long input is truncated to a reasonable length');
   t.end();

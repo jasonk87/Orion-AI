@@ -72,6 +72,7 @@ const promptSubmissionRegistry = window.OrionPromptSubmission
 let currentWorkspaceTestCommand = null; // { command, autoDetected, updatedAt } | null — per-workspace override
 let cachedUserDataPath = '';
 let activeConversationId = null;
+let conversationSelectionEpoch = 0;
 let conversations = []; // { id, title, messages, tasks, testResults }
 let activeProcessId = null;
 let projects = []; // Array of workspace folder paths
@@ -93,6 +94,7 @@ const RendererTaskOrchestration = window.OrionTaskOrchestration;
 const RendererWorkspaceResolution = window.OrionWorkspaceResolution;
 const RendererOrchestrationContracts = window.OrionOrchestrationContracts;
 const RendererSupervisorOrchestration = window.OrionSupervisorOrchestration;
+const RendererSemanticIntentRouter = window.OrionSemanticIntentRouter;
 let orchestrationTasksReady = Promise.resolve();
 const orchestrationTaskCache = new Map();
 
@@ -929,6 +931,10 @@ function setLeftSidebarCollapsed(collapsed, persist = true) {
 }
 
 function setAppMode(mode, persist = true) {
+  // Invalidate any stub hydration that began for the mode the user just left. Without this
+  // token, its awaited disk read can finish later and repaint the old conversation over the
+  // newly selected Dispatch/Coder view.
+  if (mode !== appMode) conversationSelectionEpoch += 1;
   appMode = mode;
   document.body.setAttribute('data-mode', mode);
 
@@ -953,12 +959,12 @@ function setAppMode(mode, persist = true) {
       startDispatchDraft(dispatchDraft);
     } else {
       const remembered = conversations.find(c => c.id === lastDispatchConversationId && conversationMode(c) === 'orion');
-      if (remembered) selectConversation(remembered.id);
+      if (remembered) selectConversation(remembered.id, { selectionEpoch: conversationSelectionEpoch });
       else startDispatchDraft();
     }
   } else if (!activeConv || conversationMode(activeConv) !== 'coder') {
     const replacement = conversations.find(c => conversationMode(c) === 'coder');
-    if (replacement) selectConversation(replacement.id);
+    if (replacement) selectConversation(replacement.id, { selectionEpoch: conversationSelectionEpoch });
     else createNewConversation('coder');
   }
 
@@ -2181,6 +2187,11 @@ async function enqueueOrchestrationTask(options = {}) {
   const originConv = conversations.find(conv => conv.id === originConversationId) || targetConv;
   if (!targetConv || !originConv) return { success: false, error: 'Task conversation could not be resolved.' };
   const originalUserMessage = String(options.originalUserMessage || options.prompt || '').trim();
+  const semanticIntent = options.semanticIntent || await classifyCurrentConversationIntent(
+    originConv,
+    originalUserMessage,
+    { model: options.modelSelectValue, taskId: options.taskId || '' }
+  );
   const workspace = options.workspace && typeof options.workspace === 'object'
     ? options.workspace
     : structuredWorkspaceForConversation(originConv, options.workspacePath || '');
@@ -2209,6 +2220,7 @@ async function enqueueOrchestrationTask(options = {}) {
     source: options.source || 'user-queue',
     images: Array.isArray(options.images) ? options.images : [],
     contextPacketIds: Array.isArray(options.contextPacketIds) ? options.contextPacketIds : [],
+    semanticIntent,
     timestamp: options.createdAt || Date.now()
   });
   if (!packetResult.success || !packetResult.task) {
@@ -2334,19 +2346,6 @@ async function enqueueOrchestrationTask(options = {}) {
 }
 window.enqueueOrchestrationTask = enqueueOrchestrationTask;
 
-function shouldQueueDispatchWorkForCoder(conv, prompt) {
-  if (!conv || conversationMode(conv) !== 'orion') return false;
-  const contextual = !!(
-    RendererTaskOrchestration
-    && RendererTaskOrchestration.isContextDependentRequest(prompt)
-  );
-  const executable = !!(
-    window.OrionDispatchIntent
-    && window.OrionDispatchIntent.dispatchRequestRequiresCoderExecution(prompt)
-  );
-  return contextual || executable;
-}
-
 async function queueDispatchWorkForCoder(options = {}) {
   const originConversationId = String(options.originConversationId || options.conversationId || activeConversationId || '');
   const originConv = conversations.find(conv => conv.id === originConversationId);
@@ -2357,20 +2356,23 @@ async function queueDispatchWorkForCoder(options = {}) {
   if (!originalUserMessage || !RendererTaskOrchestration || !RendererWorkspaceResolution) {
     return { success: false, error: 'Durable Dispatch-to-Coder task resolution is unavailable.' };
   }
+  const semanticIntent = options.semanticIntent || await classifyCurrentConversationIntent(
+    originConv,
+    originalUserMessage,
+    { model: options.modelSelectValue }
+  );
+  if (semanticIntent.needsClarification || semanticIntent.intent === 'clarification_required') {
+    const clarification = semanticIntent.clarificationQuestion || 'What specific work should I hand to Coder?';
+    persistTaskClarification(originConv, clarification);
+    return { success: false, needsClarification: true, clarification, task: null };
+  }
 
   const contextText = [
     ...taskContextMessages(originConv).map(message => message.text),
-    originalUserMessage
+    semanticIntent.resolvedRequest || originalUserMessage
   ].join('\n');
   const workspace = await bindNamedProjectForSupervisor(originConv, contextText);
-  const instruction = window.OrionDispatchIntent
-    ? window.OrionDispatchIntent.analyzeDispatchInstruction(originalUserMessage)
-    : { requiresCoderExecution: false };
-  const standaloneSystemWork = !!(
-    window.OrionDispatchIntent
-    && typeof window.OrionDispatchIntent.isStandaloneSystemExecutionRequest === 'function'
-    && window.OrionDispatchIntent.isStandaloneSystemExecutionRequest(instruction)
-  );
+  const standaloneSystemWork = semanticIntent.standaloneSystemOperation === true;
   const standalone = standaloneSystemWork && workspace.role !== 'active_project';
   const taskWorkspace = standalone
     ? {
@@ -2393,7 +2395,7 @@ async function queueDispatchWorkForCoder(options = {}) {
 
   const packetResult = RendererTaskOrchestration.buildTaskPacket({
     originalUserMessage,
-    resolvedObjective: String(options.resolvedObjective || '').trim(),
+    resolvedObjective: String(options.resolvedObjective || semanticIntent.resolvedRequest || '').trim(),
     title: String(options.title || '').trim(),
     precedingMessages: options.precedingMessages || taskContextMessages(originConv),
     precedingConversationSummary: String(options.precedingConversationSummary || ''),
@@ -2416,6 +2418,7 @@ async function queueDispatchWorkForCoder(options = {}) {
     source: options.source || 'dispatch-direct-coder-queue',
     images: Array.isArray(options.images) ? options.images : [],
     contextPacketIds: Array.isArray(options.contextPacketIds) ? options.contextPacketIds : [],
+    semanticIntent,
     timestamp: options.createdAt || Date.now()
   });
   if (!packetResult.success || !packetResult.task) {
@@ -2446,6 +2449,7 @@ async function queueDispatchWorkForCoder(options = {}) {
     constraints: packet.constraints,
     unresolvedDecisions: packet.unresolvedDecisions,
     precedingConversationSummary: packet.precedingConversationSummary,
+    semanticIntent,
     open: options.open === true
   });
   if (!promoted || promoted.success === false || !promoted.task) {
@@ -2519,11 +2523,15 @@ async function queueTaskContinuation(options = {}) {
   }
   if (existingTask && existingTask.status === 'pending'
       && existingTask.target && existingTask.target.conversationId === targetConversationId) {
-    const continuationInput = String(options.prompt || '').trim();
-    if (continuationInput && window.api && typeof window.api.updateOrchestrationTask === 'function') {
+    const explicitContinuationInput = String(options.prompt || '').trim();
+    const durableContinuationInput = String(
+      existingTask.continuation && existingTask.continuation.input || ''
+    ).trim();
+    const continuationInput = explicitContinuationInput || durableContinuationInput;
+    if (explicitContinuationInput && window.api && typeof window.api.updateOrchestrationTask === 'function') {
       const updated = await window.api.updateOrchestrationTask(existingTask.taskId, {
         continuation: {
-          input: continuationInput,
+          input: explicitContinuationInput,
           source: options.source || 'task-continuation',
           messageId: String(options.originMessageId || ''),
           createdAt: Date.now()
@@ -2584,6 +2592,27 @@ async function queueTaskContinuation(options = {}) {
   });
 }
 window.queueTaskContinuation = queueTaskContinuation;
+
+function pendingTaskNeedsRuntimeQueue(task) {
+  const explicitlyRestorable = !!(
+    RendererTaskOrchestration
+    && typeof RendererTaskOrchestration.pendingTaskNeedsRuntimeQueue === 'function'
+    && RendererTaskOrchestration.pendingTaskNeedsRuntimeQueue(task)
+  );
+  if (explicitlyRestorable) return true;
+  // Backward-compatible migration for tasks written before resumePolicy existed. This inspects
+  // Orion's own exact lifecycle fields, never user language. A claimed pending task with no
+  // recorded reason and no conversation-owned approval/input gate was an action-boundary yield.
+  if (!task || task.status !== 'pending') return false;
+  const execution = task.execution && typeof task.execution === 'object' ? task.execution : {};
+  if (!Number(execution.attempt) || execution.resumePolicy) return false;
+  const targetId = String(task.target && task.target.conversationId || '');
+  const targetConv = conversations.find(conv => conv.id === targetId);
+  if (targetConv && (targetConv.awaitingPlanApproval || targetConv.awaitingClarification)) return false;
+  const legacyReason = String(execution.reason || '').trim().toLowerCase();
+  const legacyReasonCode = String(execution.reasonCode || '').trim();
+  return legacyReason.includes('continue automatically') || (!legacyReason && !legacyReasonCode);
+}
 
 function ensureContinuationQueued(continuation) {
   if (!continuation || !continuation.task || !continuation.queueItem) return;
@@ -2649,11 +2678,29 @@ async function initializeOrchestrationTasks() {
     tasks.forEach(task => {
       if (task && task.taskId) orchestrationTaskCache.set(task.taskId, task);
     });
+    let taskPresentationChanged = false;
+    for (const task of tasks) {
+      for (const conversation of conversations) {
+        if (reconcileConversationTaskPresentation(conversation, task)) {
+          taskPresentationChanged = true;
+          if (!conversation.isStub && typeof window.markConversationDirty === 'function') {
+            window.markConversationDirty(conversation.id);
+          }
+        }
+      }
+    }
+    conversations.forEach(conversation =>
+      scheduleTerminalDelegatedTaskReconciliation(conversation, orchestrationTaskCache)
+    );
+    if (taskPresentationChanged) saveConversationsToStorage();
     window.promptQueue = Array.isArray(window.promptQueue) ? window.promptQueue : [];
-    for (const task of tasks.filter(item => item && item.status === 'pending')) {
+    for (const task of tasks.filter(pendingTaskNeedsRuntimeQueue)) {
       if (!task || !task.taskId || window.promptQueue.some(item => item && item.taskId === task.taskId)) continue;
       const targetId = task.target && task.target.conversationId;
       if (!targetId || !conversations.some(conv => conv.id === targetId)) continue;
+      const automaticCheckpoint = String(
+        task.execution && task.execution.resumePolicy || ''
+      ).toLowerCase() === 'automatic';
       window.promptQueue.push({
         id: createQueuedPromptId(),
         taskId: task.taskId,
@@ -2663,13 +2710,16 @@ async function initializeOrchestrationTasks() {
         taskTitle: task.title,
         conversationId: targetId,
         originConversationId: task.origin && task.origin.conversationId,
-        source: task.source || 'restored-queue',
+        source: automaticCheckpoint ? 'system' : (task.source || 'restored-queue'),
         createdAt: task.createdAt,
         alreadyRendered: true,
         preserveUserPrompt: !!(task.continuation && task.continuation.input),
         images: Array.isArray(task.images) ? task.images : [],
         contextPacketIds: Array.isArray(task.contextPacketIds) ? task.contextPacketIds : []
       });
+    }
+    if (window.promptQueue.length > 0 && typeof window.resumeDurableTaskQueue === 'function') {
+      window.resumeDurableTaskQueue(100);
     }
   } catch (error) {
     console.error('Could not initialize durable task queue:', error);
@@ -2747,6 +2797,222 @@ window.getOwnedOrchestrationTasks = async function(conversationId, statuses = []
   }
   return result.tasks;
 };
+
+async function resumeOwnedCoderTaskFromDispatch(conv, prompt, options = {}) {
+  const isContinuation = !!(
+    conv
+    && conversationMode(conv) === 'orion'
+    && RendererTaskOrchestration
+    && typeof RendererTaskOrchestration.isContinuationRequest === 'function'
+    && RendererTaskOrchestration.isContinuationRequest(options.semanticIntent)
+  );
+  if (!isContinuation) return { handled: false };
+
+  try {
+    await orchestrationTasksReady;
+    const owned = (await window.getOwnedOrchestrationTasks(conv.id, ['pending', 'active']))
+      .filter(task => {
+        if (!task || !['pending', 'active'].includes(task.status)) return false;
+        const targetId = String(task.target && task.target.conversationId || '');
+        const targetConv = conversations.find(item => item.id === targetId);
+        return !!(targetConv && conversationMode(targetConv) === 'coder');
+      })
+      .sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0));
+    owned.forEach(task => orchestrationTaskCache.set(task.taskId, task));
+    if (!owned.length) return { handled: false };
+
+    const preferredIds = [
+      conv.launchedCoderTaskId,
+      conv.lastDelegatedWork && conv.lastDelegatedWork.taskId,
+      conv.lastOwnedTaskId
+    ].map(value => String(value || '')).filter(Boolean);
+    const selection = RendererTaskOrchestration.selectOwnedContinuationTask(
+      owned,
+      conv.id,
+      preferredIds
+    );
+
+    if (selection.action === 'already_active') {
+      const task = selection.task;
+      const targetId = String(task.target && task.target.conversationId || '');
+      conv.launchedCoderConvId = targetId;
+      conv.launchedCoderTaskId = task.taskId;
+      conv.lastOwnedTaskId = task.taskId;
+      conv.launchedCoderTaskTitle = task.title;
+      if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+      saveConversationsToStorage();
+      if (typeof window.startCoderTaskMonitor === 'function') {
+        window.startCoderTaskMonitor(conv.id, targetId, task.taskId);
+      }
+      persistAssistantStatusMessage(
+        conv.id,
+        `Coder is already continuing **${task.title || 'the task'}**. I kept the existing task ${task.taskId}; no duplicate was created.`,
+        {
+          source: options.source || 'dispatch-task-continuation',
+          dedupeKey: `continuation-already-active-${task.taskId}`
+        }
+      );
+      return { success: true, handled: true, resumed: false, alreadyActive: true, task };
+    }
+
+    if (selection.action === 'ambiguous_active') {
+      persistTaskClarification(
+        conv,
+        `More than one Coder task is active for this conversation. Which one should I continue: ${selection.candidates.slice(0, 4).map(task => `${task.title} (${task.taskId})`).join('; ')}?`
+      );
+      return { success: false, handled: true, needsClarification: true };
+    }
+
+    const task = selection.action === 'resume_pending' ? selection.task : null;
+    if (selection.action === 'ambiguous_pending') {
+      persistTaskClarification(
+        conv,
+        `More than one paused Coder task belongs to this conversation. Which one should I continue: ${selection.candidates.slice(0, 4).map(item => `${item.title} (${item.taskId})`).join('; ')}?`
+      );
+      return { success: false, handled: true, needsClarification: true };
+    }
+    if (!task) return { handled: false };
+
+    const targetId = String(task.target && task.target.conversationId || '');
+    const targetConv = conversations.find(item => item.id === targetId);
+    const messageId = String(options.messageId || '');
+    const continuation = await queueTaskContinuation({
+      taskId: task.taskId,
+      prompt,
+      originalUserMessage: prompt,
+      modelSelectValue: options.modelSelectValue || window.getSelectedModel(),
+      targetConversationId: targetId,
+      originConversationId: conv.id,
+      originMessageId: messageId,
+      source: options.source || 'dispatch-task-continuation',
+      images: options.images || [],
+      requireExistingTask: true,
+      alreadyRendered: true
+    });
+    if (!continuation.success) {
+      persistAssistantStatusMessage(
+        conv.id,
+        continuation.error || `Task ${task.taskId} could not be resumed.`,
+        {
+          source: 'dispatch-task-continuation-error',
+          dedupeKey: `continuation-error-${task.taskId}`
+        }
+      );
+      return { ...continuation, handled: true };
+    }
+
+    conv.launchedCoderConvId = targetId;
+    conv.launchedCoderTaskId = task.taskId;
+    conv.lastOwnedTaskId = task.taskId;
+    conv.launchedCoderTaskTitle = task.title;
+    conv.launchedCoderTaskStart = task.startedAt || Date.now();
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+    saveConversationsToStorage();
+    const launch = startOrQueueTaskContinuation(continuation, targetConv, {
+      source: options.source || 'dispatch-task-continuation',
+      modelSelectValue: options.modelSelectValue || window.getSelectedModel(),
+      errorLabel: 'Dispatch task continuation'
+    });
+    if (typeof window.startCoderTaskMonitor === 'function') {
+      window.startCoderTaskMonitor(conv.id, targetId, task.taskId);
+    }
+    persistAssistantStatusMessage(
+      conv.id,
+      `${launch.queued ? 'Queued' : 'Continuing'} **${task.title || 'the task'}** as ${task.taskId}. No new task was created.`,
+      {
+        source: options.source || 'dispatch-task-continuation',
+        dedupeKey: `continuation-resumed-${task.taskId}`
+      }
+    );
+    return { ...launch, success: true, handled: true, resumed: true, task: continuation.task };
+  } catch (error) {
+    persistAssistantStatusMessage(
+      conv.id,
+      `I could not verify the existing Coder task, so I did not create a duplicate: ${error.message || error}`,
+      {
+        source: 'dispatch-task-continuation-error',
+        dedupeKey: `continuation-lookup-error-${conv.id}`
+      }
+    );
+    return { success: false, handled: true, error: error.message || String(error) };
+  }
+}
+
+async function classifyCurrentConversationIntent(conv, prompt, options = {}) {
+  if (options.semanticIntent && typeof options.semanticIntent === 'object') return options.semanticIntent;
+  if (!RendererSemanticIntentRouter || typeof window.classifySemanticIntent !== 'function') {
+    return RendererSemanticIntentRouter
+      ? RendererSemanticIntentRouter.safeFallback({
+          pendingPlan: conv && (conv.awaitingDelegatedPlan || conv.awaitingPlanApproval),
+          activeOwnedTask: null,
+          pendingOwnedTask: null,
+          taskBound: !!options.taskId
+        }, 'Semantic classifier is unavailable.')
+      : {
+          intent: 'clarification_required',
+          requiresExecution: false,
+          target: 'current_conversation',
+          contextDependent: true,
+          needsClarification: true,
+          clarificationQuestion: 'I could not safely determine what that message should do. Could you clarify?'
+        };
+  }
+
+  let ownedTasks = [];
+  if (conv && conversationMode(conv) === 'orion' && typeof window.getOwnedOrchestrationTasks === 'function') {
+    try {
+      await orchestrationTasksReady;
+      ownedTasks = await window.getOwnedOrchestrationTasks(
+        conv.id,
+        ['pending', 'active', 'completed', 'failed', 'cancelled']
+      );
+    } catch (error) {
+      console.warn('Could not load owned tasks for semantic classification:', error);
+    }
+  }
+  const byNewest = (left, right) => Number(right.updatedAt || right.createdAt || 0) - Number(left.updatedAt || left.createdAt || 0);
+  const activeOwnedTask = ownedTasks.filter(task => task && task.status === 'active').sort(byNewest)[0] || null;
+  const pendingOwnedTask = ownedTasks.filter(task => task && task.status === 'pending').sort(byNewest)[0] || null;
+  const recentOwnedTask = ownedTasks
+    .filter(task => task && ['completed', 'failed', 'cancelled'].includes(task.status))
+    .sort(byNewest)[0] || null;
+  const delegated = conv && conv.awaitingDelegatedPlan;
+  const pendingPlan = delegated
+    ? {
+        planId: delegated.planMessageId || delegated.planId || '',
+        taskId: delegated.taskId || '',
+        ownerConversationId: conv.id,
+        coderConversationId: delegated.coderConversationId || '',
+        title: delegated.title || '',
+        status: 'pending'
+      }
+    : (conv && conv.awaitingPlanApproval
+        ? {
+            planId: conv.awaitingPlanApprovalPlanId || '',
+            taskId: conv.awaitingPlanApprovalTaskId || options.taskId || '',
+            ownerConversationId: conv.id,
+            coderConversationId: conv.id,
+            title: conv.title || '',
+            status: 'pending'
+          }
+        : null);
+  const boundTask = activeOwnedTask || pendingOwnedTask;
+  return window.classifySemanticIntent({
+    userMessage: prompt,
+    recentVisibleConversation: taskContextMessages(conv),
+    conversationId: conv && conv.id,
+    mode: conv && conversationMode(conv),
+    workspace: conv ? structuredWorkspaceForConversation(conv) : null,
+    pendingPlan,
+    activeOwnedTask,
+    pendingOwnedTask,
+    recentOwnedTask,
+    taskBound: !!(options.taskId || boundTask || pendingPlan),
+    durableTaskObjective: (boundTask || recentOwnedTask) && (boundTask || recentOwnedTask).objective || ''
+  }, options.model || window.getSelectedModel(), window.getAppConfig ? window.getAppConfig() : {});
+}
+window.classifyCurrentConversationIntent = classifyCurrentConversationIntent;
+window.resumeOwnedCoderTaskFromDispatch = resumeOwnedCoderTaskFromDispatch;
 
 window.getOrchestrationTaskStatus = async function(taskId, requesterConversationId = '') {
   if (!taskId || !window.api || typeof window.api.getOrchestrationTask !== 'function') {
@@ -2883,14 +3149,13 @@ function ownsActiveSupervisedRun(conv) {
   );
 }
 
-async function cancelOwnedTaskRequestedInPrompt(conv, prompt, source = 'user-task-cancellation') {
-  const intent = window.OrionDispatchIntent;
+async function cancelOwnedTaskRequestedInPrompt(conv, prompt, source = 'user-task-cancellation', semanticIntent = null) {
   if (
     !conv
     || conversationMode(conv) !== 'orion'
-    || !intent
-    || typeof intent.isOwnedTaskCancellationRequest !== 'function'
-    || !intent.isOwnedTaskCancellationRequest(prompt)
+    || !semanticIntent
+    || semanticIntent.intent !== 'cancel_active_task'
+    || semanticIntent.target !== 'active_owned_task'
   ) {
     return { handled: false };
   }
@@ -3635,6 +3900,93 @@ function markDelegatedPlanMessageState(conversation, taskId, stateField) {
   return message;
 }
 
+const LEGACY_DISPATCH_TASK_TITLE = 'Execute Dispatch request';
+
+function reconcileConversationTaskPresentation(conversation, task) {
+  if (!conversation || !task || !task.taskId || !task.title) return false;
+  const originId = String(task.origin && task.origin.conversationId || '');
+  const targetId = String(task.target && task.target.conversationId || '');
+  const ownsTask = String(conversation.id || '') === originId
+    || String(conversation.id || '') === targetId
+    || String(conversation.launchedCoderTaskId || '') === String(task.taskId)
+    || String(conversation.lastOrchestrationTaskId || '') === String(task.taskId);
+  if (!ownsTask) return false;
+
+  const canonicalTitle = String(task.title).trim();
+  if (!canonicalTitle || canonicalTitle === LEGACY_DISPATCH_TASK_TITLE) return false;
+  let changed = false;
+  const replaceLegacyTitle = value => {
+    const text = String(value || '');
+    return text.includes(LEGACY_DISPATCH_TASK_TITLE)
+      ? text.split(LEGACY_DISPATCH_TASK_TITLE).join(canonicalTitle)
+      : text;
+  };
+
+  if (String(conversation.title || '').trim() === LEGACY_DISPATCH_TASK_TITLE) {
+    conversation.title = canonicalTitle;
+    changed = true;
+  }
+  if (String(conversation.launchedCoderTaskId || '') === String(task.taskId)
+      && String(conversation.launchedCoderTaskTitle || '').trim() === LEGACY_DISPATCH_TASK_TITLE) {
+    conversation.launchedCoderTaskTitle = canonicalTitle;
+    changed = true;
+  }
+  if (conversation.lastDelegatedWork
+      && String(conversation.lastDelegatedWork.taskId || '') === String(task.taskId)
+      && String(conversation.lastDelegatedWork.title || '').trim() === LEGACY_DISPATCH_TASK_TITLE) {
+    conversation.lastDelegatedWork.title = canonicalTitle;
+    changed = true;
+  }
+  for (const field of ['dispatchDiscussionSummary', 'dispatchContextSummary']) {
+    const next = replaceLegacyTitle(conversation[field]);
+    if (next !== String(conversation[field] || '')) {
+      conversation[field] = next;
+      changed = true;
+    }
+  }
+
+  for (const message of Array.isArray(conversation.messages) ? conversation.messages : []) {
+    if (!message || typeof message.text !== 'string' || !message.text.includes(LEGACY_DISPATCH_TASK_TITLE)) continue;
+    const taskBoundSource = [
+      'dispatch-handoff',
+      'queue-status',
+      'supervisor-pending',
+      'supervisor-completion',
+      'supervisor-plan',
+      'supervisor-plan-approved',
+      'supervisor-plan-revision'
+    ].includes(String(message.source || ''));
+    const namesExactTask = message.text.includes(String(task.taskId));
+    if (!taskBoundSource && !namesExactTask) continue;
+    message.text = replaceLegacyTitle(message.text);
+    changed = true;
+  }
+  if (changed) conversation.updatedAt = Date.now();
+  return changed;
+}
+
+function scheduleTerminalDelegatedTaskReconciliation(conversation, durableTasks = orchestrationTaskCache) {
+  if (!conversation || conversation.isStub || !durableTasks || typeof durableTasks.get !== 'function') return false;
+  const taskId = String(conversation.launchedCoderTaskId || '');
+  const coderConversationId = String(conversation.launchedCoderConvId || '');
+  if (!taskId || !coderConversationId) return false;
+  const task = durableTasks.get(taskId);
+  if (!task || !['completed', 'failed', 'cancelled'].includes(String(task.status || ''))) return false;
+  if (String(task.origin && task.origin.conversationId || '') !== String(conversation.id || '')) return false;
+  if (String(task.target && task.target.conversationId || '') !== coderConversationId) return false;
+  if (String(conversation._terminalTaskReconciliationScheduled || '') === taskId) return true;
+  conversation._terminalTaskReconciliationScheduled = taskId;
+  Promise.resolve()
+    .then(() => notifySupervisorOfCoderCompletion(coderConversationId, taskId))
+    .catch(error => console.error('Could not reconcile terminal delegated task presentation:', error))
+    .finally(() => {
+      if (String(conversation._terminalTaskReconciliationScheduled || '') === taskId) {
+        delete conversation._terminalTaskReconciliationScheduled;
+      }
+    });
+  return true;
+}
+
 function hydrateConversationRecord(
   conversation,
   persistedConversation,
@@ -3650,6 +4002,11 @@ function hydrateConversationRecord(
   conversation.tasks = Array.isArray(persistedConversation.tasks) ? persistedConversation.tasks : [];
   conversation.isStub = false;
   conversation.hasMessages = conversation.messages.length > 0;
+  if (durableTasks && typeof durableTasks.values === 'function') {
+    for (const task of durableTasks.values()) {
+      reconcileConversationTaskPresentation(conversation, task);
+    }
+  }
   if (!conversation.awaitingDelegatedPlan) {
     const planMessage = findDelegatedPlanMessage(conversation);
     const delegatedPlan = planMessage && planMessage.delegatedPlan;
@@ -3669,6 +4026,7 @@ function hydrateConversationRecord(
       conversation.awaitingPlanApprovalTaskId = taskId;
     }
   }
+  scheduleTerminalDelegatedTaskReconciliation(conversation, durableTasks);
   return conversation;
 }
 
@@ -4351,13 +4709,25 @@ function renderConversationList() {
   });
 }
 
-async function selectConversation(id) {
+async function selectConversation(id, options = {}) {
+  const suppliedEpoch = Number(options.selectionEpoch);
+  let selectionEpoch = Number.isFinite(suppliedEpoch)
+    ? suppliedEpoch
+    : ++conversationSelectionEpoch;
   activeConversationId = id;
   if (window.clearOrionMemoryInactivityTimer) window.clearOrionMemoryInactivityTimer();
   const conv = conversations.find(c => c.id === id);
   if (!conv) return;
+  const targetMode = conversationMode(conv);
+  if (appMode !== targetMode) {
+    // Selecting a conversation is an explicit navigation action. Keep the mode chrome and the
+    // selected transcript atomic so a Coder conversation cannot be displayed inside Dispatch
+    // (or vice versa) until the next background refresh flips it back.
+    setAppMode(targetMode);
+    selectionEpoch = conversationSelectionEpoch;
+  }
 
-  if (conversationMode(conv) === 'orion') {
+  if (targetMode === 'orion') {
     dispatchDraft = { active: false, projectPath: '', contextSummary: '' };
     lastDispatchConversationId = conv.id;
   }
@@ -4372,8 +4742,8 @@ async function selectConversation(id) {
     try {
       if (window.api && typeof window.api.readConversation === 'function') {
         const result = await window.api.readConversation(id);
-        if (activeConversationId !== id) return;
-        
+        if (activeConversationId !== id || conversationSelectionEpoch !== selectionEpoch) return;
+
         if (result && result.success && result.conversation) {
           hydrateConversationRecord(conv, result.conversation);
         } else {
@@ -4382,7 +4752,7 @@ async function selectConversation(id) {
         }
       }
     } catch (err) {
-      if (activeConversationId !== id) return;
+      if (activeConversationId !== id || conversationSelectionEpoch !== selectionEpoch) return;
       console.error("Hydration failed", err);
       el.messagesContainer.innerHTML = `<div class="error-state" style="text-align:center; padding:20px; color:var(--red);">Error loading conversation</div>`;
       return;
@@ -4401,7 +4771,9 @@ async function selectConversation(id) {
       });
     }
   }
-  
+
+  if (activeConversationId !== id || conversationSelectionEpoch !== selectionEpoch) return;
+
   el.chatTitle.textContent = conv.title;
   normalizeConversationWorkspace(conv);
   const convMode = conversationMode(conv);
@@ -4616,22 +4988,37 @@ async function submitMessage() {
 
   // Scroll to bottom for the local send action.
   scrollChatToBottom();
+  const currentMessageId = conv.messages[conv.messages.length - 1]?.id || '';
+  const semanticIntent = await classifyCurrentConversationIntent(conv, prompt, {
+    model: el.modelSelect.value,
+    taskId: conv.awaitingPlanApprovalTaskId || ''
+  });
 
   // A Dispatch cancellation is a lifecycle command, not another model prompt.
   // Resolve it before clarification routing, the global busy queue, or supervisor
   // steering so an owned pending/running task is deterministically stopped.
-  const cancellation = await cancelOwnedTaskRequestedInPrompt(conv, prompt, 'dispatch-task-cancellation');
+  const cancellation = await cancelOwnedTaskRequestedInPrompt(
+    conv,
+    prompt,
+    'dispatch-task-cancellation',
+    semanticIntent
+  );
   if (cancellation.handled) return;
 
-  // A reply beneath a relayed Coder plan is plan feedback, not a fresh Dispatch task. Keep the
-  // user in Dispatch while binding the revision to the exact Coder conversation/task.
-  if (conversationMode(conv) === 'orion' && conv.awaitingDelegatedPlan) {
+  // Free-text plan decisions are model-classified, then validated and applied by the same
+  // deterministic task/plan-ID-bound handlers used by the UI buttons.
+  if (conversationMode(conv) === 'orion' && conv.awaitingDelegatedPlan
+      && ['approve_plan', 'deny_plan', 'revise_plan'].includes(semanticIntent.intent)) {
     const delegatedPlan = conv.awaitingDelegatedPlan;
-    const revision = await window.revisePhoneCompanionPlan({
-      conversationId: delegatedPlan.coderConversationId,
-      feedback: prompt
-    });
-    if (revision && revision.success !== false) {
+    const result = semanticIntent.intent === 'approve_plan'
+      ? await window.approvePhoneCompanionPlan(conv.id)
+      : (semanticIntent.intent === 'deny_plan'
+          ? await window.denyPhoneCompanionPlan(conv.id)
+          : await window.revisePhoneCompanionPlan({
+              conversationId: delegatedPlan.coderConversationId,
+              feedback: semanticIntent.resolvedRequest || prompt
+            }));
+    if (result && result.success !== false && semanticIntent.intent === 'revise_plan') {
       markDelegatedPlanMessageState(conv, delegatedPlan.taskId, 'delegatedPlanRevisionRequested');
       conv.awaitingDelegatedPlan = null;
       notifyOrionConversation(
@@ -4639,10 +5026,10 @@ async function submitMessage() {
         `I sent your plan feedback to Coder for **${delegatedPlan.title || 'the delegated task'}**. I’ll bring the revised plan back here.`,
         'supervisor-plan-revision'
       );
-    } else {
+    } else if (!result || result.success === false) {
       persistAssistantStatusMessage(
         conv.id,
-        `Could not relay that plan revision: ${(revision && revision.error) || 'unknown error'}`,
+        `Could not apply that plan decision: ${(result && result.error) || 'unknown error'}`,
         { source: 'supervisor-plan-error', dedupeKey: `plan-revision-error-${delegatedPlan.taskId}` }
       );
     }
@@ -4650,6 +5037,19 @@ async function submitMessage() {
   }
 
   // ── Supervisor interception: Orion message while a supervised Coder task runs ──
+  // "Continue" is a lifecycle command when this Dispatch conversation already owns paused or
+  // active Coder work. Resolve it before the model can interpret stale chat context and issue a
+  // second handoff. A failed lookup is also terminal for this turn: uncertainty must never create
+  // a duplicate task.
+  const ownedContinuation = await resumeOwnedCoderTaskFromDispatch(conv, prompt, {
+    messageId: currentMessageId,
+    modelSelectValue: el.modelSelect.value,
+    images: imagesToSend,
+    source: 'desktop-dispatch-continuation',
+    semanticIntent
+  });
+  if (ownedContinuation.handled) return;
+
   if (window.runAgentLoop) {
     const selectedModel = el.modelSelect.value;
     const pendingReplyTaskId = String(
@@ -4659,7 +5059,8 @@ async function submitMessage() {
     );
     const runOptions = {
       ...(imagesToSend.length ? { images: imagesToSend } : {}),
-      ...(pendingReplyTaskId ? { taskId: pendingReplyTaskId, preserveUserPrompt: true } : {})
+      ...(pendingReplyTaskId ? { taskId: pendingReplyTaskId, preserveUserPrompt: true } : {}),
+      semanticIntent
     };
     if (conv.awaitingClarification && pendingReplyTaskId) {
       const clarificationState = conv.awaitingClarification;
@@ -4706,7 +5107,8 @@ async function submitMessage() {
       if (ownsActiveSupervisedRun(conv)) {
         await handleSupervisorMessage(conv, prompt, selectedModel, {
           messageId: conv.messages[conv.messages.length - 1]?.id || '',
-          images: imagesToSend
+          images: imagesToSend,
+          semanticIntent
         });
         return;
       }
@@ -4722,7 +5124,8 @@ async function submitMessage() {
             source: 'user-continuation',
             alreadyRendered: true,
             images: imagesToSend,
-            originMessageId: conv.messages[conv.messages.length - 1]?.id || ''
+            originMessageId: conv.messages[conv.messages.length - 1]?.id || '',
+            semanticIntent
           })
         : await enqueueOrchestrationTask({
             prompt,
@@ -4802,34 +5205,9 @@ function toTitleCase(str) {
 }
 
 function generateConversationTitle(prompt) {
-  let text = String(prompt || '').trim();
-
-  // Strip common leading filler patterns
-  const leadingFillers = [
-    /^i have a (?:program|project|app|application|file|script|tool|repo|repository) called\s+/i,
-    /^(?:can|could) you (?:please\s+)?/i,
-    /^please\s+/i,
-    /^i (?:need|want|would like) (?:you to\s+)?/i,
-    /^help me (?:with\s+)?/i,
-    /^orion[,\s]+/i,
-  ];
-  for (const pat of leadingFillers) {
-    text = text.replace(pat, '').trim();
-  }
-
-  // If the text contains multiple sentences, take only the first meaningful one
-  const sentenceBreak = text.search(/[.!?]\s+[A-Za-z]/);
-  if (sentenceBreak > 8) text = text.substring(0, sentenceBreak).trim();
-
-  // Strip location context ("in my projects folder on my desktop", etc.)
-  text = text
-    .replace(/\s+in my (?:projects?\s+folder(?:\s+on my desktop)?|desktop(?:\s+projects?\s+folder)?|projects?)\s*$/i, '')
-    .replace(/\s+on my desktop\s*$/i, '')
-    .replace(/\s+located (?:at|in)\s+\S+\s*$/i, '')
-    .trim();
-
-  // Collapse whitespace
-  text = text.replace(/\s+/g, ' ').trim();
+  // Titles are display formatting, not a second intent classifier. Preserve the user's wording
+  // and apply only mechanical whitespace/length normalization.
+  let text = String(prompt || '').replace(/\s+/g, ' ').trim();
 
   // Truncate at word boundary to ~45 chars
   if (text.length > 45) {
@@ -6061,6 +6439,9 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
   const title = String(options.title || '').trim()
     || (prompt ? generateConversationTitle(prompt) : 'New Coder Task');
   const originConv = conversations.find(item => item.id === String(options.sourceConversationId || ''));
+  const semanticIntent = options.semanticIntent || (originConv && prompt
+    ? await classifyCurrentConversationIntent(originConv, originalUserMessage, { model: options.modelSelectValue })
+    : null);
   let preflightTask = options.taskPacket && RendererTaskOrchestration
     ? RendererTaskOrchestration.normalizeTaskRecord(options.taskPacket)
     : null;
@@ -6078,7 +6459,8 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
     const preflight = RendererTaskOrchestration.buildTaskPacket({
       originalUserMessage,
       resolvedObjective: String(options.resolvedObjective || '').trim()
-        || (RendererTaskOrchestration.isContextDependentRequest(originalUserMessage) ? '' : prompt),
+        || (semanticIntent && semanticIntent.resolvedRequest)
+        || prompt,
       title,
       precedingMessages: taskContextMessages(originConv),
       precedingConversationSummary: String(options.precedingConversationSummary || ''),
@@ -6095,6 +6477,7 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
       targetConversationId: 'pending-coder-conversation',
       targetMode: 'coder',
       source: 'dispatch-handoff',
+      semanticIntent,
       timestamp: Date.now()
     });
     if (!preflight.success || !preflight.task) {
@@ -6179,6 +6562,7 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
         ? [...new Set([...(preflightTask.requirements || []), ...looseFindings])]
         : looseFindings,
       constraints: preflightTask ? preflightTask.constraints : [],
+      semanticIntent,
       unresolvedDecisions: preflightTask ? preflightTask.unresolvedDecisions : [],
       source: 'dispatch-handoff',
       modelSelectValue: window.getSelectedModel(),
@@ -6802,10 +7186,11 @@ async function submitPhoneCompanionPromptOnce(options) {
     || (conv.awaitingClarification && conv.awaitingClarification.taskId)
     || ''
   );
-  const cancellationIntent = window.OrionDispatchIntent
-    && typeof window.OrionDispatchIntent.isOwnedTaskCancellationRequest === 'function'
-    && window.OrionDispatchIntent.isOwnedTaskCancellationRequest(text);
-  if (conversationMode(conv) === 'orion' && cancellationIntent) {
+  const semanticIntent = await classifyCurrentConversationIntent(conv, text, {
+    model: window.getSelectedModel(),
+    taskId: pendingReplyTaskId
+  });
+  if (conversationMode(conv) === 'orion' && semanticIntent.intent === 'cancel_active_task') {
     const messageId = createConversationMessageId(conv.id);
     conv.messages.push({
       id: messageId,
@@ -6818,10 +7203,27 @@ async function submitPhoneCompanionPromptOnce(options) {
     if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
     saveConversationsToStorage();
     if (targetId === activeConversationId) renderUserMessage(text, phoneImages, Date.now());
-    const cancellation = await cancelOwnedTaskRequestedInPrompt(conv, text, 'phone-task-cancellation');
+    const cancellation = await cancelOwnedTaskRequestedInPrompt(conv, text, 'phone-task-cancellation', semanticIntent);
     return {
       ...cancellation,
       queued: false,
+      conversationId: targetId,
+      title: conv.title || 'New Conversation'
+    };
+  }
+  if (conversationMode(conv) === 'orion' && conv.awaitingDelegatedPlan
+      && ['approve_plan', 'deny_plan', 'revise_plan'].includes(semanticIntent.intent)) {
+    const result = semanticIntent.intent === 'approve_plan'
+      ? await window.approvePhoneCompanionPlan(conv.id)
+      : (semanticIntent.intent === 'deny_plan'
+          ? await window.denyPhoneCompanionPlan(conv.id)
+          : await window.revisePhoneCompanionPlan({
+              conversationId: conv.awaitingDelegatedPlan.coderConversationId,
+              feedback: semanticIntent.resolvedRequest || text
+            }));
+    return {
+      ...(result || {}),
+      queued: !!(result && result.queued),
       conversationId: targetId,
       title: conv.title || 'New Conversation'
     };
@@ -6846,9 +7248,10 @@ async function submitPhoneCompanionPromptOnce(options) {
       targetConversationId: targetId,
       originConversationId: targetId,
       originMessageId: messageId,
-      source: 'phone-continuation',
-      images: phoneImages,
-      alreadyRendered: true
+            source: 'phone-continuation',
+            images: phoneImages,
+            alreadyRendered: true,
+            semanticIntent
     });
     if (!continuation.success) {
       conv.awaitingClarification = clarificationState;
@@ -6869,6 +7272,50 @@ async function submitPhoneCompanionPromptOnce(options) {
     });
     return { ...launch, conversationId: targetId, title: conv.title || 'New Conversation' };
   }
+
+  const isOwnedContinuation = !!(
+    conversationMode(conv) === 'orion'
+    && !conv.awaitingDelegatedPlan
+    && !conv.awaitingPlanApproval
+    && RendererTaskOrchestration
+    && typeof RendererTaskOrchestration.isContinuationRequest === 'function'
+    && RendererTaskOrchestration.isContinuationRequest(semanticIntent)
+  );
+  if (isOwnedContinuation) {
+    const messageId = createConversationMessageId(conv.id);
+    conv.messages.push({
+      id: messageId,
+      role: 'user',
+      source: 'phone',
+      text,
+      createdAt: Date.now(),
+      ...(phoneImages.length ? { images: phoneImages } : {})
+    });
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+    saveConversationsToStorage();
+    if (targetId === activeConversationId) renderUserMessage(text, phoneImages, Date.now());
+    const continuationResult = await resumeOwnedCoderTaskFromDispatch(conv, text, {
+      messageId,
+      modelSelectValue: window.getSelectedModel(),
+      images: phoneImages,
+      source: 'phone-dispatch-continuation'
+      ,
+      semanticIntent
+    });
+    if (continuationResult.handled) {
+      return {
+        ...continuationResult,
+        queued: !!continuationResult.queued,
+        conversationId: targetId,
+        title: conv.title || 'New Conversation'
+      };
+    }
+    // No live owned task exists. Remove the provisional message so the ordinary path below can
+    // record and resolve this contextual request exactly once.
+    conv.messages = conv.messages.filter(message => message.id !== messageId);
+    saveConversationsToStorage();
+    if (targetId === activeConversationId) await selectConversation(targetId);
+  }
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
 
   if (isGlobalRunning) {
@@ -6882,7 +7329,7 @@ async function submitPhoneCompanionPromptOnce(options) {
         conv,
         text,
         window.getSelectedModel(),
-        { source: 'phone', images: phoneImages, messageId }
+        { source: 'phone', images: phoneImages, messageId, semanticIntent }
       );
       if (supervisorResult && supervisorResult.success === false) {
         return {
@@ -6922,9 +7369,10 @@ async function submitPhoneCompanionPromptOnce(options) {
           targetConversationId: targetId,
           originConversationId: targetId,
           originMessageId: messageId,
-          source: 'phone',
-          images: phoneImages,
-          alreadyRendered: true
+            source: 'phone',
+            images: phoneImages,
+            alreadyRendered: true,
+            semanticIntent
         });
     if (!queued.success) {
       return {
@@ -6951,9 +7399,10 @@ async function submitPhoneCompanionPromptOnce(options) {
     renderUserMessage(text, phoneImages, Date.now());
   }
   window.runAgentLoop(text, window.getSelectedModel(), conv, {
-    source: 'phone',
-    images: phoneImages,
-    ...(pendingReplyTaskId ? { taskId: pendingReplyTaskId, preserveUserPrompt: true } : {})
+      source: 'phone',
+      images: phoneImages,
+      ...(pendingReplyTaskId ? { taskId: pendingReplyTaskId, preserveUserPrompt: true } : {}),
+      semanticIntent
   })
     .catch(err => {
       console.error("Phone-started agent loop failed:", err);
@@ -7815,14 +8264,20 @@ function bindNamedProjectForSupervisor(orionConv, prompt) {
 async function respondOrionConversationally(orionConv, prompt, model, options = {}) {
   const config = window.getAppConfig ? window.getAppConfig() : {};
 
-  // Build context: recent conversation history (last 10 messages)
+  const contextNeed = options.semanticIntent
+    && options.semanticIntent.reasoningPolicyHint
+    && options.semanticIntent.reasoningPolicyHint.contextNeed
+    || 'none';
+  const recentLimit = contextNeed === 'none' ? 0 : (contextNeed === 'recent' ? 4 : 10);
+  // Recent conversation is candidate evidence only when the semantic route says it is needed.
   const recentMsgs = (orionConv.messages || [])
     .filter(message => !options.statusCheckin || !String(message && message.source || '').startsWith('supervisor-checkin'))
-    .slice(-10)
+    .slice(recentLimit ? -recentLimit : 0)
     .map(m => ({
       role: m.role === 'assistant' || m.role === 'model' ? 'assistant' : 'user',
       content: String(m.text || m.content || '').slice(0, 500)
     }));
+  if (recentLimit === 0) recentMsgs.length = 0;
 
   // Add coder context if a coder task is running
   let coderContext = '';
@@ -7865,7 +8320,8 @@ async function respondOrionConversationally(orionConv, prompt, model, options = 
         ...projects.map(project => typeof project === 'string' ? project : project.path)
       ].filter(Boolean),
       systemPrompt,
-      messages: recentMsgs
+      messages: recentMsgs,
+      semanticIntent: options.semanticIntent || null
     }, {
       contracts: RendererOrchestrationContracts,
       retrieveEvidence: payload => (
@@ -7873,7 +8329,10 @@ async function respondOrionConversationally(orionConv, prompt, model, options = 
           ? window.api.searchConversationEvidence(payload)
           : Promise.resolve({ success: false, evidence: [], queryTerms: [] })
       ),
-      generateReply: (contractPrompt, messages) => window.quickOrionLLMCall(contractPrompt, messages, config)
+      generateReply: (contractPrompt, messages) => window.quickOrionLLMCall(contractPrompt, messages, config, {
+        phase: options.statusCheckin ? 'final_response' : 'casual_conversation',
+        hint: options.semanticIntent && options.semanticIntent.reasoningPolicyHint || {}
+      })
     });
     const replyText = String(result.text || '').trim();
     if (!replyText) throw new Error('Supervisor response was empty.');
@@ -7930,7 +8389,8 @@ async function handleSupervisorMessage(orionConv, prompt, model, options = {}) {
   if (!RendererSupervisorOrchestration) {
     throw new Error('Supervisor orchestration is unavailable.');
   }
-  const enqueueTask = async () => {
+  const semanticIntent = options.semanticIntent || await classifyCurrentConversationIntent(orionConv, prompt, { model });
+  const enqueueTask = async classification => {
     const projectResolutionText = [
       ...taskContextMessages(orionConv).map(message => message.text),
       prompt
@@ -7946,7 +8406,8 @@ async function handleSupervisorMessage(orionConv, prompt, model, options = {}) {
       source: options.source || 'supervisor-queue',
       images: options.images || [],
       workspace,
-      alreadyRendered: true
+      alreadyRendered: true,
+      semanticIntent: classification || semanticIntent
     });
     if (queued.success) {
       persistAssistantStatusMessage(orionConv.id, `Queued as ${queued.task.title}. Orion will handle it after the active Coder task.`, {
@@ -7965,10 +8426,10 @@ async function handleSupervisorMessage(orionConv, prompt, model, options = {}) {
     conversation: orionConv,
     prompt,
     model,
-    options
+    options,
+    semanticIntent
   }, {
-    taskContracts: RendererTaskOrchestration,
-    dispatchIntent: window.OrionDispatchIntent,
+    classifyIntent: () => Promise.resolve(semanticIntent),
     cancelOwnedTask: async () => {
       const cancelled = await stopExpectedTaskForConversation(orionConv.id);
       const taskId = String((cancelled && cancelled.task && cancelled.task.taskId) || (cancelled && cancelled.taskId) || '');
@@ -7979,12 +8440,17 @@ async function handleSupervisorMessage(orionConv, prompt, model, options = {}) {
       return cancelled;
     },
     enqueueTask,
-    steerActiveTask: async ({ reason }) => {
+    askClarification: question => {
+      persistTaskClarification(orionConv, question || 'What would you like me to do?');
+      return { success: false, needsClarification: true, clarification: question };
+    },
+    steerActiveTask: async ({ reason, classification }) => {
+      const steeringPrompt = String(classification && classification.resolvedRequest || prompt);
       window.steeringQueue = window.steeringQueue || {};
       window.steeringQueue[coderConvId] = window.steeringQueue[coderConvId] || [];
-      window.steeringQueue[coderConvId].push(prompt);
+      window.steeringQueue[coderConvId].push(steeringPrompt);
       appendSystemMessage(
-        `${reason === 'executable_instruction' ? 'Executable instruction' : 'Steering'} sent to the active Coder task: "${prompt.slice(0, 80)}${prompt.length > 80 ? '…' : ''}"`,
+        `Steering sent to the active Coder task: "${steeringPrompt.slice(0, 80)}${steeringPrompt.length > 80 ? '…' : ''}"`,
         { conversationId: orionConv.id }
       );
       return { success: true, steered: true, coderConversationId: coderConvId };
@@ -7996,11 +8462,12 @@ async function handleSupervisorMessage(orionConv, prompt, model, options = {}) {
         : 'Coder is active, but it has not recorded a detailed progress update yet.';
       return respondOrionConversationally(orionConv, prompt, model, {
         ...options,
+        semanticIntent,
         statusCheckin: true,
         fallbackText
       });
     },
-    respondConversationally: () => respondOrionConversationally(orionConv, prompt, model, options)
+    respondConversationally: () => respondOrionConversationally(orionConv, prompt, model, { ...options, semanticIntent })
   });
 }
 
@@ -8039,7 +8506,8 @@ window.startCoderTaskMonitor = function(orionConvId, coderConvId, taskId = '') {
     }
     const durableTask = taskId ? orchestrationTaskCache.get(taskId) : null;
     if (durableTask && ['cancelled', 'completed', 'failed'].includes(durableTask.status)) {
-      stopCoderTaskMonitor(monitorMeta);
+      await notifySupervisorOfCoderCompletion(coderConvId, taskId);
+      if (_coderTaskMonitorMeta === monitorMeta) stopCoderTaskMonitor(monitorMeta);
       return;
     }
 
@@ -8068,11 +8536,33 @@ window.startCoderTaskMonitor = function(orionConvId, coderConvId, taskId = '') {
           if (_coderTaskMonitorMeta !== monitorMeta) return;
           if (statusRead && statusRead.success && statusRead.task) canonicalTask = statusRead.task;
         }
-        // Pending is an intentional, durable pause boundary. It must never be rewritten to failed
-        // merely because no renderer loop is currently running. Park it with a Continue action;
-        // only an abandoned ACTIVE execution is eligible for watchdog failure reconciliation.
+        // Pending can mean either a user/input pause or an automatic action-boundary checkpoint.
+        // The durable resume policy is authoritative across queue timing gaps and renderer
+        // restarts. Recover automatic work under the same task ID; only user/manual pauses should
+        // be parked behind a Continue action.
         if (canonicalTask && canonicalTask.status === 'pending') {
           if (String(orionConv.launchedCoderTaskId || '') !== taskId) return;
+          if (pendingTaskNeedsRuntimeQueue(canonicalTask)) {
+            const continuation = await queueTaskContinuation({
+              targetConversationId: coderConvId,
+              originConversationId: orionConvId,
+              taskId,
+              requireExistingTask: true,
+              source: 'automatic-action-boundary-recovery'
+            });
+            if (_coderTaskMonitorMeta !== monitorMeta) return;
+            if (continuation && continuation.success) {
+              startOrQueueTaskContinuation(continuation, coderConv, {
+                source: 'automatic-action-boundary-recovery',
+                modelSelectValue: window.getSelectedModel(),
+                errorLabel: 'Automatic Coder continuation'
+              });
+              monitorMeta.quietSince = 0;
+              return;
+            }
+            monitorMeta.quietSince = Date.now();
+            return;
+          }
           const pendingReason = String(
             canonicalTask.execution && canonicalTask.execution.reason || ''
           ).trim();
@@ -8282,6 +8772,23 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
   }
   if (taskId && String(orionConv.launchedCoderTaskId || '') !== taskId) return;
   if (durableTask && (durableTask.status === 'pending' || durableTask.status === 'active')) return;
+  const existingTerminalNotification = Array.isArray(orionConv.messages)
+    ? orionConv.messages.find(message =>
+        message
+        && message.source === 'supervisor-completion'
+        && String(message.orchestrationTaskId || '') === taskId
+      )
+    : null;
+  if (existingTerminalNotification) {
+    orionConv.launchedCoderConvId = null;
+    orionConv.launchedCoderTaskId = null;
+    orionConv.launchedCoderTaskTitle = null;
+    orionConv.launchedCoderTaskStart = null;
+    orionConv.awaitingDelegatedPlan = null;
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    return;
+  }
   if (durableTask && durableTask.status === 'cancelled') {
     if (_coderTaskMonitorMeta && _coderTaskMonitorMeta.coderConvId === finishedCoderConvId
         && (!_coderTaskMonitorMeta.taskId || _coderTaskMonitorMeta.taskId === taskId)) {
@@ -8304,7 +8811,12 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
   }
 
   const coderConv = conversations.find(c => c.id === finishedCoderConvId);
-  const taskTitle = orionConv.launchedCoderTaskTitle || (coderConv && coderConv.title) || 'Coder Task';
+  const taskTitle = String(
+    durableTask && durableTask.title
+    || orionConv.launchedCoderTaskTitle
+    || (coderConv && coderConv.title)
+    || 'Coder Task'
+  );
   const tasks = (coderConv && coderConv.tasks) || [];
   const doneTasks = tasks.filter(t => t.status === 'completed' || t.status === 'x');
   const pendingTasks = tasks.filter(t => t.status !== 'completed' && t.status !== 'x');
@@ -8339,12 +8851,16 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
     summaryText = `Coder finished **${taskTitle}**${elapsed_str}. ${doneTasks.length > 0 ? `${doneTasks.length} task${doneTasks.length > 1 ? 's' : ''} completed.` : ''} Ready for your next direction.`;
   }
 
-  notifyOrionConversation(orionConv, summaryText, 'supervisor-completion');
+  notifyOrionConversation(orionConv, summaryText, 'supervisor-completion', {
+    orchestrationTaskId: taskId,
+    orchestrationStatus: durableTask && durableTask.status || ''
+  });
 
   orionConv.lastDelegatedWork = {
     taskId,
     coderConversationId: finishedCoderConvId,
     title: taskTitle,
+    objective: durableTask && durableTask.objective || '',
     projectPath: (coderConv && coderConv.projectPath) || inferDispatchProjectPath(orionConv),
     status: durableTask ? durableTask.status : (blockedFlag || pendingTasks.length > 0 ? 'blocked' : 'completed'),
     subStatus: durableTask
@@ -8376,6 +8892,15 @@ window.onOrchestrationTaskFinalized = async function(taskId, targetConversationI
 // Appends a message to an Orion conversation, rendering it if active.
 function notifyOrionConversation(orionConv, text, source, metadata = {}) {
   if (!orionConv || !text) return;
+  if (!Array.isArray(orionConv.messages)) orionConv.messages = [];
+  if (metadata.orchestrationTaskId
+      && orionConv.messages.some(message =>
+        message
+        && message.source === source
+        && String(message.orchestrationTaskId || '') === String(metadata.orchestrationTaskId)
+      )) {
+    return;
+  }
   const message = { ...metadata, role: 'assistant', text, source, createdAt: Date.now() };
   orionConv.messages.push(message);
   orionConv.updatedAt = Date.now();

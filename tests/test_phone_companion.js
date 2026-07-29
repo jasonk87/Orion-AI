@@ -391,12 +391,18 @@ test('Phone Companion v2 auto-pairs valid LAN pairing links by default', async (
 });
 
 test('Phone Companion v2 task controls and preview endpoints reach desktop bridge', async (t) => {
-  const { main, electron } = await startMainWithConfig(1133);
+  const { main, electron, fsMock } = await startMainWithConfig(1133);
   const pair = await request('POST', 1133, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
   const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
 
   const switchRes = await request('POST', 1133, '/api/conversations/switch', { conversationId: 'conv2' }, session);
   t.equal(switchRes.statusCode, 200, 'task switching endpoint succeeds');
+  t.ok(switchRes.json.selectionRevision > 0, 'an explicit switch advances the durable device selection revision');
+  t.equal(
+    fsMock._config().phoneCompanionDevices[0].selectedConversationId,
+    'conv2',
+    'the phone selection is persisted independently of desktop activity'
+  );
 
   const newTask = await request('POST', 1133, '/api/conversations/new', { prompt: 'new task', projectPath: 'C:\\Projects\\OrionTarget' }, session);
   t.equal(newTask.statusCode, 200, 'new task endpoint succeeds');
@@ -421,6 +427,16 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
   t.equal(approve.statusCode, 200, 'plan approval succeeds');
   t.equal(deny.statusCode, 200, 'plan denial succeeds');
   t.equal(revise.statusCode, 200, 'plan revision succeeds');
+  const approvalCallsBeforeStaleAction = electron.calls.filter(call => call.includes('approvePhoneCompanionPlan')).length;
+  const staleApprove = await request('POST', 1133, '/api/approve-plan', {
+    conversationId: 'a-different-conversation'
+  }, session);
+  t.equal(staleApprove.statusCode, 409, 'a plan control from a stale or unrelated view is rejected');
+  t.equal(
+    electron.calls.filter(call => call.includes('approvePhoneCompanionPlan')).length,
+    approvalCallsBeforeStaleAction,
+    'a stale approval never reaches the desktop conversation'
+  );
 
   const stop = await request('POST', 1133, '/api/stop', {}, session);
   const resume = await request('POST', 1133, '/api/resume', {}, session);
@@ -755,13 +771,17 @@ test('phone Dispatch cancellation and supervisor failures preserve truthful outc
   const submitStart = rendererSource.indexOf('async function submitPhoneCompanionPromptOnce');
   const submitEnd = rendererSource.indexOf('\nwindow.steerPhoneCompanionTask', submitStart);
   const submitPath = rendererSource.slice(submitStart, submitEnd);
-  const cancelIndex = submitPath.indexOf(
-    "await cancelOwnedTaskRequestedInPrompt(conv, text, 'phone-task-cancellation')"
-  );
+  const classifyIndex = submitPath.indexOf('const semanticIntent = await classifyCurrentConversationIntent');
+  const cancelIndex = submitPath.indexOf('await cancelOwnedTaskRequestedInPrompt(');
   const clarificationIndex = submitPath.indexOf('if (conv.awaitingClarification && pendingReplyTaskId)');
   const busyIndex = submitPath.indexOf('if (isGlobalRunning)');
 
-  t.ok(cancelIndex >= 0, 'phone prompt recognizes an owned-task cancellation');
+  t.ok(
+    classifyIndex >= 0
+      && cancelIndex > classifyIndex
+      && submitPath.slice(cancelIndex, cancelIndex + 220).includes('semanticIntent'),
+    'phone prompt uses the shared structured classification for owned-task cancellation'
+  );
   t.ok(
     cancelIndex < clarificationIndex && cancelIndex < busyIndex,
     'phone cancellation runs before continuation or global busy routing'

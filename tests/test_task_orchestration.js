@@ -7,13 +7,17 @@ const path = require('path');
 const {
   TASK_STATES,
   isContextDependentRequest,
+  isContinuationRequest,
+  deriveTaskTitle,
   buildTaskPacket,
   normalizeTaskRecord,
   transitionTask,
   canRequesterControlTask,
+  selectOwnedContinuationTask,
   cancelPendingOwnedTasks,
   renderTaskPrompt,
   describeTaskStatus,
+  pendingTaskNeedsRuntimeQueue,
   selectSupervisedTask,
   describeSupervisedTaskPresentation
 } = require('../task-orchestration');
@@ -66,14 +70,80 @@ async function captureRejection(promise) {
   }
 }
 
-test('context-dependent request detection covers durable-reference phrases', t => {
-  ['Let\'s do it', 'Go ahead', 'Fix that', 'Use the second one', 'Make it like we discussed', 'Continue', 'Ship it',
-    'Yes', 'yes.', 'Yeah, do it', 'Yes, go ahead', 'Route it', 'Confirmed',
-    'Yes, let\'s go ahead and get this updated', 'yes, go ahead and update it', 'go ahead and do that', 'get it done']
-    .forEach(value => t.equal(isContextDependentRequest(value), true, `${value} depends on earlier context`));
-  t.equal(isContextDependentRequest('Implement a CSV export for account reports.'), false, 'self-contained work is not marked contextual');
-  t.equal(isContextDependentRequest('How do I fix that kind of error in general?'), false, 'a general instructional question is not mistaken for a queued reference');
-  t.equal(isContextDependentRequest('Yesterday the build failed'), false, 'words that merely start with an affirmation are not confirmations');
+test('context-dependent request detection consumes structured semantic intent only', t => {
+  t.equal(isContextDependentRequest({
+    intent: 'context_followup',
+    target: 'current_conversation',
+    contextDependent: true
+  }), true, 'the shared classifier can mark a resolved follow-up as contextual');
+  t.equal(isContextDependentRequest({
+    intent: 'new_task',
+    target: 'current_conversation',
+    contextDependent: false
+  }), false, 'a self-contained task is not marked contextual');
+  t.equal(isContextDependentRequest("Let's do it"), false, 'ordinary English is never classified by this deterministic task module');
+  t.end();
+});
+
+test('task continuation detection requires a structured active-owned-task target', t => {
+  t.equal(isContinuationRequest({
+    intent: 'context_followup',
+    target: 'active_owned_task',
+    contextDependent: true
+  }), true, 'the classified follow-up resumes owned work');
+  t.equal(isContinuationRequest({
+    intent: 'context_followup',
+    target: 'current_conversation',
+    contextDependent: true
+  }), false, 'a discussion follow-up is not task continuation');
+  t.equal(isContinuationRequest({
+    intent: 'approve_plan',
+    target: 'pending_plan',
+    contextDependent: true
+  }), false, 'plan approval is not confused with task continuation');
+  t.equal(isContinuationRequest('Continue'), false, 'the task contract does not infer intent from a phrase');
+  t.end();
+});
+
+test('Dispatch continuation deterministically reuses its one canonical Coder task', t => {
+  const pending = normalizeTaskRecord(baseTask({
+    taskId: 'task-pending',
+    status: 'pending',
+    updatedAt: 2000
+  }));
+  const active = normalizeTaskRecord(baseTask({
+    taskId: 'task-active',
+    status: 'active',
+    target: { conversationId: 'coder-2', sessionId: '', messageId: '', mode: 'coder' },
+    updatedAt: 3000
+  }));
+  const unrelated = normalizeTaskRecord(baseTask({
+    taskId: 'task-unrelated',
+    origin: { conversationId: 'dispatch-other', sessionId: '', messageId: '' },
+    target: { conversationId: 'coder-other', sessionId: '', messageId: '', mode: 'coder' },
+    status: 'pending',
+    updatedAt: 4000
+  }));
+
+  const paused = selectOwnedContinuationTask([pending, unrelated], 'dispatch-1', ['task-pending']);
+  t.equal(paused.action, 'resume_pending', 'one owned paused task is resumed');
+  t.equal(paused.task.taskId, 'task-pending', 'the existing task ID is retained');
+
+  const running = selectOwnedContinuationTask([pending, active, unrelated], 'dispatch-1', ['task-pending']);
+  t.equal(running.action, 'already_active', 'active owned work prevents a second handoff');
+  t.equal(running.task.taskId, 'task-active', 'the live Coder task remains authoritative');
+
+  const ambiguous = selectOwnedContinuationTask([
+    pending,
+    normalizeTaskRecord(baseTask({
+      taskId: 'task-pending-2',
+      target: { conversationId: 'coder-3', sessionId: '', messageId: '', mode: 'coder' },
+      status: 'pending',
+      updatedAt: 2500
+    }))
+  ], 'dispatch-1');
+  t.equal(ambiguous.action, 'ambiguous_pending', 'multiple paused tasks require a choice');
+  t.equal(ambiguous.task, null, 'ambiguity never invents a task selection');
   t.end();
 });
 
@@ -131,6 +201,24 @@ test('GRITLIFE contextual approval resolves to a self-contained task packet', t 
   const result = buildTaskPacket({
     taskId: 'task_gritlife_enrollments',
     originalUserMessage: "Let's do it",
+    semanticIntent: {
+      intent: 'context_followup',
+      target: 'current_conversation',
+      contextDependent: true,
+      needsClarification: false,
+      resolvedRequest: 'Design and implement a location-based commitment system for GRITLIFE using paid enrollments and subscriptions organized by Body & Physical, Medical, Community, Education, and Work. Include recurring gym memberships, yoga, massages, therapy, clubs, classes, and career development with recurring costs and benefits. Evaluate how this replaces, merges with, or derives the existing Grind, Connect, and Survive intent behavior.',
+      taskResolution: {
+        title: 'GRITLIFE location enrollments',
+        requirements: [
+          'Organize enrollments by Body & Physical, Medical, Community, Education, and Work.',
+          'Support recurring costs and benefits.'
+        ],
+        constraints: [],
+        unresolvedDecisions: [
+          'Evaluate how the enrollment system replaces, merges with, or derives Grind, Connect, and Survive.'
+        ]
+      }
+    },
     precedingMessages: [
       {
         role: 'user',
@@ -186,6 +274,14 @@ test('contextual task resolves a named registered project instead of queuing aga
   }];
   const resolved = buildTaskPacket({
     originalUserMessage: "Let's do it",
+    semanticIntent: {
+      intent: 'context_followup',
+      target: 'current_conversation',
+      contextDependent: true,
+      needsClarification: false,
+      resolvedRequest: 'Implement recurring paid subscriptions and enrollments for GRITLIFE, organized by locations such as gyms, yoga, massage, therapy, and classes.',
+      taskResolution: { title: 'GRITLIFE subscriptions', requirements: [], constraints: [], unresolvedDecisions: [] }
+    },
     precedingMessages: context,
     workspace: {
       role: 'active_project',
@@ -210,6 +306,14 @@ test('contextual task resolves a named registered project instead of queuing aga
 
   const unresolved = buildTaskPacket({
     originalUserMessage: "Let's do it",
+    semanticIntent: {
+      intent: 'context_followup',
+      target: 'current_conversation',
+      contextDependent: true,
+      needsClarification: false,
+      resolvedRequest: 'Implement recurring paid subscriptions and enrollments for GRITLIFE.',
+      taskResolution: { title: 'GRITLIFE subscriptions', requirements: [], constraints: [], unresolvedDecisions: [] }
+    },
     precedingMessages: context,
     workspace: {
       role: 'project_search_root',
@@ -279,12 +383,20 @@ test('task image attachments and context packet references survive a durable sto
 test('unresolvable option reference asks a targeted question and creates no task', t => {
   const result = buildTaskPacket({
     originalUserMessage: 'Use the second one',
-    precedingMessages: []
+    precedingMessages: [],
+    semanticIntent: {
+      intent: 'clarification_required',
+      target: 'current_conversation',
+      contextDependent: true,
+      needsClarification: true,
+      resolvedRequest: '',
+      clarificationQuestion: 'Which second option do you mean? I do not have the referenced choices.'
+    }
   });
   t.equal(result.success, false, 'resolution fails honestly');
   t.equal(result.needsClarification, true, 'clarification is required');
   t.equal(result.task, null, 'no invented task is returned');
-  t.ok(/Which option/i.test(result.clarification), 'question targets the missing choice');
+  t.ok(/Which (?:second )?option/i.test(result.clarification), 'question targets the missing choice');
   t.ok(/do not have the referenced choices/i.test(result.clarification), 'question explains the evidence gap');
   t.end();
 });
@@ -293,6 +405,19 @@ test('option reference resolves when the preceding choices are present', t => {
   const result = buildTaskPacket({
     taskId: 'task_option_two',
     originalUserMessage: 'Use the second one',
+    semanticIntent: {
+      intent: 'context_followup',
+      target: 'current_conversation',
+      contextDependent: true,
+      needsClarification: false,
+      resolvedRequest: 'Move imports to a bounded background worker with cancellation.',
+      taskResolution: {
+        title: 'Move imports to a worker',
+        requirements: ['Use a bounded background worker with cancellation.'],
+        constraints: [],
+        unresolvedDecisions: []
+      }
+    },
     options: [
       'Keep the current synchronous importer.',
       'Move imports to a bounded background worker with cancellation.',
@@ -356,6 +481,54 @@ test('task transitions and status descriptions preserve factual state', t => {
   t.end();
 });
 
+test('automatic action-boundary checkpoints persist their restart policy and continuation packet', t => {
+  const active = transitionTask(normalizeTaskRecord(baseTask()), TASK_STATES.ACTIVE, {
+    timestamp: 1100,
+    executionId: 'exec-auto-boundary'
+  });
+  const pending = transitionTask(active, TASK_STATES.PENDING, {
+    timestamp: 1200,
+    expectedExecutionId: 'exec-auto-boundary',
+    reason: 'Execution pass checkpointed after verified progress.',
+    reasonCode: 'automatic_action_boundary',
+    resumePolicy: 'automatic',
+    continuation: {
+      input: '[ORION INTERNAL CONTINUATION] Continue from the durable checkpoint.',
+      source: 'automatic-action-boundary',
+      createdAt: 1200
+    }
+  });
+
+  t.equal(pending.status, TASK_STATES.PENDING, 'the boundary remains a non-terminal pending state');
+  t.equal(pending.execution.resumePolicy, 'automatic', 'the durable task distinguishes automatic continuation from a user pause');
+  t.equal(pending.execution.reasonCode, 'automatic_action_boundary', 'the pending reason is machine-readable');
+  t.match(pending.continuation.input, /durable checkpoint/i, 'the next-pass directive survives outside the renderer queue');
+  t.equal(pending.continuation.source, 'automatic-action-boundary', 'continuation provenance is retained');
+  t.equal(pendingTaskNeedsRuntimeQueue(pending), true, 'restart recovery requeues an automatic checkpoint');
+  t.equal(
+    pendingTaskNeedsRuntimeQueue({ ...pending, execution: { ...pending.execution, resumePolicy: 'user' } }),
+    false,
+    'restart recovery does not launch work that is waiting for the user'
+  );
+  t.equal(
+    pendingTaskNeedsRuntimeQueue(normalizeTaskRecord(baseTask({ taskId: 'fresh-pending' }))),
+    true,
+    'a fresh never-claimed pending task is restored to the runtime queue'
+  );
+  t.equal(
+    deriveTaskTitle('Fix the retirement controller integration and verify the end-to-end flow.', 'GRITLIFE'),
+    'GRITLIFE — Fix the retirement controller integration and verify the end-to-end flow',
+    'resolved objectives produce useful human task titles without a generic Dispatch placeholder'
+  );
+  const migratedTitle = normalizeTaskRecord(baseTask({
+    title: 'Execute Dispatch request',
+    objective: 'Fix the retirement controller integration and verify it.'
+  })).title;
+  t.match(migratedTitle, /retirement controller integration/i, 'persisted generic titles migrate from their durable objective');
+  t.notEqual(migratedTitle, 'Execute Dispatch request', 'an existing generic title no longer survives reload');
+  t.end();
+});
+
 test('Dispatch task presentation follows one durable task from queued through planning and review', t => {
   const pending = normalizeTaskRecord(baseTask({
     taskId: 'task_dispatch_phone_lifecycle',
@@ -366,6 +539,14 @@ test('Dispatch task presentation follows one durable task from queued through pl
   const queued = describeSupervisedTaskPresentation(selectedPending);
   t.equal(selectedPending.taskId, pending.taskId, 'Dispatch selects the durable task by task ID');
   t.equal(queued.label, 'Coder queued', 'pending is presented as Coder queued');
+
+  const autoPending = {
+    ...pending,
+    execution: { attempt: 1, state: 'pending', resumePolicy: 'automatic' }
+  };
+  const continuing = describeSupervisedTaskPresentation(autoPending);
+  t.equal(continuing.label, 'Coder continuing', 'automatic pending work is not presented as a manual pause');
+  t.equal(continuing.phase, 'continuing', 'the UI receives an explicit automatic-continuation phase');
 
   const active = transitionTask(pending, TASK_STATES.ACTIVE, { timestamp: 1100 });
   const selectedActive = selectSupervisedTask([active], 'dispatch-1', active.taskId);

@@ -19,6 +19,25 @@ function geminiResponse(parts) {
   };
 }
 
+function semanticClassification(overrides = {}) {
+  return {
+    intent: 'conversation',
+    requiresExecution: false,
+    target: 'none',
+    resolvedRequest: '',
+    contextDependent: false,
+    confidence: 1,
+    needsClarification: false,
+    clarificationQuestion: '',
+    reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'none' },
+    taskResolution: { title: '', requirements: [], constraints: [], unresolvedDecisions: [] },
+    executionScope: 'none',
+    inspectionTarget: 'none',
+    standaloneSystemOperation: false,
+    ...overrides
+  };
+}
+
 function installHarness(modelTurns, options = {}) {
   const systemMessages = [];
   const rendered = [];
@@ -69,8 +88,8 @@ function installHarness(modelTurns, options = {}) {
     if (String(url).includes(':countTokens')) {
       return { ok: true, json: async () => ({ totalTokens: 100 }) };
     }
-    if (serialized.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return geminiResponse([{ text: '{"mode":"direct","reason":"test"}' }]);
+    if (serialized.includes('Classify the current user turn. Return JSON only.')) {
+      return geminiResponse([{ text: JSON.stringify(semanticClassification(options.semanticClassification)) }]);
     }
     if (serialized.includes('bounded supervisor for an autonomous local coding agent')
         && Object.prototype.hasOwnProperty.call(options, 'supervisorResponse')) {
@@ -107,12 +126,85 @@ function restoreGlobals(originalFetch) {
   global.setTimeout = nativeSetTimeout;
 }
 
+test('exact unchanged source ranges are not reread repeatedly inside one recent context window', t => {
+  const ledger = agent.createContextAcquisitionLedger();
+  const args = { path: 'systems/retirement.py', startLine: 139, endLine: 220 };
+  agent.recordContextAcquisitionToolResult(ledger, 'read_file', args, {
+    content: Array.from({ length: 82 }, (_, index) => `line ${139 + index}`).join('\n')
+  });
+
+  const redundant = agent.getRecentRedundantContextRead(ledger, 'read_file', args);
+  t.equal(redundant && redundant.redundantContext, true, 'an immediate identical range read returns a bounded reuse receipt');
+  t.match(redundant.message, /already present|move to the next/i, 'the receipt tells Coder to use evidence and advance');
+
+  agent.invalidateContextAcquisitionForFile(ledger, 'systems/retirement.py', 'modify_file');
+  t.equal(
+    agent.getRecentRedundantContextRead(ledger, 'read_file', args),
+    null,
+    'a real file mutation invalidates the reuse guard and permits a fresh read'
+  );
+  t.end();
+});
+
+test('agent loop repairs a run-owned assistant message whose turns array is lost during live reconciliation', async t => {
+  const originalFetch = global.fetch;
+  let strippedTurns = false;
+  installHarness([
+    [
+      { text: 'I will inspect the current file first.' },
+      { functionCall: { name: 'read_file', args: { path: 'engine/controller.py', startLine: 1, endLine: 20 } } }
+    ],
+    [{ text: 'The file was inspected and the task can continue safely.' }]
+  ], {
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE',
+    api: {
+      readFile: async () => '1: class GritLife:\\n2:     pass'
+    },
+    window: {
+      renderAiMessage: (_text, _logs, _conversationId, message) => {
+        if (!strippedTurns && message && Array.isArray(message.turns) && message.turns.length === 1) {
+          delete message.turns;
+          strippedTurns = true;
+        }
+      }
+    },
+    semanticClassification: semanticClassification({
+      intent: 'new_task',
+      requiresExecution: true,
+      target: 'current_conversation',
+      resolvedRequest: 'Inspect engine/controller.py.',
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'project' },
+      executionScope: 'workspace',
+      inspectionTarget: 'project'
+    })
+  });
+  const conv = conversation('run-message-reconciliation', {
+    mode: 'coder',
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE'
+  });
+  try {
+    const result = await global.window.runAgentLoop('Inspect engine/controller.py.', 'gemini-1', conv);
+    const assistant = conv.messages.find(message => message && message._agentRunToken);
+    t.equal(strippedTurns, true, 'the test reproduced a live message-shape replacement');
+    t.notOk(result && result.status === 'failed', 'the run does not fail after the turns array disappears');
+    t.ok(assistant && Array.isArray(assistant.turns), 'the run-owned assistant message repairs its turns array');
+    t.match(assistant && assistant.text, /inspected|continue safely/i, 'the next model turn is preserved as the final response');
+    t.notOk(conv.lastAgentError, 'no critical agent error is recorded');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
 test('Dispatch loop ignores a quoted executable request inside a pushed-fix status report', async t => {
   const originalFetch = global.fetch;
   const handoffs = [];
   const prompt = 'The exact request:\n> Can you kill Claude and restart it again?\nis now covered by tests and the fix was pushed.';
   installHarness([
-    [{ text: 'I am passing that request to Coder now.' }],
+    [
+      { text: 'I am passing that request to Coder now.' },
+      { functionCall: { name: 'handoff_to_coder', args: { prompt: 'Restart Claude.' } } }
+    ],
     [{ text: 'Thanks for the update. The report says that scenario is covered and the fix was pushed.' }]
   ], {
     window: {
@@ -127,6 +219,153 @@ test('Dispatch loop ignores a quoted executable request inside a pushed-fix stat
     await global.window.runAgentLoop(prompt, 'gemini-1', conv);
     t.equal(handoffs.length, 0, 'reported request causes no Coder handoff');
     t.match(conv.messages.find(message => message.role === 'assistant').text, /covered|pushed/i, 'the surrounding status report is acknowledged');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('Dispatch adjudicates an explicit contextual handoff and commits exactly one proposed Coder task', async t => {
+  const originalFetch = global.fetch;
+  const handoffs = [];
+  const resolvedObjective = 'Wire RetirementSystem into the GRITLIFE controller and verify the integration.';
+  installHarness([
+    [
+      { text: 'I will send the agreed retirement wiring fix to Coder.' },
+      {
+        functionCall: {
+          name: 'handoff_to_coder',
+          args: {
+            prompt: resolvedObjective,
+            title: 'GRITLIFE retirement wiring',
+            open: false
+          }
+        }
+      }
+    ]
+  ], {
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE',
+    projects: ['C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE'],
+    semanticClassification: semanticClassification({
+      intent: 'context_followup',
+      requiresExecution: true,
+      target: 'current_conversation',
+      resolvedRequest: resolvedObjective,
+      contextDependent: true,
+      reasoningPolicyHint: { complexity: 'medium', risk: 'medium', contextNeed: 'task' },
+      taskResolution: {
+        title: 'GRITLIFE retirement wiring',
+        requirements: ['Wire RetirementSystem into the controller.'],
+        constraints: [],
+        unresolvedDecisions: []
+      },
+      executionScope: 'mutating',
+      inspectionTarget: 'project'
+    }),
+    window: {
+      promoteWorkspaceToCoder: async payload => {
+        handoffs.push(payload);
+        return {
+          success: true,
+          conversationId: 'coder-retirement-retry',
+          taskId: 'task-retirement-retry',
+          title: 'GRITLIFE retirement wiring',
+          status: 'pending'
+        };
+      },
+      startCoderTaskMonitor: () => {}
+    }
+  });
+  const conv = conversation('dispatch-retirement-retry', {
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE',
+    projectPath: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE',
+    lastDelegatedWork: {
+      taskId: 'task-retirement-failed',
+      coderConversationId: 'coder-retirement-failed',
+      title: 'GRITLIFE retirement wiring',
+      objective: resolvedObjective,
+      status: 'failed'
+    },
+    messages: [
+      {
+        role: 'assistant',
+        text: 'The previous task failed. Want me to send the retirement wiring fix to Coder now?'
+      },
+      { role: 'user', text: 'Do the handoff' }
+    ]
+  });
+  const initiallyRejectedIntent = semanticClassification({
+    intent: 'conversation',
+    requiresExecution: false,
+    target: 'none',
+    resolvedRequest: '',
+    contextDependent: false
+  });
+
+  try {
+    await global.window.runAgentLoop('Do the handoff', 'gemini-1', conv, {
+      semanticIntent: initiallyRejectedIntent
+    });
+    t.equal(handoffs.length, 1, 'semantic disagreement produces exactly one real handoff');
+    t.equal(handoffs[0].originalUserMessage, 'Do the handoff', 'the exact user instruction is retained as provenance');
+    t.equal(handoffs[0].semanticIntent.intent, 'context_followup', 'the adjudicated structured intent reaches durable task creation');
+    t.equal(handoffs[0].semanticIntent.requiresExecution, true, 'downstream code does not reclassify the approved handoff as conversation');
+    t.match(handoffs[0].prompt, /Wire RetirementSystem/i, 'the resolved objective, not the raw approval phrase, is handed off');
+    const finalAssistant = [...conv.messages].reverse().find(message => message.role === 'assistant');
+    t.match(finalAssistant.text, /task-retirement-retry|queued/i, 'Dispatch reports the committed task rather than narrating future intent');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('an unquoted but unauthorized handoff cannot end as narrated future action', async t => {
+  const originalFetch = global.fetch;
+  const handoffs = [];
+  installHarness([
+    [
+      { text: 'I will hand that to Coder now.' },
+      {
+        functionCall: {
+          name: 'handoff_to_coder',
+          args: { prompt: 'Make an unspecified change.', title: 'Unspecified change' }
+        }
+      }
+    ]
+  ], {
+    semanticClassification: semanticClassification({
+      intent: 'conversation',
+      requiresExecution: false,
+      target: 'none',
+      resolvedRequest: '',
+      contextDependent: true,
+      needsClarification: true,
+      clarificationQuestion: 'What exact work should I send to Coder?'
+    }),
+    window: {
+      promoteWorkspaceToCoder: async payload => {
+        handoffs.push(payload);
+        return { success: true, conversationId: 'unexpected' };
+      }
+    }
+  });
+  const conv = conversation('dispatch-ambiguous-handoff', {
+    messages: [{ role: 'user', text: 'Okay.' }]
+  });
+  try {
+    await global.window.runAgentLoop('Okay.', 'gemini-1', conv, {
+      semanticIntent: semanticClassification({
+        intent: 'conversation',
+        requiresExecution: false,
+        target: 'none',
+        resolvedRequest: '',
+        contextDependent: true
+      })
+    });
+    t.equal(handoffs.length, 0, 'an unresolved approval creates no task');
+    const finalAssistant = [...conv.messages].reverse().find(message => message.role === 'assistant');
+    t.equal(finalAssistant.text, 'What exact work should I send to Coder?', 'the final answer is a targeted clarification');
+    t.notOk(/hand.*off.*now|send.*now/i.test(finalAssistant.text), 'future-action narration is never accepted as the result');
   } finally {
     restoreGlobals(originalFetch);
   }
@@ -319,6 +558,104 @@ test('Dispatch loop analyzes a pasted transcript without executing commands in i
   t.end();
 });
 
+test('clarification answers resume their durable Dispatch task and can hand implementation to Coder', async t => {
+  const originalFetch = global.fetch;
+  const workspace = 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE';
+  const handoffs = [];
+  const finalized = [];
+  const answerPrompt = [
+    'Here are my answers:',
+    'Career Fields: Core 5',
+    'Employer Names: Random Markov',
+    'Workplace NPCs: Yes, full integration'
+  ].join('\n');
+  const durablePrompt = [
+    'Task: Build coherent GRITLIFE career progression',
+    'Task ID: task-career-clarification',
+    '',
+    'Objective:',
+    'Design and implement five deep career fields with coherent promotion ladders,',
+    'generated employer names, and fully integrated workplace NPC relationships.',
+    '',
+    'Latest clarification input:',
+    answerPrompt
+  ].join('\n');
+
+  installHarness([
+    [{
+      text: 'I will inspect the relevant career architecture before delegating the implementation.',
+      functionCall: {
+        name: 'inspect_code_context',
+        args: { query: 'career fields employers workplace NPC integration' }
+      }
+    }],
+    [{ text: 'The design choices are resolved. I am handing this implementation to Coder now.' }],
+    [{ text: 'Coder has the resolved career-system task and the selected GRITLIFE workspace.' }]
+  ], {
+    workspace,
+    projects: [workspace],
+    api: {
+      inspectCodeContext: async () => ({
+        success: true,
+        sections: [{ path: 'systems/career.py', content: 'class CareerSystem: pass' }]
+      })
+    },
+    window: {
+      claimOrchestrationTask: async taskId => ({
+        success: true,
+        task: {
+          taskId,
+          title: 'Build coherent GRITLIFE career progression',
+          source: 'clarification-answers',
+          status: 'active',
+          execution: { executionId: 'exec-career-clarification' }
+        },
+        prompt: durablePrompt
+      }),
+      promoteWorkspaceToCoder: async payload => {
+        handoffs.push(payload);
+        return {
+          success: true,
+          conversationId: 'coder-career-clarification',
+          taskId: 'task-coder-career-clarification',
+          title: payload.title,
+          status: 'pending'
+        };
+      },
+      finalizeOrchestrationTask: async (taskId, status, details) => {
+        finalized.push({ taskId, status, details });
+        return { taskId, status };
+      },
+      onOrchestrationTaskFinalized: async () => {}
+    }
+  });
+  const conv = conversation('clarification-handoff', {
+    workspace,
+    dispatchProjectPath: workspace
+  });
+
+  try {
+    await global.window.runAgentLoop(answerPrompt, 'gemini-1', conv, {
+      taskId: 'task-career-clarification',
+      source: 'clarification-answers',
+      internalPrompt: true,
+      preserveUserPrompt: true
+    });
+
+    t.equal(handoffs.length, 1, 'the resumed clarification creates exactly one real Coder handoff');
+    t.match(handoffs[0].prompt, /five deep career fields/i, 'the durable implementation objective authorizes and informs the handoff');
+    t.match(handoffs[0].prompt, /workplace NPC/i, 'the resolved clarification requirements survive delegation');
+    t.equal(handoffs[0].originalUserMessage, answerPrompt, 'the generated clarification answer remains exact provenance');
+    t.equal(finalized.length, 1, 'the claimed Dispatch continuation is finalized once');
+    const finalText = conv.messages.find(message => message.role === 'assistant').text;
+    t.match(finalText, /Coder has task .* queued/i, 'Dispatch reports the actual durable handoff result');
+    t.notOk(/report about a covered scenario|quoted command/i.test(finalText), 'the quoted-report fallback never replaces the active continuation');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
 test('a direct executable request preflights once and preserves durable handoff provenance', async t => {
   const originalFetch = global.fetch;
   const workspace = 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE';
@@ -360,12 +697,29 @@ test('a direct executable request preflights once and preserves durable handoff 
     await global.window.runAgentLoop(
       'Can you kill Claude and restart it again?',
       'gemini-1',
-      conv
+      conv,
+      {
+        semanticIntent: {
+          intent: 'new_task',
+          requiresExecution: true,
+          target: 'current_conversation',
+          resolvedRequest: 'Identify the running Claude process, restart it safely, and verify the replacement.',
+          contextDependent: false,
+          confidence: 1,
+          needsClarification: false,
+          reasoningPolicyHint: { complexity: 'medium', risk: 'medium', contextNeed: 'none' },
+          executionScope: 'mutating',
+          inspectionTarget: 'local_system',
+          standaloneSystemOperation: true
+        }
+      }
     );
     t.equal(handoffs.length, 1, 'the genuine handoff creates exactly one durable Coder task');
     t.match(handoffs[0].prompt, /identify the intended local target/i, 'the deterministic packet requires safe target identification');
     t.match(handoffs[0].prompt, /verify the result/i, 'the deterministic packet requires verification');
     t.equal(handoffs[0].originalUserMessage, 'Can you kill Claude and restart it again?', 'the exact raw user utterance is retained separately from the expanded handoff prompt');
+    t.match(handoffs[0].title, /Claude|running process/i, 'the handoff receives a human title derived from the resolved objective');
+    t.notEqual(handoffs[0].title, 'Execute Dispatch request', 'the internal Dispatch placeholder is never exposed as a task title');
   } finally {
     restoreGlobals(originalFetch);
   }
@@ -400,7 +754,21 @@ test('Projects-root Claude restart creates one standalone Coder handoff with raw
     dispatchProjectPath: ''
   });
   try {
-    await global.window.runAgentLoop(rawRequest, 'gemini-1', conv);
+    await global.window.runAgentLoop(rawRequest, 'gemini-1', conv, {
+      semanticIntent: {
+        intent: 'new_task',
+        requiresExecution: true,
+        target: 'current_conversation',
+        resolvedRequest: rawRequest,
+        contextDependent: false,
+        confidence: 1,
+        needsClarification: false,
+        reasoningPolicyHint: { complexity: 'medium', risk: 'medium', contextNeed: 'none' },
+        executionScope: 'mutating',
+        inspectionTarget: 'local_system',
+        standaloneSystemOperation: true
+      }
+    });
     t.equal(handoffs.length, 1, 'the direct process request creates exactly one handoff');
     t.equal(handoffs[0].path, projectsRoot, 'the generic Projects directory is retained only as the standalone execution workspace');
     t.equal(handoffs[0].standalone, true, 'the handoff is explicitly marked standalone rather than pretending Projects is the selected project');
@@ -445,7 +813,21 @@ test('Projects-root project work cannot misuse standalone Coder routing', async 
     dispatchProjectPath: ''
   });
   try {
-    await global.window.runAgentLoop('Run npm test for the project.', 'gemini-1', conv);
+    await global.window.runAgentLoop('Run npm test for the project.', 'gemini-1', conv, {
+      semanticIntent: {
+        intent: 'new_task',
+        requiresExecution: true,
+        target: 'current_conversation',
+        resolvedRequest: 'Run npm test for the selected project.',
+        contextDependent: false,
+        confidence: 1,
+        needsClarification: false,
+        reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'project' },
+        executionScope: 'read_only',
+        inspectionTarget: 'project',
+        standaloneSystemOperation: false
+      }
+    });
     t.equal(promoteCalls, 0, 'project-bound test work never promotes the generic Projects root');
     const assistant = conv.messages.find(message => message.role === 'assistant');
     const toolErrors = (assistant.turns || [])
@@ -540,6 +922,12 @@ test('Dispatch loop permits an explicit recall claim only when exact evidence wa
     [{ text: 'I remember our earlier discussion: the intent system would become paid subscriptions and enrollments organized by locations, including gyms, yoga, massages, therapy, and classes.' }]
   ], {
     projects: ['C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE'],
+    semanticClassification: {
+      contextDependent: true,
+      target: 'current_conversation',
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' },
+      inspectionTarget: 'project'
+    },
     api: {
       searchConversationEvidence: async () => {
         searchCalls += 1;
@@ -557,7 +945,21 @@ test('Dispatch loop permits an explicit recall claim only when exact evidence wa
     dispatchProjectPath: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE'
   });
   try {
-    await global.window.runAgentLoop(prompt, 'gemini-1', conv);
+    await global.window.runAgentLoop(prompt, 'gemini-1', conv, {
+      semanticIntent: {
+        intent: 'conversation',
+        requiresExecution: false,
+        target: 'current_conversation',
+        resolvedRequest: prompt,
+        contextDependent: true,
+        confidence: 1,
+        needsClarification: false,
+        reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' },
+        executionScope: 'none',
+        inspectionTarget: 'project',
+        standaloneSystemOperation: false
+      }
+    });
     const answer = conv.messages.find(message => message.role === 'assistant');
     t.equal(searchCalls, 1, 'the exact-conversation search runs before answering');
     t.match(answer.text, /subscriptions.*enrollments|enrollments.*subscriptions/i, 'the actual retrieved subscription discussion is summarized');
@@ -589,6 +991,12 @@ test('Dispatch loop validates every recall answer and accepts a grounded semanti
     [{ text: 'I found it. The proposal used ongoing paid memberships grouped by venues, with fitness, yoga, massage, therapy, and classes.' }]
   ], {
     projects: ['C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE'],
+    semanticClassification: {
+      contextDependent: true,
+      target: 'current_conversation',
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' },
+      inspectionTarget: 'project'
+    },
     api: {
       searchConversationEvidence: async () => ({
         success: true,
@@ -619,6 +1027,11 @@ test('Dispatch loop corrects an invented recollection when no evidence exists', 
     [{ text: 'I remember we discussed traits and the Grind, Connect, and Survive systems.' }],
     [{ text: 'I could not retrieve that specific earlier conversation. I can reason from current project information if you want, but I should not reconstruct it as a memory.' }]
   ], {
+    semanticClassification: {
+      contextDependent: true,
+      target: 'current_conversation',
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' }
+    },
     api: {
       searchConversationEvidence: async () => ({ success: true, evidence: [], queryTerms: ['intent'] })
     }
@@ -642,6 +1055,11 @@ test('Dispatch loop rejects an unlabeled reconstruction when recall evidence is 
     [{ text: 'The earlier discussion centered on Grind, Connect, and Survive shaping the intent system.' }],
     [{ text: 'I could not retrieve that specific earlier discussion. I am reasoning only from what is available now.' }]
   ], {
+    semanticClassification: {
+      contextDependent: true,
+      target: 'current_conversation',
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' }
+    },
     api: {
       searchConversationEvidence: async () => ({ success: true, evidence: [], queryTerms: ['intent'] })
     }
@@ -652,6 +1070,113 @@ test('Dispatch loop rejects an unlabeled reconstruction when recall evidence is 
     const answer = conv.messages.find(message => message.role === 'assistant').text;
     t.match(answer, /could not retrieve/i, 'the answer discloses the retrieval gap');
     t.notOk(/discussion centered on Grind/i.test(answer), 'an evasive reconstruction is not accepted');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('an unresolved semantic turn fails closed before any tool-enabled model call', async t => {
+  const originalFetch = global.fetch;
+  let writeCalls = 0;
+  const harness = installHarness([
+    [{ functionCall: { name: 'write_file', args: { path: 'unsafe.txt', content: 'must not run' } } }]
+  ], {
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE',
+    api: {
+      writeFile: async () => {
+        writeCalls += 1;
+        return { success: true };
+      }
+    }
+  });
+  const conv = conversation('unresolved-semantic-turn', {
+    mode: 'coder',
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE'
+  });
+  try {
+    await global.window.runAgentLoop('Do that.', 'gemini-1', conv, {
+      semanticIntent: {
+        intent: 'clarification_required',
+        requiresExecution: false,
+        target: 'current_conversation',
+        resolvedRequest: '',
+        contextDependent: true,
+        confidence: 0,
+        needsClarification: true,
+        clarificationQuestion: 'Which change do you want me to make?',
+        reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'recent' },
+        executionScope: 'none',
+        inspectionTarget: 'none',
+        standaloneSystemOperation: false
+      }
+    });
+    t.equal(harness.modelTurns, 0, 'unresolved meaning never reaches the normal tool-enabled model path');
+    t.equal(writeCalls, 0, 'no mutation can leak through the safe fallback');
+    t.equal(
+      conv.messages.find(message => message.role === 'assistant').text,
+      'Which change do you want me to make?',
+      'the classifier question is returned directly and naturally'
+    );
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('an unresolved task-bound turn parks the same durable task as pending', async t => {
+  const originalFetch = global.fetch;
+  const finalized = [];
+  const harness = installHarness([
+    [{ text: 'This tool-enabled model turn must not run.' }]
+  ], {
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE',
+    window: {
+      claimOrchestrationTask: async taskId => ({
+        success: true,
+        task: {
+          taskId,
+          status: 'active',
+          execution: { executionId: 'exec-unresolved-bound' }
+        },
+        prompt: 'Continue the existing implementation.'
+      }),
+      finalizeOrchestrationTask: async (taskId, status, details) => {
+        finalized.push({ taskId, status, details });
+        return { taskId, status };
+      },
+      onOrchestrationTaskFinalized: async () => {}
+    }
+  });
+  const conv = conversation('unresolved-bound-turn', {
+    mode: 'coder',
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE'
+  });
+  try {
+    await global.window.runAgentLoop('Use the second one.', 'gemini-1', conv, {
+      taskId: 'task-unresolved-bound',
+      preserveUserPrompt: true,
+      semanticIntent: {
+        intent: 'clarification_required',
+        requiresExecution: false,
+        target: 'current_conversation',
+        resolvedRequest: '',
+        contextDependent: true,
+        confidence: 0.2,
+        needsClarification: true,
+        clarificationQuestion: 'Which second option do you mean?',
+        reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'task' },
+        executionScope: 'none',
+        inspectionTarget: 'none',
+        standaloneSystemOperation: false
+      }
+    });
+    t.equal(harness.modelTurns, 0, 'the unresolved bound reply never enters normal execution');
+    t.equal(finalized.length, 1, 'the claimed task is reconciled once');
+    t.equal(finalized[0].taskId, 'task-unresolved-bound', 'the exact claimed task remains authoritative');
+    t.equal(finalized[0].status, 'pending', 'clarification parks rather than completes the task');
+    t.equal(finalized[0].details.awaitingUser, true, 'the durable receipt records that user input is required');
+    t.match(conv.messages.find(message => message.role === 'assistant').text, /which second option/i, 'the targeted question is persisted');
   } finally {
     restoreGlobals(originalFetch);
   }
@@ -860,18 +1385,12 @@ test('task-bound continuation keeps the canonical packet after restart while pre
 
 test('free-text plan denial preserves the live reply and cancels only its bound durable task', async t => {
   const originalFetch = global.fetch;
-  let approvalClassifierRequest = '';
   const taskStates = new Map([
     ['task-plan-to-deny', 'pending'],
     ['task-unrelated', 'pending']
   ]);
   const finalized = [];
-  installHarness([
-    body => {
-      approvalClassifierRequest = JSON.stringify(body);
-      return [{ text: '{"intent":"deny","reason":"The user explicitly rejected the pending plan."}' }];
-    }
-  ], {
+  installHarness([], {
     window: {
       claimOrchestrationTask: async taskId => {
         taskStates.set(taskId, 'active');
@@ -911,13 +1430,27 @@ test('free-text plan denial preserves the live reply and cancels only its bound 
       {
         taskId: 'task-plan-to-deny',
         preserveUserPrompt: true,
-        source: 'user'
+        source: 'user',
+        semanticIntent: {
+          intent: 'deny_plan',
+          requiresExecution: true,
+          target: 'pending_plan',
+          resolvedRequest: 'Deny the pending plan and cancel its bound task.',
+          contextDependent: true,
+          confidence: 1,
+          needsClarification: false,
+          reasoningPolicyHint: { complexity: 'low', risk: 'medium', contextNeed: 'task' },
+          executionScope: 'mutating',
+          inspectionTarget: 'none',
+          standaloneSystemOperation: false
+        }
       }
     );
 
-    t.match(approvalClassifierRequest, /No, cancel this plan/, 'the classifier receives the live denial reply');
-    t.notOk(/Execute the original implementation objective now/.test(approvalClassifierRequest), 'the claimed task prompt does not overwrite the denial');
-    t.notOk(/GRITLIFE|approved data model/.test(approvalClassifierRequest), 'canonical execution context is not mixed into denial classification');
+    t.notOk(
+      conv.messages.some(message => /Execute the original implementation objective now/.test(String(message.text || ''))),
+      'the claimed execution objective never replaces the denial response'
+    );
     t.equal(finalized.length, 1, 'one canonical task transition is attempted');
     t.equal(finalized[0].taskId, 'task-plan-to-deny', 'the approval-bound task ID is finalized');
     t.equal(finalized[0].status, 'cancelled', 'the denied plan task becomes explicitly cancelled');
@@ -969,7 +1502,20 @@ test('free-text plan denial restores the approval gate when canonical cancellati
       {
         taskId: 'task-plan-still-active',
         preserveUserPrompt: true,
-        source: 'user'
+        source: 'user',
+        semanticIntent: {
+          intent: 'deny_plan',
+          requiresExecution: true,
+          target: 'pending_plan',
+          resolvedRequest: 'Deny the pending plan and cancel its bound task.',
+          contextDependent: true,
+          confidence: 1,
+          needsClarification: false,
+          reasoningPolicyHint: { complexity: 'low', risk: 'medium', contextNeed: 'task' },
+          executionScope: 'mutating',
+          inspectionTarget: 'none',
+          standaloneSystemOperation: false
+        }
       }
     );
 
@@ -1324,13 +1870,28 @@ test('automatic continuation stays queued behind existing user work instead of b
     if (delay === 100 || delay === 500) return null;
     return nativeSetTimeout(fn, delay, ...args);
   };
-  const conv = conversation('auto-continue-origin');
+  const conv = conversation('auto-continue-origin', { mode: 'coder' });
   try {
     await global.window.runAgentLoop(
       'Execute both milestones.',
       'gemini-1',
       conv,
-      { taskId: 'task-auto-continue' }
+      {
+        taskId: 'task-auto-continue',
+        semanticIntent: {
+          intent: 'new_task',
+          requiresExecution: true,
+          target: 'current_conversation',
+          resolvedRequest: 'Execute both milestones.',
+          contextDependent: false,
+          confidence: 1,
+          needsClarification: false,
+          reasoningPolicyHint: { complexity: 'medium', risk: 'medium', contextNeed: 'task' },
+          executionScope: 'mutating',
+          inspectionTarget: 'workspace',
+          standaloneSystemOperation: false
+        }
+      }
     );
 
     t.equal(finalized.length, 1, 'the durable task receives one end-of-pass transition');
@@ -1427,6 +1988,100 @@ test('healthy durable direct task checkpoints and automatically continues when a
     t.notOk(/ask me to continue/i.test(answer), 'the user is not asked to babysit a healthy durable task');
     t.equal(finalizedRuns.length, 1, 'the renderer receives one end-of-pass lifecycle update');
     t.equal(finalizedRuns[0].details.automaticContinuation, true, 'the UI is told the same task is continuing');
+  } finally {
+    process.env.NODE_ENV = originalNodeEnv;
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('productive pre-approval planning checkpoints continue automatically under the same durable task', async t => {
+  const originalFetch = global.fetch;
+  const originalNodeEnv = process.env.NODE_ENV;
+  const finalized = [];
+  const turns = Array.from({ length: 50 }, (_, index) => ([{
+    functionCall: {
+      name: 'read_file',
+      args: {
+        path: `systems/planning-surface-${index}.py`,
+        startLine: 1,
+        endLine: 40
+      }
+    }
+  }]));
+  installHarness(turns, {
+    supervisorResponse: '',
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE',
+    semanticClassification: {
+      intent: 'new_task',
+      requiresExecution: true,
+      target: 'current_conversation',
+      resolvedRequest: 'Trace the retirement lifecycle, prepare the implementation plan, and verify every affected surface.',
+      contextDependent: false,
+      reasoningPolicyHint: { complexity: 'high', risk: 'high', contextNeed: 'project' },
+      taskResolution: { title: 'Plan the GRITLIFE retirement lifecycle fix', requirements: [], constraints: [], unresolvedDecisions: [] },
+      executionScope: 'mutating',
+      inspectionTarget: 'project'
+    },
+    api: {
+      readFile: async (_workspace, relativePath) => String(relativePath || '').includes('.orion/')
+        ? ''
+        : 'def relevant_surface():\\n    return True\\n',
+      writeFile: async () => ({ success: true })
+    },
+    window: {
+      getAppConfig: () => ({
+        planningMode: true,
+        geminiApiKey: 'test-key',
+        modelCallDelayMs: 0,
+        autoTest: false
+      }),
+      claimOrchestrationTask: async taskId => ({
+        success: true,
+        task: {
+          taskId,
+          status: 'active',
+          title: 'Plan the GRITLIFE retirement lifecycle fix',
+          execution: { executionId: 'exec-planning-boundary' }
+        },
+        prompt: 'Trace the retirement lifecycle, prepare the implementation plan, and verify every affected surface.'
+      }),
+      finalizeOrchestrationTask: async (taskId, status, details) => {
+        finalized.push({ taskId, status, details });
+        return { taskId, status };
+      },
+      onOrchestrationTaskFinalized: async () => {}
+    }
+  });
+  global.window.promptQueue = [];
+  global.setTimeout = (fn, delay, ...args) => {
+    if (delay === 100 || delay === 500) return null;
+    return nativeSetTimeout(fn, delay, ...args);
+  };
+  const conv = conversation('planning-boundary-rollover', {
+    mode: 'coder',
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE',
+    planApproved: false,
+    awaitingPlanApproval: false
+  });
+  try {
+    process.env.NODE_ENV = 'production';
+    await global.window.runAgentLoop(
+      'Trace the retirement lifecycle and prepare the implementation plan.',
+      'gemini-1',
+      conv,
+      { taskId: 'task-planning-boundary' }
+    );
+
+    t.equal(finalized.length, 1, 'the planning pass records one canonical boundary transition');
+    t.equal(finalized[0].status, 'pending', 'unfinished planning remains pending rather than falsely completing');
+    t.equal(finalized[0].details.resumePolicy, 'automatic', 'pre-approval analysis records an automatic durable resume policy');
+    t.match(finalized[0].details.continuation.input, /ORION INTERNAL CONTINUATION/, 'the next-pass directive is persisted with the task');
+    t.equal(global.window.promptQueue.length, 1, 'the next planning pass is queued without user babysitting');
+    t.equal(global.window.promptQueue[0].taskId, 'task-planning-boundary', 'automatic planning keeps the original task ID');
+    const answer = conv.messages.find(message => message.role === 'assistant').text;
+    t.match(answer, /continuing the same task automatically/i, 'the transcript reports a checkpoint rather than a pause');
+    t.notOk(/ask me to continue/i.test(answer), 'productive planning never asks the user to restart it manually');
   } finally {
     process.env.NODE_ENV = originalNodeEnv;
     restoreGlobals(originalFetch);
@@ -1531,7 +2186,22 @@ test('Coder loop lets verified test-tool evidence supersede an earlier reported 
     await global.window.runAgentLoop(
       'The user reports that all tests passed. Verify that result yourself.',
       'gemini-1',
-      conv
+      conv,
+      {
+        semanticIntent: {
+          intent: 'new_task',
+          requiresExecution: true,
+          target: 'current_conversation',
+          resolvedRequest: 'Run the project test suite and report the independently verified result.',
+          contextDependent: false,
+          confidence: 1,
+          needsClarification: false,
+          reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'project' },
+          executionScope: 'read_only',
+          inspectionTarget: 'project',
+          standaloneSystemOperation: false
+        }
+      }
     );
     const assistantMessage = conv.messages.find(message => message.role === 'assistant');
     const answer = assistantMessage.text;
@@ -1575,7 +2245,21 @@ test('Dispatch loop cancels its owned Coder task through the canonical task tool
     lastOwnedTaskId: 'task-owned-1'
   });
   try {
-    await global.window.runAgentLoop('Cancel the Coder task I launched.', 'gemini-1', conv);
+    await global.window.runAgentLoop('Cancel the Coder task I launched.', 'gemini-1', conv, {
+      semanticIntent: {
+        intent: 'cancel_active_task',
+        requiresExecution: true,
+        target: 'active_owned_task',
+        resolvedRequest: 'Cancel task task-owned-1.',
+        contextDependent: true,
+        confidence: 1,
+        needsClarification: false,
+        reasoningPolicyHint: { complexity: 'low', risk: 'medium', contextNeed: 'task' },
+        executionScope: 'mutating',
+        inspectionTarget: 'none',
+        standaloneSystemOperation: false
+      }
+    });
     t.equal(cancellations.length, 1, 'the canonical cancellation path is called once');
     t.equal(cancellations[0].requesterConversationId, conv.id, 'authority is scoped to the owning Dispatch conversation');
     t.match(conv.messages.find(message => message.role === 'assistant').text, /cancelled/i, 'the final response uses the explicit cancelled state');
@@ -1590,7 +2274,16 @@ test('Dispatch loop resolves a named project from the Projects search root befor
   const gritlifePath = 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE';
   installHarness([
     [{ text: `GRITLIFE is attached to the exact project workspace ${gritlifePath}.` }]
-  ], { projects: [gritlifePath] });
+  ], {
+    projects: [gritlifePath],
+    semanticClassification: {
+      intent: 'status_check',
+      target: 'current_conversation',
+      resolvedRequest: 'Resolve the GRITLIFE workspace and report the selected path.',
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'project' },
+      inspectionTarget: 'project'
+    }
+  });
   const conv = conversation('workspace-resolution');
   try {
     await global.window.runAgentLoop('Open the GRITLIFE project context and tell me what workspace you selected.', 'gemini-1', conv);

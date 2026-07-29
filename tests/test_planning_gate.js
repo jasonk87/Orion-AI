@@ -1,45 +1,95 @@
 const test = require('tape');
 global.window = {};
 
+function semanticClassifierResponse({
+  intent = 'new_task',
+  target = 'current_conversation',
+  requiresExecution = true,
+  resolvedRequest = '',
+  contextDependent = false,
+  complexity = 'high',
+  risk = 'high',
+  contextNeed = 'project',
+  executionScope = 'mutating',
+  inspectionTarget = 'workspace',
+  standaloneSystemOperation = false,
+  clarificationQuestion = ''
+} = {}) {
+  return {
+    ok: true,
+    json: async () => ({
+      candidates: [{
+        content: {
+          parts: [{
+            text: JSON.stringify({
+              intent,
+              target,
+              requiresExecution,
+              resolvedRequest,
+              contextDependent,
+              confidence: 1,
+              needsClarification: intent === 'clarification_required',
+              clarificationQuestion,
+              reasoningPolicyHint: { complexity, risk, contextNeed },
+              taskResolution: { title: '', requirements: [], constraints: [], unresolvedDecisions: [] },
+              executionScope,
+              inspectionTarget,
+              standaloneSystemOperation
+            })
+          }]
+        }
+      }]
+    })
+  };
+}
+
 // Mock fetch globally
 global.fetch = async (url, options) => {
   const body = JSON.parse(options.body);
   const text = body.contents[0].parts[0].text;
 
-  if (text.includes("Classify the user's latest message about a pending implementation plan")) {
-    if (text.includes('"good to go"')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"intent":"approve","reason":""}' }] } }] }) };
+  if (text.includes('Classify the current user turn. Return JSON only.')) {
+    let intent = 'new_task';
+    let target = 'current_conversation';
+    let requiresExecution = true;
+    let executionScope = 'mutating';
+    let inspectionTarget = 'workspace';
+    let complexity = 'high';
+    let risk = 'high';
+    if (text.includes('"userMessage": "good to go"')) {
+      intent = 'approve_plan'; target = 'pending_plan';
+    } else if (text.includes('"userMessage": "stop"')) {
+      intent = 'deny_plan'; target = 'pending_plan';
+    } else if (text.includes('"userMessage": "no wait"')) {
+      intent = 'revise_plan'; target = 'pending_plan';
+    } else if (text.includes('"userMessage": "what"')) {
+      intent = 'clarification_required'; requiresExecution = false; executionScope = 'none'; complexity = 'low'; risk = 'low';
+    } else if (text.includes('"userMessage": "you never answered"')) {
+      intent = 'conversation'; requiresExecution = false; executionScope = 'none'; complexity = 'low'; risk = 'low';
+    } else if (text.includes('"userMessage": "explain"')) {
+      intent = 'conversation'; requiresExecution = false; executionScope = 'none'; complexity = 'low'; risk = 'low';
+    } else if (text.includes('run tests')) {
+      executionScope = 'read_only'; inspectionTarget = 'project'; complexity = 'low'; risk = 'low';
+    } else if (text.includes('python environments')) {
+      executionScope = 'read_only'; inspectionTarget = 'local_system'; complexity = 'low'; risk = 'low';
+    } else if (text.includes('rocket sumo')) {
+      executionScope = 'read_only'; inspectionTarget = 'project'; complexity = 'medium'; risk = 'low';
+    } else if (text.includes('find any bugs')) {
+      executionScope = 'read_only'; inspectionTarget = 'project'; complexity = 'medium'; risk = 'medium';
     }
-    if (text.includes('"no wait"')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"intent":"revise","reason":""}' }] } }] }) };
-    }
-    if (text.includes('"what"')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"intent":"unclear","reason":""}' }] } }] }) };
-    }
-    if (text.includes('"you never answered"')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"intent":"other","reason":"Separate follow-up question, not a plan verdict."}' }] } }] }) };
-    }
-    return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"intent":"deny","reason":""}' }] } }] }) };
-  }
-
-  if (text.includes("Classify whether this Orion AI request should require an implementation plan")) {
-    const userMessage = text.slice(text.lastIndexOf('User message:') + 'User message:'.length).trim();
-    if (userMessage === '"run tests"') {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":""}' }] } }] }) };
-    }
-    if (userMessage === '"what all python environments do i have installed on this computer"') {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"Read-only local environment inventory."}' }] } }] }) };
-    }
-    if (userMessage === '"I have a folder on my desktop called rocket sumo, recommend similar games and improvements"') {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"Read existing local project before recommending."}' }] } }] }) };
-    }
-    if (userMessage === '"look through my program and find any bugs"') {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reviewOnly":true,"reason":"Read-only code review."}' }] } }] }) };
-    }
-    if (userMessage === '"explain"') {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"answer","reason":""}' }] } }] }) };
-    }
-    return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"plan","reason":""}' }] } }] }) };
+    return semanticClassifierResponse({
+      intent,
+      target,
+      requiresExecution,
+      contextDependent: ['approve_plan', 'deny_plan', 'revise_plan'].includes(intent),
+      complexity,
+      risk,
+      contextNeed: inspectionTarget === 'project' ? 'project' : 'none',
+      executionScope,
+      inspectionTarget,
+      standaloneSystemOperation: inspectionTarget === 'local_system',
+      clarificationQuestion: intent === 'clarification_required' ? 'What should I do with the pending plan?' : ''
+    });
   }
 
   return { ok: false };
@@ -92,23 +142,55 @@ test('classifyPlanApprovalIntent returns correct intents', async (t) => {
 });
 
 test('classifyPlanningNeed returns correct modes', async (t) => {
-  const directRes = await agent.classifyPlanningNeed('run tests', 'gemini-1', { geminiApiKey: 'key' });
+  const semantic = (overrides = {}) => ({
+    intent: 'new_task',
+    requiresExecution: true,
+    executionScope: 'mutating',
+    inspectionTarget: 'workspace',
+    reasoningPolicyHint: { complexity: 'medium', risk: 'medium', contextNeed: 'task' },
+    ...overrides
+  });
+  const directRes = await agent.classifyPlanningNeed('run tests', 'gemini-1', { geminiApiKey: 'key' }, [], semantic({
+    executionScope: 'read_only',
+    inspectionTarget: 'project',
+    reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'project' }
+  }));
   t.equal(directRes.mode, 'direct', 'Recognizes direct mode');
 
-  const envRes = await agent.classifyPlanningNeed('what all python environments do i have installed on this computer', 'gemini-1', { geminiApiKey: 'key' });
+  const envRes = await agent.classifyPlanningNeed('what all python environments do i have installed on this computer', 'gemini-1', { geminiApiKey: 'key' }, [], semantic({
+    executionScope: 'read_only',
+    inspectionTarget: 'local_system',
+    reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'none' }
+  }));
   t.equal(envRes.mode, 'direct', 'Recognizes local Python environment inventory as direct mode');
 
-  const localProjectAdviceRes = await agent.classifyPlanningNeed('I have a folder on my desktop called rocket sumo, recommend similar games and improvements', 'gemini-1', { geminiApiKey: 'key' });
+  const localProjectAdviceRes = await agent.classifyPlanningNeed('I have a folder on my desktop called rocket sumo, recommend similar games and improvements', 'gemini-1', { geminiApiKey: 'key' }, [], semantic({
+    executionScope: 'read_only',
+    inspectionTarget: 'project',
+    reasoningPolicyHint: { complexity: 'medium', risk: 'low', contextNeed: 'project' }
+  }));
   t.equal(localProjectAdviceRes.mode, 'direct', 'Recognizes local project recommendation as direct inspection mode');
 
-  const planRes = await agent.classifyPlanningNeed('build a whole app', 'gemini-1', { geminiApiKey: 'key' });
+  const planRes = await agent.classifyPlanningNeed('build a whole app', 'gemini-1', { geminiApiKey: 'key' }, [], semantic({
+    reasoningPolicyHint: { complexity: 'high', risk: 'high', contextNeed: 'project' }
+  }));
   t.equal(planRes.mode, 'plan', 'Recognizes plan mode');
 
-  const reviewRes = await agent.classifyPlanningNeed('look through my program and find any bugs', 'gemini-1', { geminiApiKey: 'key' });
+  const reviewRes = await agent.classifyPlanningNeed('look through my program and find any bugs', 'gemini-1', { geminiApiKey: 'key' }, [], semantic({
+    executionScope: 'read_only',
+    inspectionTarget: 'project',
+    reasoningPolicyHint: { complexity: 'medium', risk: 'medium', contextNeed: 'project' }
+  }));
   t.equal(reviewRes.mode, 'direct', 'Recognizes read-only bug hunts as direct mode');
   t.equal(reviewRes.reviewOnly, true, 'Carries review-only flag for bug hunts');
 
-  const answerRes = await agent.classifyPlanningNeed('explain', 'gemini-1', { geminiApiKey: 'key' });
+  const answerRes = await agent.classifyPlanningNeed('explain', 'gemini-1', { geminiApiKey: 'key' }, [], semantic({
+    intent: 'conversation',
+    requiresExecution: false,
+    executionScope: 'none',
+    inspectionTarget: 'none',
+    reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'none' }
+  }));
   t.equal(answerRes.mode, 'answer', 'Recognizes answer mode');
 
   t.end();
@@ -404,6 +486,14 @@ test('invalid plan does not present approval UI and requests internal revision',
   const originalFetch = global.fetch;
   let fetchCallCount = 0;
   global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const serialized = JSON.stringify(body);
+    if (serialized.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({ complexity: 'high', risk: 'high' });
+    }
+    if (String(url).includes(':countTokens')) {
+      return { ok: true, json: async () => ({ totalTokens: 100 }) };
+    }
     fetchCallCount++;
     if (fetchCallCount === 1) {
       // First call: The model writes an invalid plan
@@ -517,6 +607,9 @@ test('invalid plan twice eventually yields to the user to prevent infinite loop'
       if (filePath === 'STRATEGY.md') {
         return validStrategy();
       }
+      if (String(filePath || '').startsWith('.orion/context/')) {
+        return '';
+      }
       return '# Plan\n\n## Implementation\n\nStill invalid plan.';
     },
     writeFile: async () => ({ success: true }),
@@ -535,6 +628,14 @@ test('invalid plan twice eventually yields to the user to prevent infinite loop'
   const originalFetch = global.fetch;
   let fetchCallCount = 0;
   global.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const serialized = JSON.stringify(body);
+    if (serialized.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({ complexity: 'high', risk: 'high' });
+    }
+    if (String(url).includes(':countTokens')) {
+      return { ok: true, json: async () => ({ totalTokens: 100 }) };
+    }
     fetchCallCount++;
     return {
       ok: true,
@@ -567,7 +668,7 @@ test('invalid plan twice eventually yields to the user to prevent infinite loop'
     // It should yield to the user after 1 retry (so total 2 attempts to write plan)
     t.equal(conversation.awaitingPlanApproval, true, 'loop yields and sets awaitingPlanApproval to true');
     t.equal(conversation.planApproved, false, 'plan is marked as NOT approved');
-    t.equal(fetchCallCount, 5, 'agent only tried 3 times in loop before yielding');
+    t.equal(fetchCallCount, 3, 'agent only tried 3 model turns before yielding');
   } finally {
     // Restore mocks
     global.window.runAgentLoop = originalRunAgentLoop;
@@ -617,9 +718,10 @@ test('repeated tool failures during execution do not re-trigger plan approval UI
     const body = JSON.parse(options.body);
     const text = (body.contents || [])[0]?.parts?.[0]?.text || '';
 
-    // Routing classifier: classify as 'direct' so the planApproved branch continues execution
-    if (text.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    // The shared semantic classifier resolves the approved continuation once; planning derives
+    // from this same structured result instead of making a second language-routing call.
+    if (text.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({ intent: 'context_followup', contextDependent: true, complexity: 'medium', risk: 'medium', contextNeed: 'task' });
     }
 
     // All model calls during execution: try to run a command (which will always fail via the mock)
@@ -699,8 +801,8 @@ test('edit-blocked guard reminds the model to retry the edit after it re-reads t
     // call before the actual model turn; neither may consume a slot in the turnCount sequence
     // below, or every branch shifts and the intended read/modify/modify/modify(blocked)/read_file
     // sequence never actually happens.
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({ intent: 'context_followup', contextDependent: true, complexity: 'medium', risk: 'medium', contextNeed: 'task' });
     }
     if (String(url).includes(':countTokens')) {
       return { ok: true, json: async () => ({ totalTokens: 100 }) };
@@ -779,8 +881,8 @@ test('a blind first edit to an unread file is blocked until the model reads it',
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({ complexity: 'medium', risk: 'medium' });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -842,8 +944,8 @@ test('a full re-read of an unchanged already-read file is flagged as redundant, 
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({ complexity: 'medium', risk: 'medium' });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -913,8 +1015,11 @@ test('thought parts do not leak into the visible answer text', async (t) => {
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"answer","reason":"question"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({
+        intent: 'conversation', target: 'none', requiresExecution: false,
+        complexity: 'low', risk: 'low', contextNeed: 'none', executionScope: 'none', inspectionTarget: 'none'
+      });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -987,8 +1092,8 @@ test('direct-mode edits without any mission state still require verification evi
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({ complexity: 'medium', risk: 'medium' });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -1345,8 +1450,11 @@ test('launching an app and declaring success without checking is caught, exactly
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"launching a program"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({
+        complexity: 'low', risk: 'low', contextNeed: 'none',
+        executionScope: 'read_only', inspectionTarget: 'local_system', standaloneSystemOperation: true
+      });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -1444,8 +1552,8 @@ test('a second consecutive MALFORMED_FUNCTION_CALL gets escalated guidance inste
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({ complexity: 'medium', risk: 'medium' });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -1499,8 +1607,8 @@ test('three consecutive syntax-error-introducing patches to the same file trigge
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({ complexity: 'medium', risk: 'medium' });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -1542,17 +1650,8 @@ test('three consecutive syntax-error-introducing patches to the same file trigge
 // unrequested edits to server.js after the launch failed on a pre-existing bug — the user asked
 // for a low-risk, read-only action and got repeated, destructive-feeling source changes with no
 // check-in at all.
-test('looksLikeLaunchOnlyRequest and hasFailedLaunchAttemptThisRun identify the exact scope-creep scenario', (t) => {
-  t.equal(agent.looksLikeLaunchOnlyRequest('can you launch this program?'), true, 'a plain launch request has no edit language');
-  t.equal(agent.looksLikeLaunchOnlyRequest('can you run it'), true, 'a plain run request has no edit language');
-  t.equal(agent.looksLikeLaunchOnlyRequest('can you fix the bug and launch it'), false, 'edit language in the same request removes the restriction');
-  t.equal(agent.looksLikeLaunchOnlyRequest('yes, please fix it'), false, 'an explicit follow-up authorization is not treated as launch-only');
-  t.equal(agent.looksLikeLaunchOnlyRequest('what does this project do'), false, 'a request with no launch verb at all does not match');
-  t.equal(agent.looksLikeLaunchOnlyRequest(''), false, 'empty text does not match');
-  // Regression: "Upgrade ruff and run ruff check on the project" was misclassified as
-  // launch-only, blocking harmless scratch-file writes the tooling task needed.
-  t.equal(agent.looksLikeLaunchOnlyRequest('upgrade ruff and run ruff check on the project root'), false, 'package/tooling work (upgrade + run) is not a launch-only request');
-  t.equal(agent.looksLikeLaunchOnlyRequest('install the dependencies and run the linter'), false, 'install + run is not a launch-only request');
+test('launch scope comes from structured intent while failed-launch detection stays mechanical', (t) => {
+  t.equal(agent.looksLikeLaunchOnlyRequest, undefined, 'ordinary-English launch scope is no longer inferred by a phrase helper');
 
   const failedLaunch = [{ toolName: 'launch_workspace_app', status: 'error' }];
   t.equal(agent.hasFailedLaunchAttemptThisRun(failedLaunch), true, 'a failed launch_workspace_app is detected');
@@ -1593,8 +1692,11 @@ test('a plain launch request is blocked from silently editing source files after
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"launching a program"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({
+        complexity: 'low', risk: 'low', contextNeed: 'none',
+        executionScope: 'read_only', inspectionTarget: 'local_system', standaloneSystemOperation: true
+      });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -1677,8 +1779,8 @@ test('repeated edit failures escalate to a stronger model, then revert once the 
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({ complexity: 'medium', risk: 'medium' });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -1758,8 +1860,8 @@ test('a real detected regression stops the run with a specific message, not a ge
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({ complexity: 'medium', risk: 'medium' });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -1816,13 +1918,14 @@ test('a real detected regression stops the run with a specific message, not a ge
 // workspace, or this correction" — but gave it nothing concrete to redirect toward, so the model
 // just paraphrased the correction back instead of answering: "My previous response... did not
 // require workspace interaction or an implementation plan. I am ready for your next instruction."
-// looksLikeLeakedNoToolCorrection() detects this specific failure mode so a stronger retry can fire.
-test('looksLikeLeakedNoToolCorrection detects a model describing its own internal correction instead of answering', (t) => {
+// Natural-language output is not semantically reclassified by regex. Only the exact internal
+// sentinel remains a deterministic machine protocol value.
+test('no-tool correction handling recognizes only the exact machine sentinel', (t) => {
   const leaked = 'Understood. My previous response was a discussion about game features and did not require workspace interaction or an implementation plan. I am ready for your next instruction.';
   const answerAboveLeak = 'My answer above is already a complete non-workspace answer — I gave you the full architectural design and build-starting roadmap. It is your move from here.';
-  t.equal(agent.looksLikeLeakedNoToolCorrection(leaked), true, 'the exact leaked phrasing from the transcript is detected');
-  t.equal(agent.looksLikeLeakedNoToolCorrection(answerAboveLeak), true, 'a final gate answer that points at an answer above is detected');
-  t.equal(agent.answerHasActionableFinalContent(answerAboveLeak), false, 'meta references to an answer above are not accepted as substantive final content');
+  t.equal(agent.looksLikeLeakedNoToolCorrection(leaked), false, 'ordinary prose is not classified by phrase matching');
+  t.equal(agent.looksLikeLeakedNoToolCorrection(answerAboveLeak), false, 'answer prose is not semantically reclassified by a regex fallback');
+  t.equal(agent.looksLikeLeakedNoToolCorrection('NO_ADDITIONAL_ACTION'), true, 'the exact internal protocol sentinel is recognized');
   t.equal(
     agent.looksLikeLeakedNoToolCorrection("Sure! Let's dig into Assetto Corsa's tire model and how that could inspire Apex Velocity's pit-stop mechanic."),
     false,
@@ -1832,7 +1935,7 @@ test('looksLikeLeakedNoToolCorrection detects a model describing its own interna
   t.end();
 });
 
-test('a leaked no-tool-use correction triggers a stronger retry instead of being accepted as the final answer', async (t) => {
+test('the exact no-tool-use sentinel triggers a retry instead of being accepted as the final answer', async (t) => {
   const originalRunAgentLoop = global.window.runAgentLoop;
   const originalSetTimeout = global.setTimeout;
   const originalFetch = global.fetch;
@@ -1852,15 +1955,18 @@ test('a leaked no-tool-use correction triggers a stronger retry instead of being
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"conversational follow-up"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({
+        intent: 'conversation', target: 'none', requiresExecution: false,
+        complexity: 'low', risk: 'low', contextNeed: 'recent', executionScope: 'none', inspectionTarget: 'none'
+      });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
     turnCount++;
     const textReply = (text) => ({ ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text }] } }] }) });
     if (turnCount === 1) return textReply(''); // empty first reply triggers the no-tool-use correction
-    if (turnCount === 2) return textReply('Understood. My previous response was a discussion about game features and did not require workspace interaction or an implementation plan. I am ready for your next instruction.');
+    if (turnCount === 2) return textReply('NO_ADDITIONAL_ACTION');
     return textReply("Sure — Assetto Corsa's tire wear model could work great for a pit-strategy mechanic in Apex Velocity.");
   };
 
@@ -1870,9 +1976,8 @@ test('a leaked no-tool-use correction triggers a stronger retry instead of being
 
     const aiMessage = conversation.messages.find(m => m.role === 'assistant');
     t.ok(aiMessage, 'assistant message was created');
-    t.ok(turnCount >= 3, 'the loop made at least three real model calls instead of accepting the leaked correction on the second');
-    t.notOk(/did not require workspace interaction|ready for your next instruction/i.test(aiMessage.text),
-      'the leaked correction text is not what gets shown to the user as the final answer');
+    t.ok(turnCount >= 3, 'the loop made at least three real model calls instead of accepting the internal sentinel');
+    t.notEqual(aiMessage.text, 'NO_ADDITIONAL_ACTION', 'the machine sentinel is not shown as the final answer');
     t.ok(aiMessage.text.includes('Assetto Corsa'), 'the eventual real, on-topic answer is what gets shown');
   } finally {
     global.window.runAgentLoop = originalRunAgentLoop;
@@ -1907,8 +2012,11 @@ test('planning mode accepts a complete direct answer instead of forcing an answe
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"plan","reason":"Could become a build, but a design answer is allowed."}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({
+        intent: 'conversation', target: 'none', requiresExecution: false,
+        complexity: 'medium', risk: 'low', contextNeed: 'none', executionScope: 'none', inspectionTarget: 'none'
+      });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -2032,8 +2140,8 @@ test('editing a different file while an earlier one has an unresolved syntax err
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"continuing approved execution"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({ complexity: 'medium', risk: 'medium' });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -2089,7 +2197,7 @@ test('stall detection treats successful edits and newly acquired evidence as pro
   const agentSource = require('fs').readFileSync(require('path').join(__dirname, '../agent.js'), 'utf8');
   t.ok(agentSource.includes('hadSuccessfulFileMutationThisPass'), 'stall detection tracks successful source mutations');
   t.ok(agentSource.includes('hadNewEvidenceThisPass'), 'stall detection tracks new bounded tool evidence across passes');
-  t.ok(agentSource.includes('progressScore > conversation._lastProgressScore || hadSuccessfulFileMutationThisPass || hadNewEvidenceThisPass'),
+  t.ok(agentSource.includes('advancedGoalProgress || hadSuccessfulFileMutationThisPass || hadNewEvidenceThisPass'),
     'checklist progress, real edits, or new evidence can reset stall tracking');
   t.end();
 });
@@ -2162,8 +2270,11 @@ test('fresh-task mission reset follows change_workspace to wherever the turn act
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"read-only inspection"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({
+        requiresExecution: true, complexity: 'medium', risk: 'medium',
+        executionScope: 'read_only', inspectionTarget: 'project', contextNeed: 'project'
+      });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -2293,6 +2404,7 @@ test('a task classified as deep complexity proactively upgrades the model from t
   global.window.saveConversationsToStorage = () => {};
   global.window.api = {
     readFile: async () => '',
+    writeFile: async () => ({ success: true }),
     listFiles: async () => ([]),
     getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null }),
   };
@@ -2304,8 +2416,8 @@ test('a task classified as deep complexity proactively upgrades the model from t
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","taskComplexity":"deep","reason":"large multi-file task"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({ complexity: 'high', risk: 'high' });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -2350,8 +2462,11 @@ test('a task classified as light complexity never downgrades below the user\'s e
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"answer","taskComplexity":"light","reason":"quick lookup"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({
+        intent: 'conversation', target: 'none', requiresExecution: false,
+        complexity: 'low', risk: 'low', contextNeed: 'none', executionScope: 'none', inspectionTarget: 'none'
+      });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -2410,11 +2525,8 @@ test('a proactive deep-task model upgrade survives into the plan-approval/execut
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes("Classify whether this Orion AI request should require an implementation plan")) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"plan","taskComplexity":"deep","reason":"large multi-file rework"}' }] } }] }) };
-    }
-    if (lastText.includes("Classify the user's latest message about a pending implementation plan")) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"intent":"approve","reason":""}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({ complexity: 'high', risk: 'high' });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -2439,8 +2551,12 @@ test('a proactive deep-task model upgrade survives into the plan-approval/execut
       const body = JSON.parse(options.body);
       const contents = body.contents || [];
       const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-      if (lastText.includes("Classify the user's latest message about a pending implementation plan")) {
-        return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"intent":"approve","reason":""}' }] } }] }) };
+      if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+        return semanticClassifierResponse({
+          intent: 'approve_plan', target: 'pending_plan', requiresExecution: false,
+          contextDependent: true, complexity: 'low', risk: 'low', contextNeed: 'task',
+          executionScope: 'none', inspectionTarget: 'none'
+        });
       }
       if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -2506,17 +2622,22 @@ test('trimAgedToolResultsFromMessages is a no-op for short conversations and ret
   t.end();
 });
 
-// The utility/classifier call sites (classifyPlanApprovalIntent, classifyPlanningNeed, countTokens,
-// compactHistory) must actually use the resolved cheap model, not the raw modelName.
-test('utility/classifier call sites are wrapped with resolveUtilityModelName instead of using the raw modelName', (t) => {
+// The one shared semantic classifier uses the utility model. Planning is derived from its
+// structured result and must not make a second classifier call with duplicate context.
+test('semantic routing uses the utility model once and planning derives from its result', (t) => {
   const fs = require('fs');
   const path = require('path');
   const agentSource = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
 
-  t.ok(agentSource.includes('classifyPlanApprovalIntent(userPrompt, resolveUtilityModelName(modelName), config)'),
-    'classifyPlanApprovalIntent call site uses the resolved cheap model');
-  const planningNeedMatches = agentSource.match(/classifyPlanningNeed\(userPrompt, resolveUtilityModelName\(modelName\), config(?:, conversation\.messages)?\)/g) || [];
-  t.ok(planningNeedMatches.length >= 3, 'all classifyPlanningNeed call sites use the resolved cheap model');
+  t.ok(agentSource.includes('const utilityModel = resolveUtilityModelName(modelName);'),
+    'the shared semantic classifier resolves the cheap utility model');
+  t.ok(agentSource.includes('callUtilityModel(request.prompt, utilityModel, config, true'),
+    'the shared classifier calls that resolved model');
+  const planningStart = agentSource.indexOf('async function classifyPlanningNeed(');
+  const planningEnd = agentSource.indexOf('\nfunction parseKeyValueOutput', planningStart);
+  const planningSource = agentSource.slice(planningStart, planningEnd);
+  t.notOk(planningSource.includes('callUtilityModel('),
+    'planning policy does not perform a duplicate language-classification call');
   t.ok(agentSource.includes('countTokens(messages, resolveUtilityModelName(modelName), config'),
     'countTokens call site uses the resolved cheap model');
   t.ok(agentSource.includes('compactHistory(messages, resolveUtilityModelName(modelName), config)'),
@@ -2656,8 +2777,11 @@ test('a blank final response after real tool work is nudged to produce an actual
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"answer","reason":"read-only investigation"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({
+        requiresExecution: true, complexity: 'medium', risk: 'low',
+        contextNeed: 'project', executionScope: 'read_only', inspectionTarget: 'project'
+      });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
     if (/no text and no tool call/i.test(lastText)) sawBlankRecoveryNudge = true;
@@ -2709,6 +2833,7 @@ test('Dispatch preflights a kill/restart request into one Coder handoff without 
   global.window.api = {
     listFiles: async () => ([]),
     readFile: async () => '',
+    writeFile: async () => ({ success: true }),
     getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null })
   };
 
@@ -2733,8 +2858,11 @@ test('Dispatch preflights a kill/restart request into one Coder handoff without 
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"local process operation"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({
+        resolvedRequest: request, complexity: 'medium', risk: 'high', contextNeed: 'none',
+        executionScope: 'mutating', inspectionTarget: 'local_system', standaloneSystemOperation: true
+      });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
@@ -2800,8 +2928,11 @@ test('the running-indicator placeholder is rendered immediately at the start of 
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"answer","reason":"plain question"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({
+        intent: 'conversation', target: 'none', requiresExecution: false,
+        complexity: 'low', risk: 'low', contextNeed: 'none', executionScope: 'none', inspectionTarget: 'none'
+      });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
     // A plain conversational answer — no tool calls at all — is exactly the case where nothing
@@ -2857,8 +2988,8 @@ test('a run that exhausts its per-turn ceiling while thrashing on tool calls get
     const body = JSON.parse(options.body);
     const contents = body.contents || [];
     const lastText = contents[contents.length - 1]?.parts?.[0]?.text || '';
-    if (lastText.includes('Classify whether this Orion AI request should require an implementation plan')) {
-      return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"mode":"direct","reason":"writing a file"}' }] } }] }) };
+    if (lastText.includes('Classify the current user turn. Return JSON only.')) {
+      return semanticClassifierResponse({ complexity: 'medium', risk: 'medium' });
     }
     if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
 
