@@ -221,6 +221,20 @@ test('Dispatch supervisor escalates stalls, previews Coder state, and continues 
   t.end();
 });
 
+test('desktop Coder status banner is compact and aligned with the conversation controls', (t) => {
+  const cardStart = styles.indexOf('.coder-task-status-card {');
+  const cardEnd = styles.indexOf('\n}', cardStart);
+  const cardRule = styles.slice(cardStart, cardEnd);
+  t.ok(cardStart >= 0, 'desktop status card has a dedicated style rule');
+  t.ok(cardRule.includes('width: min(850px, calc(100% - 48px));'), 'desktop banner is capped to the composer width');
+  t.ok(cardRule.includes('margin: 0 auto;'), 'desktop banner is centered instead of spanning the viewport');
+  t.ok(
+    styles.includes('.coder-task-status-card { width: calc(100% - 24px); }'),
+    'narrow screens retain a usable edge-to-edge status treatment'
+  );
+  t.end();
+});
+
 test('Dispatch opens as a focused front door without project-driven clutter', (t) => {
   t.ok(companionHtml.includes("let companionMode = 'orion'"), 'each fresh phone launch starts at Dispatch');
   t.ok(companionHtml.includes('function enterDispatch'), 'phone has one explicit chat-first Dispatch entry path');

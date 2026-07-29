@@ -247,7 +247,24 @@
         ? `[STRUCTURED STATUS FACTS]\n${JSON.stringify(statuses)}\nPreserve these exact states; mergeable is not merged, queued is not running, cancelled is not completed, and reported/mock results are not independently verified.`
         : ''
     ].filter(Boolean).join('\n\n');
-    const rawReply = await dependencies.generateReply(systemPrompt, input.messages || []);
+    const generationMessages = Array.isArray(input.messages)
+      ? input.messages.map(message => ({ ...message }))
+      : [];
+    const lastGenerationMessage = generationMessages[generationMessages.length - 1];
+    const lastGenerationText = String(
+      lastGenerationMessage && (lastGenerationMessage.content || lastGenerationMessage.text) || ''
+    ).trim();
+    if (prompt.trim() && !(
+      lastGenerationMessage
+      && lastGenerationMessage.role === 'user'
+      && lastGenerationText === prompt.trim()
+    )) {
+      // Historical context is optional, but the exact active user turn is not. Keeping this
+      // requirement inside the shared contract prevents any caller from invoking the
+      // conversational model with only a system prompt.
+      generationMessages.push({ role: 'user', content: prompt });
+    }
+    const rawReply = await dependencies.generateReply(systemPrompt, generationMessages);
     let text = String(rawReply || '').trim();
     if (contracts && (recallRequested || contracts.hasExplicitRecallClaim(text))) {
       const validation = contracts.validateMemoryResponse(text, {

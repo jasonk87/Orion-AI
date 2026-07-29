@@ -160,6 +160,62 @@ test('supervised Dispatch distinguishes direct execution from quoted status mate
   t.end();
 });
 
+test('supervised conversation always sends the exact active question to the reply model', async t => {
+  const prompt = 'While we wait, how do promotions work in careers?';
+  let generationMessages = null;
+  const result = await supervisor.buildContractedConversationalReply({
+    conversation: { id: 'dispatch-live', mode: 'orion', messages: [] },
+    prompt,
+    semanticIntent: {
+      intent: 'conversation',
+      target: 'current_conversation',
+      requiresExecution: false,
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'none' }
+    },
+    systemPrompt: 'Answer the user directly.',
+    messages: []
+  }, {
+    contracts,
+    generateReply: async (_systemPrompt, messages) => {
+      generationMessages = messages;
+      return 'Promotions occur when the career path requirements and stat gates for the next position are met.';
+    }
+  });
+
+  t.equal(generationMessages.length, 1, 'a no-history conversation still has one model input message');
+  t.deepEqual(
+    generationMessages[0],
+    { role: 'user', content: prompt },
+    'the exact current phone question is the active model turn'
+  );
+  t.match(result.text, /promotions occur/i, 'the reply answers the supplied question instead of returning a readiness greeting');
+  t.end();
+});
+
+test('supervised conversation does not duplicate an already-present active question', async t => {
+  const prompt = 'How do promotions work?';
+  let generationMessages = null;
+  await supervisor.buildContractedConversationalReply({
+    conversation: { id: 'dispatch-live', mode: 'orion', messages: [] },
+    prompt,
+    systemPrompt: 'Answer the user directly.',
+    messages: [
+      { role: 'assistant', content: 'Coder is working in the background.' },
+      { role: 'user', content: prompt }
+    ]
+  }, {
+    contracts,
+    generateReply: async (_systemPrompt, messages) => {
+      generationMessages = messages;
+      return 'Promotions depend on the next role requirements.';
+    }
+  });
+
+  t.equal(generationMessages.length, 2, 'the exact trailing user turn is not appended twice');
+  t.equal(generationMessages.filter(message => message.role === 'user').length, 1, 'only one active user question reaches the model');
+  t.end();
+});
+
 test('supervised conversational recall uses retrieved evidence and records its basis', async t => {
   const evidence = [{
     id: 'conversation:gritlife:42',

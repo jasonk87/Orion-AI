@@ -2617,13 +2617,14 @@ code {
 /* NOT a chat message — shows while a Coder task is running; hidden otherwise. */
 .coder-task-status-card {
   display: none;           /* hidden by default */
+  width: min(850px, calc(100% - 48px));
   align-items: center;
   gap: 10px;
-  padding: 8px 14px;
-  margin: 0 12px 0;
+  padding: 7px 12px;
+  margin: 0 auto;
   background: rgba(16, 185, 129, 0.06);
   border: 1px solid rgba(16, 185, 129, 0.22);
-  border-radius: 8px;
+  border-radius: 10px;
   font-size: 0.76rem;
   color: var(--text-secondary);
   animation: coder-status-border-pulse 2.4s ease-in-out infinite alternate;
@@ -3514,6 +3515,7 @@ kbd {
   #btn-launch-app { display: none; }
   #conversation-header { padding-inline: 12px; }
   .messages-container { padding-inline: 16px; }
+  .coder-task-status-card { width: calc(100% - 24px); }
   .queued-prompt-footer { align-items: flex-start; }
   .queued-prompt-actions { width: 100%; justify-content: flex-end; }
   .model-select-wrapper { max-width: 150px; }
