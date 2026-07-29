@@ -5,6 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {
+  SCHEMA_VERSION,
   TASK_STATES,
   isContextDependentRequest,
   isContinuationRequest,
@@ -18,6 +19,8 @@ const {
   renderTaskPrompt,
   describeTaskStatus,
   pendingTaskNeedsRuntimeQueue,
+  findTaskSupersessions,
+  filterSupersededTasks,
   selectSupervisedTask,
   describeSupervisedTaskPresentation
 } = require('../task-orchestration');
@@ -102,6 +105,33 @@ test('task continuation detection requires a structured active-owned-task target
     contextDependent: true
   }), false, 'plan approval is not confused with task continuation');
   t.equal(isContinuationRequest('Continue'), false, 'the task contract does not infer intent from a phrase');
+  t.end();
+});
+
+test('resolved replacement packets retain deterministic predecessor provenance', t => {
+  const result = buildTaskPacket({
+    taskId: 'task_replacement',
+    originalUserMessage: 'Continue',
+    semanticIntent: {
+      intent: 'context_followup',
+      target: 'current_conversation',
+      contextDependent: true,
+      requiresExecution: true,
+      resolvedRequest: 'Finish the verified remaining work.',
+      supersedesTaskId: 'task_predecessor',
+      taskResolution: {}
+    },
+    workspace: baseTask().workspace,
+    origin: baseTask().origin,
+    target: baseTask().target
+  });
+  t.equal(result.success, true, 'the replacement packet resolves normally');
+  t.equal(result.task.supersedesTaskId, 'task_predecessor', 'the exact predecessor ID is durable');
+  t.equal(
+    normalizeTaskRecord(result.task).supersedesTaskId,
+    'task_predecessor',
+    'predecessor provenance survives normalization'
+  );
   t.end();
 });
 
@@ -445,7 +475,7 @@ test('legacy queue records migrate into the canonical packet shape', t => {
     state: 'queued',
     createdAt: 500
   });
-  t.equal(task.schemaVersion, 1, 'current schema version is applied');
+  t.equal(task.schemaVersion, SCHEMA_VERSION, 'current schema version is applied');
   t.equal(task.taskId, 'queue_legacy', 'legacy queue id becomes the task id');
   t.equal(task.objective, 'Run npm test and report the real result.', 'legacy prompt is retained');
   t.equal(task.status, TASK_STATES.PENDING, 'queued remains pending');
@@ -569,6 +599,67 @@ test('Dispatch task presentation follows one durable task from queued through pl
   t.end();
 });
 
+test('newer continuation tasks supersede exact pending predecessors without title guessing', t => {
+  const predecessor = normalizeTaskRecord(baseTask({
+    taskId: 'task_polish_original',
+    title: 'Full Polish Pass',
+    createdAt: 1000,
+    updatedAt: 1200
+  }));
+  const structuredSuccessor = normalizeTaskRecord(baseTask({
+    taskId: 'task_polish_continuation',
+    title: 'Full Polish Pass',
+    objective: 'Finish the remaining polish work.',
+    supersedesTaskId: predecessor.taskId,
+    status: 'completed',
+    createdAt: 2000,
+    updatedAt: 3000
+  }));
+  const unrelatedSameTitle = normalizeTaskRecord(baseTask({
+    taskId: 'task_polish_unrelated',
+    title: 'Full Polish Pass',
+    origin: { conversationId: 'dispatch-other', sessionId: 'dispatch-other', messageId: 'message-other' },
+    createdAt: 4000,
+    updatedAt: 4000
+  }));
+  const tasks = [predecessor, structuredSuccessor, unrelatedSameTitle];
+
+  const supersessions = findTaskSupersessions(tasks);
+  t.equal(supersessions.length, 1, 'only an exact same-owner predecessor relationship is recognized');
+  t.equal(supersessions[0].task.taskId, predecessor.taskId, 'the stale pending predecessor is identified');
+  t.equal(supersessions[0].supersedingTask.taskId, structuredSuccessor.taskId, 'the replacement task remains authoritative');
+  t.deepEqual(
+    filterSupersededTasks(tasks).map(task => task.taskId).sort(),
+    [structuredSuccessor.taskId, unrelatedSameTitle.taskId].sort(),
+    'same-title work is preserved unless exact provenance links it'
+  );
+  t.equal(
+    selectSupervisedTask(tasks, 'dispatch-1', predecessor.taskId).taskId,
+    structuredSuccessor.taskId,
+    'an obsolete preferred task ID cannot override its newer completed continuation'
+  );
+  t.end();
+});
+
+test('schema-v1 replacement objectives recover exact predecessor task IDs mechanically', t => {
+  const predecessor = normalizeTaskRecord(baseTask({
+    taskId: 'task_legacy_polish',
+    createdAt: 1000,
+    updatedAt: 1500
+  }));
+  const successor = normalizeTaskRecord(baseTask({
+    taskId: 'task_legacy_polish_resume',
+    objective: `Resume the Full Polish Pass task (${predecessor.taskId}) and finish verification.`,
+    status: 'completed',
+    createdAt: 2000,
+    updatedAt: 2500
+  }));
+  const supersessions = findTaskSupersessions([predecessor, successor]);
+  t.equal(supersessions.length, 1, 'an exact machine task ID migrates legacy continuation lineage');
+  t.equal(supersessions[0].source, 'legacy_exact_task_id', 'legacy recovery is recorded as format parsing');
+  t.end();
+});
+
 test('active tasks can yield and resume under a new execution generation', t => {
   const pending = normalizeTaskRecord(baseTask({ taskId: 'task_yield_resume' }));
   const firstRun = transitionTask(pending, TASK_STATES.ACTIVE, { timestamp: 1100 });
@@ -650,7 +741,7 @@ test('task store serializes concurrent same-timestamp writes and reloads determi
   t.equal(tasks.length, 4, 'no concurrent write overwrote another task');
   t.deepEqual(tasks.map(task => task.taskId), [...ids].sort(), 'same-time records use task ID as deterministic tie-breaker');
   const persisted = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  t.equal(persisted.schemaVersion, 1, 'store persists its schema');
+  t.equal(persisted.schemaVersion, SCHEMA_VERSION, 'store persists its schema');
   t.equal(persisted.tasks.length, 4, 'all records exist on disk');
   t.end();
 });
@@ -790,6 +881,49 @@ test('restart reconciliation fails interrupted active work without touching othe
   t.end();
 });
 
+test('restart reconciliation cancels a pending predecessor replaced by a newer completed continuation', async t => {
+  let now = 17000;
+  const { store } = makeTempStore(t, { now: () => ++now });
+  await store.create(baseTask({
+    taskId: 'task_stale_predecessor',
+    createdAt: 1000,
+    updatedAt: 1000
+  }));
+  await store.create(baseTask({
+    taskId: 'task_completed_replacement',
+    supersedesTaskId: 'task_stale_predecessor',
+    createdAt: 2000,
+    updatedAt: 2000
+  }));
+  const activeReplacement = await store.transition('task_completed_replacement', TASK_STATES.ACTIVE);
+  await store.transition('task_completed_replacement', TASK_STATES.COMPLETED, {
+    expectedExecutionId: activeReplacement.execution.executionId,
+    result: { summary: 'Verified replacement completed.' }
+  });
+
+  const reconciled = await store.reconcileInterrupted();
+  const predecessor = await store.get('task_stale_predecessor');
+  t.equal(predecessor.status, TASK_STATES.CANCELLED, 'obsolete pending work cannot survive as queued');
+  t.equal(predecessor.supersededByTaskId, 'task_completed_replacement', 'the authoritative replacement is recorded');
+  t.match(predecessor.cancellation.reason, /Superseded by continuation task/, 'the terminal reason explains reconciliation');
+  t.ok(reconciled.some(task => task.taskId === predecessor.taskId), 'the reconciliation receipt includes the changed predecessor');
+  const reloadedStore = new OrchestrationTaskStore({
+    filePath: store.filePath,
+    now: () => ++now
+  });
+  t.equal(
+    (await reloadedStore.get('task_stale_predecessor')).supersededByTaskId,
+    'task_completed_replacement',
+    'supersession provenance survives a process restart'
+  );
+  t.equal(
+    selectSupervisedTask(await reloadedStore.list(), 'dispatch-1', '').taskId,
+    'task_completed_replacement',
+    'the cancelled predecessor cannot replace the completed successor in the UI after reconciliation'
+  );
+  t.end();
+});
+
 test('legacy array store migrates and preserves deterministic records', async t => {
   const { filePath, store } = makeTempStore(t, { now: () => 20000 });
   fs.writeFileSync(filePath, JSON.stringify([
@@ -803,7 +937,7 @@ test('legacy array store migrates and preserves deterministic records', async t 
   t.deepEqual(tasks.map(task => task.status), [TASK_STATES.PENDING, TASK_STATES.ACTIVE], 'legacy statuses retain their real meaning');
   const persisted = JSON.parse(fs.readFileSync(filePath, 'utf8'));
   t.ok(!Array.isArray(persisted), 'legacy array is replaced with schema envelope');
-  t.equal(persisted.schemaVersion, 1, 'migrated store uses current schema');
+  t.equal(persisted.schemaVersion, SCHEMA_VERSION, 'migrated store uses current schema');
   t.end();
 });
 

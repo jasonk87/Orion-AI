@@ -126,6 +126,55 @@ function restoreGlobals(originalFetch) {
   global.setTimeout = nativeSetTimeout;
 }
 
+test('Dispatch keeps the immediately preceding completion in context for a conversational reaction', async t => {
+  const originalFetch = global.fetch;
+  let completionReachedModel = false;
+  installHarness([
+    body => {
+      const serialized = JSON.stringify(body);
+      completionReachedModel = serialized.includes('Full Polish Pass is complete and 534 tests pass.');
+      return [{ text: 'Absolutely — the Full Polish Pass is complete and the verified result is still in context.' }];
+    }
+  ], {
+    semanticClassification: semanticClassification({
+      intent: 'conversation',
+      contextDependent: true,
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'recent' }
+    })
+  });
+  const conv = conversation('dispatch-completion-reaction', {
+    messages: [
+      {
+        id: 'completion-message',
+        role: 'assistant',
+        source: 'supervisor-completion',
+        text: 'Full Polish Pass is complete and 534 tests pass.',
+        createdAt: 1000
+      },
+      {
+        id: 'reaction-message',
+        role: 'user',
+        source: 'phone',
+        text: 'Awesome',
+        createdAt: 1100
+      }
+    ]
+  });
+  try {
+    await global.window.runAgentLoop('Awesome', 'gemini-1', conv);
+    const finalAssistant = [...conv.messages].reverse().find(message => message.role === 'assistant');
+    t.equal(completionReachedModel, true, 'the direct completion message reaches the actual Dispatch model call');
+    t.match(finalAssistant.text, /Full Polish Pass is complete/i, 'Dispatch responds to the real preceding result');
+    t.notOk(
+      /no pending task|what are we working on/i.test(finalAssistant.text),
+      'Dispatch does not reset to a new-chat greeting'
+    );
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
 test('exact unchanged source ranges are not reread repeatedly inside one recent context window', t => {
   const ledger = agent.createContextAcquisitionLedger();
   const args = { path: 'systems/retirement.py', startLine: 139, endLine: 220 };

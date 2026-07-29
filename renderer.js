@@ -2970,6 +2970,9 @@ async function classifyCurrentConversationIntent(conv, prompt, options = {}) {
       console.warn('Could not load owned tasks for semantic classification:', error);
     }
   }
+  if (RendererTaskOrchestration && typeof RendererTaskOrchestration.filterSupersededTasks === 'function') {
+    ownedTasks = RendererTaskOrchestration.filterSupersededTasks(ownedTasks);
+  }
   const byNewest = (left, right) => Number(right.updatedAt || right.createdAt || 0) - Number(left.updatedAt || left.createdAt || 0);
   const activeOwnedTask = ownedTasks.filter(task => task && task.status === 'active').sort(byNewest)[0] || null;
   const pendingOwnedTask = ownedTasks.filter(task => task && task.status === 'pending').sort(byNewest)[0] || null;
@@ -2997,7 +3000,7 @@ async function classifyCurrentConversationIntent(conv, prompt, options = {}) {
           }
         : null);
   const boundTask = activeOwnedTask || pendingOwnedTask;
-  return window.classifySemanticIntent({
+  const classification = await window.classifySemanticIntent({
     userMessage: prompt,
     recentVisibleConversation: taskContextMessages(conv),
     conversationId: conv && conv.id,
@@ -3010,6 +3013,14 @@ async function classifyCurrentConversationIntent(conv, prompt, options = {}) {
     taskBound: !!(options.taskId || boundTask || pendingPlan),
     durableTaskObjective: (boundTask || recentOwnedTask) && (boundTask || recentOwnedTask).objective || ''
   }, options.model || window.getSelectedModel(), window.getAppConfig ? window.getAppConfig() : {});
+  const supersedesTaskId = recentOwnedTask
+    && classification
+    && classification.intent === 'context_followup'
+    && classification.contextDependent === true
+    && classification.requiresExecution === true
+      ? recentOwnedTask.taskId
+      : '';
+  return supersedesTaskId ? { ...classification, supersedesTaskId } : classification;
 }
 window.classifyCurrentConversationIntent = classifyCurrentConversationIntent;
 window.resumeOwnedCoderTaskFromDispatch = resumeOwnedCoderTaskFromDispatch;

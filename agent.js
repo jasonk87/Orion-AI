@@ -1613,7 +1613,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const turnReasoningPolicy = ReasoningPolicy
     ? ReasoningPolicy.select({
         phase: semanticIntent.intent === 'conversation' ? 'casual_conversation' : 'context_resolution',
-        hint: semanticIntent.reasoningPolicyHint || {}
+        hint: semanticIntent.reasoningPolicyHint || {},
+        contextDependent: semanticIntent.contextDependent === true
       })
     : { contextScope: 'task', effort: 'medium' };
   let workspaceResolution = isOrionMode
@@ -2054,6 +2055,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     ? ReasoningPolicy.select({
         phase: agentExecutionMode === 'answer' ? 'casual_conversation' : 'implementation',
         hint: semanticIntent.reasoningPolicyHint || {},
+        contextDependent: semanticIntent.contextDependent === true,
         complexity: semanticIntent.reasoningPolicyHint && semanticIntent.reasoningPolicyHint.complexity,
         risk: semanticIntent.reasoningPolicyHint && semanticIntent.reasoningPolicyHint.risk
       })
@@ -2601,6 +2603,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           ? ReasoningPolicy.select({
               phase: currentReasoningPhase,
               hint: semanticIntent.reasoningPolicyHint || {},
+              contextDependent: semanticIntent.contextDependent === true,
               failureCount: highestRepeatedFailureCount
             })
           : runReasoningPolicy;

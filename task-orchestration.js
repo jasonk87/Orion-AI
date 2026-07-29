@@ -5,7 +5,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function createOrionTaskOrchestration() {
   'use strict';
 
-  const SCHEMA_VERSION = 1;
+  const SCHEMA_VERSION = 2;
   const TASK_STATES = Object.freeze({
     PENDING: 'pending',
     ACTIVE: 'active',
@@ -460,6 +460,12 @@
     ]);
     const title = compactInline(input.title || taskResolution.title) || titleFromObjective(objective, workspace.project.name);
     const taskId = compactInline(input.taskId || input.id) || generateTaskId(now, input.idFactory);
+    const supersedesTaskId = compactInline(
+      input.supersedesTaskId
+      || input.predecessorTaskId
+      || semanticIntent.supersedesTaskId
+      || ''
+    );
 
     const task = {
       schemaVersion: SCHEMA_VERSION,
@@ -478,6 +484,7 @@
       contextPacketIds: taskContextPacketIds(input),
       origin,
       target,
+      supersedesTaskId,
       source: compactInline(input.source || 'user'),
       status: TASK_STATES.PENDING,
       timestamp: now,
@@ -568,6 +575,13 @@
         : null,
       origin,
       target,
+      supersedesTaskId: compactInline(
+        record.supersedesTaskId
+        || record.predecessorTaskId
+        || record.continuationOfTaskId
+        || ''
+      ),
+      supersededByTaskId: compactInline(record.supersededByTaskId || ''),
       source: compactInline(record.source || 'unknown'),
       status,
       timestamp: createdAt,
@@ -728,8 +742,7 @@
   function selectOwnedContinuationTask(tasksValue, requesterConversationIdValue, preferredTaskIdsValue = []) {
     const requesterConversationId = compactInline(requesterConversationIdValue);
     const preferredTaskIds = uniqueStrings(preferredTaskIdsValue).map(compactInline).filter(Boolean);
-    const tasks = (Array.isArray(tasksValue) ? tasksValue : [])
-      .map(normalizeTaskRecord)
+    const tasks = filterSupersededTasks(tasksValue)
       .filter(task =>
         task.taskId
         && [TASK_STATES.PENDING, TASK_STATES.ACTIVE].includes(task.status)
@@ -827,11 +840,61 @@
     return compactInline(nested || task[`${role}ConversationId`] || '');
   }
 
+  function findTaskSupersessions(tasksValue) {
+    const tasks = (Array.isArray(tasksValue) ? tasksValue : [])
+      .filter(task => task && typeof task === 'object')
+      .map(normalizeTaskRecord);
+    const supersessions = new Map();
+
+    for (const successor of tasks) {
+      const successorOrigin = taskConversationId(successor, 'origin');
+      const successorCreatedAt = Number(successor.createdAt || successor.updatedAt || 0);
+      for (const predecessor of tasks) {
+        if (!predecessor.taskId || predecessor.taskId === successor.taskId) continue;
+        if (predecessor.status !== TASK_STATES.PENDING) continue;
+        const predecessorOrigin = taskConversationId(predecessor, 'origin');
+        if (!successorOrigin || successorOrigin !== predecessorOrigin) continue;
+        if (successorCreatedAt <= Number(predecessor.createdAt || predecessor.updatedAt || 0)) continue;
+
+        const explicitlyLinked = compactInline(successor.supersedesTaskId) === predecessor.taskId;
+        // Schema-v1 replacement tasks did not have a structured predecessor field. Recover only an
+        // exact machine task ID embedded in the successor objective; this is format parsing, not
+        // natural-language or title-similarity inference.
+        const legacyExactLink = !explicitlyLinked
+          && predecessor.taskId.startsWith('task_')
+          && compactWhitespace(successor.objective).includes(predecessor.taskId);
+        if (!explicitlyLinked && !legacyExactLink) continue;
+
+        const existing = supersessions.get(predecessor.taskId);
+        if (!existing || successorCreatedAt > Number(existing.supersedingTask.createdAt || 0)) {
+          supersessions.set(predecessor.taskId, {
+            task: predecessor,
+            supersedingTask: successor,
+            source: explicitlyLinked ? 'structured' : 'legacy_exact_task_id'
+          });
+        }
+      }
+    }
+    return [...supersessions.values()];
+  }
+
+  function filterSupersededTasks(tasksValue) {
+    const tasks = (Array.isArray(tasksValue) ? tasksValue : [])
+      .filter(task => task && typeof task === 'object')
+      .map(normalizeTaskRecord);
+    const supersededIds = new Set([
+      ...tasks
+        .filter(task => compactInline(task.supersededByTaskId))
+        .map(task => task.taskId),
+      ...findTaskSupersessions(tasks).map(item => item.task.taskId)
+    ]);
+    return tasks.filter(task => !supersededIds.has(task.taskId));
+  }
+
   function selectSupervisedTask(tasksValue, viewingConversationIdValue, activeTaskIdValue = '') {
     const viewingConversationId = compactInline(viewingConversationIdValue);
     const activeTaskId = compactInline(activeTaskIdValue);
-    const tasks = (Array.isArray(tasksValue) ? tasksValue : [])
-      .filter(task => task && typeof task === 'object')
+    const tasks = filterSupersededTasks(tasksValue)
       .filter(task => {
         if (!viewingConversationId) return false;
         const originConversationId = taskConversationId(task, 'origin');
@@ -1023,6 +1086,8 @@
     normalizeTaskRecord,
     transitionTask,
     canRequesterControlTask,
+    findTaskSupersessions,
+    filterSupersededTasks,
     selectOwnedContinuationTask,
     cancelPendingOwnedTasks,
     renderTaskPrompt,

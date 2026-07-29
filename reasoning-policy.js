@@ -25,6 +25,7 @@
   function select(input = {}) {
     const phase = PHASES.includes(input.phase) ? input.phase : 'implementation';
     const hint = input.hint && typeof input.hint === 'object' ? input.hint : {};
+    const contextDependent = input.contextDependent === true;
     const risk = level(input.risk || hint.risk);
     const complexity = level(input.complexity || hint.complexity);
     const failures = Math.max(0, Number(input.failureCount || input.repeatedFailures) || 0);
@@ -35,7 +36,15 @@
     let verificationStrictness = 'standard';
 
     if (phase === 'casual_conversation') {
-      effort = 'low'; contextScope = hint.contextNeed === 'historical' ? 'historical' : 'none'; explorationScope = 'narrow'; verificationStrictness = 'light';
+      const requestedContext = ['recent', 'task', 'project', 'historical'].includes(hint.contextNeed)
+        ? hint.contextNeed
+        : '';
+      // Standalone greetings remain context-free. A reaction or acknowledgment that the semantic
+      // classifier bound to the immediately preceding exchange still receives that recent view.
+      effort = 'low';
+      contextScope = requestedContext || (contextDependent ? 'recent' : 'none');
+      explorationScope = 'narrow';
+      verificationStrictness = 'light';
     } else if (phase === 'intent_classification') {
       effort = 'low'; contextScope = 'recent'; explorationScope = 'narrow'; verificationStrictness = 'light';
     } else if (phase === 'context_resolution') {

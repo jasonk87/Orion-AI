@@ -16,6 +16,19 @@ test('casual conversation stays lightweight and context-free', t => {
   t.end();
 });
 
+test('context-bound conversational reactions retain recent context without broad history', t => {
+  const selected = policy.select({
+    phase: 'casual_conversation',
+    contextDependent: true,
+    hint: { complexity: 'low', risk: 'low', contextNeed: 'recent' }
+  });
+  t.equal(selected.effort, 'low', 'a reaction remains inexpensive');
+  t.equal(selected.contextScope, 'recent', 'the directly relevant exchange remains available');
+  t.equal(selected.explorationScope, 'narrow', 'a reaction does not expand into project exploration');
+  t.equal(selected.coverageRequired, false, 'conversation context does not trigger task coverage');
+  t.end();
+});
+
 test('historical conversation requests opt into historical context explicitly', t => {
   const selected = policy.select({
     phase: 'casual_conversation',
