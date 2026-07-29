@@ -47,7 +47,7 @@ test('phone companion finishes with the same dark theme and complete mission hie
   t.ok(companionHtml.includes('#task-list-card { grid-area: mission; }'), 'Task List has an explicit mobile layout area');
   t.ok(companionHtml.includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
   t.ok(companionHtml.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
-  t.ok(companionHtml.includes('dispatch-focus-v22'), 'phone shell exposes the current UI build version');
+  t.ok(companionHtml.includes('durable-phone-auth-v23'), 'phone shell exposes the current UI build version');
   t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v22"), 'phone service worker cache is bumped for the current UI build');
   t.ok(companionHtml.includes('window.isSecureContext'), 'phone explains when browser push is blocked by an insecure context');
   t.ok(companionHtml.includes('Phone push needs HTTPS or localhost'), 'phone tells the user that HTTPS is required for push notifications');
@@ -74,7 +74,7 @@ test('phone companion renders approvals and tool calls as first-class mobile UI'
   t.ok(companionHtml.includes("html.push('<h' + level"), 'phone renders Markdown headings');
   t.ok(companionHtml.includes("'<li>' + renderInlineMarkdown"), 'phone renders Markdown lists');
   t.ok(companionHtml.includes('function consumeMarkdownTable'), 'phone fallback renderer supports Markdown tables');
-  t.ok(ipcServer.indexOf("url.pathname === '/marked.min.js'") < ipcServer.indexOf('const device = authenticateCompanionRequest'), 'phone Markdown parser asset is served before companion auth');
+  t.ok(ipcServer.indexOf("url.pathname === '/marked.min.js'") < ipcServer.indexOf('const authentication = authenticateCompanionRequest'), 'phone Markdown parser asset is served before companion auth');
   t.ok(ipcServer.includes("'/marked.min.js'"), 'phone service worker caches the Markdown parser asset');
   t.ok(companionHtml.includes('.message .message-answer h2'), 'phone styles Markdown headings inside assistant messages');
   t.ok(companionHtml.includes('.message .message-answer ul'), 'phone styles Markdown lists inside assistant messages');
@@ -98,7 +98,8 @@ test('phone companion renders approvals and tool calls as first-class mobile UI'
   t.ok(companionHtml.includes('function conversationActivityLabel'), 'phone labels conversations by real message/task activity');
   t.notOk(companionHtml.includes("c.taskCount + ' items'"), 'phone no longer shows checklist count as generic items');
   t.ok(companionHtml.includes("history.replaceState(null, '', location.pathname || '/')"), 'phone cleans one-time pairing links after trust is saved');
-  t.ok(companionHtml.includes("urlPairingCode && urlPairingCode !== pairingCode"), 'phone can recover from a stale saved pair URL');
+  t.notOk(companionHtml.includes('const pairingCode ='), 'clean phone shell never embeds a reusable setup code');
+  t.notOk(companionHtml.includes('urlPairingCode !== pairingCode'), 'an expired setup link cannot silently substitute a new pairing code');
   t.ok(renderer.includes('data-stable-phone-url'), 'desktop pairing card exposes the stable home-screen URL');
   t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes('stableUrl'), 'phone pairing payload includes a clean stable URL');
   t.ok(companionHtml.includes('function isAssistantThinkingPlaceholder'), 'phone treats Thinking as an internal placeholder');

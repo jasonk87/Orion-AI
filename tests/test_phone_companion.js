@@ -143,6 +143,11 @@ async function startMainWithConfig(port, config, handlers) {
   const configMock = {
     readAppConfig: () => ({ ...configData }),
     writeAppConfig: (cfg) => { Object.assign(configData, cfg); },
+    updateAppConfig: async (mutator) => {
+      const updated = mutator({ ...configData });
+      Object.assign(configData, updated || {});
+      return { ...configData };
+    },
     atomicWriteFileSync: require('fs').writeFileSync,
     getConfigPath: () => require('path').join(require('os').tmpdir(), 'orion-config-test.json'),
     '@global': true,
@@ -165,16 +170,42 @@ async function startMainWithConfig(port, config, handlers) {
   const osMock = {
     networkInterfaces: () => ({
       WiFi: [{ family: 'IPv4', internal: false, address: '192.168.50.25' }],
+      ...(handlers && handlers.tailscaleAddress
+        ? { Tailscale: [{ family: 'IPv4', internal: false, address: handlers.tailscaleAddress }] }
+        : {}),
       Loopback: [{ family: 'IPv4', internal: true, address: '127.0.0.1' }]
     }),
     homedir: require('os').homedir,
     tmpdir: require('os').tmpdir,
     '@global': true
   };
+  const httpsMock = {
+    get: (url, options, callback) => {
+      const EventEmitter = require('events');
+      const request = new EventEmitter();
+      request.destroy = (error) => {
+        if (error) process.nextTick(() => request.emit('error', error));
+      };
+      process.nextTick(() => {
+        const response = new EventEmitter();
+        response.statusCode = handlers && handlers.secureOriginReachable === false ? 503 : 200;
+        response.setEncoding = () => {};
+        callback(response);
+        if (response.statusCode === 200) {
+          response.emit('data', JSON.stringify({ success: true, service: 'orion-phone-companion' }));
+        }
+        response.emit('end');
+      });
+      return request;
+    },
+    '@global': true,
+    '@noCallThru': true
+  };
   const main = proxyquire('../main.js', {
     electron: electron.mock,
     './lib/config': configMock,
     'web-push': webPushMock,
+    https: httpsMock,
     os: osMock
   });
   main.resetCompanionServer();
@@ -219,7 +250,7 @@ function requestFirstSseFrame(port, path, session) {
 }
 
 test('Phone Companion generated inline script is valid JavaScript', (t) => {
-  const html = companionHtml('pair-code-123456', 'DESKTOP-TEST');
+  const html = companionHtml('DESKTOP-TEST');
   const inlineScripts = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)];
   t.ok(inlineScripts.length > 0, 'phone shell includes inline boot script');
   inlineScripts.forEach((match, index) => {
@@ -237,10 +268,15 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
   const root = await request('GET', 1131, '/');
   t.equal(root.statusCode, 200, 'root shell is available without token-in-URL auth');
   t.notOk(root.text.includes('phoneCompanionToken'), 'root shell does not expose legacy token');
+  t.notOk(root.text.includes('pair-code-123456'), 'clean phone shell does not embed the current setup code');
   t.ok(root.text.includes('<title>Orion</title>'), 'root shell serves the Orion mobile UI');
   t.notOk(root.text.includes('data-drawer-destination="history"'), 'root shell does not expose History as a top-level mode');
   t.ok(root.text.includes('function enterDispatch'), 'root shell enters Dispatch through the chat-first route');
   t.ok(root.text.includes("companionFetch('/api/new-focus'"), 'phone New Focus asks the desktop to cancel pending owned work');
+  t.ok(root.text.includes('permanentCredentialFailureCodes'), 'phone distinguishes durable auth revocation from transient transport failures');
+  t.ok(root.text.includes('confirmedCredentialFailures < 2'), 'phone confirms a permanent credential failure before erasing saved access');
+  t.ok(root.text.includes('Connection interrupted. Retrying saved phone access...'), 'generic auth interruptions retain the durable device credential');
+  t.ok(root.text.includes('This browser has no saved Orion phone access.'), 'clean URLs do not silently reuse a short-lived setup code');
   t.ok(root.text.includes('await cancelPendingTasksForNewFocus();'), 'phone waits for cancellation before opening a fresh Dispatch draft');
   t.ok(root.text.includes('id="dispatch-browser-overlay"'), 'root shell keeps saved discussions in an in-Dispatch browser');
   t.notOk(root.text.includes('<span>Pick up a project</span>'), 'root shell keeps project rows off the Dispatch landing');
@@ -319,6 +355,45 @@ test('Phone Companion pairing prefers configured HTTPS origin for mobile notific
   await closeServer(main.getCompanionServer());
 });
 
+test('Phone Companion does not advertise an unreachable configured HTTPS origin as the stable app URL', async (t) => {
+  const { main } = await startMainWithConfig(1151, {
+    phoneCompanionHttpsOrigin: 'https://desktop-owner.example.test'
+  }, {
+    secureOriginReachable: false
+  });
+
+  const payload = await main.getPhoneCompanionPairingForTest();
+  t.equal(payload.preferredUrlType, 'local', 'an unreachable HTTPS route is not selected');
+  t.equal(payload.secureOriginReachable, false, 'payload reports the failed secure-route check');
+  t.ok(payload.pairUrl.startsWith('http://192.168.50.25:1151/?pair='), 'pairing falls back to the reachable direct server');
+  t.equal(payload.phoneNotificationsAvailable, false, 'unreachable HTTPS is not presented as notification capable');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion uses stable Tailscale MagicDNS instead of an origin-changing device IP', async (t) => {
+  const { main } = await startMainWithConfig(1154, {
+    phoneCompanionHttpsOrigin: 'https://desktop-owner.tailnet-name.ts.net'
+  }, {
+    secureOriginReachable: false,
+    tailscaleAddress: '100.122.183.97'
+  });
+
+  const payload = await main.getPhoneCompanionPairingForTest();
+  t.equal(
+    payload.tailscaleStableUrl,
+    'http://desktop-owner.tailnet-name.ts.net:1154/',
+    'stable direct URL uses MagicDNS and the companion port'
+  );
+  t.ok(
+    payload.tailscalePairUrl.startsWith('http://desktop-owner.tailnet-name.ts.net:1154/?pair='),
+    'Tailscale pairing establishes storage on the same stable origin used by the shortcut'
+  );
+  t.notOk(payload.tailscaleStableUrl.includes('100.122.183.97'), 'the permanent shortcut is not bound to a rotatable Tailscale IP');
+
+  await closeServer(main.getCompanionServer());
+});
+
 test('Phone Companion button enables LAN server before returning QR pairing URL', async (t) => {
   const { main, fsMock } = await startMainWithConfig(1137, { enablePhoneCompanion: false });
   t.equal(main.getCompanionServer().address().address, '127.0.0.1', 'server starts localhost-only by default');
@@ -357,6 +432,70 @@ test('Phone Companion v2 pairing creates reusable sessions and revoked sessions 
 
   const revoked = await request('GET', 1132, '/api/state', null, session);
   t.equal(revoked.statusCode, 401, 'revoked session cannot access state');
+  t.equal(revoked.json.code, 'COMPANION_DEVICE_REVOKED', 'revocation has a machine-readable permanent failure code');
+  t.equal(revoked.json.rePairRequired, true, 'revocation explicitly authorizes clearing the saved credential');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion durable session remains valid after the short-lived pairing link expires', async (t) => {
+  const pairedAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const device = {
+    id: 'durable-phone',
+    name: 'Pixel',
+    secret: 'durable-secret',
+    approved: true,
+    revoked: false,
+    pairedAt,
+    lastSeenAt: pairedAt,
+    userAgent: 'test-phone'
+  };
+  const { main } = await startMainWithConfig(1152, {
+    phoneCompanionPairingExpiresAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+    phoneCompanionDevices: [device]
+  });
+
+  const state = await request('GET', 1152, '/api/state', null, {
+    deviceId: device.id,
+    secret: device.secret
+  });
+  t.equal(state.statusCode, 200, 'device credential is independent of pairing-link expiry');
+  t.equal(state.json.success, true, 'expired setup link does not expire the paired phone');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion rejects an expired setup code while preserving durable device sessions', async (t) => {
+  const { main } = await startMainWithConfig(1155, {
+    phoneCompanionPairingCode: 'expired-pair-code',
+    phoneCompanionPairingExpiresAt: new Date(Date.now() - 60 * 1000).toISOString()
+  });
+
+  const expiredPair = await request('POST', 1155, '/api/pair', {
+    pairingCode: 'expired-pair-code',
+    deviceName: 'New phone'
+  });
+  t.equal(expiredPair.statusCode, 401, 'expired setup code cannot create another device session');
+  t.equal(expiredPair.json.error, 'Invalid pairing code', 'expired setup link receives a clear rejection');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion auth failures distinguish transient missing headers from invalid durable credentials', async (t) => {
+  const { main } = await startMainWithConfig(1153);
+
+  const missing = await request('GET', 1153, '/api/state');
+  t.equal(missing.statusCode, 401, 'missing auth is rejected');
+  t.equal(missing.json.code, 'COMPANION_CREDENTIAL_MISSING', 'missing headers have an explicit code');
+  t.equal(missing.json.rePairRequired, false, 'generic missing auth does not tell a client to erase durable access');
+
+  const unknown = await request('GET', 1153, '/api/state', null, {
+    deviceId: 'unknown-device',
+    secret: 'unknown-secret'
+  });
+  t.equal(unknown.statusCode, 401, 'unknown device is rejected');
+  t.equal(unknown.json.code, 'COMPANION_DEVICE_UNKNOWN', 'unknown device has a permanent failure code');
+  t.equal(unknown.json.rePairRequired, true, 'unknown durable credential eventually requires a new pairing');
 
   await closeServer(main.getCompanionServer());
 });

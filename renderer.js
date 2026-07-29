@@ -5419,6 +5419,7 @@ function updatePhoneCompanionPairingPanel(payload = {}) {
   const pairUrl = String(payload.pairUrl || '');
   const networkEnabled = payload.networkEnabled !== false && !!pairUrl;
   const secureEnabled = payload.preferredUrlType === 'https' || /^https:\/\//i.test(pairUrl);
+  const secureUnavailable = !!payload.secureOrigin && payload.secureOriginReachable === false;
   const expiresText = payload.expiresAt ? `Expires: ${new Date(payload.expiresAt).toLocaleTimeString()}` : 'Short-lived pairing link';
   if (el.btnPhoneCompanion) {
     el.btnPhoneCompanion.style.display = '';
@@ -5436,7 +5437,11 @@ function updatePhoneCompanionPairingPanel(payload = {}) {
   }
   if (el.phoneCompanionMeta) {
     el.phoneCompanionMeta.textContent = networkEnabled
-      ? `${expiresText}. ${secureEnabled ? 'HTTPS enabled for phone notifications.' : 'Live view only; add an HTTPS phone URL in Settings for mobile notifications.'}`
+      ? `${expiresText}. ${secureEnabled
+        ? 'HTTPS enabled for phone notifications.'
+        : secureUnavailable
+          ? 'The configured HTTPS route is unavailable, so Orion is using a reachable direct route without discarding paired access.'
+          : 'Live view only; add an HTTPS phone URL in Settings for mobile notifications.'}`
       : 'LAN companion mode is disabled by default. No localhost QR is shown for phones.';
   }
   // Tailscale panel: show/hide the Tailscale QR block inside the pairing panel
@@ -5557,6 +5562,7 @@ function renderPhoneCompanionPairingCard(payload) {
   const pairUrl = String(payload.pairUrl || '');
   const stableUrl = String(payload.stableUrl || pairUrl.replace(/\?.*$/, ''));
   const secureEnabled = payload.preferredUrlType === 'https' || /^https:\/\//i.test(pairUrl);
+  const secureUnavailable = !!payload.secureOrigin && payload.secureOriginReachable === false;
   const expiresText = payload.expiresAt ? `Expires: ${new Date(payload.expiresAt).toLocaleTimeString()}` : 'Short-lived pairing link';
 
   // Tailscale section — only shown when Tailscale is active on the desktop
@@ -5584,7 +5590,11 @@ function renderPhoneCompanionPairingCard(payload) {
         <div data-companion-qr="true" aria-label="Phone Companion pairing QR code" style="background:#fff; padding:8px; border-radius:8px; line-height:0;">${qrSvg}</div>
         <div style="min-width:220px; flex:1;">
           <div style="font-weight:700; margin-bottom:6px;">Scan once to trust this phone</div>
-          <div style="color: var(--text-muted); margin-bottom:8px;">${secureEnabled ? 'This HTTPS link can request phone notifications. Add the clean URL to your home screen after pairing.' : 'This local link keeps live view working. Add a Secure Phone URL in Settings to enable background notifications.'}</div>
+          <div style="color: var(--text-muted); margin-bottom:8px;">${secureEnabled
+            ? 'This HTTPS link can request phone notifications. Add the clean URL to your home screen after pairing.'
+            : secureUnavailable
+              ? 'The saved HTTPS route is not responding. Orion is showing a reachable direct link and will preserve existing paired-device credentials.'
+              : 'This local link keeps live view working. Add a Secure Phone URL in Settings to enable background notifications.'}</div>
           <div data-pair-url="${escapeHtml(pairUrl)}" style="font-family: var(--font-mono); font-size:.76rem; word-break:break-all;">${escapeHtml(pairUrl)}</div>
           <div data-stable-phone-url="${escapeHtml(stableUrl)}" style="font-family: var(--font-mono); font-size:.76rem; word-break:break-all; margin-top:6px; color:var(--success-color);">${escapeHtml(stableUrl)}</div>
           <div data-pairing-metadata="true" style="color: var(--text-muted); font-size:.74rem; margin-top:8px;">${escapeHtml(expiresText)}</div>
