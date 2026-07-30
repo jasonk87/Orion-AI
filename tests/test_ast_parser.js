@@ -72,3 +72,28 @@ test('extractSymbols returns a clear error for unsupported file types', (t) => {
   );
   t.end();
 });
+
+test('extractSymbols supports TypeScript interfaces, types, enums, and default exports', (t) => {
+  const code = [
+    'export interface User {',
+    '  id: string;',
+    '  getName(): string;',
+    '}',
+    'export type ID = string;',
+    'export enum Role { ADMIN, USER }',
+    'export default function() { return true; }',
+    'export const fn = () => false;'
+  ].join('\n');
+
+  const result = extractSymbols(code, { path: 'types.ts' });
+  t.equal(result.success, true, 'TS extraction succeeds');
+  
+  t.ok(result.symbols.some(symbol => symbol.name === 'User' && symbol.type === 'Interface'), 'interface is returned');
+  t.ok(result.symbols.some(symbol => symbol.name === 'getName' && symbol.type === 'MethodSignature'), 'method signature is returned');
+  t.ok(result.symbols.some(symbol => symbol.name === 'ID' && symbol.type === 'TypeAlias'), 'type alias is returned');
+  t.ok(result.symbols.some(symbol => symbol.name === 'Role' && symbol.type === 'Enum'), 'enum is returned');
+  t.ok(result.symbols.some(symbol => symbol.name === 'default export (function)' && symbol.type === 'Function'), 'anonymous default export is returned');
+  t.ok(result.symbols.some(symbol => symbol.name === 'fn' && symbol.type === 'Function'), 'exported const function is returned');
+  
+  t.end();
+});

@@ -29,6 +29,17 @@ test('patch file - replace', (t) => {
   t.end();
 });
 
+test('patch file - replace refuses ambiguous single-target replacements', (t) => {
+  const original = 'const value = 1;\nconst value = 1;\n';
+  const op = { type: 'replace', target: 'const value = 1;', replacement: 'const value = 2;' };
+  t.throws(
+    () => main.applyPatch(original, op),
+    /not unique/,
+    'single replace fails loudly when the target appears more than once'
+  );
+  t.end();
+});
+
 test('patch file - replace_regex', (t) => {
   const original = 'foo 123 bar 456';
   const op = { type: 'replace_regex', pattern: '\\d+', replacement: 'NUM', flags: 'g' };

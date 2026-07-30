@@ -52,14 +52,14 @@
       <div id="sidebar-orion-content" class="sidebar-mode-content active">
         <div class="sidebar-top">
           <button id="btn-new-chat" class="btn-primary">
-            <span class="plus-icon">+</span> New Chat
+            <span class="plus-icon">+</span> New Focus
           </button>
         </div>
         <div class="sidebar-section">
           <div class="section-header">
-            <span>Recents</span>
+            <span>Discussions</span>
             <div class="section-actions">
-              <button id="btn-add-conversation" title="New Chat">+</button>
+              <button id="btn-add-conversation" title="New Focus">+</button>
             </div>
           </div>
           <div class="conversation-list" id="conversation-list">
@@ -135,10 +135,11 @@
         
         <!-- Workspace File Bar -->
         <div class="workspace-action-bar">
-          <button id="btn-change-workspace" class="btn-secondary">Change Workspace</button>
-          <button id="btn-sync-files" class="btn-secondary" title="Scan file directory">&#128260; Sync Files</button>
+          <button id="btn-change-workspace" class="btn-secondary secondary-action">Change Workspace</button>
+          <button id="btn-sync-files" class="btn-secondary secondary-action" title="Scan file directory">&#128260; Sync Files</button>
           <button id="btn-phone-companion" class="btn-secondary phone-companion-button" title="Pair Phone Companion">Phone</button>
-          <button id="btn-launch-app" class="btn-secondary" title="Launch application for testing">&#9654; Launch</button>
+          <button id="btn-launch-app" class="btn-secondary secondary-action" title="Launch application for testing">&#9654; Launch</button>
+          <button id="btn-show-agent-browser" class="btn-secondary secondary-action" title="Show Agent Browser">&#127760; Browser</button>
           <button id="btn-toggle-right-sidebar" class="btn-secondary" title="Toggle Agent Panel">&#9776; Panel</button>
           <button id="btn-command-palette" class="btn-secondary command-palette-trigger" title="Commands (Ctrl+K)" aria-label="Open command palette">&#8943;</button>
         </div>
@@ -150,12 +151,15 @@
         <div class="orion-welcome-splash" id="orion-welcome-splash" style="display:none;">
           <div class="orion-welcome-icon">&#10022;</div>
           <h1 id="orion-greeting-name">Good evening, Jason.</h1>
-          <p class="orion-welcome-sub">What are we working on?</p>
+          <p class="orion-welcome-sub">No task is too large. What are we taking on?</p>
           <div class="orion-prompt-chips">
             <button class="orion-prompt-chip" data-prompt="What did we work on last time?">Pick up where we left off</button>
             <button class="orion-prompt-chip" data-prompt="Search the web for ">Search the web…</button>
             <button class="orion-prompt-chip" data-prompt="Help me think through ">Think something through</button>
             <button class="orion-prompt-chip" data-prompt="What's on my plate today?">What's on my plate?</button>
+          </div>
+          <div class="dispatch-desktop-landing">
+            <section class="dispatch-desktop-section" id="dispatch-desktop-active-work" hidden></section>
           </div>
         </div>
 
@@ -189,6 +193,7 @@
           <span class="coder-status-task-name">task</span>
           <span class="coder-status-sep">·</span>
           <span class="coder-status-substatus">Working…</span>
+          <span class="coder-status-preview" style="display:none"></span>
         </div>
         <span class="coder-status-elapsed">0s</span>
       </div>
@@ -490,6 +495,14 @@
   <script src="node_modules/prismjs/components/prism-css.min.js"></script>
   <script src="node_modules/prismjs/components/prism-json.min.js"></script>
   <script src="operational-context.js"></script>
+  <script src="workspace-resolution.js"></script>
+  <script src="orchestration-contracts.js"></script>
+  <script src="dispatch-intent.js"></script>
+  <script src="semantic-intent-router.js"></script>
+  <script src="reasoning-policy.js"></script>
+  <script src="task-orchestration.js"></script>
+  <script src="supervisor-orchestration.js"></script>
+  <script src="prompt-submission.js"></script>
   <script src="renderer.js"></script>
   <script src="agent.js"></script>
 </body>

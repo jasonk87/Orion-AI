@@ -5,6 +5,8 @@ const path = require('path');
 const rendererJs = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8');
 const agentJs = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
 const preloadJs = fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8');
+const semanticSearchJs = fs.readFileSync(path.join(__dirname, '../lib/semantic-search.js'), 'utf8');
+const SemanticIntentRouter = require('../semantic-intent-router.js');
 global.window = {};
 global.fetch = async () => ({ ok: false });
 const agent = require('../agent.js');
@@ -49,6 +51,19 @@ test('empty Thinking placeholders are not rendered as extra chat bubbles', (t) =
   t.end();
 });
 
+test('completed assistant responses are flushed for background phone conversations', (t) => {
+  t.ok(rendererJs.includes('async function flushConversationsToStorage'), 'renderer exposes an awaitable disk flush');
+  t.ok(rendererJs.includes('if (conversationId) dirtyConversationIds.add(conversationId)'), 'explicit flush marks its target dirty');
+  t.ok(/dirtyConversationIds\.add\(c\.id\);\s*console\.error\(`Save failed for conv \$\{c\.id\}`/.test(rendererJs), 'failed conversation writes remain dirty for retry');
+
+  const finalRender = agentJs.indexOf('window.renderAiMessage(lastTextResponse, currentAgentLogs, conversation.id, finalizedRunMessage);');
+  const dirtyFinal = agentJs.indexOf('window.markConversationDirty(conversation.id);', finalRender);
+  const flushFinal = agentJs.indexOf('await window.flushConversationsToStorage(conversation.id);', finalRender);
+  t.ok(finalRender !== -1 && dirtyFinal > finalRender, 'the completed assistant message is marked dirty after its final render');
+  t.ok(flushFinal > dirtyFinal, 'the completed message is durably flushed before completion continues');
+  t.end();
+});
+
 test('conversation reload normalizes stored assistant message shapes', (t) => {
   t.ok(rendererJs.includes('function normalizeConversationMessageForReplay'), 'renderer normalizes stored messages before replay');
   t.ok(rendererJs.includes("role === 'assistant' || role === 'model' || role === 'ai' || role === 'orion'"), 'model/AI/orion roles replay as assistant answers');
@@ -61,14 +76,23 @@ test('conversation reload normalizes stored assistant message shapes', (t) => {
   t.ok(rendererJs.includes('responseLooksFailed'), 'replay preserves error status from saved tool responses');
   t.ok(agentJs.includes('function persistCurrentAgentLogs'), 'agent has a single persistence helper for live logs');
   t.ok(agentJs.includes('persistCurrentAgentLogs({ render: true });'), 'agent persists tool logs while rendering live activity');
-  t.ok(
-    /conversation\.messages\.push\(\{ role: 'assistant', text: 'Thinking\.\.\.', logs: \[\], turns: \[\], createdAt: Date\.now\(\) \}\);\s*if \(window\.saveConversationsToStorage\)/.test(agentJs),
-    'agent immediately persists the assistant placeholder so reloads keep the agent side coherent'
-  );
+  t.ok(agentJs.includes('function ensureActiveRunMessage'), 'agent owns one repairable live assistant message per run');
+  t.ok(agentJs.includes('if (!Array.isArray(activeRunMessage.turns)) activeRunMessage.turns = [];'), 'a partially hydrated run message repairs its turns before appending');
+  t.ok(agentJs.includes('ensureActiveRunMessage();\n  if (window.saveConversationsToStorage)'), 'agent immediately persists the assistant placeholder so reloads keep the agent side coherent');
   const loopStart = agentJs.indexOf('window.runAgentLoop = async function');
-  const placeholderIndex = agentJs.indexOf("conversation.messages.push({ role: 'assistant', text: 'Thinking...'", loopStart);
+  const placeholderIndex = agentJs.indexOf('ensureActiveRunMessage();', loopStart);
   const routingIndex = agentJs.indexOf('if (isInternalPrompt)', loopStart);
   t.ok(placeholderIndex > loopStart && placeholderIndex < routingIndex, 'assistant placeholder is saved before async routing/classification can fail');
+  t.end();
+});
+
+test('durable task presentation repairs legacy generic titles and missed terminal notifications', (t) => {
+  t.ok(rendererJs.includes("const LEGACY_DISPATCH_TASK_TITLE = 'Execute Dispatch request'"), 'the old internal placeholder is recognized only as a migration value');
+  t.ok(rendererJs.includes('function reconcileConversationTaskPresentation'), 'task titles are reconciled from the canonical durable task');
+  t.ok(rendererJs.includes('message.text.includes(String(task.taskId))'), 'legacy transcript text is rewritten only when bound to the exact task');
+  t.ok(rendererJs.includes('scheduleTerminalDelegatedTaskReconciliation(conversation, durableTasks);'), 'hydrating a Dispatch conversation reconciles a terminal task missed during restart');
+  t.ok(rendererJs.includes("await notifySupervisorOfCoderCompletion(coderConvId, taskId);"), 'the live monitor publishes the canonical terminal outcome instead of silently stopping');
+  t.ok(rendererJs.includes('orchestrationTaskId: taskId'), 'terminal notifications carry a durable dedupe identity');
   t.end();
 });
 
@@ -81,9 +105,10 @@ test('accepted prompts cannot leave one-sided user-only transcripts', (t) => {
   t.ok(rendererJs.includes('function buildMissingAssistantResponseMessage'), 'reload path can recover old user-only transcripts');
   t.ok(rendererJs.includes('hasMeaningfulAssistantAfterUser'), 'reload recovery requires a meaningful assistant answer');
   t.ok(rendererJs.includes('!isEmptyThinkingPlaceholder(msg.text, logs)'), 'stale Thinking placeholders do not count as assistant answers');
-  t.ok(rendererJs.includes('MISSING_ASSISTANT_RESPONSE_TEXT'), 'recovery message is explicit instead of blank');
-  t.ok(rendererJs.includes('messages.push(recoveredAssistantMessage)'), 'phone state returns the recovery bubble to mobile clients');
-  t.ok(rendererJs.includes('renderAiMessage(recoveredAssistantMessage.text'), 'desktop reload renders the same recovery bubble');
+  t.ok(rendererJs.includes('if (!options.queued) return null;'), 'an orphaned run with no reply is skipped silently instead of shown as a fake error bubble');
+  t.notOk(rendererJs.includes('Run ended before Orion saved an assistant response'), 'the old error-sounding recovery bubble text is gone');
+  t.ok(rendererJs.includes('messages.push(recoveredAssistantMessage)'), 'phone state still returns a status bubble for legitimate queued follow-ups');
+  t.ok(rendererJs.includes('renderAiMessage(recoveredAssistantMessage.text'), 'desktop reload still renders that same queued-status bubble');
   t.end();
 });
 
@@ -344,31 +369,20 @@ test('workspace resolution carries evidence forward from later desktop listings'
   t.end();
 });
 
-test('local system fact failures do not become fake blockers or web research', (t) => {
-  t.equal(agent.isLocalSystemFactRequest('how much memory does my computer have left?'), true, 'recognizes local memory query');
-  t.equal(agent.isLocalSystemFactRequest('what do you think about my computer performance wise?'), true, 'recognizes local performance assessment query');
-  t.equal(agent.isLocalSystemFactRequest('look up Gemini API docs'), false, 'does not classify docs research as local system fact');
-  t.equal(agent.isGenericNonAnswer('Understood.'), true, 'recognizes generic acknowledgement as a non-answer');
-  t.equal(agent.requestNeedsLocalInspection('what do you think about my computer performance wise?'), true, 'performance assessment requires local inspection');
-  t.equal(
-    agent.isLocalProjectOrFolderRequest('I have a folder on my desktop called rocket sumo, recommend similar games and improvements'),
-    true,
-    'local project recommendations require filesystem inspection before advice'
-  );
-  t.equal(
-    agent.requestNeedsLocalInspection('I have a folder on my desktop called rocket sumo, recommend similar games and improvements'),
-    true,
-    'local project recommendations are local inspection requests'
-  );
+test('local inspection enforcement consumes structured intent instead of response keywords', (t) => {
+  t.equal(agent.isLocalSystemFactRequest, undefined, 'the local-system phrase classifier is removed');
+  t.equal(agent.requestNeedsLocalInspection, undefined, 'the local-inspection phrase classifier is removed');
+  t.equal(agent.isLocalProjectOrFolderRequest, undefined, 'the local-project phrase classifier is removed');
+  t.equal(agent.isGenericNonAnswer('Understood.'), false, 'natural acknowledgements are not rejected by a phrase gate');
   t.equal(
     agent.isLocalAccessDeflection("I can only access file system locations that are explicitly provided to me or are within the defined workspace."),
-    true,
-    'recognizes false local-access disclaimers'
+    false,
+    'natural-language access disclaimers are not reclassified after the semantic preflight'
   );
   t.equal(
     agent.shouldHaveUsedToolsButDidNot('Understood.', [], 'what do you think about my computer performance wise?'),
-    true,
-    'generic acknowledgement cannot satisfy a local performance request without tools'
+    false,
+    'a non-empty answer is not reinterpreted by a second language classifier'
   );
   t.equal(
     agent.shouldHaveUsedToolsButDidNot(
@@ -376,10 +390,10 @@ test('local system fact failures do not become fake blockers or web research', (
       [],
       'I have a folder on my desktop called rocket sumo, recommend similar games and improvements'
     ),
-    true,
-    'local project recommendations cannot be answered with access disclaimers instead of tools'
+    false,
+    'response wording does not drive a second local-project route'
   );
-  const localFolderGuidance = agent.buildLocalInspectionNoToolGuidance('I have a folder on my desktop called rocket sumo, recommend similar games and improvements');
+  const localFolderGuidance = agent.buildLocalInspectionNoToolGuidance({ inspectionTarget: 'project' });
   t.ok(
     localFolderGuidance.includes('Get-ChildItem') && localFolderGuidance.includes('change_workspace'),
     'local project no-tool recovery tells Orion to try change_workspace then fall back to a directory search'
@@ -402,7 +416,11 @@ test('local system fact failures do not become fake blockers or web research', (
   t.ok(agentJs.includes('TOP-LEVEL FOLDER LISTS'), 'system prompt distinguishes top-level listings from recursive searches');
   t.ok(agentJs.includes('EVIDENCE CONTINUITY'), 'system prompt tells Orion to connect later filesystem evidence to prior path failures');
   t.ok(agentJs.includes('do not add -Depth/-Recurse unless nested folders are explicitly requested') || agentJs.includes('Do not add -Depth or -Recurse for a top-level list request'), 'run_command contract blocks recursive top-level folder dumps');
-  t.ok(agentJs.includes('Do not use this as a substitute for inspecting an existing local folder/project/program'), 'clarifying tool contract blocks premature clarification');
+  t.ok(
+    agentJs.includes('Do not use as a substitute for inspecting an existing local folder/project/program')
+      || agentJs.includes('Do not use this as a substitute for inspecting an existing local folder/project/program'),
+    'clarifying tool contract blocks premature clarification'
+  );
   t.equal(
     agent.shouldHaveUsedToolsButDidNot('I do not know your name yet.', [], 'do you know my name?'),
     false,
@@ -505,7 +523,7 @@ test('local system fact failures do not become fake blockers or web research', (
     ).includes('File names alone are not enough'),
     'read-through-program requests cannot be answered from path search and filenames only'
   );
-  t.ok(agentJs.includes('Active conversation workspace (resolved):'), 'run prompt surfaces the resolved conversation workspace');
+  t.ok(agentJs.includes('WorkspaceResolution.describeWorkspace(workspaceResolution'), 'run prompt surfaces the resolved conversation workspace');
   t.ok(agentJs.includes('Do not re-run change_workspace for an older dictated/autocorrected folder phrase'), 'run prompt prevents repeated guessed workspace changes after resolution');
   t.ok(
     agent.buildFinalAnswerQualityGatePrompt(
@@ -615,8 +633,24 @@ test('local system fact failures do not become fake blockers or web research', (
     agent.buildToolEvidenceEntry('run_command', { command: 'systeminfo' }, failedCommand)
   ];
 
+  const verifiedTestEvidence = agent.buildToolEvidenceEntry(
+    'run_tests',
+    {},
+    { success: true, output: '124 tests passed' }
+  );
+  t.equal(
+    verifiedTestEvidence.structuredStatuses[0].outcome,
+    'verified_passing',
+    'successful run_tests evidence carries a verified structured test status into the agent ledger'
+  );
+  t.equal(
+    verifiedTestEvidence.structuredStatuses[0].source,
+    'tool_result',
+    'structured test status preserves tool-result provenance'
+  );
+
   const webGate = agent.getEpistemicToolGate(
-    'how much memory does my computer have left?',
+    { inspectionTarget: 'local_system' },
     ledger,
     'google_search',
     { query: 'how to get system memory information without powershell or wmic' }
@@ -625,7 +659,7 @@ test('local system fact failures do not become fake blockers or web research', (
   t.ok(webGate.reason.includes('local machine'), 'web gate explains local-state boundary');
 
   const blockerGate = agent.getEpistemicToolGate(
-    'how much memory does my computer have left?',
+    { inspectionTarget: 'local_system' },
     ledger,
     'record_blocker',
     { title: 'Cannot check memory' }
@@ -634,7 +668,7 @@ test('local system fact failures do not become fake blockers or web research', (
   t.ok(blockerGate.reason.includes('failed local-inspection commands alone'), 'blocker gate explains evidence problem');
 
   const correction = agent.buildEpistemicCorrectionPrompt({
-    userPrompt: 'how much memory does my computer have left?',
+    semanticIntent: { inspectionTarget: 'local_system' },
     answerText: 'I cannot proceed without a configured Google Search API key.',
     toolEvidenceLedger: ledger
   });
@@ -756,7 +790,7 @@ test('model API calls cannot sit indefinitely without visible cooldown status', 
   t.ok(agentJs.includes('fetchWithTimeout(url'), 'Gemini generateContent uses timeout-aware fetch');
   t.ok(agentJs.includes('activeRunController = new AbortController()'), 'each agent run owns a cancellation controller');
   t.ok(agentJs.includes("window.stopAgentExecution = (options = {})"), 'stop API accepts cancellation options');
-  t.ok(agentJs.includes("requestAgentStop({ mode: options.mode || 'hard' })"), 'default stop path is hard cancellation');
+  t.ok(agentJs.includes("requestAgentStop({ mode: options.mode || 'hard', taskId: options.taskId || '' })"), 'default stop path is hard cancellation');
   t.ok(agentJs.includes('window.softStopAgentExecution'), 'soft stop is available for graceful stop-before-next-turn behavior');
   t.ok(agentJs.includes('activeRunController.abort()'), 'hard stop aborts the active model request controller');
   t.ok(agentJs.includes('signal: getActiveRunSignal()'), 'model calls receive the active run cancellation signal');
@@ -822,6 +856,12 @@ test('post-edit evidence gate requires real verification before finalizing', (t)
   ];
   t.equal(agent.hasVerificationAfterLastFileEdit(verified), true, 'real verification after edit satisfies evidence gate');
   t.equal(agent.buildPostEditEvidencePrompt(verified, { canExecute: true, promptCount: 0 }), '', 'guard does not fire after read and verification evidence');
+
+  const verifiedWithoutReread = [
+    { kind: 'file', toolName: 'patch_file', path: 'main.py', status: 'done' },
+    { toolName: 'run_command', kind: 'command', command: 'python -m py_compile main.py', label: 'Ran `python -m py_compile main.py`', status: 'done' }
+  ];
+  t.equal(agent.buildPostEditEvidencePrompt(verifiedWithoutReread, { canExecute: true, promptCount: 0 }), '', 'guard does not force an extra reread after a clean edit followed by real verification');
   t.end();
 });
 
@@ -973,9 +1013,12 @@ test('Dispatch uses Projects fallback while Coder standalone conversations get i
   t.ok(rendererJs.includes('if (promoteProjectForWorkspace) addProjectPath(folderPath)'), 'Dispatch workspace changes do not add folders to the Coder project list unless explicitly promoted');
   t.ok(rendererJs.includes('window.promoteWorkspaceToCoder'), 'renderer exposes an explicit Dispatch-to-Coder promotion path');
   t.ok(rendererJs.includes("source: 'dispatch-handoff'"), 'Dispatch handoffs queue Coder prompts with a distinct source');
+  t.ok(rendererJs.includes('assignContextPackets') && rendererJs.includes('conv.inheritedContext'), 'Dispatch assigns validated packet IDs to the new Coder conversation');
   t.ok(agentJs.includes("'handoff_to_coder'"), 'Dispatch allowlist includes the explicit Coder handoff tool');
   t.ok(agentJs.includes('change_workspace alone must not add folders to Coder'), 'handoff tool declaration teaches the model that workspace inspection is not project promotion');
   t.ok(agentJs.includes('window.promoteWorkspaceToCoder'), 'handoff_to_coder executes through the renderer promotion API');
+  t.ok(agentJs.includes('getHandoffContextPacketIds') && agentJs.includes('loadInheritedContextReceipt'), 'agent transfers and hydrates shared context receipts instead of restarting discovery');
+  t.ok(agentJs.includes('Do not deeply inspect source merely to decide that Coder should do the work'), 'Dispatch routes obvious implementation tasks before deep source inspection');
   t.ok(agentJs.includes('isGeneratedStandaloneWorkspacePath') && agentJs.includes('getDispatchWorkspaceRoot()'), 'agent ignores generated Dispatch workspaces and falls back to the Projects root');
   t.ok(agentJs.includes('formatKnownProjectsForSystemFacts'), 'agent can include registered project paths in Dispatch context');
   t.ok(rendererJs.includes('function createPhoneConversation'), 'phone conversations use a dedicated constructor');
@@ -983,6 +1026,155 @@ test('Dispatch uses Projects fallback while Coder standalone conversations get i
   t.ok(rendererJs.includes("conversationMode(conv) === 'coder'") && rendererJs.includes('conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id)'), 'only Coder standalone prompts initialize isolated workspaces');
   t.ok(preloadJs.includes('getFileSymbols') && preloadJs.includes('orion:get-file-symbols'), 'preload exposes the file-symbol tool advertised to the model');
   t.ok(preloadJs.includes('semanticSearch') && preloadJs.includes('orion:semantic-search'), 'preload exposes semantic search advertised to the model');
+  t.ok(preloadJs.includes('readMultipleRanges') && preloadJs.includes('read-multiple-ranges'), 'preload exposes bundled range reads advertised to the model');
+  t.ok(preloadJs.includes('inspectCodeContext') && preloadJs.includes('orion:inspect-code-context'), 'preload exposes context packet inspection advertised to the model');
+  t.ok(preloadJs.includes('assignContextPackets') && preloadJs.includes('hydrateContextPackets'), 'preload exposes scoped context handoff lifecycle APIs');
+  t.end();
+});
+
+test('Dispatch execution authority comes from structured intent, not request/refusal phrases', (t) => {
+  const request = 'Can you kill Claude and restart it again?';
+  t.equal(agent.dispatchRequestRequiresCoderExecution, undefined, 'ordinary-English execution is no longer inferred by a phrase helper');
+  t.equal(agent.isDispatchExecutionDeflection, undefined, 'model response prose is no longer classified as a permission refusal');
+  t.equal(agent.shouldForceDispatchHandoff, undefined, 'narrated handoffs are not inferred after the model response');
+  const structured = SemanticIntentRouter.normalizeClassification({
+    intent: 'new_task',
+    requiresExecution: true,
+    target: 'current_conversation',
+    resolvedRequest: request,
+    confidence: 1,
+    reasoningPolicyHint: { complexity: 'medium', risk: 'high', contextNeed: 'none' },
+    executionScope: 'mutating',
+    inspectionTarget: 'local_system',
+    standaloneSystemOperation: true
+  }, SemanticIntentRouter.buildInput({ userMessage: request, mode: 'orion' }));
+  t.equal(structured.requiresExecution, true, 'the shared result carries execution need');
+  t.equal(structured.inspectionTarget, 'local_system', 'the shared result carries the evidence target');
+  t.equal(structured.standaloneSystemOperation, true, 'the shared result identifies standalone process work');
+  const prompt = agent.buildForcedDispatchHandoffPrompt(request);
+  t.ok(prompt.includes(request), 'the generated Coder prompt preserves the exact user request');
+  t.ok(/identify the intended local target/i.test(prompt), 'the Coder prompt resolves ambiguous process identity safely');
+  t.ok(/verify the result/i.test(prompt), 'the Coder prompt requires outcome verification');
+  t.ok(agentJs.includes('MUST call handoff_to_coder'), 'Dispatch system instructions state the permission-boundary invariant');
+  t.ok(agentJs.includes('synthesize the allowed Coder'), 'the invariant is enforced in code, not only prose');
+  t.ok(agentJs.includes('semanticIntent.requiresExecution === true'), 'the runtime consumes structured execution authority');
+  t.notOk(agentJs.includes('instructionAnalysis.requiresCoderExecution'), 'the old phrase-analysis execution property is gone');
+  t.end();
+});
+
+test('Dispatch handoff recovery no longer derives authority from narrated response prose', (t) => {
+  t.equal(agent.looksLikeIntendedCoderHandoff, undefined, 'narrated Coder intent has no phrase classifier');
+  t.equal(agent.looksLikeUnexecutedDispatchAction, undefined, 'generic action narration has no phrase classifier');
+  t.ok(agentJs.includes("['new_task', 'context_followup', 'steer_active_task'].includes(semanticIntent.intent)"),
+    'forced Dispatch preflight is restricted to structured executable intents');
+  t.ok(agentJs.includes('dispatchPreflightAuthorized') && agentJs.includes('dispatchPreflightStandalone'),
+    'preflight uses typed execution and standalone-operation fields');
+  t.notOk(agentJs.includes('looksLikeIntendedCoderHandoff('), 'the agent loop never scans response prose for handoff language');
+  t.notOk(agentJs.includes('looksLikeUnexecutedDispatchAction('), 'the agent loop never scans response prose for action narration');
+  t.end();
+});
+
+test('Dispatch semantic routing retains terminal task context for retry approvals', (t) => {
+  t.ok(
+    rendererJs.includes("['pending', 'active', 'completed', 'failed', 'cancelled']"),
+    'semantic routing loads terminal owned tasks as context in addition to controllable work'
+  );
+  t.ok(
+    rendererJs.includes('const recentOwnedTask = ownedTasks'),
+    'the newest terminal owned task is distinguished from active and pending authority'
+  );
+  t.ok(
+    rendererJs.includes('recentOwnedTask,') && rendererJs.includes('(boundTask || recentOwnedTask)'),
+    'the shared classifier receives the terminal task and its durable objective'
+  );
+  t.ok(
+    agentJs.includes('candidateAction: {') && agentJs.includes('Dispatch semantic adjudication confirmed'),
+    'a clean contextual handoff disagreement receives one structured semantic adjudication'
+  );
+  t.ok(
+    agentJs.includes('authorizedDispatchHandoffIntent'),
+    'the adjudicated intent is carried into durable task creation without a second contradictory classification'
+  );
+  t.end();
+});
+
+test('token-saving prompt cleanup keeps tool schemas authoritative', (t) => {
+  t.notOk(agentJs.includes('\nTools available:'), 'system prompts do not duplicate the formal tool schemas as prose lists');
+  t.ok(agentJs.includes('TOOL USE:'), 'system prompts keep compact tool-use guidance');
+  t.ok(agentJs.includes("if (activeConversationMode === 'orion')"), 'tool builder branches for Dispatch conversations');
+  t.ok(agentJs.includes('allTools.filter(tool => DISPATCH_TOOL_ALLOWLIST.has(tool.name))'), 'Dispatch receives only allowlisted tool declarations');
+  t.ok(agentJs.includes("'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model'"), 'Dispatch can inspect existing project artwork through read-only visual tools');
+  t.ok(agentJs.includes('conversation._systemFactsSignature'), 'stable system facts are tracked by conversation signature');
+  t.ok(agentJs.includes('[ORION SYSTEM FACTS - compact]'), 'unchanged system facts use a compact repeat block');
+  t.ok(agentJs.includes('${workWalkthroughOverride}${knownProjectsBlock}`') && agentJs.includes('const knownProjectsBlock = knownProjectsFacts'), 'known project paths are folded into the full system-facts exchange');
+  t.notOk(agentJs.includes('buildToolUseContractPrompt()'), 'the redundant per-turn tool contract is no longer injected');
+  t.ok(agentJs.includes('const TOOL_RESULT_TRIM_THRESHOLD_CHARS = 1500') && agentJs.includes('const TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES = 3'), 'older read-only tool payloads are compacted aggressively');
+  t.ok(agentJs.includes('msgs.slice(-10)') && agentJs.includes("substring(0, 300)"), 'background memory extraction uses a bounded transcript');
+  t.end();
+});
+
+test('incidental observations are bounded Coder-only run notes', (t) => {
+  t.ok(agentJs.includes('INCIDENTAL OBSERVATIONS'), 'Coder prompt includes incidental observation policy');
+  t.ok(agentJs.includes('name: "note_incidental_issue"'), 'Coder tool schema exposes note_incidental_issue');
+  t.ok(agentJs.includes('recordIncidentalIssueCandidate(incidentalIssueBuffer, args)'), 'tool records into the run-scoped buffer');
+  t.ok(agentJs.includes('appendIncidentalObservationsToFinal'), 'final handoff can append vetted incidental observations');
+  const allowlistStart = agentJs.indexOf('const DISPATCH_TOOL_ALLOWLIST = new Set([');
+  const allowlistEnd = agentJs.indexOf(']);', allowlistStart);
+  const allowlistBlock = agentJs.slice(allowlistStart, allowlistEnd);
+  t.notOk(allowlistBlock.includes('note_incidental_issue'), 'Dispatch allowlist does not include note_incidental_issue');
+  t.ok(allowlistBlock.includes('ask_clarifying_questions'), 'Dispatch can pause ambiguous handoffs with the structured clarification tool');
+  t.end();
+});
+
+test('edit intelligence prompt and schema guardrails are wired', (t) => {
+  t.ok(agentJs.includes('Before changing a function name or signature, call "find_references"'), 'system prompt requires references before function renames/signature changes');
+  t.ok(agentJs.includes('run targeted "run_linter" after JS/TS edits'), 'system prompt calls out targeted JS/TS lint/typecheck after edits');
+  t.ok(agentJs.includes('Before writing tricky logic with loops, async behavior, parsing, file mutations'), 'scratchpad guidance targets tricky logic instead of every function');
+  t.ok(agentJs.includes('Use full-file reads when the file fits the active context budget'), 'read_file schema allows full reads when they are cheaper than repeated chunks');
+  t.ok(agentJs.includes('read_multiple_ranges') && agentJs.includes('inspect_code_context'), 'agent exposes consolidated exact-source retrieval tools');
+  t.ok(agentJs.includes('Semantic similarity scores do not prove relevance'), 'semantic_search schema requires verification of semantic results');
+  t.ok(agentJs.includes('Call this BEFORE renaming, removing, or changing the signature of any function'), 'find_references schema is proactive for refactors');
+  t.ok(agentJs.includes('stale numbers from before a previous edit can corrupt the file'), 'replace_range schema warns about stale line numbers');
+  t.ok(agentJs.includes('fileData.indexOf(args.target, index + args.target.length)'), 'modify_file refuses non-unique targets before replacing');
+  t.end();
+});
+
+test('search tools expose optional context without shrinking semantic recall', (t) => {
+  t.ok(agentJs.includes('contextLines: Number.isFinite(Number(args.contextLines))'), 'grep_search forwards optional contextLines');
+  t.ok(agentJs.includes('Optional number of surrounding lines to include before and after each match'), 'grep_search schema declares contextLines');
+  t.ok(semanticSearchJs.includes('topK = 10'), 'semantic search defaults to ten results');
+  t.ok(agentJs.includes("case 'read_multiple_ranges'"), 'read_multiple_ranges has an executor');
+  t.ok(agentJs.includes("case 'inspect_code_context'"), 'inspect_code_context has an executor');
+  t.end();
+});
+
+test('post-final cleanup gates and repeated completion blocks cannot consume useful final answers', (t) => {
+  t.ok(agentJs.includes('!bestVisibleAnswer && !memoryNudgeSent'), 'memory nudge does not run after a substantive final answer already exists');
+  t.ok(agentJs.includes('!bestVisibleAnswer && !skillGateFired'), 'skill nudge does not run after a substantive final answer already exists');
+
+  const gate = {
+    status: 'continue_work',
+    reasons: ['No test/smoke/manual verification evidence is recorded.'],
+    missingEvidence: ['tests, smoke check, manual verification, or inspected evidence'],
+    pendingWinConditions: [],
+    pendingRequirements: []
+  };
+  const signature = agent.buildCompletionGateLoopSignature(gate);
+  t.equal(signature, agent.buildCompletionGateLoopSignature({ ...gate }), 'completion block signatures are stable for identical gate reasons');
+  t.equal(agent.shouldEscapeRepeatedCompletionGateBlock({
+    gate,
+    signature,
+    previousSignature: signature,
+    fileMutationCount: 1,
+    previousFileMutationCount: 1
+  }), true, 'identical completion blocks with no intervening file mutations escape instead of looping');
+  t.equal(agent.shouldEscapeRepeatedCompletionGateBlock({
+    gate,
+    signature,
+    previousSignature: signature,
+    fileMutationCount: 2,
+    previousFileMutationCount: 1
+  }), false, 'new file mutations reset the repeated-block escape');
   t.end();
 });
 

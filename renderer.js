@@ -65,9 +65,14 @@ let appConfig = {
 };
 
 let currentWorkspace = '';
+let desktopPromptSubmissionInFlight = false;
+const promptSubmissionRegistry = window.OrionPromptSubmission
+  ? new window.OrionPromptSubmission.SubmissionRegistry({ ttlMs: 30000 })
+  : null;
 let currentWorkspaceTestCommand = null; // { command, autoDetected, updatedAt } | null — per-workspace override
 let cachedUserDataPath = '';
 let activeConversationId = null;
+let conversationSelectionEpoch = 0;
 let conversations = []; // { id, title, messages, tasks, testResults }
 let activeProcessId = null;
 let projects = []; // Array of workspace folder paths
@@ -75,7 +80,23 @@ let activeAiBubble = null; // Currently rendering AI message bubble
 let currentFileTreeItems = [];
 let currentRunArtifacts = [];
 let expandedFileFolders = new Set();
-let appMode = localStorage.getItem('appMode') || 'orion'; // 'orion' | 'coder'
+// Every cold launch begins at a clean Dispatch draft. Mode changes during the running app are
+// still preserved in memory, but an old persisted UI preference must not reopen Coder or an old
+// Dispatch transcript on the next launch.
+let appMode = 'orion'; // 'orion' | 'coder'
+let lastDispatchConversationId = '';
+let dispatchDraft = {
+  active: true,
+  projectPath: '',
+  contextSummary: ''
+};
+const RendererTaskOrchestration = window.OrionTaskOrchestration;
+const RendererWorkspaceResolution = window.OrionWorkspaceResolution;
+const RendererOrchestrationContracts = window.OrionOrchestrationContracts;
+const RendererSupervisorOrchestration = window.OrionSupervisorOrchestration;
+const RendererSemanticIntentRouter = window.OrionSemanticIntentRouter;
+let orchestrationTasksReady = Promise.resolve();
+const orchestrationTaskCache = new Map();
 
 // DOM ELEMENTS
 const el = {
@@ -248,26 +269,33 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
   
+  const btnShowAgentBrowser = document.getElementById('btn-show-agent-browser');
+  if (btnShowAgentBrowser) {
+    btnShowAgentBrowser.addEventListener('click', async () => {
+      if (window.api && typeof window.api.showAgentBrowser === 'function') {
+        const result = await window.api.showAgentBrowser();
+        if (!result.success) {
+          alert(`Failed to show agent browser: ${result.error}`);
+        }
+      }
+    });
+  }
+  
   // Load projects from local storage
   loadProjectsFromStorage();
   renderProjectsList();
   
   // Load conversations from local storage
   await loadConversationsFromStorage();
+  orchestrationTasksReady = initializeOrchestrationTasks();
+  await orchestrationTasksReady;
   
   // Migrate any project conversations that accumulated in standalone list
   migrateConversations();
   
-  // Select the most recent conversation belonging to the restored mode. Dispatch and Coder each
-  // have their own conversation history, so a conversation from the other mode -- even a
-  // standalone one -- must never become the active target just because it's the most recently
-  // created conversation overall.
-  const modeMatch = conversations.find(c => conversationMode(c) === appMode);
-  if (modeMatch) {
-    selectConversation(modeMatch.id);
-  } else {
-    createNewConversation(appMode);
-  }
+  // A cold launch is an uncommitted Dispatch draft. Existing transcripts remain available inside
+  // Dispatch, but none is selected and no empty record is created merely by opening Orion.
+  startDispatchDraft({ coldLaunch: true });
   refreshPhoneCompanionPairing();
   removeLegacyPhoneCompanionTokenBubbles();
 });
@@ -437,9 +465,9 @@ function renderImagePreviews() {
   }
   container.style.display = '';
   thumbnails.innerHTML = pendingImages.map((img, i) =>
-    `<div class="img-preview-thumb" data-idx="${i}">` +
-    `<img src="${img.previewUrl}" alt="${escapeHtml(img.name || 'image')}" title="${escapeHtml(img.name || 'image')}">` +
-    `<button class="img-preview-remove" data-idx="${i}" title="Remove image" aria-label="Remove image">&times;</button>` +
+    `<div class="img-preview-thumb" data-idx="${i}">`
+    `<img src="${img.previewUrl}" alt="${escapeHtml(img.name || 'image')}" title="${escapeHtml(img.name || 'image')}">`
+    `<button class="img-preview-remove" data-idx="${i}" title="Remove image" aria-label="Remove image">&times;</button>`
     `</div>`
   ).join('');
   thumbnails.querySelectorAll('.img-preview-remove').forEach(btn => {
@@ -903,6 +931,10 @@ function setLeftSidebarCollapsed(collapsed, persist = true) {
 }
 
 function setAppMode(mode, persist = true) {
+  // Invalidate any stub hydration that began for the mode the user just left. Without this
+  // token, its awaited disk read can finish later and repaint the old conversation over the
+  // newly selected Dispatch/Coder view.
+  if (mode !== appMode) conversationSelectionEpoch += 1;
   appMode = mode;
   document.body.setAttribute('data-mode', mode);
 
@@ -915,18 +947,25 @@ function setAppMode(mode, persist = true) {
   if (orionContent) orionContent.classList.toggle('active', mode === 'orion');
   if (coderContent) coderContent.classList.toggle('active', mode === 'coder');
 
-  // Dispatch and Coder are separate entities with separate conversation histories -- a
-  // conversation that belongs to the other mode must never stay displayed after a mode switch.
-  if (conversations.length > 0) {
-    const activeConv = conversations.find(c => c.id === activeConversationId);
-    if (!activeConv || conversationMode(activeConv) !== mode) {
-      const replacement = conversations.find(c => conversationMode(c) === mode);
-      if (replacement) {
-        selectConversation(replacement.id);
-      } else {
-        createNewConversation(mode);
-      }
+  // Dispatch preserves its current in-session focus, including an uncommitted draft, but never
+  // chooses an old transcript merely because the user opened the mode. Coder keeps its existing
+  // task-oriented selection behavior.
+  const activeConv = conversations.find(c => c.id === activeConversationId);
+  if (mode === 'orion') {
+    if (activeConv && conversationMode(activeConv) === 'orion') {
+      lastDispatchConversationId = activeConv.id;
+      dispatchDraft.active = false;
+    } else if (dispatchDraft.active) {
+      startDispatchDraft(dispatchDraft);
+    } else {
+      const remembered = conversations.find(c => c.id === lastDispatchConversationId && conversationMode(c) === 'orion');
+      if (remembered) selectConversation(remembered.id, { selectionEpoch: conversationSelectionEpoch });
+      else startDispatchDraft();
     }
+  } else if (!activeConv || conversationMode(activeConv) !== 'coder') {
+    const replacement = conversations.find(c => conversationMode(c) === 'coder');
+    if (replacement) selectConversation(replacement.id, { selectionEpoch: conversationSelectionEpoch });
+    else createNewConversation('coder');
   }
 
   // Adapt main workspace for mode
@@ -967,6 +1006,255 @@ function updateOrionGreeting() {
   nameEl.textContent = `${tod}, Jason.`;
 }
 
+function supervisedTaskContext(task, isGlobalRunning = false, globalRunningId = '') {
+  const taskId = String(task && task.taskId || '');
+  const originConversationId = String(task && task.origin && task.origin.conversationId || '');
+  const targetConversationId = String(task && task.target && task.target.conversationId || '');
+  const originConversation = conversations.find(conversation => conversation.id === originConversationId);
+  const targetConversation = conversations.find(conversation => conversation.id === targetConversationId);
+  const activeRunTaskId = window.getActiveRunTaskId ? String(window.getActiveRunTaskId() || '') : '';
+  const live = !!(
+    isGlobalRunning
+    && globalRunningId === targetConversationId
+    && (!activeRunTaskId || activeRunTaskId === taskId)
+  );
+  const awaitingReview = !!(
+    (originConversation
+      && originConversation.awaitingDelegatedPlan
+      && String(originConversation.awaitingDelegatedPlan.taskId || '') === taskId)
+    || (targetConversation
+      && targetConversation.awaitingPlanApproval
+      && !targetConversation.planApproved
+      && (!targetConversation.awaitingPlanApprovalTaskId
+        || String(targetConversation.awaitingPlanApprovalTaskId) === taskId))
+  );
+  const revisingPlan = !!(
+    (originConversation
+      && originConversation.revisingDelegatedPlan
+      && String(originConversation.revisingDelegatedPlan.taskId || '') === taskId)
+    || (targetConversation
+      && targetConversation.planRevisionInProgress
+      && String(targetConversation.planRevisionInProgress.taskId || '') === taskId)
+  );
+  return {
+    originConversation,
+    targetConversation,
+    originConversationId,
+    targetConversationId,
+    awaitingReview,
+    revisingPlan,
+    planApproved: !!(targetConversation && targetConversation.planApproved),
+    executionMode: live && window.getAgentExecutionMode ? window.getAgentExecutionMode() : '',
+    subStatus: live && window.getAgentSubStatus ? window.getAgentSubStatus() : '',
+    live
+  };
+}
+
+function getSupervisedTaskForConversation(conversationId, activeTaskId = '') {
+  if (!RendererTaskOrchestration || typeof RendererTaskOrchestration.selectSupervisedTask !== 'function') return null;
+  return RendererTaskOrchestration.selectSupervisedTask(
+    [...orchestrationTaskCache.values()],
+    conversationId,
+    activeTaskId,
+    { delegatedOnly: true }
+  );
+}
+
+function getSupervisedTaskPresentation(task, isGlobalRunning = false, globalRunningId = '') {
+  if (!task || !RendererTaskOrchestration
+      || typeof RendererTaskOrchestration.describeSupervisedTaskPresentation !== 'function') return null;
+  const context = supervisedTaskContext(task, isGlobalRunning, globalRunningId);
+  return {
+    ...RendererTaskOrchestration.describeSupervisedTaskPresentation(task, context),
+    ...context
+  };
+}
+
+function collectDispatchActiveWork(isGlobalRunning = false, globalRunningId = '') {
+  const activeWork = [];
+  conversations.filter(conversation => conversationMode(conversation) === 'orion').forEach(dispatchConversation => {
+    const preferredTaskId = dispatchConversation.launchedCoderTaskId || dispatchConversation.lastOwnedTaskId || '';
+    const durableTask = getSupervisedTaskForConversation(dispatchConversation.id, preferredTaskId);
+    const coderId = String(
+      (durableTask && durableTask.target && durableTask.target.conversationId)
+      || dispatchConversation.launchedCoderConvId
+      || ''
+    );
+    const coderConversation = coderId ? conversations.find(conversation => conversation.id === coderId) : null;
+    if (durableTask || coderConversation) {
+      const taskId = String((durableTask && durableTask.taskId) || preferredTaskId);
+      const running = isGlobalRunning && !!coderId && globalRunningId === coderId;
+      const queued = Array.isArray(window.promptQueue)
+        && window.promptQueue.some(item => item && (item.taskId === taskId || item.conversationId === coderId));
+      const waitingForInput = !!(coderConversation && coderConversation.awaitingClarification);
+      const waitingForReview = !!(coderConversation && coderConversation.awaitingPlanApproval && !coderConversation.planApproved);
+      const status = durableTask
+        ? durableTask.status
+        : (running ? 'active' : ((queued || waitingForInput || waitingForReview) ? 'pending' : 'failed'));
+      const presentation = durableTask
+        ? getSupervisedTaskPresentation(durableTask, isGlobalRunning, globalRunningId)
+        : null;
+      const subStatus = presentation
+        ? presentation.label
+        : (running && window.getAgentSubStatus
+          ? window.getAgentSubStatus()
+          : (queued
+            ? 'Queued for Coder'
+            : (waitingForInput
+              ? 'Waiting for your input'
+              : (waitingForReview ? 'Plan ready for review' : 'Needs attention'))));
+      const projectPath = (durableTask && durableTask.workspacePath)
+        || (coderConversation && coderConversation.projectPath)
+        || inferDispatchProjectPath(dispatchConversation);
+      activeWork.push({
+        id: coderId,
+        taskId,
+        supervisingConversationId: dispatchConversation.id,
+        title: (durableTask && durableTask.title) || dispatchConversation.launchedCoderTaskTitle || (coderConversation && coderConversation.title) || 'Coder task',
+        projectPath,
+        projectName: (projectPath || 'Standalone').replace(/[\\\/]+$/, '').split(/[\\\/]/).pop(),
+        status,
+        subStatus,
+        startedAt: (durableTask && durableTask.startedAt) || dispatchConversation.launchedCoderTaskStart || (coderConversation && coderConversation.createdAt) || 0,
+        completedAt: (durableTask && (durableTask.completedAt || durableTask.cancelledAt || durableTask.failedAt)) || 0,
+        canContinue: status === 'failed'
+      });
+    } else if (dispatchConversation.lastDelegatedWork) {
+      const receipt = dispatchConversation.lastDelegatedWork;
+      const projectPath = receipt.projectPath || inferDispatchProjectPath(dispatchConversation);
+      activeWork.push({
+        id: receipt.coderConversationId || '',
+        supervisingConversationId: dispatchConversation.id,
+        title: receipt.title || 'Coder task',
+        projectPath,
+        projectName: (projectPath || 'Standalone').replace(/[\\\/]+$/, '').split(/[\\\/]/).pop(),
+        status: receipt.status || 'completed',
+        subStatus: receipt.subStatus || 'Completed',
+        startedAt: receipt.startedAt || 0,
+        completedAt: receipt.completedAt || 0,
+        // Unfinished delegated work can be resumed with one click instead of a manual re-queue.
+        canContinue: !!receipt.coderConversationId && (receipt.status === 'blocked' || (receipt.pendingCount || 0) > 0)
+      });
+    }
+  });
+  return activeWork.sort((a, b) => (b.completedAt || b.startedAt || 0) - (a.completedAt || a.startedAt || 0));
+}
+
+function renderDesktopDispatchLanding() {
+  const activeSection = document.getElementById('dispatch-desktop-active-work');
+  if (!activeSection) return;
+  const runningConversationId = window.getRunningConversationId ? window.getRunningConversationId() : '';
+  const globallyRunning = !!(window.isAgentRunning && window.isAgentRunning());
+  const activeWork = collectDispatchActiveWork(globallyRunning, runningConversationId);
+
+  const visibleWork = activeWork.slice(0, 3);
+  activeSection.hidden = visibleWork.length === 0;
+  activeSection.innerHTML = visibleWork.length ? `<div class="dispatch-desktop-section-head"><span>Active work</span></div>
+    <div class="dispatch-desktop-work-list">${visibleWork.map(work => `<div class="dispatch-desktop-work-item">
+      <button class="dispatch-desktop-work-row" type="button" data-dispatch-supervisor="${escapeHtml(work.supervisingConversationId)}">
+        <span class="dispatch-desktop-work-copy">
+          <span class="dispatch-desktop-work-title">${escapeHtml(work.title)}</span>
+          <span class="dispatch-desktop-work-meta">${escapeHtml(work.projectName)} · ${escapeHtml(work.subStatus || work.status)}</span>
+        </span>
+        <span aria-hidden="true">›</span>
+      </button>
+      ${work.canContinue ? `<button class="dispatch-desktop-work-continue" type="button" data-dispatch-continue-work="${escapeHtml(work.id)}" data-dispatch-supervising="${escapeHtml(work.supervisingConversationId)}" title="Queue Coder to finish the remaining work">Continue</button>` : ''}
+    </div>`).join('')}</div>` : '';
+  if (!syncDispatchCoderStatusCard(activeConversationId, globallyRunning, runningConversationId)) {
+    hideCoderStatusCard();
+  }
+}
+
+// One-click continuation of unfinished delegated work (a completion receipt with pending tasks,
+// or a stalled run). Previously the completion summary said "you can queue a continuation" but
+// there was no mechanism behind it — resuming meant manually re-prompting the Coder conversation.
+async function continueDelegatedWork(coderConvId, supervisingOrionConvId) {
+  const coderConv = conversations.find(c => c.id === coderConvId);
+  if (!coderConv) {
+    showToast('The Coder conversation for this work no longer exists.', 'attention');
+    return;
+  }
+  const prompt = 'Continue the previous task from where it left off. Review the task checklist and the last few messages to see what is done and what remains, then complete the remaining pending work. Do not redo finished work; if you hit the same blocker again, stop and describe it precisely.';
+  const modelValue = window.getSelectedModel ? window.getSelectedModel() : undefined;
+
+  const orionConv = conversations.find(c => c.id === supervisingOrionConvId);
+  if (!orionConv) {
+    showToast('The supervising Dispatch conversation no longer exists.', 'attention');
+    return;
+  }
+  const messageId = createConversationMessageId(coderConv.id);
+  coderConv.messages.push({ id: messageId, role: 'user', source: 'dispatch-continue', text: prompt, createdAt: Date.now() });
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(coderConv.id);
+  const delegatedReceipt = orionConv.lastDelegatedWork || {};
+  const taskTitle = delegatedReceipt.title || coderConv.title || 'Continue Coder task';
+  const resumableTaskId = String(delegatedReceipt.taskId || '');
+  let resumableTask = resumableTaskId ? orchestrationTaskCache.get(resumableTaskId) : null;
+  if (resumableTaskId && (!resumableTask || resumableTask.status !== 'pending')
+      && typeof window.getOrchestrationTaskStatus === 'function') {
+    const read = await window.getOrchestrationTaskStatus(resumableTaskId, orionConv.id);
+    resumableTask = read && read.success ? read.task : null;
+  }
+  if (resumableTaskId && !resumableTask) {
+    showToast('Orion could not verify the existing task state, so it did not create a duplicate continuation.', 'attention');
+    return;
+  }
+  const queued = resumableTask && resumableTask.status === 'pending'
+    ? await queueTaskContinuation({
+        taskId: resumableTaskId,
+        prompt,
+        modelSelectValue: modelValue,
+        originConversationId: orionConv.id,
+        originMessageId: messageId,
+        targetConversationId: coderConv.id,
+        workspace: structuredWorkspaceForConversation(coderConv),
+        source: 'dispatch-continue',
+        requireExistingTask: true
+      })
+    : await enqueueOrchestrationTask({
+        prompt,
+        originalUserMessage: prompt,
+        resolvedObjective: prompt,
+        title: taskTitle,
+        modelSelectValue: modelValue,
+        originConversationId: orionConv.id,
+        originMessageId: messageId,
+        targetConversationId: coderConv.id,
+        workspace: structuredWorkspaceForConversation(coderConv),
+        precedingMessages: taskContextMessages(coderConv),
+        constraints: ['Do not redo completed work.', 'Stop and report precisely if the same blocker recurs.'],
+        source: 'dispatch-continue',
+        alreadyRendered: true
+      });
+  if (!queued.success) {
+    showToast(queued.error || queued.clarification || 'Could not queue the continuation.', 'attention');
+    return;
+  }
+
+  orionConv.launchedCoderConvId = coderConvId;
+  orionConv.launchedCoderTaskId = queued.task.taskId;
+  orionConv.lastOwnedTaskId = queued.task.taskId;
+  orionConv.launchedCoderTaskTitle = taskTitle;
+  orionConv.launchedCoderTaskStart = Date.now();
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+  await flushConversationsToStorage();
+  if (typeof window.startCoderTaskMonitor === 'function') {
+    window.startCoderTaskMonitor(orionConv.id, coderConvId, queued.task.taskId);
+  }
+  renderDesktopDispatchLanding();
+
+  if (window.isAgentRunning && window.isAgentRunning()) {
+    // Something else is mid-turn — the queue drains when it finishes.
+    showToast('Continuation queued — Coder will pick it up when the current turn finishes.');
+  } else {
+    showToast('Coder is continuing the remaining work.');
+    window.promptQueue = window.promptQueue.filter(item => item.taskId !== queued.task.taskId);
+    window.runAgentLoop(queued.queueItem.prompt, modelValue, coderConv, {
+      source: 'queue',
+      taskId: queued.task.taskId
+    });
+  }
+}
+
 function runCommandPaletteAction(command) {
   const targets = {
     'new-task': el.btnNewChat,
@@ -997,7 +1285,35 @@ function setupProgressiveDisclosure() {
   setAppMode(appMode, false); // Initialize from stored preference
 
   // Orion prompt chips — populate input (with focus) so Jason can review/edit before sending
-  document.getElementById('orion-welcome-splash')?.addEventListener('click', (e) => {
+  document.getElementById('orion-welcome-splash')?.addEventListener('click', async (e) => {
+    const continueWorkButton = e.target.closest('[data-dispatch-continue-work]');
+    if (continueWorkButton) {
+      continueDelegatedWork(
+        continueWorkButton.getAttribute('data-dispatch-continue-work'),
+        continueWorkButton.getAttribute('data-dispatch-supervising')
+      );
+      return;
+    }
+    const continueButton = e.target.closest('[data-dispatch-continue], [data-dispatch-supervisor]');
+    if (continueButton) {
+      const conversationId = continueButton.getAttribute('data-dispatch-continue')
+        || continueButton.getAttribute('data-dispatch-supervisor');
+      if (conversationId) selectConversation(conversationId);
+      return;
+    }
+    const freshProjectButton = e.target.closest('[data-dispatch-fresh-project]');
+    if (freshProjectButton) {
+      const focusResult = await window.beginNewFocus(activeConversationId);
+      if (!focusResult || focusResult.success === false) {
+        showToast('Could not cancel the pending work. The current focus was preserved.', 'error');
+        return;
+      }
+      startDispatchDraft({
+        projectPath: freshProjectButton.getAttribute('data-dispatch-fresh-project') || '',
+        contextSummary: freshProjectButton.getAttribute('data-dispatch-summary') || ''
+      });
+      return;
+    }
     const chip = e.target.closest('.orion-prompt-chip');
     if (!chip) return;
     const prompt = chip.dataset.prompt || '';
@@ -1010,6 +1326,10 @@ function setupProgressiveDisclosure() {
     input.setSelectionRange(prompt.length, prompt.length);
     // Trigger resize in case the input uses auto-height
     input.dispatchEvent(new Event('input'));
+  });
+  document.getElementById('btn-dispatch-browse')?.addEventListener('click', () => {
+    setLeftSidebarCollapsed(false);
+    el.conversationList?.querySelector('.conversation-item, .empty-state')?.scrollIntoView({ block: 'nearest' });
   });
 
   const closePalette = () => el.commandPaletteModal && el.commandPaletteModal.classList.remove('active');
@@ -1672,10 +1992,14 @@ function setupChatHandlers() {
     submitMessage();
   });
   if (el.btnStopAgent) {
-    el.btnStopAgent.addEventListener('click', () => {
+    el.btnStopAgent.addEventListener('click', async () => {
       if (window.isAgentRunning && window.isAgentRunning() && window.stopAgentExecution) {
         el.btnStopAgent.disabled = true;
-        window.stopAgentExecution({ mode: 'hard' });
+        const result = await stopExpectedTaskForConversation(activeConversationId);
+        if (!result || result.success === false) {
+          el.btnStopAgent.disabled = false;
+          showToast((result && result.error) || 'Could not stop that task.', 'attention');
+        }
       }
     });
   }
@@ -1794,22 +2118,1120 @@ function triggerSteer() {
   document.getElementById('btn-queue').style.display = 'none';
 }
 
-function triggerQueue() {
-  const text = el.chatInput.value.trim();
-  if (!text) return;
-  
-  if (window.promptQueue) {
-    const queueItem = {
-      id: createQueuedPromptId(),
-      prompt: text,
-      modelSelectValue: el.modelSelect.value,
-      conversationId: activeConversationId,
-      source: 'user-queue',
-      createdAt: Date.now()
+function createConversationMessageId(conversationId = activeConversationId) {
+  return `msg_${String(conversationId || 'conversation')}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function structuredWorkspaceForConversation(conv, explicitPath = '') {
+  const searchRoot = getDispatchWorkspaceRoot();
+  const mode = conversationMode(conv);
+  const workspacePath = String(explicitPath || (conv && (conv.workspace || conv.projectPath || conv.dispatchProjectPath)) || '').trim();
+  if (!RendererWorkspaceResolution) {
+    return {
+      role: workspacePath ? (mode === 'coder' ? 'standalone_coder' : 'active_project') : 'unresolved',
+      path: workspacePath,
+      project: { name: workspacePath.split(/[\\/]/).pop() || '', path: (conv && (conv.projectPath || conv.dispatchProjectPath)) || '' },
+      source: 'legacy',
+      resolved: !!workspacePath
+    };
+  }
+  const resolution = RendererWorkspaceResolution.classifyWorkspace({
+    mode,
+    workspacePath,
+    projectPath: conv && conv.projectPath,
+    dispatchProjectPath: conv && conv.dispatchProjectPath,
+    searchRoot,
+    standaloneRoot: getStandaloneWorkspaceRoot(),
+    knownProjects: projects
+  });
+  return {
+    role: resolution.kind,
+    path: resolution.path || '',
+    project: {
+      name: resolution.projectName || '',
+      path: resolution.projectPath || ''
+    },
+    source: resolution.source || '',
+    resolved: resolution.kind !== RendererWorkspaceResolution.KINDS.UNRESOLVED && !!resolution.path
+  };
+}
+
+function taskContextMessages(conv) {
+  return (conv && Array.isArray(conv.messages) ? conv.messages : [])
+    .filter(message => message && ['user', 'assistant', 'model', 'orion'].includes(String(message.role || '').toLowerCase()))
+    .slice(-16)
+    .map(message => ({
+      id: String(message.id || message.messageId || ''),
+      role: String(message.role || ''),
+      text: String(message.text || message.content || '').slice(0, 5000),
+      createdAt: message.createdAt || 0
+    }));
+}
+
+function persistTaskClarification(conv, clarification) {
+  if (!conv || !clarification) return;
+  conv.messages = Array.isArray(conv.messages) ? conv.messages : [];
+  conv.messages.push({
+    id: createConversationMessageId(conv.id),
+    role: 'assistant',
+    source: 'task-resolution-clarification',
+    text: clarification,
+    createdAt: Date.now()
+  });
+  conv.updatedAt = Date.now();
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+  saveConversationsToStorage();
+  if (conv.id === activeConversationId) {
+    window.clearActiveAiBubble?.();
+    renderAiMessage(clarification, [], conv.id);
+  }
+}
+
+async function enqueueOrchestrationTask(options = {}) {
+  if (!RendererTaskOrchestration || !window.api || typeof window.api.createOrchestrationTask !== 'function') {
+    return { success: false, error: 'Durable task orchestration is unavailable.' };
+  }
+  const targetConversationId = String(options.targetConversationId || options.conversationId || activeConversationId || '');
+  const originConversationId = String(options.originConversationId || targetConversationId || '');
+  const targetConv = conversations.find(conv => conv.id === targetConversationId);
+  const originConv = conversations.find(conv => conv.id === originConversationId) || targetConv;
+  if (!targetConv || !originConv) return { success: false, error: 'Task conversation could not be resolved.' };
+  const originalUserMessage = String(options.originalUserMessage || options.prompt || '').trim();
+  const semanticIntent = options.semanticIntent || await classifyCurrentConversationIntent(
+    originConv,
+    originalUserMessage,
+    { model: options.modelSelectValue, taskId: options.taskId || '' }
+  );
+  const workspace = options.workspace && typeof options.workspace === 'object'
+    ? options.workspace
+    : structuredWorkspaceForConversation(originConv, options.workspacePath || '');
+  const packetResult = RendererTaskOrchestration.buildTaskPacket({
+    originalUserMessage,
+    resolvedObjective: options.resolvedObjective || '',
+    title: options.title || '',
+    precedingMessages: options.precedingMessages || taskContextMessages(originConv),
+    precedingConversationSummary: options.precedingConversationSummary || '',
+    workspace,
+    knownProjects: projects,
+    searchRoot: getDispatchWorkspaceRoot(),
+    requirements: options.requirements || [],
+    constraints: options.constraints || [],
+    unresolvedDecisions: options.unresolvedDecisions || [],
+    origin: {
+      conversationId: originConversationId,
+      sessionId: String(options.originSessionId || originConv.sessionId || originConversationId),
+      messageId: String(options.originMessageId || '')
+    },
+    target: {
+      conversationId: targetConversationId,
+      sessionId: String(options.targetSessionId || targetConv.sessionId || targetConversationId),
+      mode: conversationMode(targetConv)
+    },
+    source: options.source || 'user-queue',
+    images: Array.isArray(options.images) ? options.images : [],
+    contextPacketIds: Array.isArray(options.contextPacketIds) ? options.contextPacketIds : [],
+    semanticIntent,
+    timestamp: options.createdAt || Date.now()
+  });
+  if (!packetResult.success || !packetResult.task) {
+    persistTaskClarification(originConv, packetResult.clarification || 'What specific work should I queue?');
+    return { success: false, needsClarification: true, clarification: packetResult.clarification, task: null };
+  }
+
+  const persisted = await window.api.createOrchestrationTask(packetResult.task);
+  if (!persisted || persisted.success === false || !persisted.task) {
+    return { success: false, error: (persisted && persisted.error) || 'Task could not be persisted.' };
+  }
+  const task = persisted.task;
+  const previousTargetTaskId = targetConv.lastOrchestrationTaskId || '';
+  const previousOriginTaskId = originConv.lastOwnedTaskId || '';
+  let queueItem = null;
+  try {
+    orchestrationTaskCache.set(task.taskId, task);
+    const runtimePrompt = RendererTaskOrchestration.renderTaskPrompt(task);
+    window.promptQueue = Array.isArray(window.promptQueue) ? window.promptQueue : [];
+    queueItem = {
+      id: options.queueId || createQueuedPromptId(),
+      taskId: task.taskId,
+      prompt: runtimePrompt,
+      originalUserMessage: task.originalUserMessage,
+      taskTitle: task.title,
+      modelSelectValue: options.modelSelectValue || (el.modelSelect && el.modelSelect.value),
+      conversationId: targetConversationId,
+      originConversationId,
+      source: options.source || task.source,
+      createdAt: task.createdAt,
+      alreadyRendered: !!options.alreadyRendered,
+      images: Array.isArray(task.images) ? task.images : [],
+      contextPacketIds: Array.isArray(task.contextPacketIds) ? task.contextPacketIds : []
     };
     window.promptQueue.push(queueItem);
-    appendQueuedMessage(text, queueItem);
+    targetConv.lastOrchestrationTaskId = task.taskId;
+    originConv.lastOwnedTaskId = task.taskId;
+    if (typeof window.markConversationDirty === 'function') {
+      window.markConversationDirty(targetConv.id);
+      window.markConversationDirty(originConv.id);
+    }
+    await flushConversationsToStorage();
+    return { success: true, task, queueItem };
+  } catch (error) {
+    window.promptQueue = (Array.isArray(window.promptQueue) ? window.promptQueue : [])
+      .filter(item => item && item.taskId !== task.taskId);
+    orchestrationTaskCache.delete(task.taskId);
+    if (targetConv.lastOrchestrationTaskId === task.taskId) {
+      targetConv.lastOrchestrationTaskId = previousTargetTaskId;
+    }
+    if (originConv.lastOwnedTaskId === task.taskId) {
+      originConv.lastOwnedTaskId = previousOriginTaskId;
+    }
+    let rollbackError = '';
+    let rollbackTask = null;
+    try {
+      const rollback = window.api && typeof window.api.cancelOrchestrationTask === 'function'
+        ? await window.api.cancelOrchestrationTask(
+            task.taskId,
+            { conversationId: originConversationId },
+            'Rolled back because the task could not be attached to the runtime queue.'
+          )
+        : null;
+      rollbackTask = rollback && rollback.task ? rollback.task : null;
+      if (!rollback || !rollback.task || rollback.task.status !== 'cancelled') {
+        rollbackError = (rollback && rollback.error) || 'durable rollback was not confirmed';
+      }
+    } catch (rollbackFailure) {
+      rollbackError = rollbackFailure.message || String(rollbackFailure);
+    }
+    if (!rollbackError) {
+      return {
+        success: false,
+        error: `Task setup failed: ${error.message || error}`,
+        taskId: task.taskId,
+        rollbackConfirmed: true
+      };
+    }
+
+    // The durable create is already committed and cancellation could not be verified. Returning an
+    // ordinary failure here invites the caller/model to retry the handoff and create a duplicate
+    // task while this one still exists. Restore the runtime attachment and report committed success
+    // with a warning; the canonical task ID remains the sole work item.
+    const retainedTask = rollbackTask && rollbackTask.status !== 'cancelled' ? rollbackTask : task;
+    orchestrationTaskCache.set(retainedTask.taskId, retainedTask);
+    if (!queueItem) {
+      queueItem = {
+        id: options.queueId || createQueuedPromptId(),
+        taskId: retainedTask.taskId,
+        prompt: retainedTask.objective || retainedTask.originalUserMessage || originalUserMessage,
+        originalUserMessage: retainedTask.originalUserMessage || originalUserMessage,
+        taskTitle: retainedTask.title || options.title || 'Queued task',
+        modelSelectValue: options.modelSelectValue || (el.modelSelect && el.modelSelect.value),
+        conversationId: targetConversationId,
+        originConversationId,
+        source: options.source || retainedTask.source || 'user-queue',
+        createdAt: retainedTask.createdAt || Date.now(),
+        alreadyRendered: !!options.alreadyRendered,
+        images: Array.isArray(retainedTask.images) ? retainedTask.images : [],
+        contextPacketIds: Array.isArray(retainedTask.contextPacketIds) ? retainedTask.contextPacketIds : []
+      };
+    }
+    window.promptQueue = Array.isArray(window.promptQueue) ? window.promptQueue : [];
+    if (!window.promptQueue.some(item => item && item.taskId === retainedTask.taskId)) {
+      window.promptQueue.push(queueItem);
+    }
+    targetConv.lastOrchestrationTaskId = retainedTask.taskId;
+    originConv.lastOwnedTaskId = retainedTask.taskId;
+    try {
+      if (typeof window.markConversationDirty === 'function') {
+        window.markConversationDirty(targetConv.id);
+        window.markConversationDirty(originConv.id);
+      }
+    } catch (_) {}
+    return {
+      success: true,
+      task: retainedTask,
+      queueItem,
+      committedWithWarning: true,
+      warning: `Task ${retainedTask.taskId} was durably created, but runtime setup failed (${error.message || error}) and rollback could not be verified (${rollbackError}). Orion retained the original task instead of retrying it.`
+    };
   }
+}
+window.enqueueOrchestrationTask = enqueueOrchestrationTask;
+
+async function queueDispatchWorkForCoder(options = {}) {
+  const originConversationId = String(options.originConversationId || options.conversationId || activeConversationId || '');
+  const originConv = conversations.find(conv => conv.id === originConversationId);
+  const originalUserMessage = String(options.originalUserMessage || options.prompt || '').trim();
+  if (!originConv || conversationMode(originConv) !== 'orion') {
+    return { success: false, error: 'The Dispatch conversation for this task could not be resolved.' };
+  }
+  if (!originalUserMessage || !RendererTaskOrchestration || !RendererWorkspaceResolution) {
+    return { success: false, error: 'Durable Dispatch-to-Coder task resolution is unavailable.' };
+  }
+  const semanticIntent = options.semanticIntent || await classifyCurrentConversationIntent(
+    originConv,
+    originalUserMessage,
+    { model: options.modelSelectValue }
+  );
+  if (semanticIntent.needsClarification || semanticIntent.intent === 'clarification_required') {
+    const clarification = semanticIntent.clarificationQuestion || 'What specific work should I hand to Coder?';
+    persistTaskClarification(originConv, clarification);
+    return { success: false, needsClarification: true, clarification, task: null };
+  }
+
+  const contextText = [
+    ...taskContextMessages(originConv).map(message => message.text),
+    semanticIntent.resolvedRequest || originalUserMessage
+  ].join('\n');
+  const workspace = await bindNamedProjectForSupervisor(originConv, contextText);
+  const standaloneSystemWork = semanticIntent.standaloneSystemOperation === true;
+  const standalone = standaloneSystemWork && workspace.role !== 'active_project';
+  const taskWorkspace = standalone
+    ? {
+        role: 'standalone_coder',
+        path: getDispatchWorkspaceRoot(),
+        project: { name: '', path: '' },
+        source: 'standalone-system-task',
+        resolved: true
+      }
+    : workspace;
+
+  if (!standalone && taskWorkspace.role !== 'active_project' && taskWorkspace.role !== 'standalone_coder') {
+    const reference = (RendererWorkspaceResolution.extractProjectReferences(contextText) || [])[0] || '';
+    const clarification = reference
+      ? `I could not resolve ${reference} to a specific project workspace. Which project folder should Coder use?`
+      : 'Which specific project workspace should Coder use? The Projects directory is only a search root.';
+    persistTaskClarification(originConv, clarification);
+    return { success: false, needsClarification: true, clarification, task: null };
+  }
+
+  const packetResult = RendererTaskOrchestration.buildTaskPacket({
+    originalUserMessage,
+    resolvedObjective: String(options.resolvedObjective || semanticIntent.resolvedRequest || '').trim(),
+    title: String(options.title || '').trim(),
+    precedingMessages: options.precedingMessages || taskContextMessages(originConv),
+    precedingConversationSummary: String(options.precedingConversationSummary || ''),
+    workspace: taskWorkspace,
+    knownProjects: projects,
+    searchRoot: getDispatchWorkspaceRoot(),
+    requirements: Array.isArray(options.requirements) ? options.requirements : [],
+    constraints: Array.isArray(options.constraints) ? options.constraints : [],
+    unresolvedDecisions: Array.isArray(options.unresolvedDecisions) ? options.unresolvedDecisions : [],
+    origin: {
+      conversationId: originConv.id,
+      sessionId: String(options.originSessionId || originConv.sessionId || originConv.id),
+      messageId: String(options.originMessageId || '')
+    },
+    target: {
+      conversationId: 'pending-coder-conversation',
+      sessionId: 'pending-coder-conversation',
+      mode: 'coder'
+    },
+    source: options.source || 'dispatch-direct-coder-queue',
+    images: Array.isArray(options.images) ? options.images : [],
+    contextPacketIds: Array.isArray(options.contextPacketIds) ? options.contextPacketIds : [],
+    semanticIntent,
+    timestamp: options.createdAt || Date.now()
+  });
+  if (!packetResult.success || !packetResult.task) {
+    persistTaskClarification(originConv, packetResult.clarification || 'What specific work should I hand to Coder?');
+    return {
+      success: false,
+      needsClarification: true,
+      clarification: packetResult.clarification,
+      task: null
+    };
+  }
+
+  const packet = packetResult.task;
+  const promoted = await window.promoteWorkspaceToCoder({
+    path: taskWorkspace.path,
+    standalone,
+    prompt: packet.objective,
+    originalUserMessage,
+    resolvedObjective: packet.objective,
+    title: packet.title,
+    taskPacket: packet,
+    sourceConversationId: originConv.id,
+    sourceSessionId: packet.origin.sessionId,
+    sourceMessageId: packet.origin.messageId,
+    contextPacketIds: packet.contextPacketIds,
+    findings: packet.requirements,
+    requirements: packet.requirements,
+    constraints: packet.constraints,
+    unresolvedDecisions: packet.unresolvedDecisions,
+    precedingConversationSummary: packet.precedingConversationSummary,
+    semanticIntent,
+    open: options.open === true
+  });
+  if (!promoted || promoted.success === false || !promoted.task) {
+    return {
+      success: false,
+      needsClarification: !!(promoted && promoted.needsClarification),
+      clarification: promoted && promoted.needsClarification ? promoted.error : '',
+      error: (promoted && promoted.error) || 'Coder task handoff failed.'
+    };
+  }
+
+  originConv.lastOwnedTaskId = promoted.task.taskId;
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(originConv.id);
+  await flushConversationsToStorage();
+  renderDesktopDispatchLanding();
+  return { ...promoted, success: true, task: promoted.task, queueItem: promoted.queueItem };
+}
+window.queueDispatchWorkForCoder = queueDispatchWorkForCoder;
+
+async function queueTaskContinuation(options = {}) {
+  const targetConversationId = String(options.targetConversationId || options.conversationId || '');
+  const targetConv = conversations.find(conv => conv.id === targetConversationId);
+  if (!targetConv) return { success: false, error: 'Task conversation could not be resolved.' };
+  let existingTaskId = String(options.taskId || '');
+  if (!existingTaskId && options.requireExistingTask) {
+    let candidates = [...orchestrationTaskCache.values()].filter(task =>
+      task
+      && task.status === 'pending'
+      && task.target
+      && String(task.target.conversationId || '') === targetConversationId);
+    if (window.api && typeof window.api.listOrchestrationTasks === 'function') {
+      const listed = await window.api.listOrchestrationTasks({
+        status: 'pending',
+        targetConversationId,
+        sort: 'desc'
+      });
+      if (listed && listed.success !== false && Array.isArray(listed.tasks)) {
+        listed.tasks.forEach(task => {
+          if (task && task.taskId) orchestrationTaskCache.set(task.taskId, task);
+        });
+        candidates = listed.tasks.filter(task =>
+          task
+          && task.status === 'pending'
+          && task.target
+          && String(task.target.conversationId || '') === targetConversationId);
+      }
+    }
+    if (candidates.length !== 1) {
+      return {
+        success: false,
+        error: candidates.length
+          ? 'More than one pending task belongs to this conversation, so Orion cannot safely guess which task to resume.'
+          : 'The pending task ID could not be recovered, so Orion did not create a duplicate continuation task.'
+      };
+    }
+    existingTaskId = String(candidates[0].taskId || '');
+  }
+  let existingTask = existingTaskId ? orchestrationTaskCache.get(existingTaskId) : null;
+  if (existingTaskId && (!existingTask || existingTask.status !== 'pending') && window.api && typeof window.api.getOrchestrationTask === 'function') {
+    const read = await window.api.getOrchestrationTask(existingTaskId);
+    existingTask = read && read.success ? read.task : null;
+    if (existingTask && existingTask.taskId) orchestrationTaskCache.set(existingTask.taskId, existingTask);
+  }
+  if (existingTaskId && (!existingTask || existingTask.status !== 'pending')) {
+    return {
+      success: false,
+      error: existingTask
+        ? `Task ${existingTaskId} is ${existingTask.status}; it cannot be resumed as pending work.`
+        : `Task ${existingTaskId} could not be found for this continuation.`
+    };
+  }
+  if (existingTask && existingTask.status === 'pending'
+      && existingTask.target && existingTask.target.conversationId === targetConversationId) {
+    const explicitContinuationInput = String(options.prompt || '').trim();
+    const durableContinuationInput = String(
+      existingTask.continuation && existingTask.continuation.input || ''
+    ).trim();
+    const continuationInput = explicitContinuationInput || durableContinuationInput;
+    if (explicitContinuationInput && window.api && typeof window.api.updateOrchestrationTask === 'function') {
+      const updated = await window.api.updateOrchestrationTask(existingTask.taskId, {
+        continuation: {
+          input: explicitContinuationInput,
+          source: options.source || 'task-continuation',
+          kind: options.planRevision === true ? 'plan_revision' : '',
+          messageId: String(options.originMessageId || ''),
+          createdAt: Date.now()
+        },
+        images: [
+          ...(Array.isArray(existingTask.images) ? existingTask.images : []),
+          ...(Array.isArray(options.images) ? options.images : [])
+        ],
+        contextPacketIds: [
+          ...(Array.isArray(existingTask.contextPacketIds) ? existingTask.contextPacketIds : []),
+          ...(Array.isArray(options.contextPacketIds) ? options.contextPacketIds : [])
+        ]
+      });
+      if (!updated || updated.success === false || !updated.task) {
+        return {
+          success: false,
+          error: (updated && updated.error) || `Task ${existingTask.taskId} could not persist its continuation input.`
+        };
+      }
+      existingTask = updated.task;
+      orchestrationTaskCache.set(existingTask.taskId, existingTask);
+    }
+    const queueItem = {
+      id: createQueuedPromptId(),
+      taskId: existingTask.taskId,
+      prompt: continuationInput || RendererTaskOrchestration.renderTaskPrompt(existingTask),
+      originalUserMessage: existingTask.originalUserMessage,
+      taskTitle: existingTask.title,
+      modelSelectValue: options.modelSelectValue || (el.modelSelect && el.modelSelect.value),
+      conversationId: targetConversationId,
+      originConversationId: existingTask.origin && existingTask.origin.conversationId,
+      source: options.source || 'task-continuation',
+      alreadyRendered: true,
+      preserveUserPrompt: !!continuationInput,
+      createdAt: Date.now(),
+      images: Array.isArray(existingTask.images) ? existingTask.images : [],
+      contextPacketIds: Array.isArray(existingTask.contextPacketIds) ? existingTask.contextPacketIds : []
+    };
+    queueItem.planRevision = options.planRevision === true
+      || String(existingTask.continuation && existingTask.continuation.kind || '') === 'plan_revision';
+    window.promptQueue = (Array.isArray(window.promptQueue) ? window.promptQueue : [])
+      .filter(item => item && item.taskId !== existingTask.taskId);
+    window.promptQueue.push(queueItem);
+    return { success: true, task: existingTask, queueItem, resumed: true };
+  }
+  if (options.requireExistingTask) {
+    return {
+      success: false,
+      error: 'The existing pending task could not be resumed, so Orion did not create a second task.'
+    };
+  }
+  return enqueueOrchestrationTask({
+    ...options,
+    prompt: options.prompt,
+    resolvedObjective: options.resolvedObjective || options.prompt,
+    originalUserMessage: options.originalUserMessage || options.prompt,
+    targetConversationId,
+    originConversationId: options.originConversationId || targetConversationId,
+    alreadyRendered: true
+  });
+}
+window.queueTaskContinuation = queueTaskContinuation;
+
+function pendingTaskNeedsRuntimeQueue(task) {
+  const explicitlyRestorable = !!(
+    RendererTaskOrchestration
+    && typeof RendererTaskOrchestration.pendingTaskNeedsRuntimeQueue === 'function'
+    && RendererTaskOrchestration.pendingTaskNeedsRuntimeQueue(task)
+  );
+  if (explicitlyRestorable) return true;
+  // Backward-compatible migration for tasks written before resumePolicy existed. This inspects
+  // Orion's own exact lifecycle fields, never user language. A claimed pending task with no
+  // recorded reason and no conversation-owned approval/input gate was an action-boundary yield.
+  if (!task || task.status !== 'pending') return false;
+  const execution = task.execution && typeof task.execution === 'object' ? task.execution : {};
+  if (!Number(execution.attempt) || execution.resumePolicy) return false;
+  const targetId = String(task.target && task.target.conversationId || '');
+  const targetConv = conversations.find(conv => conv.id === targetId);
+  if (targetConv && (targetConv.awaitingPlanApproval || targetConv.awaitingClarification)) return false;
+  const legacyReason = String(execution.reason || '').trim().toLowerCase();
+  const legacyReasonCode = String(execution.reasonCode || '').trim();
+  return legacyReason.includes('continue automatically') || (!legacyReason && !legacyReasonCode);
+}
+
+function ensureContinuationQueued(continuation) {
+  if (!continuation || !continuation.task || !continuation.queueItem) return;
+  window.promptQueue = (Array.isArray(window.promptQueue) ? window.promptQueue : [])
+    .filter(item => item && item.taskId !== continuation.task.taskId);
+  window.promptQueue.push(continuation.queueItem);
+}
+
+function startOrQueueTaskContinuation(continuation, conv, options = {}) {
+  if (!continuation || !continuation.success || !continuation.task || !continuation.queueItem || !conv) {
+    return { success: false, queued: false, error: 'Task continuation is incomplete.' };
+  }
+  const taskId = continuation.task.taskId;
+  const currentlyBusy = !!(window.isAgentRunning && window.isAgentRunning());
+  if (currentlyBusy) {
+    ensureContinuationQueued(continuation);
+    return { success: true, queued: true, taskId, taskStatus: continuation.task.status };
+  }
+
+  window.promptQueue = (Array.isArray(window.promptQueue) ? window.promptQueue : [])
+    .filter(item => item && item.taskId !== taskId);
+  const runPromise = window.runAgentLoop(
+    continuation.queueItem.prompt,
+    options.modelSelectValue || window.getSelectedModel(),
+    conv,
+    {
+      source: options.source || continuation.queueItem.source || 'task-continuation',
+      internalPrompt: true,
+      preserveUserPrompt: !!continuation.queueItem.preserveUserPrompt,
+      taskId,
+      images: continuation.queueItem.images || [],
+      contextPacketIds: continuation.queueItem.contextPacketIds || [],
+      planRevision: continuation.queueItem.planRevision === true
+    }
+  );
+
+  // runAgentLoop reserves the task synchronously before its first await. If another
+  // run won the race during persistence, the reservation will belong to that other
+  // task; put this exact continuation back instead of silently losing it.
+  const reservedTaskId = window.getActiveRunTaskId ? String(window.getActiveRunTaskId() || '') : '';
+  const reservedConversationId = window.getRunningConversationId ? String(window.getRunningConversationId() || '') : '';
+  const ownsReservation = reservedTaskId === taskId
+    && (!reservedConversationId || reservedConversationId === conv.id);
+  Promise.resolve(runPromise).then(result => {
+    if (result && result.reason === 'agent_busy') ensureContinuationQueued(continuation);
+  }).catch(error => {
+    console.error(`${options.errorLabel || 'Task continuation'} failed:`, error);
+  });
+  if (!ownsReservation) {
+    ensureContinuationQueued(continuation);
+    return { success: true, queued: true, taskId, taskStatus: continuation.task.status };
+  }
+  return { success: true, queued: false, taskId, taskStatus: 'active' };
+}
+window.startOrQueueTaskContinuation = startOrQueueTaskContinuation;
+
+async function initializeOrchestrationTasks() {
+  if (!window.api || typeof window.api.listOrchestrationTasks !== 'function') return;
+  try {
+    await window.api.migrateOrchestrationTasks?.();
+    await window.api.reconcileOrchestrationTasks?.({ reason: 'Orion restarted before the active task recorded a terminal result.' });
+    const listed = await window.api.listOrchestrationTasks({ sort: 'desc' });
+    const tasks = listed && Array.isArray(listed.tasks) ? listed.tasks : [];
+    tasks.forEach(task => {
+      if (task && task.taskId) orchestrationTaskCache.set(task.taskId, task);
+    });
+    let taskPresentationChanged = false;
+    for (const task of tasks) {
+      for (const conversation of conversations) {
+        if (reconcileConversationTaskPresentation(conversation, task)) {
+          taskPresentationChanged = true;
+          if (!conversation.isStub && typeof window.markConversationDirty === 'function') {
+            window.markConversationDirty(conversation.id);
+          }
+        }
+      }
+    }
+    conversations.forEach(conversation =>
+      scheduleTerminalDelegatedTaskReconciliation(conversation, orchestrationTaskCache)
+    );
+    if (taskPresentationChanged) saveConversationsToStorage();
+    window.promptQueue = Array.isArray(window.promptQueue) ? window.promptQueue : [];
+    for (const task of tasks.filter(pendingTaskNeedsRuntimeQueue)) {
+      if (!task || !task.taskId || window.promptQueue.some(item => item && item.taskId === task.taskId)) continue;
+      const targetId = task.target && task.target.conversationId;
+      if (!targetId || !conversations.some(conv => conv.id === targetId)) continue;
+      const automaticCheckpoint = String(
+        task.execution && task.execution.resumePolicy || ''
+      ).toLowerCase() === 'automatic';
+      window.promptQueue.push({
+        id: createQueuedPromptId(),
+        taskId: task.taskId,
+        prompt: (task.continuation && task.continuation.input)
+          || RendererTaskOrchestration.renderTaskPrompt(task),
+        originalUserMessage: task.originalUserMessage,
+        taskTitle: task.title,
+        conversationId: targetId,
+        originConversationId: task.origin && task.origin.conversationId,
+        source: automaticCheckpoint ? 'system' : (task.source || 'restored-queue'),
+        createdAt: task.createdAt,
+        alreadyRendered: true,
+        preserveUserPrompt: !!(task.continuation && task.continuation.input),
+        planRevision: String(task.continuation && task.continuation.kind || '') === 'plan_revision',
+        images: Array.isArray(task.images) ? task.images : [],
+        contextPacketIds: Array.isArray(task.contextPacketIds) ? task.contextPacketIds : []
+      });
+    }
+    if (window.promptQueue.length > 0 && typeof window.resumeDurableTaskQueue === 'function') {
+      window.resumeDurableTaskQueue(100);
+    }
+  } catch (error) {
+    console.error('Could not initialize durable task queue:', error);
+  }
+}
+
+window.claimOrchestrationTask = async function(taskId) {
+  if (!taskId || !window.api || typeof window.api.getOrchestrationTask !== 'function') return { success: true, task: null };
+  await orchestrationTasksReady;
+  const read = await window.api.getOrchestrationTask(taskId);
+  if (!read || read.success === false || !read.task) return { success: false, reason: (read && read.error) || 'Task no longer exists.' };
+  let task = read.task;
+  if (task.status !== 'pending') return { success: false, reason: `Task is ${task.status}.`, task };
+  const prompt = RendererTaskOrchestration.renderTaskPrompt(task);
+  const claimed = await window.api.transitionOrchestrationTask(taskId, 'active', {
+    startedBy: 'agent-loop',
+    consumeContinuation: true
+  });
+  if (!claimed || claimed.success === false || !claimed.task) return { success: false, reason: (claimed && claimed.error) || 'Task could not be claimed.' };
+  task = claimed.task;
+  orchestrationTaskCache.set(task.taskId, task);
+  const originConversationId = String(task.origin && task.origin.conversationId || '');
+  const targetConversationId = String(task.target && task.target.conversationId || '');
+  const originConv = conversations.find(conv => conv.id === originConversationId);
+  const targetConv = conversations.find(conv => conv.id === targetConversationId);
+  if (originConv && targetConv && conversationMode(originConv) === 'orion' && conversationMode(targetConv) === 'coder') {
+    try {
+      originConv.launchedCoderConvId = targetConversationId;
+      originConv.launchedCoderTaskId = task.taskId;
+      originConv.lastOwnedTaskId = task.taskId;
+      originConv.launchedCoderTaskTitle = task.title;
+      originConv.launchedCoderTaskStart = task.startedAt || Date.now();
+      if (typeof window.markConversationDirty === 'function') window.markConversationDirty(originConv.id);
+      saveConversationsToStorage();
+      if (typeof window.startCoderTaskMonitor === 'function') {
+        window.startCoderTaskMonitor(originConv.id, targetConversationId, task.taskId);
+      }
+      renderDesktopDispatchLanding();
+    } catch (error) {
+      // The durable active transition is already committed. Pointer/status presentation must
+      // never turn a successful claim into a retry that duplicates or strands canonical work.
+      console.error('Could not publish the claimed Dispatch-owned Coder task:', error);
+    }
+  }
+  return { success: true, task, prompt };
+};
+
+window.finalizeOrchestrationTask = async function(taskId, status, details = {}) {
+  if (!taskId || !window.api || typeof window.api.getOrchestrationTask !== 'function') return null;
+  const read = await window.api.getOrchestrationTask(taskId);
+  if (!read || read.success === false || !read.task) return null;
+  if (read.task.status === 'cancelled' || read.task.status === status) {
+    orchestrationTaskCache.set(read.task.taskId, read.task);
+    return read.task;
+  }
+  const transitioned = await window.api.transitionOrchestrationTask(taskId, status, details);
+  if (transitioned && transitioned.success && transitioned.task) {
+    orchestrationTaskCache.set(transitioned.task.taskId, transitioned.task);
+    return transitioned.task;
+  }
+  return null;
+};
+
+window.getOwnedOrchestrationTasks = async function(conversationId, statuses = []) {
+  if (!window.api || typeof window.api.listOrchestrationTasks !== 'function') {
+    throw new Error('Task-store listing is unavailable.');
+  }
+  const result = await window.api.listOrchestrationTasks({
+    originConversationId: String(conversationId || ''),
+    ...(statuses.length ? { status: statuses } : {}),
+    sort: 'desc'
+  });
+  if (!result || result.success === false || !Array.isArray(result.tasks)) {
+    throw new Error((result && result.error) || 'Task-store listing failed.');
+  }
+  return result.tasks;
+};
+
+async function resumeOwnedCoderTaskFromDispatch(conv, prompt, options = {}) {
+  const isContinuation = !!(
+    conv
+    && conversationMode(conv) === 'orion'
+    && RendererTaskOrchestration
+    && typeof RendererTaskOrchestration.isContinuationRequest === 'function'
+    && RendererTaskOrchestration.isContinuationRequest(options.semanticIntent)
+  );
+  if (!isContinuation) return { handled: false };
+
+  try {
+    await orchestrationTasksReady;
+    const owned = (await window.getOwnedOrchestrationTasks(conv.id, ['pending', 'active']))
+      .filter(task => {
+        if (!task || !['pending', 'active'].includes(task.status)) return false;
+        const targetId = String(task.target && task.target.conversationId || '');
+        const targetConv = conversations.find(item => item.id === targetId);
+        return !!(targetConv && conversationMode(targetConv) === 'coder');
+      })
+      .sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0));
+    owned.forEach(task => orchestrationTaskCache.set(task.taskId, task));
+    if (!owned.length) return { handled: false };
+
+    const preferredIds = [
+      conv.launchedCoderTaskId,
+      conv.lastDelegatedWork && conv.lastDelegatedWork.taskId,
+      conv.lastOwnedTaskId
+    ].map(value => String(value || '')).filter(Boolean);
+    const selection = RendererTaskOrchestration.selectOwnedContinuationTask(
+      owned,
+      conv.id,
+      preferredIds
+    );
+
+    if (selection.action === 'already_active') {
+      const task = selection.task;
+      const targetId = String(task.target && task.target.conversationId || '');
+      conv.launchedCoderConvId = targetId;
+      conv.launchedCoderTaskId = task.taskId;
+      conv.lastOwnedTaskId = task.taskId;
+      conv.launchedCoderTaskTitle = task.title;
+      if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+      saveConversationsToStorage();
+      if (typeof window.startCoderTaskMonitor === 'function') {
+        window.startCoderTaskMonitor(conv.id, targetId, task.taskId);
+      }
+      persistAssistantStatusMessage(
+        conv.id,
+        `Coder is already continuing **${task.title || 'the task'}**. I kept the existing task ${task.taskId}; no duplicate was created.`,
+        {
+          source: options.source || 'dispatch-task-continuation',
+          dedupeKey: `continuation-already-active-${task.taskId}`
+        }
+      );
+      return { success: true, handled: true, resumed: false, alreadyActive: true, task };
+    }
+
+    if (selection.action === 'ambiguous_active') {
+      persistTaskClarification(
+        conv,
+        `More than one Coder task is active for this conversation. Which one should I continue: ${selection.candidates.slice(0, 4).map(task => `${task.title} (${task.taskId})`).join('; ')}?`
+      );
+      return { success: false, handled: true, needsClarification: true };
+    }
+
+    const task = selection.action === 'resume_pending' ? selection.task : null;
+    if (selection.action === 'ambiguous_pending') {
+      persistTaskClarification(
+        conv,
+        `More than one paused Coder task belongs to this conversation. Which one should I continue: ${selection.candidates.slice(0, 4).map(item => `${item.title} (${item.taskId})`).join('; ')}?`
+      );
+      return { success: false, handled: true, needsClarification: true };
+    }
+    if (!task) return { handled: false };
+
+    const targetId = String(task.target && task.target.conversationId || '');
+    const targetConv = conversations.find(item => item.id === targetId);
+    const messageId = String(options.messageId || '');
+    const continuation = await queueTaskContinuation({
+      taskId: task.taskId,
+      prompt,
+      originalUserMessage: prompt,
+      modelSelectValue: options.modelSelectValue || window.getSelectedModel(),
+      targetConversationId: targetId,
+      originConversationId: conv.id,
+      originMessageId: messageId,
+      source: options.source || 'dispatch-task-continuation',
+      images: options.images || [],
+      requireExistingTask: true,
+      alreadyRendered: true
+    });
+    if (!continuation.success) {
+      persistAssistantStatusMessage(
+        conv.id,
+        continuation.error || `Task ${task.taskId} could not be resumed.`,
+        {
+          source: 'dispatch-task-continuation-error',
+          dedupeKey: `continuation-error-${task.taskId}`
+        }
+      );
+      return { ...continuation, handled: true };
+    }
+
+    conv.launchedCoderConvId = targetId;
+    conv.launchedCoderTaskId = task.taskId;
+    conv.lastOwnedTaskId = task.taskId;
+    conv.launchedCoderTaskTitle = task.title;
+    conv.launchedCoderTaskStart = task.startedAt || Date.now();
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+    saveConversationsToStorage();
+    const launch = startOrQueueTaskContinuation(continuation, targetConv, {
+      source: options.source || 'dispatch-task-continuation',
+      modelSelectValue: options.modelSelectValue || window.getSelectedModel(),
+      errorLabel: 'Dispatch task continuation'
+    });
+    if (typeof window.startCoderTaskMonitor === 'function') {
+      window.startCoderTaskMonitor(conv.id, targetId, task.taskId);
+    }
+    persistAssistantStatusMessage(
+      conv.id,
+      `${launch.queued ? 'Queued' : 'Continuing'} **${task.title || 'the task'}** as ${task.taskId}. No new task was created.`,
+      {
+        source: options.source || 'dispatch-task-continuation',
+        dedupeKey: `continuation-resumed-${task.taskId}`
+      }
+    );
+    return { ...launch, success: true, handled: true, resumed: true, task: continuation.task };
+  } catch (error) {
+    persistAssistantStatusMessage(
+      conv.id,
+      `I could not verify the existing Coder task, so I did not create a duplicate: ${error.message || error}`,
+      {
+        source: 'dispatch-task-continuation-error',
+        dedupeKey: `continuation-lookup-error-${conv.id}`
+      }
+    );
+    return { success: false, handled: true, error: error.message || String(error) };
+  }
+}
+
+async function classifyCurrentConversationIntent(conv, prompt, options = {}) {
+  if (options.semanticIntent && typeof options.semanticIntent === 'object') return options.semanticIntent;
+  if (!RendererSemanticIntentRouter || typeof window.classifySemanticIntent !== 'function') {
+    return RendererSemanticIntentRouter
+      ? RendererSemanticIntentRouter.safeFallback({
+          pendingPlan: conv && (conv.awaitingDelegatedPlan || conv.awaitingPlanApproval),
+          activeOwnedTask: null,
+          pendingOwnedTask: null,
+          taskBound: !!options.taskId
+        }, 'Semantic classifier is unavailable.')
+      : {
+          intent: 'clarification_required',
+          requiresExecution: false,
+          target: 'current_conversation',
+          contextDependent: true,
+          needsClarification: true,
+          clarificationQuestion: 'I could not safely determine what that message should do. Could you clarify?'
+        };
+  }
+
+  let ownedTasks = [];
+  if (conv && conversationMode(conv) === 'orion' && typeof window.getOwnedOrchestrationTasks === 'function') {
+    try {
+      await orchestrationTasksReady;
+      ownedTasks = await window.getOwnedOrchestrationTasks(
+        conv.id,
+        ['pending', 'active', 'completed', 'failed', 'cancelled']
+      );
+    } catch (error) {
+      console.warn('Could not load owned tasks for semantic classification:', error);
+    }
+  }
+  if (RendererTaskOrchestration && typeof RendererTaskOrchestration.filterSupersededTasks === 'function') {
+    ownedTasks = RendererTaskOrchestration.filterSupersededTasks(ownedTasks);
+  }
+  const byNewest = (left, right) => Number(right.updatedAt || right.createdAt || 0) - Number(left.updatedAt || left.createdAt || 0);
+  const activeOwnedTask = ownedTasks.filter(task => task && task.status === 'active').sort(byNewest)[0] || null;
+  const pendingOwnedTask = ownedTasks.filter(task => task && task.status === 'pending').sort(byNewest)[0] || null;
+  const recentOwnedTask = ownedTasks
+    .filter(task => task && ['completed', 'failed', 'cancelled'].includes(task.status))
+    .sort(byNewest)[0] || null;
+  const delegated = conv && conv.awaitingDelegatedPlan;
+  const pendingPlan = delegated
+    ? {
+        planId: delegated.planMessageId || delegated.planId || '',
+        taskId: delegated.taskId || '',
+        ownerConversationId: conv.id,
+        coderConversationId: delegated.coderConversationId || '',
+        title: delegated.title || '',
+        status: 'pending'
+      }
+    : (conv && conv.awaitingPlanApproval
+        ? {
+            planId: conv.awaitingPlanApprovalPlanId || '',
+            taskId: conv.awaitingPlanApprovalTaskId || options.taskId || '',
+            ownerConversationId: conv.id,
+            coderConversationId: conv.id,
+            title: conv.title || '',
+            status: 'pending'
+          }
+        : null);
+  const boundTask = activeOwnedTask || pendingOwnedTask;
+  const classification = await window.classifySemanticIntent({
+    userMessage: prompt,
+    recentVisibleConversation: taskContextMessages(conv),
+    conversationId: conv && conv.id,
+    mode: conv && conversationMode(conv),
+    workspace: conv ? structuredWorkspaceForConversation(conv) : null,
+    pendingPlan,
+    activeOwnedTask,
+    pendingOwnedTask,
+    recentOwnedTask,
+    taskBound: !!(options.taskId || boundTask || pendingPlan),
+    durableTaskObjective: (boundTask || recentOwnedTask) && (boundTask || recentOwnedTask).objective || ''
+  }, options.model || window.getSelectedModel(), window.getAppConfig ? window.getAppConfig() : {});
+  const supersedesTaskId = recentOwnedTask
+    && classification
+    && classification.intent === 'context_followup'
+    && classification.contextDependent === true
+    && classification.requiresExecution === true
+      ? recentOwnedTask.taskId
+      : '';
+  return supersedesTaskId ? { ...classification, supersedesTaskId } : classification;
+}
+window.classifyCurrentConversationIntent = classifyCurrentConversationIntent;
+window.resumeOwnedCoderTaskFromDispatch = resumeOwnedCoderTaskFromDispatch;
+
+window.getOrchestrationTaskStatus = async function(taskId, requesterConversationId = '') {
+  if (!taskId || !window.api || typeof window.api.getOrchestrationTask !== 'function') {
+    return { success: false, error: 'Task status is unavailable.' };
+  }
+  const result = await window.api.getOrchestrationTask(taskId);
+  if (!result || result.success === false || !result.task) return result || { success: false, error: 'Task not found.' };
+  orchestrationTaskCache.set(result.task.taskId, result.task);
+  if (requesterConversationId && RendererTaskOrchestration && !RendererTaskOrchestration.canRequesterControlTask(result.task, { conversationId: requesterConversationId })) {
+    return { success: false, error: 'This conversation does not own that task.', code: 'TASK_CONTROL_FORBIDDEN' };
+  }
+  return {
+    success: true,
+    task: result.task,
+    taskId: result.task.taskId,
+    status: result.task.status,
+    description: RendererTaskOrchestration ? RendererTaskOrchestration.describeTaskStatus(result.task) : result.task.status
+  };
+};
+
+window.cancelOwnedOrchestrationTask = async function(taskId, requesterConversationId, reason = 'Cancelled by user.') {
+  if (!taskId || !window.api || typeof window.api.cancelOrchestrationTask !== 'function') {
+    return { success: false, error: 'Task cancellation is unavailable.' };
+  }
+  const result = await window.api.cancelOrchestrationTask(taskId, { conversationId: requesterConversationId }, reason);
+  if (!result || result.success === false || !result.task) return result || { success: false, error: 'Cancellation failed.' };
+  orchestrationTaskCache.set(result.task.taskId, result.task);
+  window.promptQueue = (Array.isArray(window.promptQueue) ? window.promptQueue : []).filter(item => item && item.taskId !== taskId);
+  const targetId = result.task.target && result.task.target.conversationId;
+  const originId = result.task.origin && result.task.origin.conversationId;
+  setQueuedPromptMessageState(taskId, targetId, 'cancelled');
+  if (result.wasActive && window.getActiveRunTaskId && window.getActiveRunTaskId() === taskId && window.stopAgentExecution) {
+    window.stopAgentExecution({ mode: 'hard', taskId });
+  }
+  const originConv = conversations.find(conv => conv.id === originId);
+  const cancelledLaunchedTask = !!(
+    originConv
+    && String(originConv.launchedCoderTaskId || '') === String(taskId)
+  );
+  if (originConv && cancelledLaunchedTask) {
+    originConv.lastDelegatedWork = {
+      taskId,
+      coderConversationId: targetId || '',
+      title: result.task.title,
+      projectPath: result.task.workspacePath || '',
+      status: 'cancelled',
+      subStatus: 'Cancelled',
+      startedAt: result.task.startedAt || 0,
+      completedAt: result.task.cancelledAt || Date.now(),
+      pendingCount: 0
+    };
+    originConv.launchedCoderConvId = null;
+    originConv.launchedCoderTaskId = null;
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(originConv.id);
+  }
+  saveConversationsToStorage();
+  renderDesktopDispatchLanding();
+  return { ...result, stopped: !!result.wasActive };
+};
+
+async function cancelPendingTasksForNewFocus(conversationId) {
+  const ownerId = String(conversationId || '');
+  if (!RendererTaskOrchestration || typeof RendererTaskOrchestration.cancelPendingOwnedTasks !== 'function') {
+    return {
+      success: false,
+      cancelled: [],
+      failures: [{ taskId: '', error: 'Task lifecycle contracts are unavailable.' }],
+      count: 0
+    };
+  }
+  return RendererTaskOrchestration.cancelPendingOwnedTasks({ conversationId: ownerId }, {
+    listTasks: (requesterId, statuses) => window.getOwnedOrchestrationTasks(requesterId, statuses),
+    cancelTask: (taskId, requesterId) => window.cancelOwnedOrchestrationTask(
+      taskId,
+      requesterId,
+      'Cancelled when a new focus was started.'
+    )
+  });
+}
+
+window.beginNewFocus = async function(conversationId = activeConversationId) {
+  return cancelPendingTasksForNewFocus(conversationId);
+};
+
+async function stopExpectedTaskForConversation(conversationId) {
+  const requesterId = String(conversationId || '');
+  const conv = conversations.find(item => item.id === requesterId);
+  if (!conv) return { success: false, stopped: false, error: 'Conversation not found.' };
+  const runningId = window.getRunningConversationId ? window.getRunningConversationId() : '';
+  const activeTaskId = runningId === requesterId && window.getActiveRunTaskId ? window.getActiveRunTaskId() : '';
+  // A visible direct response may not have a durable task ID. In that case Stop
+  // belongs to the active response itself; do not cancel an older pending task
+  // merely because its ID is still retained on the conversation.
+  if (runningId === requesterId && !activeTaskId && window.stopAgentExecution) {
+    return window.stopAgentExecution({ mode: 'hard' });
+  }
+  // Stop the task the user can currently see running before older delegated
+  // references retained on the conversation. A stale launchedCoderTaskId must
+  // never steal the Stop action from the exact active run.
+  const candidates = [activeTaskId, conv.launchedCoderTaskId, conv.lastOwnedTaskId, conv.lastOrchestrationTaskId]
+    .map(value => String(value || ''))
+    .filter((value, index, values) => value && values.indexOf(value) === index);
+  try {
+    for (const taskId of candidates) {
+      const status = await window.getOrchestrationTaskStatus(taskId, requesterId);
+      if (!status || !status.success || !['pending', 'active'].includes(status.status)) continue;
+      return window.cancelOwnedOrchestrationTask(taskId, requesterId, 'Cancelled from the Stop control.');
+    }
+  } catch (error) {
+    return { success: false, stopped: false, error: error.message || String(error) };
+  }
+  if (runningId === requesterId && window.stopAgentExecution) {
+    return window.stopAgentExecution({ mode: 'hard' });
+  }
+  return { success: false, stopped: false, error: 'This conversation does not own the currently running task.' };
+}
+window.stopExpectedTaskForConversation = stopExpectedTaskForConversation;
+
+function ownsActiveSupervisedRun(conv) {
+  if (!conv || conversationMode(conv) !== 'orion') return false;
+  const launchedConversationId = String(conv.launchedCoderConvId || '');
+  const launchedTaskId = String(conv.launchedCoderTaskId || '');
+  const runningConversationId = String(
+    window.getRunningConversationId ? window.getRunningConversationId() || '' : ''
+  );
+  const activeRunTaskId = String(
+    window.getActiveRunTaskId ? window.getActiveRunTaskId() || '' : ''
+  );
+  return !!(
+    launchedConversationId
+    && launchedTaskId
+    && runningConversationId === launchedConversationId
+    && activeRunTaskId === launchedTaskId
+  );
+}
+
+async function cancelOwnedTaskRequestedInPrompt(conv, prompt, source = 'user-task-cancellation', semanticIntent = null) {
+  if (
+    !conv
+    || conversationMode(conv) !== 'orion'
+    || !semanticIntent
+    || semanticIntent.intent !== 'cancel_active_task'
+    || semanticIntent.target !== 'active_owned_task'
+  ) {
+    return { handled: false };
+  }
+
+  const result = await stopExpectedTaskForConversation(conv.id);
+  const taskId = String(
+    (result && result.task && result.task.taskId)
+    || (result && result.taskId)
+    || ''
+  );
+  const cancelled = !!(
+    result
+    && result.success
+    && result.task
+    && result.task.status === 'cancelled'
+  );
+  const stopped = !!(result && result.success && result.stopped);
+  const success = cancelled || stopped;
+  const taskTitle = String(result && result.task && result.task.title || 'Coder task');
+  const replyText = success
+    ? (cancelled
+        ? `Cancelled **${taskTitle}**${taskId ? ` (${taskId})` : ''}. Its final state is cancelled.`
+        : 'Stopped the active Orion response.')
+    : `I could not cancel an owned task: ${(result && (result.error || result.reason)) || 'no cancellable task was found for this conversation'}.`;
+
+  notifyOrionConversation(conv, replyText, source);
+  return {
+    ...(result && typeof result === 'object' ? result : {}),
+    handled: true,
+    success,
+    cancelled,
+    stopped,
+    taskId
+  };
+}
+
+async function triggerQueue() {
+  const text = el.chatInput.value.trim();
+  if (!text) return;
+  const queueId = createQueuedPromptId();
+  const result = await enqueueOrchestrationTask({
+    queueId,
+    prompt: text,
+    modelSelectValue: el.modelSelect.value,
+    targetConversationId: activeConversationId,
+    originConversationId: activeConversationId,
+    source: 'user-queue'
+  });
+  if (result.success) appendQueuedMessage(result.task.objective, result.queueItem, result.task);
+  else if (!result.needsClarification) showToast(result.error || 'Could not queue that task.', 'attention');
   el.chatInput.value = '';
   document.getElementById('btn-steer').style.display = 'none';
   document.getElementById('btn-queue').style.display = 'none';
@@ -1873,14 +3295,16 @@ function createQueuedPromptId() {
   return 'queue_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
 }
 
-function appendQueuedMessage(text, queueItem = {}) {
+function appendQueuedMessage(text, queueItem = {}, task = null) {
   const item = {
     id: queueItem.id || createQueuedPromptId(),
     prompt: text,
     modelSelectValue: queueItem.modelSelectValue || (el.modelSelect && el.modelSelect.value),
     conversationId: queueItem.conversationId || activeConversationId,
     source: queueItem.source || 'user-queue',
-    createdAt: queueItem.createdAt || Date.now()
+    createdAt: queueItem.createdAt || Date.now(),
+    taskId: queueItem.taskId || (task && task.taskId) || '',
+    taskTitle: queueItem.taskTitle || (task && task.title) || ''
   };
   if (item.conversationId === activeConversationId) {
     el.welcomeSplash.style.display = 'none';
@@ -1894,6 +3318,8 @@ function appendQueuedMessage(text, queueItem = {}) {
       source: 'queued-prompt',
       text: `Prompt queued: "${text}"`,
       queueId: item.id,
+      taskId: item.taskId,
+      taskTitle: item.taskTitle,
       queuedPrompt: text,
       queueState: 'queued',
       modelSelectValue: item.modelSelectValue,
@@ -1920,7 +3346,7 @@ function removePromptQueueItem(queueId, conversationId) {
 function findQueuedPromptMessage(queueId, conversationId) {
   const conv = conversations.find(c => c.id === conversationId);
   if (!conv || !Array.isArray(conv.messages)) return { conv: null, message: null };
-  const message = conv.messages.find(msg => msg && msg.queueId === queueId);
+  const message = conv.messages.find(msg => msg && (msg.queueId === queueId || msg.taskId === queueId));
   return { conv, message };
 }
 
@@ -1931,6 +3357,7 @@ function getQueuedPromptStatus(item) {
   const queueState = item.queueState || 'queued';
   if (queueState === 'steered') return 'Converted to steering';
   if (queueState === 'sent') return 'Sent to Orion';
+  if (queueState === 'cancelled') return 'Cancelled';
   if (queueIndex === 0) return 'Runs next';
   if (queueIndex > 0) return `Queued #${queueIndex + 1}`;
   return 'No longer queued';
@@ -1940,6 +3367,7 @@ function buildQueuedPromptBubble(item) {
   const queueId = String(item.id || item.queueId || '');
   const conversationId = String(item.conversationId || activeConversationId || '');
   const prompt = String(item.prompt || item.queuedPrompt || '');
+  const taskTitle = String(item.taskTitle || '');
   const queueIndex = getPromptQueueIndex(queueId, conversationId);
   const isPending = queueIndex !== -1;
   const runningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
@@ -1962,6 +3390,7 @@ function buildQueuedPromptBubble(item) {
   bubble.innerHTML = `
     <div class="message-header queued">Queued Prompt</div>
     <div class="message-body queued-prompt-body">
+      ${taskTitle ? `<div class="queued-prompt-title">${escapeHtml(taskTitle)}</div>` : ''}
       <div class="queued-prompt-copy">${escapeHtml(prompt).replace(/\n/g, '<br>')}</div>
       <div class="queued-prompt-footer">
         <span class="queued-prompt-status">${escapeHtml(statusText)}</span>
@@ -2008,6 +3437,8 @@ function setQueuedPromptMessageState(queueId, conversationId, queueState) {
       message.text = `Queued prompt converted to steering: "${message.queuedPrompt || ''}"`;
     } else if (queueState === 'sent') {
       message.text = `Queued prompt sent: "${message.queuedPrompt || ''}"`;
+    } else if (queueState === 'cancelled') {
+      message.text = `Queued task cancelled: "${message.taskTitle || message.queuedPrompt || ''}"`;
     }
   }
   if (conv) saveConversationsToStorage();
@@ -2027,7 +3458,7 @@ function handleQueuedPromptActionClick(event) {
   }
 }
 
-function promoteQueuedPromptToSteering(queueId, conversationId) {
+async function promoteQueuedPromptToSteering(queueId, conversationId) {
   const runningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
   const isThisConversationRunning = !!(window.isAgentRunning && window.isAgentRunning() && runningId === conversationId);
   if (!isThisConversationRunning) {
@@ -2041,9 +3472,14 @@ function promoteQueuedPromptToSteering(queueId, conversationId) {
     setQueuedPromptMessageState(queueId, conversationId, 'sent');
     return;
   }
-  if (enqueueSteeringForConversation(item.prompt, conversationId)) {
+  if (item.taskId) {
+    const requesterId = item.originConversationId || conversationId;
+    await window.cancelOwnedOrchestrationTask(item.taskId, requesterId, 'Converted from a pending task into steering.');
+  }
+  const steeringText = item.originalUserMessage || item.prompt;
+  if (enqueueSteeringForConversation(steeringText, conversationId)) {
     setQueuedPromptMessageState(queueId, conversationId, 'steered');
-    checkpointSteeringInstruction(item.prompt, conversationId);
+    checkpointSteeringInstruction(steeringText, conversationId);
     showToast('Queued prompt changed to steering.', 'success');
   }
 }
@@ -2084,6 +3520,7 @@ function sendQueuedPromptNow(queueId, conversationId) {
   }
   window.runAgentLoop(item.prompt, item.modelSelectValue || (el.modelSelect && el.modelSelect.value), conv, {
     source: item.source || 'queue',
+    taskId: item.taskId || '',
     ...(queuedImages.length ? { images: queuedImages } : {})
   }).catch(error => {
     console.error('Queued prompt send-now run failed:', error);
@@ -2105,7 +3542,110 @@ function conversationMode(conv) {
   return conv.projectPath ? 'coder' : 'orion';
 }
 
-function createNewConversation(mode = appMode) {
+function compactDispatchDiscussionText(value, fallback = '') {
+  const text = String(value || '')
+    .replace(/\[[^\]]+\]/g, ' ')
+    .replace(/[`*_#>|]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) return String(fallback || '').trim();
+  return text.length > 150 ? `${text.slice(0, 147).trim()}...` : text;
+}
+
+function deriveDispatchDiscussionSummary(conv) {
+  if (!conv) return '';
+  if (conv.dispatchDiscussionSummary) return compactDispatchDiscussionText(conv.dispatchDiscussionSummary, conv.title);
+  const messages = Array.isArray(conv.messages) ? conv.messages : [];
+  const latestUser = [...messages].reverse().find(message => normalizeConversationMessageRole(message) === 'user');
+  return compactDispatchDiscussionText(
+    latestUser ? extractConversationMessageText(latestUser) : '',
+    conv.title && conv.title !== 'New Conversation' && conv.title !== 'New Phone Task' ? conv.title : ''
+  );
+}
+
+function inferDispatchProjectPath(conv) {
+  if (!conv || conversationMode(conv) !== 'orion') return '';
+  const explicit = String(conv.dispatchProjectPath || '').trim();
+  if (explicit) return explicit;
+  const workspace = String(conv.workspace || '').trim();
+  if (!workspace || isGeneratedStandaloneWorkspace(workspace)) return '';
+  const normalizedWorkspace = normalizePathForComparison(workspace);
+  return projects.find(projectPath => normalizePathForComparison(projectPath) === normalizedWorkspace) || '';
+}
+
+function createDispatchConversationFromDraft(prompt = '') {
+  const normalizedPrompt = String(prompt || '').trim();
+  if (!normalizedPrompt) return null;
+  const projectPath = String(dispatchDraft.projectPath || '').trim();
+  const conv = {
+    id: 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
+    title: generateConversationTitle(normalizedPrompt) || 'New Conversation',
+    mode: 'orion',
+    projectPath: '',
+    dispatchProjectPath: projectPath,
+    dispatchContextSummary: compactDispatchDiscussionText(dispatchDraft.contextSummary),
+    dispatchDiscussionSummary: compactDispatchDiscussionText(normalizedPrompt),
+    workspace: projectPath,
+    messages: [],
+    tasks: [],
+    testResults: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    isStub: false
+  };
+  conversations.unshift(conv);
+  activeConversationId = conv.id;
+  lastDispatchConversationId = conv.id;
+  dispatchDraft = { active: false, projectPath: '', contextSummary: '' };
+  return conv;
+}
+
+function startDispatchDraft(options = {}) {
+  appMode = 'orion';
+  dispatchDraft = {
+    active: true,
+    projectPath: String(options.projectPath || '').trim(),
+    contextSummary: compactDispatchDiscussionText(options.contextSummary)
+  };
+  activeConversationId = null;
+  currentWorkspace = dispatchDraft.projectPath || getDispatchWorkspaceRoot();
+  document.body.setAttribute('data-mode', 'orion');
+  document.getElementById('btn-mode-orion')?.classList.add('active');
+  document.getElementById('btn-mode-coder')?.classList.remove('active');
+  document.getElementById('sidebar-orion-content')?.classList.add('active');
+  document.getElementById('sidebar-coder-content')?.classList.remove('active');
+  el.chatTitle.textContent = dispatchDraft.projectPath
+    ? (dispatchDraft.projectPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || 'Orion')
+    : 'Orion';
+  el.workspaceLabel.textContent = dispatchDraft.projectPath
+    ? (dispatchDraft.projectPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || '')
+    : '';
+  el.chatInput.value = '';
+  el.chatInput.placeholder = 'Ask Orion anything...';
+  if (el.welcomeSplash) el.welcomeSplash.style.display = 'none';
+  const orionSplash = document.getElementById('orion-welcome-splash');
+  if (orionSplash) orionSplash.style.display = 'flex';
+  if (el.messagesContainer) {
+    el.messagesContainer.innerHTML = '';
+    el.messagesContainer.style.display = 'none';
+  }
+  if (el.workspaceFilesPanel) el.workspaceFilesPanel.classList.add('contextual-panel-hidden');
+  updateOrionGreeting();
+  renderConversationList();
+  renderDesktopDispatchLanding();
+  el.chatInput.focus();
+}
+
+async function createNewConversation(mode = appMode) {
+  if (mode !== 'coder') {
+    const focusResult = await window.beginNewFocus(activeConversationId);
+    if (!focusResult || focusResult.success === false) {
+      showToast('Could not cancel the pending work. The current focus was preserved.', 'error');
+      return null;
+    }
+    startDispatchDraft();
+    return null;
+  }
   const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
   const title = 'New Conversation';
 
@@ -2169,6 +3709,34 @@ function createCoderConversationForProject(projectPath, { title = 'New Coder Tas
     mode: 'coder',
     projectPath,
     workspace: projectPath,
+    messages: [],
+    tasks: [],
+    testResults: null
+  };
+
+  conversations.unshift(newConv);
+  saveConversationsToStorage();
+
+  if (select) {
+    selectConversation(newId);
+    el.chatInput.focus();
+  } else {
+    renderConversationList();
+  }
+
+  return newConv;
+}
+
+function createStandaloneCoderConversation({ title = 'New Coder Task', workspacePath = '', select = false } = {}) {
+  const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+  const resolvedWorkspace = String(workspacePath || '').trim()
+    || getStandaloneWorkspaceForTitle(title, newId);
+  const newConv = {
+    id: newId,
+    title: title || 'New Coder Task',
+    mode: 'coder',
+    projectPath: '',
+    workspace: resolvedWorkspace,
     messages: [],
     tasks: [],
     testResults: null
@@ -2256,9 +3824,10 @@ function getConversationRunWorkspace(conv) {
   return conv.workspace || conv.projectPath || '';
 }
 
-function createPhoneConversation({ projectPath = '', mode = 'orion', title = 'New Phone Task' } = {}) {
+function createPhoneConversation({ projectPath = '', dispatchProjectPath = '', contextSummary = '', mode = 'orion', title = 'New Phone Task' } = {}) {
   const convId = 'conv-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
   const normalizedProjectPath = String(projectPath || '').trim();
+  const normalizedDispatchProjectPath = mode === 'orion' ? String(dispatchProjectPath || '').trim() : '';
   const conv = {
     id: convId,
     title,
@@ -2267,15 +3836,17 @@ function createPhoneConversation({ projectPath = '', mode = 'orion', title = 'Ne
     mode: normalizedProjectPath ? 'coder' : (mode === 'coder' ? 'coder' : 'orion'),
     messages: [],
     createdAt: Date.now(),
-    workspace: normalizedProjectPath || '',
+    workspace: normalizedProjectPath || normalizedDispatchProjectPath || '',
     projectPath: normalizedProjectPath,
+    dispatchProjectPath: normalizedDispatchProjectPath,
+    dispatchContextSummary: compactDispatchDiscussionText(contextSummary),
+    dispatchDiscussionSummary: '',
     tasks: [],
     awaitingPlanApproval: false,
     planApproved: false,
     awaitingClarification: null
   };
   conversations.unshift(conv);
-  saveConversationsToStorage();
   return conv;
 }
 
@@ -2323,11 +3894,6 @@ function conversationSortTime(conversation) {
 
 function chooseRicherConversation(current, candidate) {
   if (!current) return candidate;
-  const currentScore = conversationMessageValue(current);
-  const candidateScore = conversationMessageValue(candidate);
-  if (candidateScore !== currentScore) {
-    return candidateScore > currentScore ? candidate : current;
-  }
   return conversationSortTime(candidate) >= conversationSortTime(current) ? candidate : current;
 }
 
@@ -2341,23 +3907,190 @@ function mergeConversationSets(...sets) {
   return [...byId.values()].sort((a, b) => conversationSortTime(b) - conversationSortTime(a));
 }
 
+// Rehydrate the complete persisted record in place so callers holding the lightweight index
+// object keep a valid reference. Actionable state such as delegated-plan approval ownership must
+// survive a restart just as reliably as transcript messages.
+function findDelegatedPlanMessage(conversation, taskId = '') {
+  const expectedTaskId = String(taskId || '');
+  return [...(Array.isArray(conversation && conversation.messages) ? conversation.messages : [])]
+    .reverse()
+    .find(message => message
+      && message.isDelegatedPlanCard
+      && message.delegatedPlan
+      && (!expectedTaskId || String(message.delegatedPlan.taskId || '') === expectedTaskId)) || null;
+}
+
+function markDelegatedPlanMessageState(conversation, taskId, stateField) {
+  const message = findDelegatedPlanMessage(conversation, taskId);
+  if (message && stateField) message[stateField] = true;
+  return message;
+}
+
+const LEGACY_DISPATCH_TASK_TITLE = 'Execute Dispatch request';
+
+function reconcileConversationTaskPresentation(conversation, task) {
+  if (!conversation || !task || !task.taskId || !task.title) return false;
+  const originId = String(task.origin && task.origin.conversationId || '');
+  const targetId = String(task.target && task.target.conversationId || '');
+  const ownsTask = String(conversation.id || '') === originId
+    || String(conversation.id || '') === targetId
+    || String(conversation.launchedCoderTaskId || '') === String(task.taskId)
+    || String(conversation.lastOrchestrationTaskId || '') === String(task.taskId);
+  if (!ownsTask) return false;
+
+  const canonicalTitle = String(task.title).trim();
+  if (!canonicalTitle || canonicalTitle === LEGACY_DISPATCH_TASK_TITLE) return false;
+  let changed = false;
+  const replaceLegacyTitle = value => {
+    const text = String(value || '');
+    return text.includes(LEGACY_DISPATCH_TASK_TITLE)
+      ? text.split(LEGACY_DISPATCH_TASK_TITLE).join(canonicalTitle)
+      : text;
+  };
+
+  if (String(conversation.title || '').trim() === LEGACY_DISPATCH_TASK_TITLE) {
+    conversation.title = canonicalTitle;
+    changed = true;
+  }
+  if (String(conversation.launchedCoderTaskId || '') === String(task.taskId)
+      && String(conversation.launchedCoderTaskTitle || '').trim() === LEGACY_DISPATCH_TASK_TITLE) {
+    conversation.launchedCoderTaskTitle = canonicalTitle;
+    changed = true;
+  }
+  if (conversation.lastDelegatedWork
+      && String(conversation.lastDelegatedWork.taskId || '') === String(task.taskId)
+      && String(conversation.lastDelegatedWork.title || '').trim() === LEGACY_DISPATCH_TASK_TITLE) {
+    conversation.lastDelegatedWork.title = canonicalTitle;
+    changed = true;
+  }
+  for (const field of ['dispatchDiscussionSummary', 'dispatchContextSummary']) {
+    const next = replaceLegacyTitle(conversation[field]);
+    if (next !== String(conversation[field] || '')) {
+      conversation[field] = next;
+      changed = true;
+    }
+  }
+
+  for (const message of Array.isArray(conversation.messages) ? conversation.messages : []) {
+    if (!message || typeof message.text !== 'string' || !message.text.includes(LEGACY_DISPATCH_TASK_TITLE)) continue;
+    const taskBoundSource = [
+      'dispatch-handoff',
+      'queue-status',
+      'supervisor-pending',
+      'supervisor-completion',
+      'supervisor-plan',
+      'supervisor-plan-approved',
+      'supervisor-plan-revision'
+    ].includes(String(message.source || ''));
+    const namesExactTask = message.text.includes(String(task.taskId));
+    if (!taskBoundSource && !namesExactTask) continue;
+    message.text = replaceLegacyTitle(message.text);
+    changed = true;
+  }
+  if (changed) conversation.updatedAt = Date.now();
+  return changed;
+}
+
+function scheduleTerminalDelegatedTaskReconciliation(conversation, durableTasks = orchestrationTaskCache) {
+  if (!conversation || conversation.isStub || !durableTasks || typeof durableTasks.get !== 'function') return false;
+  const taskId = String(conversation.launchedCoderTaskId || '');
+  const coderConversationId = String(conversation.launchedCoderConvId || '');
+  if (!taskId || !coderConversationId) return false;
+  const task = durableTasks.get(taskId);
+  if (!task || !['completed', 'failed', 'cancelled'].includes(String(task.status || ''))) return false;
+  if (String(task.origin && task.origin.conversationId || '') !== String(conversation.id || '')) return false;
+  if (String(task.target && task.target.conversationId || '') !== coderConversationId) return false;
+  if (String(conversation._terminalTaskReconciliationScheduled || '') === taskId) return true;
+  conversation._terminalTaskReconciliationScheduled = taskId;
+  Promise.resolve()
+    .then(() => notifySupervisorOfCoderCompletion(coderConversationId, taskId))
+    .catch(error => console.error('Could not reconcile terminal delegated task presentation:', error))
+    .finally(() => {
+      if (String(conversation._terminalTaskReconciliationScheduled || '') === taskId) {
+        delete conversation._terminalTaskReconciliationScheduled;
+      }
+    });
+  return true;
+}
+
+function hydrateConversationRecord(
+  conversation,
+  persistedConversation,
+  durableTasks = orchestrationTaskCache
+) {
+  if (!conversation || !persistedConversation || typeof persistedConversation !== 'object') {
+    return conversation;
+  }
+  const stableId = conversation.id;
+  Object.assign(conversation, persistedConversation);
+  conversation.id = stableId;
+  conversation.messages = Array.isArray(persistedConversation.messages) ? persistedConversation.messages : [];
+  conversation.tasks = Array.isArray(persistedConversation.tasks) ? persistedConversation.tasks : [];
+  conversation.isStub = false;
+  conversation.hasMessages = conversation.messages.length > 0;
+  if (durableTasks && typeof durableTasks.values === 'function') {
+    for (const task of durableTasks.values()) {
+      reconcileConversationTaskPresentation(conversation, task);
+    }
+  }
+  if (!conversation.awaitingDelegatedPlan) {
+    const planMessage = findDelegatedPlanMessage(conversation);
+    const delegatedPlan = planMessage && planMessage.delegatedPlan;
+    const taskId = String(delegatedPlan && delegatedPlan.taskId || '');
+    const durableTask = taskId && durableTasks && typeof durableTasks.get === 'function'
+      ? durableTasks.get(taskId)
+      : null;
+    const taskStatus = String(durableTask && durableTask.status || '');
+    const originConversationId = String(durableTask && durableTask.origin && durableTask.origin.conversationId || '');
+    if (delegatedPlan
+        && !planMessage.delegatedPlanApproved
+        && !planMessage.delegatedPlanDenied
+        && !planMessage.delegatedPlanRevisionRequested
+        && (taskStatus === 'pending' || taskStatus === 'active')
+        && (!originConversationId || originConversationId === conversation.id)) {
+      conversation.awaitingDelegatedPlan = delegatedPlan;
+      conversation.awaitingPlanApprovalTaskId = taskId;
+    }
+  }
+  scheduleTerminalDelegatedTaskReconciliation(conversation, durableTasks);
+  return conversation;
+}
+
+// True only after the on-disk index has been read successfully this session. If startup
+// crashes before that read, the in-memory list holds at most a freshly created conversation,
+// and writing the index from it would clobber every persisted conversation stub.
+let diskConversationIndexLoaded = false;
+
 async function loadConversationsFromStorage() {
   const local = parseConversationStorageCandidate(localStorage.getItem('ag2_conversations'), 'ag2_conversations');
   const backup = parseConversationStorageCandidate(localStorage.getItem('ag2_conversations_backup'), 'ag2_conversations_backup');
   let disk = [];
-  if (window.api && typeof window.api.readConversations === 'function') {
+  if (window.api && typeof window.api.readConversationsIndex === 'function') {
     try {
-      const result = await window.api.readConversations();
-      if (result && result.success && Array.isArray(result.conversations)) {
-        disk = result.conversations;
+      const result = await window.api.readConversationsIndex();
+      if (result && result.success && Array.isArray(result.index)) {
+        disk = result.index;
+        diskConversationIndexLoaded = true;
       } else if (result && result.error) {
-        console.warn('Failed to read disk conversation store', result.error);
+        console.warn('Failed to read disk conversation index', result.error);
       }
     } catch (error) {
-      console.warn('Disk conversation store is unavailable', error);
+      console.warn('Disk conversation index is unavailable', error);
     }
   }
-  conversations = mergeConversationSets(disk, local, backup);
+  
+  // Merge and enforce stub formatting
+  conversations = mergeConversationSets(disk, local, backup).map(c => {
+    // A conversation is a stub if it explicitly says so, OR if it has no messages in its payload
+    const isStub = c.isStub !== false && (!Array.isArray(c.messages) || c.messages.length === 0);
+    return {
+      ...c,
+      isStub,
+      messages: Array.isArray(c.messages) ? c.messages : [],
+      tasks: Array.isArray(c.tasks) ? c.tasks : [],
+    };
+  });
+  
   scrubLegacyPhoneCompanionTokenMessages();
   if (conversations.length > 0) {
     saveConversationsToStorage();
@@ -2413,7 +4146,19 @@ function migrateConversations() {
       updated = true;
     }
     if (c.mode === 'orion' && c.projectPath) {
+      // Preserve useful legacy Dispatch linkage while moving it off the Coder-owned field.
+      if (!c.dispatchProjectPath && !isGeneratedStandaloneWorkspace(c.projectPath)) {
+        c.dispatchProjectPath = c.projectPath;
+      }
       c.projectPath = '';
+      updated = true;
+    }
+    if (c.mode === 'orion' && !c.dispatchProjectPath && matchingWorkspaceProject) {
+      c.dispatchProjectPath = matchingWorkspaceProject;
+      updated = true;
+    }
+    if (c.mode === 'orion' && c.dispatchProjectPath && isGeneratedStandaloneWorkspace(c.dispatchProjectPath)) {
+      c.dispatchProjectPath = '';
       updated = true;
     }
     if (c.mode === 'orion' && c.workspace && isGeneratedStandaloneWorkspace(c.workspace)) {
@@ -2435,6 +4180,13 @@ function migrateConversations() {
       const before = c.messages.length;
       c.messages = c.messages.filter(msg => !isLegacyPhoneCompanionTokenMessage(msg && msg.text));
       if (c.messages.length !== before) updated = true;
+    }
+    if (c.mode === 'orion') {
+      const summary = deriveDispatchDiscussionSummary(c);
+      if (summary && summary !== c.dispatchDiscussionSummary) {
+        c.dispatchDiscussionSummary = summary;
+        updated = true;
+      }
     }
   });
   if (updated) {
@@ -2566,16 +4318,114 @@ function latestToolActivity(logs = []) {
   return [...logs].reverse().find(log => log && (log.type === 'tool_call' || log.tool));
 }
 
-function formatDispatchToolActivity(logs = []) {
+// ── Dispatch presentation (phone parity) ─────────────────────────────────────
+// Dispatch is a conversational space, not an engineering console. Tool activity renders as one
+// collapsed line the user can expand into compact, truncated rows — never the Coder-grade chips
+// with full JSON params and raw result dumps.
+
+function formatDispatchValuePreview(value, maxLength) {
+  const text = String(value === undefined || value === null ? '' : (typeof value === 'string' ? value : JSON.stringify(value))).trim();
+  if (!text || text.length <= maxLength) return text;
+  return text.slice(0, maxLength).trimEnd() + '…';
+}
+
+function formatDispatchParamsPreview(params) {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) return '';
+  return Object.entries(params)
+    .filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== '')
+    .slice(0, 4)
+    .map(([key, value]) => `${key}: ${formatDispatchValuePreview(value, 90)}`)
+    .join('  ·  ');
+}
+
+function formatDispatchActivityRows(logs = []) {
+  return logs.slice(-8).map(log => {
+    if (log.type === 'thought' && log.content) {
+      return `<div class="thought-block">${escapeHtml(formatDispatchValuePreview(log.content, 240))}</div>`;
+    }
+    if (!(log.type === 'tool_call' || log.tool)) return '';
+    const status = log.status === 'completed' ? 'success' : (log.status || 'running');
+    const paramsPreview = formatDispatchParamsPreview(log.params);
+    const resultPreview = formatDispatchValuePreview(log.result, 240);
+    return `
+      <div class="tool-run-badge dispatch-activity-row">
+        <div class="tool-call-info">
+          <span class="tool-name">${escapeHtml(log.tool || 'tool')}</span>
+          <span class="tool-status ${escapeHtml(status)}">${escapeHtml(status)}</span>
+        </div>
+        ${paramsPreview ? `<div class="tool-params">${escapeHtml(paramsPreview)}</div>` : ''}
+        ${resultPreview ? `<div class="tool-result-box dispatch-result-preview">${escapeHtml(resultPreview)}</div>` : ''}
+      </div>
+    `;
+  }).join('');
+}
+
+function formatDispatchToolActivity(logs = [], isRunning = false) {
+  const meaningfulLogs = (logs || []).filter(log => log && (log.type === 'tool_call' || log.tool || (log.type === 'thought' && log.content)));
+  if (!meaningfulLogs.length) return '';
   const activity = latestToolActivity(logs);
-  if (!activity) return '';
-  const tool = activity.tool || 'tool';
-  const status = activity.status || 'running';
-  const verb = status === 'error' ? 'Had trouble with' : (status === 'running' ? 'Using' : 'Checked');
+  const status = activity ? (activity.status === 'completed' ? 'success' : (activity.status || 'running')) : 'success';
+  const stepCount = meaningfulLogs.filter(log => log.type === 'tool_call' || log.tool).length;
+  const headerLabel = isRunning && activity
+    ? `${status === 'error' ? 'Had trouble with' : 'Using'} <code>${escapeHtml(activity.tool || 'tool')}</code>`
+    : `Worked through ${stepCount} step${stepCount === 1 ? '' : 's'}`;
   return `
-    <div class="dispatch-tool-activity ${escapeHtml(status)}">
-      <span class="dispatch-tool-pulse"></span>
-      <span>${verb} <code>${escapeHtml(tool)}</code></span>
+    <div class="agent-logs-container dispatch-activity-log${status === 'error' ? ' error' : ''}">
+      <div class="agent-logs-header" onclick="toggleLogs(this)">
+        <span class="dispatch-current-tool${isRunning ? ' running' : ''}"><span class="dispatch-tool-pulse"></span>${headerLabel}</span>
+        <span>▼</span>
+      </div>
+      <div class="agent-logs-body" style="display: none;">${formatDispatchActivityRows(meaningfulLogs)}</div>
+    </div>
+  `;
+}
+
+// A "## Work Walkthrough" block in a delegated Coder response is a wall of markdown bullets on
+// desktop. In the Dispatch space it becomes a tidy collapsed checklist panel, same as the phone.
+function splitDispatchAssistantText(text) {
+  const raw = String(text || '');
+  const match = raw.match(/(?:^|\n)## Work Walkthrough\s*/);
+  if (!match) return { answer: raw, walkthrough: '' };
+  const start = match.index + (raw[match.index] === '\n' ? 1 : 0);
+  return {
+    answer: raw.slice(0, start).trim(),
+    walkthrough: raw.slice(start).trim()
+  };
+}
+
+function parseDispatchWalkthroughRows(walkthroughText) {
+  const body = String(walkthroughText || '').replace(/^## Work Walkthrough\s*/i, '').trim();
+  if (!body) return [];
+  return body.split(/\n+/).map(line => line.trim()).filter(Boolean).map(line => {
+    const cleaned = line.replace(/^[-*]\s*/, '').replace(/\*\*/g, '').trim();
+    const match = cleaned.match(/^([^:]+):\s*(.*)$/);
+    const rawStatus = match ? match[1].trim() : 'Done';
+    const detail = match ? match[2].trim() : cleaned;
+    const status = /^fail/i.test(rawStatus)
+      ? 'error'
+      : (/^done|^complete|^passed/i.test(rawStatus) ? 'success' : rawStatus.toLowerCase().replace(/\s+/g, '-'));
+    return { status, label: rawStatus, detail };
+  });
+}
+
+function renderDispatchWalkthroughPanel(walkthroughText) {
+  const rows = parseDispatchWalkthroughRows(walkthroughText);
+  if (!rows.length) return '';
+  const renderedRows = rows.slice(-20).map(row => `
+    <div class="tool-run-badge dispatch-activity-row walkthrough-row">
+      <div class="tool-call-info">
+        <span class="tool-name">${escapeHtml(formatDispatchValuePreview(row.detail || 'Work item', 180))}</span>
+        <span class="tool-status ${escapeHtml(row.status)}">${escapeHtml(row.label)}</span>
+      </div>
+    </div>
+  `).join('');
+  return `
+    <div class="agent-logs-container dispatch-activity-log">
+      <div class="agent-logs-header" onclick="toggleLogs(this)">
+        <span>Work walkthrough · ${rows.length} item${rows.length === 1 ? '' : 's'}</span>
+        <span>▼</span>
+      </div>
+      <div class="agent-logs-body" style="display: none;">${renderedRows}</div>
     </div>
   `;
 }
@@ -2612,41 +4462,133 @@ async function refreshPhoneCompanionPairing() {
   }
 }
 
+let saveConversationsTimeout = null;
+let dirtyConversationIds = new Set();
+
+window.markConversationDirty = function(id) {
+  if (id) dirtyConversationIds.add(id);
+};
+
 function saveConversationsToStorage() {
-  const revision = ++conversationSaveRevision;
-  let snapshot = null;
-  try {
-    snapshot = JSON.parse(JSON.stringify(conversations));
-  } catch (error) {
-    console.error("Failed to serialize conversations", error);
-    return;
-  }
-
-  if (window.api && typeof window.api.writeConversations === 'function') {
-    window.api.writeConversations({ revision, conversations: snapshot }).then(result => {
-      if (result && result.success) {
-        lastConversationDiskSaveError = '';
-      } else {
-        lastConversationDiskSaveError = result && result.error ? result.error : 'Unknown disk save error';
-        console.error("Failed to save conversations to disk", lastConversationDiskSaveError);
-      }
-    }).catch(error => {
-      lastConversationDiskSaveError = error.message || String(error);
-      console.error("Failed to save conversations to disk", error);
+  if (saveConversationsTimeout) clearTimeout(saveConversationsTimeout);
+  saveConversationsTimeout = setTimeout(() => {
+    saveConversationsTimeout = null;
+    executeSaveConversationsToStorage().catch(error => {
+      console.error('Failed to save conversations', error);
     });
+  }, 300);
+}
+
+async function flushConversationsToStorage(conversationId = '') {
+  if (conversationId) dirtyConversationIds.add(conversationId);
+  if (saveConversationsTimeout) {
+    clearTimeout(saveConversationsTimeout);
+    saveConversationsTimeout = null;
+  }
+  return executeSaveConversationsToStorage();
+}
+
+async function executeSaveConversationsToStorage() {
+  const revision = ++conversationSaveRevision;
+  
+  // 1. Build the lightweight index
+  const index = conversations.map(c => {
+    return {
+      id: c.id,
+      title: c.title,
+      mode: c.mode,
+      projectPath: c.projectPath,
+      dispatchProjectPath: c.dispatchProjectPath || '',
+      dispatchContextSummary: c.dispatchContextSummary || '',
+      dispatchDiscussionSummary: deriveDispatchDiscussionSummary(c),
+      workspace: c.workspace,
+      launchedCoderConvId: c.launchedCoderConvId,
+      launchedCoderTaskId: c.launchedCoderTaskId || '',
+      lastOwnedTaskId: c.lastOwnedTaskId || '',
+      lastOrchestrationTaskId: c.lastOrchestrationTaskId || '',
+      launchedCoderTaskTitle: c.launchedCoderTaskTitle,
+      launchedCoderTaskStart: c.launchedCoderTaskStart,
+      lastDelegatedWork: c.lastDelegatedWork || null,
+      planApproved: c.planApproved,
+      awaitingPlanApproval: c.awaitingPlanApproval,
+      awaitingPlanApprovalTaskId: c.awaitingPlanApprovalTaskId || '',
+      awaitingDelegatedPlan: c.awaitingDelegatedPlan || null,
+      planRevisionInProgress: c.planRevisionInProgress || null,
+      revisingDelegatedPlan: c.revisingDelegatedPlan || null,
+      updatedAt: c.updatedAt || Date.now(),
+      createdAt: c.createdAt || Date.now(),
+      isStub: true, // index always represents stubs
+      hasMessages: c.isStub ? !!c.hasMessages : (Array.isArray(c.messages) && c.messages.length > 0)
+    };
+  });
+
+  // 2. Identify dirty, fully-loaded conversations to write individually
+  const dirtyIds = [...dirtyConversationIds];
+  dirtyConversationIds.clear();
+  
+  if (typeof activeConversationId !== 'undefined' && activeConversationId) dirtyIds.push(activeConversationId);
+  if (window.getRunningConversationId) {
+    const rId = window.getRunningConversationId();
+    if (rId) dirtyIds.push(rId);
+  }
+  
+  const uniqueDirtyIds = [...new Set(dirtyIds)];
+  const conversationsToWrite = uniqueDirtyIds
+    .map(id => conversations.find(c => c.id === id))
+    .filter(c => c && !c.isStub); // Only write full payloads
+
+  // 3. Dispatch to disk
+  const diskWrites = [];
+  if (window.api) {
+    if (typeof window.api.writeConversationsIndex === 'function' && diskConversationIndexLoaded) {
+      const indexWrite = window.api.writeConversationsIndex({ revision, index }).then(result => {
+        if (result && result.success) {
+          lastConversationDiskSaveError = '';
+          return true;
+        } else {
+          lastConversationDiskSaveError = result && result.error ? result.error : 'Unknown disk index save error';
+          return false;
+        }
+      }).catch(error => {
+        lastConversationDiskSaveError = error.message || String(error);
+        console.error("Failed to save conversation index", error);
+        return false;
+      });
+      diskWrites.push(indexWrite);
+    }
+    
+    if (typeof window.api.writeConversation === 'function') {
+      conversationsToWrite.forEach(c => {
+        const conversationWrite = window.api.writeConversation(c).then(result => {
+          if (result && result.success) return true;
+          const message = result && result.error ? result.error : 'Unknown conversation save error';
+          throw new Error(message);
+        }).catch(error => {
+          // Keep failed payloads dirty so the next scheduled or explicit flush retries them.
+          dirtyConversationIds.add(c.id);
+          console.error(`Save failed for conv ${c.id}`, error);
+          return false;
+        });
+        diskWrites.push(conversationWrite);
+      });
+    }
   }
 
+  // 4. Save index to localStorage for instant boot
   try {
-    const serialized = JSON.stringify(snapshot);
-    localStorage.setItem('ag2_conversations', serialized);
-    localStorage.setItem('ag2_conversations_backup', serialized);
-  } catch (e) {
-    console.error("Failed to save conversations to localStorage; disk persistence remains primary", e);
+    const serializedIndex = JSON.stringify(index);
+    localStorage.setItem('ag2_conversations', serializedIndex);
+    localStorage.setItem('ag2_conversations_backup', serializedIndex);
+  } catch (err) {
+    console.warn("Failed to write conversations index to localStorage", err);
   }
 
   if (window.api && typeof window.api.syncPhoneCompanion === 'function') {
     window.api.syncPhoneCompanion();
   }
+
+  const writeResults = await Promise.all(diskWrites);
+  return { success: writeResults.every(Boolean), revision, writtenConversationIds: conversationsToWrite.map(c => c.id) };
 }
 
 function showOrionConfirmDialog({ title = 'Confirm action', message = '', confirmLabel = 'Confirm', danger = false } = {}) {
@@ -2760,7 +4702,9 @@ function renderConversationList() {
     });
 
     if (standaloneConversations.length === 0) {
-      container.innerHTML = '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No standalone conversations yet</p>';
+      container.innerHTML = mode === 'orion'
+        ? '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No history yet</p>'
+        : '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No standalone conversations yet</p>';
       return;
     }
 
@@ -2793,11 +4737,71 @@ function renderConversationList() {
   });
 }
 
-function selectConversation(id) {
+async function selectConversation(id, options = {}) {
+  const suppliedEpoch = Number(options.selectionEpoch);
+  let selectionEpoch = Number.isFinite(suppliedEpoch)
+    ? suppliedEpoch
+    : ++conversationSelectionEpoch;
   activeConversationId = id;
+  if (window.clearOrionMemoryInactivityTimer) window.clearOrionMemoryInactivityTimer();
   const conv = conversations.find(c => c.id === id);
   if (!conv) return;
-  
+  const targetMode = conversationMode(conv);
+  if (appMode !== targetMode) {
+    // Selecting a conversation is an explicit navigation action. Keep the mode chrome and the
+    // selected transcript atomic so a Coder conversation cannot be displayed inside Dispatch
+    // (or vice versa) until the next background refresh flips it back.
+    setAppMode(targetMode);
+    selectionEpoch = conversationSelectionEpoch;
+  }
+
+  if (targetMode === 'orion') {
+    dispatchDraft = { active: false, projectPath: '', contextSummary: '' };
+    lastDispatchConversationId = conv.id;
+  }
+
+  if (conv.isStub) {
+    el.messagesContainer.innerHTML = '<div class="loading-state" style="text-align:center; padding:20px; color:#888;">Loading conversation...</div>';
+    el.messagesContainer.style.display = 'flex';
+    const orionSplashEl = document.getElementById('orion-welcome-splash');
+    if (orionSplashEl) orionSplashEl.style.display = 'none';
+    el.welcomeSplash.style.display = 'none';
+    
+    try {
+      if (window.api && typeof window.api.readConversation === 'function') {
+        const result = await window.api.readConversation(id);
+        if (activeConversationId !== id || conversationSelectionEpoch !== selectionEpoch) return;
+
+        if (result && result.success && result.conversation) {
+          hydrateConversationRecord(conv, result.conversation);
+        } else {
+          el.messagesContainer.innerHTML = `<div class="error-state" style="text-align:center; padding:20px; color:var(--red);">Failed to load conversation</div>`;
+          return;
+        }
+      }
+    } catch (err) {
+      if (activeConversationId !== id || conversationSelectionEpoch !== selectionEpoch) return;
+      console.error("Hydration failed", err);
+      el.messagesContainer.innerHTML = `<div class="error-state" style="text-align:center; padding:20px; color:var(--red);">Error loading conversation</div>`;
+      return;
+    }
+    
+    const fullConvs = conversations.filter(c => !c.isStub && c.id !== activeConversationId && c.id !== (window.getRunningConversationId ? window.getRunningConversationId() : null));
+    if (fullConvs.length > 50) {
+      fullConvs.sort((a, b) => conversationSortTime(a) - conversationSortTime(b));
+      fullConvs.slice(0, fullConvs.length - 50).forEach(c => {
+        c.messages = [];
+        c.tasks = [];
+        c.testResults = null;
+        c.fileTree = null;
+        c.scratchpad = '';
+        c.isStub = true;
+      });
+    }
+  }
+
+  if (activeConversationId !== id || conversationSelectionEpoch !== selectionEpoch) return;
+
   el.chatTitle.textContent = conv.title;
   normalizeConversationWorkspace(conv);
   const convMode = conversationMode(conv);
@@ -2869,7 +4873,7 @@ function selectConversation(id) {
             conversationId: activeConversationId
           });
         } else {
-          renderSystemBubble(replayMsg.text);
+          renderSystemBubble(replayMsg.text, replayMsg.dedupeKey || '');
         }
       }
     });
@@ -2878,7 +4882,9 @@ function selectConversation(id) {
     const recoveredAssistantMessage = buildMissingAssistantResponseMessage(replayMessages, {
       queued: queuedForThisConversation
     });
-    if (recoveredAssistantMessage) {
+    const isThisConversationRunning = window.isAgentRunning && window.isAgentRunning() && 
+      (window.getRunningConversationId ? window.getRunningConversationId() === activeConversationId : true);
+    if (recoveredAssistantMessage && !isThisConversationRunning) {
       window.clearActiveAiBubble();
       renderAiMessage(recoveredAssistantMessage.text, [], activeConversationId, recoveredAssistantMessage);
     }
@@ -2909,14 +4915,20 @@ function selectConversation(id) {
 async function submitMessage() {
   const prompt = el.chatInput.value.trim();
   if (!prompt) return;
-  
+  if (desktopPromptSubmissionInFlight) return;
+  desktopPromptSubmissionInFlight = true;
+  try {
+
   if (!appConfig.geminiApiKey) {
     el.settingsModal.classList.add('active');
     appendSystemMessage("Please enter and save your Gemini API Key first.");
     return;
   }
   
-  const conv = conversations.find(c => c.id === activeConversationId);
+  let conv = conversations.find(c => c.id === activeConversationId);
+  if (!conv && appMode === 'orion' && dispatchDraft.active) {
+    conv = createDispatchConversationFromDraft(prompt);
+  }
   if (!conv) return;
   normalizeConversationWorkspace(conv);
   
@@ -2942,6 +4954,27 @@ async function submitMessage() {
     conv.title = generateConversationTitle(prompt);
     el.chatTitle.textContent = conv.title;
     renderConversationList();
+
+    if (typeof callUtilityModel === 'function' && window.appConfig && window.selectedModel) {
+      const titlePrompt = `Generate a very short, concise title (maximum 3 to 5 words) for a conversation that starts with the following prompt. Do not use quotes or punctuation in the title.\n\nPrompt: "${prompt}"`;
+      callUtilityModel(titlePrompt, window.selectedModel, window.appConfig, false)
+        .then(betterTitle => {
+          if (betterTitle) {
+            const cleanTitle = betterTitle.replace(/["']/g, '').trim();
+            if (cleanTitle && cleanTitle.length < 50) {
+              conv.title = cleanTitle;
+              if (activeConversationId === conv.id) {
+                el.chatTitle.textContent = conv.title;
+              }
+              renderConversationList();
+              if (typeof saveConversationsToStorage === 'function') {
+                saveConversationsToStorage();
+              }
+            }
+          }
+        })
+        .catch(err => console.error("Async title generation failed:", err));
+    }
   }
 
   // Initialize the folder path if this is still the first prompt (project-scoped conversations
@@ -2969,7 +5002,13 @@ async function submitMessage() {
   
   // Update messages history (store compact image refs for replay)
   const msgImages = imagesToSend.map(i => ({ data: i.data, mimeType: i.mimeType }));
-  conv.messages.push({ role: 'user', text: prompt, ...(msgImages.length ? { images: msgImages } : {}) });
+  conv.messages.push({ id: createConversationMessageId(conv.id), role: 'user', text: prompt, createdAt: userMsgTs, ...(msgImages.length ? { images: msgImages } : {}) });
+  if (conversationMode(conv) === 'orion') {
+    conv.dispatchProjectPath = inferDispatchProjectPath(conv);
+    conv.dispatchDiscussionSummary = compactDispatchDiscussionText(prompt, conv.title);
+  }
+  conv.updatedAt = Date.now();
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
   saveConversationsToStorage();
 
   renderConversationList();
@@ -2977,29 +5016,170 @@ async function submitMessage() {
 
   // Scroll to bottom for the local send action.
   scrollChatToBottom();
+  const currentMessageId = conv.messages[conv.messages.length - 1]?.id || '';
+  const semanticIntent = await classifyCurrentConversationIntent(conv, prompt, {
+    model: el.modelSelect.value,
+    taskId: conv.awaitingPlanApprovalTaskId || ''
+  });
+
+  // A Dispatch cancellation is a lifecycle command, not another model prompt.
+  // Resolve it before clarification routing, the global busy queue, or supervisor
+  // steering so an owned pending/running task is deterministically stopped.
+  const cancellation = await cancelOwnedTaskRequestedInPrompt(
+    conv,
+    prompt,
+    'dispatch-task-cancellation',
+    semanticIntent
+  );
+  if (cancellation.handled) return;
+
+  // Free-text plan decisions are model-classified, then validated and applied by the same
+  // deterministic task/plan-ID-bound handlers used by the UI buttons.
+  if (conversationMode(conv) === 'orion' && conv.awaitingDelegatedPlan
+      && ['approve_plan', 'deny_plan', 'revise_plan'].includes(semanticIntent.intent)) {
+    const delegatedPlan = conv.awaitingDelegatedPlan;
+    const result = semanticIntent.intent === 'approve_plan'
+      ? await window.approvePhoneCompanionPlan(conv.id)
+      : (semanticIntent.intent === 'deny_plan'
+          ? await window.denyPhoneCompanionPlan(conv.id)
+          : await window.revisePhoneCompanionPlan({
+              conversationId: delegatedPlan.coderConversationId,
+              feedback: semanticIntent.resolvedRequest || prompt
+            }));
+    if (!result || result.success === false) {
+      persistAssistantStatusMessage(
+        conv.id,
+        `Could not apply that plan decision: ${(result && result.error) || 'unknown error'}`,
+        { source: 'supervisor-plan-error', dedupeKey: `plan-revision-error-${delegatedPlan.taskId}` }
+      );
+    }
+    return;
+  }
 
   // ── Supervisor interception: Orion message while a supervised Coder task runs ──
+  // "Continue" is a lifecycle command when this Dispatch conversation already owns paused or
+  // active Coder work. Resolve it before the model can interpret stale chat context and issue a
+  // second handoff. A failed lookup is also terminal for this turn: uncertainty must never create
+  // a duplicate task.
+  const ownedContinuation = await resumeOwnedCoderTaskFromDispatch(conv, prompt, {
+    messageId: currentMessageId,
+    modelSelectValue: el.modelSelect.value,
+    images: imagesToSend,
+    source: 'desktop-dispatch-continuation',
+    semanticIntent
+  });
+  if (ownedContinuation.handled) return;
+
   if (window.runAgentLoop) {
     const selectedModel = el.modelSelect.value;
-    const runOptions = imagesToSend.length ? { images: imagesToSend } : {};
+    const pendingReplyTaskId = String(
+      conv.awaitingPlanApprovalTaskId
+      || (conv.awaitingClarification && conv.awaitingClarification.taskId)
+      || ''
+    );
+    const runOptions = {
+      ...(imagesToSend.length ? { images: imagesToSend } : {}),
+      ...(pendingReplyTaskId ? { taskId: pendingReplyTaskId, preserveUserPrompt: true } : {}),
+      semanticIntent
+    };
+    if (conv.awaitingClarification && pendingReplyTaskId) {
+      const clarificationState = conv.awaitingClarification;
+      const continuation = await queueTaskContinuation({
+        taskId: pendingReplyTaskId,
+        prompt,
+        modelSelectValue: selectedModel,
+        targetConversationId: conv.id,
+        originConversationId: conv.id,
+        source: 'free-text-clarification',
+        alreadyRendered: true,
+        images: imagesToSend,
+        originMessageId: conv.messages[conv.messages.length - 1]?.id || ''
+      });
+      if (!continuation.success) {
+        conv.awaitingClarification = clarificationState;
+        saveConversationsToStorage();
+        persistAssistantStatusMessage(conv.id, continuation.error || 'Could not attach that answer to the waiting task.', {
+          source: 'clarification-error',
+          dedupeKey: `clarification-error-${pendingReplyTaskId}`
+        });
+        return;
+      }
+      conv.awaitingClarification = null;
+      saveConversationsToStorage();
+      const launch = startOrQueueTaskContinuation(continuation, conv, {
+        source: 'free-text-clarification',
+        modelSelectValue: selectedModel,
+        errorLabel: 'Free-text clarification resume'
+      });
+      if (launch.queued) {
+        persistAssistantStatusMessage(conv.id, 'Answer saved. Orion will continue this task after the current work finishes.', {
+          source: 'queue-status',
+          dedupeKey: `free-text-clarification-${pendingReplyTaskId}`
+        });
+      }
+      return;
+    }
 
     if (window.isAgentRunning && window.isAgentRunning()) {
-      const runningConvId = window.getRunningConversationId ? window.getRunningConversationId() : null;
-      const isOrionConv = conversationMode(conv) === 'orion';
-      const launchedCoderConvId = conv.launchedCoderConvId;
+      // Intercept only when both halves of the durable launch identity match.
+      // A reused Coder conversation ID must not let a stale Dispatch task steer
+      // or cancel a different active run.
+      if (ownsActiveSupervisedRun(conv)) {
+        await handleSupervisorMessage(conv, prompt, selectedModel, {
+          messageId: conv.messages[conv.messages.length - 1]?.id || '',
+          images: imagesToSend,
+          semanticIntent
+        });
+        return;
+      }
 
-      // If this Orion conversation launched the currently running Coder task, intercept
-      if (isOrionConv && launchedCoderConvId && runningConvId === launchedCoderConvId) {
-        handleSupervisorMessage(conv, prompt, selectedModel);
+      if (conversationMode(conv) === 'orion'
+          && RendererSemanticIntentRouter
+          && RendererSemanticIntentRouter.canRespondDuringActiveRun(semanticIntent, 'orion')) {
+        await respondOrionConversationally(conv, prompt, selectedModel, {
+          messageId: currentMessageId,
+          images: imagesToSend,
+          semanticIntent,
+          statusCheckin: semanticIntent.intent === 'status_check'
+            && semanticIntent.target === 'active_owned_task'
+        });
         return;
       }
 
       // Default: queue as normal
-      window.promptQueue.push({ prompt, modelSelectValue: selectedModel, conversationId: conv.id, alreadyRendered: true, images: imagesToSend });
-      persistAssistantStatusMessage(conv.id, "Queued. Orion will start this after the current task finishes.", {
-        source: 'queue-status',
-        dedupeKey: `queued-${conv.id}-${prompt}`
-      });
+      const queued = pendingReplyTaskId
+        ? await queueTaskContinuation({
+            taskId: pendingReplyTaskId,
+            prompt,
+            modelSelectValue: selectedModel,
+            targetConversationId: conv.id,
+            originConversationId: conv.id,
+            source: 'user-continuation',
+            alreadyRendered: true,
+            images: imagesToSend,
+            originMessageId: conv.messages[conv.messages.length - 1]?.id || '',
+            semanticIntent
+          })
+        : await enqueueOrchestrationTask({
+            prompt,
+            modelSelectValue: selectedModel,
+            targetConversationId: conv.id,
+            originConversationId: conv.id,
+            source: 'user-queue',
+            alreadyRendered: true,
+            images: imagesToSend,
+            originMessageId: conv.messages[conv.messages.length - 1]?.id || ''
+          });
+      if (queued.success) {
+        persistAssistantStatusMessage(conv.id, `Queued as ${queued.task.title}. Orion will start it after the current task finishes.`, {
+          source: 'queue-status',
+          dedupeKey: `queued-${queued.task.taskId}`
+        });
+      } else if (!queued.needsClarification) {
+        persistAssistantStatusMessage(conv.id, `Could not queue the task: ${queued.error || 'unknown error'}`, {
+          source: 'queue-status', dedupeKey: `queue-error-${conv.id}-${Date.now()}`
+        });
+      }
     } else {
       await window.runAgentLoop(prompt, selectedModel, conv, runOptions);
       loadRunArtifacts();
@@ -3013,10 +5193,16 @@ async function submitMessage() {
         clearInterval(waitForEngine);
         const selectedModel = el.modelSelect.value;
         if (window.isAgentRunning && window.isAgentRunning()) {
-          window.promptQueue.push({ prompt: pendingPrompt, modelSelectValue: selectedModel, conversationId: pendingConv.id, alreadyRendered: true });
-          persistAssistantStatusMessage(pendingConv.id, "Queued. Orion will start this after the current task finishes.", {
-            source: 'queue-status',
-            dedupeKey: `queued-${pendingConv.id}-${pendingPrompt}`
+          const queued = await enqueueOrchestrationTask({
+            prompt: pendingPrompt,
+            modelSelectValue: selectedModel,
+            targetConversationId: pendingConv.id,
+            originConversationId: pendingConv.id,
+            source: 'user-queue',
+            alreadyRendered: true
+          });
+          if (queued.success) persistAssistantStatusMessage(pendingConv.id, `Queued as ${queued.task.title}.`, {
+            source: 'queue-status', dedupeKey: `queued-${queued.task.taskId}`
           });
         } else {
           await window.runAgentLoop(pendingPrompt, selectedModel, pendingConv);
@@ -3025,6 +5211,9 @@ async function submitMessage() {
       }
     }, 500);
     setTimeout(() => clearInterval(waitForEngine), 30000);
+  }
+  } finally {
+    desktopPromptSubmissionInFlight = false;
   }
 }
 
@@ -3049,34 +5238,9 @@ function toTitleCase(str) {
 }
 
 function generateConversationTitle(prompt) {
-  let text = String(prompt || '').trim();
-
-  // Strip common leading filler patterns
-  const leadingFillers = [
-    /^i have a (?:program|project|app|application|file|script|tool|repo|repository) called\s+/i,
-    /^(?:can|could) you (?:please\s+)?/i,
-    /^please\s+/i,
-    /^i (?:need|want|would like) (?:you to\s+)?/i,
-    /^help me (?:with\s+)?/i,
-    /^orion[,\s]+/i,
-  ];
-  for (const pat of leadingFillers) {
-    text = text.replace(pat, '').trim();
-  }
-
-  // If the text contains multiple sentences, take only the first meaningful one
-  const sentenceBreak = text.search(/[.!?]\s+[A-Za-z]/);
-  if (sentenceBreak > 8) text = text.substring(0, sentenceBreak).trim();
-
-  // Strip location context ("in my projects folder on my desktop", etc.)
-  text = text
-    .replace(/\s+in my (?:projects?\s+folder(?:\s+on my desktop)?|desktop(?:\s+projects?\s+folder)?|projects?)\s*$/i, '')
-    .replace(/\s+on my desktop\s*$/i, '')
-    .replace(/\s+located (?:at|in)\s+\S+\s*$/i, '')
-    .trim();
-
-  // Collapse whitespace
-  text = text.replace(/\s+/g, ' ').trim();
+  // Titles are display formatting, not a second intent classifier. Preserve the user's wording
+  // and apply only mechanical whitespace/length normalization.
+  let text = String(prompt || '').replace(/\s+/g, ' ').trim();
 
   // Truncate at word boundary to ~45 chars
   if (text.length > 45) {
@@ -3116,7 +5280,7 @@ function renderUserMessage(text, images = [], timestamp = null) {
   const timeStr = formatMsgTime(timestamp || Date.now());
   const imgsHtml = (images && images.length)
     ? images.map(img =>
-        `<img src="data:${escapeHtml(img.mimeType)};base64,${img.data}" alt="attached image" ` +
+        `<img src="data:${escapeHtml(img.mimeType)};base64,${img.data}" alt="attached image" `
         `style="max-width:100%;max-height:280px;border-radius:8px;margin-top:8px;display:block;border:1px solid rgba(151,164,196,.15);">`
       ).join('')
     : '';
@@ -3140,6 +5304,34 @@ function appendSystemMessage(text, options = {}) {
   const runningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
   const targetId = options.conversationId || runningId || activeConversationId;
   const dedupeKey = options.dedupeKey || text;
+  const conv = conversations.find(c => c.id === targetId);
+  if (conv && options.updateExisting && options.dedupeKey) {
+    const existing = (conv.messages || []).slice().reverse().find(msg =>
+      msg &&
+      msg.role === 'system' &&
+      msg.dedupeKey === dedupeKey
+    );
+    if (existing) {
+      existing.text = text;
+      existing.updatedAt = Date.now();
+      if (options.source) existing.source = options.source;
+      saveConversationsToStorage();
+      // Update the already-rendered chip in place. The old behavior re-rendered the entire
+      // conversation via selectConversation() — mid-run, that replay orphaned the live
+      // assistant bubble (leaving a frozen duplicate with a stuck "Working…" spinner) and the
+      // agent's next render then appended a second copy of the same message below the chips.
+      if (targetId === activeConversationId && el.messagesContainer) {
+        const chip = el.messagesContainer.querySelector(`[data-sys-dedupe="${CSS.escape(dedupeKey)}"]`);
+        const chipBody = chip && chip.querySelector('.message-body');
+        if (chipBody) {
+          chipBody.textContent = text;
+        } else {
+          renderSystemBubble(text, dedupeKey);
+        }
+      }
+      return;
+    }
+  }
   const windowMs = Number(options.windowMs || 1500);
   window.recentSystemMessages = window.recentSystemMessages || {};
   const now = Date.now();
@@ -3147,7 +5339,6 @@ function appendSystemMessage(text, options = {}) {
   if (now - lastAt < windowMs) {
     return;
   }
-  const conv = conversations.find(c => c.id === targetId);
   if (conv && options.dedupeKey) {
     conv.systemMessageDedupe = conv.systemMessageDedupe || {};
     const convLastAt = conv.systemMessageDedupe[dedupeKey] || 0;
@@ -3159,10 +5350,11 @@ function appendSystemMessage(text, options = {}) {
   window.recentSystemMessages[dedupeKey] = now;
   
   if (targetId === activeConversationId) {
-    renderSystemBubble(text);
+    renderSystemBubble(text, options.dedupeKey || '');
   }
   if (conv) {
     const sysMsg = { role: 'system', text: text };
+    if (options.dedupeKey) sysMsg.dedupeKey = options.dedupeKey;
     if (options.source === 'plan-approval') {
       sysMsg.source = 'plan-approval'; // Matches: role: 'system', source: 'plan-approval'
     } else if (options.source) {
@@ -3172,8 +5364,6 @@ function appendSystemMessage(text, options = {}) {
     saveConversationsToStorage();
   }
 }
-
-const MISSING_ASSISTANT_RESPONSE_TEXT = 'Run ended before Orion saved an assistant response. This transcript only contains your prompt, so there is no assistant answer to replay.';
 
 function persistAssistantStatusMessage(conversationId, text, options = {}) {
   const targetId = conversationId || activeConversationId;
@@ -3211,6 +5401,10 @@ function persistAssistantStatusMessage(conversationId, text, options = {}) {
 }
 
 function buildMissingAssistantResponseMessage(normalizedMessages, options = {}) {
+  // An orphaned user turn with no assistant reply (run ended before a response was saved) is
+  // skipped silently rather than replaced with a fake error bubble -- the incomplete turn just
+  // doesn't render. The only case worth a status bubble is a legitimate queued follow-up.
+  if (!options.queued) return null;
   if (!Array.isArray(normalizedMessages) || normalizedMessages.length === 0) return null;
   const lastUserIndex = normalizedMessages.map(msg => msg.role).lastIndexOf('user');
   if (lastUserIndex === -1) return null;
@@ -3220,19 +5414,15 @@ function buildMissingAssistantResponseMessage(normalizedMessages, options = {}) 
     return !isEmptyThinkingPlaceholder(msg.text, logs);
   });
   if (hasMeaningfulAssistantAfterUser) return null;
-  const queued = !!options.queued;
-  const text = queued
-    ? 'Queued. Orion will start this after the current task finishes.'
-    : MISSING_ASSISTANT_RESPONSE_TEXT;
+  const text = 'Queued. Orion will start this after the current task finishes.';
   return {
     role: 'assistant',
-    source: queued ? 'queue-status' : 'missing-assistant-recovery',
+    source: 'queue-status',
     text,
     content: text,
     logs: [],
     turns: [],
-    statusOnly: true,
-    recovered: !queued
+    statusOnly: true
   };
 }
 
@@ -3262,6 +5452,7 @@ function updatePhoneCompanionPairingPanel(payload = {}) {
   const pairUrl = String(payload.pairUrl || '');
   const networkEnabled = payload.networkEnabled !== false && !!pairUrl;
   const secureEnabled = payload.preferredUrlType === 'https' || /^https:\/\//i.test(pairUrl);
+  const secureUnavailable = !!payload.secureOrigin && payload.secureOriginReachable === false;
   const expiresText = payload.expiresAt ? `Expires: ${new Date(payload.expiresAt).toLocaleTimeString()}` : 'Short-lived pairing link';
   if (el.btnPhoneCompanion) {
     el.btnPhoneCompanion.style.display = '';
@@ -3279,7 +5470,11 @@ function updatePhoneCompanionPairingPanel(payload = {}) {
   }
   if (el.phoneCompanionMeta) {
     el.phoneCompanionMeta.textContent = networkEnabled
-      ? `${expiresText}. ${secureEnabled ? 'HTTPS enabled for phone notifications.' : 'Live view only; add an HTTPS phone URL in Settings for mobile notifications.'}`
+      ? `${expiresText}. ${secureEnabled
+        ? 'HTTPS enabled for phone notifications.'
+        : secureUnavailable
+          ? 'The configured HTTPS route is unavailable, so Orion is using a reachable direct route without discarding paired access.'
+          : 'Live view only; add an HTTPS phone URL in Settings for mobile notifications.'}`
       : 'LAN companion mode is disabled by default. No localhost QR is shown for phones.';
   }
   // Tailscale panel: show/hide the Tailscale QR block inside the pairing panel
@@ -3374,13 +5569,16 @@ setInterval(() => {
   }
 }, 4000);
 
-function renderSystemBubble(text) {
+function renderSystemBubble(text, dedupeKey = '') {
   if (isLegacyPhoneCompanionTokenMessage(text)) {
     return;
   }
   const stickToBottom = shouldAutoScrollChat();
   const bubble = document.createElement('div');
   bubble.className = 'message-bubble';
+  // Stamped so updateExisting system messages can refresh the rendered chip in place instead of
+  // re-rendering the whole conversation (see appendSystemMessage).
+  if (dedupeKey) bubble.dataset.sysDedupe = String(dedupeKey);
   bubble.innerHTML = `
     <div class="message-header" style="color: var(--text-muted);">⚙️ System</div>
     <div class="message-body" style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-muted);">${escapeHtml(text)}</div>
@@ -3397,6 +5595,7 @@ function renderPhoneCompanionPairingCard(payload) {
   const pairUrl = String(payload.pairUrl || '');
   const stableUrl = String(payload.stableUrl || pairUrl.replace(/\?.*$/, ''));
   const secureEnabled = payload.preferredUrlType === 'https' || /^https:\/\//i.test(pairUrl);
+  const secureUnavailable = !!payload.secureOrigin && payload.secureOriginReachable === false;
   const expiresText = payload.expiresAt ? `Expires: ${new Date(payload.expiresAt).toLocaleTimeString()}` : 'Short-lived pairing link';
 
   // Tailscale section — only shown when Tailscale is active on the desktop
@@ -3424,7 +5623,11 @@ function renderPhoneCompanionPairingCard(payload) {
         <div data-companion-qr="true" aria-label="Phone Companion pairing QR code" style="background:#fff; padding:8px; border-radius:8px; line-height:0;">${qrSvg}</div>
         <div style="min-width:220px; flex:1;">
           <div style="font-weight:700; margin-bottom:6px;">Scan once to trust this phone</div>
-          <div style="color: var(--text-muted); margin-bottom:8px;">${secureEnabled ? 'This HTTPS link can request phone notifications. Add the clean URL to your home screen after pairing.' : 'This local link keeps live view working. Add a Secure Phone URL in Settings to enable background notifications.'}</div>
+          <div style="color: var(--text-muted); margin-bottom:8px;">${secureEnabled
+            ? 'This HTTPS link can request phone notifications. Add the clean URL to your home screen after pairing.'
+            : secureUnavailable
+              ? 'The saved HTTPS route is not responding. Orion is showing a reachable direct link and will preserve existing paired-device credentials.'
+              : 'This local link keeps live view working. Add a Secure Phone URL in Settings to enable background notifications.'}</div>
           <div data-pair-url="${escapeHtml(pairUrl)}" style="font-family: var(--font-mono); font-size:.76rem; word-break:break-all;">${escapeHtml(pairUrl)}</div>
           <div data-stable-phone-url="${escapeHtml(stableUrl)}" style="font-family: var(--font-mono); font-size:.76rem; word-break:break-all; margin-top:6px; color:var(--success-color);">${escapeHtml(stableUrl)}</div>
           <div data-pairing-metadata="true" style="color: var(--text-muted); font-size:.74rem; margin-top:8px;">${escapeHtml(expiresText)}</div>
@@ -3475,12 +5678,16 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     ? conversations.find(c => c.id === activeConversationId)
     : null;
   const isDispatchConversation = activeConv && conversationMode(activeConv) === 'orion';
+  // The clean presentation belongs to the Dispatch SPACE, not just Dispatch-mode conversations:
+  // a delegated Coder transcript opened while the app is in Dispatch must not dump Coder-grade
+  // tool chips into that space. The same conversation opened from Coder keeps the full console.
+  const isDispatchPresentation = isDispatchConversation || (typeof appMode !== 'undefined' && appMode === 'orion');
   const isRunningThisConversation = !!(window.isAgentRunning && window.isAgentRunning() && runningConversationId === activeConversationId);
-  
+
   let logsHtml = '';
   if (hasLogs) {
-    if (isDispatchConversation) {
-      logsHtml = isRunningThisConversation ? formatDispatchToolActivity(logs) : '';
+    if (isDispatchPresentation) {
+      logsHtml = formatDispatchToolActivity(logs, isRunningThisConversation);
     } else {
     const isRunning = window.isAgentRunning && window.isAgentRunning();
     const displayStyle = isRunning ? 'flex' : 'none';
@@ -3524,8 +5731,17 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   
   // Render markdown text
   const displayText = isThinkingPlaceholder ? '' : String(text || '');
-  const renderedMarkdown = displayText
-    ? (typeof marked !== 'undefined' ? marked.parse(displayText) : escapeHtml(displayText))
+  let bodyText = displayText;
+  let walkthroughHtml = '';
+  if (isDispatchPresentation && displayText) {
+    const split = splitDispatchAssistantText(displayText);
+    if (split.walkthrough) {
+      bodyText = split.answer;
+      walkthroughHtml = renderDispatchWalkthroughPanel(split.walkthrough);
+    }
+  }
+  const renderedMarkdown = bodyText
+    ? (typeof marked !== 'undefined' ? marked.parse(bodyText) : escapeHtml(bodyText))
     : '';
   const inlineArtifactsHtml = renderInlineArtifactCards(logs);
   
@@ -3536,11 +5752,19 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   // object is not threaded in, so fall back to conversation state (the active bubble during a
   // planning yield is the plan bubble). On reloads the persisted msgMeta.isPlanApprovalCard
   // identifies the exact bubble so the card does not bleed onto execution bubbles.
+  const delegatedPlan = msgMeta && msgMeta.delegatedPlan;
   const isPlanBubble = msgMeta
-    ? !!msgMeta.isPlanApprovalCard
+    ? !!(msgMeta.isPlanApprovalCard || msgMeta.isDelegatedPlanCard)
     : !!(activeConv && activeConv.awaitingPlanApproval && !activeConv.planApproved);
   if (isPlanBubble) {
-    if (activeConv && activeConv.planApproved) {
+    const delegatedPlanApproved = !!(delegatedPlan && msgMeta.delegatedPlanApproved);
+    const delegatedPlanPending = !!(
+      delegatedPlan
+      && activeConv
+      && activeConv.awaitingDelegatedPlan
+      && activeConv.awaitingDelegatedPlan.taskId === delegatedPlan.taskId
+    );
+    if ((activeConv && activeConv.planApproved) || delegatedPlanApproved) {
       // The plan was approved — show a persistent "started" state instead of removing the card,
       // so the chat clearly reflects that the button was pressed.
       planApprovalHtml = `
@@ -3552,14 +5776,15 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
           <button class="btn-approve-plan approved" type="button" disabled>✓ Implementation Started</button>
         </div>
       `;
-    } else if (activeConv && activeConv.awaitingPlanApproval && !(window.isAgentRunning && window.isAgentRunning())) {
+    } else if ((delegatedPlanPending || (activeConv && activeConv.awaitingPlanApproval))
+        && !(window.isAgentRunning && window.isAgentRunning())) {
       planApprovalHtml = `
         <div class="plan-approval-actions">
           <div class="plan-approval-copy">
             <span class="plan-approval-title">Plan ready for review</span>
             <span class="plan-approval-subtitle">Start when the direction looks right.</span>
           </div>
-          <button class="btn-approve-plan" type="button">Start Implementation</button>
+          <button class="btn-approve-plan" type="button">${delegatedPlan ? 'Approve & Continue' : 'Start Implementation'}</button>
         </div>
       `;
     }
@@ -3571,7 +5796,22 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   if (isClarificationBubble && activeConv && activeConv.awaitingClarification) {
     clarificationHtml = buildClarificationCardHtml(activeConv.awaitingClarification);
   }
-  if (window.isAgentRunning && window.isAgentRunning() && runningConversationId === activeConversationId) {
+  let isLastAssistantMsg = true;
+  if (msgMeta && activeConv && activeConv.messages) {
+    const lastAsst = activeConv.messages.slice().reverse().find(m => {
+      const r = String((m && m.role) || '').toLowerCase();
+      return r === 'assistant' || r === 'model' || r === 'ai' || r === 'orion';
+    });
+    if (lastAsst) {
+      if (lastAsst.createdAt && msgMeta.createdAt) {
+        isLastAssistantMsg = lastAsst.createdAt === msgMeta.createdAt;
+      } else {
+        isLastAssistantMsg = lastAsst.text === msgMeta.text;
+      }
+    }
+  }
+
+  if (isLastAssistantMsg && window.isAgentRunning && window.isAgentRunning() && runningConversationId === activeConversationId) {
     const stepNum = window.currentLoopCount || 1;
     
     // Check if the current conversation's plan has been approved
@@ -3600,7 +5840,11 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     `;
   }
   
-  const aiMsgTime = isNew ? formatMsgTime(Date.now()) : '';
+  // Prefer the message's stored send time; replayed transcripts must not restamp every bubble
+  // with the render-time clock. Date.now() is correct only for a brand-new bubble with no
+  // persisted message behind it (ad-hoc status replies).
+  const aiMsgTs = msgMeta ? Number(msgMeta.createdAt || msgMeta.timestamp || msgMeta.updatedAt) || 0 : 0;
+  const aiMsgTime = aiMsgTs ? formatMsgTime(aiMsgTs) : (isNew && !msgMeta ? formatMsgTime(Date.now()) : '');
   bubble.innerHTML = `
     <div class="message-header ai">
       <span>✦ Orion AI</span>
@@ -3609,6 +5853,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     ${logsHtml}
     <div class="message-body">
       ${renderedMarkdown}
+      ${walkthroughHtml}
       ${inlineArtifactsHtml}
       ${clarificationHtml}
       ${planApprovalHtml}
@@ -3621,6 +5866,12 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   if (isNew) {
     el.messagesContainer.appendChild(bubble);
   }
+  // Stale-spinner sweep: a running indicator in any bubble other than the one just rendered is
+  // an orphan from an interrupted render path (e.g. a mid-run transcript re-render detaching the
+  // live bubble). A bubble that is not the live bubble cannot be "Working…".
+  el.messagesContainer.querySelectorAll('.agent-running-indicator').forEach(node => {
+    if (!bubble.contains(node)) node.remove();
+  });
   bubble.querySelectorAll('a[href^="orion-file:"]').forEach(link => {
     link.addEventListener('click', (event) => {
       event.preventDefault();
@@ -3644,7 +5895,13 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   wireInlineArtifactOpeners(bubble);
   const approveButton = bubble.querySelector('.btn-approve-plan');
   if (approveButton) {
-    approveButton.addEventListener('click', () => approveCurrentPlanAndContinue({ button: approveButton }));
+    approveButton.addEventListener('click', () => {
+      if (delegatedPlan) {
+        approveDelegatedPlanAndContinue(delegatedPlan, msgMeta, { button: approveButton });
+      } else {
+        approveCurrentPlanAndContinue({ button: approveButton });
+      }
+    });
   }
   // Wire clarification option rows for selection highlight
   bubble.querySelectorAll('.clarification-option, .clarification-other-row').forEach(row => {
@@ -4051,20 +6308,65 @@ async function submitClarificationAnswers({ button, bubble, targetConversationId
 
   const formattedAnswers = answers.map(a => `${a.header}: ${a.answer}`).join('\n');
   const userMessage = `Here are my answers:\n${formattedAnswers}`;
+  const clarificationTaskId = String(clarData.taskId || '');
 
   // Supervisor proxy: if these answers belong to a Coder conversation, relay them there
   const relayConvId = clarData._relayToConvId;
   if (relayConvId) {
     const coderConv = conversations.find(c => c.id === relayConvId);
-    if (coderConv) {
-      window.steeringQueue = window.steeringQueue || {};
-      window.steeringQueue[relayConvId] = window.steeringQueue[relayConvId] || [];
-      window.steeringQueue[relayConvId].push(`[CLARIFICATION ANSWER]\n${formattedAnswers}`);
-      coderConv.awaitingClarification = null;
-      conv.awaitingClarification = null;
-      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
-      appendSystemMessage('Answers relayed to Coder.', { conversationId: targetId });
+    if (!coderConv) {
+      if (button) {
+        button.disabled = false;
+        button.textContent = 'Submit';
+      }
+      return;
     }
+
+    const coderClarificationState = coderConv.awaitingClarification;
+    coderConv.awaitingClarification = null;
+    conv.awaitingClarification = null;
+    const messageId = createConversationMessageId(coderConv.id);
+    coderConv.messages.push({ id: messageId, role: 'user', text: userMessage, source: 'clarification-answers' });
+    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+
+    const continuation = await queueTaskContinuation({
+      taskId: clarificationTaskId,
+      prompt: userMessage,
+      resolvedObjective: `Continue the existing task using these clarification answers:\n${formattedAnswers}`,
+      title: `Continue after clarification: ${coderConv.title || 'Coder task'}`,
+      modelSelectValue: el.modelSelect.value,
+      targetConversationId: relayConvId,
+      originConversationId: targetId,
+      originMessageId: messageId,
+      workspace: structuredWorkspaceForConversation(coderConv),
+      source: 'clarification-answers'
+    });
+    if (!continuation.success) {
+      coderConv.awaitingClarification = coderClarificationState;
+      conv.awaitingClarification = clarData;
+      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+      if (button) {
+        button.disabled = false;
+        button.textContent = 'Submit';
+      }
+      return;
+    }
+    appendSystemMessage('Answers relayed to Coder.', { conversationId: targetId });
+    if (window.isAgentRunning && window.isAgentRunning()) {
+      persistAssistantStatusMessage(targetId, 'Queued. Coder will continue once the current task finishes.', {
+        source: 'queue-status',
+        dedupeKey: `clarification-proxy-queued-${continuation.task.taskId}`
+      });
+      return;
+    }
+    window.promptQueue = window.promptQueue.filter(item => item.taskId !== continuation.task.taskId);
+    window.runAgentLoop(continuation.queueItem.prompt, el.modelSelect.value, coderConv, {
+      source: 'clarification-answers',
+      internalPrompt: true,
+      taskId: continuation.task.taskId,
+      images: continuation.queueItem.images || [],
+      contextPacketIds: continuation.queueItem.contextPacketIds || []
+    }).catch(err => console.error('Proxied clarification resume failed:', err));
     return;
   }
 
@@ -4079,8 +6381,42 @@ async function submitClarificationAnswers({ button, bubble, targetConversationId
     return;
   }
 
-  window.runAgentLoop(userMessage, el.modelSelect.value, conv, { source: 'clarification-answers' })
-    .catch(err => console.error('Clarification resume failed:', err));
+  const supervisingConversation = conversations.find(item => item.launchedCoderConvId === targetId);
+  const continuation = await queueTaskContinuation({
+    taskId: clarificationTaskId,
+    prompt: userMessage,
+    resolvedObjective: `Continue the existing task using these clarification answers:\n${formattedAnswers}`,
+    title: `Continue after clarification: ${conv.title || 'task'}`,
+    modelSelectValue: el.modelSelect.value,
+    targetConversationId: targetId,
+    originConversationId: supervisingConversation ? supervisingConversation.id : targetId,
+    workspace: structuredWorkspaceForConversation(conv),
+    source: 'clarification-answers'
+  });
+  if (!continuation.success) {
+    conv.awaitingClarification = clarData;
+    saveConversationsToStorage();
+    if (button) {
+      button.disabled = false;
+      button.textContent = 'Submit';
+    }
+    return;
+  }
+  if (window.isAgentRunning && window.isAgentRunning()) {
+    persistAssistantStatusMessage(targetId, 'Queued. Orion will continue once the current task finishes.', {
+      source: 'queue-status',
+      dedupeKey: `clarification-answers-queued-${continuation.task.taskId}`
+    });
+    return;
+  }
+  window.promptQueue = window.promptQueue.filter(item => item.taskId !== continuation.task.taskId);
+  window.runAgentLoop(continuation.queueItem.prompt, el.modelSelect.value, conv, {
+    source: 'clarification-answers',
+    internalPrompt: true,
+    taskId: continuation.task.taskId,
+    images: continuation.queueItem.images || [],
+    contextPacketIds: continuation.queueItem.contextPacketIds || []
+  }).catch(err => console.error('Clarification resume failed:', err));
 }
 
 // UTILITY ESCAPE HTML
@@ -4113,6 +6449,9 @@ window.changeActiveWorkspace = function(folderPath, options = {}) {
         conv.projectPath = folderPath;
       } else if (conversationMode(conv) === 'orion') {
         conv.projectPath = '';
+        const normalizedFolder = normalizePathForComparison(folderPath);
+        const knownProject = projects.find(projectPath => normalizePathForComparison(projectPath) === normalizedFolder);
+        if (knownProject) conv.dispatchProjectPath = knownProject;
       }
       saveConversationsToStorage();
     }
@@ -4130,47 +6469,216 @@ window.changeActiveWorkspace = function(folderPath, options = {}) {
   }
   refreshOperationalContext();
 };
-window.promoteWorkspaceToCoder = function(options = {}) {
-  const folderPath = String(options.path || currentWorkspace || '').trim();
+window.promoteWorkspaceToCoder = async function(options = {}) {
+  const standalone = options.standalone === true;
+  const folderPath = String(
+    options.path
+    || currentWorkspace
+    || (standalone ? getDispatchWorkspaceRoot() : '')
+  ).trim();
   if (!folderPath) return { success: false, error: 'No workspace path to promote.' };
-  addProjectPath(folderPath);
-
   const prompt = String(options.prompt || '').trim();
+  const originalUserMessage = String(options.originalUserMessage || prompt).trim();
   const title = String(options.title || '').trim()
     || (prompt ? generateConversationTitle(prompt) : 'New Coder Task');
-  const conv = createCoderConversationForProject(folderPath, {
-    title,
-    select: options.open === true
-  });
-
-  if (prompt) {
-    window.promptQueue = window.promptQueue || [];
-    window.promptQueue.push({
-      id: createQueuedPromptId(),
-      prompt,
-      modelSelectValue: window.getSelectedModel(),
-      conversationId: conv.id,
+  const originConv = conversations.find(item => item.id === String(options.sourceConversationId || ''));
+  const semanticIntent = options.semanticIntent || (originConv && prompt
+    ? await classifyCurrentConversationIntent(originConv, originalUserMessage, { model: options.modelSelectValue })
+    : null);
+  let preflightTask = options.taskPacket && RendererTaskOrchestration
+    ? RendererTaskOrchestration.normalizeTaskRecord(options.taskPacket)
+    : null;
+  const handoffWorkspace = {
+    role: standalone ? 'standalone_coder' : 'active_project',
+    path: folderPath,
+    project: {
+      name: standalone ? '' : (folderPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || ''),
+      path: standalone ? '' : folderPath
+    },
+    source: standalone ? 'standalone-dispatch-handoff' : 'dispatch-handoff',
+    resolved: true
+  };
+  if (prompt && RendererTaskOrchestration && !preflightTask) {
+    const preflight = RendererTaskOrchestration.buildTaskPacket({
+      originalUserMessage,
+      resolvedObjective: String(options.resolvedObjective || '').trim()
+        || (semanticIntent && semanticIntent.resolvedRequest)
+        || prompt,
+      title,
+      precedingMessages: taskContextMessages(originConv),
+      precedingConversationSummary: String(options.precedingConversationSummary || ''),
+      workspace: handoffWorkspace,
+      requirements: [
+        ...(Array.isArray(options.requirements) ? options.requirements : []),
+        ...(Array.isArray(options.findings) ? options.findings : [])
+      ],
+      constraints: Array.isArray(options.constraints) ? options.constraints : [],
+      unresolvedDecisions: Array.isArray(options.unresolvedDecisions) ? options.unresolvedDecisions : [],
+      originConversationId: String(options.sourceConversationId || ''),
+      originSessionId: String(options.sourceSessionId || ''),
+      originMessageId: String(options.sourceMessageId || ''),
+      targetConversationId: 'pending-coder-conversation',
+      targetMode: 'coder',
       source: 'dispatch-handoff',
-      createdAt: Date.now()
+      semanticIntent,
+      timestamp: Date.now()
     });
-    persistAssistantStatusMessage(conv.id, 'Queued from Dispatch. Coder will start when the current turn finishes.', {
-      source: 'queue-status',
-      dedupeKey: `dispatch-handoff-${conv.id}`
-    });
+    if (!preflight.success || !preflight.task) {
+      const clarification = preflight.clarification || 'What specific work should I hand to Coder?';
+      if (originConv) persistTaskClarification(originConv, clarification);
+      return { success: false, needsClarification: true, error: clarification };
+    }
+    preflightTask = preflight.task;
   }
 
-  renderProjectsList();
-  renderConversationList();
+  if (!standalone) addProjectPath(folderPath);
+  const conv = standalone
+    ? createStandaloneCoderConversation({
+        title,
+        workspacePath: folderPath,
+        select: options.open === true
+      })
+    : createCoderConversationForProject(folderPath, {
+        title,
+        select: options.open === true
+      });
+
+  const requestedPacketIds = Array.isArray(options.contextPacketIds)
+    ? [...new Set(options.contextPacketIds.map(String).filter(Boolean))].slice(-5)
+    : [];
+  let assignedPacketIds = [];
+  let contextTransferError = '';
+  let createdTask = null;
+  const handoffWarnings = [];
+  if (requestedPacketIds.length > 0 && window.api && typeof window.api.assignContextPackets === 'function') {
+    try {
+      const assignment = await window.api.assignContextPackets(folderPath, requestedPacketIds, {
+        sourceConversationId: String(options.sourceConversationId || ''),
+        targetConversationId: conv.id,
+        requestedWork: prompt,
+        findings: Array.isArray(options.findings) ? options.findings : []
+      });
+      assignedPacketIds = assignment && Array.isArray(assignment.assignedPacketIds)
+        ? assignment.assignedPacketIds
+        : [];
+      if (!assignment || assignment.success === false) contextTransferError = (assignment && assignment.error) || 'Context packet assignment failed.';
+    } catch (error) {
+      contextTransferError = error.message || String(error);
+    }
+  }
+  if (assignedPacketIds.length > 0) {
+    conv.inheritedContext = {
+      packetIds: assignedPacketIds,
+      sourceConversationId: String(options.sourceConversationId || ''),
+      workspace: folderPath,
+      assignedAt: Date.now(),
+      active: true
+    };
+  }
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+  saveConversationsToStorage();
+
+  if (prompt) {
+    // Context packets only exist when Dispatch explored with inspect_code_context. If it worked
+    // with grep/read_file instead, its findings would otherwise be silently dropped here (they
+    // only ride inside packets) — fold them into the queued prompt so the investigation isn't
+    // lost at the handoff boundary.
+    const looseFindings = Array.isArray(options.findings)
+      ? options.findings.map(f => String(f || '').trim()).filter(Boolean).slice(0, 12)
+      : [];
+    const queuedPrompt = (assignedPacketIds.length === 0 && looseFindings.length > 0)
+      ? `${prompt}\n\nFindings from Dispatch's prior investigation (verify before relying on them):\n${looseFindings.map(f => `- ${f}`).join('\n')}`
+      : prompt;
+    const handoffTask = await enqueueOrchestrationTask({
+      prompt: queuedPrompt,
+      originalUserMessage: (preflightTask && preflightTask.originalUserMessage) || originalUserMessage,
+      resolvedObjective: preflightTask ? preflightTask.objective : queuedPrompt,
+      title,
+      targetConversationId: conv.id,
+      originConversationId: String(options.sourceConversationId || conv.id),
+      originSessionId: String(options.sourceSessionId || ''),
+      originMessageId: String(options.sourceMessageId || ''),
+      precedingMessages: taskContextMessages(originConv || conv),
+      precedingConversationSummary: preflightTask ? preflightTask.precedingConversationSummary : '',
+      workspace: handoffWorkspace,
+      requirements: preflightTask
+        ? [...new Set([...(preflightTask.requirements || []), ...looseFindings])]
+        : looseFindings,
+      constraints: preflightTask ? preflightTask.constraints : [],
+      semanticIntent,
+      unresolvedDecisions: preflightTask ? preflightTask.unresolvedDecisions : [],
+      source: 'dispatch-handoff',
+      modelSelectValue: window.getSelectedModel(),
+      contextPacketIds: assignedPacketIds,
+      createdAt: Date.now()
+    });
+    if (!handoffTask.success) {
+      conversations = conversations.filter(item => item.id !== conv.id);
+      saveConversationsToStorage();
+      return {
+        success: false,
+        needsClarification: !!handoffTask.needsClarification,
+        error: handoffTask.clarification || handoffTask.error || 'The handoff task could not be resolved.'
+      };
+    }
+    conv.lastOrchestrationTaskId = handoffTask.task.taskId;
+    if (originConv) originConv.lastOwnedTaskId = handoffTask.task.taskId;
+    createdTask = handoffTask.task;
+    if (handoffTask.warning) handoffWarnings.push(handoffTask.warning);
+    try {
+      persistAssistantStatusMessage(conv.id, `Queued from Dispatch as ${handoffTask.task.title}. Coder will start when the current turn finishes.`, {
+        source: 'queue-status',
+        dedupeKey: `dispatch-handoff-${handoffTask.task.taskId}`
+      });
+    } catch (error) {
+      // The durable task is already committed. A presentation/persistence warning must not turn
+      // this into a false handoff failure that prompts a duplicate retry.
+      handoffWarnings.push(`The task was queued, but its Coder status message could not be saved: ${error.message || error}`);
+    }
+  }
+
+  try {
+    renderProjectsList();
+    renderConversationList();
+  } catch (error) {
+    handoffWarnings.push(`The handoff was queued, but the conversation list could not refresh: ${error.message || error}`);
+  }
   return {
     success: true,
-    projectPath: folderPath,
+    projectPath: standalone ? '' : folderPath,
+    workspacePath: folderPath,
+    standalone,
     conversationId: conv.id,
     title: conv.title,
-    queued: !!prompt
+    queued: !!prompt,
+    taskId: createdTask ? createdTask.taskId : '',
+    status: createdTask ? createdTask.status : (prompt ? 'pending' : 'completed'),
+    task: createdTask,
+    queueItem: createdTask
+      ? (window.promptQueue || []).find(item => item && item.taskId === createdTask.taskId) || null
+      : null,
+    contextPacketIds: assignedPacketIds,
+    contextTransferred: assignedPacketIds.length > 0,
+    contextTransferError,
+    committedWithWarning: handoffWarnings.length > 0,
+    warning: handoffWarnings.join(' ')
   };
 };
 window.getSelectedModel = () => el.modelSelect ? el.modelSelect.value : appConfig.defaultModel;
 window.getKnownProjects = () => projects.slice();
+window.getRecentProjectCandidates = () => conversations
+  .slice()
+  .sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0))
+  .flatMap(conversation => [
+    conversation.dispatchProjectPath
+      ? { path: conversation.dispatchProjectPath, source: 'recent_dispatch_binding' }
+      : null,
+    conversation.projectPath
+      ? { path: conversation.projectPath, source: 'recent_coder_project' }
+      : null
+  ])
+  .filter((item, index, values) => item && values.findIndex(candidate => candidate && candidate.path === item.path) === index)
+  .slice(0, 30);
 window.selectConversationById = selectConversation;
 window.updateTasksChecklist = updateTasksChecklist;
 window.updateOperationalContext = updateOperationalContext;
@@ -4183,6 +6691,7 @@ window.appendSystemMessage = appendSystemMessage;
 window.persistAssistantStatusMessage = persistAssistantStatusMessage;
 window.markQueuedPromptRunning = markQueuedPromptRunning;
 window.saveConversationsToStorage = saveConversationsToStorage;
+window.flushConversationsToStorage = flushConversationsToStorage;
 window.showPhoneCompanionPairingCard = showPhoneCompanionPairingCard;
 window.syncWorkspaceFiles = syncWorkspaceFiles;
 window.refreshWorkspaceEntrypoint = loadWorkspaceEntrypoint;
@@ -4256,15 +6765,12 @@ function hideOrionTyping() {
   }
 }
 
-window.onAgentStatusChange = (running) => {
+window.onAgentStatusChange = (running, details = {}) => {
   const submitBtn = el.btnSubmit;
   const steerBtn = document.getElementById('btn-steer');
   const queueBtn = document.getElementById('btn-queue');
 
   if (running) {
-    // ── Supervisor: record which conversation just started ──
-    _supervisorLastRunningConvId = window.getRunningConversationId ? window.getRunningConversationId() : null;
-
     showOrionTyping();
     submitBtn.innerHTML = '&#10022;';
     submitBtn.title = 'Send or queue message';
@@ -4289,21 +6795,50 @@ window.onAgentStatusChange = (running) => {
     steerBtn.style.display = 'none';
     queueBtn.style.display = 'none';
     const conv = conversations.find(item => item.id === activeConversationId);
-    if (conv && conv.awaitingPlanApproval && !conv.planApproved) {
+    if (details.status === 'finalizing') {
+      renderAgentPresence('verifying', 'Verifying', 'Saving the response and recording the canonical task state');
+    } else if (conv && conv.awaitingPlanApproval && !conv.planApproved) {
       revealAgentPanel('A plan is ready for review.');
       renderAgentPresence('attention', 'Review needed', 'Implementation plan is waiting for approval');
     } else {
-      renderAgentPresence('complete', 'Complete', 'Orion finished the current run');
-      showToast('Orion finished the current run.', 'success');
-      agentCompletionTimer = setTimeout(() => renderAgentPresence('idle', 'Ready', ''), 2600);
+      renderAgentPresence('idle', 'Ready', '');
     }
+    if (details.status !== 'finalizing'
+        && !syncDispatchCoderStatusCard(activeConversationId, false, '')) {
+      hideCoderStatusCard();
+    }
+  }
+};
 
-    // ── Supervisor: notify the Orion conversation that launched this Coder task ──
-    // We check all conversations because the finished conv may not be the active one.
-    const justFinishedId = _supervisorLastRunningConvId;
-    _supervisorLastRunningConvId = null;
-    if (justFinishedId) notifySupervisorOfCoderCompletion(justFinishedId);
-    hideCoderStatusCard();
+window.onAgentRunFinalized = async function(conversationId, status, details = {}) {
+  const canonicalStatus = String(status || 'unknown');
+  if (String(conversationId || '') !== String(activeConversationId || '')) return;
+  const conv = conversations.find(item => item.id === conversationId);
+  clearTimeout(agentCompletionTimer);
+  if (canonicalStatus === 'completed') {
+    renderAgentPresence('complete', 'Complete', 'Orion recorded the task as completed');
+    showToast('Orion completed the task.', 'success');
+    agentCompletionTimer = setTimeout(() => renderAgentPresence('idle', 'Ready', ''), 2600);
+  } else if (canonicalStatus === 'cancelled') {
+    renderAgentPresence('idle', 'Ready', 'The task was cancelled');
+    showToast('Task stopped.', 'info');
+  } else if (canonicalStatus === 'failed') {
+    revealAgentPanel('The task failed.');
+    renderAgentPresence('attention', 'Failed', 'Open the transcript for the recorded error');
+    showToast('The task failed.', 'error');
+  } else if (canonicalStatus === 'pending') {
+    if (details.automaticContinuation) {
+      renderAgentPresence('working', 'Continuing', 'Orion checkpointed this pass and is continuing the same task');
+    } else if (conv && conv.awaitingPlanApproval && !conv.planApproved) {
+      revealAgentPanel('A plan is ready for review.');
+      renderAgentPresence('attention', 'Review needed', 'Implementation plan is waiting for approval');
+    } else if (conv && conv.awaitingClarification) {
+      renderAgentPresence('attention', 'Input needed', 'Orion is waiting for your answer');
+    } else {
+      renderAgentPresence('verifying', 'Paused', details.pendingWork ? 'Work remains queued for continuation' : 'The task is waiting to continue');
+    }
+  } else {
+    renderAgentPresence('attention', 'Status unknown', 'The run ended without a verified terminal task state');
   }
 };
 window.renderUserMessageInChat = renderUserMessage;
@@ -4312,9 +6847,20 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   const requestedConv = requestedId ? conversations.find(c => c.id === requestedId) : null;
   const activeConv = activeConversationId ? conversations.find(c => c.id === activeConversationId) : null;
   const conv = requestedConv || activeConv || conversations[0] || null;
+  if (conv && conv.isStub && conv.hasMessages && window.api && typeof window.api.readConversation === 'function') {
+    try {
+      const result = await window.api.readConversation(conv.id);
+      if (result && result.success && result.conversation) {
+        hydrateConversationRecord(conv, result.conversation);
+      }
+    } catch (err) {
+      console.error('Phone companion stub hydration failed', err);
+    }
+  }
   const resolvedId = conv ? conv.id : '';
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
   const globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
+  const globalActiveTaskId = window.getActiveRunTaskId ? String(window.getActiveRunTaskId() || '') : '';
   const isActiveTargetRunning = isGlobalRunning && globalRunningId === resolvedId;
   const queuedForResolvedConversation = Array.isArray(window.promptQueue)
     && window.promptQueue.some(q => q && q.conversationId === resolvedId);
@@ -4380,9 +6926,14 @@ window.getPhoneCompanionState = async (targetConversationId) => {
       mode: conversationMode(c),
       workspace: c.workspace || '',
       projectPath: c.projectPath || '',
+      dispatchProjectPath: inferDispatchProjectPath(c),
+      discussionSummary: deriveDispatchDiscussionSummary(c),
+      launchedCoderConvId: c.launchedCoderConvId || '',
+      launchedCoderTaskId: c.launchedCoderTaskId || '',
+      lastOwnedTaskId: c.lastOwnedTaskId || '',
       active: c.id === resolvedId,
       isDesktopActive: c.id === activeConversationId,
-      awaitingPlanApproval: !!(c.awaitingPlanApproval && !c.planApproved),
+      awaitingPlanApproval: !!((c.awaitingPlanApproval && !c.planApproved) || c.awaitingDelegatedPlan),
       awaitingClarification: !!c.awaitingClarification,
       taskCount,
       messageCount,
@@ -4393,15 +6944,72 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   const projectSummaries = projects.map(path => {
     const name = path.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || path;
     const projectConversations = conversations.filter(c => c.projectPath === path);
+    const dispatchConversations = conversations.filter(c => conversationMode(c) === 'orion' && inferDispatchProjectPath(c) === path);
+    const latestDispatch = dispatchConversations
+      .slice()
+      .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0))[0];
     return {
       path,
       name,
       conversationCount: projectConversations.length,
-      updatedAt: projectConversations.reduce((latest, c) => Math.max(latest, c.updatedAt || c.createdAt || 0), 0)
+      dispatchConversationCount: dispatchConversations.length,
+      latestDispatchConversationId: latestDispatch ? latestDispatch.id : '',
+      latestDiscussion: latestDispatch ? deriveDispatchDiscussionSummary(latestDispatch) : '',
+      updatedAt: [...projectConversations, ...dispatchConversations]
+        .reduce((latest, c) => Math.max(latest, c.updatedAt || c.createdAt || 0), 0)
     };
   });
+
+  const activeWork = collectDispatchActiveWork(isGlobalRunning, globalRunningId);
   
   const companionWorkspace = conv ? getConversationRunWorkspace(conv) : currentWorkspace;
+  const companionWorkspaceResolution = conv
+    ? structuredWorkspaceForConversation(conv, companionWorkspace)
+    : { role: 'unresolved', path: '', project: { name: '', path: '' }, resolved: false };
+  const orchestrationTasks = [...orchestrationTaskCache.values()]
+    .filter(task => task && ((task.origin && task.origin.conversationId === resolvedId)
+      || (task.target && task.target.conversationId === resolvedId)))
+    .sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0))
+    .slice(0, 12)
+    .map(task => {
+      const presentation = getSupervisedTaskPresentation(task, isGlobalRunning, globalRunningId);
+      return {
+        taskId: task.taskId,
+        title: task.title,
+        objective: task.objective,
+        status: task.status,
+        workspacePath: task.workspacePath || '',
+        originConversationId: task.origin && task.origin.conversationId,
+        targetConversationId: task.target && task.target.conversationId,
+        updatedAt: task.updatedAt || task.createdAt || 0,
+        awaitingReview: !!(presentation && presentation.awaitingReview),
+        revisingPlan: !!(presentation && presentation.revisingPlan),
+        planApproved: !!(presentation && presentation.planApproved),
+        executionMode: presentation && presentation.executionMode || '',
+        subStatus: presentation && presentation.subStatus || '',
+        presentation: presentation ? {
+          taskId: presentation.taskId,
+          status: presentation.status,
+          phase: presentation.phase,
+          label: presentation.label,
+          detail: presentation.detail,
+          agentState: presentation.agentState,
+          badgeClass: presentation.badgeClass,
+          isOngoing: presentation.isOngoing
+        } : null
+      };
+    });
+  const selectedSupervisedTask = RendererTaskOrchestration
+    && typeof RendererTaskOrchestration.selectSupervisedTask === 'function'
+    ? RendererTaskOrchestration.selectSupervisedTask(
+        orchestrationTasks,
+        resolvedId,
+        globalActiveTaskId,
+        { delegatedOnly: !!(conv && conversationMode(conv) === 'orion') }
+      )
+    : orchestrationTasks.find(task => task.status === 'active')
+      || orchestrationTasks.find(task => task.status === 'pending')
+      || null;
   const operationalResult = companionWorkspace && window.readOperationalContext
     ? await window.readOperationalContext(companionWorkspace)
     : null;
@@ -4428,17 +7036,29 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     mode: conversationMode(conv),
     conversations: conversationsSummary,
     projects: projectSummaries,
+    activeWork: activeWork.slice(0, 6),
     workspace: companionWorkspace,
+    workspaceKind: companionWorkspaceResolution.role,
+    workspaceDescription: RendererWorkspaceResolution
+      ? RendererWorkspaceResolution.describeWorkspace({
+          kind: companionWorkspaceResolution.role,
+          path: companionWorkspaceResolution.path,
+          searchRoot: getDispatchWorkspaceRoot(),
+          projectName: companionWorkspaceResolution.project && companionWorkspaceResolution.project.name
+        })
+      : companionWorkspace,
     running: isActiveTargetRunning,
     globalRunning: isGlobalRunning,
     runningConversationId: globalRunningId,
     queuedPrompts: window.promptQueue ? window.promptQueue.filter(q => q.conversationId === resolvedId).length : 0,
-    queuedPromptPreview: window.promptQueue ? window.promptQueue.filter(q => q.conversationId === resolvedId).map(q => q.prompt).slice(0, 3) : [],
+    queuedPromptPreview: window.promptQueue ? window.promptQueue.filter(q => q.conversationId === resolvedId).map(q => q.taskTitle || q.originalUserMessage || q.prompt).slice(0, 3) : [],
     subStatus: isActiveTargetRunning && window.getAgentSubStatus ? window.getAgentSubStatus() : '',
     executionMode: isActiveTargetRunning && window.getAgentExecutionMode ? window.getAgentExecutionMode() : 'idle',
-    awaitingPlanApproval: !!(conv && conv.awaitingPlanApproval && !conv.planApproved),
+    awaitingPlanApproval: !!(conv && ((conv.awaitingPlanApproval && !conv.planApproved) || conv.awaitingDelegatedPlan)),
     awaitingClarification: (conv && conv.awaitingClarification) ? conv.awaitingClarification : null,
     tasks: conv && Array.isArray(conv.tasks) ? conv.tasks : [],
+    orchestrationTasks,
+    activeTaskId: selectedSupervisedTask ? selectedSupervisedTask.taskId : '',
     model: window.getSelectedModel(),
     messages,
     latestOutput: latestOutput ? latestOutput.text : '',
@@ -4506,18 +7126,53 @@ function hasRequiredTestingPlanSection(content) {
 window.startPhoneCompanionTask = async (options = {}) => {
   const conv = createPhoneConversation({
     projectPath: options.projectPath || '',
+    dispatchProjectPath: options.dispatchProjectPath || '',
+    contextSummary: options.contextSummary || '',
     mode: options.mode || 'orion',
     title: 'New Phone Task'
   });
 
-  const prompt = String(options.prompt || '').trim();
-  if (prompt) {
-    await window.submitPhoneCompanionPrompt({ prompt, conversationId: conv.id });
+  let prompt = String(options.prompt || '').trim();
+  if (prompt && typeof options.fileContent === 'string' && options.fileContent.length > 0) {
+    const fileName = String(options.fileName || 'file.txt').replace(/[^\w.\-]/g, '_').slice(0, 80);
+    const content = options.fileContent.length > 80000
+      ? options.fileContent.slice(0, 80000) + '\n[... truncated]'
+      : options.fileContent;
+    prompt = `[Attached file: ${fileName}]\n\`\`\`\n${content}\n\`\`\`\n\n${prompt}`;
   }
-  return { success: true, conversationId: conv.id, workspace: conv.workspace, projectPath: conv.projectPath };
+  if (prompt) {
+    try {
+      await window.submitPhoneCompanionPrompt({
+        prompt,
+        conversationId: conv.id,
+        requestId: options.requestId,
+        imageData: options.imageData,
+        imageMimeType: options.imageMimeType,
+        fileContent: options.fileContent,
+        fileName: options.fileName
+      });
+    } catch (error) {
+      conversations = conversations.filter(item => item.id !== conv.id);
+      throw error;
+    }
+  } else if (conversationMode(conv) === 'coder') {
+    saveConversationsToStorage();
+  } else {
+    // A blank Dispatch request is only a client-side draft. Never leave an empty conversation in
+    // the durable index if an older phone client still calls this endpoint before the first send.
+    conversations = conversations.filter(item => item.id !== conv.id);
+    return { success: true, draft: true, conversationId: '', workspace: '', projectPath: '', dispatchProjectPath: '' };
+  }
+  return {
+    success: true,
+    conversationId: conv.id,
+    workspace: conv.workspace,
+    projectPath: conv.projectPath,
+    dispatchProjectPath: conv.dispatchProjectPath || ''
+  };
 };
 
-window.submitPhoneCompanionPrompt = async (options) => {
+async function submitPhoneCompanionPromptOnce(options) {
   // Can be called with either a string or an options object
   const text = typeof options === 'string' ? options.trim() : String(options.prompt || '').trim();
   let targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
@@ -4532,6 +7187,8 @@ window.submitPhoneCompanionPrompt = async (options) => {
   if (!conv) {
     conv = createPhoneConversation({
       projectPath: typeof options === 'object' ? options.projectPath || '' : '',
+      dispatchProjectPath: typeof options === 'object' ? options.dispatchProjectPath || '' : '',
+      contextSummary: typeof options === 'object' ? options.contextSummary || '' : '',
       mode: typeof options === 'object' ? options.mode || 'orion' : 'orion',
       title: 'New Phone Task'
     });
@@ -4544,10 +7201,18 @@ window.submitPhoneCompanionPrompt = async (options) => {
   if (conv.projectPath && !conv.workspace) {
     conv.workspace = conv.projectPath;
   }
+  const incomingDispatchProjectPath = typeof options === 'object' ? String(options.dispatchProjectPath || '').trim() : '';
+  if (conversationMode(conv) === 'orion' && incomingDispatchProjectPath) {
+    conv.dispatchProjectPath = incomingDispatchProjectPath;
+    conv.workspace = incomingDispatchProjectPath;
+  }
 
   // Generate a short title if it's new
   if (conv.messages.length === 0 || conv.title === 'New Phone Task' || conv.title === 'Untitled Conversation') {
     conv.title = text.length > 40 ? text.substring(0, 40) + '...' : text;
+  }
+  if (conversationMode(conv) === 'orion') {
+    conv.dispatchDiscussionSummary = compactDispatchDiscussionText(text, conv.title);
   }
   normalizeConversationWorkspace(conv);
   if (!conv.workspace) {
@@ -4557,35 +7222,271 @@ window.submitPhoneCompanionPrompt = async (options) => {
       conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id);
     }
   }
+  conv.updatedAt = Date.now();
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
   saveConversationsToStorage();
 
+  const pendingReplyTaskId = String(
+    conv.awaitingPlanApprovalTaskId
+    || (conv.awaitingClarification && conv.awaitingClarification.taskId)
+    || ''
+  );
+  const semanticIntent = await classifyCurrentConversationIntent(conv, text, {
+    model: window.getSelectedModel(),
+    taskId: pendingReplyTaskId
+  });
+  if (conversationMode(conv) === 'orion' && semanticIntent.intent === 'cancel_active_task') {
+    const messageId = createConversationMessageId(conv.id);
+    conv.messages.push({
+      id: messageId,
+      role: 'user',
+      source: 'phone',
+      text,
+      createdAt: Date.now(),
+      ...(phoneImages.length ? { images: phoneImages } : {})
+    });
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+    saveConversationsToStorage();
+    if (targetId === activeConversationId) renderUserMessage(text, phoneImages, Date.now());
+    const cancellation = await cancelOwnedTaskRequestedInPrompt(conv, text, 'phone-task-cancellation', semanticIntent);
+    return {
+      ...cancellation,
+      queued: false,
+      conversationId: targetId,
+      title: conv.title || 'New Conversation'
+    };
+  }
+  if (conversationMode(conv) === 'orion' && conv.awaitingDelegatedPlan
+      && ['approve_plan', 'deny_plan', 'revise_plan'].includes(semanticIntent.intent)) {
+    const result = semanticIntent.intent === 'approve_plan'
+      ? await window.approvePhoneCompanionPlan(conv.id)
+      : (semanticIntent.intent === 'deny_plan'
+          ? await window.denyPhoneCompanionPlan(conv.id)
+          : await window.revisePhoneCompanionPlan({
+              conversationId: conv.awaitingDelegatedPlan.coderConversationId,
+              feedback: semanticIntent.resolvedRequest || text
+            }));
+    return {
+      ...(result || {}),
+      queued: !!(result && result.queued),
+      conversationId: targetId,
+      title: conv.title || 'New Conversation'
+    };
+  }
+  if (conv.awaitingClarification && pendingReplyTaskId) {
+    const clarificationState = conv.awaitingClarification;
+    const messageId = createConversationMessageId(conv.id);
+    conv.messages.push({
+      id: messageId,
+      role: 'user',
+      source: 'phone',
+      text,
+      createdAt: Date.now(),
+      ...(phoneImages.length ? { images: phoneImages } : {})
+    });
+    if (targetId === activeConversationId) renderUserMessage(text, phoneImages, Date.now());
+    const continuation = await queueTaskContinuation({
+      taskId: pendingReplyTaskId,
+      prompt: text,
+      originalUserMessage: text,
+      modelSelectValue: window.getSelectedModel(),
+      targetConversationId: targetId,
+      originConversationId: targetId,
+      originMessageId: messageId,
+            source: 'phone-continuation',
+            images: phoneImages,
+            alreadyRendered: true,
+            semanticIntent
+    });
+    if (!continuation.success) {
+      conv.awaitingClarification = clarificationState;
+      saveConversationsToStorage();
+      return {
+        success: false,
+        queued: false,
+        error: continuation.error || 'Could not attach that answer to the waiting task.',
+        conversationId: targetId
+      };
+    }
+    conv.awaitingClarification = null;
+    saveConversationsToStorage();
+    const launch = startOrQueueTaskContinuation(continuation, conv, {
+      source: 'phone-continuation',
+      modelSelectValue: window.getSelectedModel(),
+      errorLabel: 'Phone free-text clarification'
+    });
+    return { ...launch, conversationId: targetId, title: conv.title || 'New Conversation' };
+  }
+
+  const isOwnedContinuation = !!(
+    conversationMode(conv) === 'orion'
+    && !conv.awaitingDelegatedPlan
+    && !conv.awaitingPlanApproval
+    && RendererTaskOrchestration
+    && typeof RendererTaskOrchestration.isContinuationRequest === 'function'
+    && RendererTaskOrchestration.isContinuationRequest(semanticIntent)
+  );
+  if (isOwnedContinuation) {
+    const messageId = createConversationMessageId(conv.id);
+    conv.messages.push({
+      id: messageId,
+      role: 'user',
+      source: 'phone',
+      text,
+      createdAt: Date.now(),
+      ...(phoneImages.length ? { images: phoneImages } : {})
+    });
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+    saveConversationsToStorage();
+    if (targetId === activeConversationId) renderUserMessage(text, phoneImages, Date.now());
+    const continuationResult = await resumeOwnedCoderTaskFromDispatch(conv, text, {
+      messageId,
+      modelSelectValue: window.getSelectedModel(),
+      images: phoneImages,
+      source: 'phone-dispatch-continuation'
+      ,
+      semanticIntent
+    });
+    if (continuationResult.handled) {
+      return {
+        ...continuationResult,
+        queued: !!continuationResult.queued,
+        conversationId: targetId,
+        title: conv.title || 'New Conversation'
+      };
+    }
+    // No live owned task exists. Remove the provisional message so the ordinary path below can
+    // record and resolve this contextual request exactly once.
+    conv.messages = conv.messages.filter(message => message.id !== messageId);
+    saveConversationsToStorage();
+    if (targetId === activeConversationId) await selectConversation(targetId);
+  }
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
 
   if (isGlobalRunning) {
-    window.promptQueue.push({ prompt: text, modelSelectValue: window.getSelectedModel(), conversationId: targetId, source: 'phone', images: phoneImages });
-    if (conv.messages) {
-      conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
+    if (ownsActiveSupervisedRun(conv)) {
+      // Push the user message to history first
+      const messageId = createConversationMessageId(conv.id);
+      conv.messages.push({ id: messageId, role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
       saveConversationsToStorage();
+      if (targetId === activeConversationId) renderUserMessage(text, phoneImages, Date.now());
+      const supervisorResult = await handleSupervisorMessage(
+        conv,
+        text,
+        window.getSelectedModel(),
+        { source: 'phone', images: phoneImages, messageId, semanticIntent }
+      );
+      if (supervisorResult && supervisorResult.success === false) {
+        return {
+          success: false,
+          queued: false,
+          error: supervisorResult.error || 'Supervisor response failed.',
+          conversationId: targetId,
+          title: conv.title || 'New Conversation'
+        };
+      }
+      return { success: true, queued: false, conversationId: targetId, title: conv.title || 'New Conversation' };
     }
-    persistAssistantStatusMessage(targetId, "Queued. Orion will start this after the current task finishes.", {
-      source: 'queue-status',
-      dedupeKey: `phone-queued-${targetId}-${text}`
-    });
+
+    if (conversationMode(conv) === 'orion'
+        && RendererSemanticIntentRouter
+        && RendererSemanticIntentRouter.canRespondDuringActiveRun(semanticIntent, 'orion')) {
+      const messageId = createConversationMessageId(conv.id);
+      conv.messages.push({
+        id: messageId,
+        role: 'user',
+        source: 'phone',
+        text,
+        createdAt: Date.now(),
+        ...(phoneImages.length ? { images: phoneImages } : {})
+      });
+      if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+      saveConversationsToStorage();
+      if (targetId === activeConversationId) renderUserMessage(text, phoneImages, Date.now());
+      const conversationalResult = await respondOrionConversationally(
+        conv,
+        text,
+        window.getSelectedModel(),
+        {
+          source: 'phone',
+          images: phoneImages,
+          messageId,
+          semanticIntent,
+          statusCheckin: semanticIntent.intent === 'status_check'
+            && semanticIntent.target === 'active_owned_task'
+        }
+      );
+      return {
+        success: conversationalResult.success !== false,
+        queued: false,
+        replyText: conversationalResult.replyText || '',
+        error: conversationalResult.error || '',
+        conversationId: targetId,
+        title: conv.title || 'New Conversation'
+      };
+    }
+
+    const messageId = createConversationMessageId(conv.id);
+    conv.messages.push({ id: messageId, role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
+    saveConversationsToStorage();
     if (targetId === activeConversationId) {
       renderUserMessage(text, phoneImages, Date.now());
     }
-    return { success: true, queued: true, conversationId: targetId, title: conv.title || 'New Conversation' };
+    const queued = pendingReplyTaskId
+      ? await queueTaskContinuation({
+          taskId: pendingReplyTaskId,
+          prompt: text,
+          originalUserMessage: text,
+          modelSelectValue: window.getSelectedModel(),
+          targetConversationId: targetId,
+          originConversationId: targetId,
+          originMessageId: messageId,
+          source: 'phone-continuation',
+          images: phoneImages,
+          alreadyRendered: true
+        })
+      : await enqueueOrchestrationTask({
+          prompt: text,
+          originalUserMessage: text,
+          modelSelectValue: window.getSelectedModel(),
+          targetConversationId: targetId,
+          originConversationId: targetId,
+          originMessageId: messageId,
+            source: 'phone',
+            images: phoneImages,
+            alreadyRendered: true,
+            semanticIntent
+        });
+    if (!queued.success) {
+      return {
+        success: false,
+        queued: false,
+        needsClarification: !!queued.needsClarification,
+        error: queued.error || queued.clarification || 'Could not queue this request.',
+        conversationId: targetId
+      };
+    }
+    persistAssistantStatusMessage(targetId, `Queued task ${queued.task.taskId}. Orion will start it after the current task finishes.`, {
+      source: 'queue-status',
+      dedupeKey: `phone-queued-${queued.task.taskId}`
+    });
+    return { success: true, queued: true, taskId: queued.task.taskId, taskStatus: queued.task.status, conversationId: targetId, title: conv.title || 'New Conversation' };
   }
 
   // Directly run agent loop on the target conversation (without forcing desktop UI switch)
   if (conv.messages) {
-    conv.messages.push({ role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
+    conv.messages.push({ id: createConversationMessageId(conv.id), role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
     saveConversationsToStorage();
   }
   if (targetId === activeConversationId) {
     renderUserMessage(text, phoneImages, Date.now());
   }
-  window.runAgentLoop(text, window.getSelectedModel(), conv, { source: 'phone', images: phoneImages })
+  window.runAgentLoop(text, window.getSelectedModel(), conv, {
+      source: 'phone',
+      images: phoneImages,
+      ...(pendingReplyTaskId ? { taskId: pendingReplyTaskId, preserveUserPrompt: true } : {}),
+      semanticIntent
+  })
     .catch(err => {
       console.error("Phone-started agent loop failed:", err);
       persistAssistantStatusMessage(targetId, `Orion could not start this phone request: ${err.message}`, {
@@ -4595,6 +7496,18 @@ window.submitPhoneCompanionPrompt = async (options) => {
     });
 
   return { success: true, queued: false, conversationId: targetId, title: conv.title || 'New Conversation' };
+}
+
+window.submitPhoneCompanionPrompt = function(options) {
+  const normalizedOptions = typeof options === 'string' ? { prompt: options } : (options || {});
+  if (!promptSubmissionRegistry) return submitPhoneCompanionPromptOnce(normalizedOptions);
+  return promptSubmissionRegistry.run({
+    requestId: normalizedOptions.requestId,
+    conversationId: normalizedOptions.conversationId || activeConversationId,
+    source: normalizedOptions.source || 'phone',
+    prompt: normalizedOptions.prompt,
+    imageCount: normalizedOptions.imageData ? 1 : 0
+  }, () => submitPhoneCompanionPromptOnce(normalizedOptions));
 };
 
 window.steerPhoneCompanionTask = async (options) => {
@@ -4621,6 +7534,20 @@ window.steerPhoneCompanionTask = async (options) => {
 window.approvePhoneCompanionPlan = async (targetId) => {
   const resolvedId = targetId || activeConversationId;
   const conv = conversations.find(c => c.id === resolvedId);
+  if (conv && conv.awaitingDelegatedPlan) {
+    const delegatedPlan = conv.awaitingDelegatedPlan;
+    const result = await window.approvePhoneCompanionPlan(delegatedPlan.coderConversationId);
+    if (result && result.success !== false) {
+      markDelegatedPlanMessageState(conv, delegatedPlan.taskId, 'delegatedPlanApproved');
+      conv.awaitingDelegatedPlan = null;
+      notifyOrionConversation(
+        conv,
+        `Plan approved for **${delegatedPlan.title || 'the Coder task'}**. Coder is continuing implementation; I’ll report the verified result here.`,
+        'supervisor-plan-approved'
+      );
+    }
+    return result;
+  }
   if (!conv || !conv.awaitingPlanApproval) return { success: false, error: 'No plan waiting for approval' };
 
   if (!appConfig.geminiApiKey) {
@@ -4640,8 +7567,10 @@ window.approvePhoneCompanionPlan = async (targetId) => {
     return { success: false, error: "Missing or invalid '## Testing Plan' section in implementation_plan.md" };
   }
 
+  const approvalTaskId = String(conv.awaitingPlanApprovalTaskId || '');
   conv.planApproved = true;
   conv.awaitingPlanApproval = false;
+  conv.awaitingPlanApprovalTaskId = '';
 
   if (resolvedId === activeConversationId) {
     const buttons = document.querySelectorAll('.btn-approve-plan:not(.approved)');
@@ -4664,26 +7593,72 @@ window.approvePhoneCompanionPlan = async (targetId) => {
   appendSystemMessage(approvalText, { conversationId: resolvedId, source: 'plan-approval' });
 
   const prompt = 'PLAN APPROVED — EXECUTE NOW. Do not summarize, describe, or restate the plan. Do not rewrite STRATEGY.md or implementation_plan.md — they are already approved. Read implementation_plan.md once to understand the tasks, then immediately start creating and editing the actual source code files. Work through every task. Update the checklist only for completed milestones. Run the test suite when done. Provide a Work Walkthrough.';
-  const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
-  if (isGlobalRunning) {
-    window.promptQueue.push({ prompt, modelSelectValue: window.getSelectedModel(), conversationId: resolvedId, source: 'plan-approval' });
+  const supervisingConversation = conversations.find(item => item.launchedCoderConvId === resolvedId);
+  const continuation = await queueTaskContinuation({
+    taskId: approvalTaskId,
+    prompt,
+    resolvedObjective: 'Execute the approved implementation plan, complete every remaining task, run the test suite, and provide a work walkthrough.',
+    title: `Execute approved plan: ${conv.title || 'Coder task'}`,
+    modelSelectValue: window.getSelectedModel(),
+    targetConversationId: resolvedId,
+    originConversationId: supervisingConversation ? supervisingConversation.id : resolvedId,
+    workspace: structuredWorkspaceForConversation(conv),
+    source: 'plan-approval',
+    requireExistingTask: true
+  });
+  if (!continuation.success) {
+    conv.planApproved = false;
+    conv.awaitingPlanApproval = true;
+    conv.awaitingPlanApprovalTaskId = approvalTaskId;
+    saveConversationsToStorage();
+    return { success: false, error: continuation.error || 'Could not resume the approved plan.' };
+  }
+  const launch = startOrQueueTaskContinuation(continuation, conv, {
+    source: 'plan-approval',
+    modelSelectValue: window.getSelectedModel(),
+    errorLabel: 'Phone-started approved plan'
+  });
+  if (launch.queued) {
     persistAssistantStatusMessage(resolvedId, "Queued. Orion will continue the approved plan after the current task finishes.", {
       source: 'queue-status',
-      dedupeKey: `plan-approval-queued-${resolvedId}`
+      dedupeKey: `plan-approval-queued-${continuation.task.taskId}`
     });
-    return { success: true, queued: true };
+    return launch;
   }
-
-  window.runAgentLoop(prompt, window.getSelectedModel(), conv, { source: 'plan-approval', internalPrompt: true })
-    .catch(err => console.error("Phone-started agent loop failed:", err));
-  return { success: true, queued: false };
+  return launch;
 };
 
 window.denyPhoneCompanionPlan = async (targetId) => {
   const resolvedId = targetId || activeConversationId;
   const conv = conversations.find(c => c.id === resolvedId);
+  if (conv && conv.awaitingDelegatedPlan) {
+    const delegatedPlan = conv.awaitingDelegatedPlan;
+    const result = await window.denyPhoneCompanionPlan(delegatedPlan.coderConversationId);
+    if (result && result.success !== false) {
+      markDelegatedPlanMessageState(conv, delegatedPlan.taskId, 'delegatedPlanDenied');
+      conv.awaitingDelegatedPlan = null;
+    }
+    return result;
+  }
   if (!conv) return { success: false, error: 'No active conversation' };
+  const deniedTaskId = String(conv.awaitingPlanApprovalTaskId || '');
+  if (deniedTaskId) {
+    const cancelled = await window.cancelOwnedOrchestrationTask(
+      deniedTaskId,
+      resolvedId,
+      'The pending implementation plan was denied.'
+    );
+    if (!cancelled || !cancelled.success || !cancelled.task || cancelled.task.status !== 'cancelled') {
+      return {
+        success: false,
+        denied: false,
+        taskId: deniedTaskId,
+        error: (cancelled && (cancelled.error || cancelled.reason)) || 'Could not cancel the denied plan task.'
+      };
+    }
+  }
   conv.awaitingPlanApproval = false;
+  conv.awaitingPlanApprovalTaskId = '';
   conv.planApproved = false;
   if (resolvedId === activeConversationId) {
     const cards = document.querySelectorAll('.plan-approval-actions');
@@ -4691,14 +7666,140 @@ window.denyPhoneCompanionPlan = async (targetId) => {
     appendSystemMessage("Phone companion denied the pending plan.");
   }
   saveConversationsToStorage();
-  return { success: true, denied: true };
+  return { success: true, denied: true, taskId: deniedTaskId, taskStatus: deniedTaskId ? 'cancelled' : '' };
 };
 
 window.revisePhoneCompanionPlan = async (options) => {
-  const text = typeof options === 'string' ? options.trim() : String(options.feedback || 'Revise the pending plan before implementing.').trim();
-  const targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
+  const normalizedOptions = typeof options === 'string' ? { feedback: options } : (options || {});
+  const text = String(normalizedOptions.feedback || 'Revise the pending plan before implementing.').trim();
+  const requestedId = String(normalizedOptions.conversationId || activeConversationId || '');
   if (!text) return { success: false, error: 'Missing revision feedback' };
-  return await window.submitPhoneCompanionPrompt({ prompt: `[Plan revision] ${text}`, conversationId: targetId });
+
+  let originConv = conversations.find(c => c.id === requestedId) || null;
+  let delegatedPlan = originConv && originConv.awaitingDelegatedPlan
+    ? originConv.awaitingDelegatedPlan
+    : null;
+  let targetId = delegatedPlan
+    ? String(delegatedPlan.coderConversationId || '')
+    : requestedId;
+  let targetConv = conversations.find(c => c.id === targetId) || null;
+
+  if (!delegatedPlan && targetConv) {
+    originConv = conversations.find(c =>
+      c
+      && c.awaitingDelegatedPlan
+      && String(c.awaitingDelegatedPlan.coderConversationId || '') === targetId
+      && (!targetConv.awaitingPlanApprovalTaskId
+        || String(c.awaitingDelegatedPlan.taskId || '') === String(targetConv.awaitingPlanApprovalTaskId || ''))
+    ) || null;
+    delegatedPlan = originConv && originConv.awaitingDelegatedPlan
+      ? originConv.awaitingDelegatedPlan
+      : null;
+  }
+
+  const taskId = String(
+    delegatedPlan && delegatedPlan.taskId
+    || targetConv && targetConv.awaitingPlanApprovalTaskId
+    || ''
+  );
+  if (!targetConv || conversationMode(targetConv) !== 'coder') {
+    return { success: false, error: 'The Coder conversation for this plan could not be resolved.' };
+  }
+  if (!taskId || !targetConv.awaitingPlanApproval || targetConv.planApproved) {
+    return { success: false, error: 'No pending implementation plan is available to revise.' };
+  }
+
+  const requesterConversationId = originConv ? originConv.id : targetConv.id;
+  const status = await window.getOrchestrationTaskStatus(taskId, requesterConversationId);
+  if (!status || !status.success || !status.task || status.task.status !== 'pending') {
+    return {
+      success: false,
+      error: (status && status.error)
+        || `Task ${taskId} is not pending, so its plan cannot be revised safely.`
+    };
+  }
+  if (String(status.task.target && status.task.target.conversationId || '') !== targetConv.id) {
+    return { success: false, error: 'The pending plan does not belong to this Coder conversation.' };
+  }
+
+  const revisionPrompt = [
+    '[PLAN REVISION REQUEST - SAME DURABLE TASK]',
+    'Revise the existing implementation plan using the feedback below.',
+    'Do not implement source changes. Do not create a new task. Return the revised plan for approval.',
+    '',
+    text
+  ].join('\n');
+  const continuation = await queueTaskContinuation({
+    taskId,
+    prompt: revisionPrompt,
+    originalUserMessage: text,
+    modelSelectValue: window.getSelectedModel(),
+    targetConversationId: targetConv.id,
+    originConversationId: requesterConversationId,
+    source: 'plan-revision',
+    requireExistingTask: true,
+    alreadyRendered: true,
+    planRevision: true
+  });
+  if (!continuation.success) {
+    return { success: false, error: continuation.error || 'Could not queue the plan revision.' };
+  }
+
+  const revisionState = {
+    taskId,
+    originConversationId: originConv ? originConv.id : '',
+    coderConversationId: targetConv.id,
+    title: String(delegatedPlan && delegatedPlan.title || status.task.title || targetConv.title || 'Coder task'),
+    requestedAt: Date.now()
+  };
+  targetConv.planApproved = false;
+  targetConv.awaitingPlanApproval = false;
+  targetConv.awaitingPlanApprovalTaskId = '';
+  targetConv.planRevisionInProgress = revisionState;
+  if (originConv) {
+    markDelegatedPlanMessageState(originConv, taskId, 'delegatedPlanRevisionRequested');
+    originConv.awaitingDelegatedPlan = null;
+    originConv.revisingDelegatedPlan = revisionState;
+  }
+  if (typeof window.markConversationDirty === 'function') {
+    window.markConversationDirty(targetConv.id);
+    if (originConv) window.markConversationDirty(originConv.id);
+  }
+  await flushConversationsToStorage();
+
+  if (originConv && typeof window.startCoderTaskMonitor === 'function') {
+    window.startCoderTaskMonitor(originConv.id, targetConv.id, taskId);
+  }
+  const launch = startOrQueueTaskContinuation(continuation, targetConv, {
+    source: 'plan-revision',
+    modelSelectValue: window.getSelectedModel(),
+    errorLabel: 'Plan revision'
+  });
+  if (!launch || launch.success === false) {
+    targetConv.planRevisionInProgress = null;
+    targetConv.awaitingPlanApproval = true;
+    targetConv.awaitingPlanApprovalTaskId = taskId;
+    if (originConv) {
+      originConv.revisingDelegatedPlan = null;
+      originConv.awaitingDelegatedPlan = delegatedPlan;
+    }
+    saveConversationsToStorage();
+    return { success: false, error: (launch && launch.error) || 'Could not start the plan revision.' };
+  }
+  if (originConv) {
+    notifyOrionConversation(
+      originConv,
+      `Coder is revising the plan for **${revisionState.title}**. I’ll replace the review card here when the revised plan is ready.`,
+      'supervisor-plan-revision'
+    );
+  }
+  return {
+    ...launch,
+    success: true,
+    revising: true,
+    taskId,
+    taskStatus: launch.queued ? 'pending' : 'active'
+  };
 };
 
 // Mirrors desktop's submitClarificationAnswers (which reads answers directly out of DOM radio
@@ -4715,46 +7816,76 @@ window.submitPhoneCompanionClarification = async ({ conversationId, answers } = 
     return { success: false, error: 'Missing Gemini API key on desktop' };
   }
 
+  const clarificationState = conv.awaitingClarification;
   const formattedAnswers = answers.map(a => `${a.header}: ${a.answer}`).join('\n');
   const userMessage = `Here are my answers:\n${formattedAnswers}`;
+  const clarificationTaskId = String(conv.awaitingClarification.taskId || '');
 
   conv.awaitingClarification = null;
   if (resolvedId === activeConversationId) {
     renderUserMessage(userMessage, [], Date.now());
   }
-  conv.messages.push({ role: 'user', text: userMessage, source: 'clarification-answers' });
+  const messageId = createConversationMessageId(conv.id);
+  conv.messages.push({ id: messageId, role: 'user', text: userMessage, source: 'clarification-answers' });
   saveConversationsToStorage();
 
-  const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
-  if (isGlobalRunning) {
-    window.promptQueue.push({ prompt: userMessage, modelSelectValue: window.getSelectedModel(), conversationId: resolvedId, source: 'clarification-answers' });
+  const supervisingConversation = conversations.find(item => item.launchedCoderConvId === resolvedId);
+  const continuation = await queueTaskContinuation({
+    taskId: clarificationTaskId,
+    prompt: userMessage,
+    resolvedObjective: `Continue the existing task using these clarification answers:\n${formattedAnswers}`,
+    title: `Continue after clarification: ${conv.title || 'task'}`,
+    modelSelectValue: window.getSelectedModel(),
+    targetConversationId: resolvedId,
+    originConversationId: supervisingConversation ? supervisingConversation.id : resolvedId,
+    originMessageId: messageId,
+    workspace: structuredWorkspaceForConversation(conv),
+    source: 'clarification-answers'
+  });
+  if (!continuation.success) {
+    conv.awaitingClarification = clarificationState;
+    saveConversationsToStorage();
+    return { success: false, error: continuation.error || 'Could not resume after clarification.' };
+  }
+  const launch = startOrQueueTaskContinuation(continuation, conv, {
+    source: 'clarification-answers',
+    modelSelectValue: window.getSelectedModel(),
+    errorLabel: 'Phone clarification resume'
+  });
+  if (launch.queued) {
     persistAssistantStatusMessage(resolvedId, "Queued. Orion will continue once the current task finishes.", {
       source: 'queue-status',
-      dedupeKey: `clarification-answers-queued-${resolvedId}`
+      dedupeKey: `clarification-answers-queued-${continuation.task.taskId}`
     });
-    return { success: true, queued: true };
+    return launch;
   }
-
-  window.runAgentLoop(userMessage, window.getSelectedModel(), conv, { source: 'clarification-answers', internalPrompt: true })
-    .catch(err => console.error('Phone clarification resume failed:', err));
-  return { success: true, queued: false };
+  return launch;
 };
 
 window.stopPhoneCompanionTask = async (targetId) => {
   const resolvedId = targetId || activeConversationId;
-  const globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
-
-  if (globalRunningId === resolvedId && window.stopAgentExecution) {
-    window.stopAgentExecution();
-    if (resolvedId === activeConversationId) {
-      appendSystemMessage("Phone companion requested pause/stop.", {
-        dedupeKey: `phone-stop-${resolvedId}`,
-        windowMs: 3000
-      });
+  const result = await stopExpectedTaskForConversation(resolvedId);
+  if (!result || result.success === false) {
+    if (result && /does not own|no longer running/i.test(String(result.error || ''))) {
+      return { success: true, stopped: false, cancelled: false };
     }
-    return { success: true, stopped: true };
+    return result || { success: false, stopped: false, error: 'Task cancellation failed.' };
   }
-  return { success: true, stopped: false };
+  const taskId = String((result.task && result.task.taskId) || result.taskId || '');
+  const cancelled = !!(result.task && result.task.status === 'cancelled');
+  if (cancelled && resolvedId === activeConversationId) {
+    appendSystemMessage(`Phone companion cancelled task ${taskId}.`, {
+      dedupeKey: `phone-stop-${taskId}`,
+      windowMs: 3000
+    });
+  }
+  return {
+    success: true,
+    stopped: !!result.stopped,
+    cancelled,
+    taskId,
+    status: result.task && result.task.status
+  };
 };
 
 window.resumePhoneCompanionTask = async (targetId) => {
@@ -4862,75 +7993,6 @@ function buildClarificationCardHtml(clarData) {
     </div>`;
 }
 
-async function submitClarificationAnswers({ button, bubble } = {}) {
-  const conv = conversations.find(c => c.id === activeConversationId);
-  if (!conv || !conv.awaitingClarification) return;
-
-  const clarData = conv.awaitingClarification;
-  const questions = clarData.questions || [];
-
-  // Collect answers from the bubble's form controls
-  const answers = [];
-  let allAnswered = true;
-  questions.forEach((q, qi) => {
-    const block = bubble ? bubble.querySelector(`.clarification-question-block[data-qi="${qi}"]`) : null;
-    let answer = null;
-    if (block) {
-      const checked = block.querySelector(`input[type="radio"][name="clarq_${qi}"]:checked`);
-      if (checked) {
-        if (checked.value === '__other__') {
-          const otherInput = block.querySelector(`.clarification-other-input[data-qi="${qi}"]`);
-          answer = otherInput ? otherInput.value.trim() : '';
-        } else {
-          const optIdx = parseInt(checked.value, 10);
-          answer = (q.options[optIdx] && q.options[optIdx].label) || '';
-        }
-      }
-    }
-    if (!answer) allAnswered = false;
-    answers.push({ header: q.header, question: q.question, answer: answer || '(no answer)' });
-  });
-
-  if (!allAnswered) {
-    // Briefly flash the submit button to signal something is missing
-    if (button) {
-      button.textContent = 'Answer all questions first';
-      setTimeout(() => { button.textContent = 'Submit'; }, 1800);
-    }
-    return;
-  }
-
-  if (button) {
-    button.disabled = true;
-    button.textContent = 'Submitting…';
-  }
-  if (bubble) {
-    const card = bubble.querySelector('.clarification-card');
-    if (card) card.classList.add('answered');
-  }
-
-  // Format answers as a readable user message
-  const formattedAnswers = answers.map(a => `${a.header}: ${a.answer}`).join('\n');
-  const userMessage = `Here are my answers:\n${formattedAnswers}`;
-
-  // Clear the awaiting state
-  conv.awaitingClarification = null;
-
-  // Render answers as a visible user message and persist to history
-  renderUserMessage(userMessage, [], Date.now());
-  conv.messages.push({ role: 'user', text: userMessage, source: 'clarification-answers' });
-  saveConversationsToStorage();
-
-  if (!appConfig.geminiApiKey) {
-    el.settingsModal.classList.add('active');
-    appendSystemMessage("Please enter and save your Gemini API Key first.");
-    return;
-  }
-
-  window.runAgentLoop(userMessage, el.modelSelect.value, conv, { source: 'clarification-answers' })
-    .catch(err => console.error('Clarification resume failed:', err));
-}
-
 async function approveCurrentPlanAndContinue(options = {}) {
   const button = options.button || null;
   const originalLabel = button ? button.textContent : '';
@@ -4984,8 +8046,10 @@ async function approveCurrentPlanAndContinue(options = {}) {
     if (subtitle) subtitle.textContent = 'Orion is building from this approved plan.';
   }
 
+  const approvalTaskId = String(conv.awaitingPlanApprovalTaskId || '');
   conv.planApproved = true;
   conv.awaitingPlanApproval = false;
+  conv.awaitingPlanApprovalTaskId = '';
 
   const approvalText = "Plan approved. Continuing implementation.";
   appendSystemMessage(approvalText, { conversationId: activeConversationId, source: 'plan-approval' });
@@ -4993,22 +8057,87 @@ async function approveCurrentPlanAndContinue(options = {}) {
   const prompt = 'PLAN APPROVED — EXECUTE NOW. Do not summarize, describe, or restate the plan. Do not rewrite STRATEGY.md or implementation_plan.md — they are already approved. Read implementation_plan.md once to understand the tasks, then immediately start creating and editing the actual source code files. Work through every task. Update the checklist only for completed milestones. Run the test suite when done. Provide a Work Walkthrough.';
 
   if (window.runAgentLoop) {
-    if (window.isAgentRunning && window.isAgentRunning()) {
-      window.promptQueue.push({ prompt, modelSelectValue: el.modelSelect.value, conversationId: conv.id, alreadyRendered: true, source: 'plan-approval' });
-      appendSystemMessage("Another task is currently running. Approved plan execution was queued.");
-      return { success: true, queued: true };
+    const supervisingConversation = conversations.find(item => item.launchedCoderConvId === conv.id);
+    const continuation = await queueTaskContinuation({
+      taskId: approvalTaskId,
+      prompt,
+      resolvedObjective: 'Execute the approved implementation plan, complete every remaining task, run the test suite, and provide a work walkthrough.',
+      title: `Execute approved plan: ${conv.title || 'task'}`,
+      modelSelectValue: el.modelSelect.value,
+      targetConversationId: conv.id,
+      originConversationId: supervisingConversation ? supervisingConversation.id : conv.id,
+      workspace: structuredWorkspaceForConversation(conv),
+      source: 'plan-approval',
+      requireExistingTask: true
+    });
+    if (!continuation.success) {
+      conv.planApproved = false;
+      conv.awaitingPlanApproval = true;
+      conv.awaitingPlanApprovalTaskId = approvalTaskId;
+      saveConversationsToStorage();
+      restoreButton();
+      return { success: false, error: continuation.error || 'Could not resume the approved plan.' };
     }
-    window.runAgentLoop(prompt, el.modelSelect.value, conv, { source: 'plan-approval', internalPrompt: true })
+    if (window.isAgentRunning && window.isAgentRunning()) {
+      appendSystemMessage("Another task is currently running. Approved plan execution was queued.");
+      return { success: true, queued: true, taskId: continuation.task.taskId };
+    }
+    window.promptQueue = window.promptQueue.filter(item => item.taskId !== continuation.task.taskId);
+    window.runAgentLoop(continuation.queueItem.prompt, el.modelSelect.value, conv, {
+      source: 'plan-approval',
+      internalPrompt: true,
+      taskId: continuation.task.taskId,
+      images: continuation.queueItem.images || [],
+      contextPacketIds: continuation.queueItem.contextPacketIds || []
+    })
       .catch(err => console.error("Desktop-started agent loop failed:", err));
-    return { success: true, queued: false };
+    return { success: true, queued: false, taskId: continuation.task.taskId };
   }
   return { success: false, error: 'Agent engine is not ready' };
+}
+
+async function approveDelegatedPlanAndContinue(delegatedPlan, message, options = {}) {
+  const button = options.button || null;
+  const orionConv = conversations.find(c => c.id === activeConversationId);
+  if (!orionConv || !delegatedPlan || !delegatedPlan.coderConversationId) {
+    return { success: false, error: 'Delegated plan ownership could not be resolved.' };
+  }
+  const pending = orionConv.awaitingDelegatedPlan;
+  if (!pending || String(pending.taskId || '') !== String(delegatedPlan.taskId || '')) {
+    return { success: false, error: 'This delegated plan is no longer pending.' };
+  }
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Starting…';
+  }
+  const result = await window.approvePhoneCompanionPlan(delegatedPlan.coderConversationId);
+  if (!result || result.success === false) {
+    if (button) {
+      button.disabled = false;
+      button.textContent = 'Approve & Continue';
+    }
+    showToast((result && result.error) || 'Could not approve the delegated plan.', 'attention');
+    return result || { success: false };
+  }
+  orionConv.awaitingDelegatedPlan = null;
+  if (message) message.delegatedPlanApproved = true;
+  notifyOrionConversation(
+    orionConv,
+    `Plan approved for **${delegatedPlan.title || 'the Coder task'}**. Coder is continuing implementation; I’ll report the verified result here.`,
+    'supervisor-plan-approved'
+  );
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+  saveConversationsToStorage();
+  return result;
 }
 
 function deleteConversation(id) {
   const convToDelete = conversations.find(c => c.id === id);
   const parentProj = convToDelete ? convToDelete.projectPath : '';
   cleanupConversationArtifacts(id);
+  if (window.api && typeof window.api.deleteConversation === 'function') {
+    window.api.deleteConversation(id);
+  }
   
   conversations = conversations.filter(c => c.id !== id);
   saveConversationsToStorage();
@@ -5032,7 +8161,12 @@ function deleteConversation(id) {
 
 function removeProject(path) {
   const removedConversationIds = conversations.filter(c => c.projectPath === path).map(c => c.id);
-  removedConversationIds.forEach(cleanupConversationArtifacts);
+  removedConversationIds.forEach(id => {
+    cleanupConversationArtifacts(id);
+    if (window.api && typeof window.api.deleteConversation === 'function') {
+      window.api.deleteConversation(id);
+    }
+  });
   projects = projects.filter(p => p !== path);
   saveProjectsToStorage();
   
@@ -5258,202 +8392,652 @@ window.readWorkspaceFileForPhone = (filePath) => {
 
 // Track which conversation ID was running when onAgentStatusChange fired (needed
 // for the completion notification because running ID is already cleared by then).
-let _supervisorLastRunningConvId = null;
 
 // Polling interval handle for the Coder task monitor.
 let _coderTaskMonitorInterval = null;
 // { orionConvId, coderConvId, lastKnownState }
 let _coderTaskMonitorMeta = null;
+let _coderTaskMonitorGeneration = 0;
 
-// ── Intent classifier ─────────────────────────────────────────────────────────
-// Returns 'checkin' | 'steering' | 'normal'
+// Kept as a thin renderer adapter for older callers; the deterministic policy
+// lives in supervisor-orchestration.js and is exercised independently.
 function classifySupervisorIntent(text) {
-  const t = text.trim().toLowerCase();
-  const checkinPatterns = [
-    /\b(how'?s it going|how is it going|any updates?|what'?s happening|what is happening)\b/,
-    /\b(status|progress|update|what'?s (it|cody|the coder) (doing|working on|up to))\b/,
-    /\b(check in|checking in|where are (we|you|things)|what have (you|we|they) done)\b/,
-    /^(how|what|where|any).{0,60}\?$/,
-  ];
-  const steeringPatterns = [
-    /\b(also|additionally|on top of that|in addition)\b/,
-    /\b(instead|skip|ignore|don't|do not|forget about|drop|remove)\b/,
-    /\b(focus on|prioritize|make sure|be sure|actually)\b/,
-    /\b(change|add|include|don't include|avoid|use|don't use)\b/,
-    /\b(while you'?re at it|while (it'?s|cody'?s) working)\b/,
-  ];
-  if (checkinPatterns.some(p => p.test(t))) return 'checkin';
-  if (steeringPatterns.some(p => p.test(t))) return 'steering';
-  // Short imperative sentences are usually steering
-  if (t.length < 120 && /^(also|add|skip|use|make|don't|do|change|include|avoid|focus|prioritize)/.test(t)) return 'steering';
-  return 'normal';
+  return RendererSupervisorOrchestration
+    ? RendererSupervisorOrchestration.classifySupervisorIntent(text)
+    : 'conversational';
 }
 
 // ── Build a human-readable status summary from Coder conversation data ────────
+// Raw tool results and model thoughts are deliberately excluded; Dispatch only needs a bounded
+// progress snapshot to produce a natural user-facing answer.
 function buildCoderStatusSummary(coderConvId) {
   if (typeof window.getCoderConversationSummary !== 'function') return null;
   const data = window.getCoderConversationSummary(coderConvId);
   if (!data) return null;
 
   const lines = [];
-  const { tasks, doneTasks, pendingTasks, recentActivity, subStatus } = data;
+  const {
+    tasks = [],
+    doneTasks = [],
+    pendingTasks = [],
+    subStatus = ''
+  } = data;
 
-  // Task progress
   if (tasks.length > 0) {
-    lines.push(`**Tasks:** ${doneTasks.length}/${tasks.length} done.`);
+    lines.push(`Checklist progress: ${doneTasks.length} of ${tasks.length} complete.`);
     const inProg = tasks.find(t => t.status === 'in-progress' || t.status === '/');
-    if (inProg) lines.push(`Currently working on: _${inProg.title || inProg.text || 'a task'}_`);
+    if (inProg) lines.push(`Current step: ${inProg.title || inProg.text || 'Working through the active task'}.`);
+    if (pendingTasks.length) {
+      lines.push(`Next steps: ${pendingTasks.slice(0, 3).map(t => t.title || t.text || 'Pending task').join('; ')}.`);
+    }
   }
 
-  // Most recent tool activity
-  const toolCalls = recentActivity.filter(a => a.tool && a.tool !== '_thought').slice(-3);
-  if (toolCalls.length > 0) {
-    const toolNames = toolCalls.map(tc => tc.tool).join(', ');
-    lines.push(`Recent tools: ${toolNames}`);
+  if (subStatus) lines.push(`Live status: ${String(subStatus).replace(/\s+/g, ' ').trim().slice(0, 240)}.`);
+
+  return { text: lines.join('\n'), tasks, doneTasks, pendingTasks, subStatus };
+}
+
+function bindNamedProjectForSupervisor(orionConv, prompt) {
+  if (!RendererWorkspaceResolution || !orionConv) return structuredWorkspaceForConversation(orionConv);
+  const coderConv = orionConv.launchedCoderConvId
+    ? conversations.find(conversation => conversation.id === orionConv.launchedCoderConvId)
+    : null;
+  const candidates = [
+    ...projects,
+    orionConv.projectPath,
+    orionConv.dispatchProjectPath,
+    coderConv && (coderConv.projectPath || coderConv.workspace)
+  ].filter(Boolean);
+  const namedProject = RendererWorkspaceResolution.findNamedProject(prompt, candidates);
+  const searchRoot = getDispatchWorkspaceRoot();
+  if (namedProject && namedProject.path && !RendererWorkspaceResolution.samePath(namedProject.path, searchRoot)) {
+    const changed = !RendererWorkspaceResolution.samePath(orionConv.dispatchProjectPath, namedProject.path)
+      || !RendererWorkspaceResolution.samePath(orionConv.workspace, namedProject.path);
+    orionConv.dispatchProjectPath = namedProject.path;
+    orionConv.workspace = namedProject.path;
+    if (changed) {
+      orionConv.updatedAt = Date.now();
+      if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+      if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    }
+  }
+  return structuredWorkspaceForConversation(orionConv);
+}
+
+// ── Orion answers conversationally while Coder runs in the background ─────────
+async function respondOrionConversationally(orionConv, prompt, model, options = {}) {
+  const config = window.getAppConfig ? window.getAppConfig() : {};
+
+  const contextNeed = options.semanticIntent
+    && options.semanticIntent.reasoningPolicyHint
+    && options.semanticIntent.reasoningPolicyHint.contextNeed
+    || 'none';
+  const recentLimit = contextNeed === 'none' ? 0 : (contextNeed === 'recent' ? 4 : 10);
+  // Recent conversation is candidate evidence only when the semantic route says it is needed.
+  const recentMsgs = (orionConv.messages || [])
+    .filter(message => !options.statusCheckin || !String(message && message.source || '').startsWith('supervisor-checkin'))
+    .slice(recentLimit ? -recentLimit : 0)
+    .map(m => ({
+      role: m.role === 'assistant' || m.role === 'model' ? 'assistant' : 'user',
+      content: String(m.text || m.content || '').slice(0, 500)
+    }));
+  if (recentLimit === 0) recentMsgs.length = 0;
+
+  // Add coder context if a coder task is running
+  let coderContext = '';
+  const coderConvId = orionConv.launchedCoderConvId;
+  if (coderConvId) {
+    const summary = buildCoderStatusSummary(coderConvId);
+    if (summary && summary.text) {
+      coderContext = `\n\nCoder task status:\n${summary.text}`;
+    }
   }
 
-  // Latest thought/text
-  const lastThought = [...recentActivity].reverse().find(a => a.tool === '_thought');
-  if (lastThought && lastThought.text) {
-    const preview = lastThought.text.slice(0, 160).replace(/\s+/g, ' ');
-    lines.push(`Last update: "${preview}${lastThought.text.length > 160 ? '…' : ''}"`);
+  const workspace = bindNamedProjectForSupervisor(orionConv, prompt);
+  const workspaceDescription = RendererWorkspaceResolution
+    ? RendererWorkspaceResolution.describeWorkspace({
+        kind: workspace.role,
+        path: workspace.path,
+        projectPath: workspace.project && workspace.project.path,
+        projectName: workspace.project && workspace.project.name,
+        source: workspace.source
+      }, (RendererWorkspaceResolution.extractProjectReferences(prompt) || [])[0] || '')
+    : '';
+  const statusGuidance = options.statusCheckin
+    ? '\n\nThe user is checking on Coder. Answer naturally in one short progress update using only the Coder task status supplied below. Summarize what is complete, what is happening now, and what remains when those facts are available. Do not print raw JSON, tool-call payloads, internal thoughts, or a mechanical field dump. Do not guess percentages or claim completion that is not recorded.'
+    : '';
+  const concurrencyGuidance = coderContext
+    ? ' A separate Coder agent is working in the background; its verified status is supplied below. You can still talk freely.'
+    : ' Another response may still be finishing, but no owned Coder status is supplied. Do not claim that a Coder task exists.';
+  const systemPrompt = `You are Orion, an AI supervisor. Answer the user's current message conversationally and helpfully.${concurrencyGuidance} Be concise and direct. Never invent a remembered conversation or upgrade a reported status.${statusGuidance}${workspaceDescription ? `\n\nWorkspace state: ${workspaceDescription}` : ''}${coderContext}`;
+
+  const runningConversationId = window.getRunningConversationId
+    ? String(window.getRunningConversationId() || '')
+    : '';
+  if (runningConversationId !== String(orionConv.id || '')
+      && typeof window.clearActiveAiBubble === 'function') {
+    window.clearActiveAiBubble();
   }
 
-  if (subStatus) lines.push(`Currently: ${subStatus}`);
-
-  return lines.length > 0 ? lines.join('\n') : 'Working — no detailed status available yet.';
+  try {
+    if (!RendererSupervisorOrchestration || !RendererOrchestrationContracts) {
+      throw new Error('Supervisor response contracts are unavailable.');
+    }
+    const result = await RendererSupervisorOrchestration.buildContractedConversationalReply({
+      conversation: orionConv,
+      prompt,
+      messageId: options.messageId || '',
+      workspacePaths: [
+        workspace.path,
+        workspace.project && workspace.project.path,
+        ...projects.map(project => typeof project === 'string' ? project : project.path)
+      ].filter(Boolean),
+      systemPrompt,
+      messages: recentMsgs,
+      semanticIntent: options.semanticIntent || null
+    }, {
+      contracts: RendererOrchestrationContracts,
+      retrieveEvidence: payload => (
+        window.api && typeof window.api.searchConversationEvidence === 'function'
+          ? window.api.searchConversationEvidence(payload)
+          : Promise.resolve({ success: false, evidence: [], queryTerms: [] })
+      ),
+      generateReply: (contractPrompt, messages) => window.quickOrionLLMCall(contractPrompt, messages, config, {
+        phase: options.statusCheckin ? 'final_response' : 'casual_conversation',
+        hint: options.semanticIntent && options.semanticIntent.reasoningPolicyHint || {}
+      })
+    });
+    const replyText = String(result.text || '').trim();
+    if (!replyText) throw new Error('Supervisor response was empty.');
+    orionConv.messages.push({
+      id: createConversationMessageId(orionConv.id),
+      role: 'assistant',
+      text: replyText,
+      source: options.statusCheckin ? 'supervisor-checkin' : 'supervisor-conversational',
+      createdAt: Date.now(),
+      responseBasis: result.responseBasis
+    });
+    orionConv.updatedAt = Date.now();
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    if (activeConversationId === orionConv.id && typeof window.renderAiMessage === 'function') {
+      window.renderAiMessage(replyText, [], orionConv.id);
+    }
+    if (typeof scrollChatToBottom === 'function') scrollChatToBottom();
+    return {
+      success: true,
+      replyText,
+      responseBasis: result.responseBasis
+    };
+  } catch (err) {
+    console.error('respondOrionConversationally error:', err);
+    const fallback = String(options.fallbackText || "I'm juggling the coder task right now — ask me again in a moment and I'll have a better answer.");
+    orionConv.messages.push({
+      id: createConversationMessageId(orionConv.id),
+      role: 'assistant',
+      text: fallback,
+      source: options.statusCheckin ? 'supervisor-checkin-error' : 'supervisor-conversational-error',
+      createdAt: Date.now()
+    });
+    orionConv.updatedAt = Date.now();
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    if (activeConversationId === orionConv.id && typeof window.renderAiMessage === 'function') {
+      window.renderAiMessage(fallback, [], orionConv.id);
+    }
+    if (typeof scrollChatToBottom === 'function') scrollChatToBottom();
+    return {
+      success: false,
+      error: err && err.message ? err.message : String(err),
+      replyText: fallback,
+      responsePersisted: true
+    };
+  }
 }
 
 // ── Main supervisor message handler ──────────────────────────────────────────
 // Called from submitMessage() when user types in Orion while Coder is running.
-function handleSupervisorMessage(orionConv, prompt, model) {
+async function handleSupervisorMessage(orionConv, prompt, model, options = {}) {
   const coderConvId = orionConv.launchedCoderConvId;
-  const intent = classifySupervisorIntent(prompt);
-
-  if (intent === 'checkin') {
-    // Build a status reply immediately without starting the full agent loop
-    const summary = buildCoderStatusSummary(coderConvId);
-    const replyText = summary
-      ? `Here's what Coder is up to:\n\n${summary}`
-      : 'Coder is still working — no detailed status available yet.';
-
-    // Persist as an assistant message in the Orion conversation
-    orionConv.messages.push({ role: 'assistant', text: replyText, source: 'supervisor-checkin', createdAt: Date.now() });
-    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
-    if (typeof window.renderAiMessage === 'function') {
-      // Clear any lingering active bubble so this renders as a fresh new bubble
-      if (typeof window.clearActiveAiBubble === 'function') window.clearActiveAiBubble();
-      window.renderAiMessage(replyText, [], orionConv.id);
+  if (!RendererSupervisorOrchestration) {
+    throw new Error('Supervisor orchestration is unavailable.');
+  }
+  const semanticIntent = options.semanticIntent || await classifyCurrentConversationIntent(orionConv, prompt, { model });
+  const enqueueTask = async classification => {
+    const projectResolutionText = [
+      ...taskContextMessages(orionConv).map(message => message.text),
+      prompt
+    ].join('\n');
+    const workspace = bindNamedProjectForSupervisor(orionConv, projectResolutionText);
+    const queued = await enqueueOrchestrationTask({
+      prompt,
+      originalUserMessage: prompt,
+      modelSelectValue: model,
+      originConversationId: orionConv.id,
+      targetConversationId: orionConv.id,
+      originMessageId: options.messageId || '',
+      source: options.source || 'supervisor-queue',
+      images: options.images || [],
+      workspace,
+      alreadyRendered: true,
+      semanticIntent: classification || semanticIntent
+    });
+    if (queued.success) {
+      persistAssistantStatusMessage(orionConv.id, `Queued as ${queued.task.title}. Orion will handle it after the active Coder task.`, {
+        source: 'queue-status',
+        dedupeKey: `supervisor-queued-${queued.task.taskId}`
+      });
+    } else if (!queued.needsClarification) {
+      persistAssistantStatusMessage(orionConv.id, queued.error || 'Could not queue this request.', {
+        source: 'queue-status',
+        dedupeKey: `supervisor-queue-error-${orionConv.id}-${Date.now()}`
+      });
     }
-    if (typeof scrollChatToBottom === 'function') scrollChatToBottom();
-    return;
-  }
-
-  if (intent === 'steering') {
-    // Inject directly into the Coder's steering queue
-    window.steeringQueue = window.steeringQueue || {};
-    window.steeringQueue[coderConvId] = window.steeringQueue[coderConvId] || [];
-    window.steeringQueue[coderConvId].push(prompt);
-    appendSystemMessage(`Steering sent to Coder: "${prompt.slice(0, 80)}${prompt.length > 80 ? '…' : ''}"`, { conversationId: orionConv.id });
-    return;
-  }
-
-  // 'normal' — queue for after Coder finishes
-  window.promptQueue = window.promptQueue || [];
-  window.promptQueue.push({ prompt, modelSelectValue: model, conversationId: orionConv.id, alreadyRendered: true });
-  persistAssistantStatusMessage(orionConv.id, 'Queued — Coder is busy. Orion will handle this when it finishes.', {
-    source: 'queue-status',
-    dedupeKey: `supervisor-queued-${orionConv.id}-${Date.now()}`
+    return queued;
+  };
+  return RendererSupervisorOrchestration.handleSupervisorMessage({
+    conversation: orionConv,
+    prompt,
+    model,
+    options,
+    semanticIntent
+  }, {
+    classifyIntent: () => Promise.resolve(semanticIntent),
+    cancelOwnedTask: async () => {
+      const cancelled = await stopExpectedTaskForConversation(orionConv.id);
+      const taskId = String((cancelled && cancelled.task && cancelled.task.taskId) || (cancelled && cancelled.taskId) || '');
+      const replyText = cancelled && cancelled.success
+        ? `Cancelled **${(cancelled.task && cancelled.task.title) || 'Coder task'}**${taskId ? ` (${taskId})` : ''}. Its final state is cancelled.`
+        : `I could not cancel the owned Coder task: ${(cancelled && (cancelled.error || cancelled.reason)) || 'cancellation failed'}.`;
+      notifyOrionConversation(orionConv, replyText, 'supervisor-cancellation');
+      return cancelled;
+    },
+    enqueueTask,
+    askClarification: question => {
+      persistTaskClarification(orionConv, question || 'What would you like me to do?');
+      return { success: false, needsClarification: true, clarification: question };
+    },
+    steerActiveTask: async ({ reason, classification }) => {
+      const steeringPrompt = String(classification && classification.resolvedRequest || prompt);
+      window.steeringQueue = window.steeringQueue || {};
+      window.steeringQueue[coderConvId] = window.steeringQueue[coderConvId] || [];
+      window.steeringQueue[coderConvId].push(steeringPrompt);
+      appendSystemMessage(
+        `Steering sent to the active Coder task: "${steeringPrompt.slice(0, 80)}${steeringPrompt.length > 80 ? '…' : ''}"`,
+        { conversationId: orionConv.id }
+      );
+      return { success: true, steered: true, coderConversationId: coderConvId };
+    },
+    respondCheckin: async () => {
+      const summary = buildCoderStatusSummary(coderConvId);
+      const fallbackText = (summary && summary.text)
+        ? `Coder is still working. ${summary.text.replace(/\n+/g, ' ')}`
+        : 'Coder is active, but it has not recorded a detailed progress update yet.';
+      return respondOrionConversationally(orionConv, prompt, model, {
+        ...options,
+        semanticIntent,
+        statusCheckin: true,
+        fallbackText
+      });
+    },
+    respondConversationally: () => respondOrionConversationally(orionConv, prompt, model, { ...options, semanticIntent })
   });
 }
 
 // ── Coder task state monitor ──────────────────────────────────────────────────
 // Polls the Coder conversation every 2s to detect state changes.
-window.startCoderTaskMonitor = function(orionConvId, coderConvId) {
+window.startCoderTaskMonitor = function(orionConvId, coderConvId, taskId = '') {
   // Clear any existing monitor
-  if (_coderTaskMonitorInterval) {
-    clearInterval(_coderTaskMonitorInterval);
-    _coderTaskMonitorInterval = null;
-  }
+  stopCoderTaskMonitor(_coderTaskMonitorMeta);
 
   _coderTaskMonitorMeta = {
+    generation: ++_coderTaskMonitorGeneration,
     orionConvId,
     coderConvId,
+    taskId: String(taskId || ''),
     lastAwaitingClarification: false,
     lastAwaitingPlanApproval: false,
     lastRunning: true,        // Coder just started, so it's running
     startTime: Date.now(),
     notifiedClarification: false,
+    quietSince: 0,
+    inFlight: false
   };
 
-  _coderTaskMonitorInterval = setInterval(() => {
-    if (!_coderTaskMonitorMeta) return;
-    const { orionConvId, coderConvId } = _coderTaskMonitorMeta;
+  _coderTaskMonitorInterval = setInterval(async () => {
+    const monitorMeta = _coderTaskMonitorMeta;
+    if (!monitorMeta || monitorMeta.inFlight) return;
+    monitorMeta.inFlight = true;
+    try {
+    const { orionConvId, coderConvId, taskId } = monitorMeta;
 
     const orionConv = conversations.find(c => c.id === orionConvId);
     const coderConv = conversations.find(c => c.id === coderConvId);
     if (!orionConv || !coderConv) {
-      stopCoderTaskMonitor();
+      stopCoderTaskMonitor(monitorMeta);
+      return;
+    }
+    const durableTask = taskId ? orchestrationTaskCache.get(taskId) : null;
+    if (durableTask && ['cancelled', 'completed', 'failed'].includes(durableTask.status)) {
+      await notifySupervisorOfCoderCompletion(coderConvId, taskId);
+      if (_coderTaskMonitorMeta === monitorMeta) stopCoderTaskMonitor(monitorMeta);
       return;
     }
 
     const isCoderRunning = !!(window.isAgentRunning && window.isAgentRunning()
-      && window.getRunningConversationId && window.getRunningConversationId() === coderConvId);
+      && window.getRunningConversationId && window.getRunningConversationId() === coderConvId
+      && (!taskId || !window.getActiveRunTaskId || window.getActiveRunTaskId() === taskId));
     const nowAwaitingClarification = !!(coderConv.awaitingClarification) && !isCoderRunning;
     const nowAwaitingPlan = !!(coderConv.awaitingPlanApproval && !coderConv.planApproved) && !isCoderRunning;
-    const elapsed = Math.round((Date.now() - _coderTaskMonitorMeta.startTime) / 1000);
+    const elapsed = Math.round((Date.now() - monitorMeta.startTime) / 1000);
 
-    // Update the status card if active Orion conv is watching
-    if (isCoderRunning && activeConversationId === orionConvId) {
-      const subStatus = window.getAgentSubStatus ? window.getAgentSubStatus() : '';
-      showCoderStatusCard(coderConv.title || 'Coder Task', subStatus, elapsed);
+    // Stall escalation: not running, nothing queued, not waiting on the user, and no completion
+    // receipt ever arrived — the run ended without the completion hook (crash, killed process,
+    // queued-but-never-started). Without this, the monitor polled forever showing "Working…" and
+    // nobody was told; the user discovered the stuck task by accident much later.
+    const isQueuedForCoder = Array.isArray(window.promptQueue)
+      && window.promptQueue.some(item => item && (taskId ? item.taskId === taskId : item.conversationId === coderConvId));
+    const isQuiet = !isCoderRunning && !isQueuedForCoder && !nowAwaitingClarification && !nowAwaitingPlan;
+    if (isQuiet) {
+      if (!monitorMeta.quietSince) monitorMeta.quietSince = Date.now();
+      if (Date.now() - monitorMeta.quietSince > 60000) {
+        const stalledTitle = orionConv.launchedCoderTaskTitle || coderConv.title || 'Coder task';
+        const pendingCount = (coderConv.tasks || []).filter(t => t.status !== 'completed' && t.status !== 'x').length;
+        let canonicalTask = durableTask;
+        if (taskId && typeof window.getOrchestrationTaskStatus === 'function') {
+          const statusRead = await window.getOrchestrationTaskStatus(taskId, orionConv.id);
+          if (_coderTaskMonitorMeta !== monitorMeta) return;
+          if (statusRead && statusRead.success && statusRead.task) canonicalTask = statusRead.task;
+        }
+        // Pending can mean either a user/input pause or an automatic action-boundary checkpoint.
+        // The durable resume policy is authoritative across queue timing gaps and renderer
+        // restarts. Recover automatic work under the same task ID; only user/manual pauses should
+        // be parked behind a Continue action.
+        if (canonicalTask && canonicalTask.status === 'pending') {
+          if (String(orionConv.launchedCoderTaskId || '') !== taskId) return;
+          if (pendingTaskNeedsRuntimeQueue(canonicalTask)) {
+            const continuation = await queueTaskContinuation({
+              targetConversationId: coderConvId,
+              originConversationId: orionConvId,
+              taskId,
+              requireExistingTask: true,
+              source: 'automatic-action-boundary-recovery'
+            });
+            if (_coderTaskMonitorMeta !== monitorMeta) return;
+            if (continuation && continuation.success) {
+              startOrQueueTaskContinuation(continuation, coderConv, {
+                source: 'automatic-action-boundary-recovery',
+                modelSelectValue: window.getSelectedModel(),
+                errorLabel: 'Automatic Coder continuation'
+              });
+              monitorMeta.quietSince = 0;
+              return;
+            }
+            monitorMeta.quietSince = Date.now();
+            return;
+          }
+          const pendingReason = String(
+            canonicalTask.execution && canonicalTask.execution.reason || ''
+          ).trim();
+          notifyOrionConversation(
+            orionConv,
+            `Coder paused **${stalledTitle}** before completion. The durable task remains pending${pendingReason ? `: ${pendingReason}.` : '.'} Use Continue to resume it without treating the work as completed or failed.`,
+            'supervisor-pending'
+          );
+          orionConv.lastDelegatedWork = {
+            taskId,
+            coderConversationId: coderConvId,
+            title: stalledTitle,
+            projectPath: coderConv.projectPath || inferDispatchProjectPath(orionConv),
+            status: 'pending',
+            subStatus: pendingReason || 'Paused before completion',
+            startedAt: orionConv.launchedCoderTaskStart || 0,
+            completedAt: canonicalTask.pendingAt || canonicalTask.updatedAt || Date.now(),
+            pendingCount: Math.max(1, pendingCount)
+          };
+          orionConv.launchedCoderConvId = null;
+          orionConv.launchedCoderTaskId = null;
+          orionConv.launchedCoderTaskTitle = null;
+          orionConv.launchedCoderTaskStart = null;
+          if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+          if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+          renderDesktopDispatchLanding();
+          stopCoderTaskMonitor(monitorMeta);
+          return;
+        }
+        if (canonicalTask && ['completed', 'cancelled', 'failed'].includes(canonicalTask.status)) {
+          await notifySupervisorOfCoderCompletion(coderConvId, taskId);
+          if (_coderTaskMonitorMeta === monitorMeta) stopCoderTaskMonitor(monitorMeta);
+          return;
+        }
+        let stalledTask = null;
+        if (taskId && canonicalTask && canonicalTask.status === 'active'
+            && typeof window.finalizeOrchestrationTask === 'function') {
+          stalledTask = await window.finalizeOrchestrationTask(taskId, 'failed', {
+            reason: 'The Coder run went quiet without recording completion.',
+            expectedExecutionId: canonicalTask.execution && canonicalTask.execution.executionId
+          });
+          if (_coderTaskMonitorMeta !== monitorMeta) return;
+        }
+        if (taskId && !stalledTask) {
+          monitorMeta.quietSince = Date.now();
+          return;
+        }
+        if (taskId && stalledTask.status !== 'failed') {
+          if (['completed', 'cancelled'].includes(stalledTask.status)) {
+            await notifySupervisorOfCoderCompletion(coderConvId, taskId);
+            if (_coderTaskMonitorMeta !== monitorMeta) return;
+          }
+          stopCoderTaskMonitor(monitorMeta);
+          return;
+        }
+        if (_coderTaskMonitorMeta !== monitorMeta
+            || (taskId && String(orionConv.launchedCoderTaskId || '') !== taskId)) return;
+        notifyOrionConversation(orionConv, `Coder went quiet on **${stalledTitle}** — the run ended without recording completion (it may have crashed or stalled). The work is parked under Active work; use its Continue action or open the Coder conversation to inspect it.`, 'supervisor-stall');
+        orionConv.lastDelegatedWork = {
+          taskId,
+          coderConversationId: coderConvId,
+          title: stalledTitle,
+          projectPath: coderConv.projectPath || inferDispatchProjectPath(orionConv),
+          status: taskId ? 'failed' : 'blocked',
+          subStatus: 'Went quiet without completing',
+          startedAt: orionConv.launchedCoderTaskStart || 0,
+          completedAt: Date.now(),
+          pendingCount
+        };
+        orionConv.launchedCoderConvId = null;
+        orionConv.launchedCoderTaskId = null;
+        orionConv.launchedCoderTaskTitle = null;
+        orionConv.launchedCoderTaskStart = null;
+        if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+        if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+        renderDesktopDispatchLanding();
+        stopCoderTaskMonitor(monitorMeta);
+        return;
+      }
+    } else {
+      monitorMeta.quietSince = 0;
+    }
+
+    // The durable task drives presentation across the queued gap and Coder execution. Live
+    // conversation activity only enriches the detail; it is not proof that the task exists.
+    if (activeConversationId === orionConvId) {
+      syncDispatchCoderStatusCard(orionConvId, isCoderRunning, isCoderRunning ? coderConvId : '');
     }
 
     // Detect: Coder needs clarification → proxy it into Orion
-    if (nowAwaitingClarification && !_coderTaskMonitorMeta.notifiedClarification) {
-      _coderTaskMonitorMeta.notifiedClarification = true;
+    if (nowAwaitingClarification && !monitorMeta.notifiedClarification) {
+      monitorMeta.notifiedClarification = true;
       renderCoderClarificationProxy(orionConv, coderConv.awaitingClarification, coderConvId);
       showCoderStatusCard(coderConv.title || 'Coder Task', 'Waiting for your input…', elapsed);
     }
     // Reset flag if coder cleared its clarification
     if (!coderConv.awaitingClarification) {
-      _coderTaskMonitorMeta.notifiedClarification = false;
+      monitorMeta.notifiedClarification = false;
     }
 
     // Detect: Coder is awaiting plan approval → notify Orion
-    if (nowAwaitingPlan && !_coderTaskMonitorMeta.lastAwaitingPlanApproval) {
-      _coderTaskMonitorMeta.lastAwaitingPlanApproval = true;
-      notifyOrionConversation(orionConv, `Coder has written an implementation plan and is waiting for your approval. Switch to the Coder conversation to review it.`, 'supervisor-plan');
+    if (nowAwaitingPlan && !monitorMeta.lastAwaitingPlanApproval) {
+      monitorMeta.lastAwaitingPlanApproval = true;
+      const relayed = await relayCoderPlanToDispatch(orionConv, coderConv, taskId);
+      if (!relayed.success) {
+        notifyOrionConversation(
+          orionConv,
+          `Coder is waiting for plan approval, but Dispatch could not load the saved plan: ${relayed.error}`,
+          'supervisor-plan-error'
+        );
+      } else if (activeConversationId === orionConvId) {
+        syncDispatchCoderStatusCard(orionConvId, false, '');
+      }
     }
-    if (!nowAwaitingPlan) _coderTaskMonitorMeta.lastAwaitingPlanApproval = false;
+    if (!nowAwaitingPlan) monitorMeta.lastAwaitingPlanApproval = false;
 
-    _coderTaskMonitorMeta.lastRunning = isCoderRunning;
+    monitorMeta.lastRunning = isCoderRunning;
+    } finally {
+      if (_coderTaskMonitorMeta === monitorMeta) monitorMeta.inFlight = false;
+    }
   }, 2000);
 };
 
-function stopCoderTaskMonitor() {
+function stopCoderTaskMonitor(expectedMeta = null) {
+  if (expectedMeta && _coderTaskMonitorMeta !== expectedMeta) return false;
   if (_coderTaskMonitorInterval) {
     clearInterval(_coderTaskMonitorInterval);
     _coderTaskMonitorInterval = null;
   }
   _coderTaskMonitorMeta = null;
   hideCoderStatusCard();
+  return true;
 }
 window.stopCoderTaskMonitor = stopCoderTaskMonitor;
 
+async function relayCoderPlanToDispatch(orionConv, coderConv, taskId) {
+  if (!orionConv || !coderConv) return { success: false, error: 'Plan relay conversations are missing.' };
+  let planText = '';
+  try {
+    planText = await readConversationTextArtifact(coderConv, 'implementation_plan.md', { maxChars: 50000 });
+  } catch (error) {
+    return { success: false, error: error.message || String(error) };
+  }
+  if (!String(planText || '').trim()) {
+    return { success: false, error: 'Coder did not save a readable implementation plan.' };
+  }
+  const delegatedPlan = {
+    taskId: String(taskId || coderConv.awaitingPlanApprovalTaskId || ''),
+    coderConversationId: coderConv.id,
+    title: orionConv.launchedCoderTaskTitle || coderConv.title || 'Coder task',
+    createdAt: Date.now()
+  };
+  coderConv.planRevisionInProgress = null;
+  orionConv.revisingDelegatedPlan = null;
+  orionConv.awaitingDelegatedPlan = delegatedPlan;
+  if (typeof window.markConversationDirty === 'function') {
+    window.markConversationDirty(coderConv.id);
+    window.markConversationDirty(orionConv.id);
+  }
+  notifyOrionConversation(
+    orionConv,
+    `Coder prepared this implementation plan for **${delegatedPlan.title}**:\n\n${String(planText).trim()}\n\nApprove it here to continue. If you want changes, reply in this Dispatch conversation and I’ll relay the revision to Coder.`,
+    'supervisor-plan',
+    {
+      isDelegatedPlanCard: true,
+      delegatedPlan
+    }
+  );
+  return { success: true, delegatedPlan };
+}
+
+function summarizeCoderCompletion(durableTask, coderConv) {
+  const result = durableTask && durableTask.result && typeof durableTask.result === 'object'
+    ? durableTask.result : {};
+  let summary = String(result.summary || '').trim();
+  if (!summary && coderConv && Array.isArray(coderConv.messages)) {
+    const finalMessage = [...coderConv.messages].reverse().find(message =>
+      message
+      && (message.role === 'assistant' || message.role === 'model')
+      && String(message.text || '').trim()
+      && String(message.text || '').trim() !== 'Thinking...'
+      && !message.isPlanApprovalCard
+    );
+    summary = finalMessage ? String(finalMessage.text || '').trim() : '';
+  }
+  summary = summary
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/\n*## Work Walkthrough[\s\S]*$/i, '')
+    .trim()
+    .slice(0, 5000);
+  return {
+    summary,
+    changedFiles: Array.isArray(result.changedFiles) ? result.changedFiles.slice(0, 20) : [],
+    verification: Array.isArray(result.verification) ? result.verification.slice(0, 12) : []
+  };
+}
+
 // ── Supervisor completion notification ────────────────────────────────────────
-function notifySupervisorOfCoderCompletion(finishedCoderConvId) {
+async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTaskId = '') {
   if (!finishedCoderConvId) return;
-  const orionConv = conversations.find(c => c.launchedCoderConvId === finishedCoderConvId);
+  const normalizedExpectedTaskId = String(expectedTaskId || '');
+  const orionConv = conversations.find(c => c.launchedCoderConvId === finishedCoderConvId
+    && (!normalizedExpectedTaskId || String(c.launchedCoderTaskId || '') === normalizedExpectedTaskId));
   if (!orionConv) return;
+  const taskId = String(normalizedExpectedTaskId || orionConv.launchedCoderTaskId
+    || (_coderTaskMonitorMeta && _coderTaskMonitorMeta.coderConvId === finishedCoderConvId && _coderTaskMonitorMeta.taskId)
+    || '');
+  let durableTask = null;
+  if (taskId) {
+    const read = await window.getOrchestrationTaskStatus(taskId, orionConv.id);
+    if (!read || !read.success || !read.task) return;
+    durableTask = read.task;
+  }
+  if (taskId && String(orionConv.launchedCoderTaskId || '') !== taskId) return;
+  if (durableTask && (durableTask.status === 'pending' || durableTask.status === 'active')) return;
+  const existingTerminalNotification = Array.isArray(orionConv.messages)
+    ? orionConv.messages.find(message =>
+        message
+        && message.source === 'supervisor-completion'
+        && String(message.orchestrationTaskId || '') === taskId
+      )
+    : null;
+  if (existingTerminalNotification) {
+    orionConv.launchedCoderConvId = null;
+    orionConv.launchedCoderTaskId = null;
+    orionConv.launchedCoderTaskTitle = null;
+    orionConv.launchedCoderTaskStart = null;
+    orionConv.awaitingDelegatedPlan = null;
+    orionConv.revisingDelegatedPlan = null;
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    return;
+  }
+  if (durableTask && durableTask.status === 'cancelled') {
+    if (_coderTaskMonitorMeta && _coderTaskMonitorMeta.coderConvId === finishedCoderConvId
+        && (!_coderTaskMonitorMeta.taskId || _coderTaskMonitorMeta.taskId === taskId)) {
+      stopCoderTaskMonitor(_coderTaskMonitorMeta);
+    }
+    orionConv.launchedCoderConvId = null;
+    orionConv.launchedCoderTaskId = null;
+    orionConv.launchedCoderTaskTitle = null;
+    orionConv.launchedCoderTaskStart = null;
+    orionConv.awaitingDelegatedPlan = null;
+    orionConv.revisingDelegatedPlan = null;
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    return;
+  }
 
   // Stop the monitor now that the task finished
-  if (_coderTaskMonitorMeta && _coderTaskMonitorMeta.coderConvId === finishedCoderConvId) {
-    stopCoderTaskMonitor();
+  if (_coderTaskMonitorMeta && _coderTaskMonitorMeta.coderConvId === finishedCoderConvId
+      && (!_coderTaskMonitorMeta.taskId || _coderTaskMonitorMeta.taskId === taskId)) {
+    stopCoderTaskMonitor(_coderTaskMonitorMeta);
   }
 
   const coderConv = conversations.find(c => c.id === finishedCoderConvId);
-  const taskTitle = orionConv.launchedCoderTaskTitle || (coderConv && coderConv.title) || 'Coder Task';
+  const taskTitle = String(
+    durableTask && durableTask.title
+    || orionConv.launchedCoderTaskTitle
+    || (coderConv && coderConv.title)
+    || 'Coder Task'
+  );
   const tasks = (coderConv && coderConv.tasks) || [];
   const doneTasks = tasks.filter(t => t.status === 'completed' || t.status === 'x');
   const pendingTasks = tasks.filter(t => t.status !== 'completed' && t.status !== 'x');
@@ -5464,9 +9048,22 @@ function notifySupervisorOfCoderCompletion(finishedCoderConvId) {
   // Determine outcome
   const blockedFlag = coderConv && Array.isArray(coderConv.messages)
     && coderConv.messages.slice(-3).some(m => /blocked|cannot|error|failed/i.test(m.text || ''));
+  const completion = summarizeCoderCompletion(durableTask, coderConv);
 
   let summaryText;
-  if (pendingTasks.length > 0 && doneTasks.length === 0) {
+  if (durableTask && durableTask.status === 'failed') {
+    summaryText = `Coder failed **${taskTitle}**. The task state is failed; check the Coder conversation for the recorded error before retrying.`;
+  } else if (durableTask && durableTask.status === 'completed') {
+    const elapsed_str = elapsed ? ` (${elapsed}m)` : '';
+    summaryText = `Coder completed **${taskTitle}**${elapsed_str}.`;
+    if (completion.summary) summaryText += `\n\n${completion.summary}`;
+    if (completion.changedFiles.length) {
+      summaryText += `\n\nChanged: ${completion.changedFiles.map(file => `\`${file}\``).join(', ')}`;
+    }
+    if (completion.verification.length) {
+      summaryText += `\n\nVerified:\n${completion.verification.map(item => `- ${item}`).join('\n')}`;
+    }
+  } else if (pendingTasks.length > 0 && doneTasks.length === 0) {
     summaryText = `Coder stopped on **${taskTitle}** — ${pendingTasks.length} task${pendingTasks.length > 1 ? 's' : ''} still pending. It may have hit a blocker. Check the Coder conversation for details.`;
   } else if (pendingTasks.length > 0) {
     summaryText = `Coder finished part of **${taskTitle}** — ${doneTasks.length} done, ${pendingTasks.length} remaining. You can queue a continuation or check the Coder conversation.`;
@@ -5475,23 +9072,69 @@ function notifySupervisorOfCoderCompletion(finishedCoderConvId) {
     summaryText = `Coder finished **${taskTitle}**${elapsed_str}. ${doneTasks.length > 0 ? `${doneTasks.length} task${doneTasks.length > 1 ? 's' : ''} completed.` : ''} Ready for your next direction.`;
   }
 
-  notifyOrionConversation(orionConv, summaryText, 'supervisor-completion');
+  notifyOrionConversation(orionConv, summaryText, 'supervisor-completion', {
+    orchestrationTaskId: taskId,
+    orchestrationStatus: durableTask && durableTask.status || ''
+  });
+
+  orionConv.lastDelegatedWork = {
+    taskId,
+    coderConversationId: finishedCoderConvId,
+    title: taskTitle,
+    objective: durableTask && durableTask.objective || '',
+    projectPath: (coderConv && coderConv.projectPath) || inferDispatchProjectPath(orionConv),
+    status: durableTask ? durableTask.status : (blockedFlag || pendingTasks.length > 0 ? 'blocked' : 'completed'),
+    subStatus: durableTask
+      ? (RendererTaskOrchestration ? RendererTaskOrchestration.describeTaskStatus(durableTask) : durableTask.status)
+      : (blockedFlag
+      ? 'Stopped with a blocker'
+      : (pendingTasks.length > 0 ? `${doneTasks.length} complete, ${pendingTasks.length} remaining` : 'Completed')),
+    startedAt: orionConv.launchedCoderTaskStart || 0,
+    completedAt: (durableTask && (durableTask.completedAt || durableTask.failedAt || durableTask.cancelledAt)) || Date.now(),
+    pendingCount: pendingTasks.length
+  };
 
   // Clear the launched coder conv reference so we don't double-notify
   orionConv.launchedCoderConvId = null;
+  orionConv.launchedCoderTaskId = null;
   orionConv.launchedCoderTaskTitle = null;
   orionConv.launchedCoderTaskStart = null;
+  orionConv.awaitingDelegatedPlan = null;
+  orionConv.revisingDelegatedPlan = null;
+  if (coderConv) coderConv.planRevisionInProgress = null;
+  orionConv.updatedAt = Date.now();
+  if (typeof window.markConversationDirty === 'function') {
+    window.markConversationDirty(orionConv.id);
+    if (coderConv) window.markConversationDirty(coderConv.id);
+  }
   if (window.saveConversationsToStorage) window.saveConversationsToStorage();
 }
 
+window.onOrchestrationTaskFinalized = async function(taskId, targetConversationId, status) {
+  if (!taskId || !targetConversationId || !['completed', 'failed', 'cancelled'].includes(String(status || ''))) return;
+  await notifySupervisorOfCoderCompletion(targetConversationId, taskId);
+};
+
 // Appends a message to an Orion conversation, rendering it if active.
-function notifyOrionConversation(orionConv, text, source) {
+function notifyOrionConversation(orionConv, text, source, metadata = {}) {
   if (!orionConv || !text) return;
-  orionConv.messages.push({ role: 'assistant', text, source, createdAt: Date.now() });
+  if (!Array.isArray(orionConv.messages)) orionConv.messages = [];
+  if (metadata.orchestrationTaskId
+      && orionConv.messages.some(message =>
+        message
+        && message.source === source
+        && String(message.orchestrationTaskId || '') === String(metadata.orchestrationTaskId)
+      )) {
+    return;
+  }
+  const message = { ...metadata, role: 'assistant', text, source, createdAt: Date.now() };
+  orionConv.messages.push(message);
+  orionConv.updatedAt = Date.now();
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
   if (window.saveConversationsToStorage) window.saveConversationsToStorage();
   if (activeConversationId === orionConv.id && typeof window.renderAiMessage === 'function') {
     window.clearActiveAiBubble();
-    window.renderAiMessage(text, [], orionConv.id);
+    window.renderAiMessage(text, [], orionConv.id, message);
   }
 }
 
@@ -5575,12 +9218,15 @@ function renderCoderClarificationProxy(orionConv, clarData, coderConvId) {
 
 
 // ── Status card ───────────────────────────────────────────────────────────────
-function showCoderStatusCard(taskTitle, subStatus, elapsedSec) {
+function showCoderStatusCard(taskTitle, subStatus, elapsedSec, preview = '', statusLabel = 'Coder working on') {
   const card = document.getElementById('coder-task-status-card');
   if (!card) return;
+  const labelEl = card.querySelector('.coder-status-label');
   const titleEl = card.querySelector('.coder-status-task-name');
   const subEl = card.querySelector('.coder-status-substatus');
   const elapsedEl = card.querySelector('.coder-status-elapsed');
+  const previewEl = card.querySelector('.coder-status-preview');
+  if (labelEl) labelEl.textContent = statusLabel || 'Coder working on';
   if (titleEl) titleEl.textContent = taskTitle || 'Coder Task';
   if (subEl) subEl.textContent = subStatus || 'Working…';
   if (elapsedEl) {
@@ -5588,7 +9234,52 @@ function showCoderStatusCard(taskTitle, subStatus, elapsedSec) {
     const secs = elapsedSec % 60;
     elapsedEl.textContent = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
   }
+  // Quick peek at what Coder is actually doing, so following along doesn't require a tab switch.
+  if (previewEl) {
+    previewEl.textContent = preview || '';
+    previewEl.style.display = preview ? '' : 'none';
+  }
   card.classList.add('visible');
+}
+
+function syncDispatchCoderStatusCard(
+  conversationId = activeConversationId,
+  isGlobalRunning = !!(window.isAgentRunning && window.isAgentRunning()),
+  globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : ''
+) {
+  const dispatchConversation = conversations.find(conversation =>
+    conversation.id === conversationId && conversationMode(conversation) === 'orion');
+  if (!dispatchConversation) return false;
+  const preferredTaskId = dispatchConversation.launchedCoderTaskId
+    || dispatchConversation.lastOwnedTaskId
+    || '';
+  const task = getSupervisedTaskForConversation(dispatchConversation.id, preferredTaskId);
+  const presentation = getSupervisedTaskPresentation(task, isGlobalRunning, globalRunningId);
+  if (!task || !presentation || !presentation.isOngoing) return false;
+  const targetConversation = presentation.targetConversation;
+  const lastAssistant = targetConversation && [...(targetConversation.messages || [])].reverse().find(message =>
+    (message.role === 'assistant' || message.role === 'model')
+    && String(message.text || '').trim()
+    && String(message.text || '').trim() !== 'Thinking...');
+  const preview = lastAssistant
+    ? String(lastAssistant.text).replace(/\s+/g, ' ').trim().slice(0, 110)
+    : '';
+  const startedAt = Number(task.startedAt || task.createdAt || Date.now());
+  const elapsed = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+  showCoderStatusCard(
+    task.title || (targetConversation && targetConversation.title) || 'Coder task',
+    presentation.detail,
+    elapsed,
+    preview,
+    presentation.label
+  );
+  const card = document.getElementById('coder-task-status-card');
+  if (card) {
+    card.dataset.taskId = String(task.taskId || '');
+    card.dataset.taskStatus = presentation.status;
+    card.dataset.taskPhase = presentation.phase;
+  }
+  return true;
 }
 
 function hideCoderStatusCard() {

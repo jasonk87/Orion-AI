@@ -11,12 +11,30 @@ const os = require('os');
 const path = require('path');
 const proxyquire = require('proxyquire').noPreserveCache();
 const http = require('http');
+const { applyReadOptions, getBinaryReadError } = require('../lib/ipc-file-tools');
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 function makeTmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'orion-cfg-test-'));
 }
+
+test('read-file applies maxChars after selecting a line range', (t) => {
+  const source = Array.from({ length: 200 }, (_, index) => `line-${index + 1}-${'x'.repeat(20)}`).join('\n');
+  const result = applyReadOptions(source, { startLine: 25, endLine: 175, maxChars: 300 });
+  t.ok(result.startsWith('25: line-25-'), 'the requested range is still numbered from its real source line');
+  t.ok(result.includes('Read truncated at 300 characters'), 'a large ranged read cannot bypass the context cap');
+  t.ok(result.length < 600, 'the returned range remains bounded after adding the continuation note');
+  t.end();
+});
+
+test('read-file redirects images and binary assets to safe inspection tools', (t) => {
+  t.ok(/inspect_screenshot_with_model/.test(getBinaryReadError('public/concept.png')), 'images are routed to model vision instead of UTF-8 decoding');
+  t.ok(/inspect_binary_asset/.test(getBinaryReadError('assets/model.glb') || getBinaryReadError('assets/archive.zip')), 'binary assets are routed to metadata inspection');
+  t.equal(getBinaryReadError('assets/icon.svg'), '', 'text-based SVG source remains available to code inspection');
+  t.equal(getBinaryReadError('src/app.js'), '', 'ordinary source files remain readable as text');
+  t.end();
+});
 
 function makeConfigModule(tmpDir) {
   return proxyquire('../lib/config', {
@@ -92,6 +110,11 @@ async function startServer(port, handlers = {}) {
   const configMock = {
     readAppConfig: () => ({ ...configData }),
     writeAppConfig: (cfg) => { Object.assign(configData, cfg); },
+    updateAppConfig: async (mutator) => {
+      const updated = mutator({ ...configData });
+      Object.assign(configData, updated || {});
+      return { ...configData };
+    },
     atomicWriteFileSync: require('fs').writeFileSync,
     getConfigPath: () => path.join(os.tmpdir(), `orion-config-test-${port}.json`),
     '@global': true,
@@ -172,6 +195,54 @@ test('writeAppConfig: concurrent calls are serialized (no race corruption)', asy
 
   // API key must survive (protected field not wiped by partial writes)
   t.equal(result.geminiApiKey, 'key-seed', 'protected API key survives concurrent writes');
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+  t.end();
+});
+
+test('updateAppConfig: concurrent record mutations use the latest durable config', async (t) => {
+  const tmpDir = makeTmpDir();
+  const cfg = makeConfigModule(tmpDir);
+  await cfg.writeAppConfig({
+    phoneCompanionDevices: [{ id: 'device-a', lastSeenAt: 'old' }]
+  });
+
+  await Promise.all([
+    cfg.updateAppConfig(config => {
+      config.phoneCompanionDevices = [...config.phoneCompanionDevices, { id: 'device-b' }];
+      return config;
+    }),
+    cfg.updateAppConfig(config => {
+      config.phoneCompanionDevices = config.phoneCompanionDevices.map(device => (
+        device.id === 'device-a' ? { ...device, lastSeenAt: 'new' } : device
+      ));
+      return config;
+    }),
+    cfg.updateAppConfig(config => {
+      config.phoneCompanionDevices = [...config.phoneCompanionDevices, { id: 'device-c' }];
+      return config;
+    })
+  ]);
+
+  const result = cfg.readAppConfig();
+  t.same(result.phoneCompanionDevices.map(device => device.id).sort(), ['device-a', 'device-b', 'device-c'], 'serialized record updates do not discard devices');
+  t.equal(result.phoneCompanionDevices.find(device => device.id === 'device-a').lastSeenAt, 'new', 'an independent device update is retained');
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+  t.end();
+});
+
+test('writeAppConfig snapshots queued input before the caller can mutate it', async (t) => {
+  const tmpDir = makeTmpDir();
+  const cfg = makeConfigModule(tmpDir);
+  const input = { phoneCompanionDevices: [{ id: 'stable-device' }] };
+  const pending = cfg.writeAppConfig(input);
+  input.phoneCompanionDevices.length = 0;
+  await pending;
+
+  const result = cfg.readAppConfig();
+  t.equal(result.phoneCompanionDevices.length, 1, 'queued write is isolated from later object mutation');
+  t.equal(result.phoneCompanionDevices[0].id, 'stable-device', 'captured record remains intact');
+
   fs.rmSync(tmpDir, { recursive: true, force: true });
   t.end();
 });

@@ -1,55 +1,68 @@
-# OrionAI Code Review
+# Orion AI — Active Issue Review
 
-## CRITICAL
+> Last audited: 2026-07-27
+> Source reviewed: `feature/structural-optimizations` (PR #9), based on `codex/conversation-scoped-artifacts`.
 
-### 1. Config write race condition (`lib/config.js`)
-`writeAppConfig` writes to a hardcoded temp filename `config.tmp.json` then renames it. Two concurrent callers (SSE updating `lastSeenAt` on every request + another endpoint updating `selectedConversationId`) both write to the same temp file. Last rename wins, first write's data is silently lost. `atomicWriteFileSync()` already exists in the file and does this correctly — `writeAppConfig` just doesn't use it.
+This review describes the active development branch. It does not claim to describe `main` or an older branch snapshot.
 
-### 2. SSE drops on Android after ~60s (`lib/ipc-server.js`)
-The `/api/events` endpoint sends no keepalive pings. Android Chrome aggressively kills idle connections. When it drops, the 3-second polling fallback is suppressed because `lastSseMessageAt` was recently set. The phone shows stale state and doesn't recover. **This is very likely contributing to the "everything unresponsive" issue on your Pixel.** Fix: send `': ping\n\n'` every ~20 seconds inside the SSE handler.
+## Resolved in the stabilization pass
 
----
+| Area | Resolution |
+|---|---|
+| Context fallback crash | `buildSectionsForPath()` estimates the actual selected source when no symbol or lexical range matches. A no-match regression test covers the fallback. |
+| Database safety | `db_query` now uses a dedicated main-process executor. It accepts one allowlisted read-only statement, blocks mutation keywords and writable PRAGMAs, opens SQLite with `-readonly`, wraps Postgres/MySQL work in read-only transactions, and keeps passwords out of process arguments. |
+| Terminal session contract | `terminal_exec` now accurately promises persistent working-directory state only. It no longer claims that environment variables or activated shells survive a fresh process. |
+| Memory/file-knowledge write races | JSON stores use unique sibling temp files and per-file IPC write queues. File knowledge is persisted in the workspace-intelligence cache rather than a second independently hashed ledger. |
+| Workspace startup load | Factory-created index services defer reconciliation until the next event-loop turn or first real lookup, so service construction no longer performs an immediate recursive walk. |
+| Embedding throughput/cache growth | Workspace chunks and fact embeddings use bounded concurrency. Persisted workspace vectors are count-capped and the complete workspace-intelligence cache has an explicit total byte ceiling; records are retained deterministically within that budget. Stale fact vectors are removed during full ranking passes. |
+| Durable identity memory | Facts and preferences can be pinned so age filtering cannot remove stable identity/preferences from recall ranking. |
+| Prompt/token overhead | Dispatch receives only its executable tool schemas; the redundant per-turn tool contract is gone; recent chat, background memory extraction, classifier examples, and aged read-only tool payloads are bounded more tightly. |
+| Phone reliability | Completed responses are explicitly flushed, unchanged polling no longer rebuilds/scans the current screen, phone-server startup is awaited and reports bind failures, and the unused standalone typing-indicator DOM was removed in favor of the active inline indicator. |
+| Push notification documentation | The branch does contain service-worker registration, Push API subscription, VAPID setup, device subscription endpoints, `notifyPhoneDevice`, and `notifyAllPhoneDevices`. Previous “zero push infrastructure” language was incorrect. |
+| Generated personal artifacts | Unrelated Wi-Fi help and personal review files were removed from the application branch. |
+| Branch verification | A Windows GitHub Actions workflow now runs `npm ci` and `npm test` for PRs and pushes to the active development/default branches. |
 
-## MODERATE
+## Resolved in the orchestration-correctness pass
 
-### 3. Deny plan button: no error handling, no double-tap protection (`companion-html.js`)
-The async click handler has no try/catch and doesn't disable the button. Network failure = unhandled promise rejection. Double-tap = two requests. The approve button handles both correctly; deny doesn't.
+This pass corrects the connected orchestration failures exposed by the live GRITLIFE conversation. All items are structural (code-enforced contracts with regression tests), not prompt-only reminders.
 
-### 4. Orphan conversations on new chat failure (`companion-html.js`)
-`startNewPhoneChat` (now defined) creates the conversation first, then sends the prompt separately. If the prompt call fails, the conversation exists in Orion but the UI stays on the new-chat screen. That conversation becomes unreachable from the phone.
+| Area | Resolution |
+|---|---|
+| Evidence-backed memory claims | `orchestration-contracts.js` defines a typed response basis (conversation evidence / project knowledge / general inference). The agent loop records retrieved conversation evidence, rejects explicit and equivalent recall claims without that evidence, and requires an honest retrieval-gap/inference disclosure for recall answers that have no evidence. Failed inspection tools do not count as project knowledge. |
+| Conversation-memory retrieval | `lib/conversation-memory.js` searches persisted conversations and session memory before project summaries, expands queries with entities from the recent exchange, and applies recency weighting for phrases like "earlier"/"we talked about". Same-millisecond session memories persist distinctly and remain retrievable in deterministic order. |
+| Resolved task packets | `task-orchestration.js` converts context-dependent utterances ("Let's do it", "Continue") into self-contained task packets (title, resolved objective, conversation summary, workspace, requirements, provenance identifiers, lifecycle status) before queuing or handoff. Durable image attachments and context-packet IDs survive restart. Unresolvable references ("Use the second one" with no context) produce a targeted clarifying question before a Coder conversation is created. |
+| Live supervisor routing | `supervisor-orchestration.js` is the shared deterministic policy used by the renderer while Coder is active. Context-dependent approvals enter the durable packet path before steering, quoted reports remain conversational, direct executable instructions reach Coder once, and conversational recall/status replies pass through the same evidence and factual-status contracts as the main agent loop. |
+| Supervisor loop safety | The bounded loop supervisor recognizes only `continue` and `stuck`, maps deprecated/unsupported actions to safe recovery actions, and requires specific repeated-failure evidence before declaring a loop. Malformed or legacy responses receive at most one short wrap-up extension, preventing both silent mid-task finalization and unbounded extension loops. |
+| Dispatch ambiguity routing | Dispatch can use the structured clarification card before an ambiguous Coder handoff. Implementation verbs such as implement, wire, integrate, scaffold, and refactor enter executable routing when they are active instructions, while the same wording remains inert inside reports, transcripts, and test examples. |
+| Phone pairing rate limits | Pairing attempts and ordinary companion-page traffic use separate per-client rate-limit buckets, so loading the shell and assets cannot exhaust the five-attempt pairing allowance before the first pairing request. |
+| Task ownership and cancellation | `lib/orchestration-task-store.js` persists tasks atomically with unique IDs, execution-generation leases, and a strict lifecycle (pending/active/completed/cancelled/failed). Handoffs return the task ID; Dispatch can inspect and cancel tasks it launched, scoped by conversation provenance. Cancellation reuses the existing AbortController path, including cancellation while a task claim is starting. Queue drains requeue rather than lose a task during contention, continuations bind only to their exact task, stale executions cannot finalize resumed work, and UI receipts are emitted only after canonical persistence. Phone/Desktop New Focus preserves the current focus if pending-task cancellation fails. |
+| Handoff commit integrity | Durable task creation is the handoff commit boundary. If a later conversation flush, status render, or monitor setup fails, Orion retains and reports the one committed task ID instead of returning an ordinary failure that could trigger a duplicate handoff. Task-bound plan and clarification replies are persisted as continuations and consumed once by the matching execution lease. |
+| Quoted-example protection | `dispatch-intent.js` classifies executable intent only for active user instructions. Command-like text inside blockquotes, fenced/inline code, quoted strings, pasted transcripts, test descriptions, and status reports does not trigger a handoff, while the genuine direct request still produces exactly one `handoff_to_coder` call. |
+| Workspace resolution | `workspace-resolution.js` distinguishes active project workspace, generic Projects search root, standalone Coder workspace, and unresolved. Named projects resolve through registered projects, conversation context, and filesystem search; the search root is never described as the selected workspace, and resolved workspaces ride along in task packets. |
+| Factual status accuracy | Structured PR/task/test/process facts are carried through the response contract; a validator rejects wording that upgrades "mergeable" to "merged", "queued" to "running", "cancelled" to "completed", user-reported tests to independently verified tests, or a simulated restart to a real one, and restores the accurate structured state. |
+| Provider-safe Gemini tools | Gemini receives a provider-specific projection of the canonical tool declarations. Free-form object maps that rely on unsupported `additionalProperties` become documented JSON strings at the Gemini boundary and are decoded/validated before execution. This prevents the live `function_declarations[24]` HTTP 400 without weakening the canonical schemas used by Ollama/Anthropic/DeepSeek. |
+| Non-blocking workspace intelligence | Runtime workspace inspection, semantic search, symbol/reference lookups, context-packet hydration, and file-knowledge operations now run through one lazy worker-thread service instead of reconciling and parsing repositories on Electron's main/UI path. Existing direct service APIs remain available for tests and compatibility. |
+| Idempotent prompt submission | Phone and desktop submissions now have single-flight/idempotency protection. Starting a phone Coder conversation executes its initial prompt once instead of creating the conversation and posting the same prompt a second time. |
+| Lean Dispatch handoff | Direct executable requests are routed into one resolved Coder task packet before a full Dispatch model turn. Dispatch stops after the durable handoff receipt, so it does not independently solve the implementation and then ask Coder to repeat it. Quoted/transcript protections and ambiguity resolution still run before this route. |
+| Plan and completion relay | Coder implementation plans are persisted and relayed into the originating Dispatch conversation for approval or revision. On completion, Dispatch receives the durable task summary, changed files, and real verification evidence rather than a generic "Coder finished" notice. |
 
-### 5. Markdown double-escapes HTML entities in link labels (`companion-html.js`)
-`renderInlineMarkdown` runs `escapeHtml()` on the whole string first, then the link regex captures text that's already HTML-escaped. Any `&`, `<`, `>`, `"`, or `'` in a link label renders as `&amp;amp;` etc.
+## Verified phone push infrastructure
 
-### 6. Three `:root` CSS blocks — first two are dead (`companion-html.js`)
-There are three separate `:root { }` declarations in the stylesheet. The third overrides everything. The first block (where most CSS variables like `--accent`, `--bg`, etc. are defined) has zero effect at runtime. All three should be collapsed into one.
+The current branch includes:
 
-### 7. `callRendererFunction` throws on any falsy return (`lib/ipc-server.js`)
-`if (!result) throw new Error('Phone companion bridge is not ready yet')` — if any renderer function legitimately returns `false`, `0`, `null`, or `''`, the phone gets a 500 error. Should be `if (result === undefined)`.
+- `web-push` and VAPID initialization
+- phone device subscriptions and revocation
+- service-worker caching and notification handling
+- `notifyPhoneDevice` and `notifyAllPhoneDevices`
+- desktop/phone delivery reporting through IPC
 
----
+## Remaining structural debt
 
-## MINOR
+These are maintainability/performance follow-ups, not known correctness or data-safety blockers for PR #9:
 
-- **`machineName` never passed to `companionHtml()`** — the connection badge always says "Connected to Desktop" regardless of actual machine name (`lib/ipc-server.js:292`)
-- **`body { overflow: hidden }` breaks Android keyboard reflow** — known Chrome Android issue where the virtual keyboard opening doesn't shrink the layout, pushing the composer input off-screen (`companion-html.js:34`)
-- **`#typing-indicator` element is dead** — `applyState()` always removes the `visible` class; the actual typing indicator is rendered directly into `messagesEl.innerHTML`. The standalone element does nothing.
-- **`main.js.bak` (198KB) committed to repo** — should be deleted and added to `.gitignore`
-- **Service worker caches `/marked.min.js`** — if marked isn't installed, SW install fails permanently and offline mode is broken
-- **Tool log "open" expand/collapse is a dead placeholder** — every tool call renders `<span>open</span>` that was never wired up to anything
-- **Hidden compat DOM elements never used** — `#project-select`, `#new-task-dup`, `#queue-line`, etc. are in a `display:none` div and are never queried by any JS
-- **`startPhoneCompanionServer` not awaited** — returns the pairing payload before confirming the server has actually bound to the port
-- **`stateRequestSerial` guard can silently drop state loads** — when `minSerial` is provided, the counter isn't incremented, so concurrent loads using the real counter can make the `minSerial` stale and silently discard state updates
-- **Debug overlay in production** — the red TAP TEST button and `window.onerror` display (added this session for diagnostics) need to be removed once we confirm clicks work on your phone
+1. `agent.js`, `renderer.js`, and `lib/companion-html.js` remain large. Monolith decomposition was explicitly deferred for a later pass; provider adapters, planning/classification, Dispatch supervision, conversation persistence, and phone rendering remain the clearest extraction boundaries.
+2. The worker keeps the existing JSON index format and synchronous filesystem/parser implementation inside the worker. This protects UI responsiveness, but very large repositories may still benefit from incremental binary persistence and finer-grained cancellation inside a single indexing request.
 
----
+## Merge position
 
-## Priority Order
-
-1. **SSE keepalive** — almost certainly part of the Android unresponsiveness
-2. **Config write race** — silent data corruption
-3. **Three `:root` blocks** — easy cleanup with visual impact
-4. **`callRendererFunction` falsy check** — defensive fix
-5. **`machineName`** — tiny fix, obvious improvement
-6. **`body overflow: hidden`** — Android keyboard fix
-7. **Deny plan error handling** — parity with approve button
+The previously identified merge blockers have regression coverage. Merge readiness should be determined by the clean-install test run and the GitHub Actions result on PR #9.

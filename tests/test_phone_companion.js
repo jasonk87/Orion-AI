@@ -1,8 +1,12 @@
 const test = require('tape');
 const http = require('http');
 const vm = require('vm');
+const fs = require('fs');
+const path = require('path');
 const proxyquire = require('proxyquire').noPreserveCache();
 const companionHtml = require('../lib/companion-html');
+
+const rendererSource = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8').replace(/\r\n/g, '\n');
 
 function request(method, port, path, body, session) {
   return new Promise((resolve, reject) => {
@@ -65,7 +69,8 @@ function makeElectronMock(handlers = {}) {
       app: {
         whenReady: () => ({ then: (cb) => { cb(); } }),
         on: () => {},
-        setAppUserModelId: () => {}
+        setAppUserModelId: () => {},
+        getPath: () => require('os').tmpdir()
       },
       Notification: NotificationMock,
       BrowserWindow: class {
@@ -91,6 +96,7 @@ function makeElectronMock(handlers = {}) {
               };
               if (script.includes('switchPhoneCompanionConversation')) return { success: true, conversationId: 'conv2' };
               if (script.includes('startPhoneCompanionTask')) return { success: true, conversationId: 'new' };
+              if (script.includes('beginNewFocus')) return handlers.newFocus || { cancelled: ['task-pending'], count: 1 };
               if (script.includes('submitPhoneCompanionPrompt')) return { success: true, queued: false };
               if (script.includes('steerPhoneCompanionTask')) return { success: true, steered: true };
               if (script.includes('approvePhoneCompanionPlan')) return { success: true, queued: false };
@@ -137,6 +143,11 @@ async function startMainWithConfig(port, config, handlers) {
   const configMock = {
     readAppConfig: () => ({ ...configData }),
     writeAppConfig: (cfg) => { Object.assign(configData, cfg); },
+    updateAppConfig: async (mutator) => {
+      const updated = mutator({ ...configData });
+      Object.assign(configData, updated || {});
+      return { ...configData };
+    },
     atomicWriteFileSync: require('fs').writeFileSync,
     getConfigPath: () => require('path').join(require('os').tmpdir(), 'orion-config-test.json'),
     '@global': true,
@@ -159,16 +170,42 @@ async function startMainWithConfig(port, config, handlers) {
   const osMock = {
     networkInterfaces: () => ({
       WiFi: [{ family: 'IPv4', internal: false, address: '192.168.50.25' }],
+      ...(handlers && handlers.tailscaleAddress
+        ? { Tailscale: [{ family: 'IPv4', internal: false, address: handlers.tailscaleAddress }] }
+        : {}),
       Loopback: [{ family: 'IPv4', internal: true, address: '127.0.0.1' }]
     }),
     homedir: require('os').homedir,
     tmpdir: require('os').tmpdir,
     '@global': true
   };
+  const httpsMock = {
+    get: (url, options, callback) => {
+      const EventEmitter = require('events');
+      const request = new EventEmitter();
+      request.destroy = (error) => {
+        if (error) process.nextTick(() => request.emit('error', error));
+      };
+      process.nextTick(() => {
+        const response = new EventEmitter();
+        response.statusCode = handlers && handlers.secureOriginReachable === false ? 503 : 200;
+        response.setEncoding = () => {};
+        callback(response);
+        if (response.statusCode === 200) {
+          response.emit('data', JSON.stringify({ success: true, service: 'orion-phone-companion' }));
+        }
+        response.emit('end');
+      });
+      return request;
+    },
+    '@global': true,
+    '@noCallThru': true
+  };
   const main = proxyquire('../main.js', {
     electron: electron.mock,
     './lib/config': configMock,
     'web-push': webPushMock,
+    https: httpsMock,
     os: osMock
   });
   main.resetCompanionServer();
@@ -213,7 +250,7 @@ function requestFirstSseFrame(port, path, session) {
 }
 
 test('Phone Companion generated inline script is valid JavaScript', (t) => {
-  const html = companionHtml('pair-code-123456', 'DESKTOP-TEST');
+  const html = companionHtml('DESKTOP-TEST');
   const inlineScripts = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)];
   t.ok(inlineScripts.length > 0, 'phone shell includes inline boot script');
   inlineScripts.forEach((match, index) => {
@@ -231,9 +268,20 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
   const root = await request('GET', 1131, '/');
   t.equal(root.statusCode, 200, 'root shell is available without token-in-URL auth');
   t.notOk(root.text.includes('phoneCompanionToken'), 'root shell does not expose legacy token');
+  t.notOk(root.text.includes('pair-code-123456'), 'clean phone shell does not embed the current setup code');
   t.ok(root.text.includes('<title>Orion</title>'), 'root shell serves the Orion mobile UI');
-  t.ok(root.text.includes('Recents'), 'root shell includes Codex-style recents');
-  t.ok(root.text.includes('Projects'), 'root shell includes project selection');
+  t.notOk(root.text.includes('data-drawer-destination="history"'), 'root shell does not expose History as a top-level mode');
+  t.ok(root.text.includes('function enterDispatch'), 'root shell enters Dispatch through the chat-first route');
+  t.ok(root.text.includes("companionFetch('/api/new-focus'"), 'phone New Focus asks the desktop to cancel pending owned work');
+  t.ok(root.text.includes('permanentCredentialFailureCodes'), 'phone distinguishes durable auth revocation from transient transport failures');
+  t.ok(root.text.includes('confirmedCredentialFailures < 2'), 'phone confirms a permanent credential failure before erasing saved access');
+  t.ok(root.text.includes('Connection interrupted. Retrying saved phone access...'), 'generic auth interruptions retain the durable device credential');
+  t.ok(root.text.includes('This browser has no saved Orion phone access.'), 'clean URLs do not silently reuse a short-lived setup code');
+  t.ok(root.text.includes('await cancelPendingTasksForNewFocus();'), 'phone waits for cancellation before opening a fresh Dispatch draft');
+  t.ok(root.text.includes('id="dispatch-browser-overlay"'), 'root shell keeps saved discussions in an in-Dispatch browser');
+  t.notOk(root.text.includes('<span>Pick up a project</span>'), 'root shell keeps project rows off the Dispatch landing');
+  t.ok(root.text.includes('Your Dispatch history, newest first.'), 'root shell presents a flat Dispatch discussion browser');
+  t.ok(root.text.includes('No task is too large. What are we taking on?'), 'root shell uses the focused Dispatch motto');
   t.ok(root.text.includes('Task List'), 'root shell includes mobile task list status');
   t.ok(root.text.includes('renderPhoneTaskList'), 'mobile shell renders the conversation checklist from state');
   t.ok(root.text.includes('data-drawer-destination="settings"'), 'root shell exposes app-level Settings through the drawer');
@@ -246,6 +294,10 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
   const marked = await request('GET', 1131, '/marked.min.js');
   t.equal(marked.statusCode, 200, 'Markdown parser asset is available before phone auth');
   t.ok(/marked/i.test(marked.text), 'Markdown parser asset returns JavaScript content');
+
+  const taskPresentation = await request('GET', 1131, '/task-orchestration.js');
+  t.equal(taskPresentation.statusCode, 200, 'shared durable-task presentation contract is available before phone auth');
+  t.ok(taskPresentation.text.includes('selectSupervisedTask'), 'shared task asset includes canonical task selection');
 
   const state = await request('GET', 1131, '/api/state');
   t.equal(state.statusCode, 401, 'state API rejects unpaired phones');
@@ -303,6 +355,45 @@ test('Phone Companion pairing prefers configured HTTPS origin for mobile notific
   await closeServer(main.getCompanionServer());
 });
 
+test('Phone Companion does not advertise an unreachable configured HTTPS origin as the stable app URL', async (t) => {
+  const { main } = await startMainWithConfig(1151, {
+    phoneCompanionHttpsOrigin: 'https://desktop-owner.example.test'
+  }, {
+    secureOriginReachable: false
+  });
+
+  const payload = await main.getPhoneCompanionPairingForTest();
+  t.equal(payload.preferredUrlType, 'local', 'an unreachable HTTPS route is not selected');
+  t.equal(payload.secureOriginReachable, false, 'payload reports the failed secure-route check');
+  t.ok(payload.pairUrl.startsWith('http://192.168.50.25:1151/?pair='), 'pairing falls back to the reachable direct server');
+  t.equal(payload.phoneNotificationsAvailable, false, 'unreachable HTTPS is not presented as notification capable');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion uses stable Tailscale MagicDNS instead of an origin-changing device IP', async (t) => {
+  const { main } = await startMainWithConfig(1154, {
+    phoneCompanionHttpsOrigin: 'https://desktop-owner.tailnet-name.ts.net'
+  }, {
+    secureOriginReachable: false,
+    tailscaleAddress: '100.122.183.97'
+  });
+
+  const payload = await main.getPhoneCompanionPairingForTest();
+  t.equal(
+    payload.tailscaleStableUrl,
+    'http://desktop-owner.tailnet-name.ts.net:1154/',
+    'stable direct URL uses MagicDNS and the companion port'
+  );
+  t.ok(
+    payload.tailscalePairUrl.startsWith('http://desktop-owner.tailnet-name.ts.net:1154/?pair='),
+    'Tailscale pairing establishes storage on the same stable origin used by the shortcut'
+  );
+  t.notOk(payload.tailscaleStableUrl.includes('100.122.183.97'), 'the permanent shortcut is not bound to a rotatable Tailscale IP');
+
+  await closeServer(main.getCompanionServer());
+});
+
 test('Phone Companion button enables LAN server before returning QR pairing URL', async (t) => {
   const { main, fsMock } = await startMainWithConfig(1137, { enablePhoneCompanion: false });
   t.equal(main.getCompanionServer().address().address, '127.0.0.1', 'server starts localhost-only by default');
@@ -341,6 +432,88 @@ test('Phone Companion v2 pairing creates reusable sessions and revoked sessions 
 
   const revoked = await request('GET', 1132, '/api/state', null, session);
   t.equal(revoked.statusCode, 401, 'revoked session cannot access state');
+  t.equal(revoked.json.code, 'COMPANION_DEVICE_REVOKED', 'revocation has a machine-readable permanent failure code');
+  t.equal(revoked.json.rePairRequired, true, 'revocation explicitly authorizes clearing the saved credential');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion durable session remains valid after the short-lived pairing link expires', async (t) => {
+  const pairedAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const device = {
+    id: 'durable-phone',
+    name: 'Pixel',
+    secret: 'durable-secret',
+    approved: true,
+    revoked: false,
+    pairedAt,
+    lastSeenAt: pairedAt,
+    userAgent: 'test-phone'
+  };
+  const { main } = await startMainWithConfig(1152, {
+    phoneCompanionPairingExpiresAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+    phoneCompanionDevices: [device]
+  });
+
+  const state = await request('GET', 1152, '/api/state', null, {
+    deviceId: device.id,
+    secret: device.secret
+  });
+  t.equal(state.statusCode, 200, 'device credential is independent of pairing-link expiry');
+  t.equal(state.json.success, true, 'expired setup link does not expire the paired phone');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion rejects an expired setup code while preserving durable device sessions', async (t) => {
+  const { main } = await startMainWithConfig(1155, {
+    phoneCompanionPairingCode: 'expired-pair-code',
+    phoneCompanionPairingExpiresAt: new Date(Date.now() - 60 * 1000).toISOString()
+  });
+
+  const expiredPair = await request('POST', 1155, '/api/pair', {
+    pairingCode: 'expired-pair-code',
+    deviceName: 'New phone'
+  });
+  t.equal(expiredPair.statusCode, 401, 'expired setup code cannot create another device session');
+  t.equal(expiredPair.json.error, 'Invalid pairing code', 'expired setup link receives a clear rejection');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion auth failures distinguish transient missing headers from invalid durable credentials', async (t) => {
+  const { main } = await startMainWithConfig(1153);
+
+  const missing = await request('GET', 1153, '/api/state');
+  t.equal(missing.statusCode, 401, 'missing auth is rejected');
+  t.equal(missing.json.code, 'COMPANION_CREDENTIAL_MISSING', 'missing headers have an explicit code');
+  t.equal(missing.json.rePairRequired, false, 'generic missing auth does not tell a client to erase durable access');
+
+  const unknown = await request('GET', 1153, '/api/state', null, {
+    deviceId: 'unknown-device',
+    secret: 'unknown-secret'
+  });
+  t.equal(unknown.statusCode, 401, 'unknown device is rejected');
+  t.equal(unknown.json.code, 'COMPANION_DEVICE_UNKNOWN', 'unknown device has a permanent failure code');
+  t.equal(unknown.json.rePairRequired, true, 'unknown durable credential eventually requires a new pairing');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion page traffic does not consume the pairing-attempt budget', async (t) => {
+  const { main } = await startMainWithConfig(1150);
+
+  for (let index = 0; index < 8; index += 1) {
+    const asset = await request('GET', 1150, index % 2 === 0 ? '/icon.svg' : '/manifest.webmanifest');
+    t.equal(asset.statusCode, 200, `ordinary page request ${index + 1} succeeds`);
+  }
+
+  const pair = await request('POST', 1150, '/api/pair', {
+    pairingCode: 'pair-code-123456',
+    deviceName: 'Phone'
+  });
+  t.equal(pair.statusCode, 200, 'the first real pairing attempt retains its separate rate-limit budget');
+  t.ok(pair.json.sessionSecret, 'successful pairing still creates a reusable session');
 
   await closeServer(main.getCompanionServer());
 });
@@ -357,15 +530,29 @@ test('Phone Companion v2 auto-pairs valid LAN pairing links by default', async (
 });
 
 test('Phone Companion v2 task controls and preview endpoints reach desktop bridge', async (t) => {
-  const { main, electron } = await startMainWithConfig(1133);
+  const { main, electron, fsMock } = await startMainWithConfig(1133);
   const pair = await request('POST', 1133, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
   const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
 
   const switchRes = await request('POST', 1133, '/api/conversations/switch', { conversationId: 'conv2' }, session);
   t.equal(switchRes.statusCode, 200, 'task switching endpoint succeeds');
+  t.ok(switchRes.json.selectionRevision > 0, 'an explicit switch advances the durable device selection revision');
+  t.equal(
+    fsMock._config().phoneCompanionDevices[0].selectedConversationId,
+    'conv2',
+    'the phone selection is persisted independently of desktop activity'
+  );
 
   const newTask = await request('POST', 1133, '/api/conversations/new', { prompt: 'new task', projectPath: 'C:\\Projects\\OrionTarget' }, session);
   t.equal(newTask.statusCode, 200, 'new task endpoint succeeds');
+
+  const dispatchStart = await request('POST', 1133, '/api/conversations/new', {
+    prompt: 'continue the architecture discussion',
+    mode: 'orion',
+    dispatchProjectPath: 'C:\\Projects\\Chronicle',
+    contextSummary: 'Last discussed expedition progression.'
+  }, session);
+  t.equal(dispatchStart.statusCode, 200, 'first Dispatch message creates its conversation through one request');
 
   const prompt = await request('POST', 1133, '/api/prompt', { prompt: 'hello', projectPath: 'C:\\Projects\\OrionTarget' }, session);
   t.equal(prompt.statusCode, 200, 'prompt submission succeeds');
@@ -379,6 +566,16 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
   t.equal(approve.statusCode, 200, 'plan approval succeeds');
   t.equal(deny.statusCode, 200, 'plan denial succeeds');
   t.equal(revise.statusCode, 200, 'plan revision succeeds');
+  const approvalCallsBeforeStaleAction = electron.calls.filter(call => call.includes('approvePhoneCompanionPlan')).length;
+  const staleApprove = await request('POST', 1133, '/api/approve-plan', {
+    conversationId: 'a-different-conversation'
+  }, session);
+  t.equal(staleApprove.statusCode, 409, 'a plan control from a stale or unrelated view is rejected');
+  t.equal(
+    electron.calls.filter(call => call.includes('approvePhoneCompanionPlan')).length,
+    approvalCallsBeforeStaleAction,
+    'a stale approval never reaches the desktop conversation'
+  );
 
   const stop = await request('POST', 1133, '/api/stop', {}, session);
   const resume = await request('POST', 1133, '/api/resume', {}, session);
@@ -391,9 +588,55 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
 
   t.ok(!electron.calls.some(call => call.includes('switchPhoneCompanionConversation')), 'desktop bridge no longer switches global active conversation task');
   t.ok(electron.calls.some(call => call.includes('C:\\\\Projects\\\\OrionTarget')), 'new task endpoint forwards selected project path');
+  t.ok(electron.calls.some(call => call.includes('C:\\\\Projects\\\\Chronicle') && call.includes('Last discussed expedition progression.')), 'Dispatch creation forwards project association and compact re-entry context');
   t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt') && call.includes('C:\\\\Projects\\\\OrionTarget')), 'prompt endpoint forwards selected project path');
   t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt')), 'desktop bridge submitted prompt');
   t.ok(electron.calls.some(call => call.includes('approvePhoneCompanionPlan')), 'desktop bridge approved plan');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion New Focus cancels only pending tasks owned by the selected conversation', async (t) => {
+  const { main, electron } = await startMainWithConfig(1148, {}, {
+    newFocus: { cancelled: ['task-old-focus'], count: 1 }
+  });
+  const pair = await request('POST', 1148, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
+  const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+
+  await request('POST', 1148, '/api/conversations/switch', { conversationId: 'dispatch-owned' }, session);
+  const result = await request('POST', 1148, '/api/new-focus', { conversationId: 'unrelated-conversation' }, session);
+
+  t.equal(result.statusCode, 200, 'new-focus endpoint succeeds');
+  t.same(result.json.cancelled, ['task-old-focus'], 'returns the renderer cancellation result');
+  t.equal(result.json.count, 1, 'reports the number of cancelled pending tasks');
+  const bridgeCall = electron.calls.find(call => call.includes('beginNewFocus'));
+  t.ok(bridgeCall, 'new-focus endpoint invokes the renderer cancellation primitive');
+  t.ok(bridgeCall.includes('dispatch-owned'), 'cancellation is scoped to the phone selected conversation');
+  t.notOk(bridgeCall.includes('unrelated-conversation'), 'caller cannot cancel another conversation by supplying an id');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion New Focus reports cancellation failure and preserves the selected focus', async (t) => {
+  const { main, electron } = await startMainWithConfig(1149, {}, {
+    newFocus: {
+      success: false,
+      cancelled: [],
+      failures: [{ taskId: 'task-still-pending', error: 'store unavailable' }],
+      count: 0
+    }
+  });
+  const pair = await request('POST', 1149, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
+  const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+
+  await request('POST', 1149, '/api/conversations/switch', { conversationId: 'dispatch-owned' }, session);
+  const result = await request('POST', 1149, '/api/new-focus', {}, session);
+
+  t.equal(result.statusCode, 200, 'the bridge returns the structured renderer result');
+  t.equal(result.json.success, false, 'the phone is told not to open a fresh focus');
+  t.equal(result.json.failures[0].taskId, 'task-still-pending', 'the failed pending task remains identifiable');
+  const bridgeCall = electron.calls.find(call => call.includes('beginNewFocus'));
+  t.ok(bridgeCall && bridgeCall.includes('dispatch-owned'), 'the failed attempt remains scoped to the selected conversation');
 
   await closeServer(main.getCompanionServer());
 });
@@ -663,3 +906,75 @@ test('Phone Companion v2 pairing pending and denied states', async (t) => {
   await closeServer(mainDenied.getCompanionServer());
 });
 
+test('phone Dispatch cancellation and supervisor failures preserve truthful outcomes', (t) => {
+  const submitStart = rendererSource.indexOf('async function submitPhoneCompanionPromptOnce');
+  const submitEnd = rendererSource.indexOf('\nwindow.steerPhoneCompanionTask', submitStart);
+  const submitPath = rendererSource.slice(submitStart, submitEnd);
+  const classifyIndex = submitPath.indexOf('const semanticIntent = await classifyCurrentConversationIntent');
+  const cancelIndex = submitPath.indexOf('await cancelOwnedTaskRequestedInPrompt(');
+  const clarificationIndex = submitPath.indexOf('if (conv.awaitingClarification && pendingReplyTaskId)');
+  const busyIndex = submitPath.indexOf('if (isGlobalRunning)');
+
+  t.ok(
+    classifyIndex >= 0
+      && cancelIndex > classifyIndex
+      && submitPath.slice(cancelIndex, cancelIndex + 220).includes('semanticIntent'),
+    'phone prompt uses the shared structured classification for owned-task cancellation'
+  );
+  t.ok(
+    cancelIndex < clarificationIndex && cancelIndex < busyIndex,
+    'phone cancellation runs before continuation or global busy routing'
+  );
+  t.ok(
+    submitPath.includes('if (supervisorResult && supervisorResult.success === false)'),
+    'phone does not turn a structured supervisor failure into success'
+  );
+  t.ok(
+    submitPath.includes('activeRunTaskId === launchedTaskId')
+      || rendererSource.includes('activeRunTaskId === launchedTaskId'),
+    'phone supervision is gated by the exact active task identity'
+  );
+  t.ok(
+    submitPath.includes("RendererSemanticIntentRouter.canRespondDuringActiveRun(semanticIntent, 'orion')")
+      && submitPath.includes('await respondOrionConversationally('),
+    'a conversational phone turn uses the lightweight Dispatch response while another run is active'
+  );
+  t.ok(
+    submitPath.includes('queued: false')
+      && submitPath.indexOf('await respondOrionConversationally(') < submitPath.indexOf('const queued = pendingReplyTaskId'),
+    'the conversational branch returns before durable task creation'
+  );
+  t.end();
+});
+
+test('new phone Coder conversations submit their initial prompt exactly once', t => {
+  const html = companionHtml();
+  const start = html.indexOf('async function startNewPhoneChat');
+  const end = html.indexOf('// New Chat: send', start);
+  const flow = html.slice(start, end);
+  t.ok(flow.includes("companionFetch('/api/conversations/new'"), 'new chat sends through the create endpoint');
+  t.equal((flow.match(/companionFetch\('\/api\/prompt'/g) || []).length, 0,
+    'new Coder flow does not post the same prompt again');
+  t.ok(flow.includes('requestId:'), 'new chat supplies an idempotency key');
+  t.end();
+});
+
+test('phone Dispatch status derives queued, active, and review presentation from the durable task', t => {
+  const html = companionHtml();
+  const stateRenderStart = html.indexOf('const supervisedTask = activeConversationMode');
+  const stateRenderEnd = html.indexOf('// Needs-attention cards', stateRenderStart);
+  const stateRender = html.slice(stateRenderStart, stateRenderEnd);
+  t.ok(stateRender.includes('selectSupervisedTask('), 'phone selects the supervised task from orchestrationTasks');
+  t.ok(stateRender.includes('{ delegatedOnly: true }'), 'phone presents only cross-conversation Coder tasks as supervised work');
+  t.ok(stateRender.includes('state.activeTaskId'), 'phone preserves taskId as the presentation identity');
+  t.ok(stateRender.includes('describeSupervisedTaskPresentation'), 'phone uses the shared lifecycle presentation contract');
+  t.ok(stateRender.includes('supervisedPresentation.agentState'), 'header state follows the durable task presentation');
+  t.ok(stateRender.includes('supervisedPresentation.label'), 'current task card follows the durable task presentation');
+  t.ok(stateRender.includes('supervisedTask.targetConversationId'), 'Coder navigation is enriched from the durable task target');
+  t.notOk(stateRender.includes('coderTaskStillOwned'), 'background Coder visibility no longer requires a fragile launched-conversation pointer');
+  t.ok(
+    stateRender.includes('supervisedPresentation.isOngoing'),
+    'queued and active tasks remain visible even when globalRunning briefly becomes false'
+  );
+  t.end();
+});

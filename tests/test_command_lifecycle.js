@@ -24,6 +24,71 @@ const main = proxyquire('../main.js', {
 
 global.mainWindow = { webContents: { send: () => {} } };
 
+// These tests deliberately launch detached, long-running processes to verify Orion's lifecycle
+// controls. Windows can keep a killed child/conhost handle alive briefly on slower CI runners,
+// even after every Tape assertion has finished. Clean up synchronously so the test file cannot
+// linger until the outer runner's timeout and so CI never inherits an orphaned preview process.
+function cleanupSpawnedTestProcesses() {
+  const pids = new Set();
+  for (const child of Object.values(main.activeProcesses || {})) {
+    if (child && child.pid) pids.add(child.pid);
+    if (child && child.stdout && !child.stdout.destroyed) child.stdout.destroy();
+    if (child && child.stderr && !child.stderr.destroyed) child.stderr.destroy();
+    if (child && typeof child.unref === 'function') child.unref();
+  }
+  for (const pid of (main.launchedWorkspaceProcesses || new Map()).values()) {
+    if (pid) pids.add(pid);
+  }
+
+  for (const pid of pids) {
+    try {
+      if (process.platform === 'win32') {
+        require('child_process').spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore'
+        });
+      } else {
+        try { process.kill(-pid, 'SIGKILL'); } catch (_) { process.kill(pid, 'SIGKILL'); }
+      }
+    } catch (_) {}
+  }
+
+  for (const id of Object.keys(main.activeProcesses || {})) delete main.activeProcesses[id];
+  if (main.launchedWorkspaceProcesses) main.launchedWorkspaceProcesses.clear();
+
+  // A detached Windows child can be fully terminated while its libuv pipe/conhost handle remains
+  // referenced. At this point every test has completed, so release any remaining non-stdio test
+  // handles instead of letting the outer per-file runner mistake teardown latency for a timeout.
+  const standardHandles = new Set([process.stdin, process.stdout, process.stderr]);
+  for (const handle of process._getActiveHandles()) {
+    if (!standardHandles.has(handle) && handle && typeof handle.unref === 'function') handle.unref();
+  }
+}
+
+test('conversation persistence trims oversized generated tool payloads without mutating live history', (t) => {
+  const hugeLog = 'x'.repeat(300000);
+  const hugeResponse = { content: 'y'.repeat(300000) };
+  const conversation = {
+    id: 'large-tool-history',
+    messages: [{
+      role: 'assistant',
+      text: 'Still useful.',
+      logs: [{ tool: 'read_file', result: hugeLog }, { tool: 'grep_search', result: 'small' }],
+      turns: [{ toolResponseParts: [{ functionResponse: { name: 'read_file', response: hugeResponse } }] }]
+    }]
+  };
+  const sanitized = main.sanitizeConversationForPersistence(conversation);
+
+  t.equal(sanitized.changed, true, 'oversized generated payloads trigger persistence cleanup');
+  t.equal(sanitized.trimmedPayloads, 2, 'both visible-log and model-turn copies are trimmed');
+  t.ok(sanitized.conversation.messages[0].logs[0].result.length < 1000, 'persisted log stores a compact receipt');
+  t.equal(sanitized.conversation.messages[0].logs[1].result, 'small', 'small tool output remains intact');
+  t.equal(sanitized.conversation.messages[0].turns[0].toolResponseParts[0].functionResponse.response.persistedPayloadTrimmed, true, 'persisted model turn stores the same cleanup receipt');
+  t.equal(conversation.messages[0].logs[0].result.length, hugeLog.length, 'live in-memory history remains untouched');
+  t.equal(conversation.messages[0].turns[0].toolResponseParts[0].functionResponse.response.content.length, hugeResponse.content.length, 'live tool response remains available during the active run');
+  t.end();
+});
+
 test('startCommandSession runs and killProcessTree kills', (t) => {
   const isWin = process.platform === 'win32';
   const cmd = isWin ? 'ping 127.0.0.1 -n 10' : 'sleep 10';
@@ -82,6 +147,8 @@ test('Windows command shell selection does not require PowerShell for plain comm
   const powershell = main.getCommandShellSpec('Get-CimInstance Win32_ComputerSystem | Select-Object -ExpandProperty TotalPhysicalMemory');
   t.ok(powershell.executable.toLowerCase().endsWith('powershell.exe'), 'PowerShell-specific commands still use PowerShell');
   t.ok(powershell.args.includes('-NoProfile'), 'PowerShell shell remains non-profiled');
+  t.ok(powershell.args.includes('-EncodedCommand'), 'PowerShell receives the command base64-encoded so -Command argv parsing cannot strip quotes');
+  t.equal(powershell.encodeCommandUtf16Base64, true, 'shell spec flags the UTF-16LE base64 encoding for the spawner');
 
   t.equal(main.commandLooksPowerShellSpecific('systeminfo'), false, 'systeminfo is not treated as PowerShell-specific');
   t.equal(main.commandLooksPowerShellSpecific('Get-ChildItem | Select-Object Name'), true, 'PowerShell pipelines are detected');
@@ -113,6 +180,34 @@ test('commands with a real unquoted semicolon route to PowerShell instead of sil
   const pythonDashC = main.getCommandShellSpec(`python -c "from x import y; print(y('literal'))"`);
   t.ok(pythonDashC.executable.toLowerCase().endsWith('cmd.exe'), 'a quoted semicolon inside python -c still stays on cmd.exe, unaffected by this change');
   t.end();
+});
+
+// Regression: PowerShell's -Command mode re-splits the raw command line and strips double quotes,
+// so `Get-Content -Path "C:\path with spaces\file"` arrived as unquoted words and failed with
+// "A positional parameter cannot be found that accepts argument ...". With -EncodedCommand the
+// quoted string must survive intact: under the old behavior this command printed three separate
+// lines ("hello", "spaced", "world") instead of one.
+test('PowerShell commands preserve double-quoted arguments containing spaces end-to-end', (t) => {
+  if (process.platform !== 'win32') {
+    t.pass('Windows-only PowerShell quoting test skipped on non-Windows');
+    t.end();
+    return;
+  }
+
+  const session = main.startCommandSession({
+    command: 'Write-Output "hello spaced world"',
+    cwd: __dirname,
+    processId: 'test_ps_quoting',
+    timeoutMs: 30000
+  });
+
+  const poll = setInterval(() => {
+    if (session.status === 'running') return;
+    clearInterval(poll);
+    t.equal(session.exitCode, 0, 'quoted PowerShell command exits cleanly');
+    t.ok(session.stdout.includes('hello spaced world'), 'the quoted string with spaces survived as a single argument');
+    t.end();
+  }, 200);
 });
 
 // Regression: a real auth page had a tab button labeled "Register" (outside any <form>, just
@@ -247,16 +342,97 @@ test('packaged updater resolves the real source root from packaged resources', (
 });
 
 test('packaged updater tracks all runtime modules required by main process', (t) => {
-  const requiredRuntimeFiles = [
-    'lib/ipc-ui.js',
-    'lib/ipc-skill.js',
-    'lib/ipc-memory.js',
-    'lib/memory-manager.js',
-    'lib/skill-loader.js'
-  ];
+  const fs = require('fs');
+  const path = require('path');
+  const parser = require('@babel/parser');
+  const repoRoot = path.resolve(__dirname, '..');
+  const pending = ['main.js'];
+  const requiredRuntimeFiles = new Set();
+
+  function visit(node, relativeRequires) {
+    if (!node || typeof node !== 'object') return;
+    if (
+      node.type === 'CallExpression'
+      && node.callee?.type === 'Identifier'
+      && node.callee.name === 'require'
+      && node.arguments?.length === 1
+      && node.arguments[0].type === 'StringLiteral'
+      && node.arguments[0].value.startsWith('.')
+    ) {
+      relativeRequires.push(node.arguments[0].value);
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach(child => visit(child, relativeRequires));
+      else if (value && typeof value === 'object') visit(value, relativeRequires);
+    }
+  }
+
+  while (pending.length) {
+    const relativeFile = pending.pop();
+    if (requiredRuntimeFiles.has(relativeFile)) continue;
+    requiredRuntimeFiles.add(relativeFile);
+
+    const absoluteFile = path.join(repoRoot, relativeFile);
+    const source = fs.readFileSync(absoluteFile, 'utf8');
+    const ast = parser.parse(source, { sourceType: 'unambiguous' });
+    const relativeRequires = [];
+    visit(ast, relativeRequires);
+
+    for (const specifier of relativeRequires) {
+      const unresolved = path.resolve(path.dirname(absoluteFile), specifier);
+      const candidates = [unresolved, `${unresolved}.js`, path.join(unresolved, 'index.js')];
+      const dependency = candidates.find(candidate => fs.existsSync(candidate) && fs.statSync(candidate).isFile());
+      if (!dependency || !dependency.startsWith(`${repoRoot}${path.sep}`)) continue;
+      const relativeDependency = path.relative(repoRoot, dependency).replace(/\\/g, '/');
+      if (!requiredRuntimeFiles.has(relativeDependency)) pending.push(relativeDependency);
+    }
+  }
 
   for (const file of requiredRuntimeFiles) {
     t.ok(main.AUTO_UPDATE_FILES.includes(file), `auto-update includes ${file}`);
+  }
+  t.end();
+});
+
+// Regression: the auto-updater compared files using only the manifest baked into the RUNNING
+// build. When an update introduced a brand-new lib module, the old manifest didn't list it — the
+// updated files that require() it were copied without the module itself, and the packaged app
+// crashed on the next launch with "Cannot find module './scan-ignore'". The file list is now
+// derived from the SOURCE tree at update time, so new lib modules ride along.
+test('source updater picks up brand-new lib modules missing from the running build manifest', (t) => {
+  const os = require('os');
+  const fsx = require('fs');
+  const pathx = require('path');
+  const ipcUi = proxyquire('../lib/ipc-ui', {
+    electron: { app: { getPath: () => os.tmpdir() }, BrowserWindow: class {} }
+  });
+  const src = fsx.mkdtempSync(pathx.join(os.tmpdir(), 'orion-update-src-'));
+  const dest = fsx.mkdtempSync(pathx.join(os.tmpdir(), 'orion-update-dest-'));
+  try {
+    fsx.mkdirSync(pathx.join(src, 'lib'), { recursive: true });
+    fsx.writeFileSync(pathx.join(src, 'lib', 'brand-new-module.js'), 'module.exports = 1;');
+    fsx.writeFileSync(pathx.join(src, 'agent.js'), 'updated agent');
+    // Root-level modules missed by the lib-only scan crashed the packaged app with
+    // "Cannot find module '../task-orchestration'" — cover them explicitly.
+    fsx.writeFileSync(pathx.join(src, 'brand-new-root-module.js'), 'module.exports = 2;');
+    fsx.writeFileSync(pathx.join(src, 'test-runner.js'), 'tooling, never shipped');
+
+    const list = ipcUi.resolveUpdateFileList(src);
+    t.ok(list.includes('lib/brand-new-module.js'), 'source-derived file list contains the new module');
+    t.ok(list.includes('agent.js'), 'static manifest entries are preserved in the union');
+    t.ok(list.includes('brand-new-root-module.js'), 'source-derived file list contains new root-level runtime modules');
+    t.notOk(list.includes('test-runner.js'), 'build/test tooling stays out of the update file list');
+
+    const changed = ipcUi.computeSourceUpdates(src, dest);
+    t.ok(changed.includes('lib/brand-new-module.js'), 'the new module is detected as needing sync');
+    t.ok(changed.includes('brand-new-root-module.js'), 'the new root module is detected as needing sync');
+
+    ipcUi.syncSourceUpdateFiles(src, dest, changed);
+    t.ok(fsx.existsSync(pathx.join(dest, 'lib', 'brand-new-module.js')), 'the new module lands in the packaged app');
+    t.ok(fsx.existsSync(pathx.join(dest, 'brand-new-root-module.js')), 'the new root module lands in the packaged app');
+  } finally {
+    fsx.rmSync(src, { recursive: true, force: true });
+    fsx.rmSync(dest, { recursive: true, force: true });
   }
   t.end();
 });
@@ -547,5 +723,12 @@ test('regression test command is scoped per workspace, not a single global value
     'workspace key normalization is case-insensitive, same as the entry point store'
   );
 
+  t.end();
+});
+
+test('command lifecycle suite leaves no spawned processes behind', (t) => {
+  cleanupSpawnedTestProcesses();
+  t.equal(Object.keys(main.activeProcesses || {}).length, 0, 'all command-session processes are cleared');
+  t.equal((main.launchedWorkspaceProcesses || new Map()).size, 0, 'all detached workspace processes are cleared');
   t.end();
 });

@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "phone-companion",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [".claude/companion-proxy.js"],
+      "autoPort": true,
+      "port": 45700
+    }
+  ]
+}

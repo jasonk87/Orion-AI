@@ -6,13 +6,29 @@
     "group": "utility",
     "version": "1.0.0",
     "inputs": {
-      "text": { "type": "string", "description": "The text to analyse", "required": true }
+      "text": {
+        "type": "string",
+        "description": "The text to analyse",
+        "required": true
+      }
     },
     "outputs": {
-      "wordCount": { "type": "number", "description": "Number of words" },
-      "sentenceCount": { "type": "number", "description": "Number of sentences" },
-      "charCount": { "type": "number", "description": "Total character count including spaces" },
-      "charCountNoSpaces": { "type": "number", "description": "Character count excluding spaces" }
+      "wordCount": {
+        "type": "number",
+        "description": "Number of words"
+      },
+      "sentenceCount": {
+        "type": "number",
+        "description": "Number of sentences"
+      },
+      "charCount": {
+        "type": "number",
+        "description": "Total character count including spaces"
+      },
+      "charCountNoSpaces": {
+        "type": "number",
+        "description": "Character count excluding spaces"
+      }
     },
     "createdBy": "human",
     "createdAt": "2026-06-29T00:00:00.000Z",
@@ -25,12 +41,25 @@
     "group": "utility",
     "version": "1.0.0",
     "inputs": {
-      "text": { "type": "string", "description": "The string to validate as JSON", "required": true }
+      "text": {
+        "type": "string",
+        "description": "The string to validate as JSON",
+        "required": true
+      }
     },
     "outputs": {
-      "valid": { "type": "boolean", "description": "Whether the string is valid JSON" },
-      "error": { "type": "string", "description": "Parse error message (only present when valid is false)" },
-      "parsed": { "type": "object", "description": "The parsed JSON value (only present when valid is true)" }
+      "valid": {
+        "type": "boolean",
+        "description": "Whether the string is valid JSON"
+      },
+      "error": {
+        "type": "string",
+        "description": "Parse error message (only present when valid is false)"
+      },
+      "parsed": {
+        "type": "object",
+        "description": "The parsed JSON value (only present when valid is true)"
+      }
     },
     "createdBy": "human",
     "createdAt": "2026-06-29T00:00:00.000Z",
@@ -43,15 +72,44 @@
     "group": "files",
     "version": "1.0.0",
     "inputs": {
-      "directory": { "type": "string", "description": "Absolute or relative directory path to scan", "required": true },
-      "days": { "type": "number", "description": "How many days back to look (default: 7)" }
+      "directory": {
+        "type": "string",
+        "description": "Absolute or relative directory path to scan",
+        "required": true
+      },
+      "days": {
+        "type": "number",
+        "description": "How many days back to look (default: 7)"
+      }
     },
     "outputs": {
-      "files": { "type": "array", "description": "Array of { path, modified, size } for matching files" },
-      "count": { "type": "number", "description": "Total number of files found" }
+      "files": {
+        "type": "array",
+        "description": "Array of { path, modified, size } for matching files"
+      },
+      "count": {
+        "type": "number",
+        "description": "Total number of files found"
+      }
     },
     "createdBy": "human",
     "createdAt": "2026-06-29T00:00:00.000Z",
+    "tested": true
+  },
+  {
+    "name": "test-skill",
+    "displayName": "Test Skill",
+    "description": "A test skill",
+    "group": "test-group",
+    "version": "1.0.0",
+    "inputs": {
+      "val": "number"
+    },
+    "outputs": {
+      "out": "number"
+    },
+    "createdBy": "orion",
+    "createdAt": "2026-07-08T22:12:48.177Z",
     "tested": true
   }
 ]

@@ -55,6 +55,8 @@ test('semantic indexing excludes environment files', (t) => {
 test('destructive command guard catches audited variants', (t) => {
   [
     'Remove-Item -LiteralPath .\\important.txt -Force',
+    'cmd /c del _count_check.py',
+    'del temporary-script.py',
     'cmd /c rmdir /s /q build',
     'node -e "require(\'fs\').rmSync(\'build\',{recursive:true,force:true})"',
     'git checkout -- .',
@@ -62,6 +64,30 @@ test('destructive command guard catches audited variants', (t) => {
     'Clear-Content .\\important.txt'
   ].forEach(command => t.equal(safety.classifyCommandRequest(command).allowed, false, `blocks ${command}`));
   t.equal(safety.classifyCommandRequest('npm test').allowed, true, 'still allows safe commands');
+  t.end();
+});
+
+// Regression: /\bformat\b/ matched ANY occurrence of the word — `ruff check --output-format=concise`
+// was denied as "destructive", and an entire agent run burned its action budget retrying
+// rephrasings of a harmless lint command. The rule now requires command position + a drive target.
+test('destructive command guard only flags actual disk formatting, not the word "format"', (t) => {
+  [
+    'ruff check . --exclude .env,.ruff_cache --output-format=concise',
+    'python -m ruff check --statistics --output-format concise',
+    'git log --format=%H',
+    'Get-Process | Format-Table -AutoSize'
+  ].forEach(command => t.equal(safety.classifyCommandRequest(command).allowed, true, `allows ${command}`));
+
+  [
+    'format C:',
+    'format.com D: /q',
+    'echo y | format e:',
+    'Format-Volume -DriveLetter D',
+    'Clear-Disk -Number 1 -RemoveData'
+  ].forEach(command => t.equal(safety.classifyCommandRequest(command).allowed, false, `blocks ${command}`));
+
+  const denial = safety.classifyCommandRequest('format C:');
+  t.ok(/deny rule/.test(denial.reason) && denial.reason.includes('matched text: "format C:"'), 'denial reason names the rule and the matched text so the agent can diagnose instead of blind-retrying');
   t.end();
 });
 
@@ -89,16 +115,16 @@ test('config failures and command retention safeguards are wired', (t) => {
   t.ok(configJs.includes('DEFAULT_CONFIG_VALUES'), 'config restores safe companion defaults when fields are absent');
   t.ok(configJs.includes("replace(/^\\uFEFF/, '')"), 'config reader tolerates UTF-8 BOMs');
   t.ok(configJs.includes('mergeConfigWithSource'), 'config merges existing/source secrets before writing');
-  t.ok(mainJs.includes("path.join(app.getPath('userData'), 'conversations.json')"), 'conversation history is stored under userData');
-  t.ok(mainJs.includes("ipcMain.handle('read-conversations'"), 'main process exposes disk conversation reads');
-  t.ok(mainJs.includes("ipcMain.handle('write-conversations'"), 'main process exposes disk conversation writes');
-  t.ok(preloadJs.includes('readConversations'), 'preload exposes disk conversation reads');
-  t.ok(preloadJs.includes('writeConversations'), 'preload exposes disk conversation writes');
+  t.ok(mainJs.includes("path.join(app.getPath('userData'), 'conversations-index.json')"), 'conversation history is stored under userData');
+  t.ok(mainJs.includes("ipcMain.handle('read-conversations-index'"), 'main process exposes disk conversation reads');
+  t.ok(mainJs.includes("ipcMain.handle('write-conversations-index'"), 'main process exposes disk conversation writes');
+  t.ok(preloadJs.includes('readConversationsIndex'), 'preload exposes disk conversation reads');
+  t.ok(preloadJs.includes('writeConversationsIndex'), 'preload exposes disk conversation writes');
   t.ok(rendererJs.includes('await loadConversationsFromStorage();'), 'startup waits for durable conversation load before selecting a chat');
   t.ok(rendererJs.includes('mergeConversationSets(disk, local, backup)'), 'renderer merges disk and local conversation stores');
   t.ok(rendererJs.includes('chooseRicherConversation'), 'renderer preserves richer copies of duplicated conversation records');
-  t.ok(rendererJs.includes('writeConversations({ revision, conversations: snapshot })'), 'conversation saves write to disk before relying on localStorage');
-  t.ok(rendererJs.includes('localStorage; disk persistence remains primary'), 'localStorage quota failures do not block durable history');
+  t.ok(rendererJs.includes('writeConversationsIndex({ revision, index })'), 'conversation saves write to disk before relying on localStorage');
+  t.ok(rendererJs.includes('Failed to write conversations index to localStorage'), 'localStorage quota failures do not block durable history');
   t.ok(ipcShellJs.includes('const MAX_COMMAND_OUTPUT_CHARS = 200000;'), 'command output has a memory cap');
   t.ok(ipcShellJs.includes('const MAX_COMMAND_SESSIONS = 100;'), 'completed command sessions have a retention cap');
   t.ok(ipcShellJs.includes('pruneCommandSessions();'), 'completed sessions are pruned');
@@ -131,10 +157,9 @@ test('conversation rename is not defeated by project workspace normalization run
   t.end();
 });
 
-// Regression: generateConversationTitle() itself (the actual text-cleanup logic) must keep
-// stripping filler phrases and truncating sensibly — this only tests the function's own behavior,
-// not the gating bug above.
-test('generateConversationTitle strips filler phrases and truncates sensibly', (t) => {
+// The synchronous title fallback is deliberately mechanical. Semantic shortening belongs to the
+// existing utility-model title pass, not another phrase table in the renderer.
+test('generateConversationTitle preserves wording and truncates sensibly without semantic regex', (t) => {
   const titleFn = rendererJs.match(/function generateConversationTitle\(prompt\) \{[\s\S]*?\n\}/);
   const caseFn = rendererJs.match(/function toTitleCase\(str\) \{[\s\S]*?\n\}/);
   t.ok(titleFn, 'generateConversationTitle function body is present in renderer.js');
@@ -142,8 +167,8 @@ test('generateConversationTitle strips filler phrases and truncates sensibly', (
 
   const sandbox = new Function(`${caseFn[0]}\n${titleFn[0]}\nreturn generateConversationTitle;`)();
 
-  t.equal(sandbox('can you help me build a snake game'), 'Build a Snake Game', 'strips leading filler like "can you help me"');
-  t.equal(sandbox('please launch the rocket sumo server'), 'Launch the Rocket Sumo Server', 'strips leading "please"');
+  t.equal(sandbox('can you help me build a snake game'), 'Can You Help Me Build a Snake Game', 'ordinary wording is not semantically stripped by a phrase rule');
+  t.equal(sandbox('please launch the rocket sumo server'), 'Please Launch the Rocket Sumo Server', 'polite wording is preserved until the model title pass');
   t.equal(sandbox(''), 'New Conversation', 'empty input falls back to the default title');
   t.ok(sandbox('a'.repeat(80)).length <= 48, 'long input is truncated to a reasonable length');
   t.end();

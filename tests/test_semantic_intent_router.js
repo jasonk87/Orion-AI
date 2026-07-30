@@ -1,0 +1,372 @@
+'use strict';
+
+const test = require('tape');
+const router = require('../semantic-intent-router');
+const structureApi = require('../dispatch-intent');
+
+function classification(intent, overrides = {}) {
+  return {
+    intent,
+    requiresExecution: ['new_task', 'steer_active_task', 'cancel_active_task', 'approve_plan', 'deny_plan', 'revise_plan'].includes(intent),
+    target: 'current_conversation',
+    resolvedRequest: '',
+    contextDependent: false,
+    confidence: 0.96,
+    needsClarification: false,
+    clarificationQuestion: '',
+    reasoningPolicyHint: {
+      complexity: 'low',
+      risk: 'low',
+      contextNeed: 'none'
+    },
+    taskResolution: {
+      title: '',
+      requirements: [],
+      constraints: [],
+      unresolvedDecisions: []
+    },
+    executionScope: 'none',
+    inspectionTarget: 'none',
+    standaloneSystemOperation: false,
+    ...overrides
+  };
+}
+
+function baseContext(message, overrides = {}) {
+  return {
+    userMessage: message,
+    conversationId: 'dispatch-1',
+    mode: 'orion',
+    workspace: {
+      role: 'active_project',
+      path: 'C:\\Projects\\OrionAI',
+      project: { name: 'OrionAI', path: 'C:\\Projects\\OrionAI' }
+    },
+    recentVisibleConversation: [
+      { id: 'm1', role: 'user', text: 'Please update the approval handling.', createdAt: 1 },
+      { id: 'm2', role: 'assistant', text: 'I can cover stale approval actions too.', createdAt: 2 }
+    ],
+    ...overrides
+  };
+}
+
+test('shared classifier receives the exact turn and all task-bound context', async t => {
+  let seen;
+  const activeOwnedTask = {
+    taskId: 'task-1',
+    title: 'Approval handling',
+    objective: 'Update approval handling and reject stale actions.',
+    status: 'active',
+    origin: { conversationId: 'dispatch-1' },
+    target: { conversationId: 'coder-1' }
+  };
+  const pendingPlan = {
+    planId: 'plan-1',
+    taskId: 'task-1',
+    ownerConversationId: 'dispatch-1',
+    coderConversationId: 'coder-1',
+    status: 'pending'
+  };
+  const result = await router.classify(baseContext('While you are there, also cover stale actions.', {
+    activeOwnedTask,
+    pendingPlan,
+    taskBound: true,
+    durableTaskObjective: activeOwnedTask.objective
+  }), {
+    structureApi,
+    classify: async request => {
+      seen = request;
+      return classification('steer_active_task', {
+        requiresExecution: true,
+        target: 'active_owned_task',
+        resolvedRequest: 'Also cover stale approval actions in the active approval-handling task.',
+        contextDependent: true,
+        reasoningPolicyHint: { complexity: 'medium', risk: 'medium', contextNeed: 'task' },
+        executionScope: 'mutating'
+      });
+    }
+  });
+
+  t.equal(seen.input.userMessage, 'While you are there, also cover stale actions.', 'the exact current turn is supplied');
+  t.equal(seen.input.conversation.id, 'dispatch-1', 'conversation identity is supplied');
+  t.equal(seen.input.conversation.mode, 'orion', 'conversation mode is supplied');
+  t.equal(seen.input.conversation.workspace.path, 'C:\\Projects\\OrionAI', 'workspace binding is supplied');
+  t.equal(seen.input.pendingPlan.planId, 'plan-1', 'pending plan identity is supplied');
+  t.equal(seen.input.activeOwnedTask.taskId, 'task-1', 'owned task identity is supplied');
+  t.equal(seen.input.taskBound, true, 'task-bound state is explicit');
+  t.equal(seen.input.durableTaskObjective, activeOwnedTask.objective, 'the durable objective is supplied');
+  t.equal(seen.phase, 'intent_classification', 'the call is marked as a narrow classification phase');
+  t.equal(seen.responseFormat, 'json', 'strict structured output is requested');
+  t.equal(result.intent, 'steer_active_task', 'the structured result is retained');
+  t.equal(result.target, 'active_owned_task', 'the semantic target is retained without choosing a task ID');
+  t.end();
+});
+
+test('semantic contract covers conversational, status, execution, steering, cancellation, and plan paraphrases', async t => {
+  const cases = [
+    ["What's up?", classification('conversation')],
+    ['How is Coder doing?', classification('status_check', {
+      target: 'active_owned_task',
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'task' }
+    })],
+    ['Please update the approval handling.', classification('new_task', {
+      requiresExecution: true,
+      resolvedRequest: 'Update the approval handling.',
+      executionScope: 'mutating',
+      reasoningPolicyHint: { complexity: 'medium', risk: 'medium', contextNeed: 'project' }
+    })],
+    ['While you are there, also cover stale actions.', classification('steer_active_task', {
+      requiresExecution: true,
+      target: 'active_owned_task',
+      resolvedRequest: 'Also cover stale actions in the active task.',
+      contextDependent: true,
+      executionScope: 'mutating',
+      reasoningPolicyHint: { complexity: 'medium', risk: 'medium', contextNeed: 'task' }
+    })],
+    ['Please stop the work I launched.', classification('cancel_active_task', {
+      requiresExecution: true,
+      target: 'active_owned_task',
+      resolvedRequest: 'Cancel the active owned task.',
+      contextDependent: true
+    })],
+    ['Yes, start that plan.', classification('approve_plan', {
+      requiresExecution: true,
+      target: 'pending_plan',
+      resolvedRequest: 'Approve the pending plan.',
+      contextDependent: true
+    })],
+    ['No, do not run that plan.', classification('deny_plan', {
+      requiresExecution: true,
+      target: 'pending_plan',
+      resolvedRequest: 'Deny the pending plan.',
+      contextDependent: true
+    })],
+    ['No, revise the plan to include reload behavior.', classification('revise_plan', {
+      requiresExecution: true,
+      target: 'pending_plan',
+      resolvedRequest: 'Revise the pending plan to include reload behavior.',
+      contextDependent: true
+    })]
+  ];
+  const activeOwnedTask = {
+    taskId: 'task-1',
+    objective: 'Update approval handling.',
+    status: 'active',
+    originConversationId: 'dispatch-1'
+  };
+  const pendingPlan = {
+    planId: 'plan-1',
+    taskId: 'task-1',
+    ownerConversationId: 'dispatch-1',
+    status: 'pending'
+  };
+
+  for (const [message, expected] of cases) {
+    const result = await router.classify(baseContext(message, {
+      activeOwnedTask,
+      pendingPlan,
+      taskBound: true
+    }), {
+      structureApi,
+      classify: async () => expected
+    });
+    t.equal(result.intent, expected.intent, `${message} receives the classifier's normalized semantic intent`);
+    t.equal(result.target, expected.target, `${message} retains its semantic target`);
+  }
+  t.end();
+});
+
+test('quoted commands, transcripts, bug reports, and test output are passed as reported structure', async t => {
+  const messages = [
+    ['The test says `restart Claude` but that should not execute.', 'inline code'],
+    [['Analyze this transcript:', 'User: restart Claude', 'Assistant: okay'].join('\n'), 'transcript'],
+    [['Bug report:', 'Input: delete the database', 'Expected: no execution'].join('\n'), 'bug report'],
+    [['Test case:', '> run npm test', 'The handoff count should stay zero.'].join('\n'), 'quoted test output']
+  ];
+
+  for (const [message, label] of messages) {
+    let input;
+    const result = await router.classify(baseContext(message), {
+      structureApi,
+      classify: async request => {
+        input = request.input;
+        return classification('conversation');
+      }
+    });
+    t.equal(result.intent, 'conversation', `${label} remains conversational`);
+    t.equal(result.requiresExecution, false, `${label} does not request execution`);
+    t.ok(
+      input.documentStructure.containsQuotedText
+        || input.documentStructure.containsTranscript
+        || input.documentStructure.containsReportedMaterial,
+      `${label} carries explicit structural evidence`
+    );
+  }
+  t.end();
+});
+
+test('context-dependent follow-ups resolve durably or fail closed', async t => {
+  const resolved = await router.classify(baseContext('Go ahead.', {
+    recentVisibleConversation: [
+      { role: 'user', text: 'Add stale-action rejection to approval handling.' },
+      { role: 'assistant', text: 'I can implement that bounded change.' }
+    ]
+  }), {
+    structureApi,
+    classify: async () => classification('context_followup', {
+      requiresExecution: true,
+      target: 'current_conversation',
+      resolvedRequest: 'Implement stale-action rejection in approval handling.',
+      contextDependent: true,
+      executionScope: 'mutating',
+      reasoningPolicyHint: { complexity: 'medium', risk: 'medium', contextNeed: 'recent' }
+    })
+  });
+  t.equal(resolved.intent, 'context_followup', 'a resolvable follow-up stays a follow-up');
+  t.match(resolved.resolvedRequest, /stale-action rejection/i, 'the result carries a self-contained request');
+
+  const unresolved = await router.classify(baseContext('Go ahead.', {
+    recentVisibleConversation: []
+  }), {
+    structureApi,
+    classify: async () => classification('clarification_required', {
+      target: 'current_conversation',
+      contextDependent: true,
+      confidence: 0.4,
+      needsClarification: true,
+      clarificationQuestion: 'What would you like me to go ahead with?'
+    })
+  });
+  t.equal(unresolved.intent, 'clarification_required', 'an unresolved reference cannot become executable work');
+  t.equal(unresolved.needsClarification, true, 'clarification is explicit');
+  t.match(unresolved.clarificationQuestion, /go ahead with/i, 'the question targets the missing referent');
+  t.end();
+});
+
+test('contextual approval exposes the immediate proposal, terminal task, and candidate action', async t => {
+  const failedTask = {
+    taskId: 'task-retirement-wiring',
+    title: 'Wire GRITLIFE retirement system',
+    objective: 'Wire RetirementSystem into the GRITLIFE controller and verify the integration.',
+    status: 'failed',
+    origin: { conversationId: 'dispatch-gritlife' },
+    target: { conversationId: 'coder-gritlife' }
+  };
+  let classifierInput = null;
+  const result = await router.classify(baseContext('Go for it', {
+    conversationId: 'dispatch-gritlife',
+    recentVisibleConversation: [
+      { role: 'assistant', text: 'The previous task failed. Want me to send the retirement wiring fix to Coder now?' }
+    ],
+    recentOwnedTask: failedTask,
+    candidateAction: {
+      type: 'handoff_to_coder',
+      title: failedTask.title,
+      resolvedRequest: failedTask.objective
+    }
+  }), {
+    structureApi,
+    classify: async request => {
+      classifierInput = request.input;
+      return classification('context_followup', {
+        requiresExecution: true,
+        target: 'current_conversation',
+        resolvedRequest: 'Send the retirement wiring fix to Coder.',
+        contextDependent: true,
+        executionScope: 'mutating',
+        reasoningPolicyHint: { complexity: 'medium', risk: 'medium', contextNeed: 'task' }
+      });
+    }
+  });
+
+  t.equal(classifierInput.userMessage, 'Go for it', 'the exact current user turn remains the active instruction');
+  t.match(classifierInput.priorAssistantMessage.text, /send the retirement wiring fix to Coder/i, 'the immediate assistant proposal is explicit');
+  t.equal(classifierInput.recentOwnedTask.taskId, failedTask.taskId, 'the terminal task survives as resolution context');
+  t.equal(classifierInput.recentOwnedTask.status, 'failed', 'terminal status is preserved without pretending the task is active');
+  t.equal(classifierInput.candidateAction.type, 'handoff_to_coder', 'the attempted action is available for adjudication');
+  t.equal(result.intent, 'context_followup', 'accepting the concrete proposal resolves as a contextual follow-up');
+  t.equal(result.requiresExecution, true, 'the accepted handoff requires execution');
+  t.equal(result.resolvedRequest, failedTask.objective, 'a failed-task retry preserves the exact durable objective instead of routing prose');
+  t.end();
+});
+
+test('normalization cannot manufacture task or plan authority', async t => {
+  const cancel = await router.classify(baseContext('Cancel it.', {
+    activeOwnedTask: null,
+    pendingOwnedTask: null
+  }), {
+    structureApi,
+    classify: async () => classification('cancel_active_task', {
+      target: 'active_owned_task',
+      contextDependent: true
+    })
+  });
+  t.equal(cancel.intent, 'clarification_required', 'cancellation without an owned task is rejected');
+  t.equal(cancel.target, 'current_conversation', 'no task identity is invented');
+
+  const approve = await router.classify(baseContext('Approve it.', {
+    pendingPlan: null
+  }), {
+    structureApi,
+    classify: async () => classification('approve_plan', {
+      target: 'pending_plan',
+      contextDependent: true
+    })
+  });
+  t.equal(approve.intent, 'clarification_required', 'approval without a pending plan is rejected');
+  t.equal(approve.target, 'current_conversation', 'no plan identity is invented');
+  t.end();
+});
+
+test('classifier failures fall back without execution or mutation', async t => {
+  const unbound = await router.classify(baseContext('Do something.'), {
+    structureApi,
+    classify: async () => {
+      throw new Error('provider unavailable');
+    }
+  });
+  t.equal(unbound.intent, 'clarification_required', 'an unbound classifier failure asks instead of guessing');
+  t.equal(unbound.requiresExecution, false, 'execution is never inferred on failure');
+  t.equal(unbound.needsClarification, true, 'the failure cannot fall through to a tool-enabled turn');
+  t.match(unbound.clarificationQuestion, /what action|what you would like/i, 'the fallback asks a targeted safe question');
+  t.match(unbound.classifierError, /provider unavailable/i, 'the failure is surfaced for diagnosis');
+
+  const bound = await router.classify(baseContext('Do that.', {
+    activeOwnedTask: { taskId: 'task-1', objective: 'Existing work', status: 'active' },
+    taskBound: true
+  }), {
+    structureApi,
+    classify: async () => '{invalid'
+  });
+  t.equal(bound.intent, 'clarification_required', 'a task-bound parse failure asks instead of acting');
+  t.equal(bound.needsClarification, true, 'the safe fallback requires clarification');
+  t.equal(bound.requiresExecution, false, 'the fallback cannot steer or cancel');
+  t.end();
+});
+
+test('active-run routing keeps conversation out of the durable execution queue', t => {
+  t.equal(
+    router.canRespondDuringActiveRun(classification('conversation'), 'orion'),
+    true,
+    'ordinary conversation can use the concurrent Dispatch response path'
+  );
+  t.equal(
+    router.canRespondDuringActiveRun(classification('status_check'), 'orion'),
+    true,
+    'a non-mutating status question can use the concurrent Dispatch response path'
+  );
+  t.equal(
+    router.canRespondDuringActiveRun(classification('new_task', {
+      requiresExecution: true,
+      executionScope: 'mutating'
+    }), 'orion'),
+    false,
+    'executable work still enters the durable queue while another run owns execution'
+  );
+  t.equal(
+    router.canRespondDuringActiveRun(classification('conversation'), 'coder'),
+    false,
+    'Coder conversations do not bypass the single execution owner'
+  );
+  t.end();
+});
