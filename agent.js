@@ -1220,9 +1220,9 @@ Verification calls this run: ${evidencePacket.verificationCount || 0}
 Judge patterns, not a single call.
 CRITICAL GUIDANCE — read before deciding:
 - Large tasks REQUIRE many tool calls. A high call count alone is NOT stuck.
-- read_file and grep_search are always exploratory — they NEVER indicate a loop on their own.
+- Distinct read_file ranges and grep_search queries are exploratory and healthy. A read_file call rejected as redundant_context_loop after Orion already replayed the exact cached source is different: repeating that exact unchanged range is genuine loop evidence.
 - "Repeated signatures" counts tool+target pairs, NOT content. Reading the same file at different line ranges shows as "repeated" but is HEALTHY progress exploring a large file.
-- Only return "stuck" if you see: (1) the exact same grep/search returning empty or error results 3+ times in a row with no variation in approach, OR (2) identical failed tool calls (same error, same target) repeating with no change.
+- Only return "stuck" if you see: (1) the exact same grep/search returning empty or error results 3+ times in a row with no variation in approach, (2) identical failed tool calls (same error, same target) repeating with no change, OR (3) the exact same unchanged source read continuing after its cached result and redundant_context_loop correction were supplied.
 - If file mutations > 0, or recent calls show different search targets or files, return "continue".
 - When uncertain, return "continue". A false "stuck" that kills a valid run is far worse than a false "continue" that extends it by a few turns.
 
@@ -3306,6 +3306,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       
       // Execute tool calls
       const toolResponseParts = [];
+      let repeatedContextReadCorrection = null;
 
       // ── Parallel execution for read-only batches ──────────────────────────────
       // When the model returns a batch of calls that are all read-only, run the
@@ -3318,8 +3319,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         'read_command_output', 'get_command_status',
         'recall_memory', 'read_notes', 'get_project_memory'
       ]);
+      const contextReadSignatures = functionCalls
+        .map(call => contextReadRequestKey(call.name, call.args || {}))
+        .filter(Boolean);
+      const hasDuplicateContextReadsInBatch = new Set(contextReadSignatures).size < contextReadSignatures.length;
       const canRunParallel = functionCalls.length > 1 &&
-        functionCalls.every(c => PARALLELIZABLE_TOOLS.has(c.name));
+        functionCalls.every(c => PARALLELIZABLE_TOOLS.has(c.name)) &&
+        !hasDuplicateContextReadsInBatch;
 
       if (canRunParallel) {
         const parallelNames = functionCalls.map(c => c.name).join(', ');
@@ -3365,6 +3371,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           currentAgentLogs[logIndex].result = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
           currentAgentLogs[logIndex].elapsed = elapsed;
           updateWalkthroughItem(walkthroughItem, toolName, args, result, isFailedToolResult(result) ? new Error(getToolFailureSignal(result) || 'error') : null);
+          if (result && result.failureCategory === 'redundant_context_loop') {
+            repeatedContextReadCorrection = result;
+          }
           const evidenceEntry = buildToolEvidenceEntry(toolName, args, result);
           toolEvidenceLedger.push(evidenceEntry);
           mergeRunStructuredStatusFacts(structuredStatusFacts, evidenceEntry.structuredStatuses);
@@ -3516,9 +3525,19 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
         const redundantContextRead = getRecentRedundantContextRead(contextAcquisitionLedger, toolName, args);
         if (redundantContextRead) {
-          currentAgentLogs[logIndex].status = 'success';
+          const redundantReadFailed = isFailedToolResult(redundantContextRead);
+          currentAgentLogs[logIndex].status = redundantReadFailed ? 'error' : 'success';
           currentAgentLogs[logIndex].result = JSON.stringify(redundantContextRead, null, 2);
-          updateWalkthroughItem(walkthroughItem, toolName, args, redundantContextRead, null);
+          updateWalkthroughItem(
+            walkthroughItem,
+            toolName,
+            args,
+            redundantContextRead,
+            redundantReadFailed ? new Error(getToolFailureSignal(redundantContextRead) || 'Repeated unchanged read') : null
+          );
+          if (redundantContextRead.failureCategory === 'redundant_context_loop') {
+            repeatedContextReadCorrection = redundantContextRead;
+          }
           toolEvidenceLedger.push(buildToolEvidenceEntry(toolName, args, redundantContextRead));
           toolResponseParts.push({
             functionResponse: {
@@ -3932,6 +3951,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
       // Append tool response parts to message history
       messages.push({ role: 'tool', parts: toolResponseParts });
+      if (repeatedContextReadCorrection) {
+        messages.push({
+          role: 'user',
+          parts: [{
+            text: `[SYSTEM: The exact unchanged source requested by your repeated read was already replayed to you from Orion's run cache. Do not call that same read again. Continue with the evidence already supplied: analyze it, choose a different concrete missing source, make the authorized edit, run verification, or provide the requested result. If a specific fact is still missing, name that fact and retrieve a different relevant range instead of repeating this call.]`
+          }]
+        });
+      }
       
       // Save api response details to current turn
       currentTurn.toolResponseParts = toolResponseParts;
@@ -8888,6 +8915,8 @@ function appendIncidentalObservationsToFinal(text, buffer, conversation = {}, op
 function createContextAcquisitionLedger() {
   return {
     files: new Map(),
+    recentReadResults: new Map(),
+    redundantReadAttempts: new Map(),
     events: [],
     readCalls: 0,
     searchCalls: 0,
@@ -8901,6 +8930,35 @@ function createContextAcquisitionLedger() {
 
 function normalizeLedgerPath(pathValue) {
   return String(pathValue || '').replace(/\\/g, '/').toLowerCase();
+}
+
+function contextReadRequestKey(toolName, args = {}) {
+  if (toolName === 'read_file' && args.path) {
+    const startLine = parseInt(args.startLine, 10);
+    const endLine = parseInt(args.endLine, 10);
+    const range = Number.isInteger(startLine) && Number.isInteger(endLine)
+      ? `${startLine}:${endLine}`
+      : 'full';
+    return `read_file|${normalizeLedgerPath(args.path)}|${range}`;
+  }
+  if (toolName === 'read_multiple_ranges' && Array.isArray(args.files) && args.files.length > 0) {
+    const files = args.files
+      .filter(file => file && file.path && Array.isArray(file.ranges))
+      .map(file => ({
+        path: normalizeLedgerPath(file.path),
+        ranges: file.ranges
+          .map(range => ({
+            startLine: parseInt(range && range.startLine, 10),
+            endLine: parseInt(range && range.endLine, 10)
+          }))
+          .filter(range => Number.isInteger(range.startLine) && Number.isInteger(range.endLine))
+          .sort((left, right) => left.startLine - right.startLine || left.endLine - right.endLine)
+      }))
+      .filter(file => file.path && file.ranges.length > 0)
+      .sort((left, right) => left.path.localeCompare(right.path));
+    return files.length > 0 ? `read_multiple_ranges|${JSON.stringify(files)}` : '';
+  }
+  return '';
 }
 
 function mergeLedgerRange(existingRanges, startLine, endLine) {
@@ -9028,12 +9086,34 @@ function getRecentRedundantContextRead(ledger, toolName, args = {}) {
       ));
   }
   if (!redundant) return null;
+  const requestKey = contextReadRequestKey(toolName, args);
+  const reuseCount = requestKey
+    ? Number(ledger.redundantReadAttempts.get(requestKey) || 0) + 1
+    : 1;
+  if (requestKey) ledger.redundantReadAttempts.set(requestKey, reuseCount);
+  const cached = requestKey ? ledger.recentReadResults.get(requestKey) : null;
+  if (reuseCount === 1 && cached && cached.result) {
+    return {
+      ...cached.result,
+      success: true,
+      skipped: true,
+      redundantContext: true,
+      reusedEvidence: true,
+      reuseCount,
+      redundantReadNote: 'You already read this exact unchanged source. Orion reused the run cache because re-reading it wastes context without adding evidence.',
+      message: 'This is the cached result from the prior successful read. The requested source is included in this tool response; use it now and move to analysis, editing, or verification.'
+    };
+  }
   return {
-    success: true,
+    success: false,
     skipped: true,
     redundantContext: true,
-    redundantReadNote: 'You already read this exact unchanged source range; re-reading it wastes context without adding evidence.',
-    message: 'This exact unchanged source range is already present in the recent run context. Use the existing evidence and move to the next analysis, edit, or verification step; reread it only after the file changes.'
+    reuseCount,
+    error: 'This exact unchanged source result was already supplied and replayed from the run cache. Repeating the same read cannot add evidence.',
+    failureCategory: 'redundant_context_loop',
+    retryable: false,
+    requiredNextAction: 'Use the supplied source, retrieve a different concrete missing range, edit, verify, or answer. Do not repeat this read.',
+    message: 'Orion blocked an identical reread after replaying the cached source once.'
   };
 }
 
@@ -9172,6 +9252,18 @@ function recordContextAcquisitionToolResult(ledger, toolName, args = {}, result 
       fullRead: !!section.fullRead
     });
   }
+  const requestKey = contextReadRequestKey(toolName, args);
+  if (requestKey && sections.length > 0) {
+    const pathKeys = [...new Set(sections.map(section => normalizeLedgerPath(section.path)).filter(Boolean))];
+    ledger.recentReadResults.set(requestKey, {
+      pathKeys,
+      result: result && typeof result === 'object' && !Array.isArray(result) ? { ...result } : { output: result }
+    });
+    ledger.redundantReadAttempts.delete(requestKey);
+    while (ledger.recentReadResults.size > 12) {
+      ledger.recentReadResults.delete(ledger.recentReadResults.keys().next().value);
+    }
+  }
   ledger.events = ledger.events.slice(-40);
 }
 
@@ -9179,6 +9271,12 @@ function invalidateContextAcquisitionForFile(ledger, pathValue, reason = 'file m
   if (!ledger || !pathValue) return;
   const key = normalizeLedgerPath(pathValue);
   if (ledger.files.delete(key)) ledger.invalidations += 1;
+  for (const [requestKey, cached] of ledger.recentReadResults.entries()) {
+    if (cached && Array.isArray(cached.pathKeys) && cached.pathKeys.includes(key)) {
+      ledger.recentReadResults.delete(requestKey);
+      ledger.redundantReadAttempts.delete(requestKey);
+    }
+  }
   ledger.events.push({ toolName: reason, kind: 'invalidation', path: String(pathValue) });
   ledger.events = ledger.events.slice(-40);
 }
@@ -9196,6 +9294,11 @@ function buildContextAcquisitionReceipt(ledger) {
       uniqueLines: file.uniqueLines,
       duplicateLines: file.duplicateLines
     }));
+  const redundantReadAttempts = [...ledger.redundantReadAttempts.entries()]
+    .filter(([, count]) => Number(count) > 0)
+    .map(([request, count]) => ({ request, count: Number(count) }))
+    .sort((left, right) => right.count - left.count || left.request.localeCompare(right.request))
+    .slice(0, 6);
   return {
     readCalls: ledger.readCalls,
     searchCalls: ledger.searchCalls,
@@ -9204,6 +9307,8 @@ function buildContextAcquisitionReceipt(ledger) {
     duplicateLinesReturned: ledger.duplicateLinesReturned,
     estimatedSourceTokens: ledger.estimatedSourceTokens,
     invalidations: ledger.invalidations,
+    redundantReadAttempts,
+    blockedRedundantReads: redundantReadAttempts.reduce((total, item) => total + Math.max(0, item.count - 1), 0),
     repeatedReads,
     recentEvents: ledger.events.slice(-12)
   };

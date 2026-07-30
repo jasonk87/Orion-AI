@@ -184,7 +184,14 @@ test('exact unchanged source ranges are not reread repeatedly inside one recent 
 
   const redundant = agent.getRecentRedundantContextRead(ledger, 'read_file', args);
   t.equal(redundant && redundant.redundantContext, true, 'an immediate identical range read returns a bounded reuse receipt');
-  t.match(redundant.message, /already present|move to the next/i, 'the receipt tells Coder to use evidence and advance');
+  t.equal(redundant && redundant.reusedEvidence, true, 'the first duplicate replays the exact cached evidence');
+  t.match(redundant && redundant.content, /line 139/, 'the cached response actually contains the requested source');
+  t.match(redundant.message, /included|move to analysis/i, 'the receipt tells Coder to use evidence and advance');
+
+  const repeatedAgain = agent.getRecentRedundantContextRead(ledger, 'read_file', args);
+  t.equal(repeatedAgain && repeatedAgain.success, false, 'a second identical retry is rejected instead of posing as useful work');
+  t.equal(repeatedAgain && repeatedAgain.failureCategory, 'redundant_context_loop', 'the repeated retry has a machine-readable loop category');
+  t.equal(repeatedAgain && repeatedAgain.retryable, false, 'the model is explicitly told not to retry the same read');
 
   agent.invalidateContextAcquisitionForFile(ledger, 'systems/retirement.py', 'modify_file');
   t.equal(
@@ -192,6 +199,75 @@ test('exact unchanged source ranges are not reread repeatedly inside one recent 
     null,
     'a real file mutation invalidates the reuse guard and permits a fresh read'
   );
+  t.end();
+});
+
+test('Coder escapes repeated unchanged read_file calls without exhausting its action budget', async t => {
+  const originalFetch = global.fetch;
+  let physicalReadCalls = 0;
+  let physicalReadCallsAfterInitial = 0;
+  let cachedSourceReachedModel = false;
+  let correctionReachedModel = false;
+  const repeatedRead = {
+    functionCall: {
+      name: 'read_file',
+      args: { path: 'render/screens.py', startLine: 58, endLine: 200 }
+    }
+  };
+  installHarness([
+    [{ text: 'I will inspect the StatPanel layout.' }, repeatedRead, repeatedRead],
+    body => {
+      const serialized = JSON.stringify(body);
+      t.ok(serialized.includes('class StatPanel'), 'the initial physical read reaches the next model turn');
+      cachedSourceReachedModel = serialized.includes('reusedEvidence') && serialized.includes('class StatPanel');
+      physicalReadCallsAfterInitial = physicalReadCalls;
+      return [{ text: 'Let me request it once more.' }, repeatedRead];
+    },
+    body => {
+      const serialized = JSON.stringify(body);
+      correctionReachedModel = serialized.includes('redundant_context_loop')
+        && serialized.includes('Do not call that same read again');
+      return [{ text: 'The StatPanel source is clear now. I can proceed without rereading it.' }];
+    },
+    [{ text: 'The StatPanel source is clear now. I can proceed without rereading it.' }]
+  ], {
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE',
+    api: {
+      readFile: async (_workspace, requestedPath) => {
+        if (requestedPath === 'render/screens.py') physicalReadCalls += 1;
+        return '58: class StatPanel:\\n59:     def render(self):\\n60:         return \"ready\"';
+      }
+    },
+    semanticClassification: semanticClassification({
+      intent: 'new_task',
+      requiresExecution: true,
+      target: 'current_conversation',
+      resolvedRequest: 'Inspect the StatPanel layout and continue the requested implementation.',
+      reasoningPolicyHint: { complexity: 'medium', risk: 'low', contextNeed: 'project' },
+      executionScope: 'workspace',
+      inspectionTarget: 'project'
+    })
+  });
+  const conv = conversation('coder-redundant-read-loop', {
+    mode: 'coder',
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE'
+  });
+  try {
+    await global.window.runAgentLoop(
+      'Inspect the StatPanel layout and continue the requested implementation.',
+      'gemini-1',
+      conv
+    );
+    const finalAssistant = [...conv.messages].reverse().find(message => message.role === 'assistant');
+    t.ok(physicalReadCallsAfterInitial > 0, 'the initial logical read reaches the filesystem');
+    t.equal(physicalReadCalls, physicalReadCallsAfterInitial, 'identical retries cause no additional filesystem reads');
+    t.equal(cachedSourceReachedModel, true, 'the first duplicate receives the cached exact source');
+    t.equal(correctionReachedModel, true, 'a further retry receives a deterministic strategy correction');
+    t.notOk(/per-turn action limit/i.test(finalAssistant.text || ''), 'the run advances before exhausting its action budget');
+    t.match(finalAssistant.text || '', /proceed without rereading/i, 'Coder advances using the evidence already supplied');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
   t.end();
 });
 

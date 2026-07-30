@@ -103,12 +103,15 @@ test('evaluateLoopStateWithSupervisorDecision parses bounded corrective JSON and
 test('context acquisition ledger tracks duplicate reads and invalidates after edits', (t) => {
   const ledger = agent.createContextAcquisitionLedger();
   agent.recordContextAcquisitionToolResult(ledger, 'read_file', { path: 'agent.js' }, { content: 'a\nb\nc' });
-  agent.recordContextAcquisitionToolResult(ledger, 'read_file', { path: 'agent.js' }, { content: 'a\nb\nc' });
+  const args = { path: 'agent.js' };
+  agent.getRecentRedundantContextRead(ledger, 'read_file', args);
+  agent.getRecentRedundantContextRead(ledger, 'read_file', args);
 
   let receipt = agent.buildContextAcquisitionReceipt(ledger);
-  t.equal(receipt.readCalls, 2, 'two read calls are tracked');
-  t.equal(receipt.duplicateLinesReturned, 3, 'second unchanged full read is counted as duplicate source');
-  t.equal(receipt.repeatedReads[0].path, 'agent.js', 'repeated read identifies the file');
+  t.equal(receipt.readCalls, 1, 'only the physical read is counted as source acquisition');
+  t.equal(receipt.duplicateLinesReturned, 0, 'cache reuse does not pretend duplicate source was returned from disk');
+  t.equal(receipt.redundantReadAttempts[0].count, 2, 'the supervisor sees both exact retry attempts');
+  t.equal(receipt.blockedRedundantReads, 1, 'the retry after cached replay is explicit loop evidence');
 
   agent.invalidateContextAcquisitionForFile(ledger, 'agent.js', 'patch_file');
   agent.recordContextAcquisitionToolResult(ledger, 'read_file', { path: 'agent.js' }, { content: 'a\nchanged\nc' });
