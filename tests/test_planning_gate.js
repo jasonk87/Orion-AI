@@ -277,6 +277,20 @@ test('Planning Gate behavior requires STRATEGY.md before implementation_plan.md'
   t.equal(approvedPlanGate.allowed, true, 'allows implementation_plan.md write during execution');
   t.equal(approvedPlanGate.forceYield, false, 'forceYield is false when canExecute=true — plan card must not re-appear during execution');
 
+  const revisionPlanGate = agent.getPlanningToolGate(config, false, 'modify_file', {
+    path: 'implementation_plan.md'
+  }, { planRevision: true });
+  t.equal(revisionPlanGate.allowed, true, 'task-bound revision may update the existing plan without rebuilding strategy');
+  t.equal(revisionPlanGate.forceYield, true, 'a revised plan returns to the approval gate');
+  const revisionSourceGate = agent.getPlanningToolGate(config, false, 'modify_file', {
+    path: 'src/app.js'
+  }, { planRevision: true });
+  t.equal(revisionSourceGate.allowed, false, 'task-bound revision cannot leak into source implementation');
+  const revisionCommandGate = agent.getPlanningToolGate({ planningMode: false }, true, 'run_tests', {
+    command: 'npm test'
+  }, { planRevision: true });
+  t.equal(revisionCommandGate.allowed, false, 'revision safety remains enforced even if planning mode is later disabled');
+
   t.end();
 });
 

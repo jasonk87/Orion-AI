@@ -8,6 +8,7 @@ const main = fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8').replace
 const renderer = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8').replace(/\r\n/g, '\n');
 const preload = fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8').replace(/\r\n/g, '\n');
 const companionHtml = fs.readFileSync(path.join(__dirname, '../lib/companion-html.js'), 'utf8').replace(/\r\n/g, '\n');
+const taskOrchestration = fs.readFileSync(path.join(__dirname, '../task-orchestration.js'), 'utf8').replace(/\r\n/g, '\n');
 const ipcUiJs = fs.readFileSync(path.join(__dirname, '../lib/ipc-ui.js'), 'utf8').replace(/\r\n/g, '\n');
 
 test('desktop uses the unified Orion command-center design system', (t) => {
@@ -274,6 +275,101 @@ test('phone landing and plan controls share one conversation identity', (t) => {
   t.ok(companionHtml.includes('renderPhoneTaskList(preserveDispatchDraft ? [] : (state.tasks || []))'), 'the blank landing does not inherit another conversation checklist');
   t.ok(companionHtml.includes("body: JSON.stringify({ conversationId })"), 'approve and deny requests carry their visible conversation identity');
   t.ok(companionHtml.includes('conversationId: formTargetConversationId'), 'plan revision remains bound to the conversation that opened revision mode');
+  t.ok(companionHtml.includes('conversationRunning: viewingConversationRunning'),
+    'phone status resolution receives the viewed conversation live state');
+  t.ok(companionHtml.includes('phonePresentation.useSupervisedTaskCard'),
+    'a terminal supervised task no longer owns the current-task card while Dispatch is live');
+  t.end();
+});
+
+test('delegated plan revision resumes the same task and leaves the old Review state', async (t) => {
+  const revisionStart = renderer.indexOf('window.revisePhoneCompanionPlan = async (options) => {');
+  const revisionEnd = renderer.indexOf('// Mirrors desktop', revisionStart);
+  const revisionSource = renderer.slice(revisionStart, revisionEnd);
+  const dispatch = {
+    id: 'dispatch-revision',
+    mode: 'orion',
+    awaitingDelegatedPlan: {
+      taskId: 'task-revision',
+      coderConversationId: 'coder-revision',
+      title: 'Revise-safe task'
+    },
+    messages: [{ isDelegatedPlanCard: true }]
+  };
+  const coder = {
+    id: 'coder-revision',
+    mode: 'coder',
+    title: 'Revise-safe task',
+    awaitingPlanApproval: true,
+    awaitingPlanApprovalTaskId: 'task-revision',
+    planApproved: false
+  };
+  const calls = { queued: null, launched: null, monitored: null, notified: null };
+  const mockWindow = {
+    getSelectedModel: () => 'test-model',
+    getOrchestrationTaskStatus: async () => ({
+      success: true,
+      task: {
+        taskId: 'task-revision',
+        title: 'Revise-safe task',
+        status: 'pending',
+        target: { conversationId: coder.id }
+      }
+    }),
+    markConversationDirty: () => {},
+    startCoderTaskMonitor: (...args) => { calls.monitored = args; }
+  };
+  const revisePlan = Function(
+    'window',
+    'conversations',
+    'activeConversationId',
+    'conversationMode',
+    'queueTaskContinuation',
+    'startOrQueueTaskContinuation',
+    'flushConversationsToStorage',
+    'saveConversationsToStorage',
+    'markDelegatedPlanMessageState',
+    'notifyOrionConversation',
+    `${revisionSource}\nreturn window.revisePhoneCompanionPlan;`
+  )(
+    mockWindow,
+    [dispatch, coder],
+    dispatch.id,
+    conversation => conversation.mode,
+    async options => {
+      calls.queued = options;
+      return {
+        success: true,
+        task: { taskId: options.taskId, status: 'pending' },
+        queueItem: { taskId: options.taskId, planRevision: options.planRevision }
+      };
+    },
+    (continuation, conversation, options) => {
+      calls.launched = { continuation, conversation, options };
+      return { success: true, queued: true, taskId: continuation.task.taskId };
+    },
+    async () => {},
+    () => {},
+    (conversation, taskId, field) => {
+      conversation.messages[0][field] = taskId === 'task-revision';
+    },
+    (conversation, message, source) => { calls.notified = { conversation, message, source }; }
+  );
+
+  const result = await revisePlan({
+    conversationId: dispatch.id,
+    feedback: 'Cover the reload path too.'
+  });
+
+  t.equal(result.taskId, 'task-revision', 'revision keeps the exact durable task ID');
+  t.equal(calls.queued.requireExistingTask, true, 'revision cannot create a replacement task');
+  t.equal(calls.queued.planRevision, true, 'the queued continuation is explicitly typed as a plan revision');
+  t.equal(dispatch.awaitingDelegatedPlan, null, 'the old Dispatch review gate is removed');
+  t.equal(dispatch.revisingDelegatedPlan.taskId, 'task-revision', 'Dispatch records the same task as revising');
+  t.equal(coder.awaitingPlanApproval, false, 'Coder leaves the old approval gate while revising');
+  t.equal(coder.planRevisionInProgress.taskId, 'task-revision', 'Coder exposes an explicit revision-in-progress state');
+  t.deepEqual(calls.monitored, [dispatch.id, coder.id, 'task-revision'], 'the same task monitor follows the revision');
+  t.equal(calls.notified.source, 'supervisor-plan-revision', 'Dispatch receives a visible revision status');
   t.end();
 });
 
@@ -338,7 +434,9 @@ test('agent presence communicates meaningful execution phases', (t) => {
   });
   t.ok(styles.includes('.agent-state-pill.verifying'), 'styles verification distinctly');
   t.ok(styles.includes('.orion-toast.success'), 'provides completion feedback');
-  t.ok(companionHtml.includes("? 'Verifying'"), 'phone uses the same verification state language');
+  t.ok(companionHtml.includes('resolvePhoneConversationPresentation')
+      && taskOrchestration.includes("? 'Verifying'"),
+    'phone uses the shared verification state language');
   t.end();
 });
 

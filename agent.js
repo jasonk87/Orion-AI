@@ -1688,7 +1688,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const userSelectedModelName = activeRunModelName;
   let modelEscalatedForEditKey = null;
   const promptSource = options.source || 'user';
-  const isInternalPrompt = !!options.internalPrompt || promptSource === 'followup' || promptSource === 'system' || promptSource === 'plan-approval';
+  const isPlanRevision = options.planRevision === true || promptSource === 'plan-revision';
+  const isInternalPrompt = !!options.internalPrompt || isPlanRevision || promptSource === 'followup'
+    || promptSource === 'system' || promptSource === 'plan-approval';
   if (!isInternalPrompt) {
     maybeSaveExplicitPreference(userPrompt, config, runMode).catch(() => {});
   }
@@ -1838,7 +1840,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let resetMissionState = false;
   let suppressPlanApprovalCardThisTurn = false;
 
-  if (isInternalPrompt) {
+  if (isPlanRevision) {
+    // A delegated revision is already bound to the exact pending task and plan by the renderer.
+    // Keep it inside planning mode so Coder may update the plan artifact but cannot start source
+    // implementation until the revised plan is presented and approved again.
+    planningDecision = { mode: 'plan', reason: 'Revising the existing task-bound implementation plan.' };
+    planningBypassedForTask = false;
+    agentExecutionMode = 'planning';
+  } else if (isInternalPrompt) {
     // System-driven continuation (approved-plan execution, queued follow-up): just build.
     // planningBypassedForTask unblocks the executor and keeps the system note execution-focused.
     planningDecision = { mode: 'direct', reason: 'Internal follow-up continuing existing work.' };
@@ -2228,7 +2237,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   }
 
   // Strategy gate prep: only a fresh plan-worthy task that has not been approved needs it.
-  if (!planningBypassedForTask && planningDecision.mode === 'plan' && config.planningMode !== false && !conversation.planApproved && !isInternalPrompt) {
+  if (!planningBypassedForTask && planningDecision.mode === 'plan' && config.planningMode !== false
+      && !conversation.planApproved && !isInternalPrompt) {
         strategyStatus = await readStrategyStatus(workspacePath, conversation);
   }
 
@@ -2258,17 +2268,20 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     });
   }
 
-  if (config.planningMode !== false) {
+  if (config.planningMode !== false || isPlanRevision) {
     const reviewOnlyConstraint = reviewOnly
       ? ' CRITICAL: The user asked you to FIND issues, not fix them. Treat the active workspace as the program under review. First inspect workspace inventory, then read the main entry points, adjacent modules, config/package files, and tests where present. A completed review must contain concrete findings tied to file paths and line/function context, severity/impact, or clearly say no specific issues were found after naming the files inspected. Do NOT stop after one file with generic potential risks. Do NOT ask which program to inspect or whether to continue inspecting. For a broad review, STRATEGY.md is allowed only as a private review strategy/report outline. Do NOT create implementation_plan.md, do NOT modify source files, do NOT start fixing issues, and do NOT ask to approve a fix plan. End by summarizing what you found and asking the user which issues they want you to address.'
       : '';
     messages.push({
       role: 'user',
       parts: [{
-        text: `[SYSTEM: Planning decision for this user request: ${planningDecision.mode}. Reason: ${planningDecision.reason || 'No reason provided.'} ${planningBypassedForTask ? 'This is a direct task, so do not create STRATEGY.md or implementation_plan.md unless new complexity appears during inspection.' : 'If this requires workspace changes and no plan is approved, complete Mission Refinement first, create a valid STRATEGY.md, then create a real implementation plan and pause.'}${reviewOnlyConstraint}]`
+        text: isPlanRevision
+          ? `[SYSTEM: This is a task-bound revision of the existing implementation plan. Read the current implementation_plan.md, apply the user's exact feedback, preserve or improve its required Testing Plan, and write the revised plan back to the same conversation-scoped artifact. Do not edit application source, execute the implementation, or create a second task. Pause for approval after the revised plan is complete.]`
+          : `[SYSTEM: Planning decision for this user request: ${planningDecision.mode}. Reason: ${planningDecision.reason || 'No reason provided.'} ${planningBypassedForTask ? 'This is a direct task, so do not create STRATEGY.md or implementation_plan.md unless new complexity appears during inspection.' : 'If this requires workspace changes and no plan is approved, complete Mission Refinement first, create a valid STRATEGY.md, then create a real implementation plan and pause.'}${reviewOnlyConstraint}]`
       }]
     });
-    if (!planningBypassedForTask && planningDecision.mode === 'plan' && !conversation.planApproved && !isInternalPrompt) {
+    if (!isPlanRevision && !planningBypassedForTask && planningDecision.mode === 'plan'
+        && !conversation.planApproved && !isInternalPrompt) {
       messages.push({
         role: 'user',
         parts: [{ text: buildRefinementPrompt(strategyStatus) }]
@@ -2459,7 +2472,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     let supervisorCorrectionAttempts = 0;
     let supervisorWrapupExtensions = 0;
     const maxMalformedToolRetries = 5;
-    const canExecuteThisTask = () => !config.planningMode || conversation.planApproved || planningBypassedForTask;
+    const canExecuteThisTask = () => isPlanRevision
+      ? false
+      : (!config.planningMode || conversation.planApproved || planningBypassedForTask);
     const dispatchPreflightAuthorized = runMode === 'orion'
       && conversation.mode === 'orion'
       && !runTaskId
@@ -3465,7 +3480,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         const reviewGate = reviewOnly ? getReviewOnlyToolGate(toolName, args) : { allowed: true, reason: '' };
         const planningGate = getPlanningToolGate(config, canExecuteThisTask(), toolName, args, {
           strategyStatus,
-          agentExecutionMode
+          agentExecutionMode,
+          planRevision: isPlanRevision
         });
         // Skill-discovery gate: require discover_skills before create_skill so Orion checks for
         // an existing skill first rather than recreating capabilities that already exist.
@@ -4940,7 +4956,7 @@ async function drainNextQueuedTask() {
     if (!targetConversation) {
       return await handleMissingQueuedTaskTarget(nextTask, targetId);
     }
-    const internal = ['followup', 'plan-approval', 'system'].includes(nextTask.source);
+    const internal = ['followup', 'plan-approval', 'plan-revision', 'system'].includes(nextTask.source);
     const queueLabel = nextTask.source === 'followup'
       ? 'Executing scheduled follow-up.'
       : (nextTask.source === 'plan-approval' ? 'Continuing approved plan.' : 'Executing queued task.');
@@ -4969,6 +4985,7 @@ async function drainNextQueuedTask() {
       internalPrompt: internal,
       taskId: nextTask.taskId || '',
       preserveUserPrompt: nextTask.preserveUserPrompt === true,
+      planRevision: nextTask.planRevision === true,
       images: Array.isArray(nextTask.images) ? nextTask.images : [],
       contextPacketIds: Array.isArray(nextTask.contextPacketIds) ? nextTask.contextPacketIds : []
     });
@@ -7431,6 +7448,30 @@ If STRATEGY.md finds mission-critical ambiguity, ask the user before planning. I
 }
 
 function getPlanningToolGate(config, canExecute, toolName, args = {}, options = {}) {
+  if (options.planRevision === true) {
+    const isPlanArtifactEdit = ['write_file', 'modify_file', 'patch_file'].includes(toolName)
+      && isImplementationPlanPath(args.path);
+    if (isPlanArtifactEdit) {
+      return {
+        allowed: true,
+        forceYield: true,
+        reason: 'Updating the existing implementation plan is allowed during a task-bound revision.'
+      };
+    }
+    const revisionBlockedTools = new Set([
+      'write_file', 'modify_file', 'patch_file', 'delete_created_file', 'start_command',
+      'run_tests', 'run_linter', 'sync_workspace_env', 'launch_workspace_app', 'preview_app',
+      'git_push', 'download_file', 'download_from_page', 'extract_archive'
+    ]);
+    if (revisionBlockedTools.has(toolName)) {
+      return {
+        allowed: false,
+        forceYield: false,
+        reason: 'Plan revision is active: only the existing implementation_plan.md may be changed before the revised plan is approved.'
+      };
+    }
+    return { allowed: true, forceYield: false, reason: '' };
+  }
   if (!config || !config.planningMode || canExecute) {
     return { allowed: true, forceYield: false, reason: '' };
   }

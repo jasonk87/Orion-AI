@@ -569,6 +569,7 @@
         ? {
             input: compactWhitespace(continuationRecord.input || continuationRecord.prompt || ''),
             source: compactInline(continuationRecord.source || 'task-continuation'),
+            kind: compactInline(continuationRecord.kind || ''),
             messageId: compactInline(continuationRecord.messageId || ''),
             createdAt: resolveNow(continuationRecord.createdAt || updatedAt)
           }
@@ -947,6 +948,7 @@
       status = TASK_STATES.FAILED;
     }
     const awaitingReview = context.awaitingReview === true || taskValue.awaitingReview === true;
+    const revisingPlan = context.revisingPlan === true || taskValue.revisingPlan === true;
     const planApproved = context.planApproved === true || taskValue.planApproved === true;
     const resumePolicy = compactInline(
       context.resumePolicy
@@ -969,6 +971,12 @@
       detail = detail || 'Coder’s implementation plan is ready for approval.';
       agentState = 'Review';
       badgeClass = 'warning';
+    } else if (revisingPlan && (status === TASK_STATES.PENDING || status === TASK_STATES.ACTIVE)) {
+      phase = 'revising-plan';
+      label = 'Coder revising plan';
+      detail = detail || 'Coder is applying your feedback and preparing a revised implementation plan.';
+      agentState = 'Coder revising';
+      badgeClass = 'success';
     } else if (status === TASK_STATES.PENDING && resumePolicy === 'automatic') {
       phase = 'continuing';
       label = 'Coder continuing';
@@ -1024,6 +1032,41 @@
       agentState,
       badgeClass,
       isOngoing: status === TASK_STATES.PENDING || status === TASK_STATES.ACTIVE
+    };
+  }
+
+  function resolvePhoneConversationPresentation(input = {}) {
+    const conversationRunning = input.conversationRunning === true;
+    const awaitingPlanApproval = input.awaitingPlanApproval === true;
+    const supervisedPresentation = input.supervisedPresentation
+      && typeof input.supervisedPresentation === 'object'
+      ? input.supervisedPresentation
+      : null;
+    const subStatus = compactWhitespace(input.subStatus || '');
+    const executionMode = compactInline(input.executionMode || '').toLowerCase();
+    const liveAgentState = /run_tests|test|verif/i.test(subStatus)
+      ? 'Verifying'
+      : (/running tool/i.test(subStatus) || executionMode === 'executing' || executionMode === 'direct'
+        ? 'Acting'
+        : 'Thinking');
+    const agentState = conversationRunning
+      ? liveAgentState
+      : (awaitingPlanApproval
+        ? 'Review'
+        : (supervisedPresentation ? supervisedPresentation.agentState : 'Ready'));
+    const useSupervisedTaskCard = !!(
+      supervisedPresentation
+      && (supervisedPresentation.isOngoing || !conversationRunning)
+    );
+    return {
+      agentState,
+      detail: conversationRunning
+        ? (subStatus || text(input.workspace))
+        : (supervisedPresentation
+          ? supervisedPresentation.detail
+          : (subStatus || text(input.workspace))),
+      isRunning: conversationRunning || !!(supervisedPresentation && supervisedPresentation.isOngoing),
+      useSupervisedTaskCard
     };
   }
 
@@ -1094,6 +1137,7 @@
     describeTaskStatus,
     pendingTaskNeedsRuntimeQueue,
     selectSupervisedTask,
-    describeSupervisedTaskPresentation
+    describeSupervisedTaskPresentation,
+    resolvePhoneConversationPresentation
   };
 });

@@ -1028,12 +1028,21 @@ function supervisedTaskContext(task, isGlobalRunning = false, globalRunningId = 
       && (!targetConversation.awaitingPlanApprovalTaskId
         || String(targetConversation.awaitingPlanApprovalTaskId) === taskId))
   );
+  const revisingPlan = !!(
+    (originConversation
+      && originConversation.revisingDelegatedPlan
+      && String(originConversation.revisingDelegatedPlan.taskId || '') === taskId)
+    || (targetConversation
+      && targetConversation.planRevisionInProgress
+      && String(targetConversation.planRevisionInProgress.taskId || '') === taskId)
+  );
   return {
     originConversation,
     targetConversation,
     originConversationId,
     targetConversationId,
     awaitingReview,
+    revisingPlan,
     planApproved: !!(targetConversation && targetConversation.planApproved),
     executionMode: live && window.getAgentExecutionMode ? window.getAgentExecutionMode() : '',
     subStatus: live && window.getAgentSubStatus ? window.getAgentSubStatus() : '',
@@ -2533,6 +2542,7 @@ async function queueTaskContinuation(options = {}) {
         continuation: {
           input: explicitContinuationInput,
           source: options.source || 'task-continuation',
+          kind: options.planRevision === true ? 'plan_revision' : '',
           messageId: String(options.originMessageId || ''),
           createdAt: Date.now()
         },
@@ -2570,6 +2580,8 @@ async function queueTaskContinuation(options = {}) {
       images: Array.isArray(existingTask.images) ? existingTask.images : [],
       contextPacketIds: Array.isArray(existingTask.contextPacketIds) ? existingTask.contextPacketIds : []
     };
+    queueItem.planRevision = options.planRevision === true
+      || String(existingTask.continuation && existingTask.continuation.kind || '') === 'plan_revision';
     window.promptQueue = (Array.isArray(window.promptQueue) ? window.promptQueue : [])
       .filter(item => item && item.taskId !== existingTask.taskId);
     window.promptQueue.push(queueItem);
@@ -2644,7 +2656,8 @@ function startOrQueueTaskContinuation(continuation, conv, options = {}) {
       preserveUserPrompt: !!continuation.queueItem.preserveUserPrompt,
       taskId,
       images: continuation.queueItem.images || [],
-      contextPacketIds: continuation.queueItem.contextPacketIds || []
+      contextPacketIds: continuation.queueItem.contextPacketIds || [],
+      planRevision: continuation.queueItem.planRevision === true
     }
   );
 
@@ -2714,6 +2727,7 @@ async function initializeOrchestrationTasks() {
         createdAt: task.createdAt,
         alreadyRendered: true,
         preserveUserPrompt: !!(task.continuation && task.continuation.input),
+        planRevision: String(task.continuation && task.continuation.kind || '') === 'plan_revision',
         images: Array.isArray(task.images) ? task.images : [],
         contextPacketIds: Array.isArray(task.contextPacketIds) ? task.contextPacketIds : []
       });
@@ -4498,6 +4512,8 @@ async function executeSaveConversationsToStorage() {
       awaitingPlanApproval: c.awaitingPlanApproval,
       awaitingPlanApprovalTaskId: c.awaitingPlanApprovalTaskId || '',
       awaitingDelegatedPlan: c.awaitingDelegatedPlan || null,
+      planRevisionInProgress: c.planRevisionInProgress || null,
+      revisingDelegatedPlan: c.revisingDelegatedPlan || null,
       updatedAt: c.updatedAt || Date.now(),
       createdAt: c.createdAt || Date.now(),
       isStub: true, // index always represents stubs
@@ -5029,15 +5045,7 @@ async function submitMessage() {
               conversationId: delegatedPlan.coderConversationId,
               feedback: semanticIntent.resolvedRequest || prompt
             }));
-    if (result && result.success !== false && semanticIntent.intent === 'revise_plan') {
-      markDelegatedPlanMessageState(conv, delegatedPlan.taskId, 'delegatedPlanRevisionRequested');
-      conv.awaitingDelegatedPlan = null;
-      notifyOrionConversation(
-        conv,
-        `I sent your plan feedback to Coder for **${delegatedPlan.title || 'the delegated task'}**. I’ll bring the revised plan back here.`,
-        'supervisor-plan-revision'
-      );
-    } else if (!result || result.success === false) {
+    if (!result || result.success === false) {
       persistAssistantStatusMessage(
         conv.id,
         `Could not apply that plan decision: ${(result && result.error) || 'unknown error'}`,
@@ -6961,6 +6969,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
         targetConversationId: task.target && task.target.conversationId,
         updatedAt: task.updatedAt || task.createdAt || 0,
         awaitingReview: !!(presentation && presentation.awaitingReview),
+        revisingPlan: !!(presentation && presentation.revisingPlan),
         planApproved: !!(presentation && presentation.planApproved),
         executionMode: presentation && presentation.executionMode || '',
         subStatus: presentation && presentation.subStatus || '',
@@ -7608,15 +7617,136 @@ window.denyPhoneCompanionPlan = async (targetId) => {
 };
 
 window.revisePhoneCompanionPlan = async (options) => {
-  const text = typeof options === 'string' ? options.trim() : String(options.feedback || 'Revise the pending plan before implementing.').trim();
-  let targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
-  const targetConv = conversations.find(c => c.id === targetId);
-  if (targetConv && targetConv.awaitingDelegatedPlan) {
-    targetId = targetConv.awaitingDelegatedPlan.coderConversationId;
-    targetConv.awaitingDelegatedPlan = null;
-  }
+  const normalizedOptions = typeof options === 'string' ? { feedback: options } : (options || {});
+  const text = String(normalizedOptions.feedback || 'Revise the pending plan before implementing.').trim();
+  const requestedId = String(normalizedOptions.conversationId || activeConversationId || '');
   if (!text) return { success: false, error: 'Missing revision feedback' };
-  return await window.submitPhoneCompanionPrompt({ prompt: `[Plan revision] ${text}`, conversationId: targetId });
+
+  let originConv = conversations.find(c => c.id === requestedId) || null;
+  let delegatedPlan = originConv && originConv.awaitingDelegatedPlan
+    ? originConv.awaitingDelegatedPlan
+    : null;
+  let targetId = delegatedPlan
+    ? String(delegatedPlan.coderConversationId || '')
+    : requestedId;
+  let targetConv = conversations.find(c => c.id === targetId) || null;
+
+  if (!delegatedPlan && targetConv) {
+    originConv = conversations.find(c =>
+      c
+      && c.awaitingDelegatedPlan
+      && String(c.awaitingDelegatedPlan.coderConversationId || '') === targetId
+      && (!targetConv.awaitingPlanApprovalTaskId
+        || String(c.awaitingDelegatedPlan.taskId || '') === String(targetConv.awaitingPlanApprovalTaskId || ''))
+    ) || null;
+    delegatedPlan = originConv && originConv.awaitingDelegatedPlan
+      ? originConv.awaitingDelegatedPlan
+      : null;
+  }
+
+  const taskId = String(
+    delegatedPlan && delegatedPlan.taskId
+    || targetConv && targetConv.awaitingPlanApprovalTaskId
+    || ''
+  );
+  if (!targetConv || conversationMode(targetConv) !== 'coder') {
+    return { success: false, error: 'The Coder conversation for this plan could not be resolved.' };
+  }
+  if (!taskId || !targetConv.awaitingPlanApproval || targetConv.planApproved) {
+    return { success: false, error: 'No pending implementation plan is available to revise.' };
+  }
+
+  const requesterConversationId = originConv ? originConv.id : targetConv.id;
+  const status = await window.getOrchestrationTaskStatus(taskId, requesterConversationId);
+  if (!status || !status.success || !status.task || status.task.status !== 'pending') {
+    return {
+      success: false,
+      error: (status && status.error)
+        || `Task ${taskId} is not pending, so its plan cannot be revised safely.`
+    };
+  }
+  if (String(status.task.target && status.task.target.conversationId || '') !== targetConv.id) {
+    return { success: false, error: 'The pending plan does not belong to this Coder conversation.' };
+  }
+
+  const revisionPrompt = [
+    '[PLAN REVISION REQUEST - SAME DURABLE TASK]',
+    'Revise the existing implementation plan using the feedback below.',
+    'Do not implement source changes. Do not create a new task. Return the revised plan for approval.',
+    '',
+    text
+  ].join('\n');
+  const continuation = await queueTaskContinuation({
+    taskId,
+    prompt: revisionPrompt,
+    originalUserMessage: text,
+    modelSelectValue: window.getSelectedModel(),
+    targetConversationId: targetConv.id,
+    originConversationId: requesterConversationId,
+    source: 'plan-revision',
+    requireExistingTask: true,
+    alreadyRendered: true,
+    planRevision: true
+  });
+  if (!continuation.success) {
+    return { success: false, error: continuation.error || 'Could not queue the plan revision.' };
+  }
+
+  const revisionState = {
+    taskId,
+    originConversationId: originConv ? originConv.id : '',
+    coderConversationId: targetConv.id,
+    title: String(delegatedPlan && delegatedPlan.title || status.task.title || targetConv.title || 'Coder task'),
+    requestedAt: Date.now()
+  };
+  targetConv.planApproved = false;
+  targetConv.awaitingPlanApproval = false;
+  targetConv.awaitingPlanApprovalTaskId = '';
+  targetConv.planRevisionInProgress = revisionState;
+  if (originConv) {
+    markDelegatedPlanMessageState(originConv, taskId, 'delegatedPlanRevisionRequested');
+    originConv.awaitingDelegatedPlan = null;
+    originConv.revisingDelegatedPlan = revisionState;
+  }
+  if (typeof window.markConversationDirty === 'function') {
+    window.markConversationDirty(targetConv.id);
+    if (originConv) window.markConversationDirty(originConv.id);
+  }
+  await flushConversationsToStorage();
+
+  if (originConv && typeof window.startCoderTaskMonitor === 'function') {
+    window.startCoderTaskMonitor(originConv.id, targetConv.id, taskId);
+  }
+  const launch = startOrQueueTaskContinuation(continuation, targetConv, {
+    source: 'plan-revision',
+    modelSelectValue: window.getSelectedModel(),
+    errorLabel: 'Plan revision'
+  });
+  if (!launch || launch.success === false) {
+    targetConv.planRevisionInProgress = null;
+    targetConv.awaitingPlanApproval = true;
+    targetConv.awaitingPlanApprovalTaskId = taskId;
+    if (originConv) {
+      originConv.revisingDelegatedPlan = null;
+      originConv.awaitingDelegatedPlan = delegatedPlan;
+    }
+    saveConversationsToStorage();
+    return { success: false, error: (launch && launch.error) || 'Could not start the plan revision.' };
+  }
+  if (originConv) {
+    notifyOrionConversation(
+      originConv,
+      `Coder is revising the plan for **${revisionState.title}**. I’ll replace the review card here when the revised plan is ready.`,
+      'supervisor-plan-revision'
+    );
+  }
+  return {
+    ...launch,
+    success: true,
+    revising: true,
+    taskId,
+    taskStatus: launch.queued ? 'pending' : 'active'
+  };
 };
 
 // Mirrors desktop's submitClarificationAnswers (which reads answers directly out of DOM radio
@@ -8736,7 +8866,13 @@ async function relayCoderPlanToDispatch(orionConv, coderConv, taskId) {
     title: orionConv.launchedCoderTaskTitle || coderConv.title || 'Coder task',
     createdAt: Date.now()
   };
+  coderConv.planRevisionInProgress = null;
+  orionConv.revisingDelegatedPlan = null;
   orionConv.awaitingDelegatedPlan = delegatedPlan;
+  if (typeof window.markConversationDirty === 'function') {
+    window.markConversationDirty(coderConv.id);
+    window.markConversationDirty(orionConv.id);
+  }
   notifyOrionConversation(
     orionConv,
     `Coder prepared this implementation plan for **${delegatedPlan.title}**:\n\n${String(planText).trim()}\n\nApprove it here to continue. If you want changes, reply in this Dispatch conversation and I’ll relay the revision to Coder.`,
@@ -8806,6 +8942,7 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
     orionConv.launchedCoderTaskTitle = null;
     orionConv.launchedCoderTaskStart = null;
     orionConv.awaitingDelegatedPlan = null;
+    orionConv.revisingDelegatedPlan = null;
     if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
     if (window.saveConversationsToStorage) window.saveConversationsToStorage();
     return;
@@ -8820,6 +8957,7 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
     orionConv.launchedCoderTaskTitle = null;
     orionConv.launchedCoderTaskStart = null;
     orionConv.awaitingDelegatedPlan = null;
+    orionConv.revisingDelegatedPlan = null;
     if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
     if (window.saveConversationsToStorage) window.saveConversationsToStorage();
     return;
@@ -8900,8 +9038,13 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
   orionConv.launchedCoderTaskTitle = null;
   orionConv.launchedCoderTaskStart = null;
   orionConv.awaitingDelegatedPlan = null;
+  orionConv.revisingDelegatedPlan = null;
+  if (coderConv) coderConv.planRevisionInProgress = null;
   orionConv.updatedAt = Date.now();
-  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+  if (typeof window.markConversationDirty === 'function') {
+    window.markConversationDirty(orionConv.id);
+    if (coderConv) window.markConversationDirty(coderConv.id);
+  }
   if (window.saveConversationsToStorage) window.saveConversationsToStorage();
 }
 

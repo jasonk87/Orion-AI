@@ -22,7 +22,8 @@ const {
   findTaskSupersessions,
   filterSupersededTasks,
   selectSupervisedTask,
-  describeSupervisedTaskPresentation
+  describeSupervisedTaskPresentation,
+  resolvePhoneConversationPresentation
 } = require('../task-orchestration');
 const { OrchestrationTaskStore } = require('../lib/orchestration-task-store');
 const { registerHandlers } = require('../lib/ipc-orchestration');
@@ -594,8 +595,40 @@ test('Dispatch task presentation follows one durable task from queued through pl
   t.equal(selectedReview.taskId, pending.taskId, 'review remains attached to the original task');
   t.equal(review.label, 'Review', 'the same task transitions to Review when the plan arrives');
 
+  const revising = describeSupervisedTaskPresentation(yieldedForReview, { revisingPlan: true });
+  t.equal(revising.label, 'Coder revising plan', 'the same task leaves Review while Coder applies revision feedback');
+  t.equal(revising.phase, 'revising-plan', 'plan revision has an explicit presentation phase');
+
   const implementing = describeSupervisedTaskPresentation(active, { planApproved: true });
   t.equal(implementing.label, 'Coder implementing', 'approved active work is presented as Coder implementing');
+  t.end();
+});
+
+test('live phone conversation state outranks a previous terminal Coder task', t => {
+  for (const terminal of [
+    { agentState: 'Complete', detail: 'Coder recorded this task as completed.', isOngoing: false },
+    { agentState: 'Cancelled', detail: 'This Coder task was cancelled.', isOngoing: false }
+  ]) {
+    const talking = resolvePhoneConversationPresentation({
+      conversationRunning: true,
+      supervisedPresentation: terminal,
+      subStatus: 'Calling model API',
+      executionMode: 'planning'
+    });
+    t.equal(talking.agentState, 'Thinking', `${terminal.agentState} cannot override a live Dispatch response`);
+    t.equal(talking.detail, 'Calling model API', 'live conversation detail replaces terminal task detail');
+    t.equal(talking.useSupervisedTaskCard, false, 'the current-task card stops presenting stale terminal work while Dispatch is live');
+  }
+
+  const idle = resolvePhoneConversationPresentation({
+    conversationRunning: false,
+    supervisedPresentation: {
+      agentState: 'Complete',
+      detail: 'Coder recorded this task as completed.',
+      isOngoing: false
+    }
+  });
+  t.equal(idle.agentState, 'Complete', 'terminal task history remains visible once the conversation is actually idle');
   t.end();
 });
 
@@ -788,6 +821,16 @@ test('store rejects lifecycle bypasses and provenance rewrites', async t => {
   t.equal(provenanceError && provenanceError.code, 'IMMUTABLE_TASK_PROVENANCE', 'ownership provenance cannot be reassigned');
   const updated = await store.update('task_guarded_update', { title: 'Clarified task title' });
   t.equal(updated.title, 'Clarified task title', 'safe descriptive metadata remains editable before completion');
+  const revisionContinuation = await store.update('task_guarded_update', {
+    continuation: {
+      input: 'Revise the plan using the task-bound feedback.',
+      source: 'plan-revision',
+      kind: 'plan_revision',
+      createdAt: 9400
+    }
+  });
+  t.equal(revisionContinuation.continuation.kind, 'plan_revision',
+    'typed plan-revision continuation state survives store normalization');
   const active = await store.transition('task_guarded_update', TASK_STATES.ACTIVE);
   await store.transition('task_guarded_update', TASK_STATES.COMPLETED, {
     result: 'done',
