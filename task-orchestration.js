@@ -892,14 +892,20 @@
     return tasks.filter(task => !supersededIds.has(task.taskId));
   }
 
-  function selectSupervisedTask(tasksValue, viewingConversationIdValue, activeTaskIdValue = '') {
+  function selectSupervisedTask(tasksValue, viewingConversationIdValue, activeTaskIdValue = '', options = {}) {
     const viewingConversationId = compactInline(viewingConversationIdValue);
     const activeTaskId = compactInline(activeTaskIdValue);
+    const delegatedOnly = options.delegatedOnly === true;
     const tasks = filterSupersededTasks(tasksValue)
       .filter(task => {
         if (!viewingConversationId) return false;
         const originConversationId = taskConversationId(task, 'origin');
         const targetConversationId = taskConversationId(task, 'target');
+        if (delegatedOnly) {
+          return originConversationId === viewingConversationId
+            && !!targetConversationId
+            && targetConversationId !== viewingConversationId;
+        }
         return targetConversationId === viewingConversationId
           || (originConversationId === viewingConversationId
             && !!targetConversationId

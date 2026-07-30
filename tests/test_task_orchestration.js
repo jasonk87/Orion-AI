@@ -632,6 +632,37 @@ test('live phone conversation state outranks a previous terminal Coder task', t 
   t.end();
 });
 
+test('Dispatch supervision excludes same-conversation Orion queue records', t => {
+  const directDispatchTask = normalizeTaskRecord(baseTask({
+    taskId: 'task_dispatch_chat',
+    title: 'You stuck?',
+    status: TASK_STATES.COMPLETED,
+    origin: { conversationId: 'dispatch-1', sessionId: 'dispatch-1', messageId: 'm-chat' },
+    target: { conversationId: 'dispatch-1', sessionId: 'dispatch-1', mode: 'orion' },
+    source: 'phone'
+  }));
+  const delegatedCoderTask = normalizeTaskRecord(baseTask({
+    taskId: 'task_delegated_coder',
+    title: 'Real Coder work',
+    status: TASK_STATES.PENDING,
+    origin: { conversationId: 'dispatch-1', sessionId: 'dispatch-1', messageId: 'm-work' },
+    target: { conversationId: 'coder-1', sessionId: 'coder-1', mode: 'coder' },
+    source: 'dispatch-handoff'
+  }));
+
+  t.equal(
+    selectSupervisedTask([directDispatchTask], 'dispatch-1', '', { delegatedOnly: true }),
+    null,
+    'a direct Orion queue record cannot present itself as Coder queued or complete'
+  );
+  t.equal(
+    selectSupervisedTask([directDispatchTask, delegatedCoderTask], 'dispatch-1', '', { delegatedOnly: true }).taskId,
+    delegatedCoderTask.taskId,
+    'real cross-conversation Coder work remains visible in Dispatch'
+  );
+  t.end();
+});
+
 test('newer continuation tasks supersede exact pending predecessors without title guessing', t => {
   const predecessor = normalizeTaskRecord(baseTask({
     taskId: 'task_polish_original',

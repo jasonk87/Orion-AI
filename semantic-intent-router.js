@@ -317,6 +317,17 @@
     }
   }
 
+  function canRespondDuringActiveRun(classification, mode = 'orion') {
+    if (String(mode || '').toLowerCase() !== 'orion'
+        || !classification
+        || typeof classification !== 'object') return false;
+    return classification.requiresExecution !== true
+      && ['conversation', 'status_check'].includes(classification.intent)
+      && ['none', 'current_conversation', 'active_owned_task'].includes(
+        classification.target || 'none'
+      );
+  }
+
   const api = {
     INTENTS,
     TARGETS,
@@ -324,7 +335,8 @@
     buildClassifierPrompt,
     normalizeClassification,
     safeFallback,
-    classify
+    classify,
+    canRespondDuringActiveRun
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   if (globalScope) globalScope.OrionSemanticIntentRouter = api;

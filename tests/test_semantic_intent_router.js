@@ -343,3 +343,30 @@ test('classifier failures fall back without execution or mutation', async t => {
   t.equal(bound.requiresExecution, false, 'the fallback cannot steer or cancel');
   t.end();
 });
+
+test('active-run routing keeps conversation out of the durable execution queue', t => {
+  t.equal(
+    router.canRespondDuringActiveRun(classification('conversation'), 'orion'),
+    true,
+    'ordinary conversation can use the concurrent Dispatch response path'
+  );
+  t.equal(
+    router.canRespondDuringActiveRun(classification('status_check'), 'orion'),
+    true,
+    'a non-mutating status question can use the concurrent Dispatch response path'
+  );
+  t.equal(
+    router.canRespondDuringActiveRun(classification('new_task', {
+      requiresExecution: true,
+      executionScope: 'mutating'
+    }), 'orion'),
+    false,
+    'executable work still enters the durable queue while another run owns execution'
+  );
+  t.equal(
+    router.canRespondDuringActiveRun(classification('conversation'), 'coder'),
+    false,
+    'Coder conversations do not bypass the single execution owner'
+  );
+  t.end();
+});

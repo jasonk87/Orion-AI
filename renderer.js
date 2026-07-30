@@ -1055,7 +1055,8 @@ function getSupervisedTaskForConversation(conversationId, activeTaskId = '') {
   return RendererTaskOrchestration.selectSupervisedTask(
     [...orchestrationTaskCache.values()],
     conversationId,
-    activeTaskId
+    activeTaskId,
+    { delegatedOnly: true }
   );
 }
 
@@ -5132,6 +5133,19 @@ async function submitMessage() {
         return;
       }
 
+      if (conversationMode(conv) === 'orion'
+          && RendererSemanticIntentRouter
+          && RendererSemanticIntentRouter.canRespondDuringActiveRun(semanticIntent, 'orion')) {
+        await respondOrionConversationally(conv, prompt, selectedModel, {
+          messageId: currentMessageId,
+          images: imagesToSend,
+          semanticIntent,
+          statusCheckin: semanticIntent.intent === 'status_check'
+            && semanticIntent.target === 'active_owned_task'
+        });
+        return;
+      }
+
       // Default: queue as normal
       const queued = pendingReplyTaskId
         ? await queueTaskContinuation({
@@ -6990,7 +7004,8 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     ? RendererTaskOrchestration.selectSupervisedTask(
         orchestrationTasks,
         resolvedId,
-        globalActiveTaskId
+        globalActiveTaskId,
+        { delegatedOnly: !!(conv && conversationMode(conv) === 'orion') }
       )
     : orchestrationTasks.find(task => task.status === 'active')
       || orchestrationTasks.find(task => task.status === 'pending')
@@ -7371,6 +7386,44 @@ async function submitPhoneCompanionPromptOnce(options) {
         };
       }
       return { success: true, queued: false, conversationId: targetId, title: conv.title || 'New Conversation' };
+    }
+
+    if (conversationMode(conv) === 'orion'
+        && RendererSemanticIntentRouter
+        && RendererSemanticIntentRouter.canRespondDuringActiveRun(semanticIntent, 'orion')) {
+      const messageId = createConversationMessageId(conv.id);
+      conv.messages.push({
+        id: messageId,
+        role: 'user',
+        source: 'phone',
+        text,
+        createdAt: Date.now(),
+        ...(phoneImages.length ? { images: phoneImages } : {})
+      });
+      if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+      saveConversationsToStorage();
+      if (targetId === activeConversationId) renderUserMessage(text, phoneImages, Date.now());
+      const conversationalResult = await respondOrionConversationally(
+        conv,
+        text,
+        window.getSelectedModel(),
+        {
+          source: 'phone',
+          images: phoneImages,
+          messageId,
+          semanticIntent,
+          statusCheckin: semanticIntent.intent === 'status_check'
+            && semanticIntent.target === 'active_owned_task'
+        }
+      );
+      return {
+        success: conversationalResult.success !== false,
+        queued: false,
+        replyText: conversationalResult.replyText || '',
+        error: conversationalResult.error || '',
+        conversationId: targetId,
+        title: conv.title || 'New Conversation'
+      };
     }
 
     const messageId = createConversationMessageId(conv.id);
@@ -8453,9 +8506,18 @@ async function respondOrionConversationally(orionConv, prompt, model, options = 
   const statusGuidance = options.statusCheckin
     ? '\n\nThe user is checking on Coder. Answer naturally in one short progress update using only the Coder task status supplied below. Summarize what is complete, what is happening now, and what remains when those facts are available. Do not print raw JSON, tool-call payloads, internal thoughts, or a mechanical field dump. Do not guess percentages or claim completion that is not recorded.'
     : '';
-  const systemPrompt = `You are Orion, an AI supervisor. You are having a conversation with the user while a separate Coder agent works on a task in the background. Answer the user's question conversationally and helpfully. Do not tell the user to wait for the coder to finish — you can talk freely. Be concise and direct. Never invent a remembered conversation or upgrade a reported status.${statusGuidance}${workspaceDescription ? `\n\nWorkspace state: ${workspaceDescription}` : ''}${coderContext}`;
+  const concurrencyGuidance = coderContext
+    ? ' A separate Coder agent is working in the background; its verified status is supplied below. You can still talk freely.'
+    : ' Another response may still be finishing, but no owned Coder status is supplied. Do not claim that a Coder task exists.';
+  const systemPrompt = `You are Orion, an AI supervisor. Answer the user's current message conversationally and helpfully.${concurrencyGuidance} Be concise and direct. Never invent a remembered conversation or upgrade a reported status.${statusGuidance}${workspaceDescription ? `\n\nWorkspace state: ${workspaceDescription}` : ''}${coderContext}`;
 
-  if (typeof window.clearActiveAiBubble === 'function') window.clearActiveAiBubble();
+  const runningConversationId = window.getRunningConversationId
+    ? String(window.getRunningConversationId() || '')
+    : '';
+  if (runningConversationId !== String(orionConv.id || '')
+      && typeof window.clearActiveAiBubble === 'function') {
+    window.clearActiveAiBubble();
+  }
 
   try {
     if (!RendererSupervisorOrchestration || !RendererOrchestrationContracts) {

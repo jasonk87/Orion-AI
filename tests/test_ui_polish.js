@@ -562,6 +562,14 @@ test('supervisor conversational failures persist honestly and propagate to phone
     phonePath.includes("error: supervisorResult.error || 'Supervisor response failed.'"),
     'phone submit returns the real supervisor failure'
   );
+  t.ok(
+    (renderer.match(/RendererSemanticIntentRouter\.canRespondDuringActiveRun\(semanticIntent, 'orion'\)/g) || []).length >= 2,
+    'desktop and phone both preserve conversational replies while another execution owns the runtime'
+  );
+  t.ok(
+    responsePath.includes("runningConversationId !== String(orionConv.id || '')"),
+    'a concurrent same-conversation reply does not clear the active run bubble'
+  );
   t.end();
 });
 
