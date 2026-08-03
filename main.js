@@ -17,7 +17,6 @@ const ipcMemory = require('./lib/ipc-memory');
 const ipcDatabase = require('./lib/ipc-database');
 const ipcOrchestration = require('./lib/ipc-orchestration');
 const conversationMemory = require('./lib/conversation-memory');
-let lastConversationWriteRevision = 0;
 const MAX_PERSISTED_TOOL_PAYLOAD_CHARS = 250000;
 
 function trimPersistedToolPayload(value) {
@@ -87,6 +86,86 @@ function sanitizeConversationForPersistence(conversation) {
   };
 }
 
+// ── Crash safety ───────────────────────────────────────────────────────────────
+// Orion runs multi-minute agent loops that hold live run state in the renderer.
+// Before this, one unhandled rejection in main ended the whole process (Node's
+// default since v15) and a renderer crash left a dead window — both lost the run
+// with no record of why. Nothing here is fatal: faults are appended to a crash log,
+// surfaced to the user, and the renderer is reloaded instead of abandoned.
+
+const MAX_RENDERER_RELOADS = 3;
+const RENDERER_RELOAD_WINDOW_MS = 60000;
+const rendererReloadTimestamps = [];
+
+// Shared with the lib modules so every swallowed fault, main-process crash, and renderer
+// fault lands in ONE file (userData/logs/crash.log) instead of three places to check.
+const { recordSwallowedFault, describe: describeFault } = require('./lib/fault-log');
+
+function appendCrashLog(scope, detail) {
+  return recordSwallowedFault(scope, detail);
+}
+
+function notifyFault(title, body) {
+  try {
+    if (Notification && typeof Notification.isSupported === 'function' && Notification.isSupported()) {
+      new Notification({ title, body: String(body).split('\n')[0].slice(0, 240) }).show();
+    }
+  } catch (_) { /* notifications are best-effort; never let one mask the fault */ }
+}
+
+function reportFault(scope, value, options = {}) {
+  const detail = describeFault(value);
+  appendCrashLog(scope, detail); // also writes the console line
+  if (options.notify !== false) notifyFault(options.title || 'Orion hit an internal error', detail);
+  // Tell the renderer so the fault lands in the conversation instead of looking like a hang.
+  try {
+    if (shared.mainWindow && !shared.mainWindow.isDestroyed()) {
+      shared.mainWindow.webContents.send('orion:main-fault', { scope, detail });
+    }
+  } catch (_) { /* the renderer may be the thing that just died */ }
+  return detail;
+}
+
+// Pure so the reload-loop guard is unit testable without crashing a real renderer.
+function shouldReloadCrashedRenderer(timestamps, now = Date.now()) {
+  const recent = timestamps.filter(at => now - at < RENDERER_RELOAD_WINDOW_MS);
+  timestamps.length = 0;
+  timestamps.push(...recent, now);
+  return timestamps.length <= MAX_RENDERER_RELOADS;
+}
+
+function installProcessCrashHandlers() {
+  process.on('unhandledRejection', reason => {
+    reportFault('unhandledRejection', reason, { title: 'Orion recovered from an internal error' });
+  });
+  process.on('uncaughtException', error => {
+    // Staying alive with a visible, logged error beats vanishing mid-run.
+    reportFault('uncaughtException', error, { title: 'Orion recovered from an internal error' });
+  });
+}
+
+function installRendererCrashRecovery() {
+  app.on('render-process-gone', (event, webContents, details) => {
+    const detail = `renderer gone (reason=${details && details.reason}, exitCode=${details && details.exitCode})`;
+    reportFault('render-process-gone', detail, { notify: false });
+    if (!shouldReloadCrashedRenderer(rendererReloadTimestamps)) {
+      notifyFault('Orion could not recover', 'The window crashed repeatedly. Restart Orion; conversations are saved on disk.');
+      return;
+    }
+    notifyFault('Orion window crashed — reloading', 'Your conversations are saved. Reopening the last state now.');
+    try {
+      if (shared.mainWindow && !shared.mainWindow.isDestroyed()) shared.mainWindow.reload();
+      else createWindow();
+    } catch (error) {
+      reportFault('render-process-recovery', error);
+    }
+  });
+
+  app.on('child-process-gone', (event, details) => {
+    reportFault('child-process-gone', `${details && details.type} gone (reason=${details && details.reason})`, { notify: false });
+  });
+}
+
 // ── Window creation ────────────────────────────────────────────────────────────
 
 function createWindow() {
@@ -135,6 +214,14 @@ function registerAllHandlers() {
 
   const { runLinter } = require('./lib/run-linter');
   const { requestWorkspaceIndex } = require('./lib/workspace-index-client');
+
+  // The renderer's global error traps report here so browser-side faults land in the
+  // same crash log as main-process ones. Renderer-only failures are the class Node
+  // tests cannot see, so an on-disk record is the only post-hoc evidence available.
+  ipcMain.on('orion:report-renderer-fault', (event, payload = {}) => {
+    const scope = `renderer:${String(payload.kind || 'error').slice(0, 40)}`;
+    appendCrashLog(scope, String(payload.detail || '').slice(0, 8000));
+  });
 
   ipcMain.handle('orion:run-linter', async (event, args) => {
     return await runLinter(args.workspacePath, args.linterType, args.targetPath);
@@ -269,6 +356,9 @@ function registerAllHandlers() {
 // ── App lifecycle ──────────────────────────────────────────────────────────────
 
 const isTestRuntime = process.env.NODE_ENV === 'test';
+// Registered outside the test runtime only: the suite installs and asserts on its own
+// uncaughtException listeners, and a permanent handler would swallow real test failures.
+if (!isTestRuntime) installProcessCrashHandlers();
 if (!isTestRuntime && process.platform === 'win32' && typeof app.setAppUserModelId === 'function') {
   app.setAppUserModelId('orion-ai');
 }
@@ -287,6 +377,7 @@ if (!isTestRuntime && !gotTheLock) {
     if (!isTestRuntime && await ipcUi.checkForSourceUpdatesAndRelaunch()) return;
 
     registerAllHandlers();
+    installRendererCrashRecovery();
     createWindow();
     if (!isTestRuntime) {
       try {
@@ -381,6 +472,13 @@ if (process.env.NODE_ENV === 'test') {
     applyLocalSourceUpdateAndRestart: ipcUi.applyLocalSourceUpdateAndRestart,
     AUTO_UPDATE_FILES: ipcUi.AUTO_UPDATE_FILES,
     sanitizeConversationForPersistence,
+    // crash safety
+    describeFault,
+    shouldReloadCrashedRenderer,
+    installProcessCrashHandlers,
+    installRendererCrashRecovery,
+    MAX_RENDERER_RELOADS,
+    RENDERER_RELOAD_WINDOW_MS,
     // safety / shared
     resolveWorkspacePath,
     classifyCommandRequest,

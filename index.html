@@ -489,6 +489,96 @@
   </div>
 
   <!-- SCRIPTS -->
+  <!--
+    Crash trap. Loaded before every app script on purpose: a top-level throw in any of
+    them (an unescaped backtick in a prompt literal, a duplicate top-level const) aborts
+    that whole file, and the app used to sit on "Agent engine is loading..." forever with
+    the real cause only in a devtools console nobody had open. This is deliberately
+    self-contained — no helpers, no styles.css — because the scripts that provide those
+    are exactly what may have just failed.
+  -->
+  <script>
+    (function () {
+      window.__orionFaults = [];
+
+      function banner(title, detail) {
+        try {
+          var id = 'orion-fault-banner';
+          var box = document.getElementById(id);
+          if (!box) {
+            box = document.createElement('div');
+            box.id = id;
+            box.setAttribute('role', 'alert');
+            box.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:99999;max-height:45vh;overflow:auto;' +
+              'background:#2a1416;color:#ffd9dc;border-top:2px solid #e5484d;padding:12px 16px;' +
+              'font:12px/1.5 Consolas,monospace;white-space:pre-wrap;-webkit-app-region:no-drag';
+            var close = document.createElement('button');
+            close.textContent = 'Dismiss';
+            close.style.cssText = 'float:right;background:#e5484d;color:#fff;border:0;border-radius:4px;padding:4px 10px;cursor:pointer';
+            close.onclick = function () { box.remove(); };
+            box.appendChild(close);
+            var body = document.createElement('div');
+            body.id = id + '-body';
+            box.appendChild(body);
+            (document.body || document.documentElement).appendChild(box);
+          }
+          var body2 = document.getElementById(id + '-body');
+          if (body2) body2.textContent += (body2.textContent ? '\n\n' : '') + title + '\n' + detail;
+        } catch (_) { /* the DOM itself may be unusable; the IPC report below still runs */ }
+      }
+
+      function record(kind, title, detail) {
+        detail = String(detail || '').slice(0, 8000);
+        window.__orionFaults.push({ kind: kind, detail: detail, at: Date.now() });
+        try { console.error('[orion:' + kind + ']', detail); } catch (_) {}
+        try { if (window.api && window.api.reportRendererFault) window.api.reportRendererFault(kind, detail); } catch (_) {}
+        banner(title, detail);
+      }
+
+      // renderer.js reuses this so a failed init step reports through the same banner and
+      // crash log as an uncaught error, instead of inventing a second reporting path.
+      window.__orionReportFault = record;
+
+      window.addEventListener('error', function (event) {
+        if (event && event.target && event.target !== window && event.target.src) {
+          record('script-load', 'Orion failed to load a script', 'Could not load ' + event.target.src);
+          return;
+        }
+        var err = event && event.error;
+        record('error', 'Orion hit a script error',
+          (err && (err.stack || err.message)) || (event && event.message) ||
+          'Unknown error at ' + (event && event.filename) + ':' + (event && event.lineno));
+      }, true);
+
+      window.addEventListener('unhandledrejection', function (event) {
+        var reason = event && event.reason;
+        record('unhandledrejection', 'Orion hit an unhandled promise rejection',
+          (reason && (reason.stack || reason.message)) || String(reason));
+      });
+
+      // Boot assertion for the documented failure mode: scripts "load" but the engine
+      // never attaches, so the desktop queues messages forever and the phone reports
+      // "window.runAgentLoop is not a function". Say so instead of hanging.
+      window.addEventListener('load', function () {
+        setTimeout(function () {
+          if (typeof window.runAgentLoop !== 'function') {
+            record('boot', 'Orion agent engine did not start',
+              'window.runAgentLoop is not a function after load. An app script threw while loading — ' +
+              'the first error above is the root cause. Conversations on disk are unaffected.');
+          }
+        }, 3000);
+      });
+
+      // Main-process faults surface here too, so a backend failure is visible in the UI.
+      try {
+        if (window.api && window.api.onMainFault) {
+          window.api.onMainFault(function (payload) {
+            banner('Orion main process: ' + (payload && payload.scope), (payload && payload.detail) || '');
+          });
+        }
+      } catch (_) {}
+    })();
+  </script>
   <script src="node_modules/marked/marked.min.js"></script>
   <script src="node_modules/prismjs/prism.js"></script>
   <script src="node_modules/prismjs/components/prism-javascript.min.js"></script>

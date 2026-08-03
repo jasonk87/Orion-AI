@@ -283,3 +283,79 @@ test('the reactive per-file escalation and proactive deep-task upgrade both use 
     'the reactive escalation no longer gates on a hardcoded gemini-only check');
   t.end();
 });
+
+// Regression: DeepSeek rejects the ENTIRE request with
+//   HTTP 400 "Invalid assistant message: content or tool_calls must be set"
+// if any assistant message carries neither. This killed a live task mid-run.
+//
+// The cause was a coupling that was easy to miss: content used to be derived as
+//   joinedText || (reasoningContent ? "" : null)
+// so reasoningContent was silently doing double duty as "does this turn have any substance".
+// When prior-turn reasoning stopped being replayed (to stop each request growing larger than
+// the last), older text-free turns collapsed to content:null with no tool_calls.
+//
+// This asserts the provider's invariant directly, across every history shape, so the two
+// concerns can never be coupled again.
+test('every assistant message sent to DeepSeek satisfies content-or-tool_calls', (t) => {
+  const reasoningPart = { text: 'internal chain of thought', thought: true, _deepseekReasoningContent: true };
+  const callPart = { functionCall: { name: 'grep_search', args: { pattern: 'x' } } };
+
+  const histories = {
+    'text only': [{ role: 'model', parts: [{ text: 'Here is the answer.' }] }],
+    'reasoning only, no text, no tools': [{ role: 'model', parts: [reasoningPart] }],
+    'tool call with no text': [{ role: 'model', parts: [callPart] }],
+    'reasoning plus tool call': [{ role: 'model', parts: [reasoningPart, callPart] }],
+    'completely empty parts': [{ role: 'model', parts: [] }],
+    'missing parts entirely': [{ role: 'model' }],
+    'older reasoning-only turn followed by a newer turn': [
+      { role: 'model', parts: [reasoningPart] },
+      { role: 'user', parts: [{ text: 'and then?' }] },
+      { role: 'model', parts: [{ text: 'final' }, reasoningPart] }
+    ],
+    'several stacked reasoning-only turns': [
+      { role: 'model', parts: [reasoningPart] },
+      { role: 'model', parts: [reasoningPart] },
+      { role: 'model', parts: [reasoningPart] }
+    ]
+  };
+
+  for (const [label, history] of Object.entries(histories)) {
+    const converted = agent.convertGeminiToDeepSeekMessages(history);
+    const assistants = converted.filter(m => m.role === 'assistant');
+    t.ok(assistants.length > 0, `${label}: produces at least one assistant message`);
+    for (const msg of assistants) {
+      const hasContent = typeof msg.content === 'string';
+      const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+      t.ok(hasContent || hasToolCalls,
+        `${label}: assistant message has content or tool_calls (content=${JSON.stringify(msg.content)}, tools=${hasToolCalls})`);
+      // content:null is legal when tool_calls carry the turn — it is only fatal when the
+      // message has neither, which is the case the guard above covers.
+      if (!hasToolCalls) {
+        t.notEqual(msg.content, null, `${label}: a tool-less assistant message never sends null content`);
+      }
+    }
+  }
+  t.end();
+});
+
+test('only the newest turn replays full reasoning, but tool-call turns keep the field', (t) => {
+  const reasoningPart = { text: 'a very long chain of thought', thought: true, _deepseekReasoningContent: true };
+  const callPart = { functionCall: { name: 'read_file', args: { path: 'a.js' } } };
+  const history = [
+    { role: 'model', parts: [reasoningPart, callPart] },
+    { role: 'tool', parts: [{ functionResponse: { name: 'read_file', response: { ok: true } } }] },
+    { role: 'model', parts: [reasoningPart, { text: 'done' }] }
+  ];
+
+  const assistants = agent.convertGeminiToDeepSeekMessages(history).filter(m => m.role === 'assistant');
+  t.equal(assistants.length, 2, 'both assistant turns are present');
+
+  // The older tool-call turn must still carry the field — DeepSeek requires it on tool-call
+  // turns — but not the full earlier transcript, which is what was inflating every request.
+  t.ok(assistants[0].reasoning_content, 'the older tool-call turn keeps a reasoning_content field');
+  t.notEqual(assistants[0].reasoning_content, 'a very long chain of thought',
+    'the older turn does not replay its full chain of thought');
+  t.equal(assistants[1].reasoning_content, 'a very long chain of thought',
+    'the newest turn replays its reasoning verbatim');
+  t.end();
+});

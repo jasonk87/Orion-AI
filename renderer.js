@@ -212,23 +212,67 @@ let agentPresenceTimer = null;
 let agentCompletionTimer = null;
 
 // INITIALIZE APP
-document.addEventListener('DOMContentLoaded', async () => {
-  setupWindowControls();
-  await loadSettings();
-  await refreshAppRuntimeInfo();
-  try { cachedUserDataPath = await window.api.getUserDataPath(); } catch (_) {}
-  setupSettingsModal();
-  setupFileViewerModal();
-  setupOperationalContextEditor();
-  setupWorkspaceHandlers();
-  setupStartActions();
-  setupEntrypointControls();
-  setupProgressiveDisclosure();
-  setupRightSidebarToggle();
-  setupChatHandlers();
-  initUpdateChecker();
-  initImageAttach();
+// Boot used to be one unguarded sequence, and `await loadSettings()` was its second
+// statement. When that threw — window.api missing because the preload bridge did not load,
+// a malformed config on disk — the rejection skipped EVERY remaining step: workspace
+// handlers, chat wiring, the update checker, image attach, every button binding. The window
+// still rendered, so it looked like a hang rather than a failure.
+//
+// Each step is now independent. A step that fails is reported through the same banner and
+// crash log as any other fault, and the rest of the UI still wires up.
+async function runInitStep(label, step) {
+  try {
+    await step();
+    return true;
+  } catch (error) {
+    const detail = (error && (error.stack || error.message)) || String(error);
+    if (typeof window.__orionReportFault === 'function') {
+      window.__orionReportFault(`init:${label}`, `Orion could not finish starting up (${label})`, detail);
+    } else {
+      console.error(`[orion:init:${label}]`, detail);
+    }
+    return false;
+  }
+}
 
+document.addEventListener('DOMContentLoaded', async () => {
+  // window.api is the renderer's only route to the main process. Without it every step
+  // below fails the same way, so say that once and plainly instead of emitting a dozen
+  // identical "Cannot read properties of undefined" traces.
+  if (!window.api && typeof window.__orionReportFault === 'function') {
+    window.__orionReportFault(
+      'preload-bridge-missing',
+      'Orion cannot reach its main process',
+      'window.api is unavailable, so settings, workspaces, and chat cannot start. This means ' +
+      'preload.js did not load. Restart Orion; your conversations on disk are unaffected.'
+    );
+  }
+
+  await runInitStep('window-controls', setupWindowControls);
+  await runInitStep('settings', loadSettings);
+  await runInitStep('runtime-info', refreshAppRuntimeInfo);
+  try { cachedUserDataPath = await window.api.getUserDataPath(); } catch (_) {}
+  await runInitStep('settings-modal', setupSettingsModal);
+  await runInitStep('file-viewer', setupFileViewerModal);
+  await runInitStep('operational-context', setupOperationalContextEditor);
+  await runInitStep('workspace-handlers', setupWorkspaceHandlers);
+  await runInitStep('start-actions', setupStartActions);
+  await runInitStep('entrypoint-controls', setupEntrypointControls);
+  await runInitStep('progressive-disclosure', setupProgressiveDisclosure);
+  await runInitStep('right-sidebar', setupRightSidebarToggle);
+  await runInitStep('chat-handlers', setupChatHandlers);
+  await runInitStep('update-checker', initUpdateChecker);
+  await runInitStep('image-attach', initImageAttach);
+
+  // The inline bindings below were the one part of boot still running unguarded. A throw here
+  // produced an unhandled rejection that killed the rest of startup silently — the same class
+  // of failure the runInitStep wrapping above was added to stop. Wrapped as one step because
+  // these are all button bindings: if the markup is intact they all succeed, and if it is not,
+  // the fault is reported once with the real cause.
+  await runInitStep('inline-bindings', () => bindInlineControls());
+});
+
+async function bindInlineControls() {
   // Bind manual task checklist add button
   const btnAddTaskManual = document.getElementById('btn-add-task-manual');
   if (btnAddTaskManual) {
@@ -298,7 +342,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   startDispatchDraft({ coldLaunch: true });
   refreshPhoneCompanionPairing();
   removeLegacyPhoneCompanionTokenBubbles();
-});
+}
 
 // --- ELECTRON WINDOW BINDINGS ---
 function setupWindowControls() {
@@ -717,7 +761,11 @@ function setupSettingsModal() {
     if (el.settingPhoneHttpsOrigin) el.settingPhoneHttpsOrigin.value = normalizedPhoneHttpsOrigin;
     appConfig.modelCallDelayMs = el.settingModelCallDelay ? Math.min(Math.max(parseInt(el.settingModelCallDelay.value) || 0, 0), 60000) : (appConfig.modelCallDelayMs || 0);
     appConfig.compactThresholdTokens = parseInt(el.settingCompactThreshold.value) || 100000;
-    appConfig.autoTest = el.settingAutoTest ? el.settingAutoTest.checked : true;
+    // Preserve the stored value when the control is absent. The settings modal no longer renders
+    // an auto-test checkbox, and falling back to `true` meant every settings save silently
+    // re-enabled auto-test — a setting agent.js still acts on in five places, that the user has
+    // no way to turn off. Missing UI must not overwrite configuration.
+    appConfig.autoTest = el.settingAutoTest ? el.settingAutoTest.checked : appConfig.autoTest;
     appConfig.planningMode = el.settingPlanningMode.checked;
     
     await window.api.writeConfig(appConfig);
@@ -5821,9 +5869,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     }
     
     const executionMode = window.getAgentExecutionMode ? window.getAgentExecutionMode() : 'planning';
-    const statusLabel = isApproved || executionMode === 'direct' || executionMode === 'executing' || executionMode === 'answer'
-      ? `Working (Step ${stepNum})...`
-      : `Preparing implementation plan (Step ${stepNum})...`;
+    const statusLabel = buildAgentStatusLabel(executionMode, stepNum, isApproved);
       
     const subStatus = window.getAgentSubStatus ? window.getAgentSubStatus() : '';
     const displayLabel = subStatus ? `${statusLabel} — ${subStatus}` : statusLabel;
@@ -6182,10 +6228,37 @@ async function runRegressionTests() {
   const result = await window.api.runCommand(getEffectiveTestCommand(), currentWorkspace, processId, appConfig.commandTimeoutMs || 120000);
   cleanListener();
   
-  const success = result.code === 0;
+  // `result.code === 0` alone collapsed four very different outcomes into "tests failed":
+  // a genuine failure, a timeout, a killed process, and a runner that never started. The agent
+  // saw `{success:false, output:"........"}` — passing pytest dots with no explanation — and
+  // could not tell "my change broke tests" from "the command never ran", so it re-ran tests
+  // through run_command instead of trusting its own tool.
+  const exitCode = result.code;
+  const neverRan = !!result.error || exitCode === null || exitCode === undefined;
+  const success = exitCode === 0 && !result.timedOut && !result.killed && !result.error;
+
+  let outcome = 'passed';
+  if (result.timedOut) outcome = 'timed_out';
+  else if (result.killed) outcome = 'killed';
+  else if (neverRan) outcome = 'did_not_run';
+  else if (!success) outcome = 'failed';
+
+  const command = getEffectiveTestCommand();
+  const diagnosis = {
+    passed: '',
+    failed: `The test command exited with code ${exitCode}. This is a real test failure — read the output above.`,
+    timed_out: `The test command did not finish within ${appConfig.commandTimeoutMs || 120000}ms and was stopped. This is NOT a test failure; the suite may just be slow, or the command may be waiting on input.`,
+    killed: 'The test process was stopped before it finished. This is NOT a test failure.',
+    did_not_run: `The test command could not be run${result.error ? ` (${result.error})` : ''}. This is NOT a test failure — check that \`${command}\` is the right command for this workspace.`
+  }[outcome];
+
   const testRunInfo = {
-    output: testOutput || result.error || `Exit code: ${result.code}`,
-    success: success,
+    output: [testOutput, diagnosis].filter(Boolean).join('\n\n') || `Exit code: ${exitCode}`,
+    success,
+    outcome,
+    ranToCompletion: !neverRan && !result.timedOut && !result.killed,
+    exitCode: exitCode === undefined ? null : exitCode,
+    command,
     timedOut: !!result.timedOut,
     timestamp: Date.now()
   };
@@ -9286,3 +9359,34 @@ function hideCoderStatusCard() {
   const card = document.getElementById('coder-task-status-card');
   if (card) card.classList.remove('visible');
 }
+
+// The label shown on the live progress pill.
+//
+// 'analyzing' is the pre-classification window — the run has started but the request has not
+// been read yet. It used to fall through to "Preparing implementation plan", which was a guess
+// made before Orion knew what was asked, so a plain "how are you doing?" displayed a
+// plan-preparation banner for the whole classification round trip.
+function buildAgentStatusLabel(executionMode, stepNum, isApproved) {
+  if (executionMode === 'analyzing') return 'Reading your request...';
+  const working = isApproved
+    || executionMode === 'direct'
+    || executionMode === 'executing'
+    || executionMode === 'answer';
+  return working ? `Working (Step ${stepNum})...` : `Preparing implementation plan (Step ${stepNum})...`;
+}
+window.buildAgentStatusLabel = buildAgentStatusLabel;
+
+// The "Working (Step N)..." / "Preparing implementation plan (Step N)..." pill is baked into an
+// assistant bubble's innerHTML by renderAiMessage, so it only disappears if that bubble is
+// re-rendered after the run ends. It never was: runAgentLoop does its FINAL render while
+// isAgentRunning() is still true and only clears the flag afterwards, in its finally block. The
+// result was a finished answer sitting under a live-looking progress pill while the header
+// already read "Ready" — two contradictory states, until the next reload.
+//
+// Called from runAgentLoop's finally once the run flags are down. Guarded so a still-running
+// (or immediately re-queued) run keeps its indicator.
+function clearAgentRunningIndicators() {
+  if (window.isAgentRunning && window.isAgentRunning()) return;
+  document.querySelectorAll('.agent-running-indicator').forEach(node => node.remove());
+}
+window.clearAgentRunningIndicators = clearAgentRunningIndicators;

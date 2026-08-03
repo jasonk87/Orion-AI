@@ -62,8 +62,16 @@ test('repeated failed theories escalate diagnosis without affecting later mechan
     risk: 'medium'
   });
   t.equal(diagnosis.effort, 'max', 'three failed theories trigger maximum supported diagnosis effort');
-  t.equal(diagnosis.explorationScope, 'broad', 'diagnosis broadens inside the task blast radius');
+  // Deliberately inverted: this used to be 'broad'. Handing a model that has failed three times
+  // the whole project to explore is what produced the repeated-search loop this phase exists to
+  // escape. Reasoning escalates; exploration tightens.
+  t.equal(diagnosis.explorationScope, 'narrow', 'repeated failure restrains new exploration instead of widening it');
+  t.equal(diagnosis.contextScope, 'project', 'the model keeps the evidence it can already see');
   t.equal(diagnosis.verificationStrictness, 'strict', 'repeated failure raises verification');
+
+  const earlyFailure = policy.select({ phase: 'failure_diagnosis', failureCount: 1 });
+  t.equal(earlyFailure.explorationScope, 'bounded', 'a first failure still allows bounded exploration');
+  t.equal(earlyFailure.effort, 'high', 'a first failure raises effort without maxing it');
 
   const command = policy.select({
     phase: 'mechanical_execution',

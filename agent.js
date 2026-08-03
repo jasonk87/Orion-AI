@@ -172,7 +172,13 @@ function getSystemInstruction(disableTools = false, cachedMemory = '', modelName
     const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
     const timeStr = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
     const timeContext = `\n\nCurrent time: ${timeStr} on ${dateStr} (${tod}).`;
-    base = DISPATCHER_INSTRUCTION.replace('{{user_memory}}', memBlock) + timeContext + orionSessionContinuityContext;
+    // The two blocks above hand the model Jason's name and the time of day on EVERY turn, which
+    // reliably produced a fresh "Morning, Jason." on every reply in a thread that was already
+    // ten messages deep. They are reference material, not an invitation to re-introduce yourself.
+    const continuityDirective = orionConversationHasHistory
+      ? '\n\nCONVERSATION IN PROGRESS: this thread already has replies from you. Do not open with a greeting, the time of day, or Jason\'s name — answer what he just said, the way you would mid-conversation. Do not restate points you already made in this thread; if you already acknowledged something, move forward instead of repeating it.'
+      : '';
+    base = DISPATCHER_INSTRUCTION.replace('{{user_memory}}', memBlock) + timeContext + continuityDirective + orionSessionContinuityContext;
   } else {
     base = SYSTEM_INSTRUCTION;
     if (modelName && (modelName.startsWith('deepseek') || modelName.includes('pro') || modelName.includes('claude-3-7'))) {
@@ -189,6 +195,19 @@ function getSystemInstruction(disableTools = false, cachedMemory = '', modelName
 
 // Session continuity: carries a summary of the previous session into the current one
 let orionSessionContinuityContext = '';
+
+// Set per run from the live conversation: true once Orion has already replied at least once in
+// this thread. Drives the "do not re-greet" directive in getSystemInstruction.
+let orionConversationHasHistory = false;
+
+function setOrionConversationHasHistory(conversation) {
+  const messages = (conversation && Array.isArray(conversation.messages)) ? conversation.messages : [];
+  orionConversationHasHistory = messages.some(message => {
+    const role = String((message && message.role) || '').toLowerCase();
+    return role === 'assistant' || role === 'model' || role === 'ai' || role === 'orion';
+  });
+  return orionConversationHasHistory;
+}
 
 // Cached formatted global-memory block, injected into every Orion system prompt.
 // Refreshed at the start of each Orion run so the model already knows Jason's facts/prefs.
@@ -211,7 +230,11 @@ async function refreshOrionMemoryBlock(config, queryText, mode, reasoningPolicy 
         .filter(Boolean)
       : [];
     if (stablePrefs.length) lines.push(`Preferences: ${stablePrefs.join('; ')}`);
-    if (contextScope === 'none') {
+    // 'recent' means the live conversation, which the model already has verbatim in its message
+    // history — ranking the stored fact corpus adds an embedding round trip per turn and returns
+    // facts about other projects. Only a scope that actually asks for stored knowledge pays for
+    // retrieval.
+    if (contextScope === 'none' || contextScope === 'recent') {
       orionCachedMemoryBlock = lines.join('\n');
       return;
     }
@@ -1541,7 +1564,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   startupStopRequest = null;
   runningConversationId = conversation.id;
   activeRunTaskId = runTaskId;
-  agentExecutionMode = 'planning';
+  // Not 'planning': this runs BEFORE the request has been classified, so claiming to prepare an
+  // implementation plan is a guess — and the wrong one for a greeting or a question. Every
+  // consumer below tests for 'answer'/'direct'/'executing', so an explicit pre-classification
+  // value behaves exactly like 'planning' for gating while letting the UI say something true.
+  agentExecutionMode = 'analyzing';
   isStopRequested = false;
   stopRequestMode = 'none';
   activeRunController = new AbortController();
@@ -1667,10 +1694,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     orionSessionContinuityContext = recallRequested
       ? ''
       : await buildOrionContinuityContext(conversation, workspacePath, turnReasoningPolicy);
+    setOrionConversationHasHistory(conversation);
     await refreshOrionMemoryBlock(config, userPrompt, runMode, turnReasoningPolicy);
   } else {
     orionSessionContinuityContext = '';
     orionCachedMemoryBlock = '';
+    orionConversationHasHistory = false;
   }
   if (window.onAgentStatusChange) window.onAgentStatusChange(true, {
     status: 'active',
@@ -2394,6 +2423,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     
     // Run the agent execution loop
     let loopCount = 0;
+    const runStartedAt = Date.now();
     let maxLoops = reviewOnly ? 40 : 20;
     // An approved multi-phase plan (mission state present and execution allowed) needs far more
     // model turns than a one-shot task. Give it substantially more room so it does not stop
@@ -2438,11 +2468,29 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // requires the file to be here first. (This is the "read before you edit" rule that keeps even
     // a weak model from mangling a file it never looked at.)
     const filesSeenThisRun = inheritedContextSeenFiles(inheritedContextReceipt);
-    // Only files that did not exist before this agent run may be removed through the cleanup
-    // tool. This lets Coder delete scratch scripts it authored without granting a general-purpose
-    // delete primitive over user files or weakening the shell command deny list.
-    const filesCreatedThisRun = new Set();
-    const toolExecutionContext = { filesCreatedThisRun };
+    // Only files Orion itself authored may be removed through the cleanup tool. This lets Coder
+    // delete scratch scripts it wrote without granting a general-purpose delete primitive over
+    // user files or weakening the shell command deny list.
+    //
+    // Tracked on the CONVERSATION, not just this run. A task that pauses, continues, or resumes
+    // through schedule_followup executes across several runs, and a per-run set meant cleanup
+    // refused to delete a diagnostic script Orion had written itself minutes earlier — leaving
+    // junk in the user's project, then burning turns on a Remove-Item workaround that the
+    // destructive-command guard correctly blocked.
+    if (!Array.isArray(conversation._orionCreatedFiles)) conversation._orionCreatedFiles = [];
+    const filesCreatedThisRun = new Set(conversation._orionCreatedFiles);
+    const toolExecutionContext = {
+      filesCreatedThisRun,
+      rememberCreatedFile: (key) => {
+        if (!key) return;
+        filesCreatedThisRun.add(key);
+        if (!conversation._orionCreatedFiles.includes(key)) {
+          conversation._orionCreatedFiles.push(key);
+          // Bounded so a long-lived conversation cannot grow this list without limit.
+          if (conversation._orionCreatedFiles.length > 200) conversation._orionCreatedFiles.shift();
+        }
+      }
+    };
     // Files that have been fully read this run and NOT edited since — a subsequent full re-read of
     // one of these returns the same bytes the model already has, which is pure waste (a transcript
     // showed a 2600-line file re-read six times in one run). We still deliver the content (safe —
@@ -2587,20 +2635,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             .map(part => part && part.functionResponse && part.functionResponse.name)
             .filter(Boolean)
           : [];
-        const mechanicalToolNames = new Set([
-          'run_command',
-          'run_tests',
-          'run_linter',
-          'get_workspace_info',
-          'list_files',
-          'read_file',
-          'read_multiple_files',
-          'read_multiple_ranges',
-          'grep_search',
-          'get_symbol_index'
-        ]);
         const mechanicalResultPending = latestToolNames.length > 0
-          && latestToolNames.every(name => mechanicalToolNames.has(name));
+          && latestToolNames.every(name => LOW_EFFORT_RESULT_TOOLS.has(name));
         const finalCorrectionPending = finalAnswerQualityPrompts > 0
           || memoryConfidenceCorrections > 0
           || statusAccuracyCorrections > 0
@@ -2614,6 +2650,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
                   : (mechanicalResultPending
                       ? 'mechanical_execution'
                       : (agentExecutionMode === 'answer' ? 'casual_conversation' : 'implementation'))));
+        // Published before the model call so the provider adapters build a schema list matching
+        // the gate that will actually run, instead of offering tools that are certain to be
+        // refused a moment later.
+        setActiveToolGateProfile({
+          reviewOnly,
+          planRevision: isPlanRevision,
+          planningMode: !!(config && config.planningMode),
+          canExecute: canExecuteThisTask()
+        });
         const phaseReasoningPolicy = ReasoningPolicy
           ? ReasoningPolicy.select({
               phase: currentReasoningPhase,
@@ -3369,7 +3414,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             if (!epistemicGate.allowed) {
               result = { error: epistemicGate.reason, failureCategory: 'unsupported_inference', recoveryGuidance: epistemicGate.guidance };
             } else {
-              const redundantRead = getRecentRedundantContextRead(contextAcquisitionLedger, toolName, args);
+              const redundantRead = getRecentRedundantContextRead(contextAcquisitionLedger, toolName, args)
+                || getRepeatedSearchResult(contextAcquisitionLedger, toolName, args);
               result = redundantRead
                 || await executeTool(toolName, args, workspacePath, config, conversation, toolExecutionContext);
             }
@@ -3539,7 +3585,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           continue;
         }
 
-        const redundantContextRead = getRecentRedundantContextRead(contextAcquisitionLedger, toolName, args);
+        const redundantContextRead = getRecentRedundantContextRead(contextAcquisitionLedger, toolName, args)
+          || getRepeatedSearchResult(contextAcquisitionLedger, toolName, args);
         if (redundantContextRead) {
           const redundantReadFailed = isFailedToolResult(redundantContextRead);
           currentAgentLogs[logIndex].status = redundantReadFailed ? 'error' : 'success';
@@ -4158,6 +4205,19 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     }
 
     ranOutOfLoopBudget = loopCount >= maxLoops;
+
+    // Turns-per-task and wall clock are THE numbers that tell you whether the loop is
+    // efficient, and nothing recorded them before — so "it greps 100 times and takes forever"
+    // could only ever be an impression. This makes it measurable, and comparable across
+    // model and policy changes.
+    recordRunEfficiency({
+      loopCount,
+      maxLoops,
+      elapsedMs: Date.now() - runStartedAt,
+      modelName: activeRunModelName,
+      ledger: contextAcquisitionLedger,
+      workWalkthrough
+    });
 
     // Plan approval is conversation state. A workspace-level implementation_plan.md may be an
     // artifact from another conversation or an older task, so its mere presence must not reactivate
@@ -4804,6 +4864,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       isAgentStarting = false;
       startingRunTaskId = null;
       startupStopRequest = null;
+    }
+    // Drop any live-progress pill still baked into the last assistant bubble. The final render
+    // happened while isAgentRunning was still true, so without this a finished answer keeps
+    // showing "Working (Step N)..." while the header already reads Ready.
+    if (!isAgentRunning && !isAgentStarting && typeof window.clearAgentRunningIndicators === 'function') {
+      window.clearAgentRunningIndicators();
     }
     if (!isAgentRunning && !isAgentStarting && Array.isArray(window.promptQueue) && window.promptQueue.length > 0) {
       scheduleQueueDrain(100);
@@ -5477,8 +5543,13 @@ async function executeTool(name, args, workspace, config, conversation, executio
         ? await writeOrionGovernanceArtifactText(workspace, conversation, args.path, args.content)
         : await window.api.writeFile(workspace, args.path, args.content);
       if (writeRes.error) throw new Error(writeRes.error);
-      if (fileDidNotExist && executionContext.filesCreatedThisRun instanceof Set) {
-        executionContext.filesCreatedThisRun.add(normalizeInventoryPath(args.path).toLowerCase());
+      if (fileDidNotExist) {
+        const createdKey = normalizeInventoryPath(args.path).toLowerCase();
+        if (typeof executionContext.rememberCreatedFile === 'function') {
+          executionContext.rememberCreatedFile(createdKey);
+        } else if (executionContext.filesCreatedThisRun instanceof Set) {
+          executionContext.filesCreatedThisRun.add(createdKey);
+        }
       }
       
       // Refresh directory UI
@@ -6091,8 +6162,15 @@ async function executeTool(name, args, workspace, config, conversation, executio
     
     case 'run_tests': {
       const testRes = await window.runRegressionTests();
+      // The outcome is carried through so the model can distinguish a real test failure from a
+      // runner that never started. A timeout/kill/did-not-run is NOT evidence that the code is
+      // broken, and treating it as such sent runs into pointless "fix the failing test" loops.
       return {
         success: testRes.success,
+        outcome: testRes.outcome || (testRes.success ? 'passed' : 'failed'),
+        ranToCompletion: testRes.ranToCompletion !== false,
+        exitCode: testRes.exitCode === undefined ? null : testRes.exitCode,
+        command: testRes.command || '',
         output: testRes.output
       };
     }
@@ -7447,6 +7525,50 @@ For existing local folders/projects/programs, inspect first and let the discover
 If STRATEGY.md finds mission-critical ambiguity, ask the user before planning. If ambiguity is minor, record the assumption in STRATEGY.md and operational context, then proceed. Base implementation_plan.md on STRATEGY.md, not just the raw user prompt. Do not add agent roles, automatic replanning, or domain-specific workflows.]`;
 }
 
+// Single source of truth for what each gate refuses, shared with buildAgentToolDeclarations so
+// the schema list and the runtime gate cannot drift apart.
+//
+// Offering a tool the gate will always refuse is not just wasted schema tokens: the model calls
+// it, gets refused, and burns an entire round trip — at whatever reasoning effort that turn was
+// running. Tools whose refusal is CONDITIONAL (write_file during planning is allowed for
+// STRATEGY.md and implementation_plan.md) stay in the schema; only always-refused tools are cut.
+const PLANNING_BLOCKED_TOOLS = Object.freeze([
+  'modify_file', 'patch_file', 'delete_created_file', 'start_command', 'run_tests', 'run_linter',
+  'sync_workspace_env', 'launch_workspace_app', 'preview_app', 'git_push', 'download_file',
+  'download_from_page', 'extract_archive', 'take_screenshot'
+]);
+
+const PLAN_REVISION_BLOCKED_TOOLS = Object.freeze([
+  'delete_created_file', 'start_command', 'run_tests', 'run_linter', 'sync_workspace_env',
+  'launch_workspace_app', 'preview_app', 'git_push', 'download_file', 'download_from_page',
+  'extract_archive'
+]);
+
+const REVIEW_ONLY_BLOCKED_TOOLS = Object.freeze([
+  'modify_file', 'patch_file', 'delete_created_file', 'sync_workspace_env',
+  'set_workspace_entrypoint', 'start_command', 'launch_workspace_app', 'preview_app', 'git_push',
+  'download_file', 'download_from_page', 'extract_archive', 'set_task_checklist',
+  'update_mission_context', 'start_subplan', 'update_subplan_context', 'complete_subplan',
+  'evaluate_win_conditions', 'record_blocker', 'resolve_blocker'
+]);
+
+// Set by the agent loop each turn so the provider adapters (which take no context) can build a
+// schema list matching the gate that is actually active.
+let activeToolGateProfile = null;
+
+function setActiveToolGateProfile(profile) {
+  activeToolGateProfile = profile && typeof profile === 'object' ? profile : null;
+}
+
+function getToolsBlockedByActiveGate() {
+  const profile = activeToolGateProfile;
+  if (!profile) return new Set();
+  if (profile.reviewOnly) return new Set(REVIEW_ONLY_BLOCKED_TOOLS);
+  if (profile.planRevision) return new Set(PLAN_REVISION_BLOCKED_TOOLS);
+  if (profile.planningMode && !profile.canExecute) return new Set(PLANNING_BLOCKED_TOOLS);
+  return new Set();
+}
+
 function getPlanningToolGate(config, canExecute, toolName, args = {}, options = {}) {
   if (options.planRevision === true) {
     const isPlanArtifactEdit = ['write_file', 'modify_file', 'patch_file'].includes(toolName)
@@ -7458,10 +7580,10 @@ function getPlanningToolGate(config, canExecute, toolName, args = {}, options = 
         reason: 'Updating the existing implementation plan is allowed during a task-bound revision.'
       };
     }
+    // write_file/modify_file/patch_file appear here but were already returned as allowed above
+    // when they target the plan artifact, so they stay in the offered schema.
     const revisionBlockedTools = new Set([
-      'write_file', 'modify_file', 'patch_file', 'delete_created_file', 'start_command',
-      'run_tests', 'run_linter', 'sync_workspace_env', 'launch_workspace_app', 'preview_app',
-      'git_push', 'download_file', 'download_from_page', 'extract_archive'
+      'write_file', 'modify_file', 'patch_file', ...PLAN_REVISION_BLOCKED_TOOLS
     ]);
     if (revisionBlockedTools.has(toolName)) {
       return {
@@ -7475,7 +7597,9 @@ function getPlanningToolGate(config, canExecute, toolName, args = {}, options = 
   if (!config || !config.planningMode || canExecute) {
     return { allowed: true, forceYield: false, reason: '' };
   }
-  const destructiveTools = ['write_file', 'modify_file', 'patch_file', 'delete_created_file', 'start_command', 'run_tests', 'run_linter', 'sync_workspace_env', 'launch_workspace_app', 'preview_app', 'git_push', 'download_file', 'download_from_page', 'extract_archive', 'take_screenshot'];
+  // write_file is conditional (STRATEGY.md and implementation_plan.md are allowed below), so it
+  // is listed here for the gate but deliberately absent from PLANNING_BLOCKED_TOOLS.
+  const destructiveTools = ['write_file', ...PLANNING_BLOCKED_TOOLS];
   const completionTools = ['complete_subplan', 'evaluate_win_conditions'];
   const strategyStatus = options.strategyStatus || {};
   const executionMode = options.agentExecutionMode || '';
@@ -7543,28 +7667,7 @@ function getReviewOnlyToolGate(toolName, args = {}) {
     }
     return { allowed: false, forceYield: false, reason: isImplementationPlanPath(args.path) ? reviewReason : reviewReason };
   }
-  const blockedTools = new Set([
-    'modify_file',
-    'patch_file',
-    'delete_created_file',
-    'sync_workspace_env',
-    'set_workspace_entrypoint',
-    'start_command',
-    'launch_workspace_app',
-    'preview_app',
-    'git_push',
-    'download_file',
-    'download_from_page',
-    'extract_archive',
-    'set_task_checklist',
-    'update_mission_context',
-    'start_subplan',
-    'update_subplan_context',
-    'complete_subplan',
-    'evaluate_win_conditions',
-    'record_blocker',
-    'resolve_blocker'
-  ]);
+  const blockedTools = new Set(REVIEW_ONLY_BLOCKED_TOOLS);
   if (blockedTools.has(toolName)) {
     return { allowed: false, forceYield: false, reason: reviewReason };
   }
@@ -8641,8 +8744,30 @@ function isGenericNonAnswer(text) {
   return !String(text || '').trim() || looksLikeLeakedNoToolCorrection(text);
 }
 
-const INSPECTION_TOOLS = new Set(['list_files', 'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context', 'get_workspace_info', 'grep_search', 'search_embeddings', 'get_symbol_index']);
+const INSPECTION_TOOLS = new Set([
+  'list_files', 'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context',
+  'get_workspace_info', 'grep_search', 'search_embeddings', 'get_symbol_index',
+  // Index-backed retrieval belongs here too: these ARE workspace inspection, and omitting them
+  // meant a run that used them exclusively was treated as never having inspected anything.
+  'semantic_search', 'find_references', 'get_file_symbols'
+]);
 const MEMORY_WRITE_TOOLS = new Set(['append_project_memory', 'remember_fact', 'remember_decision']);
+
+// Tools whose results take no deliberation to interpret — reads, searches, and status checks.
+// A turn that only consumed these is choosing the next tool, not making a judgment call, so it
+// runs at low reasoning effort instead of paying for extended thinking to decide to run a grep.
+//
+// Gaps here are expensive and were counter-intuitive: before inspect_code_context/semantic_search
+// were listed, using Orion's BETTER retrieval tools pushed the turn into 'implementation' (min
+// medium effort) while a plain grep_search stayed cheap — so the fast path punished good tool use.
+const LOW_EFFORT_RESULT_TOOLS = new Set([
+  ...INSPECTION_TOOLS,
+  'run_command', 'run_tests', 'run_linter',
+  'read_command_output', 'get_command_status',
+  'git_diff',
+  'read_notes', 'read_project_memory', 'recall_memory',
+  'discover_skills', 'inspect_environment'
+]);
 
 function hasPriorWorkspaceInspection(conversation) {
   const messages = (conversation && Array.isArray(conversation.messages)) ? conversation.messages : [];
@@ -8735,9 +8860,29 @@ function extractPythonScriptPath(command) {
   return match ? (match[1] || match[2] || match[3]) : '';
 }
 
+// Tools that REPORT on something else rather than doing it. get_command_status answering
+// "that background process exited 1" is a successful query about a failed subject — but the
+// exitCode/timedOut fields it carries used to make Orion classify the query itself as a tool
+// failure, count it toward the repeated-failure guard, escalate reasoning effort, and eventually
+// pause the task. Observed live: three "failed" get_command_status calls in one run, none of
+// which had actually failed.
+const REPORTING_TOOL_RESULT_KEYS = ['status', 'id', 'command'];
+
+function isReportingToolResult(result) {
+  return result.success === true
+    && !result.error
+    && REPORTING_TOOL_RESULT_KEYS.every(key => Object.prototype.hasOwnProperty.call(result, key));
+}
+
 function isFailedToolResult(result) {
   if (!result || typeof result !== 'object') return false;
-  if (result.error || result.success === false) return true;
+  // Checked BEFORE result.error: a redundancy block carries an error string on purpose (it is
+  // how the model is told to stop repeating itself), but it is a guard firing correctly, not a
+  // fault. Counting it as one escalated reasoning effort for doing its job.
+  if (result.redundantContext === true) return false;
+  if (isReportingToolResult(result)) return false;
+  if (result.error) return true;
+  if (result.success === false) return true;
   if (result.exitCode !== undefined && Number(result.exitCode) !== 0) return true;
   if (result.code !== undefined && Number(result.code) !== 0) return true;
   if (result.timedOut || result.killed) return true;
@@ -8746,6 +8891,10 @@ function isFailedToolResult(result) {
 
 function getToolFailureSignal(result) {
   if (!result || typeof result !== 'object') return '';
+  // Mirrors isFailedToolResult: a redundancy guard and a successful status report must not
+  // produce a failure signal, or they feed the repeated-failure counter that pauses tasks.
+  if (result.redundantContext === true) return '';
+  if (isReportingToolResult(result)) return '';
   if (result.error) return String(result.error);
   if (result.success === false && result.message) return String(result.message);
   if (result.exitCode !== undefined && Number(result.exitCode) !== 0) {
@@ -8958,6 +9107,9 @@ function createContextAcquisitionLedger() {
     files: new Map(),
     recentReadResults: new Map(),
     redundantReadAttempts: new Map(),
+    recentSearchResults: new Map(),
+    repeatedSearchAttempts: new Map(),
+    repeatedSearchBlocks: 0,
     events: [],
     readCalls: 0,
     searchCalls: 0,
@@ -8966,6 +9118,73 @@ function createContextAcquisitionLedger() {
     duplicateLinesReturned: 0,
     estimatedSourceTokens: 0,
     invalidations: 0
+  };
+}
+
+// Searches whose result is a pure function of workspace contents, so running the identical
+// query twice without an intervening write cannot return anything new.
+const DEDUPABLE_SEARCH_TOOLS = new Set([
+  'grep_search', 'semantic_search', 'search_embeddings',
+  'get_symbol_index', 'get_file_symbols', 'find_references',
+  'inspect_code_context', 'list_files'
+]);
+
+// Stable signature for a search request. Key order is normalized so {pattern, path} and
+// {path, pattern} collapse to the same search.
+function searchRequestKey(toolName, args = {}) {
+  if (!DEDUPABLE_SEARCH_TOOLS.has(toolName)) return '';
+  const meaningful = {};
+  for (const key of Object.keys(args || {}).sort()) {
+    const value = args[key];
+    if (value === undefined || value === null || value === '') continue;
+    meaningful[key] = typeof value === 'object' ? JSON.stringify(value) : String(value);
+  }
+  try {
+    return `${toolName}|${JSON.stringify(meaningful)}`;
+  } catch (_) {
+    return '';
+  }
+}
+
+// The read-side guard (getRecentRedundantContextRead) only ever covered read_file and
+// read_multiple_ranges, so an agent that searched instead of read was completely unbounded —
+// the observed "it greps 100 times" behavior. Searches now follow the same contract as reads:
+// the first repeat replays the cached result with an explicit note, and further repeats are
+// refused with a concrete instruction to do something else.
+function getRepeatedSearchResult(ledger, toolName, args = {}) {
+  if (!ledger || !ledger.recentSearchResults) return null;
+  const requestKey = searchRequestKey(toolName, args);
+  if (!requestKey) return null;
+  const cached = ledger.recentSearchResults.get(requestKey);
+  if (!cached) return null;
+
+  const reuseCount = Number(ledger.repeatedSearchAttempts.get(requestKey) || 0) + 1;
+  ledger.repeatedSearchAttempts.set(requestKey, reuseCount);
+
+  if (reuseCount === 1 && cached.result) {
+    return {
+      ...cached.result,
+      success: true,
+      skipped: true,
+      redundantContext: true,
+      reusedEvidence: true,
+      reuseCount,
+      redundantSearchNote: `You already ran this exact ${toolName} and nothing has been written since. Orion replayed the cached result instead of re-running it.`,
+      message: 'This is the cached result from the identical earlier search. Use it now — narrow the query, read a specific file, edit, or answer. Repeating this search cannot return anything new.'
+    };
+  }
+
+  ledger.repeatedSearchBlocks += 1;
+  return {
+    success: false,
+    skipped: true,
+    redundantContext: true,
+    reuseCount,
+    error: `This exact ${toolName} was already run and its result replayed. The workspace has not changed, so repeating it cannot add evidence.`,
+    failureCategory: 'redundant_context_loop',
+    retryable: false,
+    requiredNextAction: 'Change approach: use a different query, read a specific file range, make an edit, run a verification, or answer with what you already have. Do not repeat this search.',
+    message: 'Orion blocked an identical repeated search.'
   };
 }
 
@@ -9240,13 +9459,21 @@ function inheritedContextSeenFiles(receipt = {}) {
 
 function recordContextAcquisitionToolResult(ledger, toolName, args = {}, result = {}) {
   if (!ledger) return;
-  if (toolName === 'grep_search' || toolName === 'semantic_search' || toolName === 'search_embeddings' || toolName === 'get_symbol_index' || toolName === 'get_file_symbols' || toolName === 'find_references') {
+  if (DEDUPABLE_SEARCH_TOOLS.has(toolName)) {
     ledger.searchCalls += 1;
-    if (isFailedToolResult(result)) ledger.failedSearchCalls += 1;
+    const failed = isFailedToolResult(result);
+    if (failed) ledger.failedSearchCalls += 1;
+    // Cache successful searches only: a failed search may succeed on retry (a transient index
+    // miss), so replaying the failure would trap the agent instead of unblocking it. Results
+    // already replayed from the cache are not re-stored.
+    const requestKey = searchRequestKey(toolName, args);
+    if (requestKey && !failed && !(result && result.redundantContext)) {
+      ledger.recentSearchResults.set(requestKey, { result, at: Date.now() });
+    }
     ledger.events.push({
       toolName,
       kind: 'search',
-      failed: isFailedToolResult(result),
+      failed,
       target: args.pattern || args.query || args.symbolName || args.path || ''
     });
     ledger.events = ledger.events.slice(-40);
@@ -9318,6 +9545,11 @@ function invalidateContextAcquisitionForFile(ledger, pathValue, reason = 'file m
       ledger.redundantReadAttempts.delete(requestKey);
     }
   }
+  // Every cached search is dropped, not just ones mentioning this path: a search is
+  // workspace-scoped, so a write anywhere can change what any query would now return.
+  // Without this, search dedup would serve stale results across an edit.
+  if (ledger.recentSearchResults) ledger.recentSearchResults.clear();
+  if (ledger.repeatedSearchAttempts) ledger.repeatedSearchAttempts.clear();
   ledger.events.push({ toolName: reason, kind: 'invalidation', path: String(pathValue) });
   ledger.events = ledger.events.slice(-40);
 }
@@ -9340,6 +9572,11 @@ function buildContextAcquisitionReceipt(ledger) {
     .map(([request, count]) => ({ request, count: Number(count) }))
     .sort((left, right) => right.count - left.count || left.request.localeCompare(right.request))
     .slice(0, 6);
+  const repeatedSearchAttempts = [...(ledger.repeatedSearchAttempts || new Map()).entries()]
+    .filter(([, count]) => Number(count) > 0)
+    .map(([request, count]) => ({ request, count: Number(count) }))
+    .sort((left, right) => right.count - left.count || left.request.localeCompare(right.request))
+    .slice(0, 6);
   return {
     readCalls: ledger.readCalls,
     searchCalls: ledger.searchCalls,
@@ -9350,9 +9587,41 @@ function buildContextAcquisitionReceipt(ledger) {
     invalidations: ledger.invalidations,
     redundantReadAttempts,
     blockedRedundantReads: redundantReadAttempts.reduce((total, item) => total + Math.max(0, item.count - 1), 0),
+    repeatedSearchAttempts,
+    blockedRepeatedSearches: ledger.repeatedSearchBlocks || 0,
     repeatedReads,
     recentEvents: ledger.events.slice(-12)
   };
+}
+
+// Emits one line per run: turns used, wall clock, tool calls, and how much of that was
+// redundant. Goes to the console and (via the renderer bridge) to the on-disk fault log, so a
+// slow run leaves evidence instead of only a memory of waiting.
+function recordRunEfficiency(summary = {}) {
+  try {
+    const ledger = summary.ledger || {};
+    const toolCalls = Array.isArray(summary.workWalkthrough) ? summary.workWalkthrough.length : 0;
+    const seconds = Math.round((Number(summary.elapsedMs) || 0) / 100) / 10;
+    const stats = {
+      model: summary.modelName || 'unknown',
+      turns: summary.loopCount || 0,
+      turnBudget: summary.maxLoops || 0,
+      seconds,
+      secondsPerTurn: summary.loopCount ? Math.round((seconds / summary.loopCount) * 10) / 10 : 0,
+      toolCalls,
+      readCalls: ledger.readCalls || 0,
+      searchCalls: ledger.searchCalls || 0,
+      failedSearchCalls: ledger.failedSearchCalls || 0,
+      blockedRepeatedSearches: ledger.repeatedSearchBlocks || 0
+    };
+    console.log('[orion:run-efficiency]', JSON.stringify(stats));
+    if (typeof window !== 'undefined' && window.api && typeof window.api.reportRendererFault === 'function') {
+      window.api.reportRendererFault('run-efficiency', JSON.stringify(stats));
+    }
+    return stats;
+  } catch (_) {
+    return null;
+  }
 }
 
 function hasLocalInspectionAttempt(ledger) {
@@ -10121,6 +10390,29 @@ function createNonRetryableModelError(message) {
   const error = new Error(message);
   error.nonRetryable = true;
   return error;
+}
+
+// ── Shared model-retry policy ──────────────────────────────────────────────────
+// Gemini, Anthropic, and DeepSeek each grew their own copy of this backoff and their
+// own idea of which errors end a retry loop, then drifted: only Gemini jittered its
+// delay, and only Gemini forgot to re-throw user-stop errors — so pressing Stop during
+// a Gemini retry burned the remaining attempts emitting bogus "Connection error"
+// warnings instead of aborting. One policy, three call sites.
+
+// Jitter matters because Orion's own providers rate-limit as a group: without it, every
+// retry after a 429 lands on the same tick and re-triggers the limit.
+function computeNextModelRetryDelay(currentDelay, providerRetryDelayMs) {
+  const jittered = (Number(currentDelay) || 0) * 2 + Math.random() * 500;
+  const floor = Math.max(jittered, Number(providerRetryDelayMs) || 0);
+  return Math.min(floor, MODEL_API_MAX_RETRY_WAIT_MS);
+}
+
+// A retry loop must stop for two reasons that are not "the provider is busy": the request
+// can never succeed (auth/billing/malformed), or the user asked to stop.
+function isUnretryableModelError(error) {
+  if (error && error.nonRetryable) return true;
+  if (typeof isUserStopError === 'function' && isUserStopError(error)) return true;
+  return false;
 }
 
 function getNextGeminiModelForHighDemand(modelName) {
@@ -11076,10 +11368,19 @@ function buildAgentToolDeclarations() {
             }
           }
   ];
+  // Drop tools the currently active gate would refuse outright. This cuts schema tokens on every
+  // turn, but the bigger win is that the model can no longer spend a whole round trip calling a
+  // tool that was never going to be permitted.
+  //
+  // Applied before the Dispatch allowlist, not after: the gate is about what is permitted right
+  // now, and an early return for Dispatch would let a review-only or planning turn keep offering
+  // tools it is certain to refuse.
+  const blocked = getToolsBlockedByActiveGate();
+  const gatedTools = blocked.size ? allTools.filter(tool => !blocked.has(tool.name)) : allTools;
   if (activeConversationMode === 'orion') {
-    return allTools.filter(tool => DISPATCH_TOOL_ALLOWLIST.has(tool.name));
+    return gatedTools.filter(tool => DISPATCH_TOOL_ALLOWLIST.has(tool.name));
   }
-  return allTools;
+  return gatedTools;
 }
 
 const GEMINI_SCHEMA_FIELDS = new Set([
@@ -11438,14 +11739,13 @@ async function callAnthropicAPI(messages, modelName, apiKey, onWarning, disableT
       }
       if (onWarning) onWarning(`Anthropic API HTTP ${status} for ${modelName}; retrying in ${Math.ceil(retryDelayMs / 1000)}s (attempt ${i}/${attempts}).`);
       await sleepRespectingStop(retryDelayMs);
-      delay = Math.min(delay * 2, MODEL_API_MAX_RETRY_WAIT_MS);
+      delay = computeNextModelRetryDelay(delay, apiError.retryDelayMs);
     } catch (err) {
-      if (err && err.nonRetryable) throw err;
-      if (isUserStopError && isUserStopError(err)) throw err;
+      if (isUnretryableModelError(err)) throw err;
       if (i === attempts) throw err;
       if (onWarning) onWarning(`Anthropic API request failed (${err.message}); retrying (attempt ${i}/${attempts}).`);
       await sleepRespectingStop(delay);
-      delay = Math.min(delay * 2, MODEL_API_MAX_RETRY_WAIT_MS);
+      delay = computeNextModelRetryDelay(delay, 0);
     }
   }
   throw new Error('Anthropic API: exhausted retries.');
@@ -11473,7 +11773,17 @@ function convertGeminiToDeepSeekMessages(geminiMessages) {
   let toolCallCounter = 0;
   let lastToolCallIds = [];
 
-  (geminiMessages || []).forEach(msg => {
+  // Reasoning content is replayed for the MOST RECENT assistant turn only. Sending every prior
+  // turn's chain-of-thought made each request larger than the last — by turn 60 the history
+  // carried 59 turns of reasoning on top of the system prompt and tool schemas, so the loop got
+  // steadily slower the longer it ran. DeepSeek's reasoning models also historically reject
+  // reasoning_content echoed back in older assistant messages.
+  let lastModelIndex = -1;
+  (geminiMessages || []).forEach((msg, index) => {
+    if (msg && msg.role === 'model') lastModelIndex = index;
+  });
+
+  (geminiMessages || []).forEach((msg, msgIndex) => {
     if (msg.role === 'user') {
       const blocks = [];
       (msg.parts || []).forEach(p => {
@@ -11489,10 +11799,12 @@ function convertGeminiToDeepSeekMessages(geminiMessages) {
       out.push({ role: 'user', content: blocks });
     } else if (msg.role === 'model') {
       const textParts = (msg.parts || []).filter(p => p.text && !p.thought && !p._deepseekReasoningContent).map(p => p.text);
-      const reasoningContent = (msg.parts || [])
-        .filter(p => (p._deepseekReasoningContent || p.thought) && p.text)
-        .map(p => p.text)
-        .join('');
+      const reasoningContent = msgIndex === lastModelIndex
+        ? (msg.parts || [])
+          .filter(p => (p._deepseekReasoningContent || p.thought) && p.text)
+          .map(p => p.text)
+          .join('')
+        : '';
       const toolCalls = [];
       lastToolCallIds = [];
       (msg.parts || []).forEach(p => {
@@ -11503,7 +11815,7 @@ function convertGeminiToDeepSeekMessages(geminiMessages) {
         }
       });
       const joinedText = textParts.join('');
-      const assistantMsg = { role: 'assistant', content: joinedText || (reasoningContent ? "" : null) };
+      const assistantMsg = { role: 'assistant', content: joinedText || null };
       // DeepSeek thinking mode requires reasoning_content to be passed back on every
       // assistant turn that performed tool calls. Older/sanitized Orion histories may have
       // tool calls without the hidden reasoning part; include a minimal continuity marker so
@@ -11514,6 +11826,11 @@ function convertGeminiToDeepSeekMessages(geminiMessages) {
         assistantMsg.reasoning_content = '[Orion internal note: reasoning_content was not preserved for this earlier tool-call turn; continue from the tool calls and tool results.]';
       }
       if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
+      // DeepSeek rejects the whole request with "Invalid assistant message: content or
+      // tool_calls must be set" if an assistant turn has neither. A turn can legitimately end
+      // up with neither once prior-turn reasoning is no longer replayed, so null collapses to
+      // an empty string rather than being sent as null.
+      if (assistantMsg.content === null && !assistantMsg.tool_calls) assistantMsg.content = '';
       out.push(assistantMsg);
     } else if (msg.role === 'tool') {
       let idx = 0;
@@ -11687,14 +12004,13 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
       }
       if (onWarning) onWarning(`DeepSeek API HTTP ${status} for ${modelName}; retrying in ${Math.ceil(retryDelayMs / 1000)}s (attempt ${i}/${attempts}).`);
       await sleepRespectingStop(retryDelayMs);
-      delay = Math.min(delay * 2, MODEL_API_MAX_RETRY_WAIT_MS);
+      delay = computeNextModelRetryDelay(delay, apiError.retryDelayMs);
     } catch (err) {
-      if (err && err.nonRetryable) throw err;
-      if (isUserStopError && isUserStopError(err)) throw err;
+      if (isUnretryableModelError(err)) throw err;
       if (i === attempts) throw err;
       if (onWarning) onWarning(`DeepSeek API request failed (${err.message}); retrying (attempt ${i}/${attempts}).`);
       await sleepRespectingStop(delay);
-      delay = Math.min(delay * 2, MODEL_API_MAX_RETRY_WAIT_MS);
+      delay = computeNextModelRetryDelay(delay, 0);
     }
   }
   throw new Error('DeepSeek API: exhausted retries.');
@@ -12097,16 +12413,17 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
       }
       
       await sleepWithModelApiStatus(retryDelayMs, `Gemini API retry ${i}/${attempts}.`, onWarning);
-      delay = Math.max(delay * 2 + Math.random() * 500, retryDelayMs); // Exponential backoff + API retry hint
-      
+      delay = computeNextModelRetryDelay(delay, retryDelayMs);
+
     } catch (e) {
-      if (e && e.nonRetryable) throw e;
+      // isUnretryableModelError also covers user-stop, which this branch used to miss.
+      if (isUnretryableModelError(e)) throw e;
       if (i === attempts) throw e;
       if (onWarning) {
         onWarning(`Connection error: ${e.message}. Provider wait/cooldown active (Attempt ${i}/${attempts}).`);
       }
       await sleepWithModelApiStatus(delay, `Gemini connection retry ${i}/${attempts}.`, onWarning);
-      delay = delay * 2 + Math.random() * 500;
+      delay = computeNextModelRetryDelay(delay, 0);
     }
   }
 }
@@ -12261,6 +12578,16 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     recordContextAcquisitionToolResult,
     invalidateContextAcquisitionForFile,
     getRecentRedundantContextRead,
+    getRepeatedSearchResult,
+    searchRequestKey,
+    recordRunEfficiency,
+    setActiveToolGateProfile,
+    getToolsBlockedByActiveGate,
+    PLANNING_BLOCKED_TOOLS,
+    PLAN_REVISION_BLOCKED_TOOLS,
+    REVIEW_ONLY_BLOCKED_TOOLS,
+    LOW_EFFORT_RESULT_TOOLS,
+    DEDUPABLE_SEARCH_TOOLS,
     buildContextAcquisitionReceipt,
     getContextSectionsFromToolResult,
     rememberContextPacketForConversation,
@@ -12370,6 +12697,19 @@ function diagnoseModelApiFailure(errorText) {
 }
 
 if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
+  // Test-only: buildAgentToolDeclarations reads module state that the agent loop normally owns.
+  // Exposed here (never in the packaged app) so the offered tool surface can be asserted for
+  // both Dispatch and Coder conversations.
+  module.exports.getSystemInstruction = getSystemInstruction;
+  module.exports.setOrionConversationHasHistory = setOrionConversationHasHistory;
+  module.exports.refreshOrionMemoryBlock = refreshOrionMemoryBlock;
+  module.exports.__setActiveConversationModeForTest = (mode) => { activeConversationMode = mode; };
+  module.exports.__setAgentExecutionModeForTest = (mode) => { agentExecutionMode = mode; };
+  module.exports.computeNextModelRetryDelay = computeNextModelRetryDelay;
+  module.exports.isUnretryableModelError = isUnretryableModelError;
+  module.exports.createUserStopError = createUserStopError;
+  module.exports.createNonRetryableModelError = createNonRetryableModelError;
+  module.exports.MODEL_API_MAX_RETRY_WAIT_MS = MODEL_API_MAX_RETRY_WAIT_MS;
   module.exports.executeTool = executeTool; // So we can test it specifically
   module.exports.runAgentLoop = window.runAgentLoop;
   module.exports.drainNextQueuedTask = drainNextQueuedTask;

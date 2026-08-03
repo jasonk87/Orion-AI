@@ -36,9 +36,14 @@
     let verificationStrictness = 'standard';
 
     if (phase === 'casual_conversation') {
-      const requestedContext = ['recent', 'task', 'project', 'historical'].includes(hint.contextNeed)
-        ? hint.contextNeed
-        : '';
+      // 'recent' and 'historical' are allowed; 'project'/'task' are not.
+      //
+      // 'historical' is a genuine recall request ("what did we talk about last week?") and routes
+      // to the conversation-evidence search, which looks at actual past conversations. 'project'
+      // and 'task' instead rank the global stored-fact corpus by similarity to the message, which
+      // for a chatty remark returns whichever project has the most entries — that is how "I've
+      // been working on you this morning" came back as a GRITLIFE status report.
+      const requestedContext = ['recent', 'historical'].includes(hint.contextNeed) ? hint.contextNeed : '';
       // Standalone greetings remain context-free. A reaction or acknowledgment that the semantic
       // classifier bound to the immediately preceding exchange still receives that recent view.
       effort = 'low';
@@ -54,7 +59,17 @@
     } else if (phase === 'mechanical_execution') {
       effort = 'low'; contextScope = 'task'; explorationScope = 'narrow'; verificationStrictness = 'standard';
     } else if (phase === 'failure_diagnosis') {
-      effort = failures >= 3 ? 'max' : 'high'; contextScope = 'project'; explorationScope = 'broad'; verificationStrictness = 'strict';
+      // Repeated failure means the current approach is wrong, not that the model has seen too
+      // little — so exploration TIGHTENS as failures accumulate instead of widening. This used
+      // to go straight to 'broad', which handed a thrashing model the whole project to search
+      // and produced exactly the repeated-search loop it was supposed to escape.
+      //
+      // contextScope deliberately stays 'project': narrowing what the model can SEE would take
+      // away evidence it needs to diagnose. Only new exploration is restrained.
+      effort = failures >= 3 ? 'max' : 'high';
+      contextScope = 'project';
+      explorationScope = failures >= 3 ? 'narrow' : 'bounded';
+      verificationStrictness = 'strict';
     } else if (phase === 'adversarial_review') {
       effort = broad ? 'max' : 'high'; contextScope = 'project'; explorationScope = 'bounded'; verificationStrictness = 'strict';
     } else if (phase === 'final_response') {
@@ -84,9 +99,13 @@
     const modelName = String(modelNameValue || '').toLowerCase();
     const effort = level(policyValue.effort);
     if (modelName.startsWith('deepseek')) {
+      // The policy engine resolves four levels, but this branch used to collapse medium into
+      // 'high' — so every ordinary tool-selection turn ('implementation' resolves to at least
+      // medium) paid high-effort reasoning just to decide to run a grep. Each level now maps
+      // to itself, which is the difference between a fast loop and a slow one.
       return effort === 'low'
         ? { thinking: { type: 'disabled' } }
-        : { thinking: { type: 'enabled' }, reasoning_effort: effort === 'max' ? 'max' : 'high' };
+        : { thinking: { type: 'enabled' }, reasoning_effort: effort };
     }
     if (modelName.startsWith('gemini-3')) {
       return { thinkingConfig: { thinkingLevel: effort === 'max' ? 'high' : effort } };

@@ -151,5 +151,10 @@ contextBridge.exposeInMainWorld('api', {
   // Session Memory
   saveSession: (workspacePath, sessionData) => ipcRenderer.invoke('orion:save-session', { workspacePath, sessionData }),
   listSessions: (workspacePath, limit) => ipcRenderer.invoke('orion:list-sessions', { workspacePath, limit }),
-  readSession: (workspacePath, sessionId) => ipcRenderer.invoke('orion:read-session', { workspacePath, sessionId })
+  readSession: (workspacePath, sessionId) => ipcRenderer.invoke('orion:read-session', { workspacePath, sessionId }),
+
+  // Crash safety — the renderer's global error traps forward here so browser-side
+  // faults reach the same on-disk crash log as main-process ones.
+  reportRendererFault: (kind, detail) => ipcRenderer.send('orion:report-renderer-fault', { kind, detail }),
+  onMainFault: (callback) => ipcRenderer.on('orion:main-fault', (event, payload) => callback(payload))
 });

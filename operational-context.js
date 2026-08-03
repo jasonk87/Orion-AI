@@ -91,6 +91,44 @@
     return normalizeStatus(value, ['critical', 'major', 'minor'], 'major');
   }
 
+  // Win conditions are addressed by whatever identifier the model remembers. Exact id and exact
+  // title already worked; an invented slug like "wc_f3_fix" for "F3 no longer quits program..."
+  // did not, and threw — costing a full round trip to re-read the titles and retry.
+  //
+  // Deliberately conservative: fuzzy candidates are only accepted when EXACTLY ONE matches, so
+  // an ambiguous guess still errors rather than silently marking the wrong condition satisfied.
+  function winConditionSlug(value) {
+    return String(value == null ? '' : value).toLowerCase().replace(/[^a-z0-9]+/g, '');
+  }
+
+  function findWinCondition(conditions, identity) {
+    const list = Array.isArray(conditions) ? conditions : [];
+    const target = String(identity == null ? '' : identity).trim();
+    if (!target) return null;
+
+    const exactId = list.find(item => item.id === target);
+    if (exactId) return exactId;
+
+    const lower = target.toLowerCase();
+    const exactTitle = list.find(item => String(item.title || '').toLowerCase() === lower);
+    if (exactTitle) return exactTitle;
+
+    const slug = winConditionSlug(target);
+    if (slug.length < 4) return null;
+
+    const slugMatches = list.filter(item =>
+      winConditionSlug(item.id) === slug || winConditionSlug(item.title) === slug);
+    if (slugMatches.length === 1) return slugMatches[0];
+
+    const contained = list.filter(item => {
+      const titleSlug = winConditionSlug(item.title);
+      const idSlug = winConditionSlug(item.id);
+      return (titleSlug && titleSlug.includes(slug))
+        || (idSlug.length >= 4 && slug.includes(idSlug));
+    });
+    return contained.length === 1 ? contained[0] : null;
+  }
+
   function normalizeNature(value) {
     return normalizeStatus(value, ['transient', 'fixable', 'terminal'], 'fixable');
   }
@@ -283,7 +321,11 @@
       }
       case 'record_adversarial_review': {
         if (!state.coverageFrontier) throw new Error('No coverage frontier exists');
-        const status = normalizeStatus(args.status, ['passed', 'failed'], '');
+        // "pass"/"fail" are what a model naturally writes, and rejecting them cost a full
+        // round trip before it retried with "passed". Accept the obvious forms.
+        const reviewSynonyms = { pass: 'passed', ok: 'passed', success: 'passed', succeeded: 'passed', fail: 'failed', failure: 'failed' };
+        const rawReviewStatus = normalizeStatus(args.status, Object.keys(reviewSynonyms).concat(['passed', 'failed']), '');
+        const status = reviewSynonyms[rawReviewStatus] || rawReviewStatus;
         if (!status) throw new Error('Adversarial review status must be passed or failed');
         state.coverageFrontier.adversarialReview = {
           status,
@@ -483,7 +525,7 @@
         if (!Array.isArray(args.evaluations) || args.evaluations.length === 0) throw new Error('evaluations array is required');
         args.evaluations.forEach(evaluation => {
           const identity = cleanText(evaluation.id || evaluation.title, 500);
-          const condition = state.winConditions.find(item => item.id === identity || item.title.toLowerCase() === identity.toLowerCase());
+          const condition = findWinCondition(state.winConditions, identity);
           if (!condition) {
             const available = state.winConditions.length
               ? state.winConditions.map(c => `"${c.title}"`).join(', ')

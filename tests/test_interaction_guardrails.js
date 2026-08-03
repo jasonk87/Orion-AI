@@ -34,17 +34,20 @@ test('queued prompt cards can steer or run next after submission', (t) => {
   t.end();
 });
 
-test('chat scrolling only sticks when the user is already near the bottom', (t) => {
+// Auto-scroll behavior itself is executed against a real DOM in test_renderer_behavior.js.
+// What remains here is the one property that is structural rather than observable: the raw
+// scroll assignment must live in exactly one helper, so no call site can bypass the
+// sticky-bottom gate and yank the view down while the user is reading earlier output.
+test('the raw chat scroll assignment stays isolated to its helper', (t) => {
   const directScrollAssignments = rendererJs.match(/el\.chatFeed\.scrollTop = el\.chatFeed\.scrollHeight/g) || [];
   t.equal(directScrollAssignments.length, 1, 'direct chat scroll assignment is isolated to the helper');
-  t.ok(rendererJs.includes('function shouldAutoScrollChat'), 'renderer can detect whether the chat is near the bottom');
-  t.ok(rendererJs.includes('CHAT_BOTTOM_THRESHOLD_PX'), 'auto-scroll has a small bottom threshold');
   t.ok(rendererJs.includes('scrollChatToBottomIfNeeded(stickToBottom)'), 'message renderers respect the sticky-bottom gate');
   t.end();
 });
 
+// isEmptyThinkingPlaceholder's own logic is executed in test_renderer_behavior.js; these
+// assertions cover the call sites that wire it into the render paths.
 test('empty Thinking placeholders are not rendered as extra chat bubbles', (t) => {
-  t.ok(rendererJs.includes('function isEmptyThinkingPlaceholder'), 'history replay can identify empty Thinking placeholders');
   t.ok(rendererJs.includes('if (isEmptyThinkingPlaceholder(replayMsg.text, replayLogs)) return;'), 'history replay skips empty Thinking placeholders after normalization');
   t.ok(rendererJs.includes('if (!activeAiBubble && isThinkingPlaceholder && !hasLogs)'), 'live rendering suppresses empty Thinking bubbles');
   t.ok(rendererJs.includes("const displayText = isThinkingPlaceholder ? ''"), 'Thinking placeholder text is hidden when logs/status are rendered');
@@ -64,15 +67,13 @@ test('completed assistant responses are flushed for background phone conversatio
   t.end();
 });
 
+// The renderer half of replay normalization — role mapping, text recovery across every
+// historical stored shape, and log rebuilding from legacy turns — is executed against real
+// message objects in test_renderer_behavior.js. What stays here is the wiring into the
+// reload/preview call sites and the agent.js side, which that harness does not load.
 test('conversation reload normalizes stored assistant message shapes', (t) => {
-  t.ok(rendererJs.includes('function normalizeConversationMessageForReplay'), 'renderer normalizes stored messages before replay');
-  t.ok(rendererJs.includes("role === 'assistant' || role === 'model' || role === 'ai' || role === 'orion'"), 'model/AI/orion roles replay as assistant answers');
-  t.ok(rendererJs.includes('const directFields = [msg.text, msg.content, msg.output, msg.result, msg.message]'), 'replay reads assistant text from common stored fields');
-  t.ok(rendererJs.includes('const arrayFields = [msg.parts, msg.content]'), 'replay reads Gemini/OpenAI-style message parts');
   t.ok(rendererJs.includes('renderAiMessage(replayMsg.text, replayLogs, activeConversationId, replayMsg)'), 'bulk reload renders normalized assistant text and metadata');
   t.ok(rendererJs.includes("map(normalizeConversationMessageForReplay).find(msg => msg.role === 'assistant')"), 'phone preview finds normalized assistant messages');
-  t.ok(rendererJs.includes('function extractConversationMessageLogs'), 'replay rebuilds logs when old messages only stored turns');
-  t.ok(rendererJs.includes('turn.toolResponseParts'), 'replay reads saved tool responses from old turns');
   t.ok(rendererJs.includes('responseLooksFailed'), 'replay preserves error status from saved tool responses');
   t.ok(agentJs.includes('function persistCurrentAgentLogs'), 'agent has a single persistence helper for live logs');
   t.ok(agentJs.includes('persistCurrentAgentLogs({ render: true });'), 'agent persists tool logs while rendering live activity');
@@ -1101,8 +1102,23 @@ test('Dispatch semantic routing retains terminal task context for retry approval
 test('token-saving prompt cleanup keeps tool schemas authoritative', (t) => {
   t.notOk(agentJs.includes('\nTools available:'), 'system prompts do not duplicate the formal tool schemas as prose lists');
   t.ok(agentJs.includes('TOOL USE:'), 'system prompts keep compact tool-use guidance');
-  t.ok(agentJs.includes("if (activeConversationMode === 'orion')"), 'tool builder branches for Dispatch conversations');
-  t.ok(agentJs.includes('allTools.filter(tool => DISPATCH_TOOL_ALLOWLIST.has(tool.name))'), 'Dispatch receives only allowlisted tool declarations');
+  // Verified by running the builder rather than grepping for its implementation: this assertion
+  // previously pinned the exact filter expression and broke when gate-filtering was added ahead
+  // of the allowlist, even though the behavior it cared about was unchanged.
+  const namesForMode = (mode) => {
+    agent.__setActiveConversationModeForTest(mode);
+    const names = agent.buildAgentToolDeclarations().map(tool => tool.name);
+    agent.__setActiveConversationModeForTest('orion');
+    return names;
+  };
+  const dispatchTools = namesForMode('orion');
+  const coderTools = namesForMode('coder');
+  t.ok(dispatchTools.length > 0 && dispatchTools.length < coderTools.length,
+    'Dispatch receives a strictly narrower tool surface than Coder');
+  t.ok(dispatchTools.every(name => coderTools.includes(name)),
+    'Dispatch is offered only tools that exist in the full surface');
+  t.notOk(dispatchTools.includes('patch_file'), 'Dispatch is not offered direct file editing');
+  t.ok(dispatchTools.includes('handoff_to_coder'), 'Dispatch keeps the handoff tool it exists to use');
   t.ok(agentJs.includes("'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model'"), 'Dispatch can inspect existing project artwork through read-only visual tools');
   t.ok(agentJs.includes('conversation._systemFactsSignature'), 'stable system facts are tracked by conversation signature');
   t.ok(agentJs.includes('[ORION SYSTEM FACTS - compact]'), 'unchanged system facts use a compact repeat block');
