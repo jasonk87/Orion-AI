@@ -532,6 +532,7 @@ const STARTUP_CANCELLATION_RETRY_BASE_MS = 250;
 const STARTUP_CANCELLATION_RETRY_MAX_MS = 5000;
 const GEMINI_THINKING_BUDGET = 24576;
 const MODEL_API_REQUEST_TIMEOUT_MS = 600000;
+const UTILITY_MODEL_REQUEST_TIMEOUT_MS = 6000;
 const MODEL_API_MAX_RETRY_WAIT_MS = 45000;
 const MODEL_API_MAX_ATTEMPTS = 15;
 const OperationalContext = window.OrionOperationalContext || (typeof require === 'function' ? require('./operational-context') : null);
@@ -1358,6 +1359,8 @@ async function evaluateLoopStateWithSupervisor(modelName, workWalkthrough, disab
 
 // EXPOSE AGENT LOOP TO RENDERER
 window.runAgentLoop = async function(userPrompt, modelName, conversation, options = {}) {
+  const requestStartedAt = Date.now();
+  let intentClassificationMs = 0;
   const runTaskId = String(options.taskId || '');
   const liveUserPrompt = String(userPrompt || '');
   let claimedTaskPrompt = '';
@@ -1594,10 +1597,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         status: 'pending'
       }
     : null;
-  const semanticIntent = options.semanticIntent && typeof options.semanticIntent === 'object'
-    ? options.semanticIntent
-    : (options.internalPrompt === true
-        ? {
+  const semanticClassificationStartedAt = Date.now();
+  let semanticIntent;
+  try {
+    semanticIntent = options.semanticIntent && typeof options.semanticIntent === 'object'
+      ? options.semanticIntent
+      : (options.internalPrompt === true
+          ? {
             intent: 'context_followup',
             requiresExecution: true,
             target: runTaskId ? 'active_owned_task' : 'current_conversation',
@@ -1611,30 +1617,36 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             executionScope: 'mutating',
             inspectionTarget: 'workspace',
             standaloneSystemOperation: false
-          }
-        : await classifySemanticIntent({
-        userMessage: liveUserPrompt,
-        recentVisibleConversation: (conversation.messages || []).slice(-16),
-        conversationId: conversation.id,
-        mode: runMode,
-        workspace: {
-          path: resolveConversationWorkspace(conversation),
-          projectPath: conversation.projectPath || conversation.dispatchProjectPath || ''
-        },
-        pendingPlan: pendingSemanticPlan,
-        recentOwnedTask: conversation.lastDelegatedWork
-          ? {
-              taskId: conversation.lastDelegatedWork.taskId || '',
-              title: conversation.lastDelegatedWork.title || '',
-              objective: conversation.lastDelegatedWork.objective || '',
-              status: conversation.lastDelegatedWork.status || '',
-              originConversationId: conversation.id,
-              targetConversationId: conversation.lastDelegatedWork.coderConversationId || ''
             }
-          : null,
-        taskBound: !!runTaskId,
-        durableTaskObjective: claimedTaskPrompt || conversation.lastDelegatedWork && conversation.lastDelegatedWork.objective || ''
-      }, modelName, config));
+          : await classifySemanticIntent({
+            userMessage: liveUserPrompt,
+            recentVisibleConversation: (conversation.messages || []).slice(-24),
+            compactedConversationMemory: OperationalContext && typeof OperationalContext.getCompactedConversationMemory === 'function'
+              ? OperationalContext.getCompactedConversationMemory(conversation.messages || [])
+              : '',
+            conversationId: conversation.id,
+            mode: runMode,
+            workspace: {
+              path: resolveConversationWorkspace(conversation),
+              projectPath: conversation.projectPath || conversation.dispatchProjectPath || ''
+            },
+            pendingPlan: pendingSemanticPlan,
+            recentOwnedTask: conversation.lastDelegatedWork
+              ? {
+                  taskId: conversation.lastDelegatedWork.taskId || '',
+                  title: conversation.lastDelegatedWork.title || '',
+                  objective: conversation.lastDelegatedWork.objective || '',
+                  status: conversation.lastDelegatedWork.status || '',
+                  originConversationId: conversation.id,
+                  targetConversationId: conversation.lastDelegatedWork.coderConversationId || ''
+                }
+              : null,
+            taskBound: !!runTaskId,
+            durableTaskObjective: claimedTaskPrompt || conversation.lastDelegatedWork && conversation.lastDelegatedWork.objective || ''
+          }, modelName, config, { signal: getActiveRunSignal() }));
+  } finally {
+    intentClassificationMs = Date.now() - semanticClassificationStartedAt;
+  }
   const semanticClarificationRequired = semanticIntent.intent === 'clarification_required'
     || semanticIntent.needsClarification === true;
   const turnReasoningPolicy = ReasoningPolicy
@@ -2341,7 +2353,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   }
 
   function rememberBestVisibleAnswer(text) {
-    if (isSubstantiveVisibleAnswer(text)) {
+    const conciseAnswerIsComplete = agentExecutionMode === 'answer'
+      && sanitizeFinalAnswerText(text).trim().length > 0
+      && !isGenericNonAnswer(text)
+      && !looksLikeLeakedNoToolCorrection(text);
+    if (conciseAnswerIsComplete || isSubstantiveVisibleAnswer(text)) {
       bestVisibleAnswer = String(text || '');
     }
   }
@@ -2377,7 +2393,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       console.log("Current conversation tokens:", tokenCount);
       const compactThreshold = getCompactionThreshold(modelName, config);
       if (config.autoCompact !== false && tokenCount > compactThreshold) {
-        window.appendSystemMessage(`Context reached ${tokenCount} tokens; compacting for ${modelName} at threshold ${compactThreshold}.`);
+        console.log(`Context reached ${tokenCount} tokens; compacting for ${modelName} at threshold ${compactThreshold}.`);
         if (typeof window.api.writeConversationArtifact === 'function') {
           try {
             const backupStr = JSON.stringify(conversation.messages, null, 2);
@@ -2653,11 +2669,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         // Published before the model call so the provider adapters build a schema list matching
         // the gate that will actually run, instead of offering tools that are certain to be
         // refused a moment later.
+        const disableToolsForClassifierFallback = semanticIntent.classifierUnavailable === true;
         setActiveToolGateProfile({
           reviewOnly,
           planRevision: isPlanRevision,
           planningMode: !!(config && config.planningMode),
-          canExecute: canExecuteThisTask()
+          canExecute: !disableToolsForClassifierFallback && canExecuteThisTask()
         });
         const phaseReasoningPolicy = ReasoningPolicy
           ? ReasoningPolicy.select({
@@ -2730,13 +2747,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             content: 'Dispatch preflight routed executable work directly to Coder without spending a Dispatch model turn.'
           });
         } else if (activeRunModelName.startsWith('gemini-')) {
-          response = await callGeminiAPI(messagesForApiCall, activeRunModelName, config.geminiApiKey, onApiWarning, false, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
+          response = await callGeminiAPI(messagesForApiCall, activeRunModelName, config.geminiApiKey, onApiWarning, disableToolsForClassifierFallback, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
         } else if (activeRunModelName.startsWith('claude')) {
-          response = await callAnthropicAPI(messagesForApiCall, activeRunModelName, config.anthropicApiKey, onApiWarning, false, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
+          response = await callAnthropicAPI(messagesForApiCall, activeRunModelName, config.anthropicApiKey, onApiWarning, disableToolsForClassifierFallback, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
         } else if (activeRunModelName.startsWith('deepseek')) {
-          response = await callDeepSeekAPI(messagesForApiCall, activeRunModelName, config.deepseekApiKey, onApiWarning, false, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
+          response = await callDeepSeekAPI(messagesForApiCall, activeRunModelName, config.deepseekApiKey, onApiWarning, disableToolsForClassifierFallback, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
         } else {
-          response = await callOllamaAPI(messagesForApiCall, activeRunModelName, onApiWarning, false, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
+          response = await callOllamaAPI(messagesForApiCall, activeRunModelName, onApiWarning, disableToolsForClassifierFallback, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
         }
         if (response && response._orionActiveModelName) {
           activeRunModelName = response._orionActiveModelName;
@@ -2926,6 +2943,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           const adjudicatedIntent = await classifySemanticIntent({
             userMessage: liveUserPrompt,
             recentVisibleConversation: (conversation.messages || []).slice(-16),
+            compactedConversationMemory: OperationalContext && typeof OperationalContext.getCompactedConversationMemory === 'function'
+              ? OperationalContext.getCompactedConversationMemory(conversation.messages || [])
+              : '',
             conversationId: conversation.id,
             mode: runMode,
             workspace: {
@@ -2941,7 +2961,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               title: attemptedArgs.title || '',
               resolvedRequest: attemptedArgs.prompt || resolvedRequestForRouting
             }
-          }, modelName, config);
+          }, modelName, config, { signal: getActiveRunSignal() });
           if (isExecutableHandoffIntent(adjudicatedIntent)) {
             effectiveDispatchHandoffIntent = adjudicatedIntent;
             toolExecutionContext.authorizedDispatchHandoffIntent = adjudicatedIntent;
@@ -3133,8 +3153,18 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           }
         }
         const pendingTasks = conversation.tasks ? conversation.tasks.filter(t => t.status !== 'completed' && t.status !== 'x') : [];
-        if (config.planningMode && !canExecuteThisTask() && !hasAnyChecklist(conversation) &&
-            !isSubstantiveVisibleAnswer(textVal) && consecutiveNoToolCalls < 2 && loopCount < maxLoops) {
+        if (shouldApplyPlanningCompletionGate({
+          planningMode: config.planningMode,
+          requiresExecution: semanticIntent.requiresExecution,
+          planningModeDecision: planningDecision.mode,
+          executionMode: agentExecutionMode,
+          canExecute: canExecuteThisTask(),
+          hasChecklist: hasAnyChecklist(conversation),
+          answerText: textVal,
+          consecutiveNoToolCalls,
+          loopCount,
+          maxLoops
+        })) {
           messages.push({
             role: 'user',
             parts: [{
@@ -4214,6 +4244,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       loopCount,
       maxLoops,
       elapsedMs: Date.now() - runStartedAt,
+      startupMs: runStartedAt - requestStartedAt,
+      totalElapsedMs: Date.now() - requestStartedAt,
+      intentClassificationMs,
       modelName: activeRunModelName,
       ledger: contextAcquisitionLedger,
       workWalkthrough
@@ -4699,26 +4732,24 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
     // Notify phone companion whenever the agent stops — different messages by exit reason
     if (window.api && typeof window.api.notifyPhone === 'function') {
-      let notifBody;
-      if (finalizedTaskState === 'cancelled') {
-        notifBody = 'Agent stopped.';
-      } else if (finalizedTaskState === 'failed' || criticalRunError) {
-        notifBody = 'Task failed. Open Orion for the recorded error.';
-      } else if (finalizedTaskState === 'pending' || autoContinueExecution) {
-        // Mid-plan continuation queued — skip, phone will get notified when it truly finishes
-        notifBody = null;
-      } else if (ranOutOfLoopBudget) {
-        notifBody = 'Hit action limit — ask Orion to continue.';
-      } else if (forceYield) {
-        notifBody = 'Paused — needs your input.';
-      } else if (finalizedTaskState === 'completed') {
-        const shortResponse = String(lastTextResponse || '').replace(/\s+/g, ' ').slice(0, 120);
-        notifBody = shortResponse || 'Task complete';
-      } else {
-        notifBody = 'Task ended without a verified completion state. Open Orion to inspect its recorded status.';
-      }
-      if (notifBody) {
-        window.api.notifyPhone('Orion AI', notifBody).catch(() => {});
+      const notification = buildRunEndNotification({
+        conversation,
+        finalizedTaskState,
+        criticalRunError,
+        autoContinueExecution,
+        ranOutOfLoopBudget,
+        forceYield,
+        forcedYieldFailure,
+        lastTextResponse
+      });
+      if (notification) {
+        // The delivery result is inspected rather than discarded. It carries the reason a push
+        // failed ("no subscribed phone devices", "web-push not available"), which is the only
+        // signal that the phone chain is broken — previously swallowed by .catch(() => {}), so
+        // a phone that never received anything looked identical to one that did.
+        window.api.notifyPhone(notification.title, notification.body)
+          .then(result => recordPhoneNotificationOutcome(notification, result))
+          .catch(error => recordPhoneNotificationOutcome(notification, { success: false, phone: { reason: String(error && error.message || error) } }));
       }
     }
 
@@ -7232,11 +7263,17 @@ function persistCompactedConversation(conversation, summary) {
   conversation.messages = [
     {
       role: 'user',
-      text: `[COMPACTED CONTEXT SUMMARY]\n${summary}`
+      text: `[COMPACTED CONTEXT SUMMARY]\n${summary}`,
+      source: 'context-compaction',
+      internalContext: true,
+      hiddenFromTranscript: true
     },
     {
       role: 'assistant',
       text: 'Understood. I will use this compacted summary as prior context.',
+      source: 'context-compaction',
+      internalContext: true,
+      hiddenFromTranscript: true,
       logs: [],
       turns: []
     },
@@ -8325,6 +8362,18 @@ function isSubstantiveVisibleAnswer(text) {
   return answerHasActionableFinalContent(text) && !looksLikeLeakedNoToolCorrection(text);
 }
 
+function shouldApplyPlanningCompletionGate(options = {}) {
+  return options.planningMode === true
+    && options.requiresExecution === true
+    && options.planningModeDecision === 'plan'
+    && (options.executionMode === 'planning' || options.executionMode === 'analyzing')
+    && options.canExecute !== true
+    && options.hasChecklist !== true
+    && !isSubstantiveVisibleAnswer(options.answerText)
+    && Number(options.consecutiveNoToolCalls || 0) < 2
+    && Number(options.loopCount || 0) < Number(options.maxLoops || 0);
+}
+
 function getInspectedEvidenceAnchors(workWalkthrough = []) {
   const anchors = new Set();
   (workWalkthrough || []).forEach(item => {
@@ -8474,7 +8523,7 @@ async function callUtilityModel(prompt, modelName, config, requireJson = true, o
   if (modelName.startsWith('deepseek')) {
     if (!config.deepseekApiKey) return null;
     try {
-      const response = await fetch('https://api.deepseek.com/chat/completions', {
+      const response = await fetchWithTimeout('https://api.deepseek.com/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.deepseekApiKey}` },
         body: JSON.stringify({
@@ -8483,12 +8532,14 @@ async function callUtilityModel(prompt, modelName, config, requireJson = true, o
           ...providerControls,
           ...(!providerControls.thinking || providerControls.thinking.type === 'disabled' ? { temperature: 0 } : {}),
           ...(requireJson ? { response_format: { type: 'json_object' } } : {})
-        })
-      });
+        }),
+        signal: options.signal
+      }, Number(options.timeoutMs) || UTILITY_MODEL_REQUEST_TIMEOUT_MS, 'DeepSeek utility request');
       if (!response.ok) return null;
       const data = await response.json();
       return (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || null;
     } catch (e) {
+      if ((options.signal && options.signal.aborted) || isUserStopError(e)) throw e;
       console.error('DeepSeek utility call failed:', e);
       return null;
     }
@@ -8496,7 +8547,7 @@ async function callUtilityModel(prompt, modelName, config, requireJson = true, o
     if (!config.geminiApiKey) return null;
     try {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${config.geminiApiKey}`;
-      const response = await fetch(url, {
+      const response = await fetchWithTimeout(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -8506,19 +8557,21 @@ async function callUtilityModel(prompt, modelName, config, requireJson = true, o
             ...(providerControls.thinkingConfig ? { thinkingConfig: providerControls.thinkingConfig } : {}),
             ...(requireJson ? { responseMimeType: 'application/json' } : {})
           }
-        })
-      });
+        }),
+        signal: options.signal
+      }, Number(options.timeoutMs) || UTILITY_MODEL_REQUEST_TIMEOUT_MS, 'Gemini utility request');
       if (!response.ok) return null;
       const data = await response.json();
       return (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0].text) || null;
     } catch (e) {
+      if ((options.signal && options.signal.aborted) || isUserStopError(e)) throw e;
       console.error('Gemini utility call failed:', e);
       return null;
     }
   } else {
     // Assume Ollama local for anything else
     try {
-      const response = await fetch(`http://localhost:11434/api/chat`, {
+      const response = await fetchWithTimeout(`http://localhost:11434/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -8530,8 +8583,9 @@ async function callUtilityModel(prompt, modelName, config, requireJson = true, o
           stream: false,
           ...(providerControls.think !== undefined ? { think: providerControls.think } : {}),
           options: { temperature: 0 }
-        })
-      });
+        }),
+        signal: options.signal
+      }, Number(options.timeoutMs) || UTILITY_MODEL_REQUEST_TIMEOUT_MS, 'Ollama utility request');
       if (!response.ok) return null;
       const resData = await response.json();
       let text = resData.message && resData.message.content;
@@ -8541,13 +8595,14 @@ async function callUtilityModel(prompt, modelName, config, requireJson = true, o
       }
       return text || null;
     } catch (e) {
+      if ((options.signal && options.signal.aborted) || isUserStopError(e)) throw e;
       console.error('Ollama utility call failed:', e);
       return null;
     }
   }
 }
 
-async function classifySemanticIntent(input, modelName, config) {
+async function classifySemanticIntent(input, modelName, config, options = {}) {
   if (!SemanticIntentRouter) {
     return {
       intent: 'clarification_required',
@@ -8566,7 +8621,9 @@ async function classifySemanticIntent(input, modelName, config) {
     structureApi: DispatchIntent,
     classify: async request => {
       const response = await callUtilityModel(request.prompt, utilityModel, config, true, {
-        phase: 'intent_classification'
+        phase: 'intent_classification',
+        signal: options.signal,
+        timeoutMs: options.timeoutMs || config.utilityModelTimeoutMs
       });
       if (!response) throw new Error('Semantic intent classifier returned no response.');
       return response;
@@ -9602,11 +9659,17 @@ function recordRunEfficiency(summary = {}) {
     const ledger = summary.ledger || {};
     const toolCalls = Array.isArray(summary.workWalkthrough) ? summary.workWalkthrough.length : 0;
     const seconds = Math.round((Number(summary.elapsedMs) || 0) / 100) / 10;
+    const startupSeconds = Math.round((Number(summary.startupMs) || 0) / 100) / 10;
+    const totalSeconds = Math.round((Number(summary.totalElapsedMs) || Number(summary.elapsedMs) || 0) / 100) / 10;
+    const intentClassificationSeconds = Math.round((Number(summary.intentClassificationMs) || 0) / 100) / 10;
     const stats = {
       model: summary.modelName || 'unknown',
       turns: summary.loopCount || 0,
       turnBudget: summary.maxLoops || 0,
       seconds,
+      startupSeconds,
+      totalSeconds,
+      intentClassificationSeconds,
       secondsPerTurn: summary.loopCount ? Math.round((seconds / summary.loopCount) * 10) / 10 : 0,
       toolCalls,
       readCalls: ledger.readCalls || 0,
@@ -9619,6 +9682,109 @@ function recordRunEfficiency(summary = {}) {
       window.api.reportRendererFault('run-efficiency', JSON.stringify(stats));
     }
     return stats;
+  } catch (_) {
+    return null;
+  }
+}
+
+// ── Phone notifications ────────────────────────────────────────────────────────
+// A phone notification exists so you do NOT have to walk back to the desk to find out what
+// happened. "Paused — needs your input" failed that test: it told you something needed
+// attention but not what, so you had to go look anyway. Each pause reason now carries the
+// detail that lets you decide whether to get up.
+
+function firstClarifyingQuestionText(clarification) {
+  const questions = clarification && Array.isArray(clarification.questions) ? clarification.questions : [];
+  for (const entry of questions) {
+    if (typeof entry === 'string' && entry.trim()) return entry.trim();
+    if (entry && typeof entry === 'object') {
+      const text = String(entry.question || entry.header || '').trim();
+      if (text) return text;
+    }
+  }
+  return String((clarification && clarification.intro) || '').trim();
+}
+
+function buildRunEndNotification(context = {}) {
+  const {
+    conversation, finalizedTaskState, criticalRunError, autoContinueExecution,
+    ranOutOfLoopBudget, forceYield, forcedYieldFailure, lastTextResponse
+  } = context;
+
+  // A mid-plan continuation is still working — notifying here would buzz repeatedly through a
+  // long task and train you to ignore it.
+  if (finalizedTaskState === 'pending' || autoContinueExecution) return null;
+
+  const clip = (value, max) => String(value == null ? '' : value).replace(/\s+/g, ' ').trim().slice(0, max);
+  const taskTitle = clip((conversation && conversation.title) || '', 48);
+  const title = taskTitle ? `Orion · ${taskTitle}` : 'Orion AI';
+
+  let body = '';
+  let kind = 'ended';
+
+  if (finalizedTaskState === 'cancelled') {
+    kind = 'cancelled';
+    body = 'Agent stopped.';
+  } else if (finalizedTaskState === 'failed' || criticalRunError) {
+    kind = 'failed';
+    const detail = clip(criticalRunError && (criticalRunError.message || criticalRunError), 110);
+    body = detail ? `Task failed: ${detail}` : 'Task failed. Open Orion for the recorded error.';
+  } else if (ranOutOfLoopBudget) {
+    kind = 'action-limit';
+    body = 'Hit action limit — ask Orion to continue.';
+  } else if (forceYield) {
+    // The three reasons a run pauses for you, each answerable from the notification text.
+    const clarification = conversation && conversation.awaitingClarification;
+    if (clarification) {
+      kind = 'question';
+      const question = clip(firstClarifyingQuestionText(clarification), 130);
+      body = question ? `Question: ${question}` : 'Orion asked a clarifying question.';
+    } else if (conversation && conversation.awaitingPlanApproval) {
+      kind = 'plan-approval';
+      body = 'Plan ready for your approval.';
+    } else if (forcedYieldFailure) {
+      kind = 'repeated-failure';
+      const tool = clip(forcedYieldFailure.toolName || 'a tool', 40);
+      const count = Number(forcedYieldFailure.failureCount) || 3;
+      body = `Paused: ${tool} failed ${count}x. ${clip(forcedYieldFailure.error, 90)}`.trim();
+    } else {
+      kind = 'paused';
+      body = 'Paused — needs your input.';
+    }
+  } else if (finalizedTaskState === 'completed') {
+    kind = 'completed';
+    body = clip(lastTextResponse, 120) || 'Task complete';
+  } else {
+    kind = 'unverified';
+    body = 'Task ended without a verified completion state. Open Orion to inspect its recorded status.';
+  }
+
+  return body ? { title, body, kind } : null;
+}
+
+// Push delivery is the one part of the phone chain with no visible failure mode: an unsubscribed
+// phone and a delivered notification look identical from the desktop. The result is recorded so
+// the pairing panel can say WHY nothing arrived.
+function recordPhoneNotificationOutcome(notification, result) {
+  try {
+    const phone = (result && result.phone) || {};
+    const outcome = {
+      at: Date.now(),
+      kind: (notification && notification.kind) || 'unknown',
+      delivered: !!phone.success,
+      sent: Number(phone.sent) || 0,
+      failed: Number(phone.failed) || 0,
+      reason: String(phone.reason || '')
+    };
+    window.lastPhoneNotification = outcome;
+    if (!outcome.delivered) {
+      console.warn('[orion:phone-push] not delivered:', outcome.reason || 'unknown reason');
+      if (window.api && typeof window.api.reportRendererFault === 'function') {
+        window.api.reportRendererFault('phone-push', `${outcome.kind}: ${outcome.reason || 'not delivered'}`);
+      }
+    }
+    if (typeof window.updatePhonePushDiagnostic === 'function') window.updatePhonePushDiagnostic(outcome);
+    return outcome;
   } catch (_) {
     return null;
   }
@@ -12559,6 +12725,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     requestNeedsActionableFinalAnswer,
     answerHasActionableFinalContent,
     isSubstantiveVisibleAnswer,
+    shouldApplyPlanningCompletionGate,
     answerHasInspectionGrounding,
     getReviewCoverage,
     answerHasGroundedReviewReport,
@@ -12581,6 +12748,9 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     getRepeatedSearchResult,
     searchRequestKey,
     recordRunEfficiency,
+    buildRunEndNotification,
+    recordPhoneNotificationOutcome,
+    firstClarifyingQuestionText,
     setActiveToolGateProfile,
     getToolsBlockedByActiveGate,
     PLANNING_BLOCKED_TOOLS,
@@ -12634,7 +12804,9 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     estimateDeepSeekRequestTokens,
     fitDeepSeekMessagesToContextWindow,
     callDeepSeekAPI,
+    callUtilityModel,
     getNextModelForHighDemand,
+    persistCompactedConversation,
     compactHistory,
     summarizeToolStart,
     buildRepeatedFailureKey,

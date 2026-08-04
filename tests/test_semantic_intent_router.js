@@ -325,10 +325,11 @@ test('classifier failures fall back without execution or mutation', async t => {
       throw new Error('provider unavailable');
     }
   });
-  t.equal(unbound.intent, 'clarification_required', 'an unbound classifier failure asks instead of guessing');
+  t.equal(unbound.intent, 'conversation', 'an unbound classifier failure keeps the non-executing conversation path usable');
   t.equal(unbound.requiresExecution, false, 'execution is never inferred on failure');
-  t.equal(unbound.needsClarification, true, 'the failure cannot fall through to a tool-enabled turn');
-  t.match(unbound.clarificationQuestion, /what action|what you would like/i, 'the fallback asks a targeted safe question');
+  t.equal(unbound.needsClarification, false, 'ordinary chat is not replaced by a classifier-error question');
+  t.equal(unbound.reasoningPolicyHint.contextNeed, 'recent', 'the fallback retains active-conversation memory');
+  t.equal(unbound.classifierUnavailable, true, 'diagnostics can distinguish fallback routing from a real classification');
   t.match(unbound.classifierError, /provider unavailable/i, 'the failure is surfaced for diagnosis');
 
   const bound = await router.classify(baseContext('Do that.', {
@@ -341,6 +342,34 @@ test('classifier failures fall back without execution or mutation', async t => {
   t.equal(bound.intent, 'clarification_required', 'a task-bound parse failure asks instead of acting');
   t.equal(bound.needsClarification, true, 'the safe fallback requires clarification');
   t.equal(bound.requiresExecution, false, 'the fallback cannot steer or cancel');
+  t.end();
+});
+
+test('runtime placeholders never replace the real prior assistant message', async t => {
+  let input;
+  await router.classify(baseContext('As I just said, getting ready for work.', {
+    recentVisibleConversation: [
+      { role: 'assistant', text: 'What are you doing this morning?', createdAt: 1 },
+      { role: 'user', text: 'Getting ready for another day of work.', createdAt: 2 },
+      { role: 'assistant', text: 'Thinking...', createdAt: 3 },
+      { role: 'assistant', source: 'queue-status', text: 'Queued behind another task.', createdAt: 4 }
+    ],
+    compactedConversationMemory: 'Earlier in this conversation Jason discussed storm restoration work.'
+  }), {
+    structureApi,
+    classify: async request => {
+      input = request.input;
+      return classification('conversation', {
+        contextDependent: true,
+        reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'recent' }
+      });
+    }
+  });
+
+  t.equal(input.priorAssistantMessage.text, 'What are you doing this morning?', 'the real answer is the semantic referent');
+  t.notOk(input.recentVisibleConversation.some(message => message.text === 'Thinking...'), 'thinking placeholder is absent');
+  t.notOk(input.recentVisibleConversation.some(message => message.source === 'queue-status'), 'runtime status is absent');
+  t.match(input.compactedConversationMemory, /storm restoration work/, 'private conversation memory is supplied separately');
   t.end();
 });
 

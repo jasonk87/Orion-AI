@@ -299,6 +299,9 @@ test('every run records the numbers needed to tell if the loop is efficient', (t
     loopCount: 18,
     maxLoops: 20,
     elapsedMs: 96000,
+    startupMs: 3100,
+    totalElapsedMs: 99100,
+    intentClassificationMs: 2700,
     modelName: 'deepseek-v4',
     ledger,
     workWalkthrough: new Array(44)
@@ -306,11 +309,57 @@ test('every run records the numbers needed to tell if the loop is efficient', (t
 
   t.equal(stats.turns, 18, 'turns per task is recorded');
   t.equal(stats.seconds, 96, 'wall clock is recorded');
+  t.equal(stats.startupSeconds, 3.1, 'pre-model startup latency is recorded separately');
+  t.equal(stats.totalSeconds, 99.1, 'the user-visible total is recorded');
+  t.equal(stats.intentClassificationSeconds, 2.7, 'semantic classification latency is visible');
   t.equal(stats.secondsPerTurn, 5.3, 'per-turn latency is derived');
   t.equal(stats.toolCalls, 44, 'total tool calls are recorded');
   t.equal(stats.searchCalls, 31, 'search volume is visible');
   t.equal(stats.blockedRepeatedSearches, 12, 'wasted repeated searching is visible');
   t.equal(stats.model, 'deepseek-v4', 'the model is recorded so runs can be compared across models');
+  t.end();
+});
+
+test('utility classification has a bounded timeout and preserves user cancellation', async t => {
+  const originalFetch = global.fetch;
+  const hangingFetch = (_url, options = {}) => new Promise((resolve, reject) => {
+    if (!options.signal) return;
+    options.signal.addEventListener('abort', () => {
+      const error = new Error('aborted');
+      error.name = 'AbortError';
+      reject(error);
+    }, { once: true });
+  });
+  global.fetch = hangingFetch;
+
+  const startedAt = Date.now();
+  const timedOut = await agent.callUtilityModel(
+    'Return JSON.',
+    'deepseek-v4-flash',
+    { deepseekApiKey: 'test-key' },
+    true,
+    { timeoutMs: 20 }
+  );
+  t.equal(timedOut, null, 'a stalled classifier safely returns no classification');
+  t.ok(Date.now() - startedAt < 500, 'the timeout is bounded instead of hanging for minutes');
+
+  const controller = new AbortController();
+  const cancelled = agent.callUtilityModel(
+    'Return JSON.',
+    'deepseek-v4-flash',
+    { deepseekApiKey: 'test-key' },
+    true,
+    { timeoutMs: 1000, signal: controller.signal }
+  );
+  controller.abort();
+  try {
+    await cancelled;
+    t.fail('cancellation should reject the utility request');
+  } catch (error) {
+    t.ok(error, 'the active run receives the cancellation instead of swallowing it');
+  }
+
+  global.fetch = originalFetch;
   t.end();
 });
 
@@ -345,8 +394,8 @@ test('casual conversation never reaches for the cross-project fact store', (t) =
   t.equal(policy.select({ phase: 'casual_conversation', hint: { contextNeed: 'historical' } }).contextScope,
     'historical', 'a genuine recall request can still search past conversations');
 
-  t.equal(policy.select({ phase: 'casual_conversation' }).contextScope, 'none',
-    'a standalone greeting pulls no stored context at all');
+  t.equal(policy.select({ phase: 'casual_conversation' }).contextScope, 'recent',
+    'a standalone greeting sees only this conversation, not stored project/session facts');
   t.equal(policy.select({ phase: 'casual_conversation', contextDependent: true }).contextScope, 'recent',
     'a follow-up reaction still sees the recent exchange');
   t.equal(policy.select({ phase: 'casual_conversation', hint: { contextNeed: 'recent' } }).contextScope, 'recent',

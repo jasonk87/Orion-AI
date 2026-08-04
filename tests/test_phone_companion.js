@@ -1,3 +1,5 @@
+process.env.NODE_ENV = 'test';
+
 const test = require('tape');
 const http = require('http');
 const vm = require('vm');
@@ -878,6 +880,39 @@ test('Phone Companion v2 notify IPC reports desktop and phone delivery', async (
   t.ok(pushSend, 'web-push sendNotification is called');
   t.deepEqual(pushSend.subscription, pushSubscription, 'web-push receives the stored subscription');
   t.deepEqual(JSON.parse(pushSend.payload), { title: 'Orion AI', body: 'Task complete' }, 'web-push payload carries title and body');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('paired phone authenticates VAPID setup, persists its subscription, and receives push', async (t) => {
+  const session = { deviceId: 'dev1', secret: 'sec1' };
+  const pushSubscription = {
+    endpoint: 'https://push.example.test/live-subscription',
+    keys: { p256dh: 'phone-p256dh', auth: 'phone-auth' }
+  };
+  const { main, electron, webPushCalls } = await startMainWithConfig(1156, {
+    phoneCompanionDevices: [
+      { id: session.deviceId, name: 'Phone', secret: session.secret, approved: true, revoked: false }
+    ]
+  });
+
+  const unauthenticatedKey = await request('GET', 1156, '/api/vapid-public-key');
+  t.equal(unauthenticatedKey.statusCode, 401, 'the protected VAPID endpoint rejects a bare fetch');
+
+  const authenticatedKey = await request('GET', 1156, '/api/vapid-public-key', null, session);
+  t.equal(authenticatedKey.statusCode, 200, 'the paired-device request can retrieve the VAPID key');
+  t.equal(authenticatedKey.json.enabled, true, 'push is advertised as enabled');
+  t.equal(authenticatedKey.json.publicKey, 'test-public-key', 'the browser receives the configured application key');
+
+  const saved = await request('POST', 1156, '/api/push-subscribe', { subscription: pushSubscription }, session);
+  t.equal(saved.statusCode, 200, 'the authenticated subscription is persisted');
+  t.equal(saved.json.success, true, 'the server confirms subscription persistence');
+
+  const notifyHandler = electron.ipcHandlers['notify-phone'];
+  const delivered = await notifyHandler(null, { title: 'Orion AI', body: 'Verified live chain' });
+  t.equal(delivered.phone.sent, 1, 'the newly persisted subscription receives the next push');
+  const pushSend = webPushCalls.find(call => call.type === 'sendNotification');
+  t.deepEqual(pushSend.subscription, pushSubscription, 'delivery uses the subscription saved by the phone endpoint');
 
   await closeServer(main.getCompanionServer());
 });

@@ -32,6 +32,7 @@
     "tape": "^5.9.0"
   },
   "overrides": {
-    "brace-expansion": "5.0.8"
+    "brace-expansion": "5.0.9",
+    "undici": "7.29.0"
   }
 }

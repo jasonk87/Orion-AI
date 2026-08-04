@@ -8,6 +8,7 @@
 
 const test = require('tape');
 const { loadRenderer } = require('./helpers/renderer-harness');
+const operational = require('../operational-context');
 
 // ── Chat auto-scroll ───────────────────────────────────────────────────────────
 // The chat must stick to the bottom while you are following along, and must NOT yank you
@@ -159,6 +160,41 @@ test('replay rebuilds tool logs from legacy messages that only stored turns', (t
   const modern = { role: 'model', text: 'done', logs: [{ type: 'tool_call', tool: 'grep_search' }] };
   t.equal(win.normalizeConversationMessageForReplay(modern).logs[0].tool, 'grep_search',
     'messages that already have logs keep them rather than being rebuilt');
+  t.end();
+});
+
+test('desktop replay hides internal compaction scaffolding from old and new conversations', async (t) => {
+  const conversation = {
+    id: 'compacted-conversation',
+    title: "What's up",
+    mode: 'orion',
+    workspace: '',
+    messages: [
+      { role: 'user', text: '[COMPACTED CONTEXT SUMMARY]\nPrivate summary.' },
+      { role: 'assistant', text: 'Understood. I will use this compacted summary as prior context.' },
+      { role: 'system', text: 'Context reached 125000 tokens; compacting for model-x at threshold 100000.' },
+      { role: 'user', text: "What's up?" },
+      { role: 'assistant', text: 'Hey Jason, I am here.' }
+    ],
+    tasks: []
+  };
+  const { win } = loadRenderer({
+    t,
+    globals: { OrionOperationalContext: operational },
+    set: { conversations: [conversation], activeConversationId: conversation.id, appMode: 'orion' }
+  });
+
+  await win.selectConversation(conversation.id);
+  const transcript = win.document.getElementById('messages-container').textContent;
+  t.notOk(/COMPACTED CONTEXT SUMMARY|compacted summary as prior context|Context reached 125000/.test(transcript), 'internal compaction records do not render');
+  t.match(transcript, /What's up\?/, 'real user message still renders');
+  t.match(transcript, /Hey Jason, I am here/, 'real assistant answer still renders');
+
+  const phoneState = await win.getPhoneCompanionState(conversation.id);
+  const phoneTranscript = JSON.stringify(phoneState.messages || []);
+  t.notOk(/COMPACTED CONTEXT SUMMARY|compacted summary as prior context|Context reached 125000/.test(phoneTranscript), 'internal compaction records are also absent from phone state');
+  t.match(phoneTranscript, /What's up\?/, 'phone state retains the real user message');
+  t.match(phoneTranscript, /Hey Jason, I am here/, 'phone state retains the real assistant answer');
   t.end();
 });
 
@@ -531,5 +567,49 @@ test('saving settings does not overwrite config for controls the UI no longer re
 
   t.equal(read('appConfig').autoTest, false,
     'saving settings preserves autoTest instead of silently forcing it back on');
+  t.end();
+});
+
+// ── Phone push diagnosis on the desktop ────────────────────────────────────────
+// Push failure had no visible symptom here: a phone that never subscribed and one that received
+// everything looked identical. The reason string already existed inside notifyAllPhoneDevices —
+// it was just discarded, so "notifications don't work" could only be diagnosed by reading source.
+
+test('the pairing panel reports why a push did not arrive', (t) => {
+  const { win } = loadRenderer({ t });
+  const meta = win.document.getElementById('phone-companion-meta');
+  t.ok(meta, 'the pairing panel has a meta line to report into');
+
+  win.updatePhoneCompanionPairingPanel({
+    pairUrl: 'https://desktop.tailnet.ts.net/pair',
+    preferredUrlType: 'https',
+    networkEnabled: true
+  });
+  const healthy = meta.textContent;
+  t.notOk(/Last push/.test(healthy), 'nothing is claimed before any push has been attempted');
+
+  // The signature of an insecure origin: the companion page refuses to subscribe outside a
+  // secure context, so no device is ever registered and every push silently no-ops.
+  win.updatePhonePushDiagnostic({
+    delivered: false, kind: 'question', sent: 0, failed: 0, reason: 'no subscribed phone devices'
+  });
+  const failed = meta.textContent;
+  t.ok(/Last push FAILED/.test(failed), 'the failure is stated plainly');
+  t.ok(/no subscribed phone devices/.test(failed), 'the precise reason is shown');
+  t.ok(/HTTPS URL and allow notifications/i.test(failed),
+    'and the actionable fix, since this reason always means the phone never subscribed');
+
+  win.updatePhonePushDiagnostic({ delivered: true, kind: 'completed', sent: 2, failed: 0, reason: '' });
+  const ok = meta.textContent;
+  t.ok(/delivered to 2 devices/.test(ok), 'a successful push is confirmed with the device count');
+  t.notOk(/FAILED/.test(ok), 'the stale failure is replaced, not appended');
+  t.end();
+});
+
+test('push diagnosis survives being called before the panel exists', (t) => {
+  const { win } = loadRenderer({ t });
+  t.doesNotThrow(() => win.updatePhonePushDiagnostic({ delivered: false, reason: 'x' }),
+    'reporting before the panel has rendered does not throw');
+  t.doesNotThrow(() => win.updatePhonePushDiagnostic(null), 'a null outcome does not throw');
   t.end();
 });

@@ -631,14 +631,49 @@
       'task-resolution-clarification'
     ]);
     const view = (Array.isArray(messages) ? messages : [])
+      .filter(message => !isInternalContextMessage(message))
       .filter(message => message && (message.role === 'user' || message.role === 'assistant'))
       .filter(message => !excludedSources.has(cleanText(message.source, 120)))
       .map(message => ({ role: message.role, text: cleanText(message.text, 2000), source: cleanText(message.source, 120) }))
-      .filter(message => message.text && message.text !== 'Thinking...' && !message.text.startsWith('[COMPACTED CONTEXT SUMMARY]'))
+      .filter(message => message.text && message.text !== 'Thinking...')
       .filter(message => message.role !== 'assistant' || !message.source.endsWith('-error'));
     if (view.length && view[view.length - 1].role === 'user' && view[view.length - 1].text === input) view.pop();
-    const scopeLimit = contextScope === 'recent' ? 4 : (contextScope === 'historical' ? 16 : Math.max(0, Number(limit) || MAX_CHAT_VIEW_MESSAGES));
+    const scopeLimit = contextScope === 'recent' ? MAX_CHAT_VIEW_MESSAGES : (contextScope === 'historical' ? 16 : Math.max(0, Number(limit) || MAX_CHAT_VIEW_MESSAGES));
     return view.slice(-scopeLimit);
+  }
+
+  function getCompactedConversationMemory(messages) {
+    const values = Array.isArray(messages) ? messages : [];
+    for (let index = values.length - 1; index >= 0; index -= 1) {
+      const message = values[index];
+      if (!message || typeof message !== 'object') continue;
+      const source = cleanText(message.source, 120).toLowerCase();
+      const text = cleanText(message.text || message.content, 50000);
+      const structuredSummary = source === 'context-compaction';
+      const legacySummary = !source && String(message.role || '').toLowerCase() === 'user';
+      if ((!structuredSummary && !legacySummary) || !text.startsWith('[COMPACTED CONTEXT SUMMARY]')) continue;
+      return cleanText(text.slice('[COMPACTED CONTEXT SUMMARY]'.length), 12000);
+    }
+    return '';
+  }
+
+  function isInternalContextMessage(message) {
+    if (!message || typeof message !== 'object') return false;
+    if (message.internalContext === true || message.hiddenFromTranscript === true) return true;
+
+    const source = cleanText(message.source, 120).toLowerCase();
+    if (source === 'context-compaction') return true;
+
+    // These exact machine-generated shapes predate the structured flags above. Keep the
+    // compatibility check so already-persisted conversations stop exposing implementation
+    // scaffolding after an upgrade. This is format recognition, not language classification.
+    const text = cleanText(message.text || message.content, 50000);
+    if (text.startsWith('[COMPACTED CONTEXT SUMMARY]')) return true;
+    if (text === 'Understood. I will use this compacted summary as prior context.') return true;
+    return String(message.role || '').toLowerCase() === 'system'
+      && text.startsWith('Context reached ')
+      && text.includes(' tokens; compacting for ')
+      && text.includes(' at threshold ');
   }
 
   function buildReasoningMessages(input, conversationMessages, currentInput, images = [], options = {}) {
@@ -650,6 +685,15 @@
       messages.push(
         { role: 'user', parts: [{ text: statePrompt }] },
         { role: 'model', parts: [{ text: 'Working state loaded. I will reason from it and treat chat as an input/view channel.' }] }
+      );
+    }
+    const compactedConversationMemory = contextScope === 'none'
+      ? ''
+      : getCompactedConversationMemory(conversationMessages);
+    if (compactedConversationMemory) {
+      messages.push(
+        { role: 'user', parts: [{ text: `[CONVERSATION MEMORY - compacted, non-canonical]\nThis private summary preserves the earlier part of this same conversation after context compaction. Use it for conversational continuity and unresolved references. Durable task state, files, and verification evidence remain authoritative for implementation claims.\n\n${compactedConversationMemory}` }] },
+        { role: 'model', parts: [{ text: 'Earlier conversation memory loaded. I will use it for continuity without treating it as fresh verification evidence.' }] }
       );
     }
     const chatView = buildRecentChatView(conversationMessages, currentInput, MAX_CHAT_VIEW_MESSAGES, { contextScope });
@@ -833,7 +877,7 @@
     });
   }
 
-  const api = { VERSION, createEmptyContext, normalizeContext, applyAction, formatForPrompt, buildRecentChatView, buildReasoningMessages, evaluateCompletionGate, normalizeSeverity, normalizeNature, compareBlockers };
+  const api = { VERSION, createEmptyContext, normalizeContext, applyAction, formatForPrompt, buildRecentChatView, getCompactedConversationMemory, buildReasoningMessages, evaluateCompletionGate, isInternalContextMessage, normalizeSeverity, normalizeNature, compareBlockers };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   if (globalScope) globalScope.OrionOperationalContext = api;
 })(typeof window !== 'undefined' ? window : globalThis);

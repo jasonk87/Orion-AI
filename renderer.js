@@ -2206,6 +2206,7 @@ function structuredWorkspaceForConversation(conv, explicitPath = '') {
 
 function taskContextMessages(conv) {
   return (conv && Array.isArray(conv.messages) ? conv.messages : [])
+    .filter(isConversationMessageVisible)
     .filter(message => message && ['user', 'assistant', 'model', 'orion'].includes(String(message.role || '').toLowerCase()))
     .slice(-16)
     .map(message => ({
@@ -3603,7 +3604,7 @@ function compactDispatchDiscussionText(value, fallback = '') {
 function deriveDispatchDiscussionSummary(conv) {
   if (!conv) return '';
   if (conv.dispatchDiscussionSummary) return compactDispatchDiscussionText(conv.dispatchDiscussionSummary, conv.title);
-  const messages = Array.isArray(conv.messages) ? conv.messages : [];
+  const messages = Array.isArray(conv.messages) ? conv.messages.filter(isConversationMessageVisible) : [];
   const latestUser = [...messages].reverse().find(message => normalizeConversationMessageRole(message) === 'user');
   return compactDispatchDiscussionText(
     latestUser ? extractConversationMessageText(latestUser) : '',
@@ -4901,7 +4902,9 @@ async function selectConversation(id, options = {}) {
     el.messagesContainer.style.display = 'flex';
     el.messagesContainer.innerHTML = '';
     
-    const replayMessages = conv.messages.map(normalizeConversationMessageForReplay);
+    const replayMessages = conv.messages
+      .filter(isConversationMessageVisible)
+      .map(normalizeConversationMessageForReplay);
     replayMessages.forEach(replayMsg => {
       const replayLogs = Array.isArray(replayMsg.logs) ? replayMsg.logs : [];
       window.clearActiveAiBubble();
@@ -5496,6 +5499,39 @@ function showPhoneCompanionPairingCard(payload = {}, options = {}) {
   removeLegacyPhoneCompanionTokenBubbles();
 }
 
+// Last push delivery result, recorded by agent.js after every run-end notification.
+//
+// Push failure had no visible symptom on the desktop: a phone that never subscribed and a phone
+// that got the notification looked identical from here, so "notifications don't work" could only
+// be diagnosed by reading source. notifyAllPhoneDevices already returns a precise reason
+// ("no subscribed phone devices", "web-push not available") — it was simply thrown away.
+let lastPhonePushOutcome = null;
+
+function describeLastPhonePush() {
+  if (!lastPhonePushOutcome) return '';
+  if (lastPhonePushOutcome.delivered) {
+    const count = lastPhonePushOutcome.sent || 1;
+    return ` Last push: delivered to ${count} device${count === 1 ? '' : 's'}.`;
+  }
+  const reason = String(lastPhonePushOutcome.reason || '').trim();
+  // "no subscribed phone devices" is the signature of an insecure origin: the companion page
+  // refuses to subscribe outside a secure context, so nothing ever registered.
+  const hint = /no subscribed phone devices/i.test(reason)
+    ? ' The phone has not subscribed — open the companion over its HTTPS URL and allow notifications.'
+    : '';
+  return ` Last push FAILED${reason ? `: ${reason}` : ''}.${hint}`;
+}
+
+function updatePhonePushDiagnostic(outcome) {
+  lastPhonePushOutcome = outcome || null;
+  // Re-render just the meta line; a full panel refresh would need a fresh pairing payload.
+  if (el.phoneCompanionMeta && el.phoneCompanionMeta.textContent) {
+    const base = el.phoneCompanionMeta.textContent.replace(/ Last push[^]*$/, '');
+    el.phoneCompanionMeta.textContent = `${base}${describeLastPhonePush()}`;
+  }
+}
+window.updatePhonePushDiagnostic = updatePhonePushDiagnostic;
+
 function updatePhoneCompanionPairingPanel(payload = {}) {
   const pairUrl = String(payload.pairUrl || '');
   const networkEnabled = payload.networkEnabled !== false && !!pairUrl;
@@ -5522,7 +5558,7 @@ function updatePhoneCompanionPairingPanel(payload = {}) {
         ? 'HTTPS enabled for phone notifications.'
         : secureUnavailable
           ? 'The configured HTTPS route is unavailable, so Orion is using a reachable direct route without discarding paired access.'
-          : 'Live view only; add an HTTPS phone URL in Settings for mobile notifications.'}`
+          : 'Live view only; add an HTTPS phone URL in Settings for mobile notifications.'}${describeLastPhonePush()}`
       : 'LAN companion mode is disabled by default. No localhost QR is shown for phones.';
   }
   // Tailscale panel: show/hide the Tailscale QR block inside the pairing panel
@@ -6938,7 +6974,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   const queuedForResolvedConversation = Array.isArray(window.promptQueue)
     && window.promptQueue.some(q => q && q.conversationId === resolvedId);
   const normalizedPhoneMessages = conv && conv.messages
-    ? conv.messages.slice(-40).map(normalizeConversationMessageForReplay)
+    ? conv.messages.filter(isConversationMessageVisible).slice(-40).map(normalizeConversationMessageForReplay)
     : [];
   const recoveredAssistantMessage = buildMissingAssistantResponseMessage(normalizedPhoneMessages, {
     queued: queuedForResolvedConversation
@@ -6958,7 +6994,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   }
   const latestOutput = messages.slice().reverse().find(msg => msg.role === 'assistant' || msg.role === 'system');
   const latestAssistant = conv && conv.messages
-    ? conv.messages.slice().reverse().map(normalizeConversationMessageForReplay).find(msg => msg.role === 'assistant')
+    ? conv.messages.filter(isConversationMessageVisible).slice().reverse().map(normalizeConversationMessageForReplay).find(msg => msg.role === 'assistant')
     : null;
   const latestText = latestAssistant ? (latestAssistant.text || '') : '';
   const changedFiles = [];
@@ -6987,7 +7023,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   const workWalkthrough = walkthroughIndex === -1 ? '' : latestText.slice(walkthroughIndex).trim();
   const conversationsSummary = conversations.map(c => {
     const normalizedMessages = Array.isArray(c.messages)
-      ? c.messages.map(normalizeConversationMessageForReplay)
+      ? c.messages.filter(isConversationMessageVisible).map(normalizeConversationMessageForReplay)
       : [];
     const messageCount = normalizedMessages.filter(msg =>
       msg.role === 'user' || msg.role === 'assistant' || msg.role === 'steering'
@@ -8508,6 +8544,12 @@ function buildCoderStatusSummary(coderConvId) {
   if (subStatus) lines.push(`Live status: ${String(subStatus).replace(/\s+/g, ' ').trim().slice(0, 240)}.`);
 
   return { text: lines.join('\n'), tasks, doneTasks, pendingTasks, subStatus };
+}
+
+function isConversationMessageVisible(message) {
+  return !(window.OrionOperationalContext
+    && typeof window.OrionOperationalContext.isInternalContextMessage === 'function'
+    && window.OrionOperationalContext.isInternalContextMessage(message));
 }
 
 function bindNamedProjectForSupervisor(orionConv, prompt) {

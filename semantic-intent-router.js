@@ -21,6 +21,19 @@
   ]);
   const LEVELS = Object.freeze(['low', 'medium', 'high']);
   const CONTEXT_NEEDS = Object.freeze(['none', 'recent', 'task', 'project', 'historical']);
+  const RUNTIME_SCAFFOLD_SOURCES = new Set([
+    'agent-start-blocked',
+    'context-compaction',
+    'agent-status',
+    'assistant-status',
+    'automatic-continuation-status',
+    'completion-gate-status',
+    'queue-status',
+    'queued-prompt',
+    'supervisor-checkin-error',
+    'supervisor-conversational-error',
+    'task-resolution-clarification'
+  ]);
 
   function string(value, limit = 12000) {
     return value == null ? '' : String(value).trim().slice(0, limit);
@@ -40,14 +53,30 @@
     return output;
   }
 
+  function isRuntimeScaffoldingMessage(message) {
+    if (!message || typeof message !== 'object') return true;
+    if (message.internalContext === true || message.hiddenFromTranscript === true) return true;
+    const source = string(message.source, 120).toLowerCase();
+    if (RUNTIME_SCAFFOLD_SOURCES.has(source)) return true;
+    const role = string(message.role, 40).toLowerCase();
+    const text = string(message.text || message.content, 5000);
+    if (text.startsWith('[COMPACTED CONTEXT SUMMARY]')) return true;
+    if (text === 'Understood. I will use this compacted summary as prior context.') return true;
+    return role === 'assistant' && text === 'Thinking...';
+  }
+
   function visibleMessages(values) {
-    return (Array.isArray(values) ? values : []).slice(-16).map(message => ({
+    return (Array.isArray(values) ? values : [])
+      .filter(message => !isRuntimeScaffoldingMessage(message))
+      .slice(-16)
+      .map(message => ({
       id: string(message && (message.id || message.messageId), 200),
       role: string(message && message.role, 40),
       text: string(message && (message.text || message.content), 5000),
       source: string(message && message.source, 120),
       createdAt: Number(message && message.createdAt) || 0
-    })).filter(message => message.text);
+      }))
+      .filter(message => message.text);
   }
 
   function normalizeTask(task) {
@@ -116,6 +145,7 @@
       },
       recentVisibleConversation,
       priorAssistantMessage,
+      compactedConversationMemory: string(input.compactedConversationMemory, 12000),
       conversation: {
         id: string(input.conversationId || input.conversation && input.conversation.id, 300),
         mode: string(input.mode || input.conversationMode || input.conversation && input.conversation.mode, 60),
@@ -195,9 +225,31 @@
       input.pendingPlan
       || input.activeOwnedTask
       || input.pendingOwnedTask
-      || input.recentOwnedTask
       || input.taskBound
     );
+    if (!hasBoundState) {
+      // A failed classifier must never authorize execution, but it also must not make ordinary
+      // conversation unusable. Route the turn through the non-executing answer path with the
+      // active conversation attached. The response model can answer naturally or ask a question;
+      // it cannot mutate, approve, cancel, or hand off based on this fallback classification.
+      return {
+        intent: 'conversation',
+        requiresExecution: false,
+        target: 'current_conversation',
+        resolvedRequest: input.userMessage,
+        contextDependent: true,
+        confidence: 0,
+        needsClarification: false,
+        clarificationQuestion: '',
+        reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'recent' },
+        taskResolution: { title: '', requirements: [], constraints: [], unresolvedDecisions: [] },
+        executionScope: 'none',
+        inspectionTarget: 'none',
+        standaloneSystemOperation: false,
+        classifierUnavailable: true,
+        classifierError: string(error && (error.message || error), 1000)
+      };
+    }
     return {
       intent: 'clarification_required',
       requiresExecution: false,
@@ -209,7 +261,7 @@
       clarificationQuestion: hasBoundState
         ? 'I could not safely determine whether that refers to the current task or plan. What would you like me to do with it?'
         : 'I could not safely determine what action you intended. Could you clarify what you would like Orion to do?',
-      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'none' },
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'task' },
       taskResolution: { title: '', requirements: [], constraints: [], unresolvedDecisions: [] },
       executionScope: 'none',
       inspectionTarget: 'none',
@@ -331,6 +383,7 @@
   const api = {
     INTENTS,
     TARGETS,
+    isRuntimeScaffoldingMessage,
     buildInput,
     buildClassifierPrompt,
     normalizeClassification,

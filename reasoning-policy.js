@@ -25,7 +25,6 @@
   function select(input = {}) {
     const phase = PHASES.includes(input.phase) ? input.phase : 'implementation';
     const hint = input.hint && typeof input.hint === 'object' ? input.hint : {};
-    const contextDependent = input.contextDependent === true;
     const risk = level(input.risk || hint.risk);
     const complexity = level(input.complexity || hint.complexity);
     const failures = Math.max(0, Number(input.failureCount || input.repeatedFailures) || 0);
@@ -44,16 +43,19 @@
       // for a chatty remark returns whichever project has the most entries — that is how "I've
       // been working on you this morning" came back as a GRITLIFE status report.
       const requestedContext = ['recent', 'historical'].includes(hint.contextNeed) ? hint.contextNeed : '';
-      // Standalone greetings remain context-free. A reaction or acknowledgment that the semantic
-      // classifier bound to the immediately preceding exchange still receives that recent view.
+      // Current-conversation continuity is cheap and must not depend on a perfect classifier.
+      // "Recent" means only this conversation's bounded visible exchange plus its private
+      // compaction memory; it does not load unrelated sessions, project facts, or workspace state.
       effort = 'low';
-      contextScope = requestedContext || (contextDependent ? 'recent' : 'none');
+      contextScope = requestedContext || 'recent';
       explorationScope = 'narrow';
       verificationStrictness = 'light';
     } else if (phase === 'intent_classification') {
       effort = 'low'; contextScope = 'recent'; explorationScope = 'narrow'; verificationStrictness = 'light';
     } else if (phase === 'context_resolution') {
-      effort = maxLevel('medium', complexity); contextScope = hint.contextNeed || 'recent'; explorationScope = 'bounded';
+      effort = maxLevel('medium', complexity);
+      contextScope = ['task', 'project', 'historical'].includes(hint.contextNeed) ? hint.contextNeed : 'recent';
+      explorationScope = 'bounded';
     } else if (phase === 'impact_analysis') {
       effort = broad ? 'high' : 'medium'; contextScope = broad ? 'project' : 'task'; explorationScope = broad ? 'broad' : 'bounded'; verificationStrictness = broad ? 'strict' : 'standard';
     } else if (phase === 'mechanical_execution') {

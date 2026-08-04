@@ -175,6 +175,130 @@ test('Dispatch keeps the immediately preceding completion in context for a conve
   t.end();
 });
 
+test('Dispatch accepts the first concise casual answer without a planning-gate rewrite', async t => {
+  const originalFetch = global.fetch;
+  const firstAnswer = "Hey Jason — I'm here. What's going on?";
+  const harness = installHarness([
+    [{ text: firstAnswer }],
+    [{ text: "Just a casual check-in — nothing to plan or build. What's up?" }]
+  ], {
+    semanticClassification: semanticClassification({
+      intent: 'conversation',
+      requiresExecution: false,
+      target: 'none',
+      executionScope: 'none',
+      inspectionTarget: 'none',
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'none' }
+    }),
+    window: {
+      getAppConfig: () => ({
+        planningMode: true,
+        geminiApiKey: 'test-key',
+        modelCallDelayMs: 0,
+        autoTest: false
+      })
+    }
+  });
+  const conv = conversation('dispatch-casual-first-answer');
+  try {
+    await global.window.runAgentLoop("What's up?", 'gemini-1', conv);
+    const finalAssistant = [...conv.messages].reverse().find(message => message.role === 'assistant');
+    t.equal(harness.modelTurns, 1, 'the answer is accepted on the first model turn');
+    t.equal(finalAssistant.text, firstAnswer, 'the original natural answer is preserved exactly');
+    t.notOk(/nothing to plan or build/i.test(finalAssistant.text), 'planning-gate language never replaces the answer');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('Dispatch retains immediate conversation even when semantic classification misses the reference', async t => {
+  const originalFetch = global.fetch;
+  let priorStatementReachedModel = false;
+  installHarness([
+    body => {
+      const serialized = JSON.stringify(body);
+      priorStatementReachedModel = serialized.includes('Just getting ready for another day of work');
+      return [{ text: 'Right — you said you are getting ready for another day of work. I am with you.' }];
+    }
+  ], {
+    semanticClassification: semanticClassification({
+      intent: 'conversation',
+      contextDependent: false,
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'none' }
+    })
+  });
+  const conv = conversation('dispatch-immediate-chat-memory', {
+    messages: [
+      { role: 'user', text: "What's up?", createdAt: 1 },
+      { role: 'assistant', text: "Morning. What's on the docket today?", createdAt: 2 },
+      { role: 'user', text: 'Just getting ready for another day of work', createdAt: 3 },
+      { role: 'assistant', text: "Morning. What's on the docket today?", createdAt: 4 },
+      { role: 'user', text: 'As I just said getting ready for another day of work', createdAt: 5 }
+    ]
+  });
+
+  try {
+    await global.window.runAgentLoop('As I just said getting ready for another day of work', 'gemini-1', conv);
+    const finalAssistant = [...conv.messages].reverse().find(message => message.role === 'assistant');
+    t.equal(priorStatementReachedModel, true, 'the active conversation reaches the real provider request independently of classifier accuracy');
+    t.match(finalAssistant.text, /you said you are getting ready/i, 'the reply can acknowledge the actual preceding statement');
+    t.notEqual(finalAssistant.text, "Morning. What's on the docket today?", 'the stale generic answer is not repeated');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('Dispatch answers safely when the semantic classifier times out', async t => {
+  const originalFetch = global.fetch;
+  let toolsWereExposed = null;
+  const harness = installHarness([
+    [{ text: "Hey Jason — I'm here. What's going on?" }]
+  ], {
+    window: {
+      getAppConfig: () => ({
+        planningMode: true,
+        geminiApiKey: 'test-key',
+        utilityModelTimeoutMs: 20,
+        modelCallDelayMs: 0,
+        autoTest: false
+      })
+    }
+  });
+  const workingFetch = global.fetch;
+  global.fetch = async (url, request = {}) => {
+    const body = request.body ? JSON.parse(request.body) : {};
+    if (JSON.stringify(body).includes('Classify the current user turn. Return JSON only.')) {
+      return new Promise((resolve, reject) => {
+        request.signal.addEventListener('abort', () => {
+          const error = new Error('aborted');
+          error.name = 'AbortError';
+          reject(error);
+        }, { once: true });
+      });
+    }
+    if (String(url).includes(':generateContent')) {
+      toolsWereExposed = Object.prototype.hasOwnProperty.call(body, 'tools');
+    }
+    return workingFetch(url, request);
+  };
+  const conv = conversation('dispatch-classifier-timeout');
+  const startedAt = Date.now();
+
+  try {
+    await global.window.runAgentLoop("What's up?", 'gemini-1', conv);
+    const finalAssistant = [...conv.messages].reverse().find(message => message.role === 'assistant');
+    t.ok(Date.now() - startedAt < 1000, 'the stalled preflight is bounded');
+    t.equal(harness.modelTurns, 1, 'the normal answer model still runs once');
+    t.equal(toolsWereExposed, false, 'classifier failure keeps the conversational fallback explicitly tool-free');
+    t.equal(finalAssistant.text, "Hey Jason — I'm here. What's going on?", 'classifier failure does not replace conversation with an error gate');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
 test('exact unchanged source ranges are not reread repeatedly inside one recent context window', t => {
   const ledger = agent.createContextAcquisitionLedger();
   const args = { path: 'systems/retirement.py', startLine: 139, endLine: 220 };

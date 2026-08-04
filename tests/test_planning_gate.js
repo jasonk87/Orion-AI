@@ -196,6 +196,28 @@ test('classifyPlanningNeed returns correct modes', async (t) => {
   t.end();
 });
 
+test('planning completion gate applies only to unresolved executable plan work', (t) => {
+  const base = {
+    planningMode: true,
+    requiresExecution: true,
+    planningModeDecision: 'plan',
+    executionMode: 'planning',
+    canExecute: false,
+    hasChecklist: false,
+    answerText: 'I am still getting ready.',
+    consecutiveNoToolCalls: 1,
+    loopCount: 1,
+    maxLoops: 10
+  };
+
+  t.equal(agent.shouldApplyPlanningCompletionGate(base), true, 'unfinished plan work receives the completion nudge');
+  t.equal(agent.shouldApplyPlanningCompletionGate({ ...base, executionMode: 'analyzing' }), true, 'fresh plan work receives the nudge before the UI mode changes');
+  t.equal(agent.shouldApplyPlanningCompletionGate({ ...base, requiresExecution: false, planningModeDecision: 'answer', executionMode: 'answer', answerText: "Hey Jason — I'm here." }), false, 'casual conversation never receives the planning nudge');
+  t.equal(agent.shouldApplyPlanningCompletionGate({ ...base, planningModeDecision: 'direct', executionMode: 'direct' }), false, 'direct work is not forced into planning');
+  t.equal(agent.shouldApplyPlanningCompletionGate({ ...base, hasChecklist: true }), false, 'existing checklist uses the normal task continuation path');
+  t.end();
+});
+
 test('review-only gate allows strategy but blocks implementation artifacts and edits', (t) => {
   const readGate = agent.getReviewOnlyToolGate('read_file', { path: 'agent.js' });
   t.equal(readGate.allowed, true, 'allows file reading during review');
@@ -2708,6 +2730,25 @@ test('compactHistory still trims to a short tail when the boundary already falls
   } finally {
     global.fetch = originalFetch;
   }
+});
+
+test('persisted compaction context remains durable but is explicitly hidden from transcript replay', (t) => {
+  const conversation = {
+    messages: [
+      { role: 'user', text: 'Earlier real question.' },
+      { role: 'assistant', text: 'Earlier real answer.' }
+    ]
+  };
+  agent.persistCompactedConversation(conversation, 'Private compacted summary.');
+  const [summary, acknowledgement] = conversation.messages;
+
+  t.equal(summary.source, 'context-compaction', 'summary has a structured internal source');
+  t.equal(summary.internalContext, true, 'summary is marked internal');
+  t.equal(summary.hiddenFromTranscript, true, 'summary is hidden from transcript replay');
+  t.equal(acknowledgement.source, 'context-compaction', 'acknowledgement has the same structured source');
+  t.equal(acknowledgement.hiddenFromTranscript, true, 'acknowledgement is hidden from transcript replay');
+  t.ok(conversation.compactionHistory.length === 1, 'the complete pre-compaction transcript is still backed up');
+  t.end();
 });
 
 test('compactHistory dynamically truncates conversation context to protect summarizer from overflow', async (t) => {

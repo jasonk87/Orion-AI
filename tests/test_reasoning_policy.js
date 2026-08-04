@@ -3,16 +3,26 @@
 const test = require('tape');
 const policy = require('../reasoning-policy');
 
-test('casual conversation stays lightweight and context-free', t => {
+test('casual conversation stays lightweight while retaining the active conversation', t => {
   const selected = policy.select({
     phase: 'casual_conversation',
     hint: { complexity: 'low', risk: 'low', contextNeed: 'none' }
   });
   t.equal(selected.effort, 'low', 'greetings use low effort');
-  t.equal(selected.contextScope, 'none', 'unrelated history is not injected');
+  t.equal(selected.contextScope, 'recent', 'the bounded active conversation is always available');
   t.equal(selected.explorationScope, 'narrow', 'casual chat does not explore the workspace');
   t.equal(selected.verificationStrictness, 'light', 'casual chat has light verification');
   t.equal(selected.coverageRequired, false, 'coverage accounting is not imposed on chat');
+  t.end();
+});
+
+test('context resolution cannot erase immediate chat just because the classifier requests none', t => {
+  const selected = policy.select({
+    phase: 'context_resolution',
+    hint: { complexity: 'low', risk: 'low', contextNeed: 'none' }
+  });
+  t.equal(selected.contextScope, 'recent', 'none falls back to recent current-conversation context');
+  t.equal(selected.effort, 'medium', 'context resolution stays bounded rather than escalating');
   t.end();
 });
 

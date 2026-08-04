@@ -388,6 +388,21 @@ if (!isTestRuntime && !gotTheLock) {
           new Notification({ title: 'Orion phone companion unavailable', body: error.message }).show();
         }
       }
+      // Re-assert the Tailscale HTTPS route to the companion port. Phone push cannot subscribe
+      // without a secure context, and that route is the only thing providing one. Doing it on
+      // every launch means it follows the app instead of living in a .bat the user must
+      // remember to run, and it always targets the port the companion actually bound.
+      //
+      // Deliberately not awaited: it shells out to the Tailscale CLI, and a slow or missing
+      // CLI must not delay the window. Failures are recorded, never fatal.
+      const companionPort = require('./lib/config').readAppConfig().phoneCompanionPort || 45678;
+      ipcServer.ensureTailscaleServeRoute(companionPort)
+        .then(result => {
+          if (result.applied) console.log(`Tailscale serve route ready: ${result.origin} -> ${result.target}`);
+          else if (result.alreadyRouted) console.log('Tailscale serve route already present.');
+          else recordSwallowedFault('tailscale-serve', result.reason || 'route not applied');
+        })
+        .catch(error => recordSwallowedFault('tailscale-serve', error));
     }
 
     app.on('activate', () => {
@@ -408,7 +423,6 @@ app.on('window-all-closed', () => {
 
 if (process.env.NODE_ENV === 'test') {
   const { resolveWorkspacePath, classifyCommandRequest, isDestructiveCommand } = require('./safety');
-  const { readAppConfig } = require('./lib/config');
 
   module.exports = {
     // ipc-shell
