@@ -1286,3 +1286,41 @@ test('checklist updates allow marking a milestone in-progress but block repeated
   t.equal(revised.allowed, true, 'task list revisions are allowed');
   t.end();
 });
+
+test('completion-gate narration cannot become the final answer or the durable task summary', (t) => {
+  const rememberStart = agentJs.indexOf('function rememberBestVisibleAnswer(');
+  const rememberEnd = agentJs.indexOf('function useBestVisibleAnswerIfGateEcho(', rememberStart);
+  const rememberPath = agentJs.slice(rememberStart, rememberEnd);
+  t.ok(rememberPath.includes('isCompletionGateNarration(text)) return'),
+    'gate narration is never remembered as the best visible answer');
+
+  t.ok(agentJs.includes('|| (OrchestrationContracts && OrchestrationContracts.isCompletionGateNarration(lastTextResponse))'),
+    'a gate-narration final response is replaced by the substantive answer before finalize');
+  const substitutionIndex = agentJs.indexOf('isCompletionGateNarration(lastTextResponse)');
+  const finalizeIndex = agentJs.indexOf('await window.finalizeOrchestrationTask(runTaskId', substitutionIndex);
+  t.ok(substitutionIndex > 0 && finalizeIndex > substitutionIndex,
+    'the substitution happens before the durable result.summary is recorded');
+  t.end();
+});
+
+test('a user-picked reasoning level is forced through every policy selection in the run', (t) => {
+  t.ok(agentJs.includes('const forcedReasoningEffort = (ReasoningPolicy && config)'),
+    'the run reads the picked level from appConfig once at startup');
+  t.ok(agentJs.includes("normalized === 'auto' ? '' : normalized"),
+    "auto resolves to no override so the phase engine stays in charge");
+  // The override governs the reasoning behind the USER'S answer — the three policy selections
+  // the answer path makes (turn, run, and per-phase). It deliberately does NOT reach internal
+  // machinery: intent classification, conversation-title generation, and the provider-level
+  // fallback defaults. Forcing Ultra onto a title generation would bill the user for depth
+  // they never asked for, on a call they never see.
+  const answerPathBindings = ['turnReasoningPolicy', 'runReasoningPolicy', 'phaseReasoningPolicy'];
+  answerPathBindings.forEach(binding => {
+    const start = agentJs.indexOf(`const ${binding} = ReasoningPolicy`);
+    const selection = agentJs.slice(start, agentJs.indexOf('})', start));
+    t.ok(start > 0 && selection.includes('forcedEffort: forcedReasoningEffort'),
+      `${binding} forwards the user-picked level`);
+  });
+  t.equal((agentJs.match(/forcedEffort: forcedReasoningEffort/g) || []).length, answerPathBindings.length,
+    'only the answer path is overridden — utility and fallback selections stay automatic');
+  t.end();
+});

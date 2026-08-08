@@ -3620,6 +3620,15 @@ body[data-mode="orion"] .messages-container {
   outline: none;
 }
 
+/* ── Reasoning level selector ────────────────────────── */
+/* Sits beside the model select and shares its ghost style. Auto stays muted like the
+   model select; a forced level is tinted so a pinned Ultra is never an invisible cost. */
+.reasoning-select-wrapper select.reasoning-forced {
+  color: #8273f4;
+  border-color: rgba(130, 115, 244, 0.28);
+  background: rgba(130, 115, 244, 0.07);
+}
+
 /* ── Send button — slightly larger ───────────────────── */
 .btn-send {
   width: 34px;

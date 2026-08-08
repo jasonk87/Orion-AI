@@ -1013,3 +1013,48 @@ test('phone Dispatch status derives queued, active, and review presentation from
   );
   t.end();
 });
+
+// ── Phone model + reasoning pickers at the composer ────────────────────────────
+// Both selections must be reachable at the input box on the phone, not buried in the Status
+// tab, and must proxy the desktop's state so the two surfaces never disagree.
+
+test('phone composer carries model and reasoning pickers next to the input', t => {
+  const html = companionHtml();
+  const composerStart = html.indexOf('<div class="composer-model-bar">');
+  t.ok(composerStart > 0, 'a picker bar exists in the composer area');
+  const formStart = html.indexOf('<form id="prompt-form">');
+  t.ok(composerStart < formStart, 'the pickers sit directly above the prompt form');
+  const bar = html.slice(composerStart, formStart);
+  t.ok(bar.includes('id="composer-model-select"'), 'the model picker is at the composer');
+  t.ok(bar.includes('id="composer-reasoning-select"'), 'the reasoning picker is at the composer');
+  t.ok(html.includes('.composer-model-bar select.reasoning-forced'),
+    'a forced reasoning level gets distinct styling so the cost is visible');
+  t.end();
+});
+
+test('phone pickers proxy the desktop selection through /api/model', t => {
+  const html = companionHtml();
+  const start = html.indexOf('async function loadPhoneModelList');
+  const end = html.indexOf('// ── Clarifying-questions chat card', start);
+  const flow = html.slice(start, end);
+
+  t.ok(flow.includes('fillModelOptions(composerModelSelect'), 'the composer model list is populated');
+  t.ok(flow.includes('data.reasoningLevels'), 'reasoning levels come from the desktop, not hardcoded twice');
+  t.ok(flow.includes("postModelSelection({ reasoning }"), 'a reasoning change posts to the shared endpoint');
+  t.ok(flow.includes("postModelSelection({ model }"), 'a model change posts to the shared endpoint');
+  t.ok(flow.includes('await loadPhoneModelList(); // revert to the desktop\'s actual state'),
+    'a rejected change reverts to the desktop truth instead of lying');
+  t.ok(flow.includes('wirePhoneModelSelect(phoneModelSelect, composerModelSelect)')
+    && flow.includes('wirePhoneModelSelect(composerModelSelect, phoneModelSelect)'),
+    'the Status-tab and composer model selects stay mirrored');
+  t.end();
+});
+
+test('a reasoning level picked on the desktop reaches the phone through status sync', t => {
+  const html = companionHtml();
+  t.ok(html.includes('if (state.reasoning) reflectReasoningSelection(state.reasoning);'),
+    'status polling reflects a desktop-side reasoning change');
+  t.ok(html.includes('composerModelSelect].forEach(select =>'),
+    'status polling syncs both model selects without clobbering an in-progress change');
+  t.end();
+});

@@ -305,6 +305,83 @@
       || /\b(?:i|we|orion)\s+(?:got|obtained|saw)\s+(?:a\s+)?(?:clean|green|passing|successful)\s+(?:test|CI|check)(?:s|\s+suite|\s+run)?\b/i.test(text);
   }
 
+  // The completion gate holds back premature final answers by injecting a [SYSTEM] prompt; the
+  // model finishes the remaining work and then replies TO THE GATE — "Completion gate is now
+  // clear — all five coverage surfaces are inspected and verified, the win condition is
+  // satisfied, and no blockers remain. Task complete." That reply is internal machinery
+  // narration, not an answer, but it is long enough and sentence-shaped enough to pass the
+  // substantive-answer checks, so it used to clobber the model's real user-facing summary and
+  // get relayed to the user verbatim. This detector recognizes it: text that talks ABOUT gate
+  // machinery and says nothing else. A real summary that merely mentions the gate at the end
+  // keeps its substance after the gate clauses are removed, and is not flagged.
+  const GATE_MACHINERY_TERM = /\b(?:completion gate|coverage surfaces?|win[ -]conditions?|blockers?|operational (?:context|state)|ready[ _]for[ _]final|evidence gate)\b/i;
+  const GATE_NARRATION_CLAUSE = new RegExp(GATE_MACHINERY_TERM.source, 'i');
+  const BARE_COMPLETION_CLAUSE = /^(?:the\s+)?task\s+(?:is\s+)?(?:now\s+)?(?:fully\s+)?complete[d.!]*$|^(?:all\s+)?done[.!]*$|^(?:everything|all)\s+(?:is\s+)?(?:verified|complete[d]?|satisfied)[.!]*$/i;
+
+  function isCompletionGateNarration(text) {
+    const value = String(text || '').trim();
+    if (!value || !GATE_MACHINERY_TERM.test(value)) return false;
+    const residual = value
+      .split(/(?<=[.!?])\s+|\n+|;\s+|\s+[—–]\s+/)
+      .map(clause => clause.trim())
+      .filter(clause => clause
+        && !GATE_NARRATION_CLAUSE.test(clause)
+        && !BARE_COMPLETION_CLAUSE.test(clause))
+      .join(' ')
+      .trim();
+    return residual.length < 40;
+  }
+
+  // A follow-up question deserves a NEW answer. Asked "why that one over these others?", a
+  // model on a low reasoning budget will often re-emit its previous message almost verbatim —
+  // it reads as responsive, costs nothing to produce, and completely fails to answer what was
+  // actually asked. Restatement is detected by 5-word shingle overlap rather than bag-of-words
+  // similarity: a genuine re-analysis of the same topic reuses vocabulary but not phrasing,
+  // while a restatement reuses whole clauses in order.
+  const RESTATEMENT_SHINGLE_SIZE = 5;
+  const RESTATEMENT_OVERLAP_THRESHOLD = 0.6;
+  // Short replies are legitimately repeatable ("Yes.", "Still running.") and carry too few
+  // shingles to measure, so only substantial answers are checked.
+  const RESTATEMENT_MIN_WORDS = 25;
+
+  function normalizeForSimilarity(text) {
+    return String(text || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function buildShingles(words, size) {
+    const shingles = new Set();
+    for (let i = 0; i + size <= words.length; i++) {
+      shingles.add(words.slice(i, i + size).join(' '));
+    }
+    return shingles;
+  }
+
+  function restatementOverlap(draft, previous) {
+    const draftWords = normalizeForSimilarity(draft).split(' ').filter(Boolean);
+    const previousWords = normalizeForSimilarity(previous).split(' ').filter(Boolean);
+    if (draftWords.length < RESTATEMENT_MIN_WORDS || previousWords.length < RESTATEMENT_MIN_WORDS) return 0;
+    const draftShingles = buildShingles(draftWords, RESTATEMENT_SHINGLE_SIZE);
+    const previousShingles = buildShingles(previousWords, RESTATEMENT_SHINGLE_SIZE);
+    if (!draftShingles.size || !previousShingles.size) return 0;
+    let shared = 0;
+    draftShingles.forEach(shingle => { if (previousShingles.has(shingle)) shared++; });
+    // Divided by the SMALLER set so a restatement padded with one new sentence still scores
+    // high — otherwise adding filler would defeat the check.
+    return shared / Math.min(draftShingles.size, previousShingles.size);
+  }
+
+  function isRestatementOfPrevious(draft, previousAssistantText) {
+    return restatementOverlap(draft, previousAssistantText) >= RESTATEMENT_OVERLAP_THRESHOLD;
+  }
+
+  function buildRestatementCorrectionPrompt(userPrompt) {
+    return `[SYSTEM: Your draft reply repeats your previous message almost word for word. The user has now asked something different: "${String(userPrompt || '').slice(0, 500)}". Answer THAT question specifically. If they asked why you chose one thing over named alternatives, compare it against each alternative they named and give the actual reasons for the ranking. Do not restate your earlier answer, and do not open by repeating your previous conclusion.]`;
+  }
+
   function normalizeStatusIdentityPart(value) {
     return String(value || '').trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
   }
@@ -664,6 +741,10 @@
     mergeStructuredStatusFacts,
     validateStatusResponse,
     buildStatusCorrectionPrompt,
-    enforceStatusFallback
+    enforceStatusFallback,
+    isCompletionGateNarration,
+    restatementOverlap,
+    isRestatementOfPrevious,
+    buildRestatementCorrectionPrompt
   };
 });

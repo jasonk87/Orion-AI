@@ -253,6 +253,7 @@ test('Dispatch retains immediate conversation even when semantic classification 
 test('Dispatch answers safely when the semantic classifier times out', async t => {
   const originalFetch = global.fetch;
   let toolsWereExposed = null;
+  let offeredToolNames = [];
   const harness = installHarness([
     [{ text: "Hey Jason — I'm here. What's going on?" }]
   ], {
@@ -280,6 +281,8 @@ test('Dispatch answers safely when the semantic classifier times out', async t =
     }
     if (String(url).includes(':generateContent')) {
       toolsWereExposed = Object.prototype.hasOwnProperty.call(body, 'tools');
+      offeredToolNames = ((body.tools || [])[0] && (body.tools || [])[0].functionDeclarations || [])
+        .map(tool => tool.name);
     }
     return workingFetch(url, request);
   };
@@ -291,7 +294,10 @@ test('Dispatch answers safely when the semantic classifier times out', async t =
     const finalAssistant = [...conv.messages].reverse().find(message => message.role === 'assistant');
     t.ok(Date.now() - startedAt < 1000, 'the stalled preflight is bounded');
     t.equal(harness.modelTurns, 1, 'the normal answer model still runs once');
-    t.equal(toolsWereExposed, false, 'classifier failure keeps the conversational fallback explicitly tool-free');
+    t.equal(toolsWereExposed, true, 'classifier failure retains a deliberately narrow evidence surface');
+    t.ok(offeredToolNames.includes('read_file'), 'the fallback can still inspect the named project');
+    t.notOk(offeredToolNames.includes('handoff_to_coder'), 'the fallback cannot create executable work');
+    t.notOk(offeredToolNames.includes('cancel_coder_task'), 'the fallback cannot mutate task lifecycle state');
     t.equal(finalAssistant.text, "Hey Jason — I'm here. What's going on?", 'classifier failure does not replace conversation with an error gate');
   } finally {
     restoreGlobals(originalFetch);
@@ -1325,11 +1331,16 @@ test('Dispatch loop rejects an unlabeled reconstruction when recall evidence is 
   t.end();
 });
 
-test('an unresolved semantic turn fails closed before any tool-enabled model call', async t => {
+test('an unresolved unbound turn answers naturally with inspection-only tools', async t => {
   const originalFetch = global.fetch;
   let writeCalls = 0;
+  let offeredToolNames = [];
   const harness = installHarness([
-    [{ functionCall: { name: 'write_file', args: { path: 'unsafe.txt', content: 'must not run' } } }]
+    body => {
+      offeredToolNames = ((body.tools || [])[0] && (body.tools || [])[0].functionDeclarations || [])
+        .map(tool => tool.name);
+      return [{ text: 'I can inspect the project safely, but which change do you want me to make?' }];
+    }
   ], {
     workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE',
     api: {
@@ -1360,13 +1371,13 @@ test('an unresolved semantic turn fails closed before any tool-enabled model cal
         standaloneSystemOperation: false
       }
     });
-    t.equal(harness.modelTurns, 0, 'unresolved meaning never reaches the normal tool-enabled model path');
+    t.equal(harness.modelTurns, 1, 'the ordinary response model gets one chance to interpret the visible conversation');
+    t.ok(offeredToolNames.includes('read_file'), 'read-only inspection remains available');
+    t.notOk(offeredToolNames.includes('write_file'), 'writes are absent from the offered schema');
+    t.notOk(offeredToolNames.includes('handoff_to_coder'), 'handoff is absent until executable intent is established');
     t.equal(writeCalls, 0, 'no mutation can leak through the safe fallback');
-    t.equal(
-      conv.messages.find(message => message.role === 'assistant').text,
-      'Which change do you want me to make?',
-      'the classifier question is returned directly and naturally'
-    );
+    t.match(conv.messages.find(message => message.role === 'assistant').text, /inspect the project safely/i,
+      'Orion returns the contextual model answer rather than a synthetic classifier gate');
   } finally {
     restoreGlobals(originalFetch);
   }

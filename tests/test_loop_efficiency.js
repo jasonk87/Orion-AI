@@ -252,6 +252,23 @@ test('review-only and plan-revision turns are filtered to their own gates', (t) 
   t.end();
 });
 
+test('unresolved intent exposes evidence tools but no action tools', (t) => {
+  const names = toolNamesForProfile({ inspectionOnlyIntent: true }, 'orion');
+  for (const allowed of ['read_file', 'grep_search', 'list_files', 'get_workspace_info']) {
+    t.ok(names.has(allowed), `${allowed} remains available for grounded clarification`);
+  }
+  for (const blocked of ['handoff_to_coder', 'cancel_coder_task', 'change_workspace', 'edit_config']) {
+    t.notOk(names.has(blocked), `${blocked} is unavailable until executable intent is established`);
+  }
+  agent.setActiveToolGateProfile({ inspectionOnlyIntent: true });
+  t.equal(agent.getSemanticIntentToolGate('read_file').allowed, true,
+    'the runtime gate independently permits evidence collection');
+  t.equal(agent.getSemanticIntentToolGate('handoff_to_coder').allowed, false,
+    'the runtime gate independently rejects an undeclared action call');
+  agent.setActiveToolGateProfile(null);
+  t.end();
+});
+
 test('filtering measurably shrinks the per-turn schema', (t) => {
   const sizeFor = (profile) => {
     agent.__setActiveConversationModeForTest('coder');
@@ -453,5 +470,41 @@ test('the progress pill tells the truth before the request has been classified',
   t.equal(label('planning', 1, true), 'Working (Step 1)...', 'an approved plan reports working');
   t.equal(label('planning', 1, false), 'Preparing implementation plan (Step 1)...',
     'genuine plan preparation still says so');
+  t.end();
+});
+
+// ── Personal memory in casual conversation ─────────────────────────────────────
+// Regression: refreshOrionMemoryBlock skipped fact retrieval whenever contextScope was 'none'
+// or 'recent' — which is exactly what casual conversation resolves to. The intent was to stop
+// one project's facts bleeding into unrelated chat, but the effect was total amnesia during
+// ordinary talk: asked "how is the weather here today?", Orion answered "I don't know where you
+// are" while holding the stored fact "Jason lives in south-central Kentucky".
+test('personal facts are retrieved during casual conversation, not just task work', async (t) => {
+  global.window = global.window || {};
+  const rankCalls = [];
+  global.window.api = {
+    readGlobalMemory: async () => ({
+      user: { name: 'Jason', preferences: [] },
+      facts: [{ text: 'Jason lives in south-central Kentucky' }]
+    }),
+    rankMemoryFacts: async (query, config, limit, mode) => {
+      rankCalls.push({ query, mode });
+      return { success: true, results: [{ text: 'Jason lives in south-central Kentucky', category: 'personal' }] };
+    }
+  };
+
+  try {
+    // 'recent' is the scope a casual greeting/question resolves to — the exact case that lost memory.
+    await agent.refreshOrionMemoryBlock({ someKey: true }, 'how is the weather here today?', 'orion', { contextScope: 'recent' });
+    t.equal(rankCalls.length, 1, 'facts are ranked even on a low-effort casual turn');
+    t.ok(/weather/.test(rankCalls[0].query), 'ranking uses the actual user message');
+
+    // A truly context-free turn (no query) still has nothing to rank against — that is fine.
+    rankCalls.length = 0;
+    await agent.refreshOrionMemoryBlock({ someKey: true }, '', 'orion', { contextScope: 'none' });
+    t.equal(rankCalls.length, 0, 'an empty query does not force a pointless ranking call');
+  } finally {
+    delete global.window.api;
+  }
   t.end();
 });

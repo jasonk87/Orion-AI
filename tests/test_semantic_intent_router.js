@@ -243,6 +243,36 @@ test('context-dependent follow-ups resolve durably or fail closed', async t => {
   t.end();
 });
 
+test('classifier contract treats an already resolved named project as the concrete target', async t => {
+  let prompt = '';
+  await router.classify(baseContext('Look through This is Life and see for yourself.', {
+    workspace: {
+      role: 'active_project',
+      path: 'C:\\Projects\\This is Life',
+      projectPath: 'C:\\Projects\\This is Life',
+      projectName: 'This is Life'
+    }
+  }), {
+    structureApi,
+    classify: async request => {
+      prompt = request.prompt;
+      return classification('new_task', {
+        requiresExecution: true,
+        resolvedRequest: 'Inspect the This is Life project and report its current state.',
+        executionScope: 'read_only',
+        inspectionTarget: 'project',
+        reasoningPolicyHint: { complexity: 'medium', risk: 'low', contextNeed: 'project' }
+      });
+    }
+  });
+
+  t.match(prompt, /workspace as the project target already resolved/i,
+    'the language contract tells the model not to relitigate a deterministic workspace binding');
+  t.match(prompt, /affirmative follow-up/i,
+    'the language contract prevents repeated target-choice questions after confirmation');
+  t.end();
+});
+
 test('contextual approval exposes the immediate proposal, terminal task, and candidate action', async t => {
   const failedTask = {
     taskId: 'task-retirement-wiring',

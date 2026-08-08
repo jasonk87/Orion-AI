@@ -16,6 +16,7 @@ const ipcSkill = require('./lib/ipc-skill');
 const ipcMemory = require('./lib/ipc-memory');
 const ipcDatabase = require('./lib/ipc-database');
 const ipcOrchestration = require('./lib/ipc-orchestration');
+const ipcSchedule = require('./lib/ipc-schedule');
 const conversationMemory = require('./lib/conversation-memory');
 const MAX_PERSISTED_TOOL_PAYLOAD_CHARS = 250000;
 
@@ -210,6 +211,12 @@ function registerAllHandlers() {
   ipcOrchestration.registerHandlers(ipcMain, {
     filePath: () => path.join(app.getPath('userData'), 'orchestration-tasks.json')
   });
+  // The schedule clock lives here, in main, so a renderer reload cannot erase pending
+  // wake-ups the way the old in-renderer setTimeout did.
+  const scheduleRuntime = ipcSchedule.registerHandlers(ipcMain, {
+    filePath: () => path.join(app.getPath('userData'), 'orion-schedules.json')
+  });
+  scheduleRuntime.start().catch(error => recordSwallowedFault('schedule-start', error, {}));
   require('./lib/file-knowledge').registerHandlers(ipcMain);
 
   const { runLinter } = require('./lib/run-linter');

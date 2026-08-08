@@ -192,8 +192,8 @@
         return refKey.length >= 4 && (nameKey.includes(refKey) || refKey.includes(nameKey));
       })) score = 60;
       if (!best || score > best.score
-          || (score === best.score && nameKey.length > best.nameKey.length)
-          || (score === best.score && nameKey.length === best.nameKey.length && mentionIndex > best.mentionIndex)) {
+          || (score === best.score && mentionIndex > best.mentionIndex)
+          || (score === best.score && mentionIndex === best.mentionIndex && nameKey.length > best.nameKey.length)) {
         best = { ...project, score, nameKey, mentionIndex };
       }
     }

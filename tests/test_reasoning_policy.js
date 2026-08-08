@@ -163,3 +163,62 @@ test('provider controls map only documented model families and degrade safely', 
   );
   t.end();
 });
+
+// ── Per-message forced reasoning level ─────────────────────────────────────────
+// The picker beside the input box sets a level for the next answers. 'auto' keeps the phase
+// engine in charge; anything else is the user's explicit call and outranks every heuristic,
+// including failure escalation — otherwise picking Low still paid max effort after a retry.
+
+test('forced effort overrides the phase engine in both directions', t => {
+  const autoImpl = policy.select({ phase: 'implementation' });
+  t.equal(autoImpl.effortSource, 'auto', 'no override leaves the policy phase-driven');
+
+  const forcedMax = policy.select({ phase: 'casual_conversation', forcedEffort: 'max' });
+  t.equal(forcedMax.effort, 'max', 'a forced Ultra lifts even a casual turn');
+  t.equal(forcedMax.effortSource, 'forced', 'the source records that the user chose it');
+
+  const forcedLow = policy.select({ phase: 'adversarial_review', forcedEffort: 'low' });
+  t.equal(forcedLow.effort, 'low', 'a forced Low lowers a phase that would otherwise be high');
+  t.end();
+});
+
+test('a forced level outranks repeated-failure escalation', t => {
+  const escalated = policy.select({ phase: 'failure_diagnosis', failureCount: 4 });
+  t.equal(escalated.effort, 'max', 'repeated failures escalate on their own');
+
+  const forced = policy.select({ phase: 'failure_diagnosis', failureCount: 4, forcedEffort: 'low' });
+  t.equal(forced.effort, 'low', 'the user-picked level still wins after repeated failures');
+  t.equal(forced.verificationStrictness, 'strict',
+    'only effort is overridden — run governance stays phase-driven');
+  t.end();
+});
+
+test('forced effort reaches the provider controls for each family', t => {
+  const forcedUltra = policy.select({ phase: 'casual_conversation', forcedEffort: 'max' });
+  t.deepEqual(
+    policy.providerControls('deepseek-v4-pro', forcedUltra),
+    { thinking: { type: 'enabled' }, reasoning_effort: 'max' },
+    'DeepSeek receives the forced ultra effort instead of the casual default'
+  );
+  const forcedLow = policy.select({ phase: 'adversarial_review', forcedEffort: 'low' });
+  t.deepEqual(
+    policy.providerControls('deepseek-v4-flash', forcedLow),
+    { thinking: { type: 'disabled' } },
+    'a forced Low disables DeepSeek thinking even for adversarial review'
+  );
+  t.end();
+});
+
+test('effort override values are normalized defensively', t => {
+  t.equal(policy.normalizeEffortOverride('Ultra'), 'max', 'the Ultra label maps to the max level');
+  t.equal(policy.normalizeEffortOverride('MAX'), 'max', 'levels are case-insensitive');
+  t.equal(policy.normalizeEffortOverride(''), 'auto', 'empty falls back to auto');
+  t.equal(policy.normalizeEffortOverride(null), 'auto', 'null falls back to auto');
+  t.equal(policy.normalizeEffortOverride('warp9'), 'auto', 'an unknown level falls back to auto');
+  t.equal(policy.select({ phase: 'implementation', forcedEffort: 'warp9' }).effortSource, 'auto',
+    'an invalid forced level never becomes an override');
+  t.ok(policy.EFFORT_OVERRIDES.some(o => o.value === 'auto' && o.label === 'Auto'),
+    'the picker list is exported for the UI to render');
+  t.equal(policy.EFFORT_OVERRIDES.length, 5, 'auto plus the four effort levels');
+  t.end();
+});

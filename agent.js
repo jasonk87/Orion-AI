@@ -55,7 +55,7 @@ CRITICAL RULES:
    For games specifically: cohesive visual theme, animated game board, smooth reveal mechanics, clear HUD/scoreboard, satisfying start/end states, sound-readiness hooks (even if silent).
    COMPLETION GATE: A win condition for "Visual polish and animations meet professional standard" must be added to operational context for any UI project, and it must be satisfied with screenshot evidence before the task is marked complete.
    Do not rely on CDN-only frontend dependencies (such as Tailwind CDN, Chart.js CDN, icon CDNs, or remote fonts) for local production-style apps unless the user explicitly asks for CDN usage; prefer local CSS/JS or installed packages so browser console checks stay clean.
-7. FOLLOW-UP TIMERS: If you say you will wait, check back, continue after N seconds/minutes, or inspect long-running training/tests later, you MUST call "schedule_followup". Do not merely say you will wait. Schedule only one active follow-up for the same purpose; when the follow-up runs, actually inspect status/output and either continue work, stop the process, or clearly finish.
+7. FOLLOW-UP TIMERS: If you say you will wait, check back, continue after N seconds/minutes, or inspect long-running training/tests later, you MUST call "schedule_followup". Do not merely say you will wait. Schedule only one active follow-up for the same purpose; when the follow-up runs, actually inspect status/output and either continue work, stop the process, or clearly finish. Schedules are durable — they survive restarts and machine sleep — so use a real delay rather than polling in a tight loop, and use repeatEverySeconds for genuinely recurring checks instead of re-scheduling a one-shot each time. A run may arrive late after the machine was asleep; when it does, re-inspect current state instead of assuming no time has passed.
 7A. ADAPT INSTEAD OF QUITTING: Do not abandon a task after ordinary errors. If an edit, command, test, or route check fails, inspect fresh state, group repeated failures, look up official/current docs when needed, and try a different strategy. A failed tool path is evidence about that tool attempt, not proof that the user's objective is impossible. Stop only for hard blockers such as missing credentials, unavailable model access, explicit user stop, or a hard-destructive command block; when stopping, preserve state and explain the exact next recovery step.
 8. BE CONCISE: Explain your technical decisions briefly. The user can see your tools running and thoughts.
 9. AUTONOMOUS WORKFLOW: Once the user approves your plan, execute all required file creations, edits, and test runs consecutively in a single session without yielding or waiting for further conversational input. For direct tasks that do not need a plan, execute them immediately and report the result. Keep calling tools until the entire task is fully complete.
@@ -230,14 +230,17 @@ async function refreshOrionMemoryBlock(config, queryText, mode, reasoningPolicy 
         .filter(Boolean)
       : [];
     if (stablePrefs.length) lines.push(`Preferences: ${stablePrefs.join('; ')}`);
-    // 'recent' means the live conversation, which the model already has verbatim in its message
-    // history — ranking the stored fact corpus adds an embedding round trip per turn and returns
-    // facts about other projects. Only a scope that actually asks for stored knowledge pays for
-    // retrieval.
-    if (contextScope === 'none' || contextScope === 'recent') {
-      orionCachedMemoryBlock = lines.join('\n');
-      return;
-    }
+    // Facts are retrieved for EVERY scope, including casual conversation.
+    //
+    // This previously skipped retrieval for 'none' and 'recent' to stop project facts bleeding
+    // into chat. That was the wrong cut: those are exactly the scopes ordinary conversation
+    // resolves to, so Orion lost all personal memory during normal talk — asked "how is the
+    // weather here today?" it answered "I don't know where you are" while holding the fact
+    // "Jason lives in south-central Kentucky". Wrong-project bleed is a ranking-relevance
+    // problem; the fix for it is better ranking, not amnesia.
+    //
+    // The cost is one embedding call against a 15-fact corpus. The 4-minute startup this was
+    // partly meant to address turned out to be getKnowledgeBrief, not this.
 
     // RAG: rank facts/preferences by cosine similarity against the current message instead of
     // dumping the most recent ones unconditionally. If semantic ranking is unavailable, facts are
@@ -752,8 +755,9 @@ const ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS = [
 
 window.steeringQueue = {};
 window.promptQueue = [];
-window.followupTimers = window.followupTimers || {};
-window.followupTimerMeta = window.followupTimerMeta || {};
+// Follow-ups are durable now (lib/schedule-store.js, clocked by the main process). The old
+// window.followupTimers / followupTimerMeta maps are gone deliberately: keeping them would
+// invite a future edit to re-add an in-renderer timer that silently dies on reload.
 window.isAgentRunning = () => isAgentRunning || isAgentStarting;
 window.getRunningConversationId = () => runningConversationId;
 window.getActiveRunTaskId = () => activeRunTaskId || startingRunTaskId;
@@ -839,7 +843,10 @@ function requestAgentStop(options = {}) {
         }
       }).catch(() => {});
     }
-    cancelFollowupsForConversation(targetConversationId);
+    // Fire-and-forget: cancelling durable schedules is a persisted write, and a stop request
+    // must not block on it. A failure here leaves the schedule pending, which the next tick
+    // handles safely because the conversation is no longer running.
+    cancelFollowupsForConversation(targetConversationId).catch(() => {});
     if (window.promptQueue) {
       window.promptQueue = window.promptQueue.filter(item => {
         if (requestedTaskId) return item.taskId !== requestedTaskId;
@@ -1361,6 +1368,19 @@ async function evaluateLoopStateWithSupervisor(modelName, workWalkthrough, disab
 window.runAgentLoop = async function(userPrompt, modelName, conversation, options = {}) {
   const requestStartedAt = Date.now();
   let intentClassificationMs = 0;
+  // Startup (everything before the first model turn) has been observed at 258 seconds on a
+  // 378-token conversation, and 6 seconds on the next run — intermittent, so it is a call that
+  // sometimes hangs rather than work that is inherently slow. Guessing at which one has been
+  // wrong twice, so each phase now times itself and the slowest ones are reported with the run.
+  const startupPhases = {};
+  const timeStartupPhase = async (name, fn) => {
+    const startedAt = Date.now();
+    try {
+      return await fn();
+    } finally {
+      startupPhases[name] = (startupPhases[name] || 0) + (Date.now() - startedAt);
+    }
+  };
   const runTaskId = String(options.taskId || '');
   const liveUserPrompt = String(userPrompt || '');
   let claimedTaskPrompt = '';
@@ -1579,6 +1599,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   currentAgentLogs = [];
   try {
   const config = window.getAppConfig();
+  // User-picked reasoning level from the selector next to the input box. 'auto' (the default)
+  // resolves to '' so the phase engine keeps deciding; any explicit level is forced through
+  // every reasoning-policy selection this run makes.
+  const forcedReasoningEffort = (ReasoningPolicy && config)
+    ? (normalized => normalized === 'auto' ? '' : normalized)(ReasoningPolicy.normalizeEffortOverride(config.reasoningEffort))
+    : '';
   // Session continuity: build prev-session context on first message, clear otherwise
   const isOrionMode = conversation.mode === 'orion' ||
     (conversation.mode !== 'coder' && typeof appMode !== 'undefined' && appMode === 'orion');
@@ -1649,11 +1675,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   }
   const semanticClarificationRequired = semanticIntent.intent === 'clarification_required'
     || semanticIntent.needsClarification === true;
+  const taskBoundSemanticClarification = semanticClarificationRequired && !!(runTaskId || pendingSemanticPlan);
   const turnReasoningPolicy = ReasoningPolicy
     ? ReasoningPolicy.select({
         phase: semanticIntent.intent === 'conversation' ? 'casual_conversation' : 'context_resolution',
         hint: semanticIntent.reasoningPolicyHint || {},
-        contextDependent: semanticIntent.contextDependent === true
+        contextDependent: semanticIntent.contextDependent === true,
+        forcedEffort: forcedReasoningEffort
       })
     : { contextScope: 'task', effort: 'medium' };
   let workspaceResolution = isOrionMode
@@ -1707,7 +1735,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       ? ''
       : await buildOrionContinuityContext(conversation, workspacePath, turnReasoningPolicy);
     setOrionConversationHasHistory(conversation);
-    await refreshOrionMemoryBlock(config, userPrompt, runMode, turnReasoningPolicy);
+    await timeStartupPhase('memoryBlock', () => refreshOrionMemoryBlock(config, userPrompt, runMode, turnReasoningPolicy));
   } else {
     orionSessionContinuityContext = '';
     orionCachedMemoryBlock = '';
@@ -1863,8 +1891,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   } catch (_) {}
   const inheritedContextReceipt = await loadInheritedContextReceipt(conversation, workspacePath);
 
-  const scopedNotes = await readScopedNotes(workspacePath, conversation);
-  const operationalContext = await readOperationalContext(workspacePath);
+  const scopedNotes = await timeStartupPhase('scopedNotes', () => readScopedNotes(workspacePath, conversation));
+  const operationalContext = await timeStartupPhase('operationalContext', () => readOperationalContext(workspacePath));
   let workingState = operationalContext.state;
   const projectMemory = (workspacePath && window.api && window.api.readProjectMemory)
     ? await window.api.readProjectMemory(workspacePath).catch(() => ({ facts: [] }))
@@ -2107,7 +2135,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         hint: semanticIntent.reasoningPolicyHint || {},
         contextDependent: semanticIntent.contextDependent === true,
         complexity: semanticIntent.reasoningPolicyHint && semanticIntent.reasoningPolicyHint.complexity,
-        risk: semanticIntent.reasoningPolicyHint && semanticIntent.reasoningPolicyHint.risk
+        risk: semanticIntent.reasoningPolicyHint && semanticIntent.reasoningPolicyHint.risk,
+        forcedEffort: forcedReasoningEffort
       })
     : turnReasoningPolicy;
   if (!isOrionMode && runReasoningPolicy.coverageRequired && workspacePath && !workingState.coverageFrontier) {
@@ -2256,7 +2285,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   // whose content moved, so "stale notes" cannot occur, only absent ones.
   if (shouldInjectFullSystemFacts && workspacePath && window.api && typeof window.api.getKnowledgeBrief === 'function') {
     try {
-      const brief = await window.api.getKnowledgeBrief(workspacePath, 25);
+      // Hard 5s ceiling. This is a warm-start optimization: it tells the model which files it
+      // already has notes for so it can skip re-reading them. Useful, but strictly optional —
+      // and it was blocking the FIRST ANSWER for 248 seconds (measured), because the underlying
+      // worker call inherits a 5-minute default timeout. Waiting minutes to save seconds is
+      // backwards; if the index is cold or busy, run without the hint.
+      const brief = await timeStartupPhase('knowledgeBrief', () => Promise.race([
+        window.api.getKnowledgeBrief(workspacePath, 25),
+        new Promise(resolve => setTimeout(() => resolve(null), 5000))
+      ]));
       if (brief && brief.success && ((brief.knownCurrent || []).length || (brief.changed || []).length || (brief.seenCurrent || []).length)) {
         const knownLines = (brief.knownCurrent || []).map(f => `- ${f.path}: ${f.digest}`).join('\n');
         const briefText = [
@@ -2353,6 +2390,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   }
 
   function rememberBestVisibleAnswer(text) {
+    // A reply addressed at the completion gate ("Completion gate is now clear — all coverage
+    // surfaces are verified...") is sentence-shaped enough to pass the substantive checks, but
+    // it is machinery narration, not an answer. Never let it displace the real answer.
+    if (OrchestrationContracts && OrchestrationContracts.isCompletionGateNarration(text)) return;
     const conciseAnswerIsComplete = agentExecutionMode === 'answer'
       && sanitizeFinalAnswerText(text).trim().length > 0
       && !isGenericNonAnswer(text)
@@ -2402,7 +2443,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             console.warn("Failed to backup conversation pre-compaction", e);
           }
         }
-        const compactResult = await compactHistory(messages, resolveUtilityModelName(modelName), config);
+        const compactResult = await timeStartupPhase('compactHistory', () => compactHistory(messages, resolveUtilityModelName(modelName), config));
         persistCompactedConversation(conversation, compactResult.summary);
         await appendScopedNotes(workspacePath, conversation, `\n\n## Context Compaction ${new Date().toISOString()}\n${compactResult.summary}\n`);
         const checkpoint = await checkpointOperationalContext(workspacePath, 'context_compaction', 'Conversation context was compacted; canonical mission state was preserved.', 'Continue the active subplan from operational context.');
@@ -2582,7 +2623,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     if (shouldPreflightDispatchHandoff || dispatchHandoffAuthorizedByClarification) {
       toolExecutionContext.authorizedDispatchHandoffIntent = semanticIntent;
     }
-    if (semanticClarificationRequired && (runTaskId || pendingSemanticPlan)) {
+    if (taskBoundSemanticClarification) {
       // Keep the exact durable task/plan pending. A classifier failure or unresolved reference
       // must never fall through to a tool-enabled turn or be finalized as successful work.
       forceYield = true;
@@ -2669,19 +2710,27 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         // Published before the model call so the provider adapters build a schema list matching
         // the gate that will actually run, instead of offering tools that are certain to be
         // refused a moment later.
-        const disableToolsForClassifierFallback = semanticIntent.classifierUnavailable === true;
+        // An unbound ambiguous turn still goes through Orion's normal conversational model so it
+        // can use the visible exchange instead of emitting a canned, repeatable gate. Its tool
+        // surface is reduced to inspection-only capabilities until intent is resolved. Exact
+        // task/plan-bound ambiguity remains a deterministic no-tool clarification below.
+        const inspectionOnlyIntent = semanticIntent.classifierUnavailable === true
+          || (semanticClarificationRequired && !taskBoundSemanticClarification);
+        const disableToolsForSemanticSafety = taskBoundSemanticClarification;
         setActiveToolGateProfile({
           reviewOnly,
           planRevision: isPlanRevision,
+          inspectionOnlyIntent,
           planningMode: !!(config && config.planningMode),
-          canExecute: !disableToolsForClassifierFallback && canExecuteThisTask()
+          canExecute: !inspectionOnlyIntent && !disableToolsForSemanticSafety && canExecuteThisTask()
         });
         const phaseReasoningPolicy = ReasoningPolicy
           ? ReasoningPolicy.select({
               phase: currentReasoningPhase,
               hint: semanticIntent.reasoningPolicyHint || {},
               contextDependent: semanticIntent.contextDependent === true,
-              failureCount: highestRepeatedFailureCount
+              failureCount: highestRepeatedFailureCount,
+              forcedEffort: forcedReasoningEffort
             })
           : runReasoningPolicy;
         if (ReasoningPolicy && phaseReasoningPolicy.phase !== lastAppliedReasoningPhase) {
@@ -2697,7 +2746,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           ensureActiveRunMessage().logs = [...currentAgentLogs];
           window.renderAiMessage(lastTextResponse, currentAgentLogs);
         };
-        if (semanticClarificationRequired && loopCount === 1) {
+        if (taskBoundSemanticClarification && loopCount === 1) {
           const clarificationQuestion = String(
             semanticIntent.clarificationQuestion
             || 'I could not safely determine what action you intended. Could you clarify what you would like Orion to do?'
@@ -2747,13 +2796,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             content: 'Dispatch preflight routed executable work directly to Coder without spending a Dispatch model turn.'
           });
         } else if (activeRunModelName.startsWith('gemini-')) {
-          response = await callGeminiAPI(messagesForApiCall, activeRunModelName, config.geminiApiKey, onApiWarning, disableToolsForClassifierFallback, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
+          response = await callGeminiAPI(messagesForApiCall, activeRunModelName, config.geminiApiKey, onApiWarning, disableToolsForSemanticSafety, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
         } else if (activeRunModelName.startsWith('claude')) {
-          response = await callAnthropicAPI(messagesForApiCall, activeRunModelName, config.anthropicApiKey, onApiWarning, disableToolsForClassifierFallback, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
+          response = await callAnthropicAPI(messagesForApiCall, activeRunModelName, config.anthropicApiKey, onApiWarning, disableToolsForSemanticSafety, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
         } else if (activeRunModelName.startsWith('deepseek')) {
-          response = await callDeepSeekAPI(messagesForApiCall, activeRunModelName, config.deepseekApiKey, onApiWarning, disableToolsForClassifierFallback, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
+          response = await callDeepSeekAPI(messagesForApiCall, activeRunModelName, config.deepseekApiKey, onApiWarning, disableToolsForSemanticSafety, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
         } else {
-          response = await callOllamaAPI(messagesForApiCall, activeRunModelName, onApiWarning, disableToolsForClassifierFallback, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
+          response = await callOllamaAPI(messagesForApiCall, activeRunModelName, onApiWarning, disableToolsForSemanticSafety, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
         }
         if (response && response._orionActiveModelName) {
           activeRunModelName = response._orionActiveModelName;
@@ -2787,7 +2836,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             delaySeconds: retrySeconds,
             purpose: 'model-api-retry',
             prompt: 'Retry the previous task after the model/API cooldown. First inspect the latest state and avoid repeating any failed action blindly.'
-          });
+          }).catch(() => {});
           lastTextResponse += `\n\nI scheduled a follow-up retry in about ${retrySeconds} seconds instead of hammering the API.`;
         }
         const advice = diagnoseModelApiFailure(e.message);
@@ -3553,6 +3602,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         // Track when discover_skills is called so the create_skill gate knows it's been done
         if (toolName === 'discover_skills') skillDiscoveryChecked = true;
 
+        const semanticIntentGate = getSemanticIntentToolGate(toolName);
         const reviewGate = reviewOnly ? getReviewOnlyToolGate(toolName, args) : { allowed: true, reason: '' };
         const planningGate = getPlanningToolGate(config, canExecuteThisTask(), toolName, args, {
           strategyStatus,
@@ -3565,7 +3615,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           ? { allowed: false, reason: 'Call discover_skills first to check whether a skill for this already exists, then call create_skill only if nothing suitable is found.' }
           : { allowed: true, reason: '' };
         // All gates use identical response logic — handle the first failure found
-        const blockedGate = !reviewGate.allowed ? reviewGate : (!planningGate.allowed ? planningGate : (!skillDiscoveryGate.allowed ? skillDiscoveryGate : null));
+        const blockedGate = !semanticIntentGate.allowed
+          ? semanticIntentGate
+          : (!reviewGate.allowed ? reviewGate : (!planningGate.allowed ? planningGate : (!skillDiscoveryGate.allowed ? skillDiscoveryGate : null)));
         if (blockedGate) {
           const failure = classifyAgentFailure({ toolName, args, errorText: blockedGate.reason });
           const guidance = buildFailureRecoveryGuidance(failure);
@@ -4247,6 +4299,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       startupMs: runStartedAt - requestStartedAt,
       totalElapsedMs: Date.now() - requestStartedAt,
       intentClassificationMs,
+      startupPhases,
       modelName: activeRunModelName,
       ledger: contextAcquisitionLedger,
       workWalkthrough
@@ -4436,7 +4489,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         lastTextResponse = "Task finished.";
       }
     }
-    if (bestVisibleAnswer && looksLikeLeakedNoToolCorrection(lastTextResponse)) {
+    if (bestVisibleAnswer
+        && (looksLikeLeakedNoToolCorrection(lastTextResponse)
+          || (OrchestrationContracts && OrchestrationContracts.isCompletionGateNarration(lastTextResponse)))) {
+      // The last model reply answered the completion gate instead of the user. The substantive
+      // answer it produced earlier in the run is the one the user (and the Dispatch relay,
+      // via result.summary below) should see.
       lastTextResponse = bestVisibleAnswer;
     }
     if (forceYield && forcedYieldFailure
@@ -6158,6 +6216,10 @@ async function executeTool(name, args, workspace, config, conversation, executio
       return scheduleAgentFollowup(args);
     }
 
+    case 'watch_condition': {
+      return createConditionWatch(args);
+    }
+
     case 'read_notes': {
       return await readScopedNotes(workspace, conversation);
     }
@@ -7282,90 +7344,198 @@ function persistCompactedConversation(conversation, summary) {
   conversation.compactedAt = Date.now();
 }
 
-function scheduleAgentFollowup(args = {}) {
-  const delaySeconds = Math.min(Math.max(Number(args.delaySeconds || 60), 1), 3600);
+// Schedules are durable and owned by the main process. This used to be a renderer setTimeout
+// in window.followupTimers, which meant every pending "check back in N minutes" died on a
+// reload, a crash, or an app restart — silently, with nothing recorded. The tool surface the
+// model sees is unchanged; only the backing moved.
+async function scheduleAgentFollowup(args = {}) {
+  const delaySeconds = Math.min(Math.max(Number(args.delaySeconds || 60), 1), 86400);
+  const intervalSeconds = Math.max(0, Number(args.repeatEverySeconds || 0));
   const prompt = args.prompt || 'Continue the previous task. Check any long-running command or training progress, inspect output, fix issues if needed, and keep working until the task is complete.';
   const targetConversationId = runningConversationId || ((typeof activeConversationId !== 'undefined') ? activeConversationId : null);
-  const modelSelectValue = window.getSelectedModel ? window.getSelectedModel() : undefined;
+  const modelSelectValue = window.getSelectedModel ? window.getSelectedModel() : '';
   const purpose = normalizeFollowupPurpose(args.purpose || prompt);
-  const existingTimerId = Object.keys(window.followupTimerMeta || {}).find((id) => {
-    const meta = window.followupTimerMeta[id];
-    return meta && meta.conversationId === targetConversationId && meta.purpose === purpose;
-  });
 
-  if (existingTimerId && window.followupTimers[existingTimerId]) {
-    clearTimeout(window.followupTimers[existingTimerId]);
-    delete window.followupTimers[existingTimerId];
-    delete window.followupTimerMeta[existingTimerId];
+  if (!targetConversationId) {
+    return { success: false, error: 'No conversation is active to schedule a follow-up for.' };
+  }
+  if (!window.api || typeof window.api.createSchedule !== 'function') {
+    return { success: false, error: 'Durable scheduling is unavailable in this build.' };
   }
 
-  const timerId = 'followup_' + targetConversationId + '_' + Date.now();
-  window.followupTimerMeta[timerId] = {
+  // A clock time ("09:00") makes this a calendar schedule instead of an interval one.
+  const calendar = args.atTime
+    ? { atTime: String(args.atTime), onDays: args.onDays }
+    : null;
+
+  const created = await window.api.createSchedule({
     conversationId: targetConversationId,
-    purpose,
     prompt,
-    scheduledAt: Date.now(),
-    delaySeconds
-  };
-  
-  window.followupTimers[timerId] = setTimeout(async () => {
-    delete window.followupTimers[timerId];
-    delete window.followupTimerMeta[timerId];
-    
-    if (typeof conversations === 'undefined') return;
-    const targetConv = conversations.find(c => c.id === targetConversationId);
-    if (!targetConv) return;
-    if (typeof window.enqueueOrchestrationTask !== 'function') return;
-    const queued = await window.enqueueOrchestrationTask({
-      prompt,
-      resolvedObjective: prompt,
-      title: `Scheduled follow-up: ${purpose}`,
-      modelSelectValue,
-      targetConversationId,
-      originConversationId: targetConversationId,
-      source: 'followup',
-      alreadyRendered: true
-    });
-    if (!queued || !queued.success) return;
-    if (window.isAgentRunning && window.isAgentRunning()) return;
-    window.promptQueue = (window.promptQueue || []).filter(item => item && item.taskId !== queued.task.taskId);
-    
-    if (window.appendSystemMessage) {
-      window.appendSystemMessage(`Scheduled follow-up running after ${delaySeconds} seconds.`, { conversationId: targetConversationId });
-    }
-    await window.runAgentLoop(
-      prompt,
-      modelSelectValue || (window.getSelectedModel ? window.getSelectedModel() : 'gemini-2.5-flash-lite'),
-      targetConv,
-      { source: 'followup', internalPrompt: true, taskId: queued.task.taskId }
-    );
-  }, delaySeconds * 1000);
-  
+    purpose,
+    title: `Scheduled follow-up: ${purpose}`,
+    modelSelectValue,
+    source: 'followup',
+    delayMs: delaySeconds * 1000,
+    intervalMs: intervalSeconds * 1000,
+    calendar
+  });
+  if (!created || !created.success) {
+    return { success: false, error: (created && created.error) || 'Could not persist the schedule.' };
+  }
+  if (calendar && !created.schedule.calendar) {
+    return { success: false, error: `Could not read "${args.atTime}" as a time. Use 24-hour HH:MM, for example 09:00 or 17:30.` };
+  }
+
+  const repeats = intervalSeconds > 0;
+  const nextRun = new Date(created.schedule.dueAt);
+  if (created.schedule.calendar) {
+    const cal = created.schedule.calendar;
+    const days = cal.days ? cal.days.length : 7;
+    return {
+      success: true,
+      scheduleId: created.schedule.scheduleId,
+      calendar: cal,
+      nextRunAt: created.schedule.dueAt,
+      replacedExisting: (created.supersededScheduleIds || []).length > 0,
+      durable: true,
+      message: `Scheduled at ${String(cal.hour).padStart(2, '0')}:${String(cal.minute).padStart(2, '0')} local time on ${days === 7 ? 'every day' : `${days} day(s) a week`}. Next run: ${nextRun.toLocaleString()}. This survives restarts and stays correct across daylight saving.`
+    };
+  }
   return {
     success: true,
-    timerId,
+    scheduleId: created.schedule.scheduleId,
     delaySeconds,
-    replacedExisting: !!existingTimerId,
-    message: `Scheduled follow-up in ${delaySeconds} seconds.`
+    repeatEverySeconds: repeats ? intervalSeconds : 0,
+    replacedExisting: (created.supersededScheduleIds || []).length > 0,
+    durable: true,
+    message: repeats
+      ? `Scheduled every ${intervalSeconds} seconds, starting in ${delaySeconds}. This survives restarts.`
+      : `Scheduled follow-up in ${delaySeconds} seconds. This survives restarts.`
   };
 }
 
-function cancelFollowupsForConversation(conversationId) {
-  if (!conversationId || !window.followupTimerMeta) return 0;
-  let cancelled = 0;
-  Object.keys(window.followupTimerMeta).forEach((timerId) => {
-    const meta = window.followupTimerMeta[timerId];
-    if (meta && meta.conversationId === conversationId) {
-      if (window.followupTimers[timerId]) {
-        clearTimeout(window.followupTimers[timerId]);
-        delete window.followupTimers[timerId];
-      }
-      delete window.followupTimerMeta[timerId];
-      cancelled++;
+// A conditional watch: poll a cheap deterministic probe, wake the model only on a transition.
+// Separate from scheduleAgentFollowup because the cost model is completely different — a watch
+// can run every few minutes for weeks because a check that finds nothing never reaches a model.
+async function createConditionWatch(args = {}) {
+  const conversationId = runningConversationId || ((typeof activeConversationId !== 'undefined') ? activeConversationId : null);
+  if (!conversationId) return { success: false, error: 'No conversation is active to attach a watch to.' };
+  if (!window.api || typeof window.api.createSchedule !== 'function') {
+    return { success: false, error: 'Durable scheduling is unavailable in this build.' };
+  }
+
+  const type = String(args.type || '').trim().toLowerCase();
+  if (!['command', 'file', 'http'].includes(type)) {
+    return { success: false, error: "watch_condition needs type to be 'command', 'file', or 'http'." };
+  }
+  if (type === 'command' && !String(args.command || '').trim()) {
+    return { success: false, error: 'A command watch needs a command.' };
+  }
+  if (type === 'file' && !String(args.path || '').trim()) {
+    return { success: false, error: 'A file watch needs a path.' };
+  }
+  if (type === 'http' && !String(args.url || '').trim()) {
+    return { success: false, error: 'An http watch needs a url.' };
+  }
+
+  // Minimum 30s, default 5 minutes. A watch is a poll, not a spin.
+  const checkEverySeconds = Math.min(Math.max(Number(args.checkEverySeconds || 300), 30), 86400);
+  const purpose = `watch:${String(args.purpose || `${type}-${args.command || args.path || args.url}`).slice(0, 120)}`;
+
+  const created = await window.api.createSchedule({
+    conversationId,
+    prompt: String(args.prompt || 'The watched condition changed. Investigate the change and take the appropriate action.'),
+    purpose,
+    title: `Watch: ${String(args.purpose || type).slice(0, 80)}`,
+    modelSelectValue: window.getSelectedModel ? window.getSelectedModel() : '',
+    source: 'watch',
+    delayMs: checkEverySeconds * 1000,
+    intervalMs: checkEverySeconds * 1000,
+    condition: {
+      type,
+      command: args.command || '',
+      path: args.path || '',
+      url: args.url || '',
+      matchPattern: args.matchPattern || '',
+      fireWhen: args.fireWhen || 'changed',
+      workspacePath: (typeof window.getCurrentWorkspace === 'function' ? window.getCurrentWorkspace() : '') || ''
     }
   });
-  return cancelled;
+  if (!created || !created.success) {
+    return { success: false, error: (created && created.error) || 'Could not persist the watch.' };
+  }
+  return {
+    success: true,
+    scheduleId: created.schedule.scheduleId,
+    checkEverySeconds,
+    fireWhen: created.schedule.condition ? created.schedule.condition.fireWhen : 'changed',
+    replacedExisting: (created.supersededScheduleIds || []).length > 0,
+    message: `Watching every ${checkEverySeconds}s. The first check records a baseline and does not notify; after that only a real change wakes Orion.`
+  };
 }
+
+async function cancelFollowupsForConversation(conversationId) {
+  if (!conversationId) return 0;
+  if (!window.api || typeof window.api.cancelConversationSchedules !== 'function') return 0;
+  try {
+    const result = await window.api.cancelConversationSchedules(conversationId);
+    return (result && result.cancelled) || 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
+// Called by the main-process schedule tick when a schedule comes due. Returning
+// { deferred: true } hands the schedule back so the next tick retries it — used when this
+// conversation is already running, so a schedule can never overlap its own previous run.
+window.runDurableSchedule = async function(payload = {}) {
+  const conversationId = String(payload.conversationId || '');
+  if (!conversationId) return { deferred: false, error: 'missing conversation' };
+  if (typeof conversations === 'undefined') return { deferred: true, reason: 'renderer_not_ready' };
+  const targetConv = conversations.find(c => c.id === conversationId);
+  if (!targetConv) return { deferred: false, error: 'conversation no longer exists' };
+  if (window.isAgentRunning && window.isAgentRunning()) {
+    return { deferred: true, reason: 'agent_busy' };
+  }
+  if (typeof window.enqueueOrchestrationTask !== 'function') {
+    return { deferred: true, reason: 'orchestration_not_ready' };
+  }
+
+  // A watch-triggered run opens with the transition the probe already found. Without this the
+  // model would wake with no idea why and re-derive the change by hand — the exact cost the
+  // cheap probe tier exists to avoid.
+  const basePrompt = String(payload.prompt || '');
+  const prompt = payload.conditionBriefing
+    ? `${payload.conditionBriefing}\n\n${basePrompt}`
+    : basePrompt;
+  const queued = await window.enqueueOrchestrationTask({
+    prompt,
+    resolvedObjective: prompt,
+    title: payload.title || `Scheduled follow-up: ${payload.purpose || ''}`,
+    modelSelectValue: payload.modelSelectValue,
+    targetConversationId: conversationId,
+    originConversationId: conversationId,
+    source: 'followup',
+    alreadyRendered: true
+  });
+  if (!queued || !queued.success) return { deferred: true, reason: 'enqueue_failed' };
+  window.promptQueue = (window.promptQueue || []).filter(item => item && item.taskId !== queued.task.taskId);
+
+  if (window.appendSystemMessage) {
+    // A late run must say so. Reporting a nine-hour-late wake-up as if it were punctual would
+    // make the model reason about "just now" against stale evidence.
+    const note = payload.delayNote ? ` (${payload.delayNote})` : '';
+    window.appendSystemMessage(`Scheduled follow-up running${note}.`, { conversationId });
+  }
+
+  await window.runAgentLoop(
+    prompt,
+    payload.modelSelectValue || (window.getSelectedModel ? window.getSelectedModel() : 'gemini-2.5-flash-lite'),
+    targetConv,
+    { source: 'followup', internalPrompt: true, taskId: queued.task.taskId }
+  );
+  return { deferred: false, ran: true };
+};
 
 function normalizeFollowupPurpose(value) {
   const text = String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
@@ -7589,6 +7759,19 @@ const REVIEW_ONLY_BLOCKED_TOOLS = Object.freeze([
   'evaluate_win_conditions', 'record_blocker', 'resolve_blocker'
 ]);
 
+// If language classification is unavailable or an unbound reference remains ambiguous, Orion may
+// still gather evidence and answer naturally. This list excludes all mutation, execution,
+// lifecycle, approval, cancellation, navigation, and handoff capabilities. It is enforced in the
+// provider schema and once more at runtime.
+const UNRESOLVED_INTENT_INSPECTION_TOOLS = new Set([
+  'recall_memory',
+  'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context',
+  'list_files', 'get_workspace_info', 'grep_search', 'search_embeddings', 'semantic_search',
+  'get_symbol_index', 'get_file_symbols', 'find_references', 'git_diff',
+  'read_notes', 'read_project_memory', 'inspect_environment',
+  'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model'
+]);
+
 // Set by the agent loop each turn so the provider adapters (which take no context) can build a
 // schema list matching the gate that is actually active.
 let activeToolGateProfile = null;
@@ -7604,6 +7787,19 @@ function getToolsBlockedByActiveGate() {
   if (profile.planRevision) return new Set(PLAN_REVISION_BLOCKED_TOOLS);
   if (profile.planningMode && !profile.canExecute) return new Set(PLANNING_BLOCKED_TOOLS);
   return new Set();
+}
+
+function getSemanticIntentToolGate(toolName) {
+  if (!activeToolGateProfile || !activeToolGateProfile.inspectionOnlyIntent) {
+    return { allowed: true, reason: '' };
+  }
+  if (UNRESOLVED_INTENT_INSPECTION_TOOLS.has(toolName)) {
+    return { allowed: true, reason: '' };
+  }
+  return {
+    allowed: false,
+    reason: 'This turn has not established executable intent. Only read-only inspection is available until the request is resolved.'
+  };
 }
 
 function getPlanningToolGate(config, canExecute, toolName, args = {}, options = {}) {
@@ -7805,6 +8001,7 @@ function summarizeToolStart(toolName, args = {}) {
     return { toolName, kind: 'checklist', status: 'running', label: `Requested checklist update${count ? ` (${count} items)` : ''}` };
   }
   if (toolName === 'schedule_followup') return { toolName, kind: 'followup', status: 'running', label: `Scheduled follow-up in ${args.delaySeconds || 60}s` };
+  if (toolName === 'watch_condition') return { toolName, kind: 'followup', status: 'running', label: `Watching ${args.type || 'condition'} every ${args.checkEverySeconds || 300}s` };
   if (toolName === 'sync_workspace_env') return { toolName, kind: 'env', status: 'running', label: 'Synced workspace environment secrets' };
   if (toolName === 'google_search') return { toolName, kind: 'research', status: 'running', label: `Searched Google for "${args.query || ''}"` };
   if (toolName === 'fetch_web_page') return { toolName, kind: 'research', status: 'running', label: `Fetched docs page ${args.url || ''}` };
@@ -7868,7 +8065,15 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
       item.detail += ' — output looks like a placeholder/no-op test script, not real verification.';
     }
   } else if (toolName === 'schedule_followup') {
-    item.detail = result && result.replacedExisting ? 'Replaced an existing related timer' : '';
+    const parts = [];
+    if (result && result.replacedExisting) parts.push('Replaced an existing schedule for the same purpose');
+    if (result && result.repeatEverySeconds) parts.push(`repeats every ${result.repeatEverySeconds}s`);
+    item.detail = parts.join(' — ');
+  } else if (toolName === 'watch_condition') {
+    const parts = [];
+    if (result && result.fireWhen) parts.push(`wakes on ${result.fireWhen}`);
+    if (result && result.replacedExisting) parts.push('replaced an existing watch');
+    item.detail = parts.join(' — ');
   } else if (result && result.summary && (
     toolName === 'download_file' || toolName === 'inspect_archive' || toolName === 'extract_archive' ||
     toolName === 'inspect_binary_asset' || toolName === 'list_asset_metadata' ||
@@ -9670,6 +9875,15 @@ function recordRunEfficiency(summary = {}) {
       startupSeconds,
       totalSeconds,
       intentClassificationSeconds,
+      // Only phases that actually cost something are reported, slowest first. Startup has been
+      // seen at 258s on a 378-token conversation and 6s on the next run, so the question is
+      // never "is startup slow" but "which call hung this time".
+      slowestStartupPhases: Object.entries(summary.startupPhases || {})
+        .map(([name, ms]) => [name, Math.round(ms / 100) / 10])
+        .filter(([, secs]) => secs >= 0.5)
+        .sort((left, right) => right[1] - left[1])
+        .slice(0, 5)
+        .map(([name, secs]) => `${name}=${secs}s`),
       secondsPerTurn: summary.loopCount ? Math.round((seconds / summary.loopCount) * 10) / 10 : 0,
       toolCalls,
       readCalls: ledger.readCalls || 0,
@@ -11163,11 +11377,33 @@ function buildAgentToolDeclarations() {
             parameters: {
               type: "OBJECT",
               properties: {
-                delaySeconds: { type: "NUMBER", description: "Delay before continuing, in seconds. Maximum 3600." },
-                prompt: { type: "STRING", description: "Instruction Orion should run when the timer fires." },
-                purpose: { type: "STRING", description: "Optional stable dedupe key, e.g. training-progress or test-check." }
+                delaySeconds: { type: "NUMBER", description: "Delay before the first run, in seconds. Maximum 86400 (24 hours). Ignored when atTime is given." },
+                prompt: { type: "STRING", description: "Instruction Orion should run when the schedule fires." },
+                purpose: { type: "STRING", description: "Optional stable dedupe key, e.g. training-progress or test-check. Re-scheduling the same purpose in the same conversation replaces the earlier schedule instead of stacking a second one." },
+                repeatEverySeconds: { type: "NUMBER", description: "Optional. When set (minimum 30), the schedule repeats on this interval instead of running once. Missed runs while Orion was closed or asleep collapse into a single catch-up run." },
+                atTime: { type: "STRING", description: "Optional clock time in 24-hour HH:MM local time, e.g. '09:00' or '17:30'. Use this for calendar schedules like 'every morning at 9' — it stays correct across daylight saving, which repeatEverySeconds does not. Supply this INSTEAD of delaySeconds/repeatEverySeconds." },
+                onDays: { type: "STRING", description: "Optional day filter for atTime: 'weekdays', 'weekends', 'daily', or a comma list like 'mon,wed,fri'. Defaults to every day." }
               },
-              required: ["delaySeconds", "prompt"]
+              required: ["prompt"]
+            }
+          },
+          {
+            name: "watch_condition",
+            description: "Watches something cheaply and wakes Orion ONLY when it actually changes. Use this instead of schedule_followup whenever the user asks to be told when something happens — a build breaking, a file changing, a URL going down, a long job finishing. Each check runs a plain command/file/HTTP probe with no model call, so a watch can poll every few minutes for weeks at negligible cost; repeatedly re-scheduling a follow-up to 'check again' is far more expensive and should be avoided. The first check silently records a baseline. After that only a transition wakes Orion, so a condition that stays true does not notify again until it flips back and re-occurs. Probes must be read-only observations: commands that push, publish, deploy, or commit are rejected because they would run unattended.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                type: { type: "STRING", description: "'command', 'file', or 'http'." },
+                command: { type: "STRING", description: "For type=command: a read-only command. Its exit code and output are the observation." },
+                path: { type: "STRING", description: "For type=file: absolute path to a file or directory. Content is hashed, so a rewrite with identical bytes is not a change." },
+                url: { type: "STRING", description: "For type=http: an http(s) URL fetched with GET." },
+                matchPattern: { type: "STRING", description: "Optional case-insensitive regex applied to the probe output. When set, the condition is 'the pattern matched' instead of 'the check passed'." },
+                fireWhen: { type: "STRING", description: "'changed' (default) wakes on any difference. 'true' wakes when the check STARTS passing/matching. 'false' wakes when it STOPS passing — use this for 'tell me when the build breaks'." },
+                checkEverySeconds: { type: "NUMBER", description: "Poll interval in seconds. Minimum 30, default 300." },
+                prompt: { type: "STRING", description: "What Orion should do when the condition changes." },
+                purpose: { type: "STRING", description: "Short stable label. Re-watching the same purpose replaces the earlier watch." }
+              },
+              required: ["type", "prompt"]
             }
           },
           {
@@ -11542,7 +11778,10 @@ function buildAgentToolDeclarations() {
   // now, and an early return for Dispatch would let a review-only or planning turn keep offering
   // tools it is certain to refuse.
   const blocked = getToolsBlockedByActiveGate();
-  const gatedTools = blocked.size ? allTools.filter(tool => !blocked.has(tool.name)) : allTools;
+  const gateFilteredTools = blocked.size ? allTools.filter(tool => !blocked.has(tool.name)) : allTools;
+  const gatedTools = activeToolGateProfile && activeToolGateProfile.inspectionOnlyIntent
+    ? gateFilteredTools.filter(tool => UNRESOLVED_INTENT_INSPECTION_TOOLS.has(tool.name))
+    : gateFilteredTools;
   if (activeConversationMode === 'orion') {
     return gatedTools.filter(tool => DISPATCH_TOOL_ALLOWLIST.has(tool.name));
   }
@@ -12753,6 +12992,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     firstClarifyingQuestionText,
     setActiveToolGateProfile,
     getToolsBlockedByActiveGate,
+    getSemanticIntentToolGate,
     PLANNING_BLOCKED_TOOLS,
     PLAN_REVISION_BLOCKED_TOOLS,
     REVIEW_ONLY_BLOCKED_TOOLS,

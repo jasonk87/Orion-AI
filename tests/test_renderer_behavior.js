@@ -9,6 +9,9 @@
 const test = require('tape');
 const { loadRenderer } = require('./helpers/renderer-harness');
 const operational = require('../operational-context');
+const workspaceResolution = require('../workspace-resolution');
+const semanticIntentRouter = require('../semantic-intent-router');
+const reasoningPolicy = require('../reasoning-policy');
 
 // ── Chat auto-scroll ───────────────────────────────────────────────────────────
 // The chat must stick to the bottom while you are following along, and must NOT yank you
@@ -611,5 +614,180 @@ test('push diagnosis survives being called before the panel exists', (t) => {
   t.doesNotThrow(() => win.updatePhonePushDiagnostic({ delivered: false, reason: 'x' }),
     'reporting before the panel has rendered does not throw');
   t.doesNotThrow(() => win.updatePhonePushDiagnostic(null), 'a null outcome does not throw');
+  t.end();
+});
+
+test('semantic preflight resolves the latest named project before classifying the turn', async t => {
+  const searchRoot = 'C:\\Users\\Owner\\Desktop\\Projects';
+  const selfEvolvingPath = `${searchRoot}\\Self Evolving AI`;
+  const thisIsLifePath = `${searchRoot}\\This is Life`;
+  const conv = {
+    id: 'dispatch-this-is-life',
+    title: 'Good morning good morning',
+    mode: 'orion',
+    workspace: selfEvolvingPath,
+    dispatchProjectPath: selfEvolvingPath,
+    messages: [
+      { role: 'assistant', text: 'The current workspace is Self Evolving AI.', createdAt: 1 },
+      { role: 'user', text: 'This is Life is the game I want you to inspect.', createdAt: 2 },
+      { role: 'assistant', text: 'Do you want me to take a look?', createdAt: 3 }
+    ]
+  };
+  const loaded = loadRenderer({
+    t,
+    globals: {
+      OrionWorkspaceResolution: workspaceResolution,
+      OrionSemanticIntentRouter: semanticIntentRouter
+    },
+    set: {
+      projects: [selfEvolvingPath, thisIsLifePath],
+      conversations: [conv],
+      appConfig: { dispatchWorkspaceRoot: searchRoot }
+    }
+  });
+  let classifierInput = null;
+  loaded.win.getOwnedOrchestrationTasks = async () => [];
+  loaded.win.classifySemanticIntent = async input => {
+    classifierInput = input;
+    return {
+      intent: 'new_task',
+      requiresExecution: true,
+      target: 'current_conversation',
+      resolvedRequest: 'Inspect the This is Life project and report what is implemented.',
+      contextDependent: true,
+      confidence: 0.98,
+      needsClarification: false,
+      clarificationQuestion: '',
+      reasoningPolicyHint: { complexity: 'medium', risk: 'low', contextNeed: 'project' },
+      executionScope: 'read_only',
+      inspectionTarget: 'project',
+      standaloneSystemOperation: false
+    };
+  };
+
+  const result = await loaded.win.classifyCurrentConversationIntent(
+    loaded.read('conversations')[0],
+    'Look through This is Life and see for yourself.'
+  );
+  const reboundConversation = loaded.read('conversations')[0];
+
+  t.equal(result.intent, 'new_task', 'the actual semantic preflight completes normally');
+  t.equal(classifierInput.workspace.role, workspaceResolution.KINDS.ACTIVE_PROJECT,
+    'the classifier sees an active project rather than the stale workspace');
+  t.equal(classifierInput.workspace.path, thisIsLifePath,
+    'the classifier receives the exact project named in the visible conversation');
+  t.equal(reboundConversation.dispatchProjectPath, thisIsLifePath,
+    'the real Dispatch conversation is rebound before execution routing');
+  t.equal(reboundConversation.workspace, thisIsLifePath,
+    'the selected workspace and semantic target stay synchronized');
+  t.end();
+});
+
+// ── Coder completion summaries never relay completion-gate narration ───────────
+// The final model reply in a gated run often answers the GATE ("all coverage surfaces are
+// inspected and verified, no blockers remain") instead of the user. That text must never win
+// over the real summary when Dispatch relays the finished task.
+
+test('summarizeCoderCompletion skips gate narration and relays the real answer', (t) => {
+  const contracts = require('../orchestration-contracts');
+  const { win } = loadRenderer({ t, globals: { OrionOrchestrationContracts: contracts } });
+
+  const realSummary = 'Upgraded Codex playwright to 1.61.1 and removed chromium-1208/1223, freeing ~1.29 GB.';
+  const gateNarration = 'Completion gate is now clear — all five coverage surfaces are inspected and verified, the win condition is satisfied, and no blockers remain. Task complete.';
+
+  // Durable summary recorded as gate narration (a task finalized by an older build): the
+  // fallback scan must reach past the trailing narration message to the substantive one.
+  const fromFallback = win.summarizeCoderCompletion(
+    { result: { summary: gateNarration, changedFiles: [], verification: [] } },
+    {
+      messages: [
+        { role: 'assistant', text: realSummary },
+        { role: 'assistant', text: gateNarration }
+      ]
+    }
+  );
+  t.equal(fromFallback.summary, realSummary,
+    'a gate-narration durable summary is discarded in favor of the last real answer');
+
+  // A healthy durable summary passes through untouched.
+  const healthy = win.summarizeCoderCompletion(
+    { result: { summary: realSummary, changedFiles: ['a.js'], verification: ['npm test'] } },
+    { messages: [] }
+  );
+  t.equal(healthy.summary, realSummary, 'a substantive durable summary is relayed as-is');
+
+  // All-narration conversation: better an empty summary than machinery speak.
+  const nothingReal = win.summarizeCoderCompletion(
+    { result: { summary: gateNarration } },
+    { messages: [{ role: 'assistant', text: gateNarration }] }
+  );
+  t.equal(nothingReal.summary, '', 'narration is never relayed even when it is all there is');
+  t.end();
+});
+
+// ── Per-message model + reasoning pickers ──────────────────────────────────────
+// The reasoning selector sits beside the model select under the input box. It is sticky, it
+// persists to both localStorage and appConfig (which is what agent.js reads), and a forced
+// level is visually distinct so a pinned Ultra is never an invisible cost.
+
+test('the reasoning picker exists beside the model select under the input box', (t) => {
+  const { win } = loadRenderer({ t });
+  const select = win.document.getElementById('reasoning-select');
+  t.ok(select, 'a reasoning selector is present');
+  t.equal(select.closest('.chat-input-toolbar') !== null, true,
+    'it lives in the chat input toolbar, not a settings screen');
+  const values = Array.from(select.options).map(o => o.value);
+  t.deepEqual(values, ['auto', 'low', 'medium', 'high', 'max'],
+    'auto plus the four effort levels are offered');
+  t.equal(select.value, 'auto', 'auto is the default so Orion keeps deciding per step');
+  t.ok(Array.from(select.options).find(o => o.value === 'max').textContent.includes('Ultra'),
+    'the max level is labelled Ultra for the user');
+  t.end();
+});
+
+test('picking a reasoning level persists it where the agent reads it', async (t) => {
+  const { win, calls } = loadRenderer({ t });
+
+  const result = await win.setReasoningEffortSelection('max');
+  t.equal(result.reasoning, 'max', 'the selection is reported back');
+  t.equal(win.getAppConfig().reasoningEffort, 'max',
+    'appConfig carries the level — this is what runAgentLoop reads');
+  t.equal(win.localStorage.getItem('ag2_reasoning_effort'), 'max', 'the choice survives restart');
+  t.ok(calls.some(c => c.method === 'writeConfig'), 'the config is written to disk');
+  t.equal(win.document.getElementById('reasoning-select').classList.contains('reasoning-forced'), true,
+    'a forced level is visually distinct from auto');
+
+  await win.setReasoningEffortSelection('auto');
+  t.equal(win.document.getElementById('reasoning-select').classList.contains('reasoning-forced'), false,
+    'returning to auto drops the forced styling');
+  t.end();
+});
+
+test('an unknown stored reasoning level degrades to auto instead of breaking the run', async (t) => {
+  const { win } = loadRenderer({ t, globals: { OrionReasoningPolicy: reasoningPolicy } });
+  win.localStorage.setItem('ag2_reasoning_effort', 'warp9');
+  win.restoreReasoningEffortSelection();
+  t.equal(win.document.getElementById('reasoning-select').value, 'auto',
+    'a junk stored value falls back to auto');
+  t.equal(win.getAppConfig().reasoningEffort, 'auto', 'and never reaches the agent as an override');
+  t.end();
+});
+
+test('the phone companion is served both selections and can set either', async (t) => {
+  const { win } = loadRenderer({ t, globals: { OrionReasoningPolicy: reasoningPolicy } });
+  await win.setReasoningEffortSelection('high');
+
+  const payload = win.getPhoneCompanionModels();
+  t.equal(payload.reasoning, 'high', 'the phone is told the current reasoning level');
+  t.ok(Array.isArray(payload.reasoningLevels) && payload.reasoningLevels.length === 5,
+    'the phone receives the level list to render its picker');
+  t.ok(payload.models.length > 0, 'the model list is still supplied');
+
+  const set = await win.setPhoneCompanionReasoning('low');
+  t.equal(set.success, true, 'the phone can set the reasoning level');
+  t.equal(win.getAppConfig().reasoningEffort, 'low',
+    'a phone-side change lands in the same appConfig the desktop uses');
+  t.equal(win.document.getElementById('reasoning-select').value, 'low',
+    'and the desktop picker reflects it immediately');
   t.end();
 });

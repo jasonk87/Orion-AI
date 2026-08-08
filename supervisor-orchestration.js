@@ -266,6 +266,38 @@
     }
     const rawReply = await dependencies.generateReply(systemPrompt, generationMessages);
     let text = String(rawReply || '').trim();
+
+    // A follow-up must get a new answer. Asked "why that one over these others?", a model on a
+    // low reasoning budget will often re-emit its previous message nearly verbatim — responsive
+    // in shape, useless in substance. One regeneration with the restatement named explicitly is
+    // enough to break it; a second would just burn tokens, so this never loops.
+    const priorAssistantText = (() => {
+      const messages = Array.isArray(conversation.messages) ? conversation.messages : [];
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const message = messages[i];
+        if (!message || (message.role !== 'assistant' && message.role !== 'model')) continue;
+        const value = String(message.text || message.content || '').trim();
+        if (value && value !== 'Thinking...') return value;
+      }
+      return '';
+    })();
+    let restated = false;
+    if (contracts && typeof contracts.isRestatementOfPrevious === 'function'
+        && priorAssistantText && contracts.isRestatementOfPrevious(text, priorAssistantText)) {
+      restated = true;
+      const retryMessages = [
+        ...generationMessages,
+        { role: 'assistant', content: text },
+        { role: 'user', content: contracts.buildRestatementCorrectionPrompt(prompt) }
+      ];
+      const retryReply = await dependencies.generateReply(systemPrompt, retryMessages);
+      const retryText = String(retryReply || '').trim();
+      // Only accept the retry if it actually stopped restating; otherwise the original at least
+      // answers in the user's own terms rather than being replaced by a second copy.
+      if (retryText && !contracts.isRestatementOfPrevious(retryText, priorAssistantText)) {
+        text = retryText;
+      }
+    }
     if (contracts && (recallRequested || contracts.hasExplicitRecallClaim(text))) {
       const validation = contracts.validateMemoryResponse(text, {
         conversationEvidence: evidence,
@@ -287,7 +319,7 @@
           structuredStatuses: statuses
         })
       : null;
-    return { text, responseBasis, searchResult, recallRequested, statuses };
+    return { text, responseBasis, searchResult, recallRequested, statuses, restated };
   }
 
   async function handleSupervisorMessage(input = {}, dependencies = {}) {

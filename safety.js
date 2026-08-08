@@ -83,6 +83,59 @@ function classifyCommandRequest(command, options = {}) {
   return { category: 'freeform', allowed: true, reason: 'Allowed freeform terminal command' };
 }
 
+// Commands that must never run unattended on a timer, even though they are perfectly fine when
+// a human typed them and is watching the result.
+//
+// A condition probe is supposed to be a read-only OBSERVATION: it answers "did something
+// change?" and its answer decides whether to wake the model. Two things follow. First, a probe
+// that mutates state corrupts its own measurement — it would observe the change it just caused.
+// Second, and more seriously, a probe runs every few minutes with nobody watching, so an
+// outward-facing action inside one is an action nobody approved and nobody sees. `git push`
+// typed at a prompt is routine; `git push` on a five-minute timer is a robot publishing your
+// work while you sleep.
+//
+// These are additive to DESTRUCTIVE_PATTERNS, which still apply — this list is about
+// irreversible OUTWARD effects rather than local destruction.
+const UNATTENDED_FORBIDDEN_PATTERNS = [
+  /\bgit\s+push\b/i,
+  /\bgit\s+(?:commit|merge|rebase|cherry-pick|revert)\b/i,
+  /\b(?:npm|yarn|pnpm)\s+publish\b/i,
+  /\bdocker\s+push\b/i,
+  /\bgh\s+(?:pr\s+(?:merge|create)|release\s+create|repo\s+delete)\b/i,
+  /\b(?:kubectl|helm)\s+(?:apply|delete|upgrade|install|rollout)\b/i,
+  /\b(?:terraform|tofu)\s+(?:apply|destroy)\b/i,
+  /\b(?:aws|az|gcloud)\s+\S+\s+(?:create|delete|update|put|deploy)\b/i,
+  /\bcurl\b[^\r\n]*\s-X\s*(?:POST|PUT|PATCH|DELETE)\b/i,
+  /\bInvoke-(?:WebRequest|RestMethod)\b[^\r\n]*-Method\s+(?:POST|PUT|PATCH|DELETE)\b/i,
+  /\bshutdown\b|\bRestart-Computer\b|\bStop-Computer\b/i
+];
+
+function findUnattendedForbiddenPattern(command) {
+  const text = String(command || '');
+  return UNATTENDED_FORBIDDEN_PATTERNS.find(pattern => pattern.test(text)) || null;
+}
+
+// Gate for commands executed by the schedule tick with no human present. Applies the normal
+// destructive rules first, then the unattended-only restrictions.
+function classifyUnattendedProbeCommand(command) {
+  const text = String(command || '');
+  if (!text.trim()) return { allowed: false, reason: 'A condition probe needs a command.' };
+
+  const base = classifyCommandRequest(text, { source: 'freeform' });
+  if (!base.allowed) return { allowed: false, reason: base.reason, category: base.category };
+
+  const forbidden = findUnattendedForbiddenPattern(text);
+  if (forbidden) {
+    const matched = text.match(forbidden);
+    return {
+      allowed: false,
+      category: 'unattended_forbidden',
+      reason: `Condition probes run unattended on a timer, so they must be read-only checks. This command matches ${forbidden} (matched text: "${matched ? matched[0] : ''}"), which changes state outside this machine or the repository. Use a probe that only observes — a status/exit-code/read command — and let the woken run take the action, where you can see it.`
+    };
+  }
+  return { allowed: true, category: 'probe', reason: 'Allowed read-only probe command' };
+}
+
 function isIndexableWorkspaceFile(fileName) {
   const name = String(fileName || '');
   if (/^\.env(?:\.|$)/i.test(name)) return false;
@@ -91,7 +144,9 @@ function isIndexableWorkspaceFile(fileName) {
 
 module.exports = {
   classifyCommandRequest,
+  classifyUnattendedProbeCommand,
   findDestructivePattern,
+  findUnattendedForbiddenPattern,
   isDestructiveCommand,
   isIndexableWorkspaceFile,
   resolveWorkspacePath

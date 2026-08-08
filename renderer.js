@@ -45,6 +45,7 @@ let appConfig = {
   googleSearchEngineId: '3354e92e98ab54b31',
   googleSearchApiKey: '',
   defaultModel: 'gemini-2.5-flash-lite',
+  reasoningEffort: 'auto',
   compactThresholdTokens: 100000,
   autoCompact: true,
   modelContextBudgets: {
@@ -133,6 +134,7 @@ const el = {
   chatInput: document.getElementById('chat-input'),
   btnSubmit: document.getElementById('btn-submit'),
   modelSelect: document.getElementById('model-select'),
+  reasoningSelect: document.getElementById('reasoning-select'),
   chatTitle: document.getElementById('chat-title'),
   // Settings modal
   settingsModal: document.getElementById('settings-modal'),
@@ -609,6 +611,9 @@ async function loadSettings() {
   
   // Initialize dropdown with Gemini and dynamic Ollama models
   await initModelDropdown();
+  // Independent of the model dropdown: the reasoning picker must restore even when the model
+  // select is missing, otherwise a saved Ultra silently reverts to Auto.
+  restoreReasoningEffortSelection();
 }
 
 async function initModelDropdown() {
@@ -721,6 +726,36 @@ async function initModelDropdown() {
   // Sync back config
   appConfig.defaultModel = modelSelect.value;
 }
+
+// The reasoning picker next to the input box. 'auto' is the default and means the phase
+// engine keeps deciding per step; any explicit level is forced for every answer until the
+// user changes it back. Sticky on purpose — same behavior as the model select beside it.
+function restoreReasoningEffortSelection() {
+  if (!el.reasoningSelect) return;
+  const normalize = window.OrionReasoningPolicy
+    ? window.OrionReasoningPolicy.normalizeEffortOverride
+    : value => value || 'auto';
+  const saved = normalize(localStorage.getItem('ag2_reasoning_effort') || appConfig.reasoningEffort || 'auto');
+  el.reasoningSelect.value = saved;
+  if (!el.reasoningSelect.value) el.reasoningSelect.value = 'auto';
+  appConfig.reasoningEffort = el.reasoningSelect.value;
+  el.reasoningSelect.classList.toggle('reasoning-forced', el.reasoningSelect.value !== 'auto');
+}
+
+window.setReasoningEffortSelection = async (value) => {
+  const normalize = window.OrionReasoningPolicy
+    ? window.OrionReasoningPolicy.normalizeEffortOverride
+    : v => v || 'auto';
+  const level = normalize(value);
+  appConfig.reasoningEffort = level;
+  if (el.reasoningSelect) {
+    el.reasoningSelect.value = level;
+    el.reasoningSelect.classList.toggle('reasoning-forced', level !== 'auto');
+  }
+  localStorage.setItem('ag2_reasoning_effort', level);
+  try { await window.api.writeConfig(appConfig); } catch (_) {}
+  return { success: true, reasoning: level };
+};
 
 function normalizePhoneHttpsOrigin(value) {
   const raw = String(value || '').trim();
@@ -917,9 +952,21 @@ async function syncWorkspaceFiles() {
     window.api.indexWorkspace(currentWorkspace).catch(() => {});
   }
 
-  const files = await window.api.listFiles(currentWorkspace);
+  // list-files answers with an array on success but { error } on failure, so an unreadable or
+  // mid-mutation workspace used to reach buildFileTree as a non-array and throw
+  // "files.forEach is not a function" out of an unhandled promise. Surface the failure in the
+  // panel instead, and leave the last good tree data alone rather than half-clearing it.
+  const listed = await window.api.listFiles(currentWorkspace);
+  if (!Array.isArray(listed)) {
+    const reason = listed && listed.error ? String(listed.error) : 'The directory could not be read.';
+    el.fileCountBadge.textContent = '—';
+    el.fileTree.innerHTML = `<p class="empty-state">Could not list files: ${escapeHtml(reason)}</p>`;
+    loadRunArtifacts();
+    return;
+  }
+  const files = listed;
   el.fileCountBadge.textContent = files.length;
-  
+
   if (files.length === 0) {
     currentFileTreeItems = [];
     el.fileTree.innerHTML = '<p class="empty-state">No files found.</p>';
@@ -2151,6 +2198,13 @@ function setupChatHandlers() {
     localStorage.setItem('ag2_default_model', val);
     await window.api.writeConfig(appConfig);
   });
+
+  // Reasoning level select — sticky per-answer override beside the model select
+  if (el.reasoningSelect) {
+    el.reasoningSelect.addEventListener('change', () => {
+      window.setReasoningEffortSelection(el.reasoningSelect.value);
+    });
+  }
 }
 
 function triggerSteer() {
@@ -3064,12 +3118,23 @@ async function classifyCurrentConversationIntent(conv, prompt, options = {}) {
           }
         : null);
   const boundTask = activeOwnedTask || pendingOwnedTask;
+  const recentVisibleConversation = taskContextMessages(conv);
+  // Resolve an explicitly named project before asking the semantic model what the turn means.
+  // Otherwise a Dispatch conversation that was last attached to Project A can make an unambiguous
+  // request about Project B look contradictory, and the classifier will repeatedly ask the user to
+  // choose a target that the visible conversation already identified.
+  const semanticWorkspace = conv && conversationMode(conv) === 'orion'
+    ? bindNamedProjectForSupervisor(conv, [
+        ...recentVisibleConversation.map(message => message && (message.text || message.content || '')),
+        prompt
+      ].filter(Boolean).join('\n'))
+    : (conv ? structuredWorkspaceForConversation(conv) : null);
   const classification = await window.classifySemanticIntent({
     userMessage: prompt,
-    recentVisibleConversation: taskContextMessages(conv),
+    recentVisibleConversation,
     conversationId: conv && conv.id,
     mode: conv && conversationMode(conv),
-    workspace: conv ? structuredWorkspaceForConversation(conv) : null,
+    workspace: semanticWorkspace,
     pendingPlan,
     activeOwnedTask,
     pendingOwnedTask,
@@ -7169,6 +7234,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     orchestrationTasks,
     activeTaskId: selectedSupervisedTask ? selectedSupervisedTask.taskId : '',
     model: window.getSelectedModel(),
+    reasoning: appConfig.reasoningEffort || 'auto',
     messages,
     latestOutput: latestOutput ? latestOutput.text : '',
     operationalContext,
@@ -8019,7 +8085,17 @@ window.getPhoneCompanionModels = () => {
       models.push({ value: opt.value, label: opt.textContent.trim(), group });
     }
   }
-  return { current, models };
+  const reasoning = window.OrionReasoningPolicy
+    ? window.OrionReasoningPolicy.normalizeEffortOverride(appConfig.reasoningEffort)
+    : (appConfig.reasoningEffort || 'auto');
+  const reasoningLevels = window.OrionReasoningPolicy
+    ? window.OrionReasoningPolicy.EFFORT_OVERRIDES.map(option => ({ ...option }))
+    : [{ value: 'auto', label: 'Auto' }];
+  return { current, models, reasoning, reasoningLevels };
+};
+
+window.setPhoneCompanionReasoning = async (level) => {
+  return window.setReasoningEffortSelection(level);
 };
 
 window.setPhoneCompanionModel = async (modelValue) => {
@@ -8579,6 +8655,20 @@ function bindNamedProjectForSupervisor(orionConv, prompt) {
   return structuredWorkspaceForConversation(orionConv);
 }
 
+// Distinguishes small talk from a question that actually needs thinking. Greetings and
+// acknowledgements are genuinely cheap; explanation, comparison, and justification are not,
+// and answering them at the casual tier is what produced restated non-answers.
+function isSubstantiveConversationalTurn(semanticIntent, prompt) {
+  const hint = (semanticIntent && semanticIntent.reasoningPolicyHint) || {};
+  if (hint.complexity === 'medium' || hint.complexity === 'high') return true;
+  if (hint.risk === 'medium' || hint.risk === 'high') return true;
+  const text = String(prompt || '').trim();
+  if (text.length > 180) return true;
+  // "why", "how come", "compare", "versus", "instead of", "rather than", "explain",
+  // "what about" — the shapes of a question that wants reasons rather than a reply.
+  return /\b(?:why|how come|compare|comparison|versus|vs\.?|instead of|rather than|explain|walk me through|what about|trade-?offs?|pros and cons|better than|difference between)\b/i.test(text);
+}
+
 // ── Orion answers conversationally while Coder runs in the background ─────────
 async function respondOrionConversationally(orionConv, prompt, model, options = {}) {
   const config = window.getAppConfig ? window.getAppConfig() : {};
@@ -8600,11 +8690,31 @@ async function respondOrionConversationally(orionConv, prompt, model, options = 
 
   // Add coder context if a coder task is running
   let coderContext = '';
+  let liveCoderContext = false;
   const coderConvId = orionConv.launchedCoderConvId;
   if (coderConvId) {
     const summary = buildCoderStatusSummary(coderConvId);
     if (summary && summary.text) {
       coderContext = `\n\nCoder task status:\n${summary.text}`;
+      liveCoderContext = true;
+    }
+  }
+  // No live task: supply the finished run's recorded result instead. The completion notice the
+  // user sees is deliberately conversational and truncated to 500 chars in recentMsgs, so this
+  // is the only way Dispatch can answer questions like "did you test it?" about the last run.
+  if (!liveCoderContext) {
+    const finished = orionConv.lastDelegatedWork;
+    if (finished && finished.taskId) {
+      const finishedLines = [`- Task: ${finished.title || 'Coder task'}`];
+      const recordedStatus = String(finished.subStatus || finished.status || '').trim();
+      if (recordedStatus) finishedLines.push(`- Recorded status: ${recordedStatus}`);
+      if (Array.isArray(finished.changedFiles) && finished.changedFiles.length) {
+        finishedLines.push(`- Files Coder changed: ${finished.changedFiles.join(', ')}`);
+      }
+      finishedLines.push(Array.isArray(finished.verification) && finished.verification.length
+        ? `- Verification Coder recorded: ${finished.verification.join('; ')}`
+        : '- Verification Coder recorded: none was recorded for this run.');
+      coderContext = `\n\nMost recent Coder run (already finished, not running):\n${finishedLines.join('\n')}`;
     }
   }
 
@@ -8621,10 +8731,12 @@ async function respondOrionConversationally(orionConv, prompt, model, options = 
   const statusGuidance = options.statusCheckin
     ? '\n\nThe user is checking on Coder. Answer naturally in one short progress update using only the Coder task status supplied below. Summarize what is complete, what is happening now, and what remains when those facts are available. Do not print raw JSON, tool-call payloads, internal thoughts, or a mechanical field dump. Do not guess percentages or claim completion that is not recorded.'
     : '';
-  const concurrencyGuidance = coderContext
+  const concurrencyGuidance = liveCoderContext
     ? ' A separate Coder agent is working in the background; its verified status is supplied below. You can still talk freely.'
-    : ' Another response may still be finishing, but no owned Coder status is supplied. Do not claim that a Coder task exists.';
-  const systemPrompt = `You are Orion, an AI supervisor. Answer the user's current message conversationally and helpfully.${concurrencyGuidance} Be concise and direct. Never invent a remembered conversation or upgrade a reported status.${statusGuidance}${workspaceDescription ? `\n\nWorkspace state: ${workspaceDescription}` : ''}${coderContext}`;
+    : (coderContext
+      ? ' The most recent Coder run has already finished; its recorded result is supplied below. Do not say a Coder task is still running. If the user asks what was done, changed, tested, or verified, answer from that record in ordinary prose — never as a bulleted evidence dump. If no verification was recorded, say so plainly instead of implying the work was tested.'
+      : ' Another response may still be finishing, but no owned Coder status is supplied. Do not claim that a Coder task exists.');
+  const systemPrompt = `You are Orion, an AI supervisor. Answer the user's current message conversationally and helpfully.${concurrencyGuidance} Be concise and direct. Never invent a remembered conversation or upgrade a reported status. If this message is a follow-up to your previous reply, answer the NEW question — never restate your last message. When the user asks why you preferred something over specific alternatives they name, address each named alternative and give the actual basis for the ranking.${statusGuidance}${workspaceDescription ? `\n\nWorkspace state: ${workspaceDescription}` : ''}${coderContext}`;
 
   const runningConversationId = window.getRunningConversationId
     ? String(window.getRunningConversationId() || '')
@@ -8658,7 +8770,16 @@ async function respondOrionConversationally(orionConv, prompt, model, options = 
           : Promise.resolve({ success: false, evidence: [], queryTerms: [] })
       ),
       generateReply: (contractPrompt, messages) => window.quickOrionLLMCall(contractPrompt, messages, config, {
-        phase: options.statusCheckin ? 'final_response' : 'casual_conversation',
+        // Not every Dispatch turn is small talk. 'casual_conversation' resolves to low effort,
+        // which on DeepSeek disables thinking entirely — so a genuine question ("why that one
+        // over these three?") was being answered with no reasoning budget at all, and came back
+        // as a near-verbatim restatement of the previous reply. A turn the classifier rates as
+        // non-trivial gets a phase that actually affords comparison.
+        phase: options.statusCheckin
+          ? 'final_response'
+          : (isSubstantiveConversationalTurn(options.semanticIntent, prompt)
+            ? 'final_response'
+            : 'casual_conversation'),
         hint: options.semanticIntent && options.semanticIntent.reasoningPolicyHint || {}
       })
     });
@@ -9065,7 +9186,15 @@ async function relayCoderPlanToDispatch(orionConv, coderConv, taskId) {
 function summarizeCoderCompletion(durableTask, coderConv) {
   const result = durableTask && durableTask.result && typeof durableTask.result === 'object'
     ? durableTask.result : {};
+  // A summary that answers the completion gate ("all coverage surfaces are inspected and
+  // verified, no blockers remain...") is internal machinery narration, never something to relay
+  // to the user. Agent-side selection now avoids recording it, but tasks finalized by older
+  // builds still carry it — treat it as absent and fall back to the last real answer.
+  const isGateNarration = text => !!(RendererOrchestrationContracts
+    && typeof RendererOrchestrationContracts.isCompletionGateNarration === 'function'
+    && RendererOrchestrationContracts.isCompletionGateNarration(text));
   let summary = String(result.summary || '').trim();
+  if (isGateNarration(summary)) summary = '';
   if (!summary && coderConv && Array.isArray(coderConv.messages)) {
     const finalMessage = [...coderConv.messages].reverse().find(message =>
       message
@@ -9073,6 +9202,7 @@ function summarizeCoderCompletion(durableTask, coderConv) {
       && String(message.text || '').trim()
       && String(message.text || '').trim() !== 'Thinking...'
       && !message.isPlanApprovalCard
+      && !isGateNarration(message.text)
     );
     summary = finalMessage ? String(finalMessage.text || '').trim() : '';
   }
@@ -9175,9 +9305,9 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
     if (completion.changedFiles.length) {
       summaryText += `\n\nChanged: ${completion.changedFiles.map(file => `\`${file}\``).join(', ')}`;
     }
-    if (completion.verification.length) {
-      summaryText += `\n\nVerified:\n${completion.verification.map(item => `- ${item}`).join('\n')}`;
-    }
+    // Coder still records verification evidence on the durable task result, but the Dispatch
+    // relay does not print it — a bulleted evidence dump reads like a machine log, not a reply.
+    // It rides along in message metadata so it stays recoverable without being shown.
   } else if (pendingTasks.length > 0 && doneTasks.length === 0) {
     summaryText = `Coder stopped on **${taskTitle}** — ${pendingTasks.length} task${pendingTasks.length > 1 ? 's' : ''} still pending. It may have hit a blocker. Check the Coder conversation for details.`;
   } else if (pendingTasks.length > 0) {
@@ -9189,7 +9319,8 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
 
   notifyOrionConversation(orionConv, summaryText, 'supervisor-completion', {
     orchestrationTaskId: taskId,
-    orchestrationStatus: durableTask && durableTask.status || ''
+    orchestrationStatus: durableTask && durableTask.status || '',
+    verificationEvidence: completion.verification
   });
 
   orionConv.lastDelegatedWork = {
@@ -9197,6 +9328,10 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
     coderConversationId: finishedCoderConvId,
     title: taskTitle,
     objective: durableTask && durableTask.objective || '',
+    // Cached from the durable result so Dispatch can answer "did you test it?" after the run
+    // ends, when launchedCoderConvId is already cleared and no live status is available.
+    changedFiles: completion.changedFiles,
+    verification: completion.verification,
     projectPath: (coderConv && coderConv.projectPath) || inferDispatchProjectPath(orionConv),
     status: durableTask ? durableTask.status : (blockedFlag || pendingTasks.length > 0 ? 'blocked' : 'completed'),
     subStatus: durableTask

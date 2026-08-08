@@ -84,10 +84,19 @@
       effort = failures >= 3 ? 'max' : maxLevel(effort, 'high');
       verificationStrictness = 'strict';
     }
+    // A user-forced effort level (picked next to the input box) wins over everything the
+    // phase engine decided, including failure escalation — forced means forced. Everything
+    // else (context scope, exploration, verification) stays phase-driven: the user is
+    // choosing how hard the model thinks, not how the run is governed.
+    const forcedEffort = Object.prototype.hasOwnProperty.call(RANK, input.forcedEffort)
+      ? input.forcedEffort
+      : '';
+    if (forcedEffort) effort = forcedEffort;
     const coverageRequired = broad && ['impact_analysis', 'implementation', 'failure_diagnosis', 'adversarial_review', 'final_response'].includes(phase);
     return {
       phase,
       effort,
+      effortSource: forcedEffort ? 'forced' : 'auto',
       contextScope,
       explorationScope,
       verificationStrictness,
@@ -145,7 +154,23 @@
     ].filter(Boolean).join('\n');
   }
 
-  const api = { PHASES, select, providerControls, promptDirective };
+  // The per-message override levels offered next to the input box. 'auto' means "no override:
+  // let the phase engine decide" and is the default. 'max' is surfaced to the user as "Ultra".
+  const EFFORT_OVERRIDES = Object.freeze([
+    { value: 'auto', label: 'Auto' },
+    { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'high', label: 'High' },
+    { value: 'max', label: 'Ultra' }
+  ]);
+
+  function normalizeEffortOverride(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (normalized === 'ultra') return 'max';
+    return EFFORT_OVERRIDES.some(option => option.value === normalized) ? normalized : 'auto';
+  }
+
+  const api = { PHASES, EFFORT_OVERRIDES, select, providerControls, promptDirective, normalizeEffortOverride };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   if (globalScope) globalScope.OrionReasoningPolicy = api;
 })(typeof window !== 'undefined' ? window : globalThis);

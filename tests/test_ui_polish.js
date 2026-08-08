@@ -921,8 +921,54 @@ test('Dispatch relays delegated plans and completion evidence without forcing a 
     'Dispatch no longer tells the user to switch conversations for plan review');
   t.ok(renderer.includes('const completion = summarizeCoderCompletion(durableTask, coderConv)'),
     'completion notices use the durable Coder result');
-  t.ok(renderer.includes('completion.changedFiles') && renderer.includes('completion.verification'),
-    'completion relay includes changed files and verification evidence');
+  t.ok(renderer.includes('completion.changedFiles'),
+    'completion relay names the changed files');
+  t.notOk(renderer.includes('\\n\\nVerified:\\n'),
+    'the Dispatch relay never dumps a bulleted verification list at the user');
+  t.ok(renderer.includes('verificationEvidence: completion.verification'),
+    'verification evidence is still carried on the completion message metadata');
+  t.end();
+});
+
+test('Dispatch can still answer what the finished Coder run verified', (t) => {
+  const responseStart = renderer.indexOf('async function respondOrionConversationally');
+  const responseEnd = renderer.indexOf('\nasync function handleSupervisorMessage', responseStart);
+  const responsePath = renderer.slice(responseStart, responseEnd);
+
+  t.ok(responsePath.includes('const finished = orionConv.lastDelegatedWork'),
+    'a Dispatch turn with no live task falls back to the last delegated run');
+  t.ok(responsePath.includes('Verification Coder recorded:'),
+    'the finished-run context carries the recorded verification evidence');
+  t.ok(responsePath.includes('none was recorded for this run.'),
+    'a run with no verification is stated plainly instead of being left blank');
+  t.ok(responsePath.includes('Most recent Coder run (already finished, not running)'),
+    'the finished run is labelled as finished so it cannot be reported as active');
+
+  // The live-vs-finished distinction is load-bearing: reusing the running-task wording for a
+  // completed run would make Dispatch claim a Coder task is still in flight.
+  t.ok(responsePath.includes('const concurrencyGuidance = liveCoderContext'),
+    'concurrency guidance keys off a live task, not merely the presence of coder context');
+  const guidanceStart = responsePath.indexOf('const concurrencyGuidance =');
+  const guidanceEnd = responsePath.indexOf('const systemPrompt =', guidanceStart);
+  const guidancePath = responsePath.slice(guidanceStart, guidanceEnd);
+  t.ok(guidancePath.includes('Do not say a Coder task is still running.'),
+    'the finished-run branch forbids claiming the run is still active');
+  t.ok(guidancePath.includes('never as a bulleted evidence dump'),
+    'the finished-run branch asks for prose rather than a rebuilt evidence list');
+
+  // The cached receipt is what survives launchedCoderConvId being cleared at completion.
+  const notifyStart = renderer.indexOf('async function notifySupervisorOfCoderCompletion');
+  const notifyEnd = renderer.indexOf('\nwindow.onOrchestrationTaskFinalized', notifyStart);
+  const notifyPath = renderer.slice(notifyStart, notifyEnd);
+  t.ok(notifyPath.includes('verification: completion.verification'),
+    'the durable receipt caches verification for later Dispatch questions');
+  t.ok(notifyPath.includes('changedFiles: completion.changedFiles'),
+    'the durable receipt caches the changed files alongside the verification');
+  // Guard the completed path specifically — the early-return branches clear the same field first.
+  const receiptIndex = notifyPath.indexOf('verification: completion.verification');
+  const clearAfterReceipt = notifyPath.indexOf('orionConv.launchedCoderConvId = null', receiptIndex);
+  t.ok(receiptIndex >= 0 && clearAfterReceipt > receiptIndex,
+    'the receipt is written before the live coder reference is cleared');
   t.end();
 });
 

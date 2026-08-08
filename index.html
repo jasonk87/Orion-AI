@@ -224,6 +224,15 @@
                   <option value="gemini-3-flash-preview">Gemini 3 Flash Preview</option>
                 </select>
               </div>
+              <div class="model-select-wrapper reasoning-select-wrapper">
+                <select id="reasoning-select" title="Reasoning depth for the next answer (Auto lets Orion decide per step)">
+                  <option value="auto" selected>&#129504; Auto</option>
+                  <option value="low">&#129504; Low</option>
+                  <option value="medium">&#129504; Medium</option>
+                  <option value="high">&#129504; High</option>
+                  <option value="max">&#129504; Ultra</option>
+                </select>
+              </div>
             </div>
             <div class="toolbar-right">
               <button class="btn-steer" id="btn-steer" title="Send steering feedback directly to active task">&#127919; Steer</button>
