@@ -970,11 +970,115 @@ test('a direct executable request preflights once and preserves durable handoff 
       }
     );
     t.equal(handoffs.length, 1, 'the genuine handoff creates exactly one durable Coder task');
+    t.equal(handoffs[0].standalone, true, 'local-system work remains standalone even with an active project selected');
+    t.equal(handoffs[0].path, 'C:\\Users\\Owner', 'the standalone task is rooted at the user home, not the selected project');
     t.match(handoffs[0].prompt, /identify the intended local target/i, 'the deterministic packet requires safe target identification');
     t.match(handoffs[0].prompt, /verify the result/i, 'the deterministic packet requires verification');
     t.equal(handoffs[0].originalUserMessage, 'Can you kill Claude and restart it again?', 'the exact raw user utterance is retained separately from the expanded handoff prompt');
     t.match(handoffs[0].title, /Claude|running process/i, 'the handoff receives a human title derived from the resolved objective');
+    t.notOk(/^GRITLIFE\b/i.test(handoffs[0].title), 'a standalone desktop task is not mislabeled as project work');
     t.notEqual(handoffs[0].title, 'Execute Dispatch request', 'the internal Dispatch placeholder is never exposed as a task title');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('Coder finalization keeps the user-facing result separate from the generated tool walkthrough', async t => {
+  const originalFetch = global.fetch;
+  const finalized = [];
+  installHarness([
+    [{ text: 'I will inspect the visible state.' }, { functionCall: { name: 'read_file', args: { path: 'status.txt' } } }],
+    [{ text: '## Work Walkthrough\n\n**Result:** Codex is open, idle, and showing the completed Orion report.' }]
+  ], {
+    workspace: 'C:\\Users\\Owner',
+    api: { readFile: async () => 'Codex: idle' },
+    window: {
+      claimOrchestrationTask: async taskId => ({
+        success: true,
+        task: { taskId, status: 'active', execution: { executionId: 'exec-summary-separation' } },
+        prompt: 'Open Codex and report what it is doing.'
+      }),
+      finalizeOrchestrationTask: async (taskId, status, details) => {
+        finalized.push({ taskId, status, details });
+        return { taskId, status };
+      },
+      onOrchestrationTaskFinalized: async () => {}
+    }
+  });
+  const conv = conversation('coder-summary-separation', {
+    mode: 'coder',
+    workspace: 'C:\\Users\\Owner'
+  });
+  try {
+    await global.window.runAgentLoop(
+      'Open Codex and report what it is doing.',
+      'gemini-1',
+      conv,
+      { taskId: 'task-summary-separation' }
+    );
+    t.equal(finalized.length, 1, 'the durable task finalizes once');
+    t.equal(finalized[0].status, 'completed', 'the task reaches the real completed state');
+    t.match(finalized[0].details.result.summary, /^## Work Walkthrough/, 'the authored answer heading is retained');
+    t.match(finalized[0].details.result.summary, /Codex is open, idle/, 'the user-facing result is recorded');
+    t.notOk(/\*\*Done:\*\*/.test(finalized[0].details.result.summary), 'generated tool rows are not stored in the relay summary');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('a broad read-only project inspection preflights once to Coder without duplicate Dispatch discovery', async t => {
+  const originalFetch = global.fetch;
+  const workspace = 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE';
+  const handoffs = [];
+  const harness = installHarness([[{ text: 'This fallback model turn should not run.' }]], {
+    projects: [workspace],
+    workspace,
+    window: {
+      promoteWorkspaceToCoder: async payload => {
+        handoffs.push(payload);
+        return {
+          success: true,
+          conversationId: 'coder-broad-inspection',
+          taskId: 'task-broad-inspection',
+          title: payload.title,
+          status: 'pending'
+        };
+      }
+    }
+  });
+  const conv = conversation('dispatch-broad-inspection', {
+    workspace,
+    dispatchProjectPath: workspace
+  });
+  try {
+    await global.window.runAgentLoop(
+      'Review how persistence, reload, and the phone UI fit together across the project.',
+      'gemini-1',
+      conv,
+      {
+        semanticIntent: {
+          intent: 'new_task',
+          requiresExecution: true,
+          target: 'current_conversation',
+          resolvedRequest: 'Review persistence, reload, and phone UI integration across GRITLIFE.',
+          contextDependent: false,
+          confidence: 1,
+          needsClarification: false,
+          reasoningPolicyHint: { complexity: 'high', risk: 'medium', contextNeed: 'project' },
+          executionScope: 'read_only',
+          inspectionTarget: 'project',
+          inspectionBreadth: 'broad',
+          standaloneSystemOperation: false
+        }
+      }
+    );
+    t.equal(handoffs.length, 1, 'the broad inspection creates exactly one Coder task');
+    t.equal(harness.modelTurns, 0, 'Dispatch does not spend a duplicate discovery model turn first');
+    t.match(handoffs[0].prompt, /delegated read-only project inspection/i, 'Coder receives explicit read-only ownership');
+    t.match(handoffs[0].prompt, /remember_file_notes/i, 'the task requires reusable file understanding');
+    t.match(handoffs[0].prompt, /Review persistence, reload, and phone UI integration/i, 'the resolved review objective is preserved');
   } finally {
     restoreGlobals(originalFetch);
   }
@@ -1025,7 +1129,7 @@ test('Projects-root Claude restart creates one standalone Coder handoff with raw
       }
     });
     t.equal(handoffs.length, 1, 'the direct process request creates exactly one handoff');
-    t.equal(handoffs[0].path, projectsRoot, 'the generic Projects directory is retained only as the standalone execution workspace');
+    t.equal(handoffs[0].path, 'C:\\Users\\Owner', 'standalone execution uses the user home instead of misrepresenting Projects as a selected project');
     t.equal(handoffs[0].standalone, true, 'the handoff is explicitly marked standalone rather than pretending Projects is the selected project');
     t.equal(handoffs[0].originalUserMessage, rawRequest, 'the exact latest utterance is carried as provenance');
     t.notEqual(handoffs[0].prompt, rawRequest, 'the resolved execution prompt may be expanded independently');

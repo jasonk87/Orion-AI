@@ -573,6 +573,16 @@ test('local inspection enforcement consumes structured intent instead of respons
     ).includes('not inspected enough'),
     'review-only gate rejects one-file generic potential-areas reviews'
   );
+  t.equal(
+    agent.buildReviewOnlyCompletionGatePrompt(
+      'What does this command parsing function do, and is there a problem with it?',
+      'In `ai_assistant/communication/cli.py:42`, the parser splits the command on whitespace. That makes quoted Windows paths unsafe because a path containing spaces is divided into separate arguments.',
+      oneFileReview,
+      { inspectionBreadth: 'single_file' }
+    ),
+    '',
+    'a grounded one-file inspection remains lightweight instead of being forced into a broad review'
+  );
   const broadReview = [
     { toolName: 'list_files', label: 'Listed workspace files', status: 'done' },
     { toolName: 'read_file', label: 'Read `ai_assistant/communication/cli.py`', status: 'done' },

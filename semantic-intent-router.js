@@ -21,6 +21,7 @@
   ]);
   const LEVELS = Object.freeze(['low', 'medium', 'high']);
   const CONTEXT_NEEDS = Object.freeze(['none', 'recent', 'task', 'project', 'historical']);
+  const INSPECTION_BREADTHS = Object.freeze(['none', 'single_file', 'focused', 'broad']);
   const RUNTIME_SCAFFOLD_SOURCES = new Set([
     'agent-start-blocked',
     'context-compaction',
@@ -188,6 +189,7 @@
       '- requiresExecution describes whether satisfying the resolved request requires tools or state mutation. It does not authorize execution.',
       '- executionScope is read_only for inspection, review, status gathering, or known commands that do not mutate durable state; mutating is for edits, installs, lifecycle changes, queue changes, approval, denial, revision, or cancellation.',
       '- inspectionTarget identifies where evidence must come from. Use local_system for machine/process facts, workspace/project for source or project facts, and none for ordinary conversation.',
+      '- inspectionBreadth describes the source evidence needed for a workspace/project inspection: single_file means exactly one known file, focused means at most two source files, and broad means a project review or question that cannot be answered honestly without inspecting more than two files or multiple architectural surfaces. Do not use broad for local-system inspection or ordinary conversation.',
       '- standaloneSystemOperation is true only for executable local-machine work that is not bound to a selected project.',
       '- Set reasoningPolicyHint.contextNeed to historical only for an actual request about past conversations; casual conversation should be none.',
       '',
@@ -214,6 +216,7 @@
         },
         executionScope: 'none | read_only | mutating',
         inspectionTarget: 'none | local_system | workspace | project',
+        inspectionBreadth: 'none | single_file | focused | broad',
         standaloneSystemOperation: false
       }, null, 2),
       '',
@@ -247,6 +250,7 @@
         taskResolution: { title: '', requirements: [], constraints: [], unresolvedDecisions: [] },
         executionScope: 'none',
         inspectionTarget: 'none',
+        inspectionBreadth: 'none',
         standaloneSystemOperation: false,
         classifierUnavailable: true,
         classifierError: string(error && (error.message || error), 1000)
@@ -267,6 +271,7 @@
       taskResolution: { title: '', requirements: [], constraints: [], unresolvedDecisions: [] },
       executionScope: 'none',
       inspectionTarget: 'none',
+      inspectionBreadth: 'none',
       standaloneSystemOperation: false,
       classifierError: string(error && (error.message || error), 1000)
     };
@@ -318,6 +323,16 @@
       // non-durable routing paraphrase such as "send it to Coder" to become the new task payload.
       resolvedRequest = input.recentOwnedTask.objective;
     }
+    const inspectionTarget = ['none', 'local_system', 'workspace', 'project'].includes(parsed.inspectionTarget)
+      ? parsed.inspectionTarget
+      : 'none';
+    // The classifier already names the evidence domain separately from the operation shape.
+    // Treat executable local-system work as standalone even if the model omitted the redundant
+    // boolean on a context-dependent confirmation such as "yes, do that".
+    const standaloneSystemOperation = parsed.standaloneSystemOperation === true
+      || (parsed.requiresExecution === true
+        && inspectionTarget === 'local_system'
+        && ['new_task', 'context_followup'].includes(normalizedIntent));
     return {
       intent: normalizedIntent,
       requiresExecution: parsed.requiresExecution === true,
@@ -345,10 +360,11 @@
       executionScope: ['none', 'read_only', 'mutating'].includes(parsed.executionScope)
         ? parsed.executionScope
         : (parsed.requiresExecution === true ? 'mutating' : 'none'),
-      inspectionTarget: ['none', 'local_system', 'workspace', 'project'].includes(parsed.inspectionTarget)
-        ? parsed.inspectionTarget
+      inspectionTarget,
+      inspectionBreadth: INSPECTION_BREADTHS.includes(parsed.inspectionBreadth)
+        ? parsed.inspectionBreadth
         : 'none',
-      standaloneSystemOperation: parsed.standaloneSystemOperation === true
+      standaloneSystemOperation
     };
   }
 
@@ -385,6 +401,7 @@
   const api = {
     INTENTS,
     TARGETS,
+    INSPECTION_BREADTHS,
     isRuntimeScaffoldingMessage,
     buildInput,
     buildClassifierPrompt,

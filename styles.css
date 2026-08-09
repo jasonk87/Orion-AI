@@ -1757,6 +1757,44 @@ code {
   outline: none;
 }
 
+.assistant-response-images {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+  gap: 10px;
+  margin: 12px 0;
+}
+
+.assistant-response-image {
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid rgba(151, 164, 196, 0.18);
+  border-radius: 12px;
+  background: rgba(5, 8, 18, 0.6);
+}
+
+.assistant-response-image img {
+  display: block;
+  width: 100%;
+  max-height: 520px;
+  object-fit: contain;
+  background: #070a12;
+}
+
+.assistant-response-image figcaption {
+  padding: 8px 10px;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.assistant-response-image.image-load-failed::after {
+  content: 'Image unavailable';
+  display: block;
+  padding: 12px;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
 .inline-artifact-icon {
   flex: 0 0 auto;
   display: grid;

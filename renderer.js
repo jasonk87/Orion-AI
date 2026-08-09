@@ -46,6 +46,8 @@ let appConfig = {
   googleSearchApiKey: '',
   defaultModel: 'gemini-2.5-flash-lite',
   reasoningEffort: 'auto',
+  modelSelectionRevision: 0,
+  reasoningSelectionRevision: 0,
   compactThresholdTokens: 100000,
   autoCompact: true,
   modelContextBudgets: {
@@ -742,20 +744,88 @@ function restoreReasoningEffortSelection() {
   el.reasoningSelect.classList.toggle('reasoning-forced', el.reasoningSelect.value !== 'auto');
 }
 
+function getSelectionRevisions() {
+  return {
+    model: Math.max(0, Number(appConfig.modelSelectionRevision) || 0),
+    reasoning: Math.max(0, Number(appConfig.reasoningSelectionRevision) || 0)
+  };
+}
+
+function bumpSelectionRevision(field) {
+  const configKey = field === 'model' ? 'modelSelectionRevision' : 'reasoningSelectionRevision';
+  const next = Math.max(Date.now(), (Number(appConfig[configKey]) || 0) + 1);
+  appConfig[configKey] = next;
+  return next;
+}
+
+async function persistSelectionConfig() {
+  const result = await window.api.writeConfig(appConfig);
+  if (result === false || (result && result.success === false)) {
+    throw new Error('Orion could not persist the selection to config.');
+  }
+}
+
 window.setReasoningEffortSelection = async (value) => {
   const normalize = window.OrionReasoningPolicy
     ? window.OrionReasoningPolicy.normalizeEffortOverride
     : v => v || 'auto';
   const level = normalize(value);
+  const previousLevel = appConfig.reasoningEffort || 'auto';
+  const previousRevision = Number(appConfig.reasoningSelectionRevision) || 0;
+  const previousStored = localStorage.getItem('ag2_reasoning_effort');
+  if (level === previousLevel) {
+    return { success: true, reasoning: level, selectionRevisions: getSelectionRevisions() };
+  }
   appConfig.reasoningEffort = level;
+  bumpSelectionRevision('reasoning');
   if (el.reasoningSelect) {
     el.reasoningSelect.value = level;
     el.reasoningSelect.classList.toggle('reasoning-forced', level !== 'auto');
   }
   localStorage.setItem('ag2_reasoning_effort', level);
-  try { await window.api.writeConfig(appConfig); } catch (_) {}
-  return { success: true, reasoning: level };
+  try {
+    await persistSelectionConfig();
+    return { success: true, reasoning: level, selectionRevisions: getSelectionRevisions() };
+  } catch (error) {
+    appConfig.reasoningEffort = previousLevel;
+    appConfig.reasoningSelectionRevision = previousRevision;
+    if (el.reasoningSelect) {
+      el.reasoningSelect.value = previousLevel;
+      el.reasoningSelect.classList.toggle('reasoning-forced', previousLevel !== 'auto');
+    }
+    if (previousStored == null) localStorage.removeItem('ag2_reasoning_effort');
+    else localStorage.setItem('ag2_reasoning_effort', previousStored);
+    return { success: false, error: error.message || String(error), reasoning: previousLevel, selectionRevisions: getSelectionRevisions() };
+  }
 };
+
+async function setModelPreferenceSelection(modelValue) {
+  if (!el.modelSelect) return { success: false, error: 'Model selector not available on desktop' };
+  const option = Array.from(el.modelSelect.options).find(item => item.value === modelValue);
+  if (!option) return { success: false, error: `Unknown model: ${modelValue}` };
+  const previousModel = appConfig.defaultModel || el.modelSelect.value;
+  const previousRevision = Number(appConfig.modelSelectionRevision) || 0;
+  const previousStored = localStorage.getItem('ag2_default_model');
+  if (modelValue === previousModel) {
+    el.modelSelect.value = modelValue;
+    return { success: true, model: modelValue, selectionRevisions: getSelectionRevisions() };
+  }
+  el.modelSelect.value = modelValue;
+  appConfig.defaultModel = modelValue;
+  bumpSelectionRevision('model');
+  localStorage.setItem('ag2_default_model', modelValue);
+  try {
+    await persistSelectionConfig();
+    return { success: true, model: modelValue, selectionRevisions: getSelectionRevisions() };
+  } catch (error) {
+    appConfig.defaultModel = previousModel;
+    appConfig.modelSelectionRevision = previousRevision;
+    el.modelSelect.value = previousModel;
+    if (previousStored == null) localStorage.removeItem('ag2_default_model');
+    else localStorage.setItem('ag2_default_model', previousStored);
+    return { success: false, error: error.message || String(error), model: previousModel, selectionRevisions: getSelectionRevisions() };
+  }
+}
 
 function normalizePhoneHttpsOrigin(value) {
   const raw = String(value || '').trim();
@@ -2039,6 +2109,42 @@ function renderInlineArtifactCards(logs = []) {
   return `<div class="inline-artifacts">${cards}</div>`;
 }
 
+function renderAssistantResponseImages(images = [], conversationId = '') {
+  const safeImages = (Array.isArray(images) ? images : [])
+    .filter(image => image && (image.path || (image.data && image.mimeType)))
+    .slice(0, 4);
+  if (!safeImages.length) return '';
+  const rendered = safeImages.map(image => {
+    const alt = escapeHtml(image.alt || 'Orion screenshot');
+    const caption = image.caption ? `<figcaption>${escapeHtml(image.caption)}</figcaption>` : '';
+    if (image.data && image.mimeType) {
+      return `<figure class="assistant-response-image"><img src="data:${escapeHtml(image.mimeType)};base64,${image.data}" alt="${alt}">${caption}</figure>`;
+    }
+    return `<figure class="assistant-response-image"><img data-assistant-image-path="${escapeHtml(image.path)}" data-assistant-image-workspace="${escapeHtml(image.workspacePath || '')}" data-assistant-image-conversation="${escapeHtml(image.sourceConversationId || conversationId)}" alt="${alt}">${caption}</figure>`;
+  }).join('');
+  return `<div class="assistant-response-images">${rendered}</div>`;
+}
+
+function hydrateAssistantResponseImages(container) {
+  if (!container || !window.api || typeof window.api.readWorkspaceFileBase64 !== 'function') return;
+  container.querySelectorAll('img[data-assistant-image-path]').forEach(image => {
+    if (image.dataset.loading === 'true' || image.getAttribute('src')) return;
+    image.dataset.loading = 'true';
+    const imagePath = image.getAttribute('data-assistant-image-path') || '';
+    const workspacePath = image.getAttribute('data-assistant-image-workspace') || currentWorkspace || '';
+    const conversationId = image.getAttribute('data-assistant-image-conversation') || '';
+    window.api.readWorkspaceFileBase64(workspacePath, imagePath, conversationId).then(file => {
+      if (!file || file.success === false || !file.data || !String(file.mimeType || '').startsWith('image/')) {
+        image.closest('.assistant-response-image')?.classList.add('image-load-failed');
+        return;
+      }
+      image.src = `data:${file.mimeType};base64,${file.data}`;
+    }).catch(() => {
+      image.closest('.assistant-response-image')?.classList.add('image-load-failed');
+    });
+  });
+}
+
 function wireInlineArtifactOpeners(container) {
   if (!container) return;
   container.querySelectorAll('[data-open-artifact]').forEach(button => {
@@ -2194,15 +2300,16 @@ function setupChatHandlers() {
   // Model Select changes default
   el.modelSelect.addEventListener('change', async () => {
     const val = el.modelSelect.value;
-    appConfig.defaultModel = val;
-    localStorage.setItem('ag2_default_model', val);
-    await window.api.writeConfig(appConfig);
+    const result = await setModelPreferenceSelection(val);
+    if (!result.success) showToast(result.error || 'Could not save model selection.', 'error');
   });
 
   // Reasoning level select — sticky per-answer override beside the model select
   if (el.reasoningSelect) {
     el.reasoningSelect.addEventListener('change', () => {
-      window.setReasoningEffortSelection(el.reasoningSelect.value);
+      window.setReasoningEffortSelection(el.reasoningSelect.value).then(result => {
+        if (!result.success) showToast(result.error || 'Could not save reasoning selection.', 'error');
+      });
     });
   }
 }
@@ -2288,6 +2395,29 @@ function persistTaskClarification(conv, clarification) {
     window.clearActiveAiBubble?.();
     renderAiMessage(clarification, [], conv.id);
   }
+}
+
+function clearCurrentTurnTaskResolutionClarifications(conv) {
+  if (!conv || !Array.isArray(conv.messages)) return 0;
+  let latestUserIndex = -1;
+  for (let index = conv.messages.length - 1; index >= 0; index--) {
+    if (String(conv.messages[index] && conv.messages[index].role || '').toLowerCase() === 'user') {
+      latestUserIndex = index;
+      break;
+    }
+  }
+  if (latestUserIndex < 0) return 0;
+  const before = conv.messages.length;
+  conv.messages = conv.messages.filter((message, index) => !(
+    index > latestUserIndex
+    && message
+    && message.source === 'task-resolution-clarification'
+  ));
+  const removed = before - conv.messages.length;
+  if (removed > 0 && typeof window.markConversationDirty === 'function') {
+    window.markConversationDirty(conv.id);
+  }
+  return removed;
 }
 
 async function enqueueOrchestrationTask(options = {}) {
@@ -2484,13 +2614,22 @@ async function queueDispatchWorkForCoder(options = {}) {
     ...taskContextMessages(originConv).map(message => message.text),
     semanticIntent.resolvedRequest || originalUserMessage
   ].join('\n');
-  const workspace = await bindNamedProjectForSupervisor(originConv, contextText);
   const standaloneSystemWork = semanticIntent.standaloneSystemOperation === true;
-  const standalone = standaloneSystemWork && workspace.role !== 'active_project';
+  const workspace = standaloneSystemWork
+    ? structuredWorkspaceForConversation(originConv)
+    : await bindNamedProjectForSupervisor(originConv, contextText);
+  const standalone = standaloneSystemWork;
+  let standaloneWorkspacePath = '';
+  if (standalone) {
+    try {
+      const homeDir = await window.api.getHomeDir();
+      standaloneWorkspacePath = typeof homeDir === 'string' ? homeDir.trim() : '';
+    } catch (_) {}
+  }
   const taskWorkspace = standalone
     ? {
         role: 'standalone_coder',
-        path: getDispatchWorkspaceRoot(),
+        path: standaloneWorkspacePath || getDispatchWorkspaceRoot(),
         project: { name: '', path: '' },
         source: 'standalone-system-task',
         resolved: true
@@ -5893,6 +6032,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     ? (typeof marked !== 'undefined' ? marked.parse(bodyText) : escapeHtml(bodyText))
     : '';
   const inlineArtifactsHtml = renderInlineArtifactCards(logs);
+  const responseImagesHtml = renderAssistantResponseImages(msgMeta && msgMeta.images, targetId);
   
   let runningIndicatorHtml = '';
   let planApprovalHtml = '';
@@ -6000,6 +6140,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     ${logsHtml}
     <div class="message-body">
       ${renderedMarkdown}
+      ${responseImagesHtml}
       ${walkthroughHtml}
       ${inlineArtifactsHtml}
       ${clarificationHtml}
@@ -6008,6 +6149,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     </div>
   `;
   sanitizeRenderedMarkdown(bubble);
+  hydrateAssistantResponseImages(bubble);
 
   // Format code blocks
   if (isNew) {
@@ -6645,8 +6787,15 @@ window.changeActiveWorkspace = function(folderPath, options = {}) {
 };
 window.promoteWorkspaceToCoder = async function(options = {}) {
   const standalone = options.standalone === true;
+  let standaloneWorkspacePath = '';
+  if (standalone) {
+    try {
+      const homeDir = await window.api.getHomeDir();
+      standaloneWorkspacePath = typeof homeDir === 'string' ? homeDir.trim() : '';
+    } catch (_) {}
+  }
   const folderPath = String(
-    options.path
+    (standalone ? standaloneWorkspacePath : options.path)
     || currentWorkspace
     || (standalone ? getDispatchWorkspaceRoot() : '')
   ).trim();
@@ -6656,6 +6805,7 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
   const title = String(options.title || '').trim()
     || (prompt ? generateConversationTitle(prompt) : 'New Coder Task');
   const originConv = conversations.find(item => item.id === String(options.sourceConversationId || ''));
+  if (originConv) clearCurrentTurnTaskResolutionClarifications(originConv);
   const semanticIntent = options.semanticIntent || (originConv && prompt
     ? await classifyCurrentConversationIntent(originConv, originalUserMessage, { model: options.modelSelectValue })
     : null);
@@ -7051,7 +7201,8 @@ window.getPhoneCompanionState = async (targetConversationId) => {
       role: replayMsg.role,
       content: text,
       text,
-      logs: replayMsg.role === 'assistant' ? replayLogs : []
+      logs: replayMsg.role === 'assistant' ? replayLogs : [],
+      images: Array.isArray(replayMsg.images) ? replayMsg.images.slice(0, 4) : []
     };
   });
   if (recoveredAssistantMessage && !isActiveTargetRunning) {
@@ -7235,6 +7386,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     activeTaskId: selectedSupervisedTask ? selectedSupervisedTask.taskId : '',
     model: window.getSelectedModel(),
     reasoning: appConfig.reasoningEffort || 'auto',
+    selectionRevisions: getSelectionRevisions(),
     messages,
     latestOutput: latestOutput ? latestOutput.text : '',
     operationalContext,
@@ -8091,7 +8243,7 @@ window.getPhoneCompanionModels = () => {
   const reasoningLevels = window.OrionReasoningPolicy
     ? window.OrionReasoningPolicy.EFFORT_OVERRIDES.map(option => ({ ...option }))
     : [{ value: 'auto', label: 'Auto' }];
-  return { current, models, reasoning, reasoningLevels };
+  return { current, models, reasoning, reasoningLevels, selectionRevisions: getSelectionRevisions() };
 };
 
 window.setPhoneCompanionReasoning = async (level) => {
@@ -8099,20 +8251,7 @@ window.setPhoneCompanionReasoning = async (level) => {
 };
 
 window.setPhoneCompanionModel = async (modelValue) => {
-  if (!el.modelSelect) return { success: false, error: 'Model selector not available on desktop' };
-  let found = false;
-  for (let i = 0; i < el.modelSelect.options.length; i++) {
-    if (el.modelSelect.options[i].value === modelValue) {
-      el.modelSelect.selectedIndex = i;
-      found = true;
-      break;
-    }
-  }
-  if (!found) return { success: false, error: `Unknown model: ${modelValue}` };
-  appConfig.defaultModel = modelValue;
-  localStorage.setItem('ag2_default_model', modelValue);
-  try { await window.api.writeConfig(appConfig); } catch (_) {}
-  return { success: true, model: modelValue };
+  return setModelPreferenceSelection(modelValue);
 };
 
 window.runPhoneCompanionSkill = async ({ name, inputs } = {}) => {
@@ -8564,6 +8703,27 @@ window.readWorkspaceFileForPhone = (filePath) => {
   } catch (err) {
     return { success: false, error: err.message };
   }
+};
+
+// Conversation images are served by reference rather than embedded into every phone-state poll.
+// The lookup is scoped to the exact conversation and only succeeds for an image actually attached
+// to one of its persisted messages, so the endpoint cannot become an arbitrary filesystem reader.
+window.readChatImageForPhone = async (payload = {}) => {
+  const conversationId = String(payload.conversationId || '');
+  const imagePath = String(payload.path || '');
+  const conv = conversations.find(conversation => conversation.id === conversationId);
+  if (!conv || !imagePath) return { success: false, error: 'Conversation image not found.' };
+  const image = (Array.isArray(conv.messages) ? conv.messages : [])
+    .flatMap(message => Array.isArray(message && message.images) ? message.images : [])
+    .find(candidate => candidate && String(candidate.path || '') === imagePath);
+  if (!image) return { success: false, error: 'Image is not attached to this conversation.' };
+  const workspacePath = String(image.workspacePath || conv.workspace || conv.projectPath || '');
+  const sourceConversationId = String(image.sourceConversationId || conversationId);
+  const result = await window.api.readWorkspaceFileBase64(workspacePath, imagePath, sourceConversationId);
+  if (!result || result.success === false || !String(result.mimeType || '').startsWith('image/')) {
+    return { success: false, error: (result && result.error) || 'Attached image is unavailable.' };
+  }
+  return result;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -9195,26 +9355,52 @@ function summarizeCoderCompletion(durableTask, coderConv) {
     && RendererOrchestrationContracts.isCompletionGateNarration(text));
   let summary = String(result.summary || '').trim();
   if (isGateNarration(summary)) summary = '';
-  if (!summary && coderConv && Array.isArray(coderConv.messages)) {
-    const finalMessage = [...coderConv.messages].reverse().find(message =>
+  const finalMessage = coderConv && Array.isArray(coderConv.messages)
+    ? [...coderConv.messages].reverse().find(message =>
       message
       && (message.role === 'assistant' || message.role === 'model')
       && String(message.text || '').trim()
       && String(message.text || '').trim() !== 'Thinking...'
       && !message.isPlanApprovalCard
       && !isGateNarration(message.text)
-    );
-    summary = finalMessage ? String(finalMessage.text || '').trim() : '';
+    )
+    : null;
+  if (!summary && finalMessage) {
+    summary = String(finalMessage.text || '').trim();
   }
-  summary = summary
+  // Older task records sometimes appended a generated tool ledger under a final Work
+  // Walkthrough heading. Remove only that mechanical tail. A user-authored report may itself
+  // begin with "## Work Walkthrough" and must survive intact.
+  const stripGeneratedWalkthroughTail = text => {
+    const value = String(text || '');
+    const marker = '## Work Walkthrough';
+    let searchFrom = value.length;
+    while (searchFrom >= 0) {
+      const index = value.lastIndexOf(marker, searchFrom);
+      if (index < 0) break;
+      const tail = value.slice(index + marker.length).trimStart();
+      if (/^-\s+\*\*(?:Done|Failed|Working):\*\*/i.test(tail)) {
+        return value.slice(0, index).trim();
+      }
+      searchFrom = index - 1;
+    }
+    return value;
+  };
+  summary = stripGeneratedWalkthroughTail(summary)
     .replace(/\n{3,}/g, '\n\n')
-    .replace(/\n*## Work Walkthrough[\s\S]*$/i, '')
     .trim()
     .slice(0, 5000);
   return {
     summary,
     changedFiles: Array.isArray(result.changedFiles) ? result.changedFiles.slice(0, 20) : [],
-    verification: Array.isArray(result.verification) ? result.verification.slice(0, 12) : []
+    verification: Array.isArray(result.verification) ? result.verification.slice(0, 12) : [],
+    images: (Array.isArray(result.images) ? result.images : (finalMessage && Array.isArray(finalMessage.images) ? finalMessage.images : []))
+      .filter(image => image && image.path)
+      .slice(0, 4)
+      .map(image => ({
+        ...image,
+        sourceConversationId: image.sourceConversationId || (coderConv && coderConv.id) || ''
+      }))
   };
 }
 
@@ -9320,7 +9506,8 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
   notifyOrionConversation(orionConv, summaryText, 'supervisor-completion', {
     orchestrationTaskId: taskId,
     orchestrationStatus: durableTask && durableTask.status || '',
-    verificationEvidence: completion.verification
+    verificationEvidence: completion.verification,
+    images: completion.images
   });
 
   orionConv.lastDelegatedWork = {
@@ -9332,6 +9519,7 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
     // ends, when launchedCoderConvId is already cleared and no live status is available.
     changedFiles: completion.changedFiles,
     verification: completion.verification,
+    images: completion.images,
     projectPath: (coderConv && coderConv.projectPath) || inferDispatchProjectPath(orionConv),
     status: durableTask ? durableTask.status : (blockedFlag || pendingTasks.length > 0 ? 'blocked' : 'completed'),
     subStatus: durableTask

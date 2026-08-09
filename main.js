@@ -8,6 +8,7 @@ const shared = require('./lib/shared');
 // ── Lib modules ────────────────────────────────────────────────────────────────
 const ipcFileTools = require('./lib/ipc-file-tools');
 const ipcShell = require('./lib/ipc-shell');
+const ipcComputerUse = require('./lib/ipc-computer-use');
 const ipcWorkspace = require('./lib/ipc-workspace');
 const ipcServer = require('./lib/ipc-server');
 const ipcUi = require('./lib/ipc-ui');
@@ -201,6 +202,7 @@ function registerAllHandlers() {
 
   ipcFileTools.registerHandlers(ipcMain);
   ipcShell.registerHandlers(ipcMain, { getWorkspaceEntrypoint, readAppConfig, startStaticWorkspaceServer });
+  ipcComputerUse.registerHandlers(ipcMain, { captureDesktopScreenshot: ipcShell.captureDesktopScreenshot });
   ipcWorkspace.registerHandlers(ipcMain, { startStaticWorkspaceServer });
   ipcServer.registerHandlers(ipcMain, { Notification });
   ipcUi.registerHandlers(ipcMain);
@@ -443,6 +445,9 @@ if (process.env.NODE_ENV === 'test') {
     pickBestClickCandidate: ipcShell.pickBestClickCandidate,
     getCommandShellSpec: ipcShell.getCommandShellSpec,
     previewWorkspaceApp: ipcShell.previewWorkspaceApp,
+    normalizeComputerAction: ipcComputerUse.normalizeComputerAction,
+    buildPowerShellInputScript: ipcComputerUse.buildPowerShellInputScript,
+    performComputerAction: ipcComputerUse.performComputerAction,
     // ipc-file-tools
     writeRunArtifact: ipcFileTools.writeRunArtifact,
     listRunArtifacts: ipcFileTools.listRunArtifacts,

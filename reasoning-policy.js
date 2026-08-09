@@ -33,6 +33,7 @@
     let contextScope = hint.contextNeed || 'task';
     let explorationScope = 'bounded';
     let verificationStrictness = 'standard';
+    let requireSurfaceInventory = false;
 
     if (phase === 'casual_conversation') {
       // 'recent' and 'historical' are allowed; 'project'/'task' are not.
@@ -84,15 +85,51 @@
       effort = failures >= 3 ? 'max' : maxLevel(effort, 'high');
       verificationStrictness = 'strict';
     }
-    // A user-forced effort level (picked next to the input box) wins over everything the
-    // phase engine decided, including failure escalation — forced means forced. Everything
-    // else (context scope, exploration, verification) stays phase-driven: the user is
-    // choosing how hard the model thinks, not how the run is governed.
+    // A user-forced effort level (picked next to the input box) wins over everything the phase
+    // engine decided, including failure escalation — forced means forced.
     const forcedEffort = Object.prototype.hasOwnProperty.call(RANK, input.forcedEffort)
       ? input.forcedEffort
       : '';
     if (forcedEffort) effort = forcedEffort;
-    const coverageRequired = broad && ['impact_analysis', 'implementation', 'failure_diagnosis', 'adversarial_review', 'final_response'].includes(phase);
+
+    let coverageRequired = broad && ['impact_analysis', 'implementation', 'failure_diagnosis', 'adversarial_review', 'final_response'].includes(phase);
+    let adversarialReviewRequired = risk === 'high' && ['implementation', 'adversarial_review', 'final_response'].includes(phase);
+
+    // Asking for the hardest thinking and getting a narrow look is the failure this prevents.
+    // Effort alone only buys deeper reasoning about whatever the model already chose to look
+    // at, so a forced high/max could think brilliantly about a self-selected corner while
+    // never inventorying the surface it was asked to audit. Raising effort therefore raises
+    // the RIGOUR knobs with it: how much evidence is required, and how hard a claim must be
+    // proven before it counts.
+    //
+    // What it deliberately does NOT do is widen contextScope to the whole repository. "Think
+    // as hard as possible" is not "read everything" — the blast radius still comes from the
+    // task. Breadth is set by the caller declaring a broad audit (below), not by effort.
+    const forcedHigh = forcedEffort === 'high' || forcedEffort === 'max';
+    if (forcedHigh && phase !== 'intent_classification' && phase !== 'mechanical_execution') {
+      verificationStrictness = 'strict';
+      if (explorationScope === 'narrow') explorationScope = 'bounded';
+      if (['impact_analysis', 'implementation', 'failure_diagnosis', 'adversarial_review', 'final_response', 'context_resolution'].includes(phase)) {
+        coverageRequired = true;
+      }
+      if (forcedEffort === 'max' && ['implementation', 'adversarial_review', 'final_response', 'failure_diagnosis'].includes(phase)) {
+        adversarialReviewRequired = true;
+      }
+    }
+
+    // An explicitly broad request (a full audit, "review everything I changed") is the one case
+    // where the blast radius itself must be comprehensive. Item 11 in practice: a review that
+    // picked a few related files was excellent inside its chosen area and silently incomplete
+    // outside it. Breadth is declared, then tracked — not inferred from effort.
+    const auditBreadth = input.auditBreadth === 'comprehensive';
+    if (auditBreadth) {
+      contextScope = 'project';
+      explorationScope = 'broad';
+      verificationStrictness = 'strict';
+      coverageRequired = true;
+      requireSurfaceInventory = true;
+    }
+
     return {
       phase,
       effort,
@@ -100,8 +137,10 @@
       contextScope,
       explorationScope,
       verificationStrictness,
-      adversarialReviewRequired: risk === 'high' && ['implementation', 'adversarial_review', 'final_response'].includes(phase),
+      adversarialReviewRequired,
       coverageRequired,
+      requireSurfaceInventory,
+      auditBreadth: auditBreadth ? 'comprehensive' : 'task',
       restoreDefaultAfterPhase: true
     };
   }
@@ -150,6 +189,15 @@
         : '',
       policy.adversarialReviewRequired
         ? 'Before finalizing, perform a bounded adversarial review of the current task blast radius.'
+        : '',
+      // The instruction that turns a broad request into an actually-comprehensive one. Without
+      // it a model picks a plausible subset, reviews it well, and reports as though it covered
+      // everything — thorough-looking and incomplete.
+      policy.requireSurfaceInventory
+        ? 'This is an explicitly comprehensive audit. Before analysing anything, ENUMERATE the full changed surface first (every materially changed file/module in scope) and state that inventory. Then work through it. You may judge an item low-risk and say so briefly, but you may not silently omit it. If you cannot enumerate the surface, say so instead of reviewing a self-selected subset.'
+        : '',
+      policy.effortSource === 'forced' && (policy.effort === 'high' || policy.effort === 'max')
+        ? 'The user explicitly requested this reasoning depth. Spend it on rigour, not narration: for every load-bearing claim, trace it to the actual source text or a command result before asserting it, and state plainly which claims you verified versus inferred. Do not assert agreement with a finding you have not checked yourself.'
         : ''
     ].filter(Boolean).join('\n');
   }

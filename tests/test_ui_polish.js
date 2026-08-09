@@ -680,7 +680,7 @@ test('Dispatch/Coder navigation is user-owned and stale background state cannot 
 
   t.ok(companionHtml.includes('pendingConversationSelectionId = taskId'), 'phone locks the requested destination before switching');
   t.ok(
-    companionHtml.includes('stateSelectionRevision < acceptedSelectionRevision'),
+    companionHtml.includes('stateSelectionRevision < acceptedConversationSelectionRevision'),
     'phone rejects a stale poll or SSE selection revision'
   );
   t.ok(
@@ -758,6 +758,15 @@ test('screenshot artifacts are previewable from the artifact panel', (t) => {
   t.ok(styles.includes('.artifact-item.previewable'), 'previewable artifacts have interaction styling');
   t.ok(styles.includes('.inline-artifact-card'), 'inline artifact cards are styled');
   t.ok(styles.includes('.file-viewer-image'), 'screenshot preview image is styled');
+  t.end();
+});
+
+test('assistant responses can render persisted screenshot references as inline chat images', (t) => {
+  const agentJsSource = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8').replace(/\r\n/g, '\n');
+  t.ok(renderer.includes('function renderAssistantResponseImages'), 'desktop chat renders assistant image attachments');
+  t.ok(renderer.includes('function hydrateAssistantResponseImages'), 'conversation-scoped references are hydrated through the safe file API');
+  t.ok(agentJsSource.includes('finalizedRunMessage.images = attachedResponseImages'), 'the agent persists response image references on its own message');
+  t.ok(styles.includes('.assistant-response-images'), 'assistant image layout is styled with the rest of the chat UI');
   t.end();
 });
 
@@ -927,6 +936,10 @@ test('Dispatch relays delegated plans and completion evidence without forcing a 
     'the Dispatch relay never dumps a bulleted verification list at the user');
   t.ok(renderer.includes('verificationEvidence: completion.verification'),
     'verification evidence is still carried on the completion message metadata');
+  t.ok(renderer.includes('images: completion.images'),
+    'screenshots attached by Coder are relayed into the supervising Dispatch completion message');
+  t.ok(renderer.includes('sourceConversationId: image.sourceConversationId || (coderConv && coderConv.id)'),
+    'relayed screenshots retain their exact source-conversation provenance');
   t.end();
 });
 

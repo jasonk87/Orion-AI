@@ -27,6 +27,7 @@ function classification(intent, overrides = {}) {
     },
     executionScope: 'none',
     inspectionTarget: 'none',
+    inspectionBreadth: 'none',
     standaloneSystemOperation: false,
     ...overrides
   };
@@ -261,6 +262,7 @@ test('classifier contract treats an already resolved named project as the concre
         resolvedRequest: 'Inspect the This is Life project and report its current state.',
         executionScope: 'read_only',
         inspectionTarget: 'project',
+        inspectionBreadth: 'broad',
         reasoningPolicyHint: { complexity: 'medium', risk: 'low', contextNeed: 'project' }
       });
     }
@@ -270,6 +272,56 @@ test('classifier contract treats an already resolved named project as the concre
     'the language contract tells the model not to relitigate a deterministic workspace binding');
   t.match(prompt, /affirmative follow-up/i,
     'the language contract prevents repeated target-choice questions after confirmation');
+  t.match(prompt, /more than two files or multiple architectural surfaces/i,
+    'the classifier receives a semantic breadth contract instead of a filename keyword rule');
+  t.end();
+});
+
+test('inspection breadth survives strict normalization', async t => {
+  const broad = await router.classify(baseContext('Review the project architecture.'), {
+    structureApi,
+    classify: async () => classification('new_task', {
+      requiresExecution: true,
+      executionScope: 'read_only',
+      inspectionTarget: 'project',
+      inspectionBreadth: 'broad'
+    })
+  });
+  t.equal(broad.inspectionBreadth, 'broad', 'a valid broad inspection scope is retained');
+
+  const invalid = await router.classify(baseContext('Read the main file.'), {
+    structureApi,
+    classify: async () => classification('new_task', {
+      requiresExecution: true,
+      executionScope: 'read_only',
+      inspectionTarget: 'project',
+      inspectionBreadth: 'everything_forever'
+    })
+  });
+  t.equal(invalid.inspectionBreadth, 'none', 'unknown breadth values fail closed');
+  t.end();
+});
+
+test('executable local-system follow-up normalizes to standalone without phrase matching', async t => {
+  const result = await router.classify(baseContext('Yes, do that.', {
+    recentVisibleConversation: [
+      { role: 'assistant', text: 'I can ask Coder to open Codex and report what it is doing.' }
+    ]
+  }), {
+    structureApi,
+    classify: async () => classification('context_followup', {
+      requiresExecution: true,
+      resolvedRequest: 'Open Codex and report its current visible state.',
+      contextDependent: true,
+      executionScope: 'read_only',
+      inspectionTarget: 'local_system',
+      standaloneSystemOperation: false
+    })
+  });
+
+  t.equal(result.inspectionTarget, 'local_system', 'the model-selected evidence domain is preserved');
+  t.equal(result.standaloneSystemOperation, true,
+    'a local-system execution request does not require a redundant boolean to avoid project resolution');
   t.end();
 });
 

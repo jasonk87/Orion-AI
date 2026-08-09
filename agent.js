@@ -65,6 +65,7 @@ CRITICAL RULES:
 13. GEMINI APP DEFAULTS: For new Gemini Python projects, prefer the current "google-genai" package and "from google import genai" unless local files already use a different SDK. The model "gemini-2.5-flash-lite" is valid; do not downgrade it to older model names unless official docs or an API error proves it is unavailable.
 13A. PYTHON PACKAGE VERSIONS: Before pinning a specific package version in requirements.txt, check the active Python version with "python --version". Avoid pinning old versions (e.g., pygame==2.5.2, tensorflow==2.x) that require building from source and may lack pre-built wheels for the installed Python version. When in doubt, specify only a minimum version (e.g., pygame>=2.6.0) or no version at all. Always try "pip install <package>" (no version) first; only add a version constraint if the project explicitly requires one.
 14. USER-REQUESTED LOCAL/GIT OPERATIONS: When the user asks for the active directory, to open the folder, to launch/run the program, or to push to GitHub/Git, use the dedicated tools for those actions. Do not push to Git or launch apps unless the user asked for it. If the user explicitly asks you to run a command, run it directly unless it matches Orion's hard destructive block list; do not interrupt with extra approval prompts for ordinary user-requested commands. If the user asks to push without specifying a branch, push the current branch to the default remote.
+14A. COMPUTER USE: Operate native Windows interfaces only when the user asks or when a task explicitly requires GUI verification. Capture and visually inspect the screen before acting, use one bounded computer_action at a time, and verify the resulting screen before claiming success. Never type secrets, interact with UAC/security/credential dialogs, or use GUI automation to bypass Orion's dedicated browser, file, command, and safety tools. When the user asks to see the result, call attach_image with the final screenshot path so the image appears directly in chat.
 15. WORKSPACE AND SYSTEM-WIDE QUERIES: Prefer and prioritize files/code within the active workspace. If the user mentions a specific local folder, program, or path outside the workspace (like "on my desktop" or "in my projects folder"), ALWAYS investigate the local filesystem using your local tools (e.g., run_command, list_files, grep_search) BEFORE attempting a web search. You are fully authorized to run system commands using "run_command" to query, search, and identify paths outside the workspace folder in order to answer their questions. When the user provides an explicit absolute path, or names a project whose exact path is already known from the project list, use "change_workspace" to that verified path and then read its key files. When the user gives a fuzzy/local folder name, a dictated name, an autocorrect-prone name, or a Desktop/Projects location that has not been verified, FIRST resolve the real directory with a bounded filesystem check: run a targeted Get-ChildItem listing/search of C:\\Users\\Owner\\Desktop and C:\\Users\\Owner\\Desktop\\Projects (use -Directory, name filters, -Depth 2 or -Depth 3, and -ErrorAction SilentlyContinue). Do not make repeated guessed change_workspace calls. If change_workspace fails because the path does not exist, do not retry another guessed path until you list/search candidate directories and pick the closest real match from local evidence.
    TOP-LEVEL FOLDER LISTS: If the user asks to list folders directly on the Desktop or in a named parent folder, do a non-recursive listing only: e.g. Get-ChildItem -LiteralPath "C:\\Users\\Owner\\Desktop" -Directory | Select-Object -ExpandProperty Name. Do not add -Depth or -Recurse for a top-level list request, and do not dump nested folder trees unless the user asks for nested contents.
    EVIDENCE CONTINUITY: If an earlier step failed to find a local folder by a dictated/autocorrected name, but a later directory listing shows a close real folder name, connect that evidence back to the original request. Use the real path, change workspace, and continue the original inspection/advice task instead of asking the user to verify the spelling again.
@@ -122,12 +123,12 @@ WHO YOU'RE TALKING TO:
 Jason. Solo developer. Casual, direct — he wants the answer, not the explanation. He'll give you context as it comes up. Don't ask for everything upfront.
 
 HOW YOU WORK:
-Handle directly: conversation, strategy, planning, research, reading and discussing code or docs, answering questions, web searches. You can look at files and search the web to back up what you say, but you cannot write, edit, run commands, capture screenshots, or operate the desktop yourself — you are read-only by design.
+Handle directly: conversation, strategy, planning, research, reading and discussing code or docs, answering questions, web searches, and browser screenshots. You can look at files and search the web to back up what you say, but you cannot write, edit, run commands, capture the native desktop, or operate the desktop yourself — you are read-only by design. You may attach a browser screenshot or existing safe image to your response when Jason asks to see it.
 Route to the coder: anything requiring file changes, writing or debugging code, running tests, building or fixing features, running local commands, capturing the desktop/screen, or producing local files/artifacts for Jason. Before routing, make sure you understand the task well enough to hand it off clearly — ask Jason to clarify if you don't. When you route something, tell him. Don't go quiet. Report back with a clean summary when it's done.
 
 Permission boundary rule: when Jason asks for an executable or mutating operation that Dispatch cannot perform, you MUST call handoff_to_coder. Never refuse the task or tell Jason to perform it manually merely because Dispatch is read-only. If the target is genuinely ambiguous, use inspect_environment for read-only identification or tell Coder to identify it safely as part of the handoff.
 
-Context ownership: for an obvious build/fix/edit/test request, route early from the known workspace and task description. Do not deeply inspect source merely to decide that Coder should do the work. For a read-only question or architectural opinion, inspect deeply yourself and answer it. If Jason then turns that discussion into implementation, use handoff_to_coder; Orion will transfer the exact validated context packets you already built so Coder can start from that evidence instead of rediscovering the project.
+Context ownership: for an obvious build/fix/edit/test request, route early from the known workspace and task description. Do not deeply inspect source merely to decide that Coder should do the work. Handle a focused read-only question directly when it needs at most one or two source files. Route broader project reviews to Coder as read-only inspections so one agent owns the source survey, persists version-bound file notes/project knowledge, and reports back through Dispatch. If a focused discussion later becomes implementation, use handoff_to_coder; Orion will transfer exact validated context packets so Coder can start from that evidence instead of rediscovering the project.
 
 HOW YOU THINK:
 Don't snap-route. Ask yourself first: can I handle this directly? Do I have enough context to give the coder a clear task? Is this a coding problem or a planning conversation first? Think it through, then act.
@@ -146,7 +147,7 @@ At the start of a conversation, call recall_memory with scope="global" to orient
 {{user_memory}}
 
 TOOL USE:
-Your callable tools are supplied separately as formal schemas. In Dispatch, use read/search/memory/workspace/handoff tools when available. You still cannot edit files, run commands, capture screenshots, or produce local artifacts yourself; hand those tasks to Coder with a concise task description.
+Your callable tools are supplied separately as formal schemas. In Dispatch, use read/search/memory/workspace/handoff tools when available. You may capture and attach the browser worker, but you still cannot edit files, run commands, capture or control the native desktop, or produce other local artifacts yourself; hand those tasks to Coder with a concise task description.
 
 DATABASE QUERIES (db_query):
 - Use "db_query" to read data directly from a local SQLite file or a Postgres/MySQL database without handing off to Coder.
@@ -544,6 +545,7 @@ const OrchestrationContracts = window.OrionOrchestrationContracts || (typeof req
 const DispatchIntent = window.OrionDispatchIntent || (typeof require === 'function' ? require('./dispatch-intent') : null);
 const SemanticIntentRouter = window.OrionSemanticIntentRouter || (typeof require === 'function' ? require('./semantic-intent-router') : null);
 const ReasoningPolicy = window.OrionReasoningPolicy || (typeof require === 'function' ? require('./reasoning-policy') : null);
+const DispatchInspectionPolicy = window.OrionDispatchInspectionPolicy || (typeof require === 'function' ? require('./dispatch-inspection-policy') : null);
 const TaskOrchestration = window.OrionTaskOrchestration || (typeof require === 'function' ? require('./task-orchestration') : null);
 
 const OPERATIONAL_CONTEXT_TOOL_DECLARATIONS = [
@@ -1788,6 +1790,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let activeRunMessage = null;
   let workWalkthrough = [];
   const persistedVisualArtifactKeys = new Set();
+  const attachedResponseImages = [];
   let forceYield = false;
   let forcedYieldFailure = null;
   let autoContinueExecution = false;
@@ -2058,6 +2061,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       needsLocalInspection: semanticIntent.inspectionTarget && semanticIntent.inspectionTarget !== 'none',
       benefitsFromWorkspaceContext: ['workspace', 'project'].includes(semanticIntent.inspectionTarget),
       inspectionTarget: semanticIntent.inspectionTarget || 'none',
+      inspectionBreadth: semanticIntent.inspectionBreadth || 'none',
       ...planningDecision
     };
   }
@@ -2129,6 +2133,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     if (cleared) workingState = cleared;
   }
 
+  // A BROAD review request is the one case where the blast radius itself must be comprehensive
+  // rather than task-scoped, so the policy can require a surface inventory instead of letting
+  // the model pick a plausible subset and report as if it covered the whole request.
+  //
+  // Deliberately NOT derived from reviewOnly: that flag covers every read-only inspection,
+  // including "what does this file do", and treating those as project-wide audits would force
+  // full coverage tracking onto a one-file question. Breadth has to be asked for — which is
+  // also why effort never sets it. "Think hard" is not "read everything".
+  const comprehensiveAudit = semanticIntent.inspectionBreadth === 'broad';
   const runReasoningPolicy = ReasoningPolicy
     ? ReasoningPolicy.select({
         phase: agentExecutionMode === 'answer' ? 'casual_conversation' : 'implementation',
@@ -2136,7 +2149,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         contextDependent: semanticIntent.contextDependent === true,
         complexity: semanticIntent.reasoningPolicyHint && semanticIntent.reasoningPolicyHint.complexity,
         risk: semanticIntent.reasoningPolicyHint && semanticIntent.reasoningPolicyHint.risk,
-        forcedEffort: forcedReasoningEffort
+        forcedEffort: forcedReasoningEffort,
+        auditBreadth: comprehensiveAudit ? 'comprehensive' : 'task'
       })
     : turnReasoningPolicy;
   if (!isOrionMode && runReasoningPolicy.coverageRequired && workspacePath && !workingState.coverageFrontier) {
@@ -2381,6 +2395,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     if (!msg) return;
     msg.text = lastTextResponse;
     msg.logs = [...currentAgentLogs];
+    msg.images = attachedResponseImages.map(image => ({ ...image }));
     if (window.saveConversationsToStorage) {
       window.saveConversationsToStorage();
     }
@@ -2506,6 +2521,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     let reviewCompletionPrompts = 0;
     let reviewCompletionLoopExtensions = 0;
     let pendingWorkspaceResolutionPrompts = 0;
+    let inspectionKnowledgePersistencePrompts = 0;
+    let inspectionKnowledgePersistenceLoopExtensions = 0;
     let memoryNudgeSent = false;
     let skillGateFired = false;
     let skillDiscoveryChecked = false; // true once discover_skills has been called this run
@@ -2538,6 +2555,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const filesCreatedThisRun = new Set(conversation._orionCreatedFiles);
     const toolExecutionContext = {
       filesCreatedThisRun,
+      attachedResponseImages,
+      lastDesktopSnapshot: null,
       rememberCreatedFile: (key) => {
         if (!key) return;
         filesCreatedThisRun.add(key);
@@ -2585,7 +2604,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       && !runTaskId
       && !isInternalPrompt
       && semanticIntent.requiresExecution === true
+      && !(DispatchInspectionPolicy && DispatchInspectionPolicy.isSourceInspectionIntent(semanticIntent))
       && ['new_task', 'context_followup', 'steer_active_task'].includes(semanticIntent.intent);
+    let dispatchInspectionDelegationPending = !!(DispatchInspectionPolicy
+      && DispatchInspectionPolicy.shouldDelegate({
+        mode: runMode,
+        semanticIntent,
+        ledger: contextAcquisitionLedger
+      }));
     const dispatchPreflightStandalone = semanticIntent.standaloneSystemOperation === true;
     const dispatchPreflightAtGenericRoot = WorkspaceResolution
       ? WorkspaceResolution.samePath(workspacePath, getDispatchWorkspaceRoot())
@@ -2593,6 +2619,18 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const dispatchPreflightWorkspacePermission = WorkspaceResolution
       ? WorkspaceResolution.canHandoffWorkspace(workspaceResolution)
       : { allowed: !!workspacePath };
+    const canDelegateCurrentInspectionWorkspace = () => {
+      if (!workspacePath) return false;
+      if (!WorkspaceResolution) return true;
+      const currentResolution = WorkspaceResolution.classifyWorkspace({
+        mode: 'orion',
+        workspacePath,
+        dispatchProjectPath: conversation.dispatchProjectPath,
+        searchRoot: getDispatchWorkspaceRoot(),
+        knownProjects: getKnownWorkspaceCandidates(conversation)
+      });
+      return WorkspaceResolution.canHandoffWorkspace(currentResolution).allowed;
+    };
     const dispatchPreflightIsCancellation = semanticIntent.intent === 'cancel_active_task';
     // A clarification answer is not, by itself, an executable sentence. It is nevertheless an
     // authoritative continuation of the exact durable task that asked the questions. Once that
@@ -2613,7 +2651,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       ? claimedTaskPrompt
       : resolvedRequestForRouting;
     const shouldPreflightDispatchHandoff = !!(
-      dispatchPreflightAuthorized
+      (dispatchPreflightAuthorized || dispatchInspectionDelegationPending)
       && !dispatchPreflightIsCancellation
       && (dispatchPreflightWorkspacePermission.allowed
         || !dispatchPreflightAtGenericRoot
@@ -2623,6 +2661,18 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     if (shouldPreflightDispatchHandoff || dispatchHandoffAuthorizedByClarification) {
       toolExecutionContext.authorizedDispatchHandoffIntent = semanticIntent;
     }
+    const refreshDispatchInspectionDelegation = () => {
+      if (dispatchForcedHandoffSent || !DispatchInspectionPolicy) return false;
+      dispatchInspectionDelegationPending = DispatchInspectionPolicy.shouldDelegate({
+        mode: runMode,
+        semanticIntent,
+        ledger: contextAcquisitionLedger
+      });
+      if (dispatchInspectionDelegationPending) {
+        toolExecutionContext.authorizedDispatchHandoffIntent = semanticIntent;
+      }
+      return dispatchInspectionDelegationPending;
+    };
     if (taskBoundSemanticClarification) {
       // Keep the exact durable task/plan pending. A classifier failure or unresolved reference
       // must never fall through to a tool-enabled turn or be finalized as successful work.
@@ -2730,7 +2780,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               hint: semanticIntent.reasoningPolicyHint || {},
               contextDependent: semanticIntent.contextDependent === true,
               failureCount: highestRepeatedFailureCount,
-              forcedEffort: forcedReasoningEffort
+              forcedEffort: forcedReasoningEffort,
+              // Carried across every phase of the run: a comprehensive audit must not quietly
+              // narrow back to task scope once the run moves past its first phase.
+              auditBreadth: comprehensiveAudit ? 'comprehensive' : 'task'
             })
           : runReasoningPolicy;
         if (ReasoningPolicy && phaseReasoningPolicy.phase !== lastAppliedReasoningPhase) {
@@ -2761,7 +2814,37 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             type: 'thought',
             content: 'Semantic intent was unresolved, so Orion asked for clarification without exposing execution tools.'
           });
-        } else if (shouldPreflightDispatchHandoff && loopCount === 1 && !dispatchForcedHandoffSent) {
+        } else if (((shouldPreflightDispatchHandoff && loopCount === 1)
+              || (dispatchInspectionDelegationPending && canDelegateCurrentInspectionWorkspace()))
+            && !dispatchForcedHandoffSent) {
+          const delegatedInspection = dispatchInspectionDelegationPending
+            && DispatchInspectionPolicy
+            && DispatchInspectionPolicy.isReadOnlyProjectInspection(semanticIntent);
+          const inspectedPaths = delegatedInspection
+            ? DispatchInspectionPolicy.inspectedPaths(contextAcquisitionLedger)
+            : [];
+          const existingInspectionPacketIds = delegatedInspection
+            ? getHandoffContextPacketIds(conversation, workspacePath)
+            : [];
+          if (delegatedInspection && inspectedPaths.length > 0
+              && existingInspectionPacketIds.length === 0
+              && window.api && typeof window.api.inspectCodeContext === 'function') {
+            try {
+              const packet = await window.api.inspectCodeContext(workspacePath, {
+                query: resolvedRequestForRouting || liveUserPrompt,
+                paths: inspectedPaths,
+                budgetTokens: 12000,
+                conversationId: conversation.id,
+                runId: conversation._activeContextRunId || ''
+              });
+              rememberContextPacketForConversation(conversation, workspacePath, 'inspect_code_context', packet);
+            } catch (error) {
+              currentAgentLogs.push({
+                type: 'thought',
+                content: `Dispatch inspection handoff continued without a context packet: ${error.message || error}`
+              });
+            }
+          }
           const taskTitle = resolveDispatchHandoffTitle({
             semanticIntent,
             contextualTaskResolution,
@@ -2772,10 +2855,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           const handoffCall = {
             name: 'handoff_to_coder',
             args: {
-              prompt: buildForcedDispatchHandoffPrompt(resolvedRequestForRouting),
+              prompt: delegatedInspection
+                ? DispatchInspectionPolicy.buildDelegatedObjective({
+                    resolvedRequest: resolvedRequestForRouting,
+                    userMessage: liveUserPrompt,
+                    inspectedPaths
+                  })
+                : buildForcedDispatchHandoffPrompt(resolvedRequestForRouting),
               title: taskTitle,
               open: false,
-              standalone: dispatchPreflightStandalone && dispatchPreflightAtGenericRoot,
+              standalone: dispatchPreflightStandalone,
+              ...(dispatchPreflightStandalone ? { path: resolvedHomeDir } : {}),
               originalUserMessage: liveUserPrompt
             }
           };
@@ -2784,7 +2874,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               finishReason: 'STOP',
               content: {
                 parts: [
-                  { text: "This needs Coder's execution tools, so I've handed it off with the project context and requirements intact." },
+                  { text: delegatedInspection
+                    ? "This needs a broader project inspection than Dispatch should duplicate, so I've handed the same read-only review to Coder with the project context intact."
+                    : "This needs Coder's execution tools, so I've handed it off with the project context and requirements intact." },
                   { functionCall: handoffCall }
                 ]
               }
@@ -2793,7 +2885,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           dispatchForcedHandoffSent = true;
           currentAgentLogs.push({
             type: 'thought',
-            content: 'Dispatch preflight routed executable work directly to Coder without spending a Dispatch model turn.'
+            content: delegatedInspection
+              ? 'Dispatch inspection policy routed a broad review to Coder before another Dispatch model turn.'
+              : 'Dispatch preflight routed executable work directly to Coder without spending a Dispatch model turn.'
           });
         } else if (activeRunModelName.startsWith('gemini-')) {
           response = await callGeminiAPI(messagesForApiCall, activeRunModelName, config.geminiApiKey, onApiWarning, disableToolsForSemanticSafety, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
@@ -2963,10 +3057,18 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         const isExecutableHandoffIntent = intent => !!(
           intent
           && intent.requiresExecution === true
+          && !(DispatchInspectionPolicy && DispatchInspectionPolicy.isSourceInspectionIntent(intent))
           && ['new_task', 'context_followup', 'steer_active_task'].includes(intent.intent)
         );
+        const isDelegatedInspectionHandoff = intent => !!(
+          DispatchInspectionPolicy
+          && DispatchInspectionPolicy.isReadOnlyProjectInspection(intent)
+          && dispatchInspectionDelegationPending
+          && canDelegateCurrentInspectionWorkspace()
+        );
         let handoffAuthorized = dispatchHandoffAuthorizedByClarification
-          || isExecutableHandoffIntent(effectiveDispatchHandoffIntent);
+          || isExecutableHandoffIntent(effectiveDispatchHandoffIntent)
+          || isDelegatedInspectionHandoff(effectiveDispatchHandoffIntent);
 
         // The primary classifier and the task model can disagree about a short contextual
         // confirmation such as "Go for it." Rejection used to feed the model a false quoted-content
@@ -3060,9 +3162,6 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // no-tool sentence such as "I can't do that here, so I'll pass it to Coder" cannot synthesize
       // a second durable task after the first call has already executed.
       const standaloneEnvironmentRequest = effectiveDispatchHandoffIntent.standaloneSystemOperation === true;
-      const atGenericSearchRoot = WorkspaceResolution
-        ? WorkspaceResolution.samePath(workspacePath, getDispatchWorkspaceRoot())
-        : String(workspacePath || '').toLowerCase() === String(getDispatchWorkspaceRoot() || '').toLowerCase();
       if (runMode === 'orion' && functionCalls.some(call => call && call.name === 'handoff_to_coder')) {
         for (const call of functionCalls) {
           if (!call || call.name !== 'handoff_to_coder') continue;
@@ -3071,7 +3170,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           // utterance as separate provenance instead of making downstream code reverse-engineer it
           // from the resolved objective.
           call.args.originalUserMessage = liveUserPrompt;
-          call.args.standalone = standaloneEnvironmentRequest && atGenericSearchRoot;
+          call.args.standalone = standaloneEnvironmentRequest;
+          if (standaloneEnvironmentRequest) call.args.path = resolvedHomeDir;
           const proposedTitle = String(call.args.title || '').trim();
           if (!proposedTitle || proposedTitle.toLowerCase() === 'execute dispatch request') {
             call.args.title = resolveDispatchHandoffTitle({
@@ -3094,6 +3194,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       const classifiedExecutionNeedsRealHandoff = !!(
         runMode === 'orion'
         && effectiveDispatchHandoffIntent.requiresExecution === true
+        && !(DispatchInspectionPolicy && DispatchInspectionPolicy.isSourceInspectionIntent(effectiveDispatchHandoffIntent))
         && ['new_task', 'context_followup', 'steer_active_task'].includes(effectiveDispatchHandoffIntent.intent)
       );
       if (functionCalls.length === 0
@@ -3112,7 +3213,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               workspaceResolution
             }),
             open: false,
-            standalone: standaloneEnvironmentRequest && atGenericSearchRoot,
+            standalone: standaloneEnvironmentRequest,
+            ...(standaloneEnvironmentRequest ? { path: resolvedHomeDir } : {}),
             originalUserMessage: liveUserPrompt
           }
         };
@@ -3311,7 +3413,27 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           messages.push({ role: 'user', parts: [{ text: epistemicCorrection }] });
           continue;
         }
-        const reviewCompletionPrompt = reviewOnly ? buildReviewOnlyCompletionGatePrompt(userPrompt, textVal, workWalkthrough) : '';
+        const inspectionKnowledgePrompt = reviewOnly && DispatchInspectionPolicy
+          ? DispatchInspectionPolicy.buildKnowledgePersistencePrompt({
+              ledger: contextAcquisitionLedger,
+              workWalkthrough,
+              limit: runMode === 'orion' ? 2 : 8
+            })
+          : '';
+        if (inspectionKnowledgePrompt && loopCount >= maxLoops && inspectionKnowledgePersistenceLoopExtensions < 2) {
+          inspectionKnowledgePersistenceLoopExtensions++;
+          maxLoops++;
+        }
+        if (inspectionKnowledgePrompt && inspectionKnowledgePersistencePrompts < 2 && loopCount < maxLoops) {
+          inspectionKnowledgePersistencePrompts++;
+          currentAgentLogs.push({ type: 'thought', content: 'Inspection knowledge gate: save version-bound file understanding before the review finishes.' });
+          messages.push({ role: 'user', parts: [{ text: inspectionKnowledgePrompt }] });
+          continue;
+        }
+        const reviewCompletionPrompt = reviewOnly ? buildReviewOnlyCompletionGatePrompt(userPrompt, textVal, workWalkthrough, {
+          inspectionBreadth: semanticIntent.inspectionBreadth,
+          ledger: contextAcquisitionLedger
+        }) : '';
         if (reviewCompletionPrompt && loopCount >= maxLoops && reviewCompletionLoopExtensions < 3) {
           reviewCompletionLoopExtensions++;
           maxLoops++;
@@ -3519,6 +3641,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           mergeRunStructuredStatusFacts(structuredStatusFacts, evidenceEntry.structuredStatuses);
           recordContextAcquisitionToolResult(contextAcquisitionLedger, toolName, args, result);
           rememberContextPacketForConversation(conversation, workspacePath, toolName, result);
+          refreshDispatchInspectionDelegation();
 
           // read_file state tracking
           if (toolName === 'read_file' && args.path && !isFailedToolResult(result)) {
@@ -3867,6 +3990,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         mergeRunStructuredStatusFacts(structuredStatusFacts, evidenceEntry.structuredStatuses);
         recordContextAcquisitionToolResult(contextAcquisitionLedger, toolName, args, result);
         rememberContextPacketForConversation(conversation, workspacePath, toolName, result);
+        refreshDispatchInspectionDelegation();
 
         if (toolName === 'write_file' && isStrategyPath(args.path) && !isFailedToolResult(result)) {
           try {
@@ -4533,6 +4657,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       autoContinueExecution,
       forceYield
     });
+    // Keep the durable task result as the actual answer. The visible Coder bubble may append a
+    // generated tool walkthrough for inspection, but that mechanical block is not the completion
+    // report Dispatch should relay to the user.
+    const userFacingResultSummary = String(lastTextResponse || '').trim();
     lastTextResponse = withWorkWalkthrough(lastTextResponse, workWalkthrough, true, conversation);
 
     // Save walkthrough to file so the chat bubble stays clean
@@ -4547,6 +4675,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const finalizedRunMessage = ensureActiveRunMessage();
     finalizedRunMessage.text = lastTextResponse;
     finalizedRunMessage.logs = [...currentAgentLogs];
+    finalizedRunMessage.images = attachedResponseImages.map(image => ({ ...image }));
     if (OrchestrationContracts) {
       const projectKnowledgeTools = new Set([
         'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context', 'list_files',
@@ -4657,9 +4786,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
                 : (forcedYieldFailure
                   ? `Paused after ${forcedYieldFailure.failureCount || 3} repeated ${forcedYieldFailure.toolName || 'tool'} failures.`
                   : '')))),
-        summary: String(lastTextResponse || '').replace(/\s+/g, ' ').slice(0, 1000),
+        summary: userFacingResultSummary.replace(/\s+/g, ' ').slice(0, 1000),
         result: {
-          summary: String(lastTextResponse || '').trim().slice(0, 5000),
+          summary: userFacingResultSummary.slice(0, 5000),
           changedFiles: [...new Set(
             (workWalkthrough || [])
               .filter(item => isFileMutationItem(item) && item.path)
@@ -4674,7 +4803,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             .filter(item => item.status !== 'error')
             .map(item => String(item.label || item.detail || item.toolName).replace(/\s+/g, ' ').trim())
             .filter(Boolean)
-            .slice(-20)
+            .slice(-20),
+          images: attachedResponseImages.map(image => ({ ...image }))
         },
         conversationId: conversation.id,
         pendingWork: !!(hasPendingWork || durableBoundaryWork),
@@ -5434,10 +5564,17 @@ async function executeTool(name, args, workspace, config, conversation, executio
         throw new Error('list_files returned an unexpected result shape.');
       }
       const mappedFiles = fileList.map(f => ({ path: f.path, isDir: f.isDir, size: f.size }));
+      // The walk itself is depth- and count-bounded. When it hits a limit the listing is
+      // INCOMPLETE, and the model must not read absence as proof a file does not exist.
+      const walkTruncation = files && files.truncated ? String(files.truncationReason || 'The directory listing was truncated.') : '';
       if (args.mode !== 'all') {
-        return buildCuratedFileInventory(mappedFiles, {
+        const curated = buildCuratedFileInventory(mappedFiles, {
           maxFiles: Number.isFinite(Number(args.maxFiles)) ? Number(args.maxFiles) : 250
         });
+        return walkTruncation ? { ...curated, incompleteListing: walkTruncation } : curated;
+      }
+      if (walkTruncation && mappedFiles.length <= 800) {
+        return { mode: 'all', files: mappedFiles, incompleteListing: walkTruncation };
       }
       if (mappedFiles.length > 800) {
         return {
@@ -5813,7 +5950,12 @@ async function executeTool(name, args, workspace, config, conversation, executio
     }
 
     case 'handoff_to_coder': {
-      const requestedPath = String(args.path || workspace || conversation.workspace || '').trim();
+      const standaloneHandoff = args.standalone === true;
+      const requestedPath = String(
+        standaloneHandoff
+          ? resolvedHomeDir
+          : (args.path || workspace || conversation.workspace || '')
+      ).trim();
       if (!requestedPath) throw new Error("Missing workspace path to hand off to Coder");
       const prompt = String(args.prompt || '').trim();
       const originalUserMessage = String(
@@ -5821,10 +5963,6 @@ async function executeTool(name, args, workspace, config, conversation, executio
         || [...(conversation.messages || [])].reverse().find(message => message && message.role === 'user')?.text
         || prompt
       ).trim();
-      const standaloneHandoff = args.standalone === true;
-      if (args.standalone === true && !standaloneHandoff) {
-        throw new Error('Standalone Coder handoff is limited to an explicit local process/application operation. Resolve a project workspace for file, test, build, or dependency work.');
-      }
       const resolution = await resolveWorkspacePathForChange(requestedPath);
       if (!resolution.success) {
         throw new Error(`Coder handoff path "${resolution.path}" is invalid or does not exist: ${resolution.error}`);
@@ -6450,7 +6588,66 @@ async function executeTool(name, args, workspace, config, conversation, executio
         conversationId: conversation.id
       });
       if (!result.success) throw new Error(result.error || 'Screen capture failed');
+      executionContext.lastDesktopSnapshot = {
+        path: result.path,
+        width: Number(result.width) || 0,
+        height: Number(result.height) || 0,
+        capturedAt: Date.now(),
+        inspectedAt: 0
+      };
       return result;
+    }
+
+    case 'computer_action': {
+      if (!conversation || conversation.mode !== 'coder') {
+        throw new Error('computer_action is Coder-only. Dispatch must hand executable desktop work to Coder.');
+      }
+      const snapshot = executionContext.lastDesktopSnapshot;
+      if (!snapshot || !snapshot.width || !snapshot.height || Date.now() - snapshot.capturedAt > 120000) {
+        throw new Error('Computer use requires a fresh capture_screen from this run. Capture and inspect the visible target before acting.');
+      }
+      if (!snapshot.inspectedAt || snapshot.inspectedAt < snapshot.capturedAt) {
+        throw new Error('Computer use requires inspect_screenshot_with_model on the fresh capture before acting. Orion will not click or type against an uninspected screen.');
+      }
+      const action = {
+        ...args,
+        sourceWidth: snapshot.width,
+        sourceHeight: snapshot.height
+      };
+      const result = await window.api.computerAction(workspace, action, conversation.id, args.destination || '');
+      if (!result || !result.success) throw new Error((result && result.error) || 'Computer action failed');
+      if (result.path && result.width && result.height) {
+        executionContext.lastDesktopSnapshot = {
+          path: result.path,
+          width: Number(result.width) || snapshot.width,
+          height: Number(result.height) || snapshot.height,
+          capturedAt: Date.now(),
+          inspectedAt: 0
+        };
+      }
+      return result;
+    }
+
+    case 'attach_image': {
+      if (!args.path) throw new Error("Missing 'path' parameter");
+      const file = await window.api.readWorkspaceFileBase64(workspace, args.path, conversation && conversation.id ? conversation.id : '');
+      if (!file || file.success === false) throw new Error((file && file.error) || 'Image could not be read');
+      if (!String(file.mimeType || '').startsWith('image/')) throw new Error(`attach_image requires an image, got ${file.mimeType || 'unknown type'}`);
+      const images = executionContext.attachedResponseImages || [];
+      if (images.length >= 4) throw new Error('A response can attach at most 4 images.');
+      const reference = String(args.path);
+      if (!images.some(image => image.path === reference)) {
+        images.push({
+          path: reference,
+          workspacePath: workspace || '',
+          sourceConversationId: conversation && conversation.id ? conversation.id : '',
+          mimeType: file.mimeType,
+          alt: String(args.alt || 'Orion screenshot').slice(0, 240),
+          caption: String(args.caption || '').slice(0, 500)
+        });
+      }
+      executionContext.attachedResponseImages = images;
+      return { success: true, attached: reference, imageCount: images.length };
     }
 
     case 'inspect_screenshot': {
@@ -6473,10 +6670,10 @@ async function executeTool(name, args, workspace, config, conversation, executio
       if (!args.goal) throw new Error("Missing 'goal' parameter");
       const activeModelName = config.activeRunModelName || config.modelName || 'gemini-2.5-flash-lite';
       if (String(activeModelName || '').startsWith('gemini-') && !config.geminiApiKey) throw new Error('Gemini API key is required for Gemini multimodal screenshot inspection.');
-      const file = await window.api.readWorkspaceFileBase64(workspace, args.path);
+      const file = await window.api.readWorkspaceFileBase64(workspace, args.path, conversation && conversation.id ? conversation.id : '');
       if (!file.success) throw new Error(file.error || 'Could not read screenshot image');
       if (!String(file.mimeType || '').startsWith('image/')) throw new Error(`Screenshot inspection requires an image file, got ${file.mimeType}`);
-      return await inspectScreenshotWithModel({
+      const inspection = await inspectScreenshotWithModel({
         imageBase64: file.data,
         mimeType: file.mimeType,
         path: args.path,
@@ -6484,6 +6681,11 @@ async function executeTool(name, args, workspace, config, conversation, executio
         modelName: activeModelName,
         apiKey: config.geminiApiKey
       });
+      if (executionContext.lastDesktopSnapshot
+          && String(executionContext.lastDesktopSnapshot.path || '') === String(args.path)) {
+        executionContext.lastDesktopSnapshot.inspectedAt = Date.now();
+      }
+      return inspection;
     }
 
     case 'sync_workspace_env': {
@@ -7249,7 +7451,7 @@ function buildDiscoveryFromToolOutcome(toolName, args = {}, result = {}, outcome
   if (!result || result.error || result.success === false) return null;
   const assetTools = new Set(['download_file', 'inspect_archive', 'extract_archive', 'inspect_binary_asset', 'list_asset_metadata']);
   const browserTools = new Set(['open_url', 'search_web', 'click_element', 'download_from_page']);
-  const visualTools = new Set(['take_screenshot', 'preview_app', 'capture_screen', 'inspect_screenshot', 'compare_screenshot_to_goal', 'inspect_screenshot_with_model']);
+  const visualTools = new Set(['take_screenshot', 'preview_app', 'capture_screen', 'computer_action', 'attach_image', 'inspect_screenshot', 'compare_screenshot_to_goal', 'inspect_screenshot_with_model']);
   if (assetTools.has(toolName)) {
     const source = result.url || args.url || '';
     const path = result.path || result.destination || args.path || '';
@@ -7742,19 +7944,20 @@ If STRATEGY.md finds mission-critical ambiguity, ask the user before planning. I
 const PLANNING_BLOCKED_TOOLS = Object.freeze([
   'modify_file', 'patch_file', 'delete_created_file', 'start_command', 'run_tests', 'run_linter',
   'sync_workspace_env', 'launch_workspace_app', 'preview_app', 'git_push', 'download_file',
-  'download_from_page', 'extract_archive', 'take_screenshot'
+  'download_from_page', 'extract_archive', 'take_screenshot', 'computer_action'
 ]);
 
 const PLAN_REVISION_BLOCKED_TOOLS = Object.freeze([
   'delete_created_file', 'start_command', 'run_tests', 'run_linter', 'sync_workspace_env',
   'launch_workspace_app', 'preview_app', 'git_push', 'download_file', 'download_from_page',
-  'extract_archive'
+  'extract_archive', 'computer_action'
 ]);
 
 const REVIEW_ONLY_BLOCKED_TOOLS = Object.freeze([
   'modify_file', 'patch_file', 'delete_created_file', 'sync_workspace_env',
   'set_workspace_entrypoint', 'start_command', 'launch_workspace_app', 'preview_app', 'git_push',
   'download_file', 'download_from_page', 'extract_archive', 'set_task_checklist',
+  'computer_action',
   'update_mission_context', 'start_subplan', 'update_subplan_context', 'complete_subplan',
   'evaluate_win_conditions', 'record_blocker', 'resolve_blocker'
 ]);
@@ -7947,6 +8150,8 @@ function summarizeToolStart(toolName, args = {}) {
   if (toolName === 'take_screenshot') return { toolName, kind: 'visual', status: 'running', label: 'Captured browser screenshot' };
   if (toolName === 'preview_app') return { toolName, kind: 'visual', status: 'running', label: `Launched app${args.command ? ` \`${args.command}\`` : ''} and captured a screenshot` };
   if (toolName === 'capture_screen') return { toolName, kind: 'visual', status: 'running', label: 'Captured a fresh screen screenshot' };
+  if (toolName === 'computer_action') return { toolName, kind: 'computer', status: 'running', label: `${args.action || 'Acted'} on ${args.targetDescription || 'the visible desktop'}` };
+  if (toolName === 'attach_image') return { toolName, kind: 'visual', status: 'running', label: `Attached image \`${args.path || 'screenshot'}\`` };
   if (toolName === 'inspect_screenshot') return { toolName, kind: 'visual', status: 'running', label: `Inspected screenshot \`${args.path || 'screenshot'}\`` };
   if (toolName === 'compare_screenshot_to_goal') return { toolName, kind: 'visual', status: 'running', label: `Compared screenshot to goal` };
   if (toolName === 'inspect_screenshot_with_model') return { toolName, kind: 'visual', status: 'running', label: `Inspected screenshot with active model vision` };
@@ -8005,6 +8210,12 @@ function summarizeToolStart(toolName, args = {}) {
   if (toolName === 'sync_workspace_env') return { toolName, kind: 'env', status: 'running', label: 'Synced workspace environment secrets' };
   if (toolName === 'google_search') return { toolName, kind: 'research', status: 'running', label: `Searched Google for "${args.query || ''}"` };
   if (toolName === 'fetch_web_page') return { toolName, kind: 'research', status: 'running', label: `Fetched docs page ${args.url || ''}` };
+  if (toolName === 'remember_file_notes') {
+    return { toolName, kind: 'memory', status: 'running', path: args.path, label: `Saved file knowledge for \`${args.path || 'file'}\`` };
+  }
+  if (toolName === 'remember_fact' || toolName === 'append_project_memory' || toolName === 'remember_decision') {
+    return { toolName, kind: 'memory', status: 'running', label: 'Updated durable project knowledge' };
+  }
   return { toolName, status: 'running', label: `Used \`${toolName}\`` };
 }
 
@@ -8077,10 +8288,10 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
   } else if (result && result.summary && (
     toolName === 'download_file' || toolName === 'inspect_archive' || toolName === 'extract_archive' ||
     toolName === 'inspect_binary_asset' || toolName === 'list_asset_metadata' ||
-    toolName === 'take_screenshot' || toolName === 'preview_app' || toolName === 'capture_screen' || toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal' || toolName === 'inspect_screenshot_with_model'
+    toolName === 'take_screenshot' || toolName === 'preview_app' || toolName === 'capture_screen' || toolName === 'computer_action' || toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal' || toolName === 'inspect_screenshot_with_model'
   )) {
     item.detail = result.summary;
-    if (result.path && (toolName === 'take_screenshot' || toolName === 'preview_app' || toolName === 'capture_screen' || toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal' || toolName === 'inspect_screenshot_with_model')) {
+    if (result.path && (toolName === 'take_screenshot' || toolName === 'preview_app' || toolName === 'capture_screen' || toolName === 'computer_action' || toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal' || toolName === 'inspect_screenshot_with_model')) {
       item.path = result.path;
       item.width = result.width || item.width || 0;
       item.height = result.height || item.height || 0;
@@ -8411,7 +8622,7 @@ function buildRunArtifactPayload({ conversation, userPrompt, modelName, workspac
 }
 
 function isScreenshotProducingTool(toolName) {
-  return toolName === 'take_screenshot' || toolName === 'preview_app' || toolName === 'capture_screen';
+  return toolName === 'take_screenshot' || toolName === 'preview_app' || toolName === 'capture_screen' || toolName === 'computer_action';
 }
 
 function collectVisualArtifacts(items = [], workspacePath = '') {
@@ -8629,14 +8840,23 @@ function answerHasGroundedReviewReport(answerText, workWalkthrough = []) {
   return answerHasInspectionGrounding(text, workWalkthrough);
 }
 
-function buildReviewOnlyCompletionGatePrompt(userPrompt, answerText, workWalkthrough = []) {
+function buildReviewOnlyCompletionGatePrompt(userPrompt, answerText, workWalkthrough = [], options = {}) {
   const inspected = (workWalkthrough || []).some(item => item && item.status !== 'error');
   if (!inspected) {
     return '[SYSTEM: Review completion gate. This is a read-only code review of the active workspace. Start with workspace inventory, then inspect relevant source/config/test files. Do not ask which program to inspect when an active workspace exists.]';
   }
   const coverage = getReviewCoverage(workWalkthrough);
-  if (!coverage.broadEnough) {
-    return `[SYSTEM: Review completion gate. You have not inspected enough of the program to finish a broad bug/structural review yet. Current coverage: ${coverage.fileCount} source file(s) read${coverage.hasInventory ? ' with inventory context' : ''}. Continue with concrete tools: list files if needed, then read the main entry point, adjacent modules, config/package files, and tests where present. Do not stop after one file with general possibilities.]`;
+  const ledgerFileCount = DispatchInspectionPolicy && options.ledger
+    ? DispatchInspectionPolicy.inspectedPaths(options.ledger).length
+    : 0;
+  const fileCount = Math.max(coverage.fileCount, ledgerFileCount);
+  const broadInspection = options.inspectionBreadth == null || options.inspectionBreadth === 'broad';
+  const broadEnough = fileCount >= 3 || (fileCount >= 2 && coverage.hasSearchOrCommand);
+  if (broadInspection && !broadEnough) {
+    return `[SYSTEM: Review completion gate. You have not inspected enough of the program to finish a broad bug/structural review yet. Current coverage: ${fileCount} source file(s) read${coverage.hasInventory ? ' with inventory context' : ''}. Continue with concrete tools: list files if needed, then read the main entry point, adjacent modules, config/package files, and tests where present. Do not stop after one file with general possibilities.]`;
+  }
+  if (!broadInspection && fileCount < 1) {
+    return '[SYSTEM: Review completion gate. This focused inspection has no source evidence yet. Inspect the one or two files required by the request before answering.]';
   }
   if (!answerHasGroundedReviewReport(answerText, workWalkthrough)) {
     return '[SYSTEM: Review completion gate. Your draft is not a grounded findings report yet. Either continue inspecting files, or produce a concrete report now with specific findings tied to file paths and line/function context, severity/impact, and a clear note if no specific issues were found. Do not ask the user whether to keep inspecting; finish the review from the available evidence or gather the missing evidence with tools. Only the final saved assistant response counts. Write a complete, standalone report, not a continuation, correction, or shorter follow-up to earlier text.]';
@@ -8718,9 +8938,31 @@ function hasAnyChecklist(conversation) {
   return !!(conversation && Array.isArray(conversation.tasks) && conversation.tasks.length > 0);
 }
 
+// Phases where a user-forced reasoning level must NOT apply. Both are mechanical: deciding
+// which tool to call next, and routing an intent. Paying Ultra for those would burn money on
+// plumbing while changing nothing about the answer.
+//
+// Everything else is substantive — adversarial review, diagnosis, verification, correction, and
+// the conversational reply itself — and must honour the setting. Those paths build their own
+// policy objects, so without this they silently reverted to phase defaults while the UI still
+// said Ultra: the user pays for depth and quietly does not get it.
+const FORCED_EFFORT_EXEMPT_PHASES = new Set(['intent_classification', 'mechanical_execution']);
+
+function resolveForcedEffortForPhase(config, phase) {
+  if (!ReasoningPolicy || !config) return '';
+  if (FORCED_EFFORT_EXEMPT_PHASES.has(String(phase || ''))) return '';
+  const normalized = ReasoningPolicy.normalizeEffortOverride(config.reasoningEffort);
+  return normalized === 'auto' ? '' : normalized;
+}
+
 async function callUtilityModel(prompt, modelName, config, requireJson = true, options = {}) {
+  const utilityPhase = options.phase || 'intent_classification';
   const reasoningPolicy = options.reasoningPolicy || (ReasoningPolicy
-    ? ReasoningPolicy.select({ phase: options.phase || 'intent_classification', hint: options.hint || {} })
+    ? ReasoningPolicy.select({
+        phase: utilityPhase,
+        hint: options.hint || {},
+        forcedEffort: resolveForcedEffortForPhase(config, utilityPhase)
+      })
     : null);
   const providerControls = ReasoningPolicy && reasoningPolicy
     ? ReasoningPolicy.providerControls(modelName, reasoningPolicy)
@@ -8875,6 +9117,7 @@ async function classifyPlanningNeed(userPrompt, modelName, config, recentMessage
       needsLocalInspection: false,
       benefitsFromWorkspaceContext: false,
       inspectionTarget: 'none',
+      inspectionBreadth: 'none',
       taskComplexity: 'light',
       taskRisk: 'low',
       coverageRequired: false
@@ -8888,6 +9131,7 @@ async function classifyPlanningNeed(userPrompt, modelName, config, recentMessage
     needsLocalInspection: semanticIntent.inspectionTarget && semanticIntent.inspectionTarget !== 'none',
     benefitsFromWorkspaceContext: ['workspace', 'project'].includes(semanticIntent.inspectionTarget),
     inspectionTarget: semanticIntent.inspectionTarget || 'none',
+    inspectionBreadth: semanticIntent.inspectionBreadth || 'none',
     taskComplexity: highImpact ? 'deep' : (hint.complexity === 'low' ? 'light' : 'standard')
   };
 }
@@ -8990,7 +9234,9 @@ function resolveDispatchHandoffTitle({
   ).trim();
   if (structuredTitle) return structuredTitle;
   const objective = String(semanticIntent.resolvedRequest || resolvedRequest || '').trim();
-  const projectName = String(workspaceResolution.projectName || '').trim();
+  const projectName = semanticIntent.standaloneSystemOperation === true
+    ? ''
+    : String(workspaceResolution.projectName || '').trim();
   if (TaskOrchestration && typeof TaskOrchestration.deriveTaskTitle === 'function') {
     return TaskOrchestration.deriveTaskTitle(objective, projectName);
   }
@@ -9013,7 +9259,7 @@ const INSPECTION_TOOLS = new Set([
   // meant a run that used them exclusively was treated as never having inspected anything.
   'semantic_search', 'find_references', 'get_file_symbols'
 ]);
-const MEMORY_WRITE_TOOLS = new Set(['append_project_memory', 'remember_fact', 'remember_decision']);
+const MEMORY_WRITE_TOOLS = new Set(['append_project_memory', 'remember_fact', 'remember_decision', 'remember_file_notes']);
 
 // Tools whose results take no deliberation to interpret — reads, searches, and status checks.
 // A turn that only consumed these is choosing the next tool, not making a judgment call, so it
@@ -10905,7 +11151,7 @@ const DISPATCH_TOOL_ALLOWLIST = new Set([
   'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context', 'list_files', 'get_workspace_info', 'change_workspace',
   'handoff_to_coder',
   'get_coder_task_status', 'cancel_coder_task',
-  'open_url', 'click_element', 'fill_input', 'take_screenshot', 'navigate_back',
+  'open_url', 'click_element', 'fill_input', 'take_screenshot', 'navigate_back', 'attach_image',
   'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model',
   'grep_search', 'search_embeddings', 'semantic_search',
   'get_symbol_index', 'fetch_page', 'git_diff', 'git_rollback', 'edit_config', 'get_file_symbols', 'find_references',
@@ -11013,7 +11259,7 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "handoff_to_coder",
-            description: "Promotes a resolved local project into Coder and optionally queues implementation/execution. A named local process/application operation may instead use standalone=true from the generic Projects search root. File, test, build, install, and dependency work still requires an exact project workspace. REQUIRED: when the user asks for an operation outside Dispatch's read-only permissions, call this tool; never refuse or tell the user to perform it manually merely because Dispatch cannot execute it. For an obvious implementation/execution request, route early without deeply inspecting source first. IMPORTANT — context transfer: exact-source context packets are generated ONLY by inspect_code_context calls. If your investigation used grep_search/read_file instead, no packets exist, so you MUST pass your key conclusions in `findings` — otherwise Coder starts blind and rediscovers everything. This is the explicit promotion path; change_workspace alone must not add folders to Coder.",
+            description: "Promotes a resolved local project into Coder and optionally queues implementation/execution. A local-machine process/application/desktop operation that is not project-bound uses standalone=true and runs from the user's home workspace, regardless of which project Dispatch currently has selected. File, test, build, install, and dependency work still requires an exact project workspace. REQUIRED: when the user asks for an operation outside Dispatch's read-only permissions, call this tool; never refuse or tell the user to perform it manually merely because Dispatch cannot execute it. For an obvious implementation/execution request, route early without deeply inspecting source first. IMPORTANT — context transfer: exact-source context packets are generated ONLY by inspect_code_context calls. If your investigation used grep_search/read_file instead, no packets exist, so you MUST pass your key conclusions in `findings` — otherwise Coder starts blind and rediscovers everything. This is the explicit promotion path; change_workspace alone must not add folders to Coder.",
             parameters: {
               type: "OBJECT",
               properties: {
@@ -11314,6 +11560,34 @@ function buildAgentToolDeclarations() {
               },
               required: ["path", "updates"]
             }
+          },
+          {
+            name: 'computer_action',
+            description: 'Coder-only Windows computer control. Use capture_screen first, inspect it with model vision, then perform ONE bounded mouse, keyboard, or scroll action against the visible primary display. Orion is hidden while the action runs and the resulting screen is captured by default. Never use this to type secrets, operate security/UAC dialogs, or bypass the dedicated browser, file, command, or safety tools. Coordinates refer to the most recent capture_screen image. If the user asks to see the result in chat, call attach_image with the returned path.',
+            parameters: { type: 'OBJECT', properties: {
+              action: { type: 'STRING', enum: ['move', 'click', 'scroll', 'type', 'key'] },
+              targetDescription: { type: 'STRING', description: 'Short visible target and intended action, for example "the GRITLIFE project row in Codex".' },
+              x: { type: 'NUMBER', description: 'X coordinate in the most recent capture_screen image; required for move/click/scroll.' },
+              y: { type: 'NUMBER', description: 'Y coordinate in the most recent capture_screen image; required for move/click/scroll.' },
+              button: { type: 'STRING', enum: ['left', 'right', 'middle'] },
+              clickCount: { type: 'NUMBER', description: '1-3 clicks.' },
+              amount: { type: 'NUMBER', description: 'Wheel delta from -2400 to 2400. Positive scrolls up; negative scrolls down.' },
+              text: { type: 'STRING', description: 'Literal Unicode text for a type action. Secrets and credentials are forbidden.' },
+              key: { type: 'STRING', description: 'Letter, digit, navigation key, Enter, Escape, Tab, Delete, or F1-F12.' },
+              modifiers: { type: 'ARRAY', items: { type: 'STRING', enum: ['ctrl', 'shift', 'alt'] } },
+              intervalMs: { type: 'NUMBER', description: 'Optional typing/click interval, 0-250 ms.' },
+              settleMs: { type: 'NUMBER', description: 'Wait 0-5000 ms before the after-action screenshot.' },
+              captureAfter: { type: 'BOOLEAN', description: 'Capture the resulting screen. Defaults true.' }
+            }, required: ['action', 'targetDescription'] }
+          },
+          {
+            name: 'attach_image',
+            description: 'Attaches an existing workspace or conversation-scoped image to this assistant response so it is visible directly in desktop and phone chat. Use this after take_screenshot, capture_screen, preview_app, or computer_action when the user asks to see the image. This does not read arbitrary external paths; the image must resolve through Orion\'s workspace/artifact boundary.',
+            parameters: { type: 'OBJECT', properties: {
+              path: { type: 'STRING', description: 'Workspace-relative path or orion-artifact:// reference returned by a visual tool.' },
+              alt: { type: 'STRING', description: 'Concise accessible description of the image.' },
+              caption: { type: 'STRING', description: 'Optional short caption displayed with the image.' }
+            }, required: ['path'] }
           },
           {
             name: "get_file_symbols",
@@ -12663,10 +12937,15 @@ window.quickOrionLLMCall = async function(systemPrompt, userMessages, config, op
   ];
 
   let resp;
+  const quickPhase = options.phase || 'casual_conversation';
   const reasoningPolicy = ReasoningPolicy
     ? ReasoningPolicy.select({
-        phase: options.phase || 'casual_conversation',
-        hint: options.hint || {}
+        phase: quickPhase,
+        hint: options.hint || {},
+        // The Dispatch conversational reply runs through here. A user who selected Ultra and
+        // then asks a hard question must get Ultra, not the casual default.
+        forcedEffort: resolveForcedEffortForPhase(config, quickPhase),
+        auditBreadth: options.auditBreadth
       })
     : null;
   if (/anthropic|claude/i.test(modelName)) {

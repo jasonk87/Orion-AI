@@ -722,6 +722,88 @@ test('summarizeCoderCompletion skips gate narration and relays the real answer',
     { messages: [{ role: 'assistant', text: gateNarration }] }
   );
   t.equal(nothingReal.summary, '', 'narration is never relayed even when it is all there is');
+
+  const authoredWalkthrough = [
+    '## Work Walkthrough',
+    '',
+    'Opened Codex and inspected the active window.',
+    '',
+    '**Result:** Codex is open, idle, and showing the completed Orion report.',
+    '',
+    '## Work Walkthrough',
+    '- **Done:** Captured the desktop',
+    '- **Done:** Attached `codex.png`'
+  ].join('\n');
+  const legacyWalkthrough = win.summarizeCoderCompletion(
+    { result: { summary: authoredWalkthrough } },
+    { messages: [] }
+  );
+  t.match(legacyWalkthrough.summary, /^## Work Walkthrough/, 'an authored report heading is preserved');
+  t.match(legacyWalkthrough.summary, /Codex is open, idle/, 'the actual result reaches Dispatch');
+  t.notOk(/Captured the desktop/.test(legacyWalkthrough.summary), 'only the generated tool ledger tail is removed');
+  t.end();
+});
+
+test('a successful handoff retry removes only the stale clarification from the current turn', t => {
+  const conv = {
+    id: 'dispatch-retry',
+    messages: [
+      { role: 'assistant', source: 'task-resolution-clarification', text: 'An older clarification stays.' },
+      { role: 'user', text: 'Yes, do that.' },
+      { role: 'assistant', source: 'task-resolution-clarification', text: 'Which project workspace should I use?' },
+      { role: 'assistant', source: 'agent-run', text: 'Coder has the task queued.' }
+    ]
+  };
+  const loaded = loadRenderer({
+    t,
+    set: { conversations: [conv] },
+    expose: ['clearCurrentTurnTaskResolutionClarifications']
+  });
+  const removed = loaded.expose.clearCurrentTurnTaskResolutionClarifications(loaded.read('conversations')[0]);
+  const messages = loaded.read('conversations')[0].messages;
+  t.equal(removed, 1, 'the failed attempt clarification is removed before the successful retry is persisted');
+  t.ok(messages.some(message => message.text === 'An older clarification stays.'), 'prior-turn history is untouched');
+  t.ok(messages.some(message => message.source === 'agent-run'), 'the live success bubble is untouched');
+  t.notOk(messages.some(message => /Which project workspace/.test(message.text)), 'the contradictory current-turn prompt is gone');
+  t.end();
+});
+
+test('phone image relay honors the attached Coder artifact provenance', async t => {
+  const imagePath = 'C:\\Users\\Owner\\AppData\\Roaming\\orion-ai\\artifacts\\coder-1\\codex.png';
+  const calls = [];
+  const loaded = loadRenderer({
+    t,
+    api: {
+      readWorkspaceFileBase64: async (...args) => {
+        calls.push(args);
+        return { success: true, data: 'aW1hZ2U=', mimeType: 'image/png' };
+      }
+    },
+    set: {
+      conversations: [{
+        id: 'dispatch-1',
+        mode: 'orion',
+        workspace: 'C:\\Users\\Owner',
+        messages: [{
+          role: 'assistant',
+          source: 'supervisor-completion',
+          images: [{
+            path: imagePath,
+            workspacePath: 'C:\\Users\\Owner',
+            sourceConversationId: 'coder-1',
+            mimeType: 'image/png'
+          }]
+        }]
+      }]
+    }
+  });
+  const result = await loaded.win.readChatImageForPhone({
+    conversationId: 'dispatch-1',
+    path: imagePath
+  });
+  t.equal(result.success, true, 'the Dispatch attachment resolves');
+  t.deepEqual(calls[0], ['C:\\Users\\Owner', imagePath, 'coder-1'],
+    'the file API validates the source Coder conversation instead of losing provenance');
   t.end();
 });
 
@@ -756,10 +838,26 @@ test('picking a reasoning level persists it where the agent reads it', async (t)
   t.ok(calls.some(c => c.method === 'writeConfig'), 'the config is written to disk');
   t.equal(win.document.getElementById('reasoning-select').classList.contains('reasoning-forced'), true,
     'a forced level is visually distinct from auto');
+  const forcedRevision = result.selectionRevisions.reasoning;
+  t.ok(forcedRevision > 0, 'the persisted selection receives a monotonic revision for poll ordering');
 
-  await win.setReasoningEffortSelection('auto');
+  const reset = await win.setReasoningEffortSelection('auto');
+  t.ok(reset.selectionRevisions.reasoning > forcedRevision, 'a later selection has a strictly newer revision');
   t.equal(win.document.getElementById('reasoning-select').classList.contains('reasoning-forced'), false,
     'returning to auto drops the forced styling');
+  t.end();
+});
+
+test('a failed config write cannot claim or display a durable reasoning change', async t => {
+  const { win } = loadRenderer({
+    t,
+    api: { writeConfig: async () => false }
+  });
+  const result = await win.setReasoningEffortSelection('max');
+  t.equal(result.success, false, 'the failed persistence is reported to the caller');
+  t.equal(win.getAppConfig().reasoningEffort, 'auto', 'the in-memory selection rolls back');
+  t.equal(win.document.getElementById('reasoning-select').value, 'auto', 'the desktop picker rolls back');
+  t.equal(win.localStorage.getItem('ag2_reasoning_effort'), null, 'localStorage does not retain a selection that config rejected');
   t.end();
 });
 
@@ -782,6 +880,7 @@ test('the phone companion is served both selections and can set either', async (
   t.ok(Array.isArray(payload.reasoningLevels) && payload.reasoningLevels.length === 5,
     'the phone receives the level list to render its picker');
   t.ok(payload.models.length > 0, 'the model list is still supplied');
+  t.equal(payload.selectionRevisions.reasoning > 0, true, 'model-list sync carries the selection revision');
 
   const set = await win.setPhoneCompanionReasoning('low');
   t.equal(set.success, true, 'the phone can set the reasoning level');
@@ -789,5 +888,7 @@ test('the phone companion is served both selections and can set either', async (
     'a phone-side change lands in the same appConfig the desktop uses');
   t.equal(win.document.getElementById('reasoning-select').value, 'low',
     'and the desktop picker reflects it immediately');
+  t.equal(set.selectionRevisions.reasoning, win.getPhoneCompanionModels().selectionRevisions.reasoning,
+    'the POST acknowledgement and subsequent polls use the same canonical revision');
   t.end();
 });

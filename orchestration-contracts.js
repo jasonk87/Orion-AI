@@ -314,18 +314,27 @@
   // get relayed to the user verbatim. This detector recognizes it: text that talks ABOUT gate
   // machinery and says nothing else. A real summary that merely mentions the gate at the end
   // keeps its substance after the gate clauses are removed, and is not flagged.
-  const GATE_MACHINERY_TERM = /\b(?:completion gate|coverage surfaces?|win[ -]conditions?|blockers?|operational (?:context|state)|ready[ _]for[ _]final|evidence gate)\b/i;
-  const GATE_NARRATION_CLAUSE = new RegExp(GATE_MACHINERY_TERM.source, 'i');
+  // Vocabulary is split by how much it proves. "Completion gate" and "coverage surfaces" name
+  // internal apparatus and appear nowhere in ordinary speech. "Blockers" and "verified" are
+  // plain English that developers use constantly — treating them as machinery meant a perfectly
+  // good short answer like "No blockers, done." was suppressed as narration and never shown.
+  //
+  // So a strong apparatus term is REQUIRED. Weak terms only help strip clauses once narration
+  // has already been established by a strong one; they can never establish it alone.
+  const GATE_APPARATUS_STRONG = /\b(?:completion gate|coverage surfaces?|win[ -]conditions?|ready[ _]for[ _]final|evidence gate|operational (?:context|state)|gate (?:is )?(?:now )?(?:clear|cleared|satisfied))\b/i;
+  const GATE_APPARATUS_WEAK = /\b(?:blockers?|inspected and verified|all surfaces?|no blockers remain)\b/i;
   const BARE_COMPLETION_CLAUSE = /^(?:the\s+)?task\s+(?:is\s+)?(?:now\s+)?(?:fully\s+)?complete[d.!]*$|^(?:all\s+)?done[.!]*$|^(?:everything|all)\s+(?:is\s+)?(?:verified|complete[d]?|satisfied)[.!]*$/i;
 
   function isCompletionGateNarration(text) {
     const value = String(text || '').trim();
-    if (!value || !GATE_MACHINERY_TERM.test(value)) return false;
+    // No apparatus term means this is someone talking, not the machinery narrating itself.
+    if (!value || !GATE_APPARATUS_STRONG.test(value)) return false;
     const residual = value
       .split(/(?<=[.!?])\s+|\n+|;\s+|\s+[—–]\s+/)
       .map(clause => clause.trim())
       .filter(clause => clause
-        && !GATE_NARRATION_CLAUSE.test(clause)
+        && !GATE_APPARATUS_STRONG.test(clause)
+        && !GATE_APPARATUS_WEAK.test(clause)
         && !BARE_COMPLETION_CLAUSE.test(clause))
       .join(' ')
       .trim();
@@ -360,6 +369,15 @@
     return shingles;
   }
 
+  // Measures how much of THE DRAFT is recycled phrasing — deliberately not similarity, and
+  // deliberately not divided by the smaller of the two sets.
+  //
+  // Dividing by the smaller set punished brevity: a short but legitimate answer that reused a
+  // few phrases from a long previous message scored near 1.0 purely because its own shingle set
+  // was tiny, and got rejected for being concise. Dividing by the DRAFT asks the question that
+  // actually matters — "does this reply contain anything new?" — and is just as resistant to
+  // padding, because defeating it requires adding as much genuinely new material as the
+  // original, at which point it is a new answer.
   function restatementOverlap(draft, previous) {
     const draftWords = normalizeForSimilarity(draft).split(' ').filter(Boolean);
     const previousWords = normalizeForSimilarity(previous).split(' ').filter(Boolean);
@@ -369,9 +387,7 @@
     if (!draftShingles.size || !previousShingles.size) return 0;
     let shared = 0;
     draftShingles.forEach(shingle => { if (previousShingles.has(shingle)) shared++; });
-    // Divided by the SMALLER set so a restatement padded with one new sentence still scores
-    // high — otherwise adding filler would defeat the check.
-    return shared / Math.min(draftShingles.size, previousShingles.size);
+    return shared / draftShingles.size;
   }
 
   function isRestatementOfPrevious(draft, previousAssistantText) {

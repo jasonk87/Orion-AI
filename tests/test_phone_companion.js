@@ -28,7 +28,7 @@ function request(method, port, path, body, session) {
       res.on('end', () => {
         let json = null;
         try { json = JSON.parse(text); } catch (e) {}
-        resolve({ statusCode: res.statusCode, text, json });
+        resolve({ statusCode: res.statusCode, headers: res.headers, text, json });
       });
     });
     req.on('error', reject);
@@ -109,6 +109,11 @@ function makeElectronMock(handlers = {}) {
               if (script.includes('resumePhoneCompanionTask')) return { success: true, queued: true };
               if (script.includes('discoverPhoneCompanionSkills')) return handlers.skills || { skills: [{ name: 'demo-skill', description: 'demo' }], count: 1 };
               if (script.includes('runPhoneCompanionSkill')) return handlers.skillRun || { success: true, outputs: { ok: true } };
+              if (script.includes('readChatImageForPhone')) return handlers.chatImage || {
+                success: true,
+                data: Buffer.from('phone-image').toString('base64'),
+                mimeType: 'image/png'
+              };
               return { success: true };
             },
             send: () => {}
@@ -1052,9 +1057,84 @@ test('phone pickers proxy the desktop selection through /api/model', t => {
 
 test('a reasoning level picked on the desktop reaches the phone through status sync', t => {
   const html = companionHtml();
-  t.ok(html.includes('if (state.reasoning) reflectReasoningSelection(state.reasoning);'),
-    'status polling reflects a desktop-side reasoning change');
+  // Guarded, not unconditional: an unguarded reflect let a poll issued before the user's own
+  // POST landed carry the desktop's stale value back down and revert their selection.
+  t.ok(/if \(state\.reasoning && !syncSuppressed\('reasoning', state\.reasoning, state\.selectionRevisions\)\)/.test(html),
+    'status polling reflects a desktop-side reasoning change, unless the phone has an unechoed local pick');
   t.ok(html.includes('composerModelSelect].forEach(select =>'),
-    'status polling syncs both model selects without clobbering an in-progress change');
+    'status polling syncs both model selects');
+  t.ok(/if \(state\.model && !syncSuppressed\('model', state\.model, state\.selectionRevisions\)\)/.test(html),
+    'and the model sync carries the same guard');
+  t.ok(html.includes('shouldRejectSelectionRevision(acceptedSelectionRevision[field], revision)'),
+    'an older poll remains rejected even after a newer POST has been acknowledged');
+  t.ok(html.includes('acknowledgeSelectionResponse(body.model ? \'model\' : \'reasoning\', data)'),
+    'the successful POST advances the phone-side accepted revision before forced refresh');
+  t.end();
+});
+
+test('a pre-save revision-zero poll cannot overwrite an acknowledged phone selection', t => {
+  const html = companionHtml();
+  const start = html.indexOf('function shouldRejectSelectionRevision(');
+  const end = html.indexOf('\n  }', start);
+  t.ok(start > 0 && end > start, 'the generated phone client contains the revision-ordering guard');
+  const source = html.slice(start, end + 4);
+  const shouldReject = new Function(`${source}; return shouldRejectSelectionRevision;`)();
+
+  t.equal(shouldReject(0, 0), false, 'an unversioned initial state remains compatible');
+  t.equal(shouldReject(100, 0), true, 'revision zero is stale after a saved selection is acknowledged');
+  t.equal(shouldReject(100, 99), true, 'any older positive revision is also stale');
+  t.equal(shouldReject(100, 100), false, 'the acknowledged revision may be rendered');
+  t.equal(shouldReject(100, 101), false, 'a genuinely newer desktop change may win');
+  t.end();
+});
+
+test('assistant screenshot references render directly in phone chat through the authenticated image endpoint', t => {
+  const html = companionHtml();
+  t.ok(html.includes('data-chat-image-path'), 'conversation-scoped image references get an inline image element');
+  t.ok(html.includes("companionFetch('/api/chat-image?conversationId='"), 'image bytes use the paired companion fetch path');
+  t.ok(html.includes('URL.createObjectURL(await response.blob())'), 'the fetched image is displayed without persisting base64 in state');
+  t.ok(html.includes('releaseChatImageObjectUrls()'), 'object URLs are released when the transcript rerenders');
+  t.ok(html.includes('attempt < 2'), 'transient image fetch failures receive bounded retries');
+  t.ok(html.includes('Image unavailable — tap to retry'), 'a persistent failure stays visible and user-retryable');
+  t.notOk(html.includes("figure.style.display = 'none'"), 'a failed first fetch cannot silently erase the attachment');
+  t.end();
+});
+
+test('paired phone retrieves a conversation-scoped Coder screenshot through the real image route', async t => {
+  const port = 1156;
+  const bytes = Buffer.from('real-phone-image-bytes');
+  const { main } = await startMainWithConfig(port, {}, {
+    state: {
+      conversationId: 'dispatch-image',
+      title: 'Desktop inspection',
+      conversations: [{ id: 'dispatch-image', title: 'Desktop inspection', active: true }],
+      messages: []
+    },
+    chatImage: {
+      success: true,
+      data: bytes.toString('base64'),
+      mimeType: 'image/png'
+    }
+  });
+  try {
+    const pair = await request('POST', port, '/api/pair', {
+      pairingCode: 'pair-code-123456',
+      deviceName: 'Pixel'
+    });
+    const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+    await request('GET', port, '/api/state', null, session);
+    const image = await request(
+      'GET',
+      port,
+      '/api/chat-image?conversationId=dispatch-image&path=' + encodeURIComponent('orion-artifact://coder/codex.png'),
+      null,
+      session
+    );
+    t.equal(image.statusCode, 200, 'the authenticated image route serves the attachment');
+    t.equal(image.headers['content-type'], 'image/png', 'the original image MIME type is preserved');
+    t.equal(Buffer.from(image.text, 'binary').toString(), bytes.toString(), 'the relayed screenshot bytes are intact');
+  } finally {
+    await closeServer(main.getCompanionServer());
+  }
   t.end();
 });

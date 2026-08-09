@@ -84,6 +84,7 @@ function makeElectronMock(handlers = {}) {
                 conversationId: 'conv1', title: 'T', conversations: [], tasks: [], messages: [],
                 latestOutput: '', preview: {}
               };
+              if (script.includes('readChatImageForPhone')) return handlers.chatImage || { success: false, error: 'Image not found' };
               if (script.includes('readWorkspaceFileForPhone')) return handlers.readFile || { success: false, error: 'File not found' };
               if (script.includes('submitPhoneCompanionPrompt')) return handlers.prompt || { success: true, queued: false };
               return { success: true };
@@ -298,6 +299,36 @@ test('/api/files/read: serves text file content with correct headers', async (t)
   t.equal(res.statusCode, 200, 'successful read returns 200');
   t.equal(res.text, 'hello file', 'response body contains file content');
   t.ok(electron.calls.some(c => c.includes('readWorkspaceFileForPhone')), 'renderer function was called');
+  await closeServer(main.getCompanionServer());
+  t.end();
+});
+
+test('/api/chat-image serves an authenticated image attached to the selected conversation', async (t) => {
+  const imageBytes = Buffer.from('conversation-image');
+  const { main, electron } = await startServer(1240, {
+    state: { conversationId: 'conv1', title: 'T', conversations: [], tasks: [], messages: [], latestOutput: '', preview: {} },
+    chatImage: { success: true, data: imageBytes.toString('base64'), mimeType: 'image/png' }
+  });
+  const session = await pairDevice(1240);
+  await request('GET', 1240, '/api/state', null, session);
+  const imagePath = encodeURIComponent('orion-artifact://conv1/screenshots/result.png');
+  const res = await request('GET', 1240, `/api/chat-image?conversationId=conv1&path=${imagePath}`, null, session);
+  t.equal(res.statusCode, 200, 'the selected conversation may load its attached image');
+  t.equal(res.text, imageBytes.toString(), 'the endpoint returns the original image bytes');
+  t.ok(electron.calls.some(call => call.includes('readChatImageForPhone')), 'the scoped renderer image bridge was used');
+  await closeServer(main.getCompanionServer());
+  t.end();
+});
+
+test('/api/chat-image rejects a stale or unrelated conversation id', async (t) => {
+  const { main } = await startServer(1241, {
+    state: { conversationId: 'conv1', title: 'T', conversations: [], tasks: [], messages: [], latestOutput: '', preview: {} },
+    chatImage: { success: true, data: Buffer.from('x').toString('base64'), mimeType: 'image/png' }
+  });
+  const session = await pairDevice(1241);
+  await request('GET', 1241, '/api/state', null, session);
+  const res = await request('GET', 1241, '/api/chat-image?conversationId=conv2&path=image.png', null, session);
+  t.equal(res.statusCode, 409, 'a paired phone cannot fetch another conversation through a stale view');
   await closeServer(main.getCompanionServer());
   t.end();
 });

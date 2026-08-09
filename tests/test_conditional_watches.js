@@ -110,7 +110,7 @@ test('unattended probes cannot take outward-facing actions', t => {
 });
 
 test('ordinary read-only checks remain usable as probes', t => {
-  ['npm test', 'git status --porcelain', 'node -e "process.exit(0)"', 'git rev-parse HEAD']
+  ['npm test', 'git status --porcelain', 'git rev-parse HEAD', 'pytest -q', 'curl -s https://example.com']
     .forEach(command => {
       t.equal(safety.classifyUnattendedProbeCommand(command).allowed, true,
         `"${command}" is a legitimate read-only probe`);
@@ -121,14 +121,32 @@ test('ordinary read-only checks remain usable as probes', t => {
 // ── Probes ────────────────────────────────────────────────────────────────────
 
 test('a command probe observes exit code as well as output', async t => {
-  const passing = await runProbe({ type: 'command', command: 'node -e "process.exit(0)"' });
-  const failing = await runProbe({ type: 'command', command: 'node -e "process.exit(3)"' });
+  // Uses git rather than `node -e` because interpreters are no longer allowlisted for probes —
+  // they can perform arbitrary writes that no denylist can inspect. git rev-parse gives a real
+  // pass/fail pair through a program that only reads.
+  const repoRoot = path.join(__dirname, '..');
+  const passing = await runProbe({ type: 'command', command: 'git rev-parse --verify HEAD', workspacePath: repoRoot });
+  const failing = await runProbe({ type: 'command', command: 'git rev-parse --verify refs/heads/definitely-not-a-real-branch', workspacePath: repoRoot });
   t.equal(passing.truthy, true, 'exit 0 is a passing check');
   t.equal(failing.truthy, false, 'a non-zero exit is a failing check');
   // Regression guard: without windowsVerbatimArguments the quoted command was mangled into a
   // no-op that always exited 0, so a failing build could never be observed at all.
-  t.equal(failing.exitCode, 3, 'the real exit code survives shell quoting');
+  t.ok(failing.exitCode > 0, `the real non-zero exit code survives shell quoting (got ${failing.exitCode})`);
   t.notEqual(passing.signature, failing.signature, 'the exit code is part of the observed identity');
+  t.end();
+});
+
+test('a probe killed by a signal is an error, never a passing check', async t => {
+  // Node reports code === null for a signal kill. Coercing that to 0 made a KILLED probe read
+  // as "the condition is satisfied" — an OOM kill or our own timeout could fire a watch on
+  // nothing. A terminated process produced no measurement at all.
+  const result = await runProbe(
+    { type: 'command', command: 'ping -n 60 127.0.0.1' },
+    { timeoutMs: 1200 }
+  );
+  t.equal(result.ok, false, 'a killed probe is not a successful observation');
+  t.notEqual(result.truthy, true, 'and is never reported as a satisfied condition');
+  t.notEqual(result.exitCode, 0, 'it does not masquerade as exit 0');
   t.end();
 });
 
@@ -142,11 +160,12 @@ test('a blocked probe command reports the block instead of running', async t => 
 test('a probe that hangs is killed rather than wedging the tick', async t => {
   const started = Date.now();
   const result = await runProbe(
-    { type: 'command', command: 'node -e "setTimeout(()=>{},60000)"' },
+    { type: 'command', command: 'ping -n 60 127.0.0.1' },
     { timeoutMs: 1500 }
   );
   t.equal(result.ok, false, 'a hung probe reports failure');
-  t.equal(result.timedOut, true, 'explicitly as a timeout');
+  t.ok(result.timedOut || result.killedBySignal,
+    'explicitly as a timeout or a signal kill, not as a result');
   t.ok(Date.now() - started < 20000, 'and does not block the tick for the command\'s full duration');
   // The probe runs under a cmd.exe/powershell wrapper, so child.kill() leaves the real command
   // orphaned. That was not merely slow — a 5-minute watch with a hanging probe would leak one
