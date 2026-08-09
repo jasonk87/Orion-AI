@@ -213,8 +213,9 @@
     const semanticIntent = input.semanticIntent && typeof input.semanticIntent === 'object'
       ? input.semanticIntent
       : {};
-    const recallRequested = semanticIntent.reasoningPolicyHint
-      && semanticIntent.reasoningPolicyHint.contextNeed === 'historical';
+    const memoryIntent = String(semanticIntent.memoryIntent || 'none');
+    const recallRequested = memoryIntent === 'conversation_recall';
+    const memoryPolicyQuestion = memoryIntent === 'memory_policy';
     const suppliedStatuses = Array.isArray(input.structuredStatuses) ? input.structuredStatuses : [];
     const extractedStatuses = contracts
       ? contracts.extractStructuredStatusFacts([prompt, input.statusText || ''].filter(Boolean).join('\n'))
@@ -242,6 +243,9 @@
       String(input.systemPrompt || ''),
       recallRequested
         ? (evidencePrompt || '[MEMORY RETRIEVAL RESULT]\nNo relevant prior-conversation evidence was retrieved. Say so plainly and label any reasoning as inference.')
+        : '',
+      memoryPolicyQuestion && contracts && typeof contracts.buildMemoryPolicyContext === 'function'
+        ? contracts.buildMemoryPolicyContext()
         : '',
       statuses.length
         ? `[STRUCTURED STATUS FACTS]\n${JSON.stringify(statuses)}\nPreserve these exact states; mergeable is not merged, queued is not running, cancelled is not completed, and reported/mock results are not independently verified.`
@@ -298,7 +302,7 @@
         text = retryText;
       }
     }
-    if (contracts && (recallRequested || contracts.hasExplicitRecallClaim(text))) {
+    if (contracts && (recallRequested || (!memoryPolicyQuestion && contracts.hasExplicitRecallClaim(text)))) {
       const validation = contracts.validateMemoryResponse(text, {
         conversationEvidence: evidence,
         recallRequested

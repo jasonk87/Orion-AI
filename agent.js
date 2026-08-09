@@ -1718,9 +1718,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const resolvedRequestForRouting = contextualTaskResolution && contextualTaskResolution.success
     ? contextualTaskResolution.task.objective
     : (semanticIntent.resolvedRequest || userPrompt);
-  const recallRequested = !!(isOrionMode
-    && semanticIntent.reasoningPolicyHint
-    && semanticIntent.reasoningPolicyHint.contextNeed === 'historical');
+  const memoryIntent = String(semanticIntent.memoryIntent || 'none');
+  const recallRequested = isOrionMode && memoryIntent === 'conversation_recall';
+  const memoryPolicyQuestion = isOrionMode && memoryIntent === 'memory_policy';
   const conversationEvidenceSearch = recallRequested
     ? await searchConversationEvidenceForRun(conversation, userPrompt, workspaceResolution)
     : { success: true, evidence: [], queryTerms: [] };
@@ -2187,6 +2187,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         ? 'Understood. I will base any recall claim only on these retrieved conversational excerpts.'
         : 'Understood. I will not claim to remember a conversation that was not retrieved.' }] }
     );
+  }
+  if (memoryPolicyQuestion && OrchestrationContracts
+      && typeof OrchestrationContracts.buildMemoryPolicyContext === 'function') {
+    messages.splice(Math.max(0, messages.length - 1), 0, {
+      role: 'user',
+      parts: [{ text: OrchestrationContracts.buildMemoryPolicyContext() }]
+    });
   }
 
   // OC injection optimization: subsequent turns inject a short header instead of full OC state
@@ -3271,7 +3278,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           });
           continue;
         }
-        if (OrchestrationContracts && (recallRequested || OrchestrationContracts.hasExplicitRecallClaim(textVal))) {
+        if (OrchestrationContracts && (recallRequested
+            || (!memoryPolicyQuestion && OrchestrationContracts.hasExplicitRecallClaim(textVal)))) {
           const memoryValidation = OrchestrationContracts.validateMemoryResponse(textVal, {
             conversationEvidence: retrievedConversationEvidence,
             recallRequested
@@ -4629,7 +4637,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         : '';
       lastTextResponse = `I paused before completion because \`${failureLabel}\` failed ${forcedYieldFailure.failureCount || 3} times in the same way.${failureDetail}\n\nWork already completed remains in the workspace. This task is still pending, not completed; continue it after changing the failing command or verification approach.`;
     }
-    if (OrchestrationContracts && (recallRequested || OrchestrationContracts.hasExplicitRecallClaim(lastTextResponse))) {
+    if (OrchestrationContracts && (recallRequested
+        || (!memoryPolicyQuestion && OrchestrationContracts.hasExplicitRecallClaim(lastTextResponse)))) {
       const finalMemoryValidation = OrchestrationContracts.validateMemoryResponse(lastTextResponse, {
         conversationEvidence: retrievedConversationEvidence,
         recallRequested

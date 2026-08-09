@@ -19,6 +19,7 @@ function classification(intent, overrides = {}) {
       risk: 'low',
       contextNeed: 'none'
     },
+    memoryIntent: 'none',
     taskResolution: {
       title: '',
       requirements: [],
@@ -274,6 +275,34 @@ test('classifier contract treats an already resolved named project as the concre
     'the language contract prevents repeated target-choice questions after confirmation');
   t.match(prompt, /more than two files or multiple architectural surfaces/i,
     'the classifier receives a semantic breadth contract instead of a filename keyword rule');
+  t.end();
+});
+
+test('memory behavior questions are structurally distinct from conversation recall', async t => {
+  let classifierPrompt = '';
+  const policyQuestion = await router.classify(baseContext('Do you ever save anything I tell you or only when I specifically ask?'), {
+    structureApi,
+    classify: async request => {
+      classifierPrompt = request.prompt;
+      return classification('conversation', {
+        memoryIntent: 'memory_policy',
+        reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' }
+      });
+    }
+  });
+  t.equal(policyQuestion.memoryIntent, 'memory_policy', 'the memory mechanism question keeps its semantic category');
+  t.equal(policyQuestion.reasoningPolicyHint.contextNeed, 'none', 'a policy explanation cannot accidentally trigger historical retrieval');
+  t.match(classifierPrompt, /memory_policy asks how Orion saves/i, 'the shared classifier contract explains the distinction');
+
+  const recall = await router.classify(baseContext('What did we decide in our earlier conversation?'), {
+    structureApi,
+    classify: async () => classification('conversation', {
+      memoryIntent: 'conversation_recall',
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'recent' }
+    })
+  });
+  t.equal(recall.memoryIntent, 'conversation_recall', 'a genuine recall request remains explicit');
+  t.equal(recall.reasoningPolicyHint.contextNeed, 'historical', 'genuine recall deterministically requests historical evidence');
   t.end();
 });
 

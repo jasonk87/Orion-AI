@@ -1260,6 +1260,47 @@ test('committed Coder handoff remains successful when supervisor UI persistence 
   t.end();
 });
 
+test('Dispatch explains memory behavior without entering the conversation-recall gate', async t => {
+  const originalFetch = global.fetch;
+  let searchCalls = 0;
+  let memoryPolicyReachedModel = false;
+  const answerText = 'I save conversations automatically and selectively keep durable facts or preferences when they are likely to matter again. You do not have to ask every time, but an explicit request makes it unambiguous; not every statement becomes permanent memory.';
+  const harness = installHarness([
+    body => {
+      memoryPolicyReachedModel = JSON.stringify(body).includes('[ORION MEMORY BEHAVIOR]');
+      return [{ text: answerText }];
+    }
+  ], {
+    semanticClassification: {
+      intent: 'conversation',
+      requiresExecution: false,
+      target: 'current_conversation',
+      memoryIntent: 'memory_policy',
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' }
+    },
+    api: {
+      searchConversationEvidence: async () => {
+        searchCalls += 1;
+        return { success: true, evidence: [], queryTerms: [] };
+      }
+    }
+  });
+  const prompt = 'By the way, do you ever save anything I tell you or only when I specifically ask?';
+  const conv = conversation('memory-policy-question');
+  try {
+    await global.window.runAgentLoop(prompt, 'gemini-1', conv);
+    const answer = conv.messages.find(message => message.role === 'assistant');
+    t.equal(searchCalls, 0, 'a memory-policy question does not search for an allegedly earlier conversation');
+    t.equal(harness.modelTurns, 1, 'the natural first answer is not replaced by a recall correction turn');
+    t.equal(memoryPolicyReachedModel, true, 'the response model receives authoritative memory-mechanism context');
+    t.equal(answer.text, answerText, 'the direct answer survives without an unrelated retrieval fallback');
+    t.notOk(/couldn.?t retrieve that specific earlier conversation/i.test(answer.text), 'the conversation-recall fallback is absent');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
 test('Dispatch loop permits an explicit recall claim only when exact evidence was retrieved', async t => {
   const originalFetch = global.fetch;
   let searchCalls = 0;
@@ -1284,6 +1325,7 @@ test('Dispatch loop permits an explicit recall claim only when exact evidence wa
     semanticClassification: {
       contextDependent: true,
       target: 'current_conversation',
+      memoryIntent: 'conversation_recall',
       reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' },
       inspectionTarget: 'project'
     },
@@ -1313,6 +1355,7 @@ test('Dispatch loop permits an explicit recall claim only when exact evidence wa
         contextDependent: true,
         confidence: 1,
         needsClarification: false,
+        memoryIntent: 'conversation_recall',
         reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' },
         executionScope: 'none',
         inspectionTarget: 'project',
@@ -1353,6 +1396,7 @@ test('Dispatch loop validates every recall answer and accepts a grounded semanti
     semanticClassification: {
       contextDependent: true,
       target: 'current_conversation',
+      memoryIntent: 'conversation_recall',
       reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' },
       inspectionTarget: 'project'
     },
@@ -1389,6 +1433,7 @@ test('Dispatch loop corrects an invented recollection when no evidence exists', 
     semanticClassification: {
       contextDependent: true,
       target: 'current_conversation',
+      memoryIntent: 'conversation_recall',
       reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' }
     },
     api: {
@@ -1417,6 +1462,7 @@ test('Dispatch loop rejects an unlabeled reconstruction when recall evidence is 
     semanticClassification: {
       contextDependent: true,
       target: 'current_conversation',
+      memoryIntent: 'conversation_recall',
       reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' }
     },
     api: {

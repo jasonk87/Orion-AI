@@ -21,6 +21,13 @@
   ]);
   const LEVELS = Object.freeze(['low', 'medium', 'high']);
   const CONTEXT_NEEDS = Object.freeze(['none', 'recent', 'task', 'project', 'historical']);
+  const MEMORY_INTENTS = Object.freeze([
+    'none',
+    'conversation_recall',
+    'memory_policy',
+    'stored_memory_lookup',
+    'memory_write'
+  ]);
   const INSPECTION_BREADTHS = Object.freeze(['none', 'single_file', 'focused', 'broad']);
   const RUNTIME_SCAFFOLD_SOURCES = new Set([
     'agent-start-blocked',
@@ -186,12 +193,14 @@
       '- recentOwnedTask supplies context for a retry or replacement after terminal work. It is not active-task authority and must never by itself authorize cancellation, steering, or a claim that the old task is still running.',
       '- candidateAction is an attempted action awaiting semantic adjudication, not proof of authorization. Approve its meaning only when userMessage and the supplied conversation actually request that action.',
       '- A conversational reaction or acknowledgment whose meaning depends on priorAssistantMessage is contextDependent and should request recent context. A standalone greeting or unrelated small talk is not contextDependent and should request no context.',
+      '- Distinguish memory semantics explicitly. conversation_recall asks what was said, decided, or discussed in a past conversation. memory_policy asks how Orion saves, retains, or forgets information and is not a recall request. stored_memory_lookup asks what is currently stored. memory_write asks Orion to save new information.',
+      '- Set reasoningPolicyHint.contextNeed to historical for conversation_recall or a stored_memory_lookup that genuinely needs history. A memory_policy explanation does not need historical conversation retrieval.',
       '- requiresExecution describes whether satisfying the resolved request requires tools or state mutation. It does not authorize execution.',
       '- executionScope is read_only for inspection, review, status gathering, or known commands that do not mutate durable state; mutating is for edits, installs, lifecycle changes, queue changes, approval, denial, revision, or cancellation.',
       '- inspectionTarget identifies where evidence must come from. Use local_system for machine/process facts, workspace/project for source or project facts, and none for ordinary conversation.',
       '- inspectionBreadth describes the source evidence needed for a workspace/project inspection: single_file means exactly one known file, focused means at most two source files, and broad means a project review or question that cannot be answered honestly without inspecting more than two files or multiple architectural surfaces. Do not use broad for local-system inspection or ordinary conversation.',
       '- standaloneSystemOperation is true only for executable local-machine work that is not bound to a selected project.',
-      '- Set reasoningPolicyHint.contextNeed to historical only for an actual request about past conversations; casual conversation should be none.',
+      '- Set reasoningPolicyHint.contextNeed to historical only when historical evidence is actually needed; casual conversation and memory_policy explanations should be none.',
       '',
       'Required schema:',
       JSON.stringify({
@@ -208,6 +217,7 @@
           risk: 'low | medium | high',
           contextNeed: 'none | recent | task | project | historical'
         },
+        memoryIntent: 'none | conversation_recall | memory_policy | stored_memory_lookup | memory_write',
         taskResolution: {
           title: '',
           requirements: [],
@@ -247,6 +257,7 @@
         needsClarification: false,
         clarificationQuestion: '',
         reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'recent' },
+        memoryIntent: 'none',
         taskResolution: { title: '', requirements: [], constraints: [], unresolvedDecisions: [] },
         executionScope: 'none',
         inspectionTarget: 'none',
@@ -268,6 +279,7 @@
         ? 'I could not safely determine whether that refers to the current task or plan. What would you like me to do with it?'
         : 'I could not safely determine what action you intended. Could you clarify what you would like Orion to do?',
       reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'task' },
+      memoryIntent: 'none',
       taskResolution: { title: '', requirements: [], constraints: [], unresolvedDecisions: [] },
       executionScope: 'none',
       inspectionTarget: 'none',
@@ -305,6 +317,10 @@
 
     const hint = parsed.reasoningPolicyHint && typeof parsed.reasoningPolicyHint === 'object'
       ? parsed.reasoningPolicyHint : {};
+    const memoryIntent = MEMORY_INTENTS.includes(parsed.memoryIntent) ? parsed.memoryIntent : 'none';
+    let contextNeed = CONTEXT_NEEDS.includes(hint.contextNeed) ? hint.contextNeed : 'none';
+    if (memoryIntent === 'conversation_recall') contextNeed = 'historical';
+    if (memoryIntent === 'memory_policy' && contextNeed === 'historical') contextNeed = 'none';
     const resolution = parsed.taskResolution && typeof parsed.taskResolution === 'object'
       ? parsed.taskResolution : {};
     let resolvedRequest = string(parsed.resolvedRequest, 12000);
@@ -349,8 +365,9 @@
       reasoningPolicyHint: {
         complexity: LEVELS.includes(hint.complexity) ? hint.complexity : 'low',
         risk: LEVELS.includes(hint.risk) ? hint.risk : 'low',
-        contextNeed: CONTEXT_NEEDS.includes(hint.contextNeed) ? hint.contextNeed : 'none'
+        contextNeed
       },
+      memoryIntent,
       taskResolution: {
         title: string(resolution.title, 500),
         requirements: strings(resolution.requirements),
@@ -402,6 +419,7 @@
     INTENTS,
     TARGETS,
     INSPECTION_BREADTHS,
+    MEMORY_INTENTS,
     isRuntimeScaffoldingMessage,
     buildInput,
     buildClassifierPrompt,

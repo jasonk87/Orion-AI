@@ -163,6 +163,10 @@
     return `I found the earlier conversation. The relevant part was: ${summary.slice(0, 1800)}`;
   }
 
+  function buildMemoryPolicyContext() {
+    return `[ORION MEMORY BEHAVIOR]\nThe user is asking how Orion's memory works, not asking Orion to reconstruct a particular past conversation. Answer the mechanism directly and naturally. Conversations are persisted automatically. Durable facts and preferences are saved selectively when they appear useful; the user does not always have to ask, while an explicit request to remember something should be honored and makes the intent unambiguous. Not every statement becomes a durable fact. Compacted conversation summaries help continuity but are not a verbatim permanent transcript. Do not cite specific personal facts as examples unless they were actually retrieved in this run.`;
+  }
+
   const TASK_STATE_ALIASES = Object.freeze({
     pending: 'pending',
     queued: 'pending',
@@ -752,6 +756,7 @@
     validateMemoryResponse,
     buildMemoryCorrectionPrompt,
     buildEvidenceBackedRecallFallback,
+    buildMemoryPolicyContext,
     extractStructuredStatusFacts,
     structuredStatusIdentity,
     mergeStructuredStatusFacts,

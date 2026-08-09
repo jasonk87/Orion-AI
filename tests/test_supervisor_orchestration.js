@@ -235,6 +235,7 @@ test('supervised conversational recall uses retrieved evidence and records its b
       intent: 'conversation',
       target: 'current_conversation',
       requiresExecution: false,
+      memoryIntent: 'conversation_recall',
       reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' }
     },
     systemPrompt: 'Answer conversationally.',
@@ -263,6 +264,7 @@ test('supervised conversational recall cannot invent a missing conversation', as
       intent: 'conversation',
       target: 'current_conversation',
       requiresExecution: false,
+      memoryIntent: 'conversation_recall',
       reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' }
     },
     systemPrompt: 'Answer conversationally.',
@@ -276,6 +278,40 @@ test('supervised conversational recall cannot invent a missing conversation', as
   t.match(result.text, /could(?: not|n['’]t) retrieve/i, 'the response discloses the retrieval gap');
   t.notOk(/Grind|Connect|Survive/i.test(result.text), 'the plausible fabrication is removed');
   t.equal(result.responseBasis.conversationEvidence.length, 0, 'the basis records the absence of evidence');
+  t.end();
+});
+
+test('supervised memory-policy questions answer the mechanism without recall retrieval', async t => {
+  let retrievalCalls = 0;
+  let systemPrompt = '';
+  const result = await supervisor.buildContractedConversationalReply({
+    conversation: { id: 'dispatch-live', mode: 'orion', messages: [] },
+    prompt: 'Do you save anything I tell you automatically?',
+    semanticIntent: {
+      intent: 'conversation',
+      target: 'current_conversation',
+      requiresExecution: false,
+      memoryIntent: 'memory_policy',
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'none' }
+    },
+    systemPrompt: 'Answer conversationally.',
+    messages: []
+  }, {
+    contracts,
+    retrieveEvidence: async () => {
+      retrievalCalls += 1;
+      return { success: true, evidence: [], queryTerms: [] };
+    },
+    generateReply: async prompt => {
+      systemPrompt = prompt;
+      return 'Yes. Conversations are saved automatically, while durable facts and preferences are kept selectively; asking explicitly makes your intent unambiguous.';
+    }
+  });
+
+  t.equal(retrievalCalls, 0, 'the supervisor does not search past conversations for a memory-mechanism question');
+  t.match(systemPrompt, /ORION MEMORY BEHAVIOR/, 'the shared factual memory policy reaches the response model');
+  t.match(result.text, /saved automatically/i, 'the direct mechanism answer is preserved');
+  t.notOk(/could(?: not|n['â€™]t) retrieve/i.test(result.text), 'no unrelated recall fallback appears');
   t.end();
 });
 
