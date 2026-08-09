@@ -1,5 +1,9 @@
 'use strict';
 
+// These assertions intentionally exercise US Central daylight-saving transitions.
+// CI runners commonly use UTC, which has no DST and would make the test meaningless.
+process.env.TZ = 'America/Chicago';
+
 // Calendar schedules ("weekdays at 09:00"). The reason this cannot reuse interval recurrence
 // is DST: a day is 23 or 25 hours twice a year, so a schedule maintained by adding 86,400,000ms
 // drifts to 08:00 or 10:00 and stays wrong until a human notices. Every test that mentions
