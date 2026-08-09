@@ -47,6 +47,9 @@ test('semantic indexing excludes environment files', (t) => {
   t.equal(safety.isIndexableWorkspaceFile('.env'), false, 'excludes .env');
   t.equal(safety.isIndexableWorkspaceFile('.env.local'), false, 'excludes .env.local');
   t.equal(safety.isIndexableWorkspaceFile('production.env'), false, 'does not index env extension files');
+  t.equal(safety.isIndexableWorkspaceFile('.orion/context/operational-context.json'), false, 'excludes Orion internal state even when it has an indexable extension');
+  t.equal(safety.isIndexableWorkspaceFile('node_modules/package/index.js'), false, 'excludes dependency trees by full relative path');
+  t.equal(safety.isIndexableWorkspaceFile('src/context/operational-context.json'), true, 'ordinary project JSON remains indexable');
   t.ok(ipcWorkspaceJs.includes('if (embeddedAllChunks) {'), 'records file hash only after all chunks embed');
   t.ok(ipcWorkspaceJs.includes('delete indexData.files[file.relPath];'), 'failed embedding remains eligible for retry');
   t.end();

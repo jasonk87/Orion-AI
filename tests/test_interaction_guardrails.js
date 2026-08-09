@@ -1201,6 +1201,16 @@ test('post-final cleanup gates and repeated completion blocks cannot consume use
     fileMutationCount: 2,
     previousFileMutationCount: 1
   }), false, 'new file mutations reset the repeated-block escape');
+  t.equal(agent.getUserFacingWorkRevision([
+    { toolName: 'read_file', status: 'done' },
+    { toolName: 'record_adversarial_review', status: 'done' },
+    { toolName: 'append_project_memory', status: 'done' }
+  ]), 1, 'gate bookkeeping does not masquerade as new user-facing work');
+  t.equal(agent.getUserFacingWorkRevision([
+    { toolName: 'read_file', status: 'done' },
+    { toolName: 'record_adversarial_review', status: 'done' },
+    { toolName: 'run_tests', status: 'error' }
+  ]), 2, 'a real verification step permits a later answer to supersede the pre-gate draft');
   t.end();
 });
 

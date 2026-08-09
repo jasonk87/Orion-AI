@@ -12,6 +12,7 @@ const operational = require('../operational-context');
 const workspaceResolution = require('../workspace-resolution');
 const semanticIntentRouter = require('../semantic-intent-router');
 const reasoningPolicy = require('../reasoning-policy');
+const taskOrchestration = require('../task-orchestration');
 
 // ── Chat auto-scroll ───────────────────────────────────────────────────────────
 // The chat must stick to the bottom while you are following along, and must NOT yank you
@@ -890,5 +891,83 @@ test('the phone companion is served both selections and can set either', async (
     'and the desktop picker reflects it immediately');
   t.equal(set.selectionRevisions.reasoning, win.getPhoneCompanionModels().selectionRevisions.reasoning,
     'the POST acknowledgement and subsequent polls use the same canonical revision');
+  t.end();
+});
+
+test('Dispatch captures model and reasoning into the durable Coder task and runtime queue', async (t) => {
+  let persistedTask = null;
+  const origin = {
+    id: 'dispatch-profile',
+    mode: 'orion',
+    title: 'Dispatch task',
+    sessionId: 'dispatch-profile',
+    messages: []
+  };
+  const target = {
+    id: 'coder-profile',
+    mode: 'coder',
+    title: 'Coder task',
+    sessionId: 'coder-profile',
+    projectPath: 'C:\\Projects\\Orion',
+    messages: []
+  };
+  const loaded = loadRenderer({
+    t,
+    globals: {
+      OrionReasoningPolicy: reasoningPolicy,
+      OrionTaskOrchestration: taskOrchestration
+    },
+    set: {
+      conversations: [origin, target],
+      activeConversationId: origin.id,
+      currentWorkspace: 'C:\\Projects\\Orion'
+    },
+    api: {
+      createOrchestrationTask: async task => {
+        persistedTask = task;
+        return { success: true, task };
+      },
+      writeConfig: async () => true,
+      writeConversations: async () => ({ success: true })
+    }
+  });
+  const { win } = loaded;
+  const modelSelect = win.document.getElementById('model-select');
+  const modelOption = win.document.createElement('option');
+  modelOption.value = 'deepseek-v4-flash';
+  modelOption.textContent = 'DeepSeek V4 Flash';
+  modelSelect.appendChild(modelOption);
+  modelSelect.value = 'deepseek-v4-flash';
+  await win.setReasoningEffortSelection('max');
+
+  const result = await win.enqueueOrchestrationTask({
+    prompt: 'Fix and verify the issue.',
+    originalUserMessage: 'Fix it.',
+    targetConversationId: target.id,
+    originConversationId: origin.id,
+    workspace: {
+      role: 'active_project',
+      path: 'C:\\Projects\\Orion',
+      project: { name: 'Orion', path: 'C:\\Projects\\Orion' },
+      source: 'test',
+      resolved: true
+    },
+    semanticIntent: {
+      intent: 'new_task',
+      requiresExecution: true,
+      target: 'current_conversation',
+      resolvedRequest: 'Fix and verify the issue.',
+      contextDependent: false,
+      needsClarification: false,
+      taskResolution: {}
+    }
+  });
+
+  t.equal(result.success, true, 'the actual renderer handoff queue accepts the task');
+  t.equal(persistedTask.executionProfile.requestedModel, 'deepseek-v4-flash', 'the selected model is durably persisted');
+  t.equal(persistedTask.executionProfile.requestedReasoning, 'max', 'the selected reasoning is durably persisted');
+  t.equal(result.queueItem.modelSelectValue, 'deepseek-v4-flash', 'the immediate runtime queue uses the same model');
+  t.equal(result.queueItem.reasoningEffort, 'max', 'the immediate runtime queue uses the same reasoning');
+  t.equal(result.queueItem.executionProfile.requestedReasoning, 'max', 'the runtime queue retains the whole policy contract');
   t.end();
 });

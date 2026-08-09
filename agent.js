@@ -1604,8 +1604,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   // User-picked reasoning level from the selector next to the input box. 'auto' (the default)
   // resolves to '' so the phase engine keeps deciding; any explicit level is forced through
   // every reasoning-policy selection this run makes.
+  const requestedReasoningEffort = options.reasoningEffort != null
+    ? options.reasoningEffort
+    : (options.executionProfile && options.executionProfile.requestedReasoning != null
+        ? options.executionProfile.requestedReasoning
+        : config.reasoningEffort);
   const forcedReasoningEffort = (ReasoningPolicy && config)
-    ? (normalized => normalized === 'auto' ? '' : normalized)(ReasoningPolicy.normalizeEffortOverride(config.reasoningEffort))
+    ? (normalized => normalized === 'auto' ? '' : normalized)(ReasoningPolicy.normalizeEffortOverride(requestedReasoningEffort))
     : '';
   // Session continuity: build prev-session context on first message, clear otherwise
   const isOrionMode = conversation.mode === 'orion' ||
@@ -1757,6 +1762,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   // handling below) can revert once the file it was escalated for gets a clean edit, instead of
   // silently staying on the more expensive model for the rest of the conversation.
   const userSelectedModelName = activeRunModelName;
+  const allowTaskModelEscalation = !options.executionProfile
+    || options.executionProfile.allowEscalation !== false;
   let modelEscalatedForEditKey = null;
   const promptSource = options.source || 'user';
   const isPlanRevision = options.planRevision === true || promptSource === 'plan-revision';
@@ -1785,6 +1792,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
 
   let lastTextResponse = "Thinking...";
   let bestVisibleAnswer = "";
+  let gateProtectedAnswer = "";
+  let gateProtectedWorkRevision = -1;
+  let gateProtectionType = "";
   let aiMessageIndex = Array.isArray(conversation.messages) ? conversation.messages.length : 0;
   const runMessageToken = `agent-run-${conversation.id || 'conversation'}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   let activeRunMessage = null;
@@ -2087,7 +2097,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     delete conversation._proactiveDeepTaskBaseModel;
   }
   const taskComplexity = planningDecision.taskComplexity || (planningDecision.mode === 'plan' ? 'deep' : 'standard');
-  if (taskComplexity === 'deep') {
+  if (taskComplexity === 'deep' && allowTaskModelEscalation) {
     const upgraded = getNextModelForHighDemand(userSelectedModelName);
     if (upgraded) {
       activeRunModelName = upgraded;
@@ -2425,7 +2435,40 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     }
   }
 
+  function protectVisibleAnswerAcrossInternalGate(type) {
+    const candidate = bestVisibleAnswer || (isSubstantiveVisibleAnswer(lastTextResponse)
+      ? String(lastTextResponse || '')
+      : '');
+    if (!candidate) return;
+    const revision = getUserFacingWorkRevision(workWalkthrough);
+    if (!gateProtectedAnswer || revision > gateProtectedWorkRevision) {
+      gateProtectedAnswer = candidate;
+      gateProtectedWorkRevision = revision;
+      gateProtectionType = String(type || 'internal-gate');
+    }
+  }
+
+  function useGateProtectedAnswerWhenNoNewWork() {
+    if (!gateProtectedAnswer) return false;
+    const revision = getUserFacingWorkRevision(workWalkthrough);
+    if (revision > gateProtectedWorkRevision) {
+      gateProtectedAnswer = '';
+      gateProtectedWorkRevision = -1;
+      gateProtectionType = '';
+      return false;
+    }
+    lastTextResponse = gateProtectedAnswer;
+    ensureActiveRunMessage().text = lastTextResponse;
+    return true;
+  }
+
   function useBestVisibleAnswerIfGateEcho(text) {
+    // Internal gates are allowed to demand more work, but their follow-up turn is not a new user
+    // request. If no new user-facing evidence or implementation happened after the gate, keep the
+    // complete answer that caused the gate instead of replacing it with bookkeeping prose such as
+    // "the assessment above is grounded" or "the report stands." This is based on turn provenance
+    // and concrete work revision, not on trying to enumerate every phrase a model might use.
+    if (useGateProtectedAnswerWhenNoNewWork()) return true;
     if (bestVisibleAnswer && looksLikeLeakedNoToolCorrection(text)) {
       lastTextResponse = bestVisibleAnswer;
       ensureActiveRunMessage().text = lastTextResponse;
@@ -2927,6 +2970,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           ensureActiveRunMessage().text = lastTextResponse;
           break;
         }
+        criticalRunError = e;
         console.error(e);
         lastTextResponse = `Error contacting Model API: ${e.message}`;
         const retryDelayMs = parseRetryDelayMs(e.message);
@@ -3407,6 +3451,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         }
         if (evidencePrompt && loopCount < maxLoops) {
           postEditEvidencePrompts++;
+          protectVisibleAnswerAcrossInternalGate('post-edit-evidence');
           currentAgentLogs.push({ type: 'thought', content: 'Verification guard: code changed, so Orion must inspect the changed files and run or justify a real check before finishing.' });
           messages.push({ role: 'user', parts: [{ text: evidencePrompt }] });
           continue;
@@ -3434,6 +3479,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         }
         if (inspectionKnowledgePrompt && inspectionKnowledgePersistencePrompts < 2 && loopCount < maxLoops) {
           inspectionKnowledgePersistencePrompts++;
+          protectVisibleAnswerAcrossInternalGate('inspection-knowledge');
           currentAgentLogs.push({ type: 'thought', content: 'Inspection knowledge gate: save version-bound file understanding before the review finishes.' });
           messages.push({ role: 'user', parts: [{ text: inspectionKnowledgePrompt }] });
           continue;
@@ -3448,6 +3494,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         }
         if (reviewCompletionPrompt && reviewCompletionPrompts < 3 && loopCount < maxLoops) {
           reviewCompletionPrompts++;
+          protectVisibleAnswerAcrossInternalGate('review-completion');
           currentAgentLogs.push({ type: 'thought', content: 'Review completion gate: review-only work needs broad enough coverage and grounded findings before final response.' });
           messages.push({ role: 'user', parts: [{ text: reviewCompletionPrompt }] });
           continue;
@@ -3468,6 +3515,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         }
         if (finalAnswerQualityPrompt && finalAnswerQualityPrompts < 2 && loopCount < maxLoops) {
           finalAnswerQualityPrompts++;
+          protectVisibleAnswerAcrossInternalGate('final-answer-quality');
           currentAgentLogs.push({ type: 'thought', content: 'Final-answer quality gate: the draft inspected context but did not answer with recommendations, a plan, changes, or a next action.' });
           messages.push({ role: 'user', parts: [{ text: finalAnswerQualityPrompt }] });
           continue;
@@ -3499,6 +3547,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           }
           if (completionGate.status === 'continue_work' && completionGatePrompts < 3 && loopCount < maxLoops) {
             completionGatePrompts++;
+            protectVisibleAnswerAcrossInternalGate('operational-completion');
             const gateMessage = buildCompletionGateMessage(completionGate);
             currentAgentLogs.push({ type: 'thought', content: `Completion gate held final response.\n${gateMessage}` });
             messages.push({
@@ -4122,7 +4171,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               // tooling gap — escalate to a stronger model for the turns needed to fix it, then
               // revert once this file gets a clean edit so the rest of the run doesn't silently
               // stay on the more expensive model.
-              if (!modelEscalatedForEditKey) {
+              if (!modelEscalatedForEditKey && allowTaskModelEscalation) {
                 const strongerModel = getNextModelForHighDemand(activeRunModelName);
                 if (strongerModel) {
                   modelEscalatedForEditKey = editKey;
@@ -4621,13 +4670,22 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         lastTextResponse = "Task finished.";
       }
     }
+    const protectedGateAnswerStillCurrent = gateProtectedAnswer
+      && getUserFacingWorkRevision(workWalkthrough) <= gateProtectedWorkRevision;
     if (bestVisibleAnswer
-        && (looksLikeLeakedNoToolCorrection(lastTextResponse)
+        && (protectedGateAnswerStillCurrent
+          || looksLikeLeakedNoToolCorrection(lastTextResponse)
           || (OrchestrationContracts && OrchestrationContracts.isCompletionGateNarration(lastTextResponse)))) {
       // The last model reply answered the completion gate instead of the user. The substantive
       // answer it produced earlier in the run is the one the user (and the Dispatch relay,
       // via result.summary below) should see.
-      lastTextResponse = bestVisibleAnswer;
+      lastTextResponse = protectedGateAnswerStillCurrent ? gateProtectedAnswer : bestVisibleAnswer;
+      if (protectedGateAnswerStillCurrent) {
+        currentAgentLogs.push({
+          type: 'thought',
+          content: `Answer continuity guard: ${gateProtectionType || 'an internal gate'} completed without new user-facing work, so Orion preserved the substantive answer that preceded it.`
+        });
+      }
     }
     if (forceYield && forcedYieldFailure
         && !conversation.awaitingPlanApproval && !conversation.awaitingClarification) {
@@ -4871,7 +4929,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         conversation,
         modelName,
         taskId: runTaskId,
-        structuredPlan: structuredContinuation
+        structuredPlan: structuredContinuation,
+        reasoningEffort: requestedReasoningEffort,
+        executionProfile: options.executionProfile
       });
     }
 
@@ -5112,7 +5172,14 @@ function buildAutomaticTaskContinuationPrompt(structuredPlan = false) {
   return `[ORION INTERNAL CONTINUATION - not a user message] ${directive} Do not restart completed work, restate the plan, or stop merely because this is a fresh execution pass. Stop only for completion, cancellation, required user input, a real blocker, or repeated work that produces no new evidence. Do not quote this as something the user said.`;
 }
 
-function enqueueAutomaticTaskContinuation({ conversation, modelName, taskId = '', structuredPlan = false } = {}) {
+function enqueueAutomaticTaskContinuation({
+  conversation,
+  modelName,
+  taskId = '',
+  structuredPlan = false,
+  reasoningEffort = 'auto',
+  executionProfile = null
+} = {}) {
   if (!conversation || !conversation.id || conversation.awaitingPlanApproval) return false;
   if (!Array.isArray(window.promptQueue)) window.promptQueue = [];
   const normalizedTaskId = String(taskId || '');
@@ -5127,6 +5194,10 @@ function enqueueAutomaticTaskContinuation({ conversation, modelName, taskId = ''
   window.promptQueue.push({
     prompt: buildAutomaticTaskContinuationPrompt(structuredPlan),
     modelSelectValue: modelName,
+    reasoningEffort,
+    executionProfile: executionProfile && typeof executionProfile === 'object'
+      ? { ...executionProfile }
+      : null,
     conversationId: conversation.id,
     taskId: normalizedTaskId,
     alreadyRendered: true,
@@ -5278,6 +5349,8 @@ async function drainNextQueuedTask() {
       source: nextTask.source || 'queue',
       internalPrompt: internal,
       taskId: nextTask.taskId || '',
+      reasoningEffort: nextTask.reasoningEffort,
+      executionProfile: nextTask.executionProfile,
       preserveUserPrompt: nextTask.preserveUserPrompt === true,
       planRevision: nextTask.planRevision === true,
       images: Array.isArray(nextTask.images) ? nextTask.images : [],
@@ -5486,6 +5559,16 @@ function buildCuratedFileInventory(files, options = {}) {
 }
 
 // TOOL EXECUTOR HUB
+const AGENT_COMMAND_OUTPUT_MAX_CHARS = 200000;
+
+function appendBoundedCommandOutput(currentValue, chunkValue, maxChars = AGENT_COMMAND_OUTPUT_MAX_CHARS) {
+  const combined = `${String(currentValue || '')}${String(chunkValue || '')}`;
+  return {
+    output: combined.length > maxChars ? combined.slice(-maxChars) : combined,
+    truncated: combined.length > maxChars
+  };
+}
+
 async function executeTool(name, args, workspace, config, conversation, executionContext = {}) {
   console.log(`Executing tool ${name} with args:`, args);
   
@@ -6243,14 +6326,20 @@ async function executeTool(name, args, workspace, config, conversation, executio
       const processId = `cmd_${conversation.id}_${Date.now()}`;
       let stdoutOutput = '';
       let stderrOutput = '';
+      let stdoutTruncated = false;
+      let stderrTruncated = false;
       
       // Setup output streamer listener
       const cleanOutput = typeof window.api.onCommandOutput === 'function'
         ? window.api.onCommandOutput(processId, (data) => {
             if (data.type === 'stderr') {
-              stderrOutput += data.text;
+              const appended = appendBoundedCommandOutput(stderrOutput, data.text);
+              stderrOutput = appended.output;
+              stderrTruncated = stderrTruncated || appended.truncated;
             } else {
-              stdoutOutput += data.text;
+              const appended = appendBoundedCommandOutput(stdoutOutput, data.text);
+              stdoutOutput = appended.output;
+              stdoutTruncated = stdoutTruncated || appended.truncated;
             }
           })
         : () => {};
@@ -6286,18 +6375,30 @@ async function executeTool(name, args, workspace, config, conversation, executio
         currentAgentLogs.push({ type: 'thought', content: `pip build failure detected — retrying without version pin: ${retryCmd}` });
         const retryId = `cmd_${conversation.id}_retry_${Date.now()}`;
         let retryStdout = '', retryStderr = '';
+        let retryStdoutTruncated = false, retryStderrTruncated = false;
         const cleanRetry = typeof window.api.onCommandOutput === 'function'
           ? window.api.onCommandOutput(retryId, (data) => {
-              if (data.type === 'stderr') retryStderr += data.text;
-              else retryStdout += data.text;
+              if (data.type === 'stderr') {
+                const appended = appendBoundedCommandOutput(retryStderr, data.text);
+                retryStderr = appended.output;
+                retryStderrTruncated = retryStderrTruncated || appended.truncated;
+              } else {
+                const appended = appendBoundedCommandOutput(retryStdout, data.text);
+                retryStdout = appended.output;
+                retryStdoutTruncated = retryStdoutTruncated || appended.truncated;
+              }
             })
           : () => {};
         const retryResult = await window.api.runCommand(retryCmd, workspace, retryId, timeoutMs);
         cleanRetry();
+        const boundedRetryStdout = appendBoundedCommandOutput('', retryStdout || retryResult.stdout || '');
+        const boundedRetryStderr = appendBoundedCommandOutput('', retryStderr || retryResult.stderr || retryResult.error || '');
         return {
           exitCode: retryResult.code,
-          stdout: retryStdout || retryResult.stdout || '',
-          stderr: retryStderr || retryResult.stderr || retryResult.error || '',
+          stdout: boundedRetryStdout.output,
+          stderr: boundedRetryStderr.output,
+          outputTruncated: retryStdoutTruncated || retryStderrTruncated || boundedRetryStdout.truncated || boundedRetryStderr.truncated,
+          outputLimitChars: AGENT_COMMAND_OUTPUT_MAX_CHARS,
           timedOut: !!retryResult.timedOut,
           killed: !!retryResult.killed,
           timeoutMs: retryResult.timeoutMs || timeoutMs,
@@ -6308,10 +6409,14 @@ async function executeTool(name, args, workspace, config, conversation, executio
         };
       }
 
+      const boundedStdout = appendBoundedCommandOutput('', stdoutOutput || result.stdout || '');
+      const boundedStderr = appendBoundedCommandOutput('', stderrOutput || result.stderr || result.error || '');
       return {
         exitCode: result.code,
-        stdout: stdoutOutput || result.stdout || '',
-        stderr: stderrOutput || result.stderr || result.error || '',
+        stdout: boundedStdout.output,
+        stderr: boundedStderr.output,
+        outputTruncated: stdoutTruncated || stderrTruncated || boundedStdout.truncated || boundedStderr.truncated,
+        outputLimitChars: AGENT_COMMAND_OUTPUT_MAX_CHARS,
         timedOut: !!result.timedOut,
         killed: !!result.killed,
         timeoutMs: result.timeoutMs || timeoutMs
@@ -8813,6 +8918,31 @@ function getInspectedEvidenceAnchors(workWalkthrough = []) {
     if (parts.length) anchors.add(parts[parts.length - 1].toLowerCase());
   });
   return [...anchors].filter(anchor => anchor.length >= 4);
+}
+
+// These tools update Orion's own bookkeeping after the substantive work is already done. They
+// can satisfy an operational gate, but they do not create a new user-facing answer by themselves.
+// Keeping this distinction structural prevents a post-gate acknowledgement from replacing the
+// detailed answer that preceded it while still allowing a genuinely new read/edit/test to produce
+// a revised final answer.
+const INTERNAL_GATE_MAINTENANCE_TOOLS = new Set([
+  'update_mission_context', 'start_subplan', 'update_subplan_context', 'complete_subplan',
+  'record_discovery', 'record_evidence', 'record_blocker', 'resolve_blocker',
+  'convert_blocker_to_backlog', 'promote_discovery', 'discard_noise',
+  'set_coverage_frontier', 'update_coverage_frontier', 'evaluate_win_conditions',
+  'record_adversarial_review', 'set_task_checklist', 'update_notes',
+  'append_project_memory', 'remember_file_notes', 'remember_fact', 'remember_decision'
+]);
+
+function getUserFacingWorkRevision(workWalkthrough = []) {
+  return (workWalkthrough || []).reduce((revision, item) => {
+    if (!item) return revision;
+    const toolName = String(item.toolName || '');
+    if (toolName && INTERNAL_GATE_MAINTENANCE_TOOLS.has(toolName)) return revision;
+    // A failed edit/test/read is still new user-facing evidence. It must invalidate the protected
+    // pre-gate answer so Orion cannot preserve an earlier success claim after a real check fails.
+    return revision + 1;
+  }, 0);
 }
 
 function answerHasInspectionGrounding(answerText, workWalkthrough = []) {
@@ -12554,6 +12684,33 @@ function estimateDeepSeekRequestTokens(messages, modelName, systemText, tools) {
   return new TextEncoder().encode(JSON.stringify(request)).length;
 }
 
+function boundedToolOutputPreview(value, maxChars = 800) {
+  const text = String(value == null ? '' : value);
+  if (text.length <= maxChars) return text;
+  const edge = Math.max(100, Math.floor((maxChars - 80) / 2));
+  return `${text.slice(0, edge)}\n... ${text.length - (edge * 2)} characters omitted ...\n${text.slice(-edge)}`;
+}
+
+function buildEmergencyToolResultReceipt(name, response, originalLength) {
+  const source = response && typeof response === 'object' ? response : {};
+  const receipt = {
+    trimmed: true,
+    contextOverflowPrevented: true,
+    originalLength
+  };
+  if (name === 'run_command' || name === 'terminal_exec' || name === 'run_tests') {
+    for (const key of ['exitCode', 'timedOut', 'killed', 'signal', 'success', 'outputTruncated', 'outputLimitChars']) {
+      if (Object.prototype.hasOwnProperty.call(source, key)) receipt[key] = source[key];
+    }
+    if (source.stdout != null) receipt.stdoutPreview = boundedToolOutputPreview(source.stdout);
+    if (source.stderr != null) receipt.stderrPreview = boundedToolOutputPreview(source.stderr);
+    receipt.note = `This ${name} output was too large to fit safely in the DeepSeek request. The execution result and bounded output edges are preserved here; rerun a narrower command only if exact omitted output is required.`;
+    return receipt;
+  }
+  receipt.note = `This ${name} output was too large to fit safely in the DeepSeek request. Use inspect_code_context, get_file_symbols, grep_search with contextLines, or a narrower read_file range to retrieve the exact relevant source.`;
+  return receipt;
+}
+
 function fitDeepSeekMessagesToContextWindow(messages, modelName, systemText, tools, options = {}) {
   const configuredLimit = Number(options.maxInputTokens);
   const maxInputTokens = Number.isFinite(configuredLimit) && configuredLimit > 0
@@ -12570,7 +12727,7 @@ function fitDeepSeekMessagesToContextWindow(messages, modelName, systemText, too
     if (!message || message.role !== 'tool' || !Array.isArray(message.parts)) return;
     message.parts.forEach((part, partIndex) => {
       const name = part && part.functionResponse && part.functionResponse.name;
-      if (!name || !TRIMMABLE_TOOL_RESULT_NAMES.has(name)) return;
+      if (!name) return;
       let serialized = '';
       try {
         serialized = JSON.stringify(part.functionResponse.response || {});
@@ -12578,10 +12735,17 @@ function fitDeepSeekMessagesToContextWindow(messages, modelName, systemText, too
         return;
       }
       if (serialized.length > TOOL_RESULT_TRIM_THRESHOLD_CHARS) {
-        candidates.push({ messageIndex, partIndex, name, originalLength: serialized.length });
+        candidates.push({
+          messageIndex,
+          partIndex,
+          name,
+          originalLength: serialized.length,
+          response: part.functionResponse.response || {}
+        });
       }
     });
   });
+  candidates.sort((left, right) => right.originalLength - left.originalLength);
 
   let collapsedToolResults = 0;
   for (const candidate of candidates) {
@@ -12591,12 +12755,11 @@ function fitDeepSeekMessagesToContextWindow(messages, modelName, systemText, too
     parts[candidate.partIndex] = {
       functionResponse: {
         name: candidate.name,
-        response: {
-          trimmed: true,
-          contextOverflowPrevented: true,
-          originalLength: candidate.originalLength,
-          note: `This ${candidate.name} output was too large to fit safely in the DeepSeek request. Use inspect_code_context, get_file_symbols, grep_search with contextLines, or a narrower read_file range to retrieve the exact relevant source.`
-        }
+        response: buildEmergencyToolResultReceipt(
+          candidate.name,
+          candidate.response,
+          candidate.originalLength
+        )
       }
     };
     fitted = fitted.slice();
@@ -13302,6 +13465,8 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     getAgentReadCharBudget,
     resolveAgentReadMaxChars,
     classifyAgentFailure,
+    appendBoundedCommandOutput,
+    AGENT_COMMAND_OUTPUT_MAX_CHARS,
     recommendedNatureForFailureCategory,
     buildFailureRecoveryGuidance,
     resolveConversationWorkspace,
@@ -13344,6 +13509,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     evaluateLoopStateWithSupervisorDecision,
     buildPostEditEvidencePrompt,
     buildFinalVerificationSummary,
+    getUserFacingWorkRevision,
     buildCompletionGateLoopSignature,
     shouldEscapeRepeatedCompletionGateBlock,
     stripEchoedSystemScaffold,

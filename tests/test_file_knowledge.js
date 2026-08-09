@@ -115,3 +115,18 @@ test('agent wiring: read recording, notes tool, and run-start brief are connecte
   t.ok(agentJs.includes("'read_notes', 'read_project_memory', 'remember_file_notes'"), 'Dispatch can save file notes too');
   t.end();
 });
+
+test('file-note IPC preflight rejects internal state immediately without waking the index worker', (t) => {
+  t.deepEqual(
+    fk.validateIndexablePath('.orion/context/operational-context.json'),
+    {
+      success: false,
+      error: 'Not an indexable project file: .orion/context/operational-context.json',
+      code: 'NOT_INDEXABLE'
+    },
+    'internal operational state is rejected deterministically'
+  );
+  t.equal(fk.validateIndexablePath('engine/save.py'), null, 'ordinary project source reaches the worker');
+  t.equal(fk.FILE_KNOWLEDGE_TIMEOUT_MS, 20000, 'file-note operations have a bounded interactive deadline');
+  t.end();
+});

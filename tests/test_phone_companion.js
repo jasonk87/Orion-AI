@@ -745,6 +745,84 @@ test('Phone Companion pushes state over SSE instead of only polling', async (t) 
   }
 });
 
+test('Phone Companion replaces suspended mobile connections immediately on foreground', t => {
+  const html = companionHtml();
+  const ipcServerSource = fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8');
+  const mainSource = fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8');
+
+  t.ok(html.includes("if (document.hidden) suspendBackgroundConnection();"),
+    'backgrounding proactively retires the stream instead of leaving a ghost active connection');
+  t.ok(html.includes("startEventStream({ force: true });"),
+    'foreground recovery always replaces the pre-suspension stream');
+  t.ok(html.includes("window.addEventListener('pageshow', recoverForegroundConnection)"),
+    'PWA restoration and back-forward cache restoration recover immediately');
+  t.ok(html.includes("window.addEventListener('online', recoverForegroundConnection)"),
+    'a network handoff recovers immediately without waiting for the poll interval');
+  t.ok(html.includes("window.addEventListener('focus', recoverForegroundConnection)"),
+    'returning focus also recovers browsers with unreliable visibility events');
+  t.ok(html.includes("if (!sseStateReceived || lastSseMessageAt < recoveryStartedAt) loadState({ force: true });"),
+    'a bounded fallback state request runs when the replacement stream has not delivered state');
+  t.ok(html.includes("requestTimeout = setTimeout(() => requestController.abort(), 7000)"),
+    'a stalled state request cannot block foreground recovery indefinitely');
+  t.ok(html.includes("lastSseActivityAt = Date.now();"),
+    'SSE keepalive bytes count as live activity and suppress redundant status polling');
+  t.ok(ipcServerSource.includes('if (pushInFlight)') && ipcServerSource.includes('pushAgain = true'),
+    'server state pushes are coalesced while a renderer snapshot is in flight');
+  t.ok(mainSource.includes('backgroundThrottling: false'),
+    'the canonical desktop state bridge remains responsive while the desktop window is minimized');
+  t.end();
+});
+
+test('phone state transports only the activity the mobile UI can display', t => {
+  const start = rendererSource.indexOf('function truncatePhoneTransportText(');
+  const end = rendererSource.indexOf('function scrubLegacyPhoneCompanionTokenMessages', start);
+  t.ok(start > 0 && end > start, 'phone transport compaction helpers are independently testable');
+  const source = rendererSource.slice(start, end);
+  const compactPhoneToolLogs = new Function(
+    `${source}; return compactPhoneToolLogs;`
+  )();
+  const logs = Array.from({ length: 20 }, (_, index) => ({
+    type: 'tool_call',
+    tool: `tool-${index}`,
+    status: 'completed',
+    params: { path: `file-${index}.js`, content: 'p'.repeat(4000) },
+    result: 'r'.repeat(12000)
+  }));
+  const compact = compactPhoneToolLogs(logs, 8);
+
+  t.equal(compact.length, 8, 'transport matches the eight operations the phone renderer shows');
+  t.equal(compact[0].tool, 'tool-12', 'the newest visible operations are preserved');
+  t.ok(compact.every(log => log.result.length < 2500), 'large invisible tool results are bounded before network transfer');
+  t.ok(compact.every(log => log.params.content.length < 900), 'large tool parameters are bounded before network transfer');
+  t.ok(rendererSource.includes('const text = replayMsg.text;')
+      && rendererSource.includes('logs: replayMsg.role === \'assistant\' ? replayLogs : []'),
+    'assistant answer text remains intact while only execution logs are compacted');
+  t.end();
+});
+
+test('phone renders an outgoing message before waiting for Orion to answer', t => {
+  const html = companionHtml();
+  const submitStart = html.indexOf('async function handlePromptSubmit()');
+  const submitEnd = html.indexOf("document.getElementById('send').addEventListener", submitStart);
+  const flow = html.slice(submitStart, submitEnd);
+  const optimisticIndex = flow.indexOf('appendOptimisticPhoneMessage(text, optimisticImages, promptPayload.requestId)');
+  const existingConversationPost = flow.indexOf("companionFetch('/api/prompt'");
+  const newConversationPost = flow.indexOf("companionFetch('/api/conversations/new'");
+
+  t.ok(optimisticIndex > 0, 'the phone creates its local user bubble in the real submit path');
+  t.ok(optimisticIndex < existingConversationPost, 'an existing-conversation bubble renders before its POST can wait on classification or an answer');
+  t.ok(optimisticIndex < newConversationPost, 'a first-message bubble also renders before conversation creation waits');
+  t.ok(flow.indexOf("promptEl.value = '';", optimisticIndex) < existingConversationPost,
+    'the composer clears immediately rather than looking unsent while Orion works');
+  t.ok(html.includes('optimisticPhoneSend') && html.includes('canonicalMessageArrived'),
+    'intermediate state snapshots preserve the local bubble until its canonical message arrives');
+  t.ok(rendererSource.includes("requestId: replayMsg.requestId || ''"),
+    'the canonical phone state echoes the idempotency receipt used to reconcile the local bubble');
+  t.ok(rendererSource.includes("requestId: phoneRequestId"),
+    'the persisted user message carries that exact receipt through the real renderer route');
+  t.end();
+});
+
 test('Phone Companion delete requires explicit UI confirmation flag', async (t) => {
   const { main, electron } = await startMainWithConfig(1143);
   const pair = await request('POST', 1143, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
@@ -1052,6 +1130,29 @@ test('phone pickers proxy the desktop selection through /api/model', t => {
   t.ok(flow.includes('wirePhoneModelSelect(phoneModelSelect, composerModelSelect)')
     && flow.includes('wirePhoneModelSelect(composerModelSelect, phoneModelSelect)'),
     'the Status-tab and composer model selects stay mirrored');
+  t.end();
+});
+
+test('paired phone can change the desktop reasoning level through the real model endpoint', async t => {
+  const port = 1157;
+  const { main, electron } = await startMainWithConfig(port);
+  try {
+    const pair = await request('POST', port, '/api/pair', {
+      pairingCode: 'pair-code-123456',
+      deviceName: 'Pixel'
+    });
+    const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+    const response = await request('POST', port, '/api/model', { reasoning: 'high' }, session);
+
+    t.equal(response.statusCode, 200, 'the authenticated reasoning update succeeds');
+    t.equal(response.json && response.json.success, true, 'the endpoint reports success');
+    t.ok(
+      electron.calls.some(script => script.includes('setPhoneCompanionReasoning') && script.includes('"high"')),
+      'the endpoint invokes the allowlisted desktop reasoning bridge with the selected level'
+    );
+  } finally {
+    await closeServer(main.getCompanionServer());
+  }
   t.end();
 });
 

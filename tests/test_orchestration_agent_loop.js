@@ -1980,6 +1980,60 @@ test('pre-loop initialization failure finalizes the task and releases the runner
   t.end();
 });
 
+test('a model API failure finalizes durable work as failed, never completed', async t => {
+  const originalFetch = global.fetch;
+  const finalized = [];
+  installHarness([], {
+    window: {
+      claimOrchestrationTask: async taskId => ({
+        success: true,
+        task: { taskId, status: 'active', execution: { executionId: 'exec-provider-failure' } },
+        prompt: 'Complete the durable work.'
+      }),
+      finalizeOrchestrationTask: async (taskId, status, details) => {
+        finalized.push({ taskId, status, details });
+        return { taskId, status };
+      },
+      onOrchestrationTaskFinalized: async () => {},
+      getAppConfig: () => ({
+        planningMode: false,
+        deepseekApiKey: '',
+        modelCallDelayMs: 0,
+        autoTest: false,
+        reasoningEffort: 'auto'
+      })
+    }
+  });
+  const conv = conversation('provider-failure', { mode: 'coder' });
+  try {
+    await global.window.runAgentLoop(
+      'Complete the durable work.',
+      'deepseek-v4-flash',
+      conv,
+      {
+        taskId: 'task-provider-failure',
+        semanticIntent: semanticClassification({
+          intent: 'new_task',
+          requiresExecution: true,
+          target: 'current_conversation',
+          resolvedRequest: 'Complete the durable work.',
+          reasoningPolicyHint: { complexity: 'medium', risk: 'medium', contextNeed: 'task' },
+          executionScope: 'mutating',
+          inspectionTarget: 'workspace'
+        })
+      }
+    );
+
+    t.equal(finalized.length, 1, 'the claimed task receives one canonical terminal transition');
+    t.equal(finalized[0].status, 'failed', 'the provider failure is recorded as failed');
+    t.notEqual(finalized[0].status, 'completed', 'an API error cannot be reported as completion');
+    t.match(finalized[0].details.reason, /api key/i, 'the durable failure keeps the real provider reason');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
 test('queue drain requeues an item when a competing start reports agent_busy', async t => {
   const originalRun = global.window.runAgentLoop;
   const originalConversations = global.conversations;
@@ -1995,7 +2049,16 @@ test('queue drain requeues an item when a competing start reports agent_busy', a
     prompt: 'Run the durable task.',
     preserveUserPrompt: true,
     images: [{ mimeType: 'image/png', data: 'abc' }],
-    contextPacketIds: ['packet-1']
+    contextPacketIds: ['packet-1'],
+    modelSelectValue: 'deepseek-v4-flash',
+    reasoningEffort: 'max',
+    executionProfile: {
+      requestedModel: 'deepseek-v4-flash',
+      requestedReasoning: 'max',
+      allowEscalation: true,
+      allowDowngrade: false,
+      capturedAt: 1000
+    }
   }];
   global.window.runAgentLoop = async (_prompt, _model, _conversation, runOptions) => {
     receivedRunOptions = runOptions;
@@ -2008,6 +2071,8 @@ test('queue drain requeues an item when a competing start reports agent_busy', a
     t.equal(global.window.promptQueue[0].taskId, 'task-requeue', 'the same durable task is put back at the front');
     t.equal(global.window.promptQueue[0].contextPacketIds[0], 'packet-1', 'durable context references remain attached');
     t.equal(receivedRunOptions.preserveUserPrompt, true, 'task-bound live replies preserve their queued user text at claim time');
+    t.equal(receivedRunOptions.reasoningEffort, 'max', 'the durable reasoning selection reaches the actual agent loop');
+    t.equal(receivedRunOptions.executionProfile.requestedModel, 'deepseek-v4-flash', 'the durable model policy reaches the actual agent loop');
   } finally {
     global.window.runAgentLoop = originalRun;
     global.conversations = originalConversations;

@@ -89,6 +89,61 @@ test('context-dependent request detection consumes structured semantic intent on
   t.end();
 });
 
+test('task execution profile preserves the selected model and reasoning across normalization', t => {
+  const result = buildTaskPacket({
+    taskId: 'task-profile',
+    originalUserMessage: 'Fix the issue.',
+    objective: 'Fix and verify the issue.',
+    workspace: baseTask().workspace,
+    origin: baseTask().origin,
+    target: baseTask().target,
+    executionProfile: {
+      requestedModel: 'deepseek-v4-flash',
+      requestedReasoning: 'max',
+      allowEscalation: true,
+      allowDowngrade: false,
+      capturedAt: 1000
+    },
+    timestamp: 1000
+  });
+  t.equal(result.success, true, 'the task packet is created');
+  t.deepEqual(result.task.executionProfile, {
+    requestedModel: 'deepseek-v4-flash',
+    requestedReasoning: 'max',
+    allowEscalation: true,
+    allowDowngrade: false,
+    capturedAt: 1000
+  }, 'the dispatch selection is part of the durable task contract');
+  const restored = normalizeTaskRecord(JSON.parse(JSON.stringify(result.task)));
+  t.deepEqual(restored.executionProfile, result.task.executionProfile, 'restart normalization preserves the execution profile exactly');
+  t.match(renderTaskPrompt(restored), /Requested model: deepseek-v4-flash/, 'Coder receives the requested model in the self-contained packet');
+  t.match(renderTaskPrompt(restored), /Requested reasoning: max/, 'Coder receives the requested reasoning in the self-contained packet');
+
+  const legacy = normalizeTaskRecord(baseTask({ executionProfile: undefined, modelSelectValue: 'gemini-2.5-flash' }));
+  t.equal(legacy.executionProfile.requestedModel, 'gemini-2.5-flash', 'legacy queued model data migrates forward');
+  t.equal(legacy.executionProfile.requestedReasoning, 'auto', 'legacy tasks safely default to dynamic reasoning');
+  t.end();
+});
+
+test('legacy model API errors recorded as completed migrate to failed', t => {
+  const migrated = normalizeTaskRecord(baseTask({
+    schemaVersion: 2,
+    status: 'completed',
+    result: {
+      summary: 'Error contacting Model API: Orion blocked an oversized DeepSeek request locally.'
+    }
+  }));
+  t.equal(migrated.status, 'failed', 'the false terminal success is repaired');
+  t.equal(migrated.failure.code, 'legacy_model_api_failure', 'the migration reason remains structured');
+
+  const ordinary = normalizeTaskRecord(baseTask({
+    status: 'completed',
+    result: { summary: 'Documented the text Error contacting Model API: in a troubleshooting guide.' }
+  }));
+  t.equal(ordinary.status, 'completed', 'ordinary prose mentioning the phrase is not reclassified');
+  t.end();
+});
+
 test('task continuation detection requires a structured active-owned-task target', t => {
   t.equal(isContinuationRequest({
     intent: 'context_followup',

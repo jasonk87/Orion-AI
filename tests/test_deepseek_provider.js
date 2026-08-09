@@ -165,6 +165,50 @@ test('DeepSeek context fitting collapses a giant recent read result without muta
   t.end();
 });
 
+test('DeepSeek emergency fitting bounds a giant recent command result while retaining verification evidence', (t) => {
+  const stdout = `first match\n${'x'.repeat(50000)}\nlast match`;
+  const messages = [
+    { role: 'user', parts: [{ text: 'inspect the diagnostic result' }] },
+    { role: 'model', parts: [{ functionCall: { name: 'run_command', args: { command: 'Select-String huge.json needle' } } }] },
+    {
+      role: 'tool',
+      parts: [{
+        functionResponse: {
+          name: 'run_command',
+          response: { exitCode: 0, stdout, stderr: '', timedOut: false, killed: false }
+        }
+      }]
+    }
+  ];
+  const fitted = agent.fitDeepSeekMessagesToContextWindow(
+    messages,
+    'deepseek-v4-flash',
+    'system',
+    [],
+    { maxInputTokens: 4000 }
+  );
+  const response = fitted.messages[2].parts[0].functionResponse.response;
+
+  t.equal(fitted.collapsedToolResults, 1, 'recent execution output is eligible only for emergency request fitting');
+  t.equal(response.exitCode, 0, 'the command exit status survives emergency fitting');
+  t.equal(response.timedOut, false, 'timeout evidence survives emergency fitting');
+  t.match(response.stdoutPreview, /first match/, 'the start of command evidence is retained');
+  t.match(response.stdoutPreview, /last match/, 'the end of command evidence is retained');
+  t.match(response.note, /rerun a narrower command/i, 'the model receives a safe exact-evidence recovery path');
+  t.equal(messages[2].parts[0].functionResponse.response.stdout.length, stdout.length, 'canonical live history is not mutated');
+  t.ok(fitted.estimatedTokens <= fitted.maxInputTokens, 'the provider request is brought below the safety ceiling');
+  t.end();
+});
+
+test('live command streaming is bounded before it enters agent history', (t) => {
+  const first = agent.appendBoundedCommandOutput('', 'a'.repeat(agent.AGENT_COMMAND_OUTPUT_MAX_CHARS - 10));
+  const second = agent.appendBoundedCommandOutput(first.output, `${'b'.repeat(1000)}TAIL`);
+  t.equal(second.output.length, agent.AGENT_COMMAND_OUTPUT_MAX_CHARS, 'the renderer-side live buffer cannot grow past its cap');
+  t.equal(second.truncated, true, 'the caller can disclose that output was truncated');
+  t.match(second.output, /TAIL$/, 'the newest diagnostic output is retained');
+  t.end();
+});
+
 test('callDeepSeekAPI fits oversized tool output before fetch and blocks irreducible overflow locally', async (t) => {
   const originalFetch = global.fetch;
   let calls = 0;

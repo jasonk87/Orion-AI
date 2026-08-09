@@ -1,5 +1,6 @@
 const test = require('tape');
 global.window = {};
+const operational = require('../operational-context');
 
 function semanticClassifierResponse({
   intent = 'new_task',
@@ -2466,11 +2467,147 @@ test('a task classified as deep complexity proactively upgrades the model from t
   };
 
   try {
-    await window.runAgentLoop('do a large multi-file refactor', 'gemini-2.5-flash-lite', conversation);
-    t.equal(modelsRequested[0], 'gemini-2.5-flash', 'turn 1 is already upgraded to the stronger model for a deep task, before any edits happen');
+    await window.runAgentLoop('do a large multi-file refactor', 'gemini-2.5-flash-lite', conversation, {
+      executionProfile: {
+        requestedModel: 'gemini-2.5-flash-lite',
+        requestedReasoning: 'max',
+        allowEscalation: true,
+        allowDowngrade: false
+      }
+    });
+    t.equal(modelsRequested[0], 'gemini-2.5-flash', 'turn 1 is already upgraded to the stronger model for a deep task, even when the durable handoff profile names the lower tier');
   } finally {
     global.window.runAgentLoop = originalRunAgentLoop;
     global.fetch = originalFetch;
+  }
+  t.end();
+});
+
+test('an internal completion gate cannot replace a detailed answer with gate bookkeeping', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalFetch = global.fetch;
+  const originalClaimOrchestrationTask = global.window.claimOrchestrationTask;
+  const originalFinalizeOrchestrationTask = global.window.finalizeOrchestrationTask;
+  const originalOnOrchestrationTaskFinalized = global.window.onOrchestrationTaskFinalized;
+  const finalized = [];
+
+  let persistedState = operational.createEmptyContext(1000);
+  persistedState = operational.applyAction(persistedState, 'update_mission_context', {
+    mission: 'Assess browser conversion feasibility for GRITLIFE.',
+    winConditions: [{ id: 'assessment', title: 'Deliver a grounded feasibility assessment.' }]
+  }, 1001).state;
+  persistedState = operational.applyAction(persistedState, 'evaluate_win_conditions', {
+    evaluations: [{ id: 'assessment', status: 'satisfied', evidence: ['Source architecture was inspected.'] }]
+  }, 1002).state;
+  persistedState = operational.applyAction(persistedState, 'record_tool_result', {
+    toolName: 'read_file',
+    success: true,
+    summary: 'Inspected the simulation and rendering boundaries.'
+  }, 1003).state;
+  persistedState = operational.applyAction(persistedState, 'set_coverage_frontier', {
+    risk: 'high',
+    requiredSurfaces: ['Simulation/rendering boundary'],
+    notInspected: [],
+    adversarialReviewRequired: true
+  }, 1004).state;
+  persistedState = operational.applyAction(persistedState, 'update_coverage_frontier', {
+    inspected: ['Simulation/rendering boundary'],
+    verified: ['Simulation/rendering boundary']
+  }, 1005).state;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: false, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: false });
+  global.window.getCurrentWorkspace = () => '/test/gritlife';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.claimOrchestrationTask = async taskId => ({
+    success: true,
+    task: { taskId, status: 'active', execution: { executionId: 'exec-gate-answer-continuity' } },
+    prompt: 'Assess browser conversion feasibility for GRITLIFE.'
+  });
+  global.window.finalizeOrchestrationTask = async (taskId, status, details) => {
+    finalized.push({ taskId, status, details });
+    return { taskId, status };
+  };
+  global.window.onOrchestrationTaskFinalized = async () => {};
+  global.window.api = {
+    readFile: async (_workspace, filePath) => {
+      if (filePath === '.orion/context/operational-context.json') return JSON.stringify(persistedState);
+      if (filePath === '.orion/context/journal.jsonl') return '';
+      return 'The simulation is Python and the rendering boundary is isolated.';
+    },
+    writeFile: async (_workspace, filePath, content) => {
+      if (filePath === '.orion/context/operational-context.json') persistedState = JSON.parse(content);
+      return { success: true };
+    },
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null })
+  };
+
+  const detailedAnswer = [
+    'The practical route is a Python simulation service with a browser frontend, not a full rewrite.',
+    '',
+    '- Keep the existing simulation and save logic on the server.',
+    '- Replace the current rendering layer with a responsive browser UI.',
+    '- Add authenticated family accounts and a hosted multiplayer session layer.',
+    '- Start with a LAN prototype, then add internet hosting after save synchronization is proven.',
+    '',
+    'That preserves the mature game logic while making phone and computer play realistic.'
+  ].join('\n');
+  let turn = 0;
+  global.fetch = async (url) => {
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+    turn++;
+    if (turn === 1) {
+      return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'read_file', args: { path: 'README.md' } } }] } }] }) };
+    }
+    if (turn === 2) {
+      return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: detailedAnswer }] } }] }) };
+    }
+    if (turn === 3) {
+      return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'record_adversarial_review', args: { status: 'passed', summary: 'Checked the main migration risk.', evidence: ['rendering boundary inspected'] } } }] } }] }) };
+    }
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'The assessment I delivered above is complete and grounded. No further inspection is needed; the report stands.' }] } }] }) };
+  };
+
+  const conversation = {
+    id: 'test-gate-answer-continuity',
+    mode: 'coder',
+    messages: [],
+    tasks: [],
+    awaitingPlanApproval: false,
+    planApproved: true
+  };
+  try {
+    await window.runAgentLoop(
+      'Assess how hard it would be to move GRITLIFE to the browser for phones and computers.',
+      'gemini-1',
+      conversation,
+      {
+        taskId: 'task-gate-answer-continuity',
+        semanticIntent: {
+          intent: 'new_task', requiresExecution: true, target: 'current_conversation',
+          resolvedRequest: 'Assess browser conversion feasibility for GRITLIFE.',
+          contextDependent: false, confidence: 1, needsClarification: false,
+          reasoningPolicyHint: { complexity: 'high', risk: 'high', contextNeed: 'project' },
+          taskResolution: { title: 'Assess browser conversion', requirements: [], constraints: [], unresolvedDecisions: [] },
+          executionScope: 'read_only', inspectionTarget: 'project', inspectionBreadth: 'focused'
+        }
+      }
+    );
+    const final = conversation.messages.find(message => message.role === 'assistant');
+    t.ok(final, 'the run saves a final assistant response');
+    t.ok(final.text.startsWith(detailedAnswer), 'the original detailed assessment remains visible after the gate bookkeeping turn');
+    t.notOk(/report stands/i.test(final.text), 'the gate-directed acknowledgement never becomes the visible or durable answer');
+    t.equal(finalized.length, 1, 'the durable task finalizes once');
+    t.equal(finalized[0].details.result.summary, detailedAnswer, 'the Dispatch relay receives the detailed assessment without the generated walkthrough');
+    t.equal(persistedState.coverageFrontier.adversarialReview.status, 'passed', 'the gate itself still performs and records its required validation');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.window.claimOrchestrationTask = originalClaimOrchestrationTask;
+    global.window.finalizeOrchestrationTask = originalFinalizeOrchestrationTask;
+    global.window.onOrchestrationTaskFinalized = originalOnOrchestrationTaskFinalized;
   }
   t.end();
 });

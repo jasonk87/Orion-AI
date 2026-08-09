@@ -2,6 +2,8 @@ const test = require('tape');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { EventEmitter } = require('events');
+const proxyquire = require('proxyquire');
 const {
   WorkspaceIndexService,
   getWorkspaceIndexService,
@@ -378,5 +380,38 @@ test('runtime workspace intelligence executes through the worker boundary', asyn
   t.equal(telemetry.success, true, 'worker exposes its index telemetry');
   t.ok(telemetry.telemetry.workspaceFilesIndexed > 0, 'index reconciliation happened inside the worker service');
   await closeWorkspaceIndexWorker();
+  t.end();
+});
+
+test('a timed-out synchronous index job retires its worker and rejects work queued behind it', async t => {
+  const workers = [];
+  class StalledWorker extends EventEmitter {
+    constructor() {
+      super();
+      this.terminated = false;
+      workers.push(this);
+    }
+    unref() {}
+    postMessage() {}
+    async terminate() {
+      this.terminated = true;
+      this.emit('exit', 1);
+      return 1;
+    }
+  }
+  const isolatedClient = proxyquire.noPreserveCache().load('../lib/workspace-index-client', {
+    worker_threads: { Worker: StalledWorker }
+  });
+  const keepAlive = setTimeout(() => {}, 1500);
+  const slow = isolatedClient.requestWorkspaceIndex('saveFileDigest', {}, { timeoutMs: 1000 });
+  const queued = isolatedClient.requestWorkspaceIndex('telemetry', {}, { timeoutMs: 5000 });
+  const settled = await Promise.allSettled([slow, queued]);
+  clearTimeout(keepAlive);
+
+  t.equal(settled[0].status, 'rejected', 'the over-deadline request fails explicitly');
+  t.equal(settled[0].reason.code, 'WORKSPACE_INDEX_TIMEOUT', 'the timeout is machine-readable');
+  t.equal(settled[1].status, 'rejected', 'work behind the wedged synchronous job is released instead of hanging');
+  t.equal(workers.length, 1, 'both requests shared the same worker');
+  t.equal(workers[0].terminated, true, 'the wedged worker is retired');
   t.end();
 });

@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { SCAN_SKIP_DIRECTORIES } = require('./lib/scan-ignore');
 
 const DESTRUCTIVE_PATTERNS = [
   /\brm\s+-r[fF]?\b/i,
@@ -317,9 +318,12 @@ function classifyUnattendedProbeCommand(command) {
 }
 
 function isIndexableWorkspaceFile(fileName) {
-  const name = String(fileName || '');
-  if (/^\.env(?:\.|$)/i.test(name)) return false;
-  return INDEXABLE_EXTENSIONS.has(path.extname(name).toLowerCase());
+  const name = String(fileName || '').replace(/\\/g, '/');
+  const parts = name.split('/').filter(Boolean);
+  const base = parts[parts.length - 1] || '';
+  if (parts.some(part => SCAN_SKIP_DIRECTORIES.has(part.toLowerCase()))) return false;
+  if (/^\.env(?:\.|$)/i.test(base)) return false;
+  return INDEXABLE_EXTENSIONS.has(path.extname(base).toLowerCase());
 }
 
 module.exports = {

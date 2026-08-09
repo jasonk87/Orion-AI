@@ -5,7 +5,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function createOrionTaskOrchestration() {
   'use strict';
 
-  const SCHEMA_VERSION = 2;
+  const SCHEMA_VERSION = 3;
   const TASK_STATES = Object.freeze({
     PENDING: 'pending',
     ACTIVE: 'active',
@@ -364,6 +364,37 @@
     };
   }
 
+  function normalizeExecutionProfile(value, fallbacks = {}) {
+    const supplied = value && typeof value === 'object' ? value : {};
+    const requestedModel = compactInline(
+      supplied.requestedModel
+      || supplied.model
+      || fallbacks.requestedModel
+      || fallbacks.modelSelectValue
+      || ''
+    );
+    const requestedReasoningValue = compactInline(
+      supplied.requestedReasoning
+      || supplied.reasoningEffort
+      || supplied.reasoning
+      || fallbacks.requestedReasoning
+      || fallbacks.reasoningEffort
+      || 'auto'
+    ).toLowerCase() || 'auto';
+    const requestedReasoning = requestedReasoningValue === 'ultra'
+      ? 'max'
+      : (['auto', 'low', 'medium', 'high', 'max'].includes(requestedReasoningValue)
+          ? requestedReasoningValue
+          : 'auto');
+    return {
+      requestedModel,
+      requestedReasoning,
+      allowEscalation: supplied.allowEscalation !== false,
+      allowDowngrade: supplied.allowDowngrade === true,
+      capturedAt: resolveNow(supplied.capturedAt || fallbacks.capturedAt || fallbacks.now)
+    };
+  }
+
   function clarificationForRequest(request, reason, classifierQuestion) {
     const supplied = compactWhitespace(classifierQuestion);
     if (supplied) return supplied;
@@ -466,6 +497,12 @@
       || semanticIntent.supersedesTaskId
       || ''
     );
+    const executionProfile = normalizeExecutionProfile(input.executionProfile, {
+      modelSelectValue: input.modelSelectValue,
+      reasoningEffort: input.reasoningEffort,
+      capturedAt: now,
+      now
+    });
 
     const task = {
       schemaVersion: SCHEMA_VERSION,
@@ -482,6 +519,7 @@
       unresolvedDecisions,
       images: normalizeImageAttachments(taskImageInput(input)),
       contextPacketIds: taskContextPacketIds(input),
+      executionProfile,
       origin,
       target,
       supersedesTaskId,
@@ -545,6 +583,12 @@
         invalidStatus = compactInline(rawStatus);
       }
     }
+    const persistedResultSummary = compactWhitespace(
+      record.result && typeof record.result === 'object' ? record.result.summary : ''
+    );
+    const legacyCompletedProviderFailure = status === TASK_STATES.COMPLETED
+      && persistedResultSummary.startsWith('Error contacting Model API:');
+    if (legacyCompletedProviderFailure) status = TASK_STATES.FAILED;
     const persistedTitle = compactInline(record.title);
     const title = !persistedTitle || persistedTitle.toLowerCase() === 'execute dispatch request'
       ? titleFromObjective(objective || originalUserMessage, workspace.project.name)
@@ -565,6 +609,12 @@
       unresolvedDecisions: uniqueStrings(record.unresolvedDecisions || []),
       images: normalizeImageAttachments(taskImageInput(record)),
       contextPacketIds: taskContextPacketIds(record),
+      executionProfile: normalizeExecutionProfile(record.executionProfile, {
+        modelSelectValue: record.modelSelectValue,
+        reasoningEffort: record.reasoningEffort,
+        capturedAt: record.createdAt || record.timestamp || now,
+        now
+      }),
       continuation: continuationRecord && compactWhitespace(continuationRecord.input || continuationRecord.prompt || '')
         ? {
             input: compactWhitespace(continuationRecord.input || continuationRecord.prompt || ''),
@@ -598,6 +648,12 @@
         ...(normalized.failure && typeof normalized.failure === 'object' ? normalized.failure : {}),
         code: 'invalid_persisted_status',
         message: `Unrecognized persisted task state: ${invalidStatus}`
+      };
+    } else if (legacyCompletedProviderFailure) {
+      normalized.failure = {
+        ...(normalized.failure && typeof normalized.failure === 'object' ? normalized.failure : {}),
+        code: 'legacy_model_api_failure',
+        message: persistedResultSummary.slice(0, 1000)
       };
     }
     return normalized;
@@ -793,6 +849,8 @@
       `Workspace role: ${workspace.role}`,
       `Exact workspace path: ${workspace.path || '(unresolved)'}`,
       `Selected project: ${project.name || '(none)'}${project.path ? ` (${project.path})` : ''}`,
+      `Requested model: ${task.executionProfile.requestedModel || '(use current default)'}`,
+      `Requested reasoning: ${task.executionProfile.requestedReasoning || 'auto'}`,
       '',
       renderList('Known requirements', task.requirements),
       '',
@@ -1128,6 +1186,7 @@
     SCHEMA_VERSION,
     TASK_STATES,
     normalizeTransitionStatus,
+    normalizeExecutionProfile,
     isContextDependentRequest,
     isContinuationRequest,
     deriveTaskTitle: titleFromObjective,

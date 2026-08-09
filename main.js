@@ -181,7 +181,11 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      // The phone companion asks this renderer for its canonical state. Chromium normally
+      // throttles a hidden/minimized renderer, which made those bridge calls arrive in bursts
+      // and left a foregrounded phone waiting on an arbitrary background-timer delay.
+      backgroundThrottling: false
     }
   });
 

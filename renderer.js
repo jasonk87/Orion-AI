@@ -1413,9 +1413,11 @@ async function continueDelegatedWork(coderConvId, supervisingOrionConvId) {
   } else {
     showToast('Coder is continuing the remaining work.');
     window.promptQueue = window.promptQueue.filter(item => item.taskId !== queued.task.taskId);
-    window.runAgentLoop(queued.queueItem.prompt, modelValue, coderConv, {
+    window.runAgentLoop(queued.queueItem.prompt, queued.queueItem.modelSelectValue || modelValue, coderConv, {
       source: 'queue',
-      taskId: queued.task.taskId
+      taskId: queued.task.taskId,
+      reasoningEffort: queued.queueItem.reasoningEffort,
+      executionProfile: queued.queueItem.executionProfile
     });
   }
 }
@@ -2420,6 +2422,58 @@ function clearCurrentTurnTaskResolutionClarifications(conv) {
   return removed;
 }
 
+function captureTaskExecutionProfile(options = {}, existingTask = null) {
+  const persisted = existingTask && existingTask.executionProfile && typeof existingTask.executionProfile === 'object'
+    ? existingTask.executionProfile
+    : null;
+  if (persisted && RendererTaskOrchestration) {
+    return RendererTaskOrchestration.normalizeExecutionProfile(persisted, {
+      capturedAt: existingTask.createdAt || Date.now()
+    });
+  }
+  const supplied = options.executionProfile && typeof options.executionProfile === 'object'
+    ? options.executionProfile
+    : {};
+  const selectedModel = String(
+    supplied.requestedModel
+    || options.modelSelectValue
+    || (window.getSelectedModel && window.getSelectedModel())
+    || (el.modelSelect && el.modelSelect.value)
+    || ''
+  ).trim();
+  const selectedReasoning = String(
+    supplied.requestedReasoning
+    || options.reasoningEffort
+    || appConfig.reasoningEffort
+    || 'auto'
+  ).trim().toLowerCase() || 'auto';
+  return RendererTaskOrchestration
+    ? RendererTaskOrchestration.normalizeExecutionProfile({
+        ...supplied,
+        requestedModel: selectedModel,
+        requestedReasoning: selectedReasoning,
+        capturedAt: supplied.capturedAt || Date.now()
+      })
+    : {
+        requestedModel: selectedModel,
+        requestedReasoning: selectedReasoning,
+        allowEscalation: supplied.allowEscalation !== false,
+        allowDowngrade: supplied.allowDowngrade === true,
+        capturedAt: supplied.capturedAt || Date.now()
+      };
+}
+
+function queueExecutionFields(task, options = {}) {
+  const executionProfile = captureTaskExecutionProfile(options, task);
+  return {
+    executionProfile,
+    modelSelectValue: executionProfile.requestedModel
+      || options.modelSelectValue
+      || (el.modelSelect && el.modelSelect.value),
+    reasoningEffort: executionProfile.requestedReasoning || 'auto'
+  };
+}
+
 async function enqueueOrchestrationTask(options = {}) {
   if (!RendererTaskOrchestration || !window.api || typeof window.api.createOrchestrationTask !== 'function') {
     return { success: false, error: 'Durable task orchestration is unavailable.' };
@@ -2438,6 +2492,7 @@ async function enqueueOrchestrationTask(options = {}) {
   const workspace = options.workspace && typeof options.workspace === 'object'
     ? options.workspace
     : structuredWorkspaceForConversation(originConv, options.workspacePath || '');
+  const executionProfile = captureTaskExecutionProfile(options);
   const packetResult = RendererTaskOrchestration.buildTaskPacket({
     originalUserMessage,
     resolvedObjective: options.resolvedObjective || '',
@@ -2463,6 +2518,7 @@ async function enqueueOrchestrationTask(options = {}) {
     source: options.source || 'user-queue',
     images: Array.isArray(options.images) ? options.images : [],
     contextPacketIds: Array.isArray(options.contextPacketIds) ? options.contextPacketIds : [],
+    executionProfile,
     semanticIntent,
     timestamp: options.createdAt || Date.now()
   });
@@ -2483,13 +2539,14 @@ async function enqueueOrchestrationTask(options = {}) {
     orchestrationTaskCache.set(task.taskId, task);
     const runtimePrompt = RendererTaskOrchestration.renderTaskPrompt(task);
     window.promptQueue = Array.isArray(window.promptQueue) ? window.promptQueue : [];
+    const executionFields = queueExecutionFields(task, options);
     queueItem = {
       id: options.queueId || createQueuedPromptId(),
       taskId: task.taskId,
       prompt: runtimePrompt,
       originalUserMessage: task.originalUserMessage,
       taskTitle: task.title,
-      modelSelectValue: options.modelSelectValue || (el.modelSelect && el.modelSelect.value),
+      ...executionFields,
       conversationId: targetConversationId,
       originConversationId,
       source: options.source || task.source,
@@ -2550,13 +2607,14 @@ async function enqueueOrchestrationTask(options = {}) {
     const retainedTask = rollbackTask && rollbackTask.status !== 'cancelled' ? rollbackTask : task;
     orchestrationTaskCache.set(retainedTask.taskId, retainedTask);
     if (!queueItem) {
+      const executionFields = queueExecutionFields(retainedTask, options);
       queueItem = {
         id: options.queueId || createQueuedPromptId(),
         taskId: retainedTask.taskId,
         prompt: retainedTask.objective || retainedTask.originalUserMessage || originalUserMessage,
         originalUserMessage: retainedTask.originalUserMessage || originalUserMessage,
         taskTitle: retainedTask.title || options.title || 'Queued task',
-        modelSelectValue: options.modelSelectValue || (el.modelSelect && el.modelSelect.value),
+        ...executionFields,
         conversationId: targetConversationId,
         originConversationId,
         source: options.source || retainedTask.source || 'user-queue',
@@ -2807,13 +2865,14 @@ async function queueTaskContinuation(options = {}) {
       existingTask = updated.task;
       orchestrationTaskCache.set(existingTask.taskId, existingTask);
     }
+    const executionFields = queueExecutionFields(existingTask, options);
     const queueItem = {
       id: createQueuedPromptId(),
       taskId: existingTask.taskId,
       prompt: continuationInput || RendererTaskOrchestration.renderTaskPrompt(existingTask),
       originalUserMessage: existingTask.originalUserMessage,
       taskTitle: existingTask.title,
-      modelSelectValue: options.modelSelectValue || (el.modelSelect && el.modelSelect.value),
+      ...executionFields,
       conversationId: targetConversationId,
       originConversationId: existingTask.origin && existingTask.origin.conversationId,
       source: options.source || 'task-continuation',
@@ -2891,13 +2950,15 @@ function startOrQueueTaskContinuation(continuation, conv, options = {}) {
     .filter(item => item && item.taskId !== taskId);
   const runPromise = window.runAgentLoop(
     continuation.queueItem.prompt,
-    options.modelSelectValue || window.getSelectedModel(),
+    continuation.queueItem.modelSelectValue || options.modelSelectValue || window.getSelectedModel(),
     conv,
     {
       source: options.source || continuation.queueItem.source || 'task-continuation',
       internalPrompt: true,
       preserveUserPrompt: !!continuation.queueItem.preserveUserPrompt,
       taskId,
+      reasoningEffort: continuation.queueItem.reasoningEffort,
+      executionProfile: continuation.queueItem.executionProfile,
       images: continuation.queueItem.images || [],
       contextPacketIds: continuation.queueItem.contextPacketIds || [],
       planRevision: continuation.queueItem.planRevision === true
@@ -2957,6 +3018,7 @@ async function initializeOrchestrationTasks() {
       const automaticCheckpoint = String(
         task.execution && task.execution.resumePolicy || ''
       ).toLowerCase() === 'automatic';
+      const executionFields = queueExecutionFields(task);
       window.promptQueue.push({
         id: createQueuedPromptId(),
         taskId: task.taskId,
@@ -2964,6 +3026,7 @@ async function initializeOrchestrationTasks() {
           || RendererTaskOrchestration.renderTaskPrompt(task),
         originalUserMessage: task.originalUserMessage,
         taskTitle: task.title,
+        ...executionFields,
         conversationId: targetId,
         originConversationId: task.origin && task.origin.conversationId,
         source: automaticCheckpoint ? 'system' : (task.source || 'restored-queue'),
@@ -3774,6 +3837,8 @@ function sendQueuedPromptNow(queueId, conversationId) {
   window.runAgentLoop(item.prompt, item.modelSelectValue || (el.modelSelect && el.modelSelect.value), conv, {
     source: item.source || 'queue',
     taskId: item.taskId || '',
+    reasoningEffort: item.reasoningEffort,
+    executionProfile: item.executionProfile,
     ...(queuedImages.length ? { images: queuedImages } : {})
   }).catch(error => {
     console.error('Queued prompt send-now run failed:', error);
@@ -4690,6 +4755,38 @@ function normalizeConversationMessageForReplay(msg) {
     text: extractConversationMessageText(msg),
     logs: extractConversationMessageLogs(msg || {})
   };
+}
+
+function truncatePhoneTransportText(value, maxLength) {
+  const text = typeof value === 'string' ? value : (() => {
+    try { return JSON.stringify(value); } catch (_) { return String(value || ''); }
+  })();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength).trimEnd()}\n...[trimmed for phone transport]`;
+}
+
+function compactPhoneToolParams(params) {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) return {};
+  return Object.fromEntries(Object.entries(params).slice(0, 8).map(([key, value]) => [
+    key,
+    typeof value === 'string'
+      ? truncatePhoneTransportText(value, 500)
+      : truncatePhoneTransportText(value, 800)
+  ]));
+}
+
+function compactPhoneToolLogs(logs, limit = 8) {
+  return (Array.isArray(logs) ? logs : [])
+    .filter(log => log && (log.type === 'tool_call' || log.tool || (log.type === 'thought' && log.content)))
+    .slice(-limit)
+    .map(log => ({
+      type: log.type || 'tool_call',
+      content: truncatePhoneTransportText(log.content || '', 1200),
+      tool: log.tool || '',
+      status: log.status || 'running',
+      params: compactPhoneToolParams(log.params),
+      result: truncatePhoneTransportText(log.result || '', 2400)
+    }));
 }
 
 function scrubLegacyPhoneCompanionTokenMessages() {
@@ -6676,10 +6773,12 @@ async function submitClarificationAnswers({ button, bubble, targetConversationId
       return;
     }
     window.promptQueue = window.promptQueue.filter(item => item.taskId !== continuation.task.taskId);
-    window.runAgentLoop(continuation.queueItem.prompt, el.modelSelect.value, coderConv, {
+    window.runAgentLoop(continuation.queueItem.prompt, continuation.queueItem.modelSelectValue || el.modelSelect.value, coderConv, {
       source: 'clarification-answers',
       internalPrompt: true,
       taskId: continuation.task.taskId,
+      reasoningEffort: continuation.queueItem.reasoningEffort,
+      executionProfile: continuation.queueItem.executionProfile,
       images: continuation.queueItem.images || [],
       contextPacketIds: continuation.queueItem.contextPacketIds || []
     }).catch(err => console.error('Proxied clarification resume failed:', err));
@@ -6726,10 +6825,12 @@ async function submitClarificationAnswers({ button, bubble, targetConversationId
     return;
   }
   window.promptQueue = window.promptQueue.filter(item => item.taskId !== continuation.task.taskId);
-  window.runAgentLoop(continuation.queueItem.prompt, el.modelSelect.value, conv, {
+  window.runAgentLoop(continuation.queueItem.prompt, continuation.queueItem.modelSelectValue || el.modelSelect.value, conv, {
     source: 'clarification-answers',
     internalPrompt: true,
     taskId: continuation.task.taskId,
+    reasoningEffort: continuation.queueItem.reasoningEffort,
+    executionProfile: continuation.queueItem.executionProfile,
     images: continuation.queueItem.images || [],
     contextPacketIds: continuation.queueItem.contextPacketIds || []
   }).catch(err => console.error('Clarification resume failed:', err));
@@ -6823,6 +6924,7 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
     resolved: true
   };
   if (prompt && RendererTaskOrchestration && !preflightTask) {
+    const executionProfile = captureTaskExecutionProfile(options);
     const preflight = RendererTaskOrchestration.buildTaskPacket({
       originalUserMessage,
       resolvedObjective: String(options.resolvedObjective || '').trim()
@@ -6845,6 +6947,7 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
       targetMode: 'coder',
       source: 'dispatch-handoff',
       semanticIntent,
+      executionProfile,
       timestamp: Date.now()
     });
     if (!preflight.success || !preflight.task) {
@@ -6932,7 +7035,13 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
       semanticIntent,
       unresolvedDecisions: preflightTask ? preflightTask.unresolvedDecisions : [],
       source: 'dispatch-handoff',
-      modelSelectValue: window.getSelectedModel(),
+      modelSelectValue: (preflightTask && preflightTask.executionProfile && preflightTask.executionProfile.requestedModel)
+        || window.getSelectedModel(),
+      reasoningEffort: (preflightTask && preflightTask.executionProfile && preflightTask.executionProfile.requestedReasoning)
+        || appConfig.reasoningEffort
+        || 'auto',
+      executionProfile: (preflightTask && preflightTask.executionProfile)
+        || captureTaskExecutionProfile(options),
       contextPacketIds: assignedPacketIds,
       createdAt: Date.now()
     });
@@ -7195,12 +7304,14 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     queued: queuedForResolvedConversation
   });
   const messages = normalizedPhoneMessages.map(replayMsg => {
-    const replayLogs = Array.isArray(replayMsg.logs) ? replayMsg.logs : [];
+    const replayLogs = compactPhoneToolLogs(replayMsg.logs, 8);
     const text = replayMsg.text;
     return {
       role: replayMsg.role,
       content: text,
       text,
+      createdAt: replayMsg.createdAt || 0,
+      requestId: replayMsg.requestId || '',
       logs: replayMsg.role === 'assistant' ? replayLogs : [],
       images: Array.isArray(replayMsg.images) ? replayMsg.images.slice(0, 4) : []
     };
@@ -7215,34 +7326,22 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   const latestText = latestAssistant ? (latestAssistant.text || '') : '';
   const changedFiles = [];
   const testResults = [];
-  const latestToolCalls = [];
+  const latestToolCalls = compactPhoneToolLogs(latestAssistant && latestAssistant.logs, 8);
   (latestAssistant && Array.isArray(latestAssistant.logs) ? latestAssistant.logs : []).forEach(log => {
     if (log.tool === 'write_file' || log.tool === 'modify_file' || log.tool === 'patch_file') {
       const params = log.params || {};
       if (params.path && !changedFiles.includes(params.path)) changedFiles.push(params.path);
     }
     if (log.tool === 'run_tests' || log.tool === 'run_command') {
-      testResults.push(log.result || '');
-    }
-    if (log.type === 'tool_call' || log.tool || log.type === 'thought') {
-      latestToolCalls.push({
-        type: log.type || 'tool_call',
-        content: log.content || '',
-        tool: log.tool || '',
-        status: log.status || 'running',
-        params: log.params || {},
-        result: log.result || ''
-      });
+      testResults.push(truncatePhoneTransportText(log.result || '', 2400));
     }
   });
   const walkthroughIndex = latestText.indexOf('\n\n## Work Walkthrough');
   const workWalkthrough = walkthroughIndex === -1 ? '' : latestText.slice(walkthroughIndex).trim();
   const conversationsSummary = conversations.map(c => {
-    const normalizedMessages = Array.isArray(c.messages)
-      ? c.messages.filter(isConversationMessageVisible).map(normalizeConversationMessageForReplay)
-      : [];
-    const messageCount = normalizedMessages.filter(msg =>
-      msg.role === 'user' || msg.role === 'assistant' || msg.role === 'steering'
+    const messageCount = (Array.isArray(c.messages) ? c.messages : []).filter(msg =>
+      isConversationMessageVisible(msg)
+      && ['user', 'assistant', 'steering'].includes(normalizeConversationMessageRole(msg))
     ).length;
     const taskCount = Array.isArray(c.tasks) ? c.tasks.length : 0;
     return {
@@ -7503,6 +7602,7 @@ async function submitPhoneCompanionPromptOnce(options) {
   // Can be called with either a string or an options object
   const text = typeof options === 'string' ? options.trim() : String(options.prompt || '').trim();
   let targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
+  const phoneRequestId = typeof options === 'object' ? String(options.requestId || '').trim() : '';
   // Image data from phone companion (optional)
   const phoneImageData = typeof options === 'object' && options.imageData ? options.imageData : null;
   const phoneImageMime = typeof options === 'object' && options.imageMimeType ? options.imageMimeType : 'image/jpeg';
@@ -7568,6 +7668,7 @@ async function submitPhoneCompanionPromptOnce(options) {
       id: messageId,
       role: 'user',
       source: 'phone',
+      requestId: phoneRequestId,
       text,
       createdAt: Date.now(),
       ...(phoneImages.length ? { images: phoneImages } : {})
@@ -7607,6 +7708,7 @@ async function submitPhoneCompanionPromptOnce(options) {
       id: messageId,
       role: 'user',
       source: 'phone',
+      requestId: phoneRequestId,
       text,
       createdAt: Date.now(),
       ...(phoneImages.length ? { images: phoneImages } : {})
@@ -7659,6 +7761,7 @@ async function submitPhoneCompanionPromptOnce(options) {
       id: messageId,
       role: 'user',
       source: 'phone',
+      requestId: phoneRequestId,
       text,
       createdAt: Date.now(),
       ...(phoneImages.length ? { images: phoneImages } : {})
@@ -7694,7 +7797,7 @@ async function submitPhoneCompanionPromptOnce(options) {
     if (ownsActiveSupervisedRun(conv)) {
       // Push the user message to history first
       const messageId = createConversationMessageId(conv.id);
-      conv.messages.push({ id: messageId, role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
+      conv.messages.push({ id: messageId, role: 'user', source: 'phone', requestId: phoneRequestId, text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
       saveConversationsToStorage();
       if (targetId === activeConversationId) renderUserMessage(text, phoneImages, Date.now());
       const supervisorResult = await handleSupervisorMessage(
@@ -7723,6 +7826,7 @@ async function submitPhoneCompanionPromptOnce(options) {
         id: messageId,
         role: 'user',
         source: 'phone',
+        requestId: phoneRequestId,
         text,
         createdAt: Date.now(),
         ...(phoneImages.length ? { images: phoneImages } : {})
@@ -7754,7 +7858,7 @@ async function submitPhoneCompanionPromptOnce(options) {
     }
 
     const messageId = createConversationMessageId(conv.id);
-    conv.messages.push({ id: messageId, role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
+    conv.messages.push({ id: messageId, role: 'user', source: 'phone', requestId: phoneRequestId, text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
     saveConversationsToStorage();
     if (targetId === activeConversationId) {
       renderUserMessage(text, phoneImages, Date.now());
@@ -7802,7 +7906,7 @@ async function submitPhoneCompanionPromptOnce(options) {
 
   // Directly run agent loop on the target conversation (without forcing desktop UI switch)
   if (conv.messages) {
-    conv.messages.push({ id: createConversationMessageId(conv.id), role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
+    conv.messages.push({ id: createConversationMessageId(conv.id), role: 'user', source: 'phone', requestId: phoneRequestId, text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
     saveConversationsToStorage();
   }
   if (targetId === activeConversationId) {
@@ -8407,10 +8511,12 @@ async function approveCurrentPlanAndContinue(options = {}) {
       return { success: true, queued: true, taskId: continuation.task.taskId };
     }
     window.promptQueue = window.promptQueue.filter(item => item.taskId !== continuation.task.taskId);
-    window.runAgentLoop(continuation.queueItem.prompt, el.modelSelect.value, conv, {
+    window.runAgentLoop(continuation.queueItem.prompt, continuation.queueItem.modelSelectValue || el.modelSelect.value, conv, {
       source: 'plan-approval',
       internalPrompt: true,
       taskId: continuation.task.taskId,
+      reasoningEffort: continuation.queueItem.reasoningEffort,
+      executionProfile: continuation.queueItem.executionProfile,
       images: continuation.queueItem.images || [],
       contextPacketIds: continuation.queueItem.contextPacketIds || []
     })
