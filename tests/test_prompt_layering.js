@@ -46,6 +46,11 @@ function dispatchPrompt() {
   return agent.getSystemInstruction(false, '', '');
 }
 
+function operatorPrompt() {
+  agent.__setActiveConversationModeForTest('operator');
+  return agent.getSystemInstruction(false, '', '');
+}
+
 test('orion-operating-contract exports the shared fragments as non-empty strings', (t) => {
   t.equal(typeof contract.VERIFICATION_DISCIPLINE, 'string');
   t.ok(contract.VERIFICATION_DISCIPLINE.length > 0, 'verification discipline fragment is not empty');
@@ -235,5 +240,84 @@ test('Phase 3: DOM-before-pixel-control is shared inside Coder\'s computer-use r
   const dispatch = dispatchPrompt();
   t.notOk(dispatch.includes(contract.DOM_BEFORE_PIXEL_CONTROL),
     'the fragment was not added to Dispatch, which has no computer_action to prefer DOM tools over');
+  t.end();
+});
+
+// ── Phase 3 piece 3: OPERATOR_INSTRUCTION ───────────────────────────────────────────────────────
+// getSystemInstruction() now has a real three-way branch (Dispatch / Coder / Operator). These tests
+// exercise the same assembled-prompt-text level as everything above, per this file's own stated
+// convention, so they keep meaning regardless of later internal restructuring.
+
+test('Phase 3 piece 3: getSystemInstruction serves OPERATOR_INSTRUCTION for activeConversationMode "operator"', (t) => {
+  const operator = operatorPrompt();
+  t.ok(operator.includes("operating the user's desktop and browser directly on Jason's behalf"),
+    'Operator gets its own identity opening, not a fallback to Coder\'s prompt');
+  t.notOk(operator.includes('You are Orion AI, the ultimate pair programmer agent'),
+    'Operator prompt is not silently Coder\'s prompt (the pre-Phase-3 collapse this whole audit exists to prevent)');
+  agent.__setActiveConversationModeForTest('orion');
+  t.end();
+});
+
+test('Phase 3 piece 3: Operator shares VERIFICATION_DISCIPLINE, TOOL_SCHEMA_NOTE, DOM_BEFORE_PIXEL_CONTROL, and ADAPT_INSTEAD_OF_QUITTING with the other specialists', (t) => {
+  const operator = operatorPrompt();
+  for (const fragment of [contract.VERIFICATION_DISCIPLINE, contract.TOOL_SCHEMA_NOTE, contract.DOM_BEFORE_PIXEL_CONTROL, contract.ADAPT_INSTEAD_OF_QUITTING]) {
+    t.ok(operator.includes(fragment), 'Operator prompt contains the exact shared fragment');
+    t.equal(countOccurrences(operator, fragment), 1, 'the fragment appears exactly once (no accidental double-inclusion or hand-copy)');
+  }
+  t.ok(operator.includes('TOOL PREFERENCE — DOM BEFORE PIXELS:'), 'Operator has its own header for the shared DOM-before-pixel rule');
+  t.ok(operator.includes('ADAPT INSTEAD OF QUITTING:'), 'Operator has its own header for the shared adapt rule');
+  agent.__setActiveConversationModeForTest('orion');
+  t.end();
+});
+
+test('Phase 3 piece 3: Operator prompt covers state freshness, evidence-before-completion, and the real-world side-effects permission boundary', (t) => {
+  const operator = operatorPrompt();
+  t.ok(operator.includes('STATE FRESHNESS'), 'has a dedicated state-freshness section');
+  t.ok(operator.includes('capture_screen') && operator.includes('inspect_screenshot_with_model'),
+    'state-freshness guidance names the actual gated tools, not just an abstract rule');
+  t.ok(/does not need re-inspection/i.test(operator),
+    'explicitly covers when a fresh look is NOT required, not just when it is');
+
+  t.ok(operator.includes('EVIDENCE BEFORE COMPLETION'), 'has a dedicated evidence-before-completion section');
+  t.ok(/observed the result|actually observed/i.test(operator), 'completion is tied to observation, not intent');
+
+  t.ok(operator.includes('REAL-WORLD SIDE EFFECTS') || operator.includes('PERMISSION BOUNDARY'),
+    'has a dedicated permission-boundary section');
+  t.ok(/purchase/i.test(operator) && /send/i.test(operator) && /delet/i.test(operator) && /submit/i.test(operator),
+    'permission boundary names purchases, sends, deletions, and submissions explicitly, not just an abstract "irreversible" label');
+  t.ok(/explicitly/i.test(operator), 'permission boundary requires explicit authorization, not inferred intent');
+  agent.__setActiveConversationModeForTest('orion');
+  t.end();
+});
+
+test('Phase 3 piece 3: Operator prompt excludes Coder-specific testing, file-edit, and mission/subplan content', (t) => {
+  const operator = operatorPrompt();
+  const coderOnlyExcludedFromOperator = [
+    'TESTING AND REGRESSION DISCIPLINE',
+    'FILE EDIT DISCIPLINE',
+    'PREVIEW_APP RULES',
+    'DESIGN QUALITY',
+    'update_mission_context',
+    'start_subplan',
+    'coverage_frontier',
+    'MEMORY REASONING CONTRACT',
+    'SCRATCHPAD CHAIN-OF-THOUGHT'
+  ];
+  for (const phrase of coderOnlyExcludedFromOperator) {
+    t.notOk(operator.includes(phrase), `Operator prompt does not include Coder-specific "${phrase}"`);
+  }
+  // And the reverse: Operator's own content must not have leaked into Coder or Dispatch.
+  const coder = coderPrompt();
+  const dispatch = dispatchPrompt();
+  t.notOk(coder.includes('REAL-WORLD SIDE EFFECTS'), "Operator's permission-boundary section was not added to Coder");
+  t.notOk(dispatch.includes('REAL-WORLD SIDE EFFECTS'), "Operator's permission-boundary section was not added to Dispatch");
+  agent.__setActiveConversationModeForTest('orion');
+  t.end();
+});
+
+test('Phase 3 piece 3: Operator prompt is not suspiciously short', (t) => {
+  const operator = operatorPrompt();
+  t.ok(operator.length > 2500, `Operator prompt is substantial (${operator.length} chars)`);
+  agent.__setActiveConversationModeForTest('orion');
   t.end();
 });
