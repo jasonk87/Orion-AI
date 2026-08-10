@@ -170,3 +170,25 @@ test('assembled prompts are not suspiciously short after extraction', (t) => {
   t.ok(dispatch.length > 2000, `Dispatch prompt is still substantial (${dispatch.length} chars)`);
   t.end();
 });
+
+test('Dispatch is instructed to use schedule_followup and watch_condition, not just told it exists', (t) => {
+  // Dispatch gained both tools when the allowlist fix landed (schedule_followup / watch_condition),
+  // but DISPATCHER_INSTRUCTION never actually told it when to use them — a real gap noticed during
+  // the Phase 1 prompt-layering review. This guards the fix: a dedicated SCHEDULING section that
+  // names both tools and tells Dispatch when each applies.
+  const dispatch = dispatchPrompt();
+  t.ok(dispatch.includes('SCHEDULING (schedule_followup / watch_condition):'), 'Dispatch prompt has a dedicated scheduling section');
+  t.ok(dispatch.includes('schedule_followup'), 'schedule_followup is named');
+  t.ok(dispatch.includes('watch_condition'), 'watch_condition is named');
+  t.ok(/every morning|check back|remind me/i.test(dispatch), 'gives Dispatch a concrete durable-request example, not just an abstract rule');
+  t.ok(/tell me when/i.test(dispatch), 'gives Dispatch a concrete "notify me when" example for watch_condition');
+
+  // This is Dispatch-specific behavior (Dispatch's own routing/ownership rules), not a shared
+  // operating rule — it must not leak into Coder's prompt, which already has its own differently
+  // worded FOLLOW-UP TIMERS rule for its own execution context.
+  const coder = coderPrompt();
+  t.notOk(coder.includes('SCHEDULING (schedule_followup / watch_condition):'),
+    "Dispatch's scheduling section was not accidentally added to Coder");
+  t.ok(coder.includes('FOLLOW-UP TIMERS'), 'Coder keeps its own, separate follow-up rule');
+  t.end();
+});

@@ -157,7 +157,12 @@ ${OrionOperatingContract.DB_QUERY_CORE}
 
 ENVIRONMENT INSPECTION (inspect_environment):
 - Use "inspect_environment" for read-only system checks: package versions, running processes, port availability, env vars, git status.
-- Commands are safety-filtered — writes, installs, server starts, and destructive operations are blocked.`;
+- Commands are safety-filtered — writes, installs, server starts, and destructive operations are blocked.
+
+SCHEDULING (schedule_followup / watch_condition):
+- Use "schedule_followup" for durable one-off or recurring requests — "every morning at 8, give me X," "check back with me in an hour," "remind me before the meeting." Schedules survive restarts and machine sleep. Never just promise to follow up later without actually scheduling one — you have no way to act on that promise otherwise.
+- Use "watch_condition" for "tell me when Y happens" instead of scheduling repeated follow-ups to check the same thing — it polls quietly in the background and only wakes this conversation when the condition actually changes.
+- Schedule only one active follow-up or watch per purpose; when one fires, actually report the outcome to Jason rather than letting it fire silently.`;
 
 
 // Returns the right system instruction for the current mode.
