@@ -802,10 +802,11 @@ const ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS = [
   },
   {
     name: 'capture_screen',
-    description: 'Captures a fresh OS-level desktop screenshot — for NATIVE apps (pygame, tkinter, etc.) previously launched with preview_app. NOT for web apps: use open_url + take_screenshot instead, which captures the browser worker view of the page rather than whatever happens to be on screen. Optionally waits first (delayMs) to let the native app advance.',
+    description: 'Captures a fresh OS-level desktop screenshot — for NATIVE apps (pygame, tkinter, etc.) previously launched with preview_app, or for computer_action targeting. NOT for web apps: use open_url + take_screenshot instead, which captures the browser worker view of the page rather than whatever happens to be on screen. Optionally waits first (delayMs) to let the native app advance. On a multi-monitor machine, the result includes availableDisplays (each with an id); pass one of those ids as displayId to capture a specific monitor instead of the primary one. A subsequent computer_action automatically targets whichever display this capture used.',
     parameters: { type: 'OBJECT', properties: {
       delayMs: { type: 'NUMBER', description: 'Optional ms to wait before capturing (max 120000), to let the running app advance.' },
-      destination: { type: 'STRING', description: 'Optional workspace-relative PNG path for the screenshot.' }
+      destination: { type: 'STRING', description: 'Optional workspace-relative PNG path for the screenshot.' },
+      displayId: { type: 'STRING', description: 'Optional monitor id from a previous capture_screen\'s availableDisplays. Omit to use the primary display.' }
     } }
   },
   {
@@ -7068,7 +7069,8 @@ async function executeTool(name, args, workspace, config, conversation, executio
       const result = await window.api.captureScreen(workspace, {
         delayMs: args.delayMs,
         destination: args.destination || '',
-        conversationId: conversation.id
+        conversationId: conversation.id,
+        displayId: args.displayId || ''
       });
       if (!result.success) throw new Error(result.error || 'Screen capture failed');
       // State-freshness optimization (item 6): the main process cheaply compared this capture's
@@ -7087,7 +7089,9 @@ async function executeTool(name, args, workspace, config, conversation, executio
         width: Number(result.width) || 0,
         height: Number(result.height) || 0,
         capturedAt: now,
-        inspectedAt: reuseInspection ? now : 0
+        inspectedAt: reuseInspection ? now : 0,
+        displayId: result.displayId != null ? String(result.displayId) : '',
+        availableDisplays: Array.isArray(result.availableDisplays) ? result.availableDisplays : []
       };
       if (reuseInspection) {
         result.inspectionSkipped = true;
@@ -7112,7 +7116,10 @@ async function executeTool(name, args, workspace, config, conversation, executio
         sourceWidth: snapshot.width,
         sourceHeight: snapshot.height
       };
-      const result = await window.api.computerAction(workspace, action, conversation.id, args.destination || '');
+      // Always the display the model's most recent capture_screen actually showed it - never a
+      // separate model-supplied parameter - so an action can't land on a monitor the model never
+      // looked at.
+      const result = await window.api.computerAction(workspace, action, conversation.id, args.destination || '', snapshot.displayId || '');
       if (!result || !result.success) throw new Error((result && result.error) || 'Computer action failed');
       if (result.path && result.width && result.height) {
         executionContext.lastDesktopSnapshot = {
@@ -7120,7 +7127,9 @@ async function executeTool(name, args, workspace, config, conversation, executio
           width: Number(result.width) || snapshot.width,
           height: Number(result.height) || snapshot.height,
           capturedAt: Date.now(),
-          inspectedAt: 0
+          inspectedAt: 0,
+          displayId: result.displayId != null ? String(result.displayId) : (snapshot.displayId || ''),
+          availableDisplays: snapshot.availableDisplays || []
         };
       }
       return result;
@@ -12187,12 +12196,16 @@ function buildAgentToolDeclarations() {
           },
           {
             name: 'computer_action',
-            description: 'Coder-only Windows computer control. Use capture_screen first, inspect it with model vision, then perform ONE bounded mouse, keyboard, or scroll action against the visible primary display. Orion is hidden while the action runs and the resulting screen is captured by default. Never use this to type secrets, operate security/UAC dialogs, or bypass the dedicated browser, file, command, or safety tools. Coordinates refer to the most recent capture_screen image. If the user asks to see the result in chat, call attach_image with the returned path.',
+            description: 'Coder/Operator Windows computer control. Use capture_screen first, inspect it with model vision, then perform ONE bounded mouse, keyboard, scroll, or drag action against the same display that capture_screen captured (including a non-primary monitor, if capture_screen was given a displayId). Orion is hidden while the action runs and the resulting screen is captured by default. Never use this to type secrets, operate security/UAC dialogs, or bypass the dedicated browser, file, command, or safety tools. Coordinates refer to the most recent capture_screen image. If the user asks to see the result in chat, call attach_image with the returned path.',
             parameters: { type: 'OBJECT', properties: {
-              action: { type: 'STRING', enum: ['move', 'click', 'scroll', 'type', 'key'] },
+              action: { type: 'STRING', enum: ['move', 'click', 'scroll', 'type', 'key', 'drag'] },
               targetDescription: { type: 'STRING', description: 'Short visible target and intended action, for example "the GRITLIFE project row in Codex".' },
-              x: { type: 'NUMBER', description: 'X coordinate in the most recent capture_screen image; required for move/click/scroll.' },
-              y: { type: 'NUMBER', description: 'Y coordinate in the most recent capture_screen image; required for move/click/scroll.' },
+              x: { type: 'NUMBER', description: 'X coordinate in the most recent capture_screen image; required for move/click/scroll/drag (drag start point).' },
+              y: { type: 'NUMBER', description: 'Y coordinate in the most recent capture_screen image; required for move/click/scroll/drag (drag start point).' },
+              endX: { type: 'NUMBER', description: 'X coordinate to release the drag at; required for drag.' },
+              endY: { type: 'NUMBER', description: 'Y coordinate to release the drag at; required for drag.' },
+              steps: { type: 'NUMBER', description: 'Drag only: intermediate move steps between press and release, 1-50 (default 12). Higher is smoother for apps that need real drag motion, not just a jump.' },
+              stepDelayMs: { type: 'NUMBER', description: 'Drag only: delay between each intermediate step, 0-250 ms (default 15).' },
               button: { type: 'STRING', enum: ['left', 'right', 'middle'] },
               clickCount: { type: 'NUMBER', description: '1-3 clicks.' },
               amount: { type: 'NUMBER', description: 'Wheel delta from -2400 to 2400. Positive scrolls up; negative scrolls down.' },
