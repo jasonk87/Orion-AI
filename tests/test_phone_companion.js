@@ -81,21 +81,28 @@ function makeElectronMock(handlers = {}) {
             executeJavaScript: async (script) => {
               calls.push(script);
               if (script.includes('approvePhoneCompanionPairing')) return handlers.pairingApproval || { approved: true };
-              if (script.includes('getPhoneCompanionState')) return handlers.state || {
-                conversationId: 'conv1',
-                title: 'Task One',
-                conversations: [{ id: 'conv1', title: 'Task One', active: true }],
-                tasks: [{ title: 'Build', status: 'in-progress' }],
-                messages: [],
-                latestOutput: 'latest',
-                preview: {
-                  latestAssistantOutput: 'latest',
-                  workWalkthrough: 'Done: test',
-                  changedFiles: ['app.js'],
-                  testResults: ['npm test passed'],
-                  appLaunchUrl: 'http://localhost:3000'
-                }
-              };
+              if (script.includes('getPhoneCompanionState')) {
+                // stateProvider lets a test control timing/sequencing per call (e.g. to hold the
+                // Nth call open until a concurrent triggerCompanionSync() has had a chance to fire,
+                // reproducing races between a state change landing and an SSE connection assembling
+                // its snapshot). Falls through to the static handlers.state used by most tests.
+                if (typeof handlers.stateProvider === 'function') return handlers.stateProvider();
+                return handlers.state || {
+                  conversationId: 'conv1',
+                  title: 'Task One',
+                  conversations: [{ id: 'conv1', title: 'Task One', active: true }],
+                  tasks: [{ title: 'Build', status: 'in-progress' }],
+                  messages: [],
+                  latestOutput: 'latest',
+                  preview: {
+                    latestAssistantOutput: 'latest',
+                    workWalkthrough: 'Done: test',
+                    changedFiles: ['app.js'],
+                    testResults: ['npm test passed'],
+                    appLaunchUrl: 'http://localhost:3000'
+                  }
+                };
+              }
               if (script.includes('switchPhoneCompanionConversation')) return { success: true, conversationId: 'conv2' };
               if (script.includes('startPhoneCompanionTask')) return { success: true, conversationId: 'new' };
               if (script.includes('beginNewFocus')) return handlers.newFocus || { cancelled: ['task-pending'], count: 1 };
@@ -254,6 +261,70 @@ function requestFirstSseFrame(port, path, session) {
     });
     req.end();
   });
+}
+
+// Opens an SSE connection and keeps collecting parsed `data:` frames for as long as the caller
+// holds it open (unlike requestFirstSseFrame, which destroys the socket after the first one).
+// Used to observe a *sequence* of pushes on a single connection -- e.g. an initial snapshot
+// followed by a later update that arrives while the connection is still open.
+function openSseConnection(port, path, session) {
+  const frames = [];
+  let notify = null;
+  const req = http.request({
+    method: 'GET',
+    hostname: '127.0.0.1',
+    port,
+    path,
+    headers: session ? { Authorization: `Bearer ${session.secret}`, 'X-Orion-Device-Id': session.deviceId } : {}
+  });
+  const responsePromise = new Promise((resolve, reject) => {
+    req.on('response', (res) => {
+      let buffer = '';
+      res.on('data', chunk => {
+        buffer += chunk.toString();
+        let sepIndex;
+        while ((sepIndex = buffer.indexOf('\n\n')) !== -1) {
+          const rawEvent = buffer.slice(0, sepIndex);
+          buffer = buffer.slice(sepIndex + 2);
+          const dataLines = rawEvent.split('\n').filter(line => line.startsWith('data:'));
+          if (dataLines.length) {
+            try {
+              frames.push(JSON.parse(dataLines.map(line => line.slice(5).trim()).join('\n')));
+              if (notify) notify();
+            } catch (e) {}
+          }
+        }
+      });
+      resolve(res);
+    });
+    req.on('error', (err) => {
+      if (!/ECONNRESET|aborted/i.test(err.message)) reject(err);
+    });
+  });
+  req.end();
+  return {
+    frames,
+    responsePromise,
+    waitForFrameCount(count, timeoutMs = 2000) {
+      return new Promise((resolve, reject) => {
+        if (frames.length >= count) { resolve(frames); return; }
+        const timer = setTimeout(() => {
+          notify = null;
+          reject(new Error(`Timed out waiting for ${count} SSE frame(s); got ${frames.length}`));
+        }, timeoutMs);
+        notify = () => {
+          if (frames.length >= count) {
+            clearTimeout(timer);
+            notify = null;
+            resolve(frames);
+          }
+        };
+      });
+    },
+    close() {
+      req.destroy();
+    }
+  };
 }
 
 test('Phone Companion generated inline script is valid JavaScript', (t) => {
@@ -741,6 +812,71 @@ test('Phone Companion pushes state over SSE instead of only polling', async (t) 
     const framePayload = JSON.parse(dataLine.slice('data: '.length));
     t.equal(framePayload.success, true, 'pushed frame carries the same state shape as /api/state');
   } finally {
+    await closeServer(main.getCompanionServer());
+  }
+});
+
+test('Phone Companion does not drop a state update that lands while an SSE connection is (re)establishing', async (t) => {
+  // Regression test for a state-sync gap: a phone reconnecting (e.g. coming back from
+  // backgrounded/inactive) registers its SSE connection AFTER assembling its first snapshot.
+  // If a message finishes processing (persistConversations -> triggerCompanionSync) in that
+  // window, the sync had nowhere to land -- the connection wasn't registered in
+  // activeSseTriggers yet -- and the phone showed nothing new until an unrelated later event or a
+  // full app reopen. The message itself sent and was processed correctly; only the push that was
+  // supposed to tell the UI about it was silently lost.
+  let resolveFirstSnapshot = null;
+  let stateCalls = 0;
+  const stateV1 = {
+    conversationId: 'conv1', title: 'Before reply', conversations: [], tasks: [], messages: [],
+    latestOutput: 'v1', preview: {}
+  };
+  const stateV2 = {
+    conversationId: 'conv1', title: 'After reply', conversations: [], tasks: [], messages: [],
+    latestOutput: 'v2', preview: {}
+  };
+  const { main } = await startMainWithConfig(1199, {}, {
+    stateProvider: () => {
+      stateCalls += 1;
+      // Hold the connection's first snapshot open until the test explicitly resolves it, so a
+      // triggerCompanionSync() can be fired while this connection is still assembling that
+      // snapshot -- mirroring a message finishing right as the phone's SSE stream reconnects.
+      if (stateCalls === 1) {
+        return new Promise(resolve => { resolveFirstSnapshot = () => resolve(stateV1); });
+      }
+      return stateV2;
+    }
+  });
+  let live = null;
+  try {
+    const pair = await request('POST', 1199, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
+    const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+
+    live = openSseConnection(1199, '/api/events', session);
+    await live.responsePromise;
+
+    // Wait for the server to have entered its first getPhoneCompanionState() call (proving the
+    // snapshot is genuinely in flight) before simulating the race.
+    await new Promise(resolve => {
+      (function check() { stateCalls >= 1 ? resolve() : setImmediate(check); })();
+    });
+    t.equal(stateCalls, 1, 'the connection began assembling its initial snapshot');
+    t.ok(typeof resolveFirstSnapshot === 'function', 'the first snapshot call is genuinely pending, not already resolved');
+
+    // A message finishes processing concurrently with this connection's setup.
+    main.triggerCompanionSync();
+    // Now let the held-open initial snapshot resolve.
+    resolveFirstSnapshot();
+
+    const frames = await live.waitForFrameCount(2, 2000);
+    t.equal(frames.length, 2, 'the connection receives both its initial snapshot and the update that raced its setup');
+    t.equal(frames[0].title, 'Before reply', 'first frame is the state as of connection time');
+    t.equal(frames[1].title, 'After reply', 'second frame reflects the concurrent update -- it was not silently dropped');
+  } finally {
+    // Always tear down the still-open SSE socket before closing the server -- server.close()
+    // waits for existing keep-alive connections to end on their own, and this connection's
+    // 20s ping keeps it alive indefinitely. Skipping this step (e.g. on an assertion failure
+    // above) would hang the whole test run instead of just failing this one test.
+    if (live) live.close();
     await closeServer(main.getCompanionServer());
   }
 });

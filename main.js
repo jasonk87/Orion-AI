@@ -473,6 +473,7 @@ if (process.env.NODE_ENV === 'test') {
     enablePhoneCompanionLanMode: ipcServer.enablePhoneCompanionLanMode,
     buildCompanionPairingAnnouncement: ipcServer.buildCompanionPairingAnnouncement,
     getPhoneCompanionPairingForTest: ipcServer.getPhoneCompanionPairingPayload,
+    triggerCompanionSync: ipcServer.triggerCompanionSync,
     getCompanionServer: () => shared.companionServer,
     resetCompanionServer: () => {
       if (shared.companionServer) {
