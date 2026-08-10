@@ -2184,8 +2184,9 @@ code {
   color: #fecaca;
 }
 
-/* DELETE BUTTON STYLING FOR SIDEBAR ITEMS */
-.project-item .delete-btn, .conversation-item .delete-btn {
+/* DELETE/RENAME BUTTON STYLING FOR SIDEBAR ITEMS */
+.project-item .delete-btn, .conversation-item .delete-btn,
+.conversation-item .rename-btn {
   opacity: 0.62;
   transition: var(--transition-fast);
   color: var(--text-muted);
@@ -2194,13 +2195,43 @@ code {
   border-radius: 6px !important;
 }
 
-.project-item:hover .delete-btn, .conversation-item:hover .delete-btn {
+.project-item:hover .delete-btn, .conversation-item:hover .delete-btn,
+.conversation-item:hover .rename-btn {
   opacity: 0.82;
 }
 
 .project-item:hover .delete-btn:hover, .conversation-item:hover .delete-btn:hover {
   opacity: 1;
   color: var(--error-color) !important;
+}
+
+.conversation-item:hover .rename-btn:hover {
+  opacity: 1;
+  color: var(--text-primary) !important;
+}
+
+/* Sidebar conversation search - a plain text filter above each conversation list */
+.conversation-search-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  margin: 2px 0 4px;
+  font-size: 0.78rem;
+  font-family: var(--font-sans);
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+
+.conversation-search-input::placeholder {
+  color: var(--text-muted);
+}
+
+.conversation-search-input:focus {
+  outline: none;
+  border-color: var(--accent-color);
 }
 
 /* Ghost icon button used for sidebar row actions (delete, add-conversation) */

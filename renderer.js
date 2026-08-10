@@ -87,6 +87,9 @@ let expandedFileFolders = new Set();
 // still preserved in memory, but an old persisted UI preference must not reopen Coder or an old
 // Dispatch transcript on the next launch.
 let appMode = 'orion'; // 'orion' | 'coder' | 'operator'
+// Item 9 (UI polish): a plain client-side title filter per sidebar tab. Kept as one small object
+// rather than three separate variables so renderConversationList can look a mode up generically.
+let conversationSearchQueries = { orion: '', coder: '', operator: '' };
 let lastDispatchConversationId = '';
 let dispatchDraft = {
   active: true,
@@ -125,6 +128,9 @@ const el = {
   conversationListOperator: document.getElementById('conversation-list-operator'),
   btnAddConversationOperator: document.getElementById('btn-add-conversation-operator'),
   btnNewConversationOperator: document.getElementById('btn-new-conversation-operator'),
+  conversationSearchOrion: document.getElementById('conversation-search-orion'),
+  conversationSearchCoder: document.getElementById('conversation-search-coder'),
+  conversationSearchOperator: document.getElementById('conversation-search-operator'),
   btnSettings: document.getElementById('btn-settings'),
   btnChangeWorkspace: document.getElementById('btn-change-workspace'),
   btnSyncFiles: document.getElementById('btn-sync-files'),
@@ -2294,6 +2300,19 @@ function setupChatHandlers() {
   if (el.btnNewConversationOperator) {
     el.btnNewConversationOperator.addEventListener('click', () => createNewConversation('operator'));
   }
+
+  // Item 9 (UI polish): sidebar conversation search, one plain substring filter per mode.
+  [
+    { input: el.conversationSearchOrion, mode: 'orion' },
+    { input: el.conversationSearchCoder, mode: 'coder' },
+    { input: el.conversationSearchOperator, mode: 'operator' }
+  ].forEach(({ input, mode }) => {
+    if (!input) return;
+    input.addEventListener('input', () => {
+      conversationSearchQueries[mode] = input.value;
+      renderConversationList();
+    });
+  });
   if (el.btnNewConversationCoder && el.newConvPickerMenu) {
     const closePicker = () => { el.newConvPickerMenu.hidden = true; };
     const openPicker = () => {
@@ -4373,6 +4392,33 @@ function conversationMessageValue(conversation) {
   return meaningfulAssistant * 100000 + logCount * 1000 + messages.length * 10;
 }
 
+// Item 9 (UI polish): the sidebar previously hardcoded every conversation's displayed age to the
+// literal string 'now', regardless of how old it actually was. conversationSortTime already
+// computes the best-available last-activity timestamp for a conversation (used for the >50
+// stub-eviction sort); this turns that same timestamp into the short relative label the list
+// actually needs.
+function formatRelativeConversationTime(timestampMs) {
+  const ts = Number(timestampMs) || 0;
+  if (!ts) return 'new';
+  const diffMs = Date.now() - ts;
+  if (diffMs < 0) return 'now'; // clock skew or a timestamp set slightly ahead - never show a negative age
+  const minute = 60 * 1000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  const week = 7 * day;
+  if (diffMs < minute) return 'now';
+  if (diffMs < hour) return `${Math.floor(diffMs / minute)}m`;
+  if (diffMs < day) return `${Math.floor(diffMs / hour)}h`;
+  if (diffMs < week) return `${Math.floor(diffMs / day)}d`;
+  if (diffMs < 5 * week) return `${Math.floor(diffMs / week)}w`;
+  // Beyond ~a month, a relative count stops being useful at a glance - a short date reads better.
+  const date = new Date(ts);
+  const sameYear = date.getFullYear() === new Date().getFullYear();
+  return sameYear
+    ? date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+    : date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
 function conversationSortTime(conversation) {
   const messages = Array.isArray(conversation && conversation.messages) ? conversation.messages : [];
   const messageTimes = messages
@@ -5241,28 +5287,43 @@ function renderConversationList() {
       return mode !== 'coder' || !c.projectPath;
     });
 
-    if (standaloneConversations.length === 0) {
-      container.innerHTML = mode === 'orion'
-        ? '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No history yet</p>'
-        : '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No standalone conversations yet</p>';
+    const query = String((conversationSearchQueries && conversationSearchQueries[mode]) || '').trim().toLowerCase();
+    const visibleConversations = query
+      ? standaloneConversations.filter(c => String(c.title || '').toLowerCase().includes(query))
+      : standaloneConversations;
+
+    if (visibleConversations.length === 0) {
+      if (query) {
+        container.innerHTML = '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No conversations match your search</p>';
+      } else {
+        container.innerHTML = mode === 'orion'
+          ? '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No history yet</p>'
+          : '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No standalone conversations yet</p>';
+      }
       return;
     }
 
-    standaloneConversations.forEach(conv => {
+    visibleConversations.forEach(conv => {
       const item = document.createElement('div');
       item.className = `conversation-item ${conv.id === activeConversationId ? 'active' : ''}`;
 
-      const age = 'now';
+      const age = formatRelativeConversationTime(conversationSortTime(conv));
 
       item.innerHTML = `
         <div class="conversation-details row-details-flex">
           <span class="conversation-name">${escapeHtml(conv.title)}</span>
           <span class="conversation-time">${age}</span>
         </div>
+        <button class="rename-btn icon-btn-ghost icon-btn-spaced" title="Rename conversation">&#9998;</button>
         <button class="delete-btn icon-btn-ghost" title="Delete conversation">&times;</button>
       `;
 
       item.querySelector('.conversation-details').addEventListener('click', () => selectConversation(conv.id));
+
+      item.querySelector('.rename-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        renameConversation(conv.id);
+      });
 
       item.querySelector('.delete-btn').addEventListener('click', async (e) => {
         e.stopPropagation();
@@ -5275,6 +5336,24 @@ function renderConversationList() {
       container.appendChild(item);
     });
   });
+}
+
+// Item 9 (UI polish): manual rename. Distinct from the automatic first-message title generation
+// in the send-prompt flow -- that only fires while a conversation still has zero messages and its
+// default "New Conversation" title; this lets the user override the title at any point after.
+function renameConversation(id) {
+  const conv = conversations.find(c => c.id === id);
+  if (!conv) return;
+  const currentTitle = conv.title || 'New Conversation';
+  const newTitle = prompt('Rename conversation to:', currentTitle);
+  if (newTitle == null) return; // cancelled
+  const trimmed = newTitle.trim();
+  if (!trimmed || trimmed === currentTitle) return;
+  conv.title = trimmed.slice(0, 200);
+  conv.updatedAt = Date.now();
+  if (activeConversationId === id && el.chatTitle) el.chatTitle.textContent = conv.title;
+  renderConversationList();
+  if (typeof saveConversationsToStorage === 'function') saveConversationsToStorage();
 }
 
 async function selectConversation(id, options = {}) {
