@@ -2350,7 +2350,7 @@ function structuredWorkspaceForConversation(conv, explicitPath = '') {
   const workspacePath = String(explicitPath || (conv && (conv.workspace || conv.projectPath || conv.dispatchProjectPath)) || '').trim();
   if (!RendererWorkspaceResolution) {
     return {
-      role: workspacePath ? (mode === 'coder' ? 'standalone_coder' : 'active_project') : 'unresolved',
+      role: workspacePath ? ((mode === 'coder' || mode === 'operator') ? 'standalone_coder' : 'active_project') : 'unresolved',
       path: workspacePath,
       project: { name: workspacePath.split(/[\\/]/).pop() || '', path: (conv && (conv.projectPath || conv.dispatchProjectPath)) || '' },
       source: 'legacy',
@@ -3884,7 +3884,11 @@ function markQueuedPromptRunning(queueId, conversationId) {
 // mode from projectPath (only Coder ever had projects), so old data keeps behaving as before.
 function conversationMode(conv) {
   if (!conv) return 'orion';
-  if (conv.mode === 'orion' || conv.mode === 'coder') return conv.mode;
+  // Phase 3 of the Operator architecture plan: an explicitly-tagged operator conversation is
+  // recognized directly, the same way 'orion'/'coder' already are, rather than falling through to
+  // the projectPath-presence guess below (which predates operator and only distinguishes Coder
+  // from Dispatch).
+  if (conv.mode === 'orion' || conv.mode === 'coder' || conv.mode === 'operator') return conv.mode;
   return conv.projectPath ? 'coder' : 'orion';
 }
 
@@ -4478,7 +4482,11 @@ function migrateConversations() {
   }
 
   conversations.forEach(c => {
-    const hasExplicitMode = c.mode === 'orion' || c.mode === 'coder';
+    // Phase 3 of the Operator architecture plan: this runs on every load (unlike the one-time
+    // backfill above), so an operator-tagged conversation must count as already explicit here.
+    // Without this, the inference below would silently stomp c.mode back to 'coder'/'orion' on
+    // every single app start.
+    const hasExplicitMode = c.mode === 'orion' || c.mode === 'coder' || c.mode === 'operator';
     const matchingWorkspaceProject = (!c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace))
       ? projects.find(proj => {
         const lowerWorkspace = c.workspace.toLowerCase();
@@ -4515,7 +4523,7 @@ function migrateConversations() {
       c.projectPath = '';
       updated = true;
     }
-    if (conversationMode(c) === 'coder' && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)) {
+    if ((conversationMode(c) === 'coder' || conversationMode(c) === 'operator') && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)) {
       // Find if workspace is inside any project folder
       if (matchingWorkspaceProject) {
         c.projectPath = matchingWorkspaceProject;
@@ -5362,7 +5370,7 @@ async function submitMessage() {
   if (!conv.workspace) {
     if (conv.projectPath) {
       conv.workspace = conv.projectPath;
-    } else if (conversationMode(conv) === 'coder') {
+    } else if (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator') {
       conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id);
     }
   }
@@ -6888,7 +6896,7 @@ window.changeActiveWorkspace = function(folderPath, options = {}) {
     if (conv) {
       conv.workspace = folderPath;
       targetMode = conversationMode(conv);
-      const promoteProject = options.promoteProject === true || (options.promoteProject !== false && conversationMode(conv) === 'coder');
+      const promoteProject = options.promoteProject === true || (options.promoteProject !== false && (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator'));
       promoteProjectForWorkspace = promoteProject;
       if (promoteProject) {
         conv.projectPath = folderPath;
@@ -7621,7 +7629,7 @@ window.startPhoneCompanionTask = async (options = {}) => {
       conversations = conversations.filter(item => item.id !== conv.id);
       throw error;
     }
-  } else if (conversationMode(conv) === 'coder') {
+  } else if (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator') {
     saveConversationsToStorage();
   } else {
     // A blank Dispatch request is only a client-side draft. Never leave an empty conversation in
@@ -7685,7 +7693,7 @@ async function submitPhoneCompanionPromptOnce(options) {
   if (!conv.workspace) {
     if (conv.projectPath) {
       conv.workspace = conv.projectPath;
-    } else if (conversationMode(conv) === 'coder') {
+    } else if (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator') {
       conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id);
     }
   }

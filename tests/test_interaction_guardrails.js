@@ -1029,7 +1029,10 @@ test('Dispatch uses Projects fallback while Coder standalone conversations get i
   t.ok(rendererJs.includes("c.mode === 'orion' && c.workspace && isGeneratedStandaloneWorkspace(c.workspace)"), 'migration clears generated standalone workspaces from Dispatch conversations');
   t.ok(rendererJs.includes("return mode === 'orion' || !c.projectPath;"), 'Dispatch list keeps Dispatch conversations even when they inspected a project workspace');
   t.ok(rendererJs.includes('c.projectPath && isGeneratedStandaloneWorkspace(c.workspace)'), 'migration clears accidental project linkage from generated standalone workspaces');
-  t.ok(rendererJs.includes("conversationMode(c) === 'coder' && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)"), 'migration never promotes generated standalone workspaces or Dispatch conversations into projects');
+  // Phase 3 of the Operator architecture plan: operator conversations get this same auto-bind
+  // treatment as Coder now (both do real workspace-bound artifact work), so the condition gained
+  // an explicit operator clause alongside coder.
+  t.ok(rendererJs.includes("(conversationMode(c) === 'coder' || conversationMode(c) === 'operator') && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)"), 'migration never promotes generated standalone workspaces or Dispatch conversations into projects, and now treats operator the same as coder');
   // Phase 3 of the Operator architecture plan: Operator does real workspace-bound artifact work
   // like Coder, so change_workspace promotes both into project scope now, not Coder alone. Dispatch
   // still takes the separate known-projects branch below, unaffected by this change.
