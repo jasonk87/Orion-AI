@@ -1206,6 +1206,53 @@ test('Operator receives a narrower, desktop/browser-execution tool surface, not 
   t.end();
 });
 
+test('Dispatch can hand work to Operator through its own dedicated tool, distinct from handoff_to_coder', (t) => {
+  // Phase 3 piece 5: handoff_to_operator is a sibling tool to handoff_to_coder, not a generalized
+  // replacement for it - Dispatch chooses explicitly between the two.
+  t.ok(agentJs.includes("'handoff_to_operator'"), 'Dispatch allowlist includes the explicit Operator handoff tool');
+  t.ok(agentJs.includes('name: "handoff_to_operator"'), 'the model is actually offered a handoff_to_operator tool declaration');
+  t.ok(agentJs.includes("case 'handoff_to_operator'"), 'the executor implements handoff_to_operator as its own case, not by aliasing handoff_to_coder');
+  t.ok(agentJs.includes('change_workspace alone must not add folders to Operator'), 'Operator handoff tool declaration teaches the model that workspace inspection is not project promotion, mirroring the Coder tool');
+  t.ok(agentJs.includes('window.promoteWorkspaceToOperator'), 'handoff_to_operator executes through its own renderer promotion API, not Coder\'s');
+
+  agent.__setActiveConversationModeForTest('orion');
+  const dispatchTools = agent.buildAgentToolDeclarations().map(tool => tool.name);
+  agent.__setActiveConversationModeForTest('orion');
+  t.ok(dispatchTools.includes('handoff_to_operator'), 'Dispatch is actually offered handoff_to_operator, not just declared in source');
+  t.ok(dispatchTools.includes('handoff_to_coder'), 'Dispatch keeps handoff_to_coder alongside the new tool');
+
+  // Registry: AGENT_HANDOFF_IMPLEMENTATIONS grew a real second entry rather than a stub.
+  t.ok(agentJs.includes('operator: {') && agentJs.includes("promote: (payload) => window.promoteWorkspaceToOperator(payload)"),
+    'AGENT_HANDOFF_IMPLEMENTATIONS registers a real Operator promote implementation');
+  t.ok(agentJs.includes('startMonitor: (dispatchConvId, targetConvId, taskId) => window.startOperatorTaskMonitor(dispatchConvId, targetConvId, taskId)'),
+    'AGENT_HANDOFF_IMPLEMENTATIONS registers a real Operator monitor implementation');
+
+  // Field reuse: Operator handoffs are tracked through the same launchedCoder* field names as
+  // Coder (by design - see the comment on both handoff cases), distinguished by launchedTaskRole.
+  t.ok(agentJs.includes("conversation.launchedTaskRole = handoffRole") , 'the Operator handoff case records its role the same way the Coder handoff case does');
+
+  // Routing prose: Dispatch's own prompt actually tells it when to prefer Operator over Coder.
+  t.ok(agentJs.includes('Route to the operator'), 'DISPATCHER_INSTRUCTION explains when to route to Operator instead of Coder');
+  t.ok(agentJs.includes('MUST call handoff_to_coder or handoff_to_operator'), 'the permission-boundary invariant now names both specialists');
+
+  // Renderer: the promotion + monitor + notification trio actually exist, not just referenced.
+  t.ok(rendererJs.includes('window.promoteWorkspaceToOperator = async function'), 'renderer implements the Operator promotion entry point');
+  t.ok(rendererJs.includes('window.startOperatorTaskMonitor = function'), 'renderer implements the Operator task monitor');
+  t.ok(rendererJs.includes('function stopOperatorTaskMonitor'), 'renderer implements a matching Operator monitor stop function');
+  t.ok(rendererJs.includes('async function notifySupervisorOfOperatorCompletion'), 'renderer implements an Operator-phrased completion notifier, not a reuse of the Coder-phrased one');
+  t.ok(rendererJs.includes('function createOperatorConversationForProject'), 'renderer implements an Operator-specific project conversation constructor');
+  t.ok(rendererJs.includes('function createStandaloneOperatorConversation'), 'renderer implements an Operator-specific standalone conversation constructor');
+
+  // The finalization hook is role-aware instead of always assuming Coder.
+  t.ok(rendererJs.includes("conversationMode(targetConv) === 'operator'") && rendererJs.includes('notifySupervisorOfOperatorCompletion(targetConversationId, taskId)'),
+    'window.onOrchestrationTaskFinalized routes Operator task completions to the Operator notifier, not the Coder one');
+
+  // Display name registry (piece 6).
+  t.ok(rendererJs.includes("operator: 'Operator'"), 'AGENT_ROLE_DISPLAY_NAMES includes a display name for the operator role');
+
+  t.end();
+});
+
 test('Dispatch can see and actually invoke the durable scheduling tools its own prompt tells it to use', async (t) => {
   // Declaration: Dispatch's own system prompt says "if you promise to check later, you MUST use
   // schedule_followup; schedules are durable." That instruction was a lie until these two tools

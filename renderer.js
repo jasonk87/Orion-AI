@@ -1172,11 +1172,13 @@ function updateOrionGreeting() {
 }
 
 // Phase 2 of the Operator architecture plan: display name per specialist role, keyed by the same
-// target.mode value task-orchestration.js already stores on every task. 'coder' is the only real
-// specialist today; describeSupervisedTaskPresentation's roleLabel option defaults to 'Coder' on
-// its own, so an unregistered/missing role still renders exactly as before this registry existed.
+// target.mode value task-orchestration.js already stores on every task. 'coder' and 'operator' are
+// the two real specialists; describeSupervisedTaskPresentation's roleLabel option defaults to
+// 'Coder' on its own, so an unregistered/missing role still renders exactly as before this
+// registry existed.
 const AGENT_ROLE_DISPLAY_NAMES = {
-  coder: 'Coder'
+  coder: 'Coder',
+  operator: 'Operator'
 };
 
 function supervisedTaskContext(task, isGlobalRunning = false, globalRunningId = '') {
@@ -4085,6 +4087,64 @@ function createStandaloneCoderConversation({ title = 'New Coder Task', workspace
     id: newId,
     title: title || 'New Coder Task',
     mode: 'coder',
+    projectPath: '',
+    workspace: resolvedWorkspace,
+    messages: [],
+    tasks: [],
+    testResults: null
+  };
+
+  conversations.unshift(newConv);
+  saveConversationsToStorage();
+
+  if (select) {
+    selectConversation(newId);
+    el.chatInput.focus();
+  } else {
+    renderConversationList();
+  }
+
+  return newConv;
+}
+
+// Phase 3 piece 5 of the Operator architecture plan. Parallel to createCoderConversationForProject/
+// createStandaloneCoderConversation above rather than a shared parameterized helper: those two are
+// tiny and this keeps the 'operator' mode tag explicit at the literal call site instead of adding a
+// role parameter two functions have to thread through, for a pair this small.
+function createOperatorConversationForProject(projectPath, { title = 'New Operator Task', select = false } = {}) {
+  const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+  const newConv = {
+    id: newId,
+    title: title || 'New Operator Task',
+    mode: 'operator',
+    projectPath,
+    workspace: projectPath,
+    messages: [],
+    tasks: [],
+    testResults: null
+  };
+
+  conversations.unshift(newConv);
+  saveConversationsToStorage();
+
+  if (select) {
+    selectConversation(newId);
+    el.chatInput.focus();
+  } else {
+    renderConversationList();
+  }
+
+  return newConv;
+}
+
+function createStandaloneOperatorConversation({ title = 'New Operator Task', workspacePath = '', select = false } = {}) {
+  const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+  const resolvedWorkspace = String(workspacePath || '').trim()
+    || getStandaloneWorkspaceForTitle(title, newId);
+  const newConv = {
+    id: newId,
+    title: title || 'New Operator Task',
+    mode: 'operator',
     projectPath: '',
     workspace: resolvedWorkspace,
     messages: [],
@@ -7145,6 +7205,238 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
     warning: handoffWarnings.join(' ')
   };
 };
+
+// Phase 3 piece 5 of the Operator architecture plan. Deliberate close parallel of
+// window.promoteWorkspaceToCoder above rather than a generalized/parameterized version of it: the
+// underlying machinery this delegates to (RendererTaskOrchestration.buildTaskPacket, which already
+// takes a free targetMode string; enqueueOrchestrationTask; captureTaskExecutionProfile;
+// taskContextMessages) was already role-generic before this piece, so the only things that
+// actually differ below are the literal 'operator' mode tag, the operator conversation
+// constructors, and role-specific copy (title default, status message). Generalizing
+// promoteWorkspaceToCoder itself into a shared role-parameterized function would touch a large,
+// working, Coder-battle-tested function for a payoff this small — the "write a parallel one"
+// option from the brief, not the "reuse/generalize" one.
+window.promoteWorkspaceToOperator = async function(options = {}) {
+  const standalone = options.standalone === true;
+  const prompt = String(options.prompt || '').trim();
+  const originalUserMessage = String(options.originalUserMessage || prompt).trim();
+  const title = String(options.title || '').trim()
+    || (prompt ? generateConversationTitle(prompt) : 'New Operator Task');
+  const originConv = conversations.find(item => item.id === String(options.sourceConversationId || ''));
+  if (originConv) clearCurrentTurnTaskResolutionClarifications(originConv);
+  const semanticIntent = options.semanticIntent || (originConv && prompt
+    ? await classifyCurrentConversationIntent(originConv, originalUserMessage, { model: options.modelSelectValue })
+    : null);
+  const standaloneSystemOperation = standalone && (
+    options.standaloneSystemOperation === true
+    || !!(semanticIntent && semanticIntent.standaloneSystemOperation)
+  );
+  let standaloneWorkspacePath = '';
+  if (standalone) {
+    if (standaloneSystemOperation) {
+      try {
+        const homeDir = await window.api.getHomeDir();
+        standaloneWorkspacePath = typeof homeDir === 'string' ? homeDir.trim() : '';
+      } catch (_) {}
+    } else {
+      standaloneWorkspacePath = String(options.path || '').trim()
+        || getStandaloneWorkspaceForTitle(
+          title,
+          `operator_handoff_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+        );
+    }
+  }
+  const folderPath = String(
+    (standalone ? standaloneWorkspacePath : options.path)
+    || currentWorkspace
+    || (standalone ? getDispatchWorkspaceRoot() : '')
+  ).trim();
+  if (!folderPath) return { success: false, error: 'No workspace path to promote.' };
+  let preflightTask = options.taskPacket && RendererTaskOrchestration
+    ? RendererTaskOrchestration.normalizeTaskRecord(options.taskPacket)
+    : null;
+  // role stays 'active_project'/'standalone_coder' even for Operator: those are WorkspaceResolution's
+  // own KINDS constants (see workspace-resolution.js), and piece 2's classifyWorkspace fix already
+  // made 'operator' mode classify identically to 'coder' mode — there is no separate "standalone
+  // operator" kind, by design.
+  const handoffWorkspace = {
+    role: standalone ? 'standalone_coder' : 'active_project',
+    path: folderPath,
+    project: {
+      name: standalone ? '' : (folderPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || ''),
+      path: standalone ? '' : folderPath
+    },
+    source: standalone ? 'standalone-dispatch-operator-handoff' : 'dispatch-operator-handoff',
+    resolved: true
+  };
+  if (prompt && RendererTaskOrchestration && !preflightTask) {
+    const executionProfile = captureTaskExecutionProfile(options);
+    const preflight = RendererTaskOrchestration.buildTaskPacket({
+      originalUserMessage,
+      resolvedObjective: String(options.resolvedObjective || '').trim()
+        || (semanticIntent && semanticIntent.resolvedRequest)
+        || prompt,
+      title,
+      precedingMessages: taskContextMessages(originConv),
+      precedingConversationSummary: String(options.precedingConversationSummary || ''),
+      workspace: handoffWorkspace,
+      requirements: [
+        ...(Array.isArray(options.requirements) ? options.requirements : []),
+        ...(Array.isArray(options.findings) ? options.findings : [])
+      ],
+      constraints: Array.isArray(options.constraints) ? options.constraints : [],
+      unresolvedDecisions: Array.isArray(options.unresolvedDecisions) ? options.unresolvedDecisions : [],
+      originConversationId: String(options.sourceConversationId || ''),
+      originSessionId: String(options.sourceSessionId || ''),
+      originMessageId: String(options.sourceMessageId || ''),
+      targetConversationId: 'pending-operator-conversation',
+      targetMode: 'operator',
+      source: 'dispatch-operator-handoff',
+      semanticIntent,
+      executionProfile,
+      timestamp: Date.now()
+    });
+    if (!preflight.success || !preflight.task) {
+      const clarification = preflight.clarification || 'What specific work should I hand to Operator?';
+      if (originConv) persistTaskClarification(originConv, clarification);
+      return { success: false, needsClarification: true, error: clarification };
+    }
+    preflightTask = preflight.task;
+  }
+
+  if (!standalone) addProjectPath(folderPath);
+  const conv = standalone
+    ? createStandaloneOperatorConversation({
+        title,
+        workspacePath: folderPath,
+        select: options.open === true
+      })
+    : createOperatorConversationForProject(folderPath, {
+        title,
+        select: options.open === true
+      });
+
+  const requestedPacketIds = Array.isArray(options.contextPacketIds)
+    ? [...new Set(options.contextPacketIds.map(String).filter(Boolean))].slice(-5)
+    : [];
+  let assignedPacketIds = [];
+  let contextTransferError = '';
+  let createdTask = null;
+  const handoffWarnings = [];
+  if (requestedPacketIds.length > 0 && window.api && typeof window.api.assignContextPackets === 'function') {
+    try {
+      const assignment = await window.api.assignContextPackets(folderPath, requestedPacketIds, {
+        sourceConversationId: String(options.sourceConversationId || ''),
+        targetConversationId: conv.id,
+        requestedWork: prompt,
+        findings: Array.isArray(options.findings) ? options.findings : []
+      });
+      assignedPacketIds = assignment && Array.isArray(assignment.assignedPacketIds)
+        ? assignment.assignedPacketIds
+        : [];
+      if (!assignment || assignment.success === false) contextTransferError = (assignment && assignment.error) || 'Context packet assignment failed.';
+    } catch (error) {
+      contextTransferError = error.message || String(error);
+    }
+  }
+  if (assignedPacketIds.length > 0) {
+    conv.inheritedContext = {
+      packetIds: assignedPacketIds,
+      sourceConversationId: String(options.sourceConversationId || ''),
+      workspace: folderPath,
+      assignedAt: Date.now(),
+      active: true
+    };
+  }
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+  saveConversationsToStorage();
+
+  if (prompt) {
+    const looseFindings = Array.isArray(options.findings)
+      ? options.findings.map(f => String(f || '').trim()).filter(Boolean).slice(0, 12)
+      : [];
+    const queuedPrompt = (assignedPacketIds.length === 0 && looseFindings.length > 0)
+      ? `${prompt}\n\nFindings from Dispatch's prior investigation (verify before relying on them):\n${looseFindings.map(f => `- ${f}`).join('\n')}`
+      : prompt;
+    const handoffTask = await enqueueOrchestrationTask({
+      prompt: queuedPrompt,
+      originalUserMessage: (preflightTask && preflightTask.originalUserMessage) || originalUserMessage,
+      resolvedObjective: preflightTask ? preflightTask.objective : queuedPrompt,
+      title,
+      targetConversationId: conv.id,
+      originConversationId: String(options.sourceConversationId || conv.id),
+      originSessionId: String(options.sourceSessionId || ''),
+      originMessageId: String(options.sourceMessageId || ''),
+      precedingMessages: taskContextMessages(originConv || conv),
+      precedingConversationSummary: preflightTask ? preflightTask.precedingConversationSummary : '',
+      workspace: handoffWorkspace,
+      requirements: preflightTask
+        ? [...new Set([...(preflightTask.requirements || []), ...looseFindings])]
+        : looseFindings,
+      constraints: preflightTask ? preflightTask.constraints : [],
+      semanticIntent,
+      unresolvedDecisions: preflightTask ? preflightTask.unresolvedDecisions : [],
+      source: 'dispatch-operator-handoff',
+      modelSelectValue: (preflightTask && preflightTask.executionProfile && preflightTask.executionProfile.requestedModel)
+        || window.getSelectedModel(),
+      reasoningEffort: (preflightTask && preflightTask.executionProfile && preflightTask.executionProfile.requestedReasoning)
+        || appConfig.reasoningEffort
+        || 'auto',
+      executionProfile: (preflightTask && preflightTask.executionProfile)
+        || captureTaskExecutionProfile(options),
+      contextPacketIds: assignedPacketIds,
+      createdAt: Date.now()
+    });
+    if (!handoffTask.success) {
+      conversations = conversations.filter(item => item.id !== conv.id);
+      saveConversationsToStorage();
+      return {
+        success: false,
+        needsClarification: !!handoffTask.needsClarification,
+        error: handoffTask.clarification || handoffTask.error || 'The handoff task could not be resolved.'
+      };
+    }
+    conv.lastOrchestrationTaskId = handoffTask.task.taskId;
+    if (originConv) originConv.lastOwnedTaskId = handoffTask.task.taskId;
+    createdTask = handoffTask.task;
+    if (handoffTask.warning) handoffWarnings.push(handoffTask.warning);
+    try {
+      persistAssistantStatusMessage(conv.id, `Queued from Dispatch as ${handoffTask.task.title}. Operator will start when the current turn finishes.`, {
+        source: 'queue-status',
+        dedupeKey: `dispatch-operator-handoff-${handoffTask.task.taskId}`
+      });
+    } catch (error) {
+      handoffWarnings.push(`The task was queued, but its Operator status message could not be saved: ${error.message || error}`);
+    }
+  }
+
+  try {
+    renderProjectsList();
+    renderConversationList();
+  } catch (error) {
+    handoffWarnings.push(`The handoff was queued, but the conversation list could not refresh: ${error.message || error}`);
+  }
+  return {
+    success: true,
+    projectPath: standalone ? '' : folderPath,
+    workspacePath: folderPath,
+    standalone,
+    conversationId: conv.id,
+    title: conv.title,
+    queued: !!prompt,
+    taskId: createdTask ? createdTask.taskId : '',
+    status: createdTask ? createdTask.status : (prompt ? 'pending' : 'completed'),
+    task: createdTask,
+    queueItem: createdTask
+      ? (window.promptQueue || []).find(item => item && item.taskId === createdTask.taskId) || null
+      : null,
+    contextPacketIds: assignedPacketIds,
+    contextTransferred: assignedPacketIds.length > 0,
+    contextTransferError,
+    committedWithWarning: handoffWarnings.length > 0,
+    warning: handoffWarnings.join(' ')
+  };
+};
 window.getSelectedModel = () => el.modelSelect ? el.modelSelect.value : appConfig.defaultModel;
 window.getKnownProjects = () => projects.slice();
 window.getRecentProjectCandidates = () => conversations
@@ -8898,6 +9190,13 @@ let _coderTaskMonitorInterval = null;
 let _coderTaskMonitorMeta = null;
 let _coderTaskMonitorGeneration = 0;
 
+// Polling interval handle for the Operator task monitor (Phase 3 piece 5). Deliberately a
+// separate, simpler pair of variables/functions rather than folding Operator into the Coder
+// monitor: see the comment above startOperatorTaskMonitor for why.
+let _operatorTaskMonitorInterval = null;
+let _operatorTaskMonitorMeta = null;
+let _operatorTaskMonitorGeneration = 0;
+
 // Kept as a thin renderer adapter for older callers; the deterministic policy
 // lives in supervisor-orchestration.js and is exercised independently.
 function classifySupervisorIntent(text) {
@@ -9702,9 +10001,275 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
   if (window.saveConversationsToStorage) window.saveConversationsToStorage();
 }
 
+// ── Operator task monitor (Phase 3 piece 5) ────────────────────────────────────
+//
+// Deliberately not a full mirror of startCoderTaskMonitor above. Most of that function's ~215
+// lines exist to service two Coder-only pause states: awaitingClarification (Coder can call
+// ask_clarifying_questions) and awaitingPlanApproval (Coder has a plan-approval workflow, relayed
+// to Dispatch via relayCoderPlanToDispatch). Operator has neither: piece 4 did not put
+// ask_clarifying_questions on OPERATOR_TOOL_ALLOWLIST, and OPERATOR_INSTRUCTION (piece 3) defines
+// no plan-approval step. Building the clarification-proxy and plan-relay machinery for pause
+// states Operator cannot enter would be dead code, not parity. What Operator's monitor still
+// needs, and has: terminal-status detection (the primary path is actually
+// window.onOrchestrationTaskFinalized below; this poll is the backstop for missed events) and a
+// quiet-stall backstop so a crashed/killed Operator run doesn't poll forever with no notification.
+window.startOperatorTaskMonitor = function(orionConvId, operatorConvId, taskId = '') {
+  stopOperatorTaskMonitor(_operatorTaskMonitorMeta);
+
+  _operatorTaskMonitorMeta = {
+    generation: ++_operatorTaskMonitorGeneration,
+    orionConvId,
+    operatorConvId,
+    taskId: String(taskId || ''),
+    startTime: Date.now(),
+    quietSince: 0,
+    inFlight: false
+  };
+
+  _operatorTaskMonitorInterval = setInterval(async () => {
+    const monitorMeta = _operatorTaskMonitorMeta;
+    if (!monitorMeta || monitorMeta.inFlight) return;
+    monitorMeta.inFlight = true;
+    try {
+      const { orionConvId, operatorConvId, taskId } = monitorMeta;
+
+      const orionConv = conversations.find(c => c.id === orionConvId);
+      const operatorConv = conversations.find(c => c.id === operatorConvId);
+      if (!orionConv || !operatorConv) {
+        stopOperatorTaskMonitor(monitorMeta);
+        return;
+      }
+      const durableTask = taskId ? orchestrationTaskCache.get(taskId) : null;
+      if (durableTask && ['cancelled', 'completed', 'failed'].includes(durableTask.status)) {
+        await notifySupervisorOfOperatorCompletion(operatorConvId, taskId);
+        if (_operatorTaskMonitorMeta === monitorMeta) stopOperatorTaskMonitor(monitorMeta);
+        return;
+      }
+
+      const isOperatorRunning = !!(window.isAgentRunning && window.isAgentRunning()
+        && window.getRunningConversationId && window.getRunningConversationId() === operatorConvId
+        && (!taskId || !window.getActiveRunTaskId || window.getActiveRunTaskId() === taskId));
+      const isQueuedForOperator = Array.isArray(window.promptQueue)
+        && window.promptQueue.some(item => item && (taskId ? item.taskId === taskId : item.conversationId === operatorConvId));
+      const isQuiet = !isOperatorRunning && !isQueuedForOperator;
+
+      if (isQuiet) {
+        if (!monitorMeta.quietSince) monitorMeta.quietSince = Date.now();
+        if (Date.now() - monitorMeta.quietSince > 60000) {
+          const stalledTitle = orionConv.launchedCoderTaskTitle || operatorConv.title || 'Operator task';
+          let canonicalTask = durableTask;
+          if (taskId && typeof window.getOrchestrationTaskStatus === 'function') {
+            const statusRead = await window.getOrchestrationTaskStatus(taskId, orionConv.id);
+            if (_operatorTaskMonitorMeta !== monitorMeta) return;
+            if (statusRead && statusRead.success && statusRead.task) canonicalTask = statusRead.task;
+          }
+          if (canonicalTask && ['completed', 'cancelled', 'failed'].includes(canonicalTask.status)) {
+            await notifySupervisorOfOperatorCompletion(operatorConvId, taskId);
+            if (_operatorTaskMonitorMeta === monitorMeta) stopOperatorTaskMonitor(monitorMeta);
+            return;
+          }
+          let stalledTask = null;
+          if (taskId && canonicalTask && canonicalTask.status === 'active'
+              && typeof window.finalizeOrchestrationTask === 'function') {
+            stalledTask = await window.finalizeOrchestrationTask(taskId, 'failed', {
+              reason: 'The Operator run went quiet without recording completion.',
+              expectedExecutionId: canonicalTask.execution && canonicalTask.execution.executionId
+            });
+            if (_operatorTaskMonitorMeta !== monitorMeta) return;
+          }
+          if (taskId && !stalledTask) {
+            monitorMeta.quietSince = Date.now();
+            return;
+          }
+          if (taskId && stalledTask.status !== 'failed') {
+            if (['completed', 'cancelled'].includes(stalledTask.status)) {
+              await notifySupervisorOfOperatorCompletion(operatorConvId, taskId);
+              if (_operatorTaskMonitorMeta !== monitorMeta) return;
+            }
+            stopOperatorTaskMonitor(monitorMeta);
+            return;
+          }
+          if (_operatorTaskMonitorMeta !== monitorMeta
+              || (taskId && String(orionConv.launchedCoderTaskId || '') !== taskId)) return;
+          notifyOrionConversation(orionConv, `Operator went quiet on **${stalledTitle}** — the run ended without recording completion (it may have crashed or stalled). The work is parked under Active work; open the Operator conversation to inspect it.`, 'supervisor-stall');
+          orionConv.lastDelegatedWork = {
+            taskId,
+            coderConversationId: operatorConvId,
+            title: stalledTitle,
+            projectPath: operatorConv.projectPath || inferDispatchProjectPath(orionConv),
+            status: taskId ? 'failed' : 'blocked',
+            subStatus: 'Went quiet without completing',
+            startedAt: orionConv.launchedCoderTaskStart || 0,
+            completedAt: Date.now(),
+            pendingCount: 0
+          };
+          orionConv.launchedCoderConvId = null;
+          orionConv.launchedCoderTaskId = null;
+          orionConv.launchedCoderTaskTitle = null;
+          orionConv.launchedCoderTaskStart = null;
+          orionConv.launchedTaskRole = null;
+          if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+          if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+          renderDesktopDispatchLanding();
+          stopOperatorTaskMonitor(monitorMeta);
+          return;
+        }
+      } else {
+        monitorMeta.quietSince = 0;
+      }
+
+      if (activeConversationId === orionConvId) {
+        syncDispatchCoderStatusCard(orionConvId, isOperatorRunning, isOperatorRunning ? operatorConvId : '');
+      }
+    } finally {
+      if (_operatorTaskMonitorMeta === monitorMeta) monitorMeta.inFlight = false;
+    }
+  }, 2000);
+};
+
+function stopOperatorTaskMonitor(expectedMeta = null) {
+  if (expectedMeta && _operatorTaskMonitorMeta !== expectedMeta) return false;
+  if (_operatorTaskMonitorInterval) {
+    clearInterval(_operatorTaskMonitorInterval);
+    _operatorTaskMonitorInterval = null;
+  }
+  _operatorTaskMonitorMeta = null;
+  return true;
+}
+window.stopOperatorTaskMonitor = stopOperatorTaskMonitor;
+
+// Parallel to notifySupervisorOfCoderCompletion, with Operator-phrased messages. Reuses
+// summarizeCoderCompletion directly (confirmed role-agnostic: it reads durableTask.result and the
+// specialist conversation's messages generically, with no "Coder"-specific text). Does not reuse
+// notifySupervisorOfCoderCompletion itself, which hardcodes "Coder" throughout its summary text.
+async function notifySupervisorOfOperatorCompletion(finishedOperatorConvId, expectedTaskId = '') {
+  if (!finishedOperatorConvId) return;
+  const normalizedExpectedTaskId = String(expectedTaskId || '');
+  const orionConv = conversations.find(c => c.launchedCoderConvId === finishedOperatorConvId
+    && (!normalizedExpectedTaskId || String(c.launchedCoderTaskId || '') === normalizedExpectedTaskId));
+  if (!orionConv) return;
+  const taskId = String(normalizedExpectedTaskId || orionConv.launchedCoderTaskId
+    || (_operatorTaskMonitorMeta && _operatorTaskMonitorMeta.operatorConvId === finishedOperatorConvId && _operatorTaskMonitorMeta.taskId)
+    || '');
+  let durableTask = null;
+  if (taskId) {
+    const read = await window.getOrchestrationTaskStatus(taskId, orionConv.id);
+    if (!read || !read.success || !read.task) return;
+    durableTask = read.task;
+  }
+  if (taskId && String(orionConv.launchedCoderTaskId || '') !== taskId) return;
+  if (durableTask && (durableTask.status === 'pending' || durableTask.status === 'active')) return;
+  const existingTerminalNotification = Array.isArray(orionConv.messages)
+    ? orionConv.messages.find(message =>
+        message
+        && message.source === 'supervisor-completion'
+        && String(message.orchestrationTaskId || '') === taskId
+      )
+    : null;
+  if (existingTerminalNotification) {
+    orionConv.launchedCoderConvId = null;
+    orionConv.launchedCoderTaskId = null;
+    orionConv.launchedCoderTaskTitle = null;
+    orionConv.launchedCoderTaskStart = null;
+    orionConv.launchedTaskRole = null;
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    return;
+  }
+  if (durableTask && durableTask.status === 'cancelled') {
+    if (_operatorTaskMonitorMeta && _operatorTaskMonitorMeta.operatorConvId === finishedOperatorConvId
+        && (!_operatorTaskMonitorMeta.taskId || _operatorTaskMonitorMeta.taskId === taskId)) {
+      stopOperatorTaskMonitor(_operatorTaskMonitorMeta);
+    }
+    orionConv.launchedCoderConvId = null;
+    orionConv.launchedCoderTaskId = null;
+    orionConv.launchedCoderTaskTitle = null;
+    orionConv.launchedCoderTaskStart = null;
+    orionConv.launchedTaskRole = null;
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    return;
+  }
+
+  if (_operatorTaskMonitorMeta && _operatorTaskMonitorMeta.operatorConvId === finishedOperatorConvId
+      && (!_operatorTaskMonitorMeta.taskId || _operatorTaskMonitorMeta.taskId === taskId)) {
+    stopOperatorTaskMonitor(_operatorTaskMonitorMeta);
+  }
+
+  const operatorConv = conversations.find(c => c.id === finishedOperatorConvId);
+  const taskTitle = String(
+    durableTask && durableTask.title
+    || orionConv.launchedCoderTaskTitle
+    || (operatorConv && operatorConv.title)
+    || 'Operator Task'
+  );
+  const elapsed = orionConv.launchedCoderTaskStart
+    ? Math.round((Date.now() - orionConv.launchedCoderTaskStart) / 60000)
+    : null;
+  const completion = summarizeCoderCompletion(durableTask, operatorConv);
+
+  let summaryText;
+  if (durableTask && durableTask.status === 'failed') {
+    summaryText = `Operator failed **${taskTitle}**. The task state is failed; check the Operator conversation for the recorded error before retrying.`;
+  } else if (durableTask && durableTask.status === 'completed') {
+    const elapsed_str = elapsed ? ` (${elapsed}m)` : '';
+    summaryText = `Operator completed **${taskTitle}**${elapsed_str}.`;
+    if (completion.summary) summaryText += `\n\n${completion.summary}`;
+  } else {
+    const elapsed_str = elapsed ? ` (${elapsed}m)` : '';
+    summaryText = `Operator finished **${taskTitle}**${elapsed_str}. Ready for your next direction.`;
+  }
+
+  notifyOrionConversation(orionConv, summaryText, 'supervisor-completion', {
+    orchestrationTaskId: taskId,
+    orchestrationStatus: durableTask && durableTask.status || '',
+    verificationEvidence: completion.verification,
+    images: completion.images
+  });
+
+  orionConv.lastDelegatedWork = {
+    taskId,
+    coderConversationId: finishedOperatorConvId,
+    title: taskTitle,
+    objective: durableTask && durableTask.objective || '',
+    changedFiles: completion.changedFiles,
+    verification: completion.verification,
+    images: completion.images,
+    projectPath: (operatorConv && operatorConv.projectPath) || inferDispatchProjectPath(orionConv),
+    status: durableTask ? durableTask.status : 'completed',
+    subStatus: durableTask
+      ? (RendererTaskOrchestration ? RendererTaskOrchestration.describeTaskStatus(durableTask) : durableTask.status)
+      : 'Completed',
+    startedAt: orionConv.launchedCoderTaskStart || 0,
+    completedAt: (durableTask && (durableTask.completedAt || durableTask.failedAt || durableTask.cancelledAt)) || Date.now(),
+    pendingCount: 0
+  };
+
+  orionConv.launchedCoderConvId = null;
+  orionConv.launchedCoderTaskId = null;
+  orionConv.launchedCoderTaskTitle = null;
+  orionConv.launchedCoderTaskStart = null;
+  orionConv.launchedTaskRole = null;
+  orionConv.updatedAt = Date.now();
+  if (typeof window.markConversationDirty === 'function') {
+    window.markConversationDirty(orionConv.id);
+    if (operatorConv) window.markConversationDirty(operatorConv.id);
+  }
+  if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+}
+
 window.onOrchestrationTaskFinalized = async function(taskId, targetConversationId, status) {
   if (!taskId || !targetConversationId || !['completed', 'failed', 'cancelled'].includes(String(status || ''))) return;
-  await notifySupervisorOfCoderCompletion(targetConversationId, taskId);
+  // Route by the target conversation's own role rather than always assuming Coder. Before this
+  // fix, an Operator task's completion would still call notifySupervisorOfCoderCompletion (which
+  // matches on the reused launchedCoderConvId field, so it would "work" but mislabel every message
+  // as "Coder failed/completed..." for a run that was never Coder).
+  const targetConv = conversations.find(c => c.id === targetConversationId);
+  if (targetConv && conversationMode(targetConv) === 'operator') {
+    await notifySupervisorOfOperatorCompletion(targetConversationId, taskId);
+  } else {
+    await notifySupervisorOfCoderCompletion(targetConversationId, taskId);
+  }
 };
 
 // Appends a message to an Orion conversation, rendering it if active.

@@ -128,9 +128,11 @@ Jason. Solo developer. Casual, direct — he wants the answer, not the explanati
 
 HOW YOU WORK:
 Handle directly: conversation, strategy, planning, research, reading and discussing code or docs, answering questions, web searches, and browser screenshots. You can look at files and search the web to back up what you say, but you cannot write, edit, run commands, capture the native desktop, or operate the desktop yourself — you are read-only by design. You may attach a browser screenshot or existing safe image to your response when Jason asks to see it.
-Route to the coder: anything requiring file changes, writing or debugging code, running tests, building or fixing features, running local commands, capturing the desktop/screen, or producing local files/artifacts for Jason. Before routing, make sure you understand the task well enough to hand it off clearly — ask Jason to clarify if you don't. When you route something, tell him. Don't go quiet. Report back with a clean summary when it's done.
+Route to the coder: anything requiring file changes, writing or debugging code, running tests, building or fixing features, running local commands tied to a codebase, or producing local files/artifacts for Jason. Before routing, make sure you understand the task well enough to hand it off clearly — ask Jason to clarify if you don't. When you route something, tell him. Don't go quiet. Report back with a clean summary when it's done.
 
-Permission boundary rule: when Jason asks for an executable or mutating operation that Dispatch cannot perform, you MUST call handoff_to_coder. Never refuse the task or tell Jason to perform it manually merely because Dispatch is read-only. If the target is genuinely ambiguous, use inspect_environment for read-only identification or tell Coder to identify it safely as part of the handoff.
+Route to the operator: anything requiring hands-on desktop or browser execution that isn't code work — clicking through an application UI, filling in a web form, driving a multi-step browser workflow, launching or monitoring a local process/app, or capturing and inspecting the desktop/screen to verify something happened. Same rule as Coder: understand the task first, tell Jason when you route it, report back when it's done. If a request is genuinely both (e.g. "build this feature, then click through it to confirm it works"), route the code portion to Coder first and hand the verification portion to Operator once Coder reports back — don't try to make one specialist do the other's job.
+
+Permission boundary rule: when Jason asks for an executable or mutating operation that Dispatch cannot perform, you MUST call handoff_to_coder or handoff_to_operator, whichever fits the work. Never refuse the task or tell Jason to perform it manually merely because Dispatch is read-only. If the target is genuinely ambiguous, use inspect_environment for read-only identification or tell the specialist to identify it safely as part of the handoff.
 
 Context ownership: for an obvious build/fix/edit/test request, route early from the known workspace and task description. Do not deeply inspect source merely to decide that Coder should do the work. Handle a focused read-only question directly when it needs at most one or two source files. Route broader project reviews to Coder as read-only inspections so one agent owns the source survey, persists version-bound file notes/project knowledge, and reports back through Dispatch. If a focused discussion later becomes implementation, use handoff_to_coder; Orion will transfer exact validated context packets so Coder can start from that evidence instead of rediscovering the project.
 
@@ -6249,6 +6251,130 @@ async function executeTool(name, args, workspace, config, conversation, executio
       };
     }
 
+    case 'handoff_to_operator': {
+      // Phase 3 piece 5: a sibling tool to handoff_to_coder, not a generalization of it. Dispatch
+      // chooses explicitly between the two based on what the work is (code/build/test/install work
+      // goes to Coder; desktop/browser execution work goes to Operator) — see DISPATCHER_INSTRUCTION.
+      // Everything below mirrors handoff_to_coder's structure (workspace resolution, standalone/
+      // system-operation handling, context packet transfer, supervisor tracking) because that
+      // structure is role-agnostic; only the target role, target functions, and user-facing text
+      // differ.
+      const standaloneHandoff = args.standalone === true;
+      const authorizedHandoffIntent = executionContext.authorizedDispatchHandoffIntent || {};
+      const standaloneSystemHandoff = standaloneHandoff
+        && authorizedHandoffIntent.standaloneSystemOperation === true;
+      const isolatedStandaloneHandoff = standaloneHandoff && !standaloneSystemHandoff;
+      const requestedPath = String(
+        standaloneSystemHandoff
+          ? resolvedHomeDir
+          : (isolatedStandaloneHandoff ? '' : (args.path || workspace || conversation.workspace || ''))
+      ).trim();
+      if (!requestedPath && !isolatedStandaloneHandoff) throw new Error("Missing workspace path to hand off to Operator");
+      const prompt = String(args.prompt || '').trim();
+      const originalUserMessage = String(
+        args.originalUserMessage
+        || [...(conversation.messages || [])].reverse().find(message => message && message.role === 'user')?.text
+        || prompt
+      ).trim();
+      const resolution = isolatedStandaloneHandoff
+        ? { success: true, path: '', fuzzyResolved: false, resolvedFrom: '', matchedName: 'Standalone' }
+        : await resolveWorkspacePathForChange(requestedPath);
+      if (!resolution.success) {
+        throw new Error(`Operator handoff path "${resolution.path}" is invalid or does not exist: ${resolution.error}`);
+      }
+      const handoffRole = 'operator';
+      const handoffImpl = AGENT_HANDOFF_IMPLEMENTATIONS[handoffRole];
+      if (!handoffImpl || typeof window.promoteWorkspaceToOperator !== 'function') {
+        throw new Error('Operator handoff is not available in this Orion build.');
+      }
+      let handoffWorkspace = isolatedStandaloneHandoff
+        ? { kind: WorkspaceResolution ? WorkspaceResolution.KINDS.STANDALONE_CODER : 'standalone_coder', path: 'pending-standalone-workspace' }
+        : WorkspaceResolution ? WorkspaceResolution.classifyWorkspace({
+        mode: 'operator',
+        workspacePath: resolution.path,
+        dispatchProjectPath: conversation.dispatchProjectPath,
+        searchRoot: getDispatchWorkspaceRoot(),
+        knownProjects: getKnownWorkspaceCandidates(conversation)
+      }) : { kind: 'active_project', path: resolution.path };
+      if (WorkspaceResolution && handoffWorkspace.kind === WorkspaceResolution.KINDS.UNRESOLVED
+          && !WorkspaceResolution.samePath(resolution.path, getDispatchWorkspaceRoot())) {
+        handoffWorkspace = WorkspaceResolution.bindResolvedProject(handoffWorkspace, {
+          path: resolution.path,
+          name: resolution.matchedName || getLocalPathBaseName(resolution.path),
+          source: args.path ? 'explicit_verified_handoff_path' : 'resolved_conversation_workspace'
+        });
+      }
+      const handoffPermission = WorkspaceResolution ? WorkspaceResolution.canHandoffWorkspace(handoffWorkspace) : { allowed: true };
+      if (!handoffPermission.allowed && !standaloneHandoff) {
+        throw new Error(handoffPermission.reason || 'Resolve a concrete project workspace before handing work to Operator.');
+      }
+      const contextPacketIds = resolution.path
+        ? getHandoffContextPacketIds(conversation, resolution.path)
+        : [];
+      const result = await handoffImpl.promote({
+        path: resolution.path,
+        prompt,
+        originalUserMessage,
+        standalone: standaloneHandoff,
+        standaloneSystemOperation: standaloneSystemHandoff,
+        title: args.title || '',
+        open: args.open === true,
+        sourceConversationId: conversation.id,
+        sourceSessionId: conversation.sessionId || conversation.id,
+        sourceMessageId: (conversation.messages || []).slice().reverse().find(message => message.role === 'user')?.id || '',
+        contextPacketIds,
+        findings: Array.isArray(args.findings) ? args.findings : [],
+        semanticIntent: executionContext.authorizedDispatchHandoffIntent || undefined
+      });
+      if (!result || result.success === false) {
+        throw new Error((result && result.error) || 'Operator handoff failed.');
+      }
+
+      // ── Supervisor: track the launched Operator conversation ───────────────
+      // Reuses the launchedCoder* field names by design (see the identical comment on
+      // handoff_to_coder above) — launchedTaskRole distinguishes this as an Operator task for
+      // role-aware readers like window.onOrchestrationTaskFinalized's routing check.
+      conversation.launchedCoderConvId = result.conversationId;
+      conversation.launchedCoderTaskId = result.taskId || '';
+      conversation.lastOwnedTaskId = result.taskId || conversation.lastOwnedTaskId || '';
+      conversation.launchedCoderTaskTitle = result.title || 'Operator Task';
+      conversation.launchedCoderTaskStart = Date.now();
+      conversation.launchedTaskRole = handoffRole;
+      const committedHandoffWarnings = result.warning ? [String(result.warning)] : [];
+      try {
+        if (typeof window.markConversationDirty === 'function') {
+          window.markConversationDirty(conversation.id);
+        }
+        if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+      } catch (error) {
+        committedHandoffWarnings.push(`The task was queued, but Dispatch could not save its supervisor pointer: ${error.message || error}`);
+      }
+      // Kick off the supervisor monitor in the renderer
+      if (typeof handoffImpl.startMonitor === 'function' && typeof window.startOperatorTaskMonitor === 'function') {
+        try {
+          handoffImpl.startMonitor(conversation.id, result.conversationId, result.taskId || '');
+        } catch (error) {
+          committedHandoffWarnings.push(`The task was queued, but its live supervisor monitor did not start: ${error.message || error}`);
+        }
+      }
+      // ───────────────────────────────────────────────────────────────────────
+
+      return {
+        ...result,
+        success: true,
+        message: prompt
+          ? `${standaloneHandoff ? 'Opened a standalone Operator task in' : 'Promoted'} ${result.workspacePath || resolution.path} and queued task ${result.taskId || '(pending ID)'} with state ${result.status || 'pending'}.${result.contextTransferred ? ` Transferred ${result.contextPacketIds.length} validated context packet(s).` : ''}`
+          : `Promoted ${resolution.path} to Operator as a project.`,
+        originalUserMessage,
+        standalone: standaloneHandoff,
+        fuzzyResolved: !!resolution.fuzzyResolved,
+        resolvedFrom: resolution.resolvedFrom,
+        matchedName: resolution.matchedName || getLocalPathBaseName(resolution.path),
+        committedWithWarning: committedHandoffWarnings.length > 0,
+        warning: committedHandoffWarnings.join(' ')
+      };
+    }
+
     case 'get_coder_task_status': {
       const taskId = String(args.taskId || conversation.launchedCoderTaskId || conversation.lastOwnedTaskId || '').trim();
       if (!taskId) throw new Error('No task ID is associated with this Dispatch conversation.');
@@ -11408,6 +11534,12 @@ const AGENT_HANDOFF_IMPLEMENTATIONS = {
     displayName: 'Coder',
     promote: (payload) => window.promoteWorkspaceToCoder(payload),
     startMonitor: (dispatchConvId, targetConvId, taskId) => window.startCoderTaskMonitor(dispatchConvId, targetConvId, taskId)
+  },
+  // Phase 3 piece 5: the second registered specialist, backing the handoff_to_operator tool below.
+  operator: {
+    displayName: 'Operator',
+    promote: (payload) => window.promoteWorkspaceToOperator(payload),
+    startMonitor: (dispatchConvId, targetConvId, taskId) => window.startOperatorTaskMonitor(dispatchConvId, targetConvId, taskId)
   }
 };
 
@@ -11421,6 +11553,7 @@ const DISPATCH_TOOL_ALLOWLIST = new Set([
   'google_search', 'fetch_web_page', 'fetch_api_docs', 'search_api_docs',
   'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context', 'list_files', 'get_workspace_info', 'change_workspace',
   'handoff_to_coder',
+  'handoff_to_operator',
   'get_coder_task_status', 'cancel_coder_task',
   'open_url', 'click_element', 'fill_input', 'take_screenshot', 'navigate_back', 'attach_image',
   'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model',
@@ -11581,6 +11714,26 @@ function buildAgentToolDeclarations() {
                 },
                 title: { type: "STRING", description: "Optional title for the new Coder conversation." },
                 open: { type: "BOOLEAN", description: "Whether to switch the UI to the new Coder conversation immediately. Defaults to false." }
+              }
+            }
+          },
+          {
+            name: "handoff_to_operator",
+            description: "Queues work for Operator in either a resolved project or an isolated standalone Operator workspace. Use this instead of handoff_to_coder when the request is desktop/browser execution — clicking through an application UI, filling in a web form, driving a multi-step browser workflow, running/monitoring a local process, or taking and inspecting screenshots to verify an on-screen state — rather than reading, writing, or testing source code. Work that depends on existing project files, tests, builds, installs, or dependencies still requires the exact project workspace. A local-machine process/application/desktop operation not bound to an existing project may use standalone=true; Orion creates an isolated workspace automatically from the user's home workspace. REQUIRED: when the user asks for a desktop/browser operation outside Dispatch's read-only permissions, call this tool; never refuse or tell the user to perform it manually merely because Dispatch cannot execute it. IMPORTANT — context transfer: exact-source context packets are generated ONLY by inspect_code_context calls. If your investigation used grep_search/read_file instead, no packets exist, so you MUST pass your key conclusions in `findings` — otherwise Operator starts blind and rediscovers everything. This is the explicit promotion path; change_workspace alone must not add folders to Operator.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                path: { type: "STRING", description: "Optional absolute folder path to promote. Defaults to the current Dispatch workspace." },
+                prompt: { type: "STRING", description: "Optional exact task for Operator to start, such as what to click through, fill in, launch, or verify on screen." },
+                originalUserMessage: { type: "STRING", description: "Exact latest user utterance retained separately when prompt is expanded. Orion injects this provenance; do not paraphrase it." },
+                standalone: { type: "BOOLEAN", description: "True when the task is not bound to an existing project. Orion creates an isolated Operator workspace, except local process/application/desktop operations use the home workspace. Never use standalone to bypass resolution for work that depends on project files, tests, builds, installs, or dependencies." },
+                findings: {
+                  type: "ARRAY",
+                  items: { type: "STRING" },
+                  description: "Concise findings or decisions already established in Dispatch (file paths, key line references, conclusions). REQUIRED in practice when you explored with grep_search/read_file, since only inspect_code_context produces transferable context packets. Do not paste source code here; exact source is transferred through context packets."
+                },
+                title: { type: "STRING", description: "Optional title for the new Operator conversation." },
+                open: { type: "BOOLEAN", description: "Whether to switch the UI to the new Operator conversation immediately. Defaults to false." }
               }
             }
           },
