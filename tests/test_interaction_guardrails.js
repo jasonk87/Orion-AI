@@ -1139,6 +1139,64 @@ test('token-saving prompt cleanup keeps tool schemas authoritative', (t) => {
   t.end();
 });
 
+test('Dispatch can see and actually invoke the durable scheduling tools its own prompt tells it to use', async (t) => {
+  // Declaration: Dispatch's own system prompt says "if you promise to check later, you MUST use
+  // schedule_followup; schedules are durable." That instruction was a lie until these two tools
+  // were on the allowlist below — the model literally never received their schemas in Dispatch mode.
+  agent.__setActiveConversationModeForTest('orion');
+  const dispatchTools = agent.buildAgentToolDeclarations().map(tool => tool.name);
+  agent.__setActiveConversationModeForTest('orion');
+  t.ok(dispatchTools.includes('schedule_followup'), 'Dispatch is offered schedule_followup');
+  t.ok(dispatchTools.includes('watch_condition'), 'Dispatch is offered watch_condition');
+
+  // Invocation: seeing the tool is not the same as being able to use it. Actually run both
+  // executors as Dispatch and confirm a durable schedule comes back, the way runAgentLoop would
+  // derive activeConversationMode from conversation.mode === 'orion' for a real Dispatch turn.
+  const oldApi = global.window.api;
+  const oldActiveConversationId = global.activeConversationId;
+  let createScheduleCalls = [];
+  global.window.api = {
+    createSchedule: async (input) => {
+      createScheduleCalls.push(input);
+      return {
+        success: true,
+        schedule: { scheduleId: `sched_${createScheduleCalls.length}`, dueAt: Date.now() + 60000, calendar: null }
+      };
+    }
+  };
+  global.activeConversationId = 'conv_dispatch_1';
+  try {
+    const followupResult = await agent.executeTool(
+      'schedule_followup',
+      { prompt: 'check the deploy status', delaySeconds: 60, purpose: 'deploy-check' },
+      'C:\\workspace',
+      {},
+      { id: 'conv_dispatch_1', mode: 'orion' },
+      {}
+    );
+    t.ok(followupResult && followupResult.success, 'Dispatch can invoke schedule_followup and get a real result, not a missing-tool error');
+    t.ok(followupResult.durable, 'the result confirms the follow-up survives restarts, matching what Dispatch is told to promise the user');
+
+    const watchResult = await agent.executeTool(
+      'watch_condition',
+      { type: 'file', path: 'C:\\workspace\\build.log', prompt: 'The build log changed.', purpose: 'build-log' },
+      'C:\\workspace',
+      {},
+      { id: 'conv_dispatch_1', mode: 'orion' },
+      {}
+    );
+    t.ok(watchResult && watchResult.success, 'Dispatch can invoke watch_condition and get a real result, not a missing-tool error');
+    t.equal(createScheduleCalls.length, 2, 'both calls actually reached the durable schedule store');
+    t.ok(createScheduleCalls.every(call => call.conversationId === 'conv_dispatch_1'),
+      'both schedules are attached to the calling Dispatch conversation, so they fire back into it specifically');
+  } finally {
+    global.window.api = oldApi;
+    global.activeConversationId = oldActiveConversationId;
+    agent.__setActiveConversationModeForTest('orion');
+  }
+  t.end();
+});
+
 test('incidental observations are bounded Coder-only run notes', (t) => {
   t.ok(agentJs.includes('INCIDENTAL OBSERVATIONS'), 'Coder prompt includes incidental observation policy');
   t.ok(agentJs.includes('name: "note_incidental_issue"'), 'Coder tool schema exposes note_incidental_issue');

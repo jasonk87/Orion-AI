@@ -11321,7 +11321,15 @@ const DISPATCH_TOOL_ALLOWLIST = new Set([
   'read_notes', 'read_project_memory', 'remember_file_notes',
   'inspect_environment',
   'db_query',
-  'ask_clarifying_questions'
+  'ask_clarifying_questions',
+  // Scheduling a durable follow-up or watch is orchestration intent ("check on this later",
+  // "tell me when X happens"), not code execution — the schedule only ever re-enters this same
+  // conversation at its own mode (see activeConversationMode derivation from conversation.mode
+  // in runAgentLoop), and watch_condition's command probes are independently sandboxed to
+  // read-only checks by classifyUnattendedProbeCommand regardless of who created the watch.
+  // Without these two, Dispatch's own system prompt tells it to schedule follow-ups it is
+  // structurally unable to create.
+  'schedule_followup', 'watch_condition'
 ]);
 
 // Single source of truth for the agent's tool declarations, consumed by every provider
