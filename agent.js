@@ -6079,7 +6079,10 @@ async function executeTool(name, args, workspace, config, conversation, executio
       if (!resolution.success) {
         throw new Error(`Coder handoff path "${resolution.path}" is invalid or does not exist: ${resolution.error}`);
       }
-      if (typeof window.promoteWorkspaceToCoder !== 'function') {
+      // Phase 2: this tool always hands off to role 'coder' today — see AGENT_HANDOFF_IMPLEMENTATIONS.
+      const handoffRole = 'coder';
+      const handoffImpl = AGENT_HANDOFF_IMPLEMENTATIONS[handoffRole];
+      if (!handoffImpl || typeof window.promoteWorkspaceToCoder !== 'function') {
         throw new Error('Coder handoff is not available in this Orion build.');
       }
       let handoffWorkspace = isolatedStandaloneHandoff
@@ -6106,7 +6109,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
       const contextPacketIds = resolution.path
         ? getHandoffContextPacketIds(conversation, resolution.path)
         : [];
-      const result = await window.promoteWorkspaceToCoder({
+      const result = await handoffImpl.promote({
         path: resolution.path,
         prompt,
         originalUserMessage,
@@ -6126,11 +6129,15 @@ async function executeTool(name, args, workspace, config, conversation, executio
       }
 
       // ── Supervisor: track the launched Coder conversation ──────────────────
+      // launchedCoder* field names are unchanged (companion-html.js and other readers depend on
+      // them by name) — launchedTaskRole is new and purely additive, so future role-aware code can
+      // check it instead of assuming the field names imply the role.
       conversation.launchedCoderConvId = result.conversationId;
       conversation.launchedCoderTaskId = result.taskId || '';
       conversation.lastOwnedTaskId = result.taskId || conversation.lastOwnedTaskId || '';
       conversation.launchedCoderTaskTitle = result.title || 'Coder Task';
       conversation.launchedCoderTaskStart = Date.now();
+      conversation.launchedTaskRole = handoffRole;
       const committedHandoffWarnings = result.warning ? [String(result.warning)] : [];
       try {
         if (typeof window.markConversationDirty === 'function') {
@@ -6144,9 +6151,9 @@ async function executeTool(name, args, workspace, config, conversation, executio
         committedHandoffWarnings.push(`The task was queued, but Dispatch could not save its supervisor pointer: ${error.message || error}`);
       }
       // Kick off the supervisor monitor in the renderer
-      if (typeof window.startCoderTaskMonitor === 'function') {
+      if (typeof handoffImpl.startMonitor === 'function' && typeof window.startCoderTaskMonitor === 'function') {
         try {
-          window.startCoderTaskMonitor(conversation.id, result.conversationId, result.taskId || '');
+          handoffImpl.startMonitor(conversation.id, result.conversationId, result.taskId || '');
         } catch (error) {
           committedHandoffWarnings.push(`The task was queued, but its live supervisor monitor did not start: ${error.message || error}`);
         }
@@ -11308,6 +11315,23 @@ function convertGeminiToOllamaMessages(geminiMessages) {
   
   return ollamaMessages;
 }
+
+// Phase 2 of the Operator architecture plan: registry of handoff implementations by specialist
+// role. 'coder' is the only registered specialist today, and the handoff_to_coder tool below still
+// always dispatches with role 'coder' — Coder's behavior is unchanged from the user's perspective.
+// What changes is that the executor looks the implementation up here by role instead of calling
+// window.promoteWorkspaceToCoder / window.startCoderTaskMonitor by name directly, so a second
+// specialist (Operator, Phase 3) registers a promote/startMonitor pair here rather than agent.js
+// growing a second near-duplicate handoff case block. The functions are thin lookups evaluated at
+// call time (not captured at module load), so they still see whatever window.promoteWorkspaceToCoder
+// resolves to at the moment a handoff actually runs — the same timing tests already rely on.
+const AGENT_HANDOFF_IMPLEMENTATIONS = {
+  coder: {
+    displayName: 'Coder',
+    promote: (payload) => window.promoteWorkspaceToCoder(payload),
+    startMonitor: (dispatchConvId, targetConvId, taskId) => window.startCoderTaskMonitor(dispatchConvId, targetConvId, taskId)
+  }
+};
 
 // Dispatch (Orion) can look at files, code, and the web to back up what it says, and it can
 // explicitly hand a workspace to Coder when Jason asks. It must never be structurally able to
