@@ -1027,7 +1027,10 @@ test('Dispatch uses Projects fallback while Coder standalone conversations get i
   t.ok(rendererJs.includes("!c.projectPath && c.mode !== 'orion' && c.mode !== 'coder'"), 'legacy coder backfill does not overwrite explicit Dispatch/Coder modes');
   t.ok(rendererJs.includes("if (c.mode === 'orion' && c.projectPath)"), 'migration clears accidental project linkage from explicit Dispatch conversations');
   t.ok(rendererJs.includes("c.mode === 'orion' && c.workspace && isGeneratedStandaloneWorkspace(c.workspace)"), 'migration clears generated standalone workspaces from Dispatch conversations');
-  t.ok(rendererJs.includes("return mode === 'orion' || !c.projectPath;"), 'Dispatch list keeps Dispatch conversations even when they inspected a project workspace');
+  // Item 10 of the Operator architecture plan: this became "mode !== 'coder'" instead of
+  // "mode === 'orion'" so the same project-path exclusion that already applied to Coder's list
+  // also applies to the new Operator list, without special-casing a third mode name here.
+  t.ok(rendererJs.includes("return mode !== 'coder' || !c.projectPath;"), 'Dispatch and Operator lists keep their conversations even when they inspected a project workspace; only Coder filters standalone-vs-project');
   t.ok(rendererJs.includes('c.projectPath && isGeneratedStandaloneWorkspace(c.workspace)'), 'migration clears accidental project linkage from generated standalone workspaces');
   // Phase 3 of the Operator architecture plan: operator conversations get this same auto-bind
   // treatment as Coder now (both do real workspace-bound artifact work), so the condition gained

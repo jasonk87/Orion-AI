@@ -86,7 +86,7 @@ let expandedFileFolders = new Set();
 // Every cold launch begins at a clean Dispatch draft. Mode changes during the running app are
 // still preserved in memory, but an old persisted UI preference must not reopen Coder or an old
 // Dispatch transcript on the next launch.
-let appMode = 'orion'; // 'orion' | 'coder'
+let appMode = 'orion'; // 'orion' | 'coder' | 'operator'
 let lastDispatchConversationId = '';
 let dispatchDraft = {
   active: true,
@@ -122,6 +122,9 @@ const el = {
   projectList: document.getElementById('project-list'),
   conversationList: document.getElementById('conversation-list'),
   conversationListCoder: document.getElementById('conversation-list-coder'),
+  conversationListOperator: document.getElementById('conversation-list-operator'),
+  btnAddConversationOperator: document.getElementById('btn-add-conversation-operator'),
+  btnNewConversationOperator: document.getElementById('btn-new-conversation-operator'),
   btnSettings: document.getElementById('btn-settings'),
   btnChangeWorkspace: document.getElementById('btn-change-workspace'),
   btnSyncFiles: document.getElementById('btn-sync-files'),
@@ -1105,16 +1108,23 @@ function setAppMode(mode, persist = true) {
 
   const orionBtn = document.getElementById('btn-mode-orion');
   const coderBtn = document.getElementById('btn-mode-coder');
+  const operatorBtn = document.getElementById('btn-mode-operator');
   const orionContent = document.getElementById('sidebar-orion-content');
   const coderContent = document.getElementById('sidebar-coder-content');
+  const operatorContent = document.getElementById('sidebar-operator-content');
   if (orionBtn) orionBtn.classList.toggle('active', mode === 'orion');
   if (coderBtn) coderBtn.classList.toggle('active', mode === 'coder');
+  if (operatorBtn) operatorBtn.classList.toggle('active', mode === 'operator');
   if (orionContent) orionContent.classList.toggle('active', mode === 'orion');
   if (coderContent) coderContent.classList.toggle('active', mode === 'coder');
+  if (operatorContent) operatorContent.classList.toggle('active', mode === 'operator');
 
   // Dispatch preserves its current in-session focus, including an uncommitted draft, but never
-  // chooses an old transcript merely because the user opened the mode. Coder keeps its existing
-  // task-oriented selection behavior.
+  // chooses an old transcript merely because the user opened the mode. Coder and Operator each
+  // keep their own task-oriented selection behavior, scoped to their own mode — this used to be
+  // a blanket "anything that isn't orion is coder" check, which meant selecting an Operator
+  // conversation immediately bounced the view to a Coder one because setAppMode had never heard
+  // of a third mode. Item 10 of the Operator architecture plan.
   const activeConv = conversations.find(c => c.id === activeConversationId);
   if (mode === 'orion') {
     if (activeConv && conversationMode(activeConv) === 'orion') {
@@ -1127,10 +1137,10 @@ function setAppMode(mode, persist = true) {
       if (remembered) selectConversation(remembered.id, { selectionEpoch: conversationSelectionEpoch });
       else startDispatchDraft();
     }
-  } else if (!activeConv || conversationMode(activeConv) !== 'coder') {
-    const replacement = conversations.find(c => conversationMode(c) === 'coder');
+  } else if (!activeConv || conversationMode(activeConv) !== mode) {
+    const replacement = conversations.find(c => conversationMode(c) === mode);
     if (replacement) selectConversation(replacement.id, { selectionEpoch: conversationSelectionEpoch });
-    else createNewConversation('coder');
+    else createNewConversation(mode);
   }
 
   // Adapt main workspace for mode
@@ -1150,9 +1160,13 @@ function setAppMode(mode, persist = true) {
     // Update greeting time
     updateOrionGreeting();
   } else {
-    if (chatInput) chatInput.placeholder = 'Ask Orion to build, fix, or investigate…';
+    if (chatInput) {
+      chatInput.placeholder = mode === 'operator'
+        ? 'Ask Operator to click, type, or navigate…'
+        : 'Ask Orion to build, fix, or investigate…';
+    }
     if (orionSplash) orionSplash.style.display = 'none';
-    // Restore coder splash if no messages
+    // Restore the shared splash if no messages
     const conv = conversations.find(c => c.id === activeConversationId);
     const hasMessages = conv && conv.messages && conv.messages.length > 0;
     if (!hasMessages) {
@@ -1462,6 +1476,7 @@ function setupProgressiveDisclosure() {
   // Mode switcher
   document.getElementById('btn-mode-orion')?.addEventListener('click', () => setAppMode('orion'));
   document.getElementById('btn-mode-coder')?.addEventListener('click', () => setAppMode('coder'));
+  document.getElementById('btn-mode-operator')?.addEventListener('click', () => setAppMode('operator'));
   setAppMode(appMode, false); // Initialize from stored preference
 
   // Orion prompt chips — populate input (with focus) so Jason can review/edit before sending
@@ -2272,6 +2287,12 @@ function setupChatHandlers() {
   }
   if (el.btnAddConversationCoder) {
     el.btnAddConversationCoder.addEventListener('click', () => createNewConversation('coder'));
+  }
+  if (el.btnAddConversationOperator) {
+    el.btnAddConversationOperator.addEventListener('click', () => createNewConversation('operator'));
+  }
+  if (el.btnNewConversationOperator) {
+    el.btnNewConversationOperator.addEventListener('click', () => createNewConversation('operator'));
   }
   if (el.btnNewConversationCoder && el.newConvPickerMenu) {
     const closePicker = () => { el.newConvPickerMenu.hidden = true; };
@@ -4048,7 +4069,7 @@ function startDispatchDraft(options = {}) {
 }
 
 async function createNewConversation(mode = appMode) {
-  if (mode !== 'coder') {
+  if (mode === 'orion') {
     const focusResult = await window.beginNewFocus(activeConversationId);
     if (!focusResult || focusResult.success === false) {
       showToast('Could not cancel the pending work. The current focus was preserved.', 'error');
@@ -4057,13 +4078,17 @@ async function createNewConversation(mode = appMode) {
     startDispatchDraft();
     return null;
   }
+  // Coder and Operator both get a real standalone conversation record. Operator previously had
+  // no branch here at all, so calling this with 'operator' silently fell into the Dispatch-draft
+  // path above and produced an 'orion' conversation instead — item 10 of the Operator
+  // architecture plan.
   const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
   const title = 'New Conversation';
 
   const newConv = {
     id: newId,
     title: title,
-    mode: mode === 'coder' ? 'coder' : 'orion',
+    mode: mode === 'coder' || mode === 'operator' ? mode : 'orion',
     projectPath: '',
     workspace: '', // will slugify on first prompt
     messages: [],
@@ -5197,11 +5222,13 @@ function confirmConversationDelete(title) {
 }
 
 function renderConversationList() {
-  // Dispatch (Orion) and Coder each keep their own standalone-conversation history -- a chat
-  // started in one never appears in the other's list, even though neither has a projectPath.
+  // Dispatch (Orion), Coder, and Operator each keep their own standalone-conversation history --
+  // a chat started in one never appears in another's list, even though none but Coder has a
+  // projectPath.
   const listConfigs = [
     { container: el.conversationList, mode: 'orion' },
-    { container: el.conversationListCoder, mode: 'coder' }
+    { container: el.conversationListCoder, mode: 'coder' },
+    { container: el.conversationListOperator, mode: 'operator' }
   ].filter(cfg => cfg.container);
   if (listConfigs.length === 0) return;
 
@@ -5211,7 +5238,7 @@ function renderConversationList() {
     const standaloneConversations = conversations.filter(c => {
       const convMode = conversationMode(c);
       if (convMode !== mode) return false;
-      return mode === 'orion' || !c.projectPath;
+      return mode !== 'coder' || !c.projectPath;
     });
 
     if (standaloneConversations.length === 0) {

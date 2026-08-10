@@ -46,6 +46,10 @@
           <span class="mode-nav-icon">&lt;/&gt;</span>
           <span class="mode-nav-label">Coder</span>
         </button>
+        <button id="btn-mode-operator" class="mode-nav-item" title="Operator — Desktop &amp; Browser Automation">
+          <span class="mode-nav-icon">&#9881;</span>
+          <span class="mode-nav-label">Operator</span>
+        </button>
       </div>
 
       <!-- ORION MODE CONTENT -->
@@ -109,6 +113,29 @@
             </div>
           </div>
           <div class="conversation-list" id="conversation-list-coder">
+            <!-- Dynamic conversation list (mirrors #conversation-list) -->
+          </div>
+        </div>
+      </div>
+
+      <!-- OPERATOR MODE CONTENT -->
+      <!-- Deliberately flat like Orion's, not project-structured like Coder's: Operator does
+           desktop/browser automation bound to whatever workspace a task names, not a registered
+           source-code project, so there is no "Projects" concept to browse here. -->
+      <div id="sidebar-operator-content" class="sidebar-mode-content">
+        <div class="sidebar-top">
+          <button id="btn-new-conversation-operator" class="btn-primary">
+            <span class="plus-icon">+</span> New Conversation
+          </button>
+        </div>
+        <div class="sidebar-section">
+          <div class="section-header">
+            <span>Conversations</span>
+            <div class="section-actions">
+              <button id="btn-add-conversation-operator" title="New Conversation">+</button>
+            </div>
+          </div>
+          <div class="conversation-list" id="conversation-list-operator">
             <!-- Dynamic conversation list (mirrors #conversation-list) -->
           </div>
         </div>
