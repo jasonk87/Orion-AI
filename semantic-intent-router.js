@@ -415,6 +415,24 @@
       );
   }
 
+  function requiresProjectWorkspace(classification) {
+    if (!classification || typeof classification !== 'object') return false;
+    const inspectionTarget = String(classification.inspectionTarget || '').toLowerCase();
+    const contextNeed = String(
+      classification.reasoningPolicyHint && classification.reasoningPolicyHint.contextNeed || ''
+    ).toLowerCase();
+    return inspectionTarget === 'workspace'
+      || inspectionTarget === 'project'
+      || contextNeed === 'project';
+  }
+
+  function canUseStandaloneCoderWorkspace(classification) {
+    if (!classification || typeof classification !== 'object') return false;
+    return classification.requiresExecution === true
+      && ['new_task', 'context_followup'].includes(classification.intent)
+      && !requiresProjectWorkspace(classification);
+  }
+
   const api = {
     INTENTS,
     TARGETS,
@@ -426,7 +444,9 @@
     normalizeClassification,
     safeFallback,
     classify,
-    canRespondDuringActiveRun
+    canRespondDuringActiveRun,
+    requiresProjectWorkspace,
+    canUseStandaloneCoderWorkspace
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   if (globalScope) globalScope.OrionSemanticIntentRouter = api;

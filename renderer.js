@@ -2676,20 +2676,36 @@ async function queueDispatchWorkForCoder(options = {}) {
   const workspace = standaloneSystemWork
     ? structuredWorkspaceForConversation(originConv)
     : await bindNamedProjectForSupervisor(originConv, contextText);
-  const standalone = standaloneSystemWork;
+  const hasConcreteWorkspace = workspace.role === 'active_project' || workspace.role === 'standalone_coder';
+  const standalone = standaloneSystemWork || (!hasConcreteWorkspace
+    && RendererSemanticIntentRouter
+    && RendererSemanticIntentRouter.canUseStandaloneCoderWorkspace(semanticIntent));
   let standaloneWorkspacePath = '';
   if (standalone) {
-    try {
-      const homeDir = await window.api.getHomeDir();
-      standaloneWorkspacePath = typeof homeDir === 'string' ? homeDir.trim() : '';
-    } catch (_) {}
+    if (standaloneSystemWork) {
+      try {
+        const homeDir = await window.api.getHomeDir();
+        standaloneWorkspacePath = typeof homeDir === 'string' ? homeDir.trim() : '';
+      } catch (_) {}
+    } else {
+      const standaloneTitle = String(
+        options.title
+        || semanticIntent.taskResolution && semanticIntent.taskResolution.title
+        || semanticIntent.resolvedRequest
+        || originalUserMessage
+      ).trim();
+      standaloneWorkspacePath = getStandaloneWorkspaceForTitle(
+        standaloneTitle,
+        `handoff_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+      );
+    }
   }
   const taskWorkspace = standalone
     ? {
         role: 'standalone_coder',
         path: standaloneWorkspacePath || getDispatchWorkspaceRoot(),
         project: { name: '', path: '' },
-        source: 'standalone-system-task',
+        source: standaloneSystemWork ? 'standalone-system-task' : 'standalone-coder-task',
         resolved: true
       }
     : workspace;
@@ -2760,6 +2776,7 @@ async function queueDispatchWorkForCoder(options = {}) {
     unresolvedDecisions: packet.unresolvedDecisions,
     precedingConversationSummary: packet.precedingConversationSummary,
     semanticIntent,
+    standaloneSystemOperation: standaloneSystemWork,
     open: options.open === true
   });
   if (!promoted || promoted.success === false || !promoted.task) {
@@ -6888,19 +6905,6 @@ window.changeActiveWorkspace = function(folderPath, options = {}) {
 };
 window.promoteWorkspaceToCoder = async function(options = {}) {
   const standalone = options.standalone === true;
-  let standaloneWorkspacePath = '';
-  if (standalone) {
-    try {
-      const homeDir = await window.api.getHomeDir();
-      standaloneWorkspacePath = typeof homeDir === 'string' ? homeDir.trim() : '';
-    } catch (_) {}
-  }
-  const folderPath = String(
-    (standalone ? standaloneWorkspacePath : options.path)
-    || currentWorkspace
-    || (standalone ? getDispatchWorkspaceRoot() : '')
-  ).trim();
-  if (!folderPath) return { success: false, error: 'No workspace path to promote.' };
   const prompt = String(options.prompt || '').trim();
   const originalUserMessage = String(options.originalUserMessage || prompt).trim();
   const title = String(options.title || '').trim()
@@ -6910,6 +6914,31 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
   const semanticIntent = options.semanticIntent || (originConv && prompt
     ? await classifyCurrentConversationIntent(originConv, originalUserMessage, { model: options.modelSelectValue })
     : null);
+  const standaloneSystemOperation = standalone && (
+    options.standaloneSystemOperation === true
+    || !!(semanticIntent && semanticIntent.standaloneSystemOperation)
+  );
+  let standaloneWorkspacePath = '';
+  if (standalone) {
+    if (standaloneSystemOperation) {
+      try {
+        const homeDir = await window.api.getHomeDir();
+        standaloneWorkspacePath = typeof homeDir === 'string' ? homeDir.trim() : '';
+      } catch (_) {}
+    } else {
+      standaloneWorkspacePath = String(options.path || '').trim()
+        || getStandaloneWorkspaceForTitle(
+          title,
+          `handoff_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+        );
+    }
+  }
+  const folderPath = String(
+    (standalone ? standaloneWorkspacePath : options.path)
+    || currentWorkspace
+    || (standalone ? getDispatchWorkspaceRoot() : '')
+  ).trim();
+  if (!folderPath) return { success: false, error: 'No workspace path to promote.' };
   let preflightTask = options.taskPacket && RendererTaskOrchestration
     ? RendererTaskOrchestration.normalizeTaskRecord(options.taskPacket)
     : null;

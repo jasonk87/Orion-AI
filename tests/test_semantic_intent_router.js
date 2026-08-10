@@ -510,3 +510,31 @@ test('active-run routing keeps conversation out of the durable execution queue',
   );
   t.end();
 });
+
+test('standalone Coder eligibility follows structured project dependency', t => {
+  const creativeTask = classification('new_task', {
+    requiresExecution: true,
+    executionScope: 'mutating',
+    inspectionTarget: 'none',
+    reasoningPolicyHint: { complexity: 'medium', risk: 'low', contextNeed: 'none' }
+  });
+  t.equal(router.requiresProjectWorkspace(creativeTask), false,
+    'a self-contained artifact task does not invent a project dependency');
+  t.equal(router.canUseStandaloneCoderWorkspace(creativeTask), true,
+    'self-contained executable work may use an isolated standalone Coder workspace');
+
+  const projectTask = classification('new_task', {
+    requiresExecution: true,
+    executionScope: 'mutating',
+    inspectionTarget: 'project',
+    reasoningPolicyHint: { complexity: 'medium', risk: 'medium', contextNeed: 'project' }
+  });
+  t.equal(router.requiresProjectWorkspace(projectTask), true,
+    'structured project evidence keeps existing-project work project-bound');
+  t.equal(router.canUseStandaloneCoderWorkspace(projectTask), false,
+    'standalone routing cannot bypass a missing project for project-bound work');
+
+  t.equal(router.canUseStandaloneCoderWorkspace(classification('conversation')), false,
+    'ordinary conversation is never turned into a standalone task');
+  t.end();
+});

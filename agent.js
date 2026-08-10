@@ -2662,13 +2662,16 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         semanticIntent,
         ledger: contextAcquisitionLedger
       }));
-    const dispatchPreflightStandalone = semanticIntent.standaloneSystemOperation === true;
     const dispatchPreflightAtGenericRoot = WorkspaceResolution
       ? WorkspaceResolution.samePath(workspacePath, getDispatchWorkspaceRoot())
       : String(workspacePath || '').toLowerCase() === String(getDispatchWorkspaceRoot() || '').toLowerCase();
     const dispatchPreflightWorkspacePermission = WorkspaceResolution
       ? WorkspaceResolution.canHandoffWorkspace(workspaceResolution)
       : { allowed: !!workspacePath };
+    const dispatchPreflightStandalone = semanticIntent.standaloneSystemOperation === true
+      || (!dispatchPreflightWorkspacePermission.allowed
+        && SemanticIntentRouter
+        && SemanticIntentRouter.canUseStandaloneCoderWorkspace(semanticIntent));
     const canDelegateCurrentInspectionWorkspace = () => {
       if (!workspacePath) return false;
       if (!WorkspaceResolution) return true;
@@ -3213,6 +3216,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // no-tool sentence such as "I can't do that here, so I'll pass it to Coder" cannot synthesize
       // a second durable task after the first call has already executed.
       const standaloneEnvironmentRequest = effectiveDispatchHandoffIntent.standaloneSystemOperation === true;
+      const standaloneCoderRequest = standaloneEnvironmentRequest
+        || (!dispatchPreflightWorkspacePermission.allowed
+          && SemanticIntentRouter
+          && SemanticIntentRouter.canUseStandaloneCoderWorkspace(effectiveDispatchHandoffIntent));
       if (runMode === 'orion' && functionCalls.some(call => call && call.name === 'handoff_to_coder')) {
         for (const call of functionCalls) {
           if (!call || call.name !== 'handoff_to_coder') continue;
@@ -3221,8 +3228,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           // utterance as separate provenance instead of making downstream code reverse-engineer it
           // from the resolved objective.
           call.args.originalUserMessage = liveUserPrompt;
-          call.args.standalone = standaloneEnvironmentRequest;
+          call.args.standalone = standaloneCoderRequest;
           if (standaloneEnvironmentRequest) call.args.path = resolvedHomeDir;
+          else if (standaloneCoderRequest) delete call.args.path;
           const proposedTitle = String(call.args.title || '').trim();
           if (!proposedTitle || proposedTitle.toLowerCase() === 'execute dispatch request') {
             call.args.title = resolveDispatchHandoffTitle({
@@ -3264,7 +3272,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               workspaceResolution
             }),
             open: false,
-            standalone: standaloneEnvironmentRequest,
+            standalone: standaloneCoderRequest,
             ...(standaloneEnvironmentRequest ? { path: resolvedHomeDir } : {}),
             originalUserMessage: liveUserPrompt
           }
@@ -6043,26 +6051,34 @@ async function executeTool(name, args, workspace, config, conversation, executio
 
     case 'handoff_to_coder': {
       const standaloneHandoff = args.standalone === true;
+      const authorizedHandoffIntent = executionContext.authorizedDispatchHandoffIntent || {};
+      const standaloneSystemHandoff = standaloneHandoff
+        && authorizedHandoffIntent.standaloneSystemOperation === true;
+      const isolatedStandaloneHandoff = standaloneHandoff && !standaloneSystemHandoff;
       const requestedPath = String(
-        standaloneHandoff
+        standaloneSystemHandoff
           ? resolvedHomeDir
-          : (args.path || workspace || conversation.workspace || '')
+          : (isolatedStandaloneHandoff ? '' : (args.path || workspace || conversation.workspace || ''))
       ).trim();
-      if (!requestedPath) throw new Error("Missing workspace path to hand off to Coder");
+      if (!requestedPath && !isolatedStandaloneHandoff) throw new Error("Missing workspace path to hand off to Coder");
       const prompt = String(args.prompt || '').trim();
       const originalUserMessage = String(
         args.originalUserMessage
         || [...(conversation.messages || [])].reverse().find(message => message && message.role === 'user')?.text
         || prompt
       ).trim();
-      const resolution = await resolveWorkspacePathForChange(requestedPath);
+      const resolution = isolatedStandaloneHandoff
+        ? { success: true, path: '', fuzzyResolved: false, resolvedFrom: '', matchedName: 'Standalone' }
+        : await resolveWorkspacePathForChange(requestedPath);
       if (!resolution.success) {
         throw new Error(`Coder handoff path "${resolution.path}" is invalid or does not exist: ${resolution.error}`);
       }
       if (typeof window.promoteWorkspaceToCoder !== 'function') {
         throw new Error('Coder handoff is not available in this Orion build.');
       }
-      let handoffWorkspace = WorkspaceResolution ? WorkspaceResolution.classifyWorkspace({
+      let handoffWorkspace = isolatedStandaloneHandoff
+        ? { kind: WorkspaceResolution ? WorkspaceResolution.KINDS.STANDALONE_CODER : 'standalone_coder', path: 'pending-standalone-workspace' }
+        : WorkspaceResolution ? WorkspaceResolution.classifyWorkspace({
         mode: 'orion',
         workspacePath: resolution.path,
         dispatchProjectPath: conversation.dispatchProjectPath,
@@ -6081,12 +6097,15 @@ async function executeTool(name, args, workspace, config, conversation, executio
       if (!handoffPermission.allowed && !standaloneHandoff) {
         throw new Error(handoffPermission.reason || 'Resolve a concrete project workspace before handing work to Coder.');
       }
-      const contextPacketIds = getHandoffContextPacketIds(conversation, resolution.path);
+      const contextPacketIds = resolution.path
+        ? getHandoffContextPacketIds(conversation, resolution.path)
+        : [];
       const result = await window.promoteWorkspaceToCoder({
         path: resolution.path,
         prompt,
         originalUserMessage,
         standalone: standaloneHandoff,
+        standaloneSystemOperation: standaloneSystemHandoff,
         title: args.title || '',
         open: args.open === true,
         sourceConversationId: conversation.id,
@@ -6132,7 +6151,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
         ...result,
         success: true,
         message: prompt
-          ? `${standaloneHandoff ? 'Opened a standalone Coder task from' : 'Promoted'} ${resolution.path} and queued task ${result.taskId || '(pending ID)'} with state ${result.status || 'pending'}.${result.contextTransferred ? ` Transferred ${result.contextPacketIds.length} validated context packet(s).` : ''}`
+          ? `${standaloneHandoff ? 'Opened a standalone Coder task in' : 'Promoted'} ${result.workspacePath || resolution.path} and queued task ${result.taskId || '(pending ID)'} with state ${result.status || 'pending'}.${result.contextTransferred ? ` Transferred ${result.contextPacketIds.length} validated context packet(s).` : ''}`
           : `Promoted ${resolution.path} to Coder as a project.`,
         originalUserMessage,
         standalone: standaloneHandoff,
@@ -10713,10 +10732,15 @@ async function resolveDispatchWorkspaceForRun(conversation, userPrompt, semantic
       .join('\n')
     : '';
   const projectReferenceText = [recentConversationContext, userPrompt].filter(Boolean).join('\n');
-  const named = WorkspaceResolution.findNamedProject(projectReferenceText, knownProjects);
+  const projectScopedTurn = !semanticIntent
+    || !SemanticIntentRouter
+    || SemanticIntentRouter.requiresProjectWorkspace(semanticIntent);
+  const named = projectScopedTurn
+    ? WorkspaceResolution.findNamedProject(projectReferenceText, knownProjects)
+    : null;
   if (named) {
     resolution = WorkspaceResolution.bindResolvedProject(resolution, named, named.source || 'registered_project');
-  } else if (resolution.kind !== WorkspaceResolution.KINDS.ACTIVE_PROJECT) {
+  } else if (projectScopedTurn && resolution.kind !== WorkspaceResolution.KINDS.ACTIVE_PROJECT) {
     // A bounded filesystem lookup covers named projects that have not yet been registered. The
     // search starts from entity-like names (for example an all-caps app name) and never treats the
     // generic Projects directory itself as the selected project.
@@ -11398,14 +11422,14 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "handoff_to_coder",
-            description: "Promotes a resolved local project into Coder and optionally queues implementation/execution. A local-machine process/application/desktop operation that is not project-bound uses standalone=true and runs from the user's home workspace, regardless of which project Dispatch currently has selected. File, test, build, install, and dependency work still requires an exact project workspace. REQUIRED: when the user asks for an operation outside Dispatch's read-only permissions, call this tool; never refuse or tell the user to perform it manually merely because Dispatch cannot execute it. For an obvious implementation/execution request, route early without deeply inspecting source first. IMPORTANT — context transfer: exact-source context packets are generated ONLY by inspect_code_context calls. If your investigation used grep_search/read_file instead, no packets exist, so you MUST pass your key conclusions in `findings` — otherwise Coder starts blind and rediscovers everything. This is the explicit promotion path; change_workspace alone must not add folders to Coder.",
+            description: "Queues work for Coder in either a resolved project or an isolated standalone Coder workspace. Work that depends on existing project files, tests, builds, installs, or dependencies requires the exact project workspace. Executable work that is not bound to an existing project may use standalone=true; Orion creates an isolated workspace automatically. A local-machine process/application/desktop operation also uses standalone=true but runs from the user's home workspace. REQUIRED: when the user asks for an operation outside Dispatch's read-only permissions, call this tool; never refuse or tell the user to perform it manually merely because Dispatch cannot execute it. For an obvious implementation/execution request, route early without deeply inspecting source first. IMPORTANT — context transfer: exact-source context packets are generated ONLY by inspect_code_context calls. If your investigation used grep_search/read_file instead, no packets exist, so you MUST pass your key conclusions in `findings` — otherwise Coder starts blind and rediscovers everything. This is the explicit promotion path; change_workspace alone must not add folders to Coder.",
             parameters: {
               type: "OBJECT",
               properties: {
                 path: { type: "STRING", description: "Optional absolute folder path to promote. Defaults to the current Dispatch workspace." },
                 prompt: { type: "STRING", description: "Optional exact task for Coder to start, such as what to build, fix, or investigate." },
                 originalUserMessage: { type: "STRING", description: "Exact latest user utterance retained separately when prompt is expanded. Orion injects this provenance; do not paraphrase it." },
-                standalone: { type: "BOOLEAN", description: "True only for a named local process/application operation that is not project-bound. Never use for file edits, tests, builds, installs, or dependency work." },
+                standalone: { type: "BOOLEAN", description: "True when the task is not bound to an existing project. Orion creates an isolated Coder workspace, except local process/application/desktop operations use the home workspace. Never use standalone to bypass resolution for work that depends on project files, tests, builds, installs, or dependencies." },
                 findings: {
                   type: "ARRAY",
                   items: { type: "STRING" },

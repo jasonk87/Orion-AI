@@ -971,3 +971,71 @@ test('Dispatch captures model and reasoning into the durable Coder task and runt
   t.equal(result.queueItem.executionProfile.requestedReasoning, 'max', 'the runtime queue retains the whole policy contract');
   t.end();
 });
+
+test('Dispatch creates an isolated Coder workspace for self-contained work without a project', async (t) => {
+  let persistedTask = null;
+  const projectsRoot = 'C:\\Users\\Owner\\Desktop\\Projects';
+  const origin = {
+    id: 'dispatch-standalone-icons',
+    mode: 'orion',
+    title: 'Icon discussion',
+    sessionId: 'dispatch-standalone-icons',
+    workspace: projectsRoot,
+    dispatchProjectPath: '',
+    messages: [{ role: 'user', text: 'Create the SVG icon family.', createdAt: 1 }]
+  };
+  const { win, read } = loadRenderer({
+    t,
+    globals: {
+      OrionReasoningPolicy: reasoningPolicy,
+      OrionTaskOrchestration: taskOrchestration,
+      OrionWorkspaceResolution: workspaceResolution,
+      OrionSemanticIntentRouter: semanticIntentRouter
+    },
+    set: {
+      conversations: [origin],
+      projects: [],
+      activeConversationId: origin.id,
+      currentWorkspace: projectsRoot
+    },
+    api: {
+      createOrchestrationTask: async task => {
+        persistedTask = task;
+        return { success: true, task };
+      },
+      writeConversations: async () => ({ success: true })
+    }
+  });
+  const semanticIntent = {
+    intent: 'new_task',
+    requiresExecution: true,
+    target: 'current_conversation',
+    resolvedRequest: 'Create a cohesive SVG icon family for Coder, Dispatch, phone, desktop, and notifications.',
+    contextDependent: false,
+    needsClarification: false,
+    reasoningPolicyHint: { complexity: 'medium', risk: 'low', contextNeed: 'none' },
+    executionScope: 'mutating',
+    inspectionTarget: 'none',
+    inspectionBreadth: 'none',
+    standaloneSystemOperation: false,
+    taskResolution: { title: 'Design Orion icon family', requirements: [], constraints: [], unresolvedDecisions: [] }
+  };
+
+  const result = await win.queueDispatchWorkForCoder({
+    originConversationId: origin.id,
+    originalUserMessage: 'Create the SVG icon family.',
+    resolvedObjective: semanticIntent.resolvedRequest,
+    title: 'Design Orion icon family',
+    semanticIntent
+  });
+
+  t.equal(result.success, true, 'the real renderer handoff succeeds without a selected project');
+  t.equal(result.standalone, true, 'the handoff is explicitly standalone');
+  t.equal(persistedTask.workspace.role, 'standalone_coder', 'the durable packet records standalone scope');
+  t.match(persistedTask.workspace.path, /standalone-workspaces/i, 'an isolated generated workspace is assigned');
+  t.notEqual(persistedTask.workspace.path, projectsRoot, 'the generic Projects root is never presented as the task workspace');
+  const coderConversation = read('conversations').find(conversation => conversation.id === result.conversationId);
+  t.equal(coderConversation.projectPath, '', 'the Coder conversation does not invent a project binding');
+  t.equal(coderConversation.workspace, persistedTask.workspace.path, 'Coder and the durable task share the exact standalone workspace');
+  t.end();
+});

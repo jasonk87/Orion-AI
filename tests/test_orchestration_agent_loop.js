@@ -1142,6 +1142,79 @@ test('Projects-root Claude restart creates one standalone Coder handoff with raw
   t.end();
 });
 
+test('Projects-root self-contained artifact work uses one isolated standalone Coder handoff', async t => {
+  const originalFetch = global.fetch;
+  const projectsRoot = 'C:\\Users\\Owner\\Desktop\\Projects';
+  const rawRequest = 'Create a cohesive SVG icon family for Coder, Dispatch, phone, desktop, and notifications.';
+  const handoffs = [];
+  const iconTaskIntent = semanticClassification({
+    intent: 'new_task',
+    requiresExecution: true,
+    target: 'current_conversation',
+    resolvedRequest: rawRequest,
+    contextDependent: false,
+    confidence: 1,
+    needsClarification: false,
+    reasoningPolicyHint: { complexity: 'medium', risk: 'low', contextNeed: 'none' },
+    executionScope: 'mutating',
+    inspectionTarget: 'none',
+    inspectionBreadth: 'none',
+    standaloneSystemOperation: false,
+    taskResolution: { title: 'Design Orion icon family', requirements: [], constraints: [], unresolvedDecisions: [] }
+  });
+  installHarness([
+    [{
+      functionCall: {
+        name: 'handoff_to_coder',
+        args: {
+          prompt: rawRequest,
+          title: 'Design Orion icon family',
+          standalone: false
+        }
+      }
+    }],
+    [{ text: 'Coder has the standalone icon-design task.' }]
+  ], {
+    workspace: projectsRoot,
+    semanticClassification: iconTaskIntent,
+    api: {
+      listFiles: async pathValue => String(pathValue || '').endsWith('\\SVG')
+        ? { error: 'Directory does not exist' }
+        : []
+    },
+    window: {
+      promoteWorkspaceToCoder: async payload => {
+        handoffs.push(payload);
+        return {
+          success: true,
+          conversationId: 'coder-standalone-icons',
+          taskId: 'task-standalone-icons',
+          title: payload.title,
+          workspacePath: 'C:\\Users\\Owner\\Desktop\\Projects\\OrionAI\\standalone-workspaces\\design-orion-icons-1234',
+          status: 'pending'
+        };
+      }
+    }
+  });
+  const conv = conversation('projects-root-icon-design', {
+    workspace: projectsRoot,
+    dispatchProjectPath: ''
+  });
+  try {
+    await global.window.runAgentLoop(rawRequest, 'gemini-1', conv, {
+      semanticIntent: iconTaskIntent
+    });
+    t.equal(handoffs.length, 1, 'the self-contained request creates exactly one Coder handoff');
+    t.equal(handoffs[0].standalone, true, 'the generic Projects root is replaced by standalone task scope');
+    t.equal(handoffs[0].standaloneSystemOperation, false, 'creative artifact work is isolated rather than rooted at the user home');
+    t.equal(handoffs[0].path, '', 'the renderer is allowed to allocate the isolated workspace');
+    t.equal(handoffs[0].originalUserMessage, rawRequest, 'raw provenance survives the standalone handoff');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
 test('Projects-root project work cannot misuse standalone Coder routing', async t => {
   const originalFetch = global.fetch;
   const projectsRoot = 'C:\\Users\\Owner\\Desktop\\Projects';
