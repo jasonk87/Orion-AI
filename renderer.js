@@ -1171,10 +1171,20 @@ function updateOrionGreeting() {
   nameEl.textContent = `${tod}, Jason.`;
 }
 
+// Phase 2 of the Operator architecture plan: display name per specialist role, keyed by the same
+// target.mode value task-orchestration.js already stores on every task. 'coder' is the only real
+// specialist today; describeSupervisedTaskPresentation's roleLabel option defaults to 'Coder' on
+// its own, so an unregistered/missing role still renders exactly as before this registry existed.
+const AGENT_ROLE_DISPLAY_NAMES = {
+  coder: 'Coder'
+};
+
 function supervisedTaskContext(task, isGlobalRunning = false, globalRunningId = '') {
   const taskId = String(task && task.taskId || '');
   const originConversationId = String(task && task.origin && task.origin.conversationId || '');
   const targetConversationId = String(task && task.target && task.target.conversationId || '');
+  const targetRole = String(task && task.target && task.target.mode || '').toLowerCase();
+  const roleLabel = AGENT_ROLE_DISPLAY_NAMES[targetRole] || undefined;
   const originConversation = conversations.find(conversation => conversation.id === originConversationId);
   const targetConversation = conversations.find(conversation => conversation.id === targetConversationId);
   const activeRunTaskId = window.getActiveRunTaskId ? String(window.getActiveRunTaskId() || '') : '';
@@ -1206,6 +1216,7 @@ function supervisedTaskContext(task, isGlobalRunning = false, globalRunningId = 
     targetConversation,
     originConversationId,
     targetConversationId,
+    roleLabel,
     awaitingReview,
     revisingPlan,
     planApproved: !!(targetConversation && targetConversation.planApproved),
