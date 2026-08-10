@@ -11440,6 +11440,34 @@ const DISPATCH_TOOL_ALLOWLIST = new Set([
   'schedule_followup', 'watch_condition'
 ]);
 
+// Phase 3 piece 4 of the Operator architecture plan. Operator does desktop/browser execution, not
+// source-code work, so it does not get read_file/patch_file/find_references or any operational-
+// context mission/subplan tool (those aren't in this list at all, so they're excluded by omission
+// the same way Dispatch's allowlist above excludes them). It does get:
+// - computer_action, gated by its own capture-then-inspect-then-invalidate contract in executeTool.
+// - the full browser-worker set (DOM-addressed, preferred over computer_action per OPERATOR_INSTRUCTION).
+// - process management, for launching/monitoring/killing whatever it needs to interact with.
+// - the screenshot/inspection tools that back OPERATOR_INSTRUCTION's evidence-before-completion rule.
+// - the full memory/scheduling set, matching Coder's own memory tools since Operator does real
+//   workspace-bound work and needs the same durable-context tools Coder has.
+// - set_task_checklist, its own progress-reporting tool (Coder's step_complete is excluded on
+//   purpose: it auto-runs the configured test command, which is meaningless without source to test).
+// get_workspace_info/change_workspace are also included even though Jason's brief didn't name a
+// "workspace" category explicitly: without them Operator has no way to learn or set the workspace
+// it is bound to, which both piece 2's change_workspace fix and OPERATOR_INSTRUCTION's identity
+// assume it can do. Flagged here as a judgment call rather than a silent addition.
+const OPERATOR_TOOL_ALLOWLIST = new Set([
+  'computer_action',
+  'open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back', 'download_from_page', 'wait_for_page', 'take_screenshot',
+  'run_command', 'start_command', 'get_command_status', 'read_command_output', 'kill_command', 'terminal_exec',
+  'capture_screen', 'inspect_screenshot', 'compare_screenshot_to_goal', 'inspect_screenshot_with_model', 'attach_image',
+  'schedule_followup', 'watch_condition',
+  'recall_memory', 'remember_fact', 'remember_decision', 'remember_preference',
+  'read_notes', 'update_notes', 'read_project_memory', 'append_project_memory', 'remember_file_notes', 'save_session_summary',
+  'get_workspace_info', 'change_workspace',
+  'set_task_checklist'
+]);
+
 // Single source of truth for the agent's tool declarations, consumed by every provider
 // (Gemini, Ollama, and Anthropic). Previously this ~480-line array was duplicated verbatim
 // inside callGeminiAPI and callOllamaAPI, which silently drifted out of sync. Reads the
@@ -12337,6 +12365,9 @@ function buildAgentToolDeclarations() {
     : gateFilteredTools;
   if (activeConversationMode === 'orion') {
     return gatedTools.filter(tool => DISPATCH_TOOL_ALLOWLIST.has(tool.name));
+  }
+  if (activeConversationMode === 'operator') {
+    return gatedTools.filter(tool => OPERATOR_TOOL_ALLOWLIST.has(tool.name));
   }
   return gatedTools;
 }

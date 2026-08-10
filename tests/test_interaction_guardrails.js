@@ -1156,6 +1156,56 @@ test('token-saving prompt cleanup keeps tool schemas authoritative', (t) => {
   t.end();
 });
 
+// Phase 3 piece 4 of the Operator architecture plan: before this piece landed, activeConversationMode
+// could already become 'operator' (piece 2b), but buildAgentToolDeclarations had no 'operator' branch,
+// so it fell through to the bare `return gatedTools;` — the exact same FULL Coder tool surface,
+// including patch_file and every operational-context mission tool. This test would have failed
+// against that pre-piece-4 code (patch_file would have been present) and pins the fix.
+test('Operator receives a narrower, desktop/browser-execution tool surface, not Coder\'s full surface', (t) => {
+  const namesForMode = (mode) => {
+    agent.__setActiveConversationModeForTest(mode);
+    const names = agent.buildAgentToolDeclarations().map(tool => tool.name);
+    agent.__setActiveConversationModeForTest('orion');
+    return names;
+  };
+  const coderTools = namesForMode('coder');
+  const operatorTools = namesForMode('operator');
+
+  t.ok(operatorTools.length > 0 && operatorTools.length < coderTools.length,
+    'Operator receives a strictly narrower tool surface than Coder');
+  t.ok(operatorTools.every(name => coderTools.includes(name)),
+    'Operator is offered only tools that exist in the full surface');
+
+  // Not code/mission/skill tools, per the brief.
+  t.notOk(operatorTools.includes('patch_file'), 'Operator cannot edit source files');
+  t.notOk(operatorTools.includes('write_file'), 'Operator cannot write source files');
+  t.notOk(operatorTools.includes('read_file'), 'Operator is not offered code-reading tools');
+  t.notOk(operatorTools.includes('find_references'), 'Operator is not offered code-navigation tools');
+  t.notOk(operatorTools.includes('run_tests'), 'Operator has no test runner - there is no code to test');
+  t.notOk(operatorTools.includes('update_mission_context'), 'Operator is not offered mission tracking');
+  t.notOk(operatorTools.includes('start_subplan'), 'Operator is not offered subplan tracking');
+  t.notOk(operatorTools.includes('discover_skills'), 'Operator is not offered the skill registry');
+  t.notOk(operatorTools.includes('create_skill'), 'Operator cannot author skills');
+  t.notOk(operatorTools.includes('step_complete'), 'Operator does not get Coder\'s test-coupled step-completion tool');
+
+  // The categories the brief did name.
+  t.ok(operatorTools.includes('computer_action'), 'Operator has native desktop control');
+  for (const browserTool of ['open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back', 'download_from_page', 'wait_for_page', 'take_screenshot']) {
+    t.ok(operatorTools.includes(browserTool), `Operator has the full browser-worker tool: ${browserTool}`);
+  }
+  for (const processTool of ['run_command', 'start_command', 'get_command_status', 'read_command_output', 'kill_command', 'terminal_exec']) {
+    t.ok(operatorTools.includes(processTool), `Operator has the process-management tool: ${processTool}`);
+  }
+  for (const inspectionTool of ['capture_screen', 'inspect_screenshot', 'compare_screenshot_to_goal', 'inspect_screenshot_with_model', 'attach_image']) {
+    t.ok(operatorTools.includes(inspectionTool), `Operator has the screenshot/inspection tool: ${inspectionTool}`);
+  }
+  for (const memoryTool of ['schedule_followup', 'watch_condition', 'recall_memory', 'remember_fact', 'remember_decision', 'remember_preference']) {
+    t.ok(operatorTools.includes(memoryTool), `Operator has the memory/scheduling tool: ${memoryTool}`);
+  }
+  t.ok(operatorTools.includes('set_task_checklist'), 'Operator has its own task-status tool');
+  t.end();
+});
+
 test('Dispatch can see and actually invoke the durable scheduling tools its own prompt tells it to use', async (t) => {
   // Declaration: Dispatch's own system prompt says "if you promise to check later, you MUST use
   // schedule_followup; schedules are durable." That instruction was a lie until these two tools
