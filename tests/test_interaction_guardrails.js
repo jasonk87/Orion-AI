@@ -2,10 +2,15 @@ const test = require('tape');
 const fs = require('fs');
 const path = require('path');
 
-const rendererJs = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8');
-const agentJs = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
-const preloadJs = fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8');
-const semanticSearchJs = fs.readFileSync(path.join(__dirname, '../lib/semantic-search.js'), 'utf8');
+// Normalized to LF like every other test file that grep-matches these sources (see
+// test_ui_polish.js, test_renderer_behavior.js, test_phone_companion.js): this checkout has
+// agent.js checked out with CRLF line endings, and a handful of assertions below match
+// multi-line literals containing a bare '\n'. Without normalizing, those never match on Windows
+// even though the source they're checking is unchanged.
+const rendererJs = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8').replace(/\r\n/g, '\n');
+const agentJs = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8').replace(/\r\n/g, '\n');
+const preloadJs = fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8').replace(/\r\n/g, '\n');
+const semanticSearchJs = fs.readFileSync(path.join(__dirname, '../lib/semantic-search.js'), 'utf8').replace(/\r\n/g, '\n');
 const SemanticIntentRouter = require('../semantic-intent-router.js');
 global.window = {};
 global.fetch = async () => ({ ok: false });
