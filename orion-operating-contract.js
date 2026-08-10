@@ -42,7 +42,25 @@
 - For SQLite: provide "dbPath" as an absolute path to the .sqlite, .db, or .sqlite3 file.
 - For Postgres/MySQL: provide "connectionString" (e.g. "postgresql://user:pass@host:5432/dbname") and optionally set "dbType" to "postgres" or "mysql".`;
 
-  const api = { VERIFICATION_DISCIPLINE, TOOL_SCHEMA_NOTE, DB_QUERY_CORE };
+  // Phase 3 of the Operator architecture plan. Coder has always had both browser-worker tools
+  // (open_url/click_element/fill_input/navigate_back — DOM-addressed) and native computer_action
+  // (pixel-coordinate-addressed) available to it; Operator now does too. This rule used to live
+  // only as a single clause buried in Coder's "14A. COMPUTER USE" rule ("do not use GUI automation
+  // to bypass Orion's dedicated browser... tools"). Promoted here — with the reasoning made
+  // explicit — because it is not actually Coder-specific: it applies wherever both a DOM tool and
+  // computer_action are available, which after Phase 3 is true for both specialists.
+  const DOM_BEFORE_PIXEL_CONTROL = `Prefer DOM-precise interaction over native pixel-based computer_action whenever the target is a web page. Browser-worker tools (open_url, click_element, fill_input, navigate_back, wait_for_page) address elements by CSS selector or visible text and do not require a vision-model inspection round-trip to use safely. Native computer_action addresses the screen by pixel coordinates, which is comparatively brittle and requires a fresh screenshot inspection before every action. Fall back to computer_action only when the target genuinely is not reachable through the browser worker — a native application, an OS-level dialog, a canvas-rendered surface, or similar — not merely because acting on it directly seems faster.`;
+
+  // Phase 3 of the Operator architecture plan. Originally SYSTEM_INSTRUCTION's "7A. ADAPT INSTEAD
+  // OF QUITTING," Coder-only. Promoted verbatim in substance (generalized "an edit" to "an action"
+  // so the same rule reads correctly for Operator's clicks/navigations, not just Coder's file
+  // edits) rather than hand-copied into OPERATOR_INSTRUCTION with different wording, which is
+  // exactly the drift this file exists to prevent. Not added to DISPATCHER_INSTRUCTION — Dispatch
+  // cannot take the kind of multi-step corrective action this rule describes, so giving it this
+  // instruction would be a behavior claim it can't back up, not a preserved behavior.
+  const ADAPT_INSTEAD_OF_QUITTING = `Do not abandon a task after ordinary errors. If an action, command, test, or route check fails, inspect fresh state, group repeated failures, look up official/current docs when needed, and try a different strategy. A failed attempt is evidence about that specific approach, not proof the objective is impossible. Stop only for hard blockers such as missing credentials, unavailable model access, explicit user stop, or a hard-destructive command block; when stopping, preserve state and explain the exact next recovery step.`;
+
+  const api = { VERIFICATION_DISCIPLINE, TOOL_SCHEMA_NOTE, DB_QUERY_CORE, DOM_BEFORE_PIXEL_CONTROL, ADAPT_INSTEAD_OF_QUITTING };
 
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   if (globalScope) globalScope.OrionOperatingContract = api;

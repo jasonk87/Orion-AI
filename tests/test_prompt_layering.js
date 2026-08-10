@@ -192,3 +192,48 @@ test('Dispatch is instructed to use schedule_followup and watch_condition, not j
   t.ok(coder.includes('FOLLOW-UP TIMERS'), 'Coder keeps its own, separate follow-up rule');
   t.end();
 });
+
+test('Phase 3: DOM_BEFORE_PIXEL_CONTROL and ADAPT_INSTEAD_OF_QUITTING are exported as non-empty strings', (t) => {
+  t.equal(typeof contract.DOM_BEFORE_PIXEL_CONTROL, 'string');
+  t.ok(contract.DOM_BEFORE_PIXEL_CONTROL.length > 0, 'DOM-before-pixel fragment is not empty');
+  t.equal(typeof contract.ADAPT_INSTEAD_OF_QUITTING, 'string');
+  t.ok(contract.ADAPT_INSTEAD_OF_QUITTING.length > 0, 'adapt-instead-of-quitting fragment is not empty');
+  t.end();
+});
+
+test('Phase 3: ADAPT INSTEAD OF QUITTING is now sourced from the shared fragment, still Coder-only', (t) => {
+  // Promoted from Coder's old inline "7A." text ahead of Operator's prompt existing, so the rule
+  // is written once instead of being hand-copied into OPERATOR_INSTRUCTION with different wording
+  // — the exact drift Phase 1 was built to prevent, this time caught before it could happen.
+  const coder = coderPrompt();
+  t.ok(coder.includes(contract.ADAPT_INSTEAD_OF_QUITTING), 'Coder prompt contains the exact shared fragment');
+  t.equal(countOccurrences(coder, contract.ADAPT_INSTEAD_OF_QUITTING), 1,
+    'the fragment appears exactly once (no accidental double-inclusion)');
+  t.ok(coder.includes('7A. ADAPT INSTEAD OF QUITTING:'), 'Coder keeps its own numbered-rule header');
+
+  // Not promoted into Dispatch: Dispatch cannot take the corrective multi-step action this rule
+  // describes, so adding it would be a new behavior claim, not a preserved one.
+  const dispatch = dispatchPrompt();
+  t.notOk(dispatch.includes(contract.ADAPT_INSTEAD_OF_QUITTING),
+    'the fragment was not added to Dispatch, which has no matching capability');
+  t.end();
+});
+
+test('Phase 3: DOM-before-pixel-control is shared inside Coder\'s computer-use rule', (t) => {
+  // This rule used to be a single buried clause in "14A. COMPUTER USE" ("do not use GUI automation
+  // to bypass Orion's dedicated browser... tools"). Promoted to the shared contract because it
+  // applies wherever a DOM tool and computer_action are both available — true for Coder today and
+  // for Operator once Operator's prompt exists (see the later Phase 3 assertions below).
+  const coder = coderPrompt();
+  t.ok(coder.includes(contract.DOM_BEFORE_PIXEL_CONTROL), 'Coder prompt contains the exact shared fragment');
+  t.equal(countOccurrences(coder, contract.DOM_BEFORE_PIXEL_CONTROL), 1,
+    'the fragment appears exactly once (no accidental double-inclusion)');
+  t.ok(coder.includes('14A. COMPUTER USE:'), 'Coder keeps its own numbered-rule header');
+  t.ok(coder.includes('Never type secrets or interact with UAC/security/credential dialogs'),
+    "Coder's own computer-use safety clause survives, reworded around the new shared opening sentence");
+
+  const dispatch = dispatchPrompt();
+  t.notOk(dispatch.includes(contract.DOM_BEFORE_PIXEL_CONTROL),
+    'the fragment was not added to Dispatch, which has no computer_action to prefer DOM tools over');
+  t.end();
+});

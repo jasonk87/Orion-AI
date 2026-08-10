@@ -11,6 +11,7 @@ const rendererJs = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8
 const agentJs = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8').replace(/\r\n/g, '\n');
 const preloadJs = fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8').replace(/\r\n/g, '\n');
 const semanticSearchJs = fs.readFileSync(path.join(__dirname, '../lib/semantic-search.js'), 'utf8').replace(/\r\n/g, '\n');
+const orionOperatingContractJs = fs.readFileSync(path.join(__dirname, '../orion-operating-contract.js'), 'utf8').replace(/\r\n/g, '\n');
 const SemanticIntentRouter = require('../semantic-intent-router.js');
 global.window = {};
 global.fetch = async () => ({ ok: false });
@@ -199,7 +200,12 @@ test('repeated failure guard warns on second failure and pauses on third', (t) =
 });
 
 test('tool contract separates failed tools from task truth', (t) => {
-  t.ok(agentJs.includes('A failed tool path is evidence about that tool attempt, not proof'), 'system prompt separates tool failure from task truth');
+  // Phase 3 of the Operator architecture plan promoted this rule (Coder's old "7A." text) into
+  // orion-operating-contract.js's ADAPT_INSTEAD_OF_QUITTING fragment, which agent.js now
+  // interpolates rather than containing verbatim — see test_prompt_layering.js for the assembled-
+  // prompt-level guard. This checks the fragment's actual source instead of the (now-templated)
+  // spot in agent.js.
+  t.ok(orionOperatingContractJs.includes('A failed attempt is evidence about that specific approach, not proof'), 'system prompt separates tool failure from task truth');
   t.ok(agentJs.includes("Do not use web search to answer facts about the user's local machine"), 'system prompt blocks local-machine web fallback');
   t.ok(agentJs.includes('For local machine facts, a non-zero exit proves only that this command attempt failed'), 'run_command schema warns against overclaiming failed commands');
   t.ok(agentJs.includes('Do not use for facts about this local machine'), 'google_search schema blocks local-state usage');
