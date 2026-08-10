@@ -1,11 +1,22 @@
 name: Test
 
 on:
+  # Runs for a PR into any base branch, including main — this part already covers "does this
+  # change break anything before it merges" regardless of branch naming.
   pull_request:
+  # Runs for direct pushes. This repo cycles through many short-lived, differently-named working
+  # branches (codex/*, fix/*, feature/*, jules-*, numeric-suffixed branches, etc.) — a hardcoded
+  # branch list here WILL go stale again, exactly like it just did (the previous two entries,
+  # codex/conversation-scoped-artifacts and feature/structural-optimizations, no longer exist as
+  # branches at all). Keep `main` and the actual current working branch listed below, but don't
+  # treat this list as durable: the real fix for "CI doesn't cover current work" is a branch
+  # protection rule on `main` requiring the `test` and `smoke` checks to pass before merging —
+  # that makes coverage independent of what any branch happens to be named. Branch protection is
+  # a GitHub repo-settings change, not something expressible in this file.
   push:
     branches:
-      - codex/conversation-scoped-artifacts
-      - feature/structural-optimizations
+      - main
+      - reliability-hardening-2026-08-03
 
 permissions:
   contents: read
