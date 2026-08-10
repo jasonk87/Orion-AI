@@ -7071,13 +7071,28 @@ async function executeTool(name, args, workspace, config, conversation, executio
         conversationId: conversation.id
       });
       if (!result.success) throw new Error(result.error || 'Screen capture failed');
+      // State-freshness optimization (item 6): the main process cheaply compared this capture's
+      // pixels against the last screenshot the model actually inspected (see
+      // compareToLastInspectedScreenshot in lib/ipc-shell.js). If it is confident nothing
+      // meaningful changed, the prior inspection can cover this capture too, so mark it inspected
+      // now instead of forcing another full model-vision call. Any uncertainty - no prior
+      // inspection, a real difference, a dimension change - falls through to inspectedAt: 0,
+      // which keeps the existing hard requirement: computer_action still refuses to act without a
+      // real inspection of a fresh-enough capture.
+      const freshness = result.freshnessCheck || null;
+      const reuseInspection = !!(freshness && freshness.available && freshness.unchanged);
+      const now = Date.now();
       executionContext.lastDesktopSnapshot = {
         path: result.path,
         width: Number(result.width) || 0,
         height: Number(result.height) || 0,
-        capturedAt: Date.now(),
-        inspectedAt: 0
+        capturedAt: now,
+        inspectedAt: reuseInspection ? now : 0
       };
+      if (reuseInspection) {
+        result.inspectionSkipped = true;
+        result.inspectionSkippedReason = 'Screen looks unchanged since the last inspection (cheap pixel comparison) — reusing that inspection instead of calling inspect_screenshot_with_model again.';
+      }
       return result;
     }
 
@@ -7167,6 +7182,17 @@ async function executeTool(name, args, workspace, config, conversation, executio
       if (executionContext.lastDesktopSnapshot
           && String(executionContext.lastDesktopSnapshot.path || '') === String(args.path)) {
         executionContext.lastDesktopSnapshot.inspectedAt = Date.now();
+      }
+      // Record this as the new baseline for the cheap freshness check (item 6), so the next
+      // capture_screen can potentially skip a redundant model-vision call if nothing changes.
+      // Best-effort: if recording fails, the only consequence is the next capture won't have a
+      // baseline to compare against, which correctly falls back to requiring a full inspection.
+      if (window.api && typeof window.api.recordInspectedScreenshot === 'function') {
+        try {
+          await window.api.recordInspectedScreenshot(workspace, args.path, conversation && conversation.id ? conversation.id : '');
+        } catch (error) {
+          console.error('Failed to record inspected-screenshot baseline:', error);
+        }
       }
       return inspection;
     }
