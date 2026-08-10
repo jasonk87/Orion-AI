@@ -479,6 +479,10 @@
       sessionId: input.targetSessionId,
       messageId: ''
     });
+    // target.mode is this task's specialist-role field (Phase 2 of the Operator architecture
+    // plan reuses it rather than adding a parallel "role" field): 'coder' today, and the value a
+    // future specialist would be dispatched with. Defaults to 'coder' because Coder is currently
+    // the only real specialist a task can target.
     target.mode = compactInline((input.target && input.target.mode) || input.targetMode || 'coder') || 'coder';
     const requirements = uniqueStrings([
       ...(input.requirements || input.knownRequirements || []),
@@ -565,6 +569,7 @@
       sessionId: record.targetSessionId,
       messageId: ''
     });
+    // See the matching comment in buildTaskPacket() above: target.mode is the specialist-role field.
     target.mode = compactInline((record.target && record.target.mode) || record.targetMode || 'coder') || 'coder';
     const createdAt = resolveNow(record.createdAt || record.timestamp || now);
     const updatedAt = resolveNow(record.updatedAt || createdAt);
@@ -796,14 +801,18 @@
     return !conversationId && !!sessionId && !!task.origin.sessionId && sessionId === task.origin.sessionId;
   }
 
-  function selectOwnedContinuationTask(tasksValue, requesterConversationIdValue, preferredTaskIdsValue = []) {
+  // Phase 2 of the Operator architecture plan: which specialist a continuation task must target is
+  // now a parameter (defaulting to 'coder', the only real specialist today) instead of a hardcoded
+  // literal, so this function keeps working unmodified once a second role exists to resume.
+  function selectOwnedContinuationTask(tasksValue, requesterConversationIdValue, preferredTaskIdsValue = [], options = {}) {
     const requesterConversationId = compactInline(requesterConversationIdValue);
     const preferredTaskIds = uniqueStrings(preferredTaskIdsValue).map(compactInline).filter(Boolean);
+    const role = compactInline(options.role).toLowerCase() || 'coder';
     const tasks = filterSupersededTasks(tasksValue)
       .filter(task =>
         task.taskId
         && [TASK_STATES.PENDING, TASK_STATES.ACTIVE].includes(task.status)
-        && compactInline(task.target && task.target.mode).toLowerCase() === 'coder'
+        && compactInline(task.target && task.target.mode).toLowerCase() === role
         && canRequesterControlTask(task, { conversationId: requesterConversationId }))
       .sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0));
     if (!tasks.length) return { action: 'none', task: null, candidates: [] };
@@ -1023,6 +1032,10 @@
     const subStatus = compactWhitespace(context.subStatus || taskValue.subStatus || '');
     const verifying = status === TASK_STATES.ACTIVE
       && (/verif|test/.test(executionMode) || /run_tests|test|verif/i.test(subStatus));
+    // Phase 2 of the Operator architecture plan: the specialist display name is a parameter
+    // (defaulting to 'Coder', the only real specialist today) instead of hardcoded into every
+    // branch below, so a second specialist's presentation reuses this same status machine.
+    const roleLabel = compactWhitespace(context.roleLabel || taskValue.roleLabel || '') || 'Coder';
 
     let phase = status;
     let label;
@@ -1032,58 +1045,58 @@
     if (awaitingReview && (status === TASK_STATES.PENDING || status === TASK_STATES.ACTIVE)) {
       phase = 'review';
       label = 'Review';
-      detail = detail || 'Coder’s implementation plan is ready for approval.';
+      detail = detail || `${roleLabel}’s implementation plan is ready for approval.`;
       agentState = 'Review';
       badgeClass = 'warning';
     } else if (revisingPlan && (status === TASK_STATES.PENDING || status === TASK_STATES.ACTIVE)) {
       phase = 'revising-plan';
-      label = 'Coder revising plan';
-      detail = detail || 'Coder is applying your feedback and preparing a revised implementation plan.';
-      agentState = 'Coder revising';
+      label = `${roleLabel} revising plan`;
+      detail = detail || `${roleLabel} is applying your feedback and preparing a revised implementation plan.`;
+      agentState = `${roleLabel} revising`;
       badgeClass = 'success';
     } else if (status === TASK_STATES.PENDING && resumePolicy === 'automatic') {
       phase = 'continuing';
-      label = 'Coder continuing';
-      detail = detail || 'Coder checkpointed its progress and is starting the next pass automatically.';
-      agentState = 'Coder continuing';
+      label = `${roleLabel} continuing`;
+      detail = detail || `${roleLabel} checkpointed its progress and is starting the next pass automatically.`;
+      agentState = `${roleLabel} continuing`;
       badgeClass = 'success';
     } else if (status === TASK_STATES.PENDING) {
       phase = 'queued';
-      label = 'Coder queued';
-      detail = detail || 'Waiting for Coder to claim this task.';
-      agentState = 'Coder queued';
+      label = `${roleLabel} queued`;
+      detail = detail || `Waiting for ${roleLabel} to claim this task.`;
+      agentState = `${roleLabel} queued`;
       badgeClass = 'warning';
     } else if (status === TASK_STATES.ACTIVE && verifying) {
       phase = 'verifying';
-      label = 'Coder verifying';
-      detail = detail || 'Coder is verifying the implementation.';
-      agentState = 'Coder verifying';
+      label = `${roleLabel} verifying`;
+      detail = detail || `${roleLabel} is verifying the implementation.`;
+      agentState = `${roleLabel} verifying`;
       badgeClass = 'success';
     } else if (status === TASK_STATES.ACTIVE && planApproved) {
       phase = 'implementing';
-      label = 'Coder implementing';
-      detail = detail || 'Coder is implementing the approved plan.';
-      agentState = 'Coder implementing';
+      label = `${roleLabel} implementing`;
+      detail = detail || `${roleLabel} is implementing the approved plan.`;
+      agentState = `${roleLabel} implementing`;
       badgeClass = 'success';
     } else if (status === TASK_STATES.ACTIVE) {
       phase = 'planning';
-      label = 'Coder planning';
-      detail = detail || 'Coder is inspecting the workspace and preparing the plan.';
-      agentState = 'Coder planning';
+      label = `${roleLabel} planning`;
+      detail = detail || `${roleLabel} is inspecting the workspace and preparing the plan.`;
+      agentState = `${roleLabel} planning`;
       badgeClass = 'success';
     } else if (status === TASK_STATES.COMPLETED) {
       label = 'Completed';
-      detail = detail || 'Coder recorded this task as completed.';
+      detail = detail || `${roleLabel} recorded this task as completed.`;
       agentState = 'Complete';
       badgeClass = 'success';
     } else if (status === TASK_STATES.CANCELLED) {
       label = 'Cancelled';
-      detail = detail || 'This Coder task was cancelled.';
+      detail = detail || `This ${roleLabel} task was cancelled.`;
       agentState = 'Cancelled';
       badgeClass = 'muted';
     } else {
       label = 'Failed';
-      detail = detail || 'Coder recorded this task as failed.';
+      detail = detail || `${roleLabel} recorded this task as failed.`;
       agentState = 'Failed';
       badgeClass = 'danger';
     }

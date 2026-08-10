@@ -659,6 +659,54 @@ test('Dispatch task presentation follows one durable task from queued through pl
   t.end();
 });
 
+test('Phase 2: task presentation and continuation selection are role-generic, not hardcoded to Coder', t => {
+  // These guard the Phase 2 generalization: selectOwnedContinuationTask and
+  // describeSupervisedTaskPresentation used to have 'coder' baked in as a literal. Both now take an
+  // optional role/roleLabel that defaults to 'coder'/'Coder' — the tests above already lock in that
+  // default (unchanged) behavior. These tests prove the parameter is real: supplying a different
+  // role/roleLabel actually changes the result, rather than the option being silently ignored.
+  const coderTask = normalizeTaskRecord(baseTask({
+    taskId: 'task_role_coder',
+    origin: { conversationId: 'dispatch-1', sessionId: 'dispatch-1', messageId: 'message-1' },
+    target: { conversationId: 'coder-1', sessionId: 'coder-1', mode: 'coder' }
+  }));
+  const operatorTask = normalizeTaskRecord(baseTask({
+    taskId: 'task_role_operator',
+    origin: { conversationId: 'dispatch-1', sessionId: 'dispatch-1', messageId: 'message-2' },
+    target: { conversationId: 'operator-1', sessionId: 'operator-1', mode: 'operator' }
+  }));
+
+  // selectOwnedContinuationTask: without a role option, only the coder-mode task is a candidate
+  // (unchanged default — this is exactly what every pre-Phase-2 caller still gets). With
+  // role: 'operator', only the operator-mode task is a candidate. Neither role leaks into the
+  // other's result, and both tasks being present and pending simultaneously proves the filter is
+  // doing real work, not just returning "the only task there is."
+  const defaultRole = selectOwnedContinuationTask([coderTask, operatorTask], 'dispatch-1', []);
+  t.equal(defaultRole.action, 'resume_pending', 'the one pending coder-mode task resumes by default');
+  t.equal(defaultRole.task.taskId, 'task_role_coder', 'default role selects only the coder task');
+
+  const explicitCoder = selectOwnedContinuationTask([coderTask, operatorTask], 'dispatch-1', [], { role: 'coder' });
+  t.equal(explicitCoder.task.taskId, 'task_role_coder', 'role: "coder" is equivalent to the default');
+
+  const operatorRole = selectOwnedContinuationTask([coderTask, operatorTask], 'dispatch-1', [], { role: 'operator' });
+  t.equal(operatorRole.action, 'resume_pending', 'the one pending operator-mode task resumes when asked for that role');
+  t.equal(operatorRole.task.taskId, 'task_role_operator', 'role: "operator" selects only the operator task, not the coder one');
+
+  const noSuchRole = selectOwnedContinuationTask([coderTask, operatorTask], 'dispatch-1', [], { role: 'reviewer' });
+  t.equal(noSuchRole.action, 'none', 'a role with no matching tasks finds nothing, rather than falling back to any role');
+
+  // describeSupervisedTaskPresentation: roleLabel defaults to 'Coder' (already covered by the
+  // exact-string assertions above), and an explicit roleLabel substitutes cleanly everywhere the
+  // literal 'Coder' used to be hardcoded, without corrupting the phase/badge machinery around it.
+  const operatorPresentation = describeSupervisedTaskPresentation(operatorTask, { roleLabel: 'Operator' });
+  t.equal(operatorPresentation.label, 'Operator queued', 'a supplied roleLabel replaces the hardcoded "Coder" in the label');
+  t.equal(operatorPresentation.agentState, 'Operator queued', 'and in the agent-state string');
+  t.equal(operatorPresentation.detail, 'Waiting for Operator to claim this task.', 'and in the detail sentence');
+  t.equal(operatorPresentation.phase, 'queued', 'the underlying phase/badge logic is unaffected by the role label');
+  t.equal(operatorPresentation.badgeClass, 'warning', 'and the badge class is unaffected too');
+  t.end();
+});
+
 test('live phone conversation state outranks a previous terminal Coder task', t => {
   for (const terminal of [
     { agentState: 'Complete', detail: 'Coder recorded this task as completed.', isOngoing: false },
