@@ -55,7 +55,12 @@
   }
 
   function classifyWorkspace(input = {}) {
-    const mode = input.mode === 'coder' ? 'coder' : 'orion';
+    // Operator (Phase 3 of the Operator architecture plan) does real workspace-bound artifact work
+    // like Coder, not Dispatch's search-root-aware resolution, so it takes the same 'coder' branch
+    // below. Normalized here rather than only at each call site so any caller that forwards
+    // conversation.mode straight through (e.g. recall_memory's `mode: conversation.mode`) is
+    // covered even without its own explicit coder-or-operator check.
+    const mode = (input.mode === 'coder' || input.mode === 'operator') ? 'coder' : 'orion';
     const searchRoot = cleanPath(input.searchRoot);
     const standaloneRoot = cleanPath(input.standaloneRoot);
     const declaredProjectPath = cleanPath(input.projectPath || input.dispatchProjectPath);

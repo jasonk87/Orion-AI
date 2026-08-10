@@ -1030,7 +1030,10 @@ test('Dispatch uses Projects fallback while Coder standalone conversations get i
   t.ok(rendererJs.includes("return mode === 'orion' || !c.projectPath;"), 'Dispatch list keeps Dispatch conversations even when they inspected a project workspace');
   t.ok(rendererJs.includes('c.projectPath && isGeneratedStandaloneWorkspace(c.workspace)'), 'migration clears accidental project linkage from generated standalone workspaces');
   t.ok(rendererJs.includes("conversationMode(c) === 'coder' && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)"), 'migration never promotes generated standalone workspaces or Dispatch conversations into projects');
-  t.ok(agentJs.includes("if (conversation.mode === 'coder')") && agentJs.includes('conversation.projectPath = targetPath'), 'change_workspace only promotes Coder conversations into project scope');
+  // Phase 3 of the Operator architecture plan: Operator does real workspace-bound artifact work
+  // like Coder, so change_workspace promotes both into project scope now, not Coder alone. Dispatch
+  // still takes the separate known-projects branch below, unaffected by this change.
+  t.ok(agentJs.includes("if (conversation.mode === 'coder' || conversation.mode === 'operator')") && agentJs.includes('conversation.projectPath = targetPath'), 'change_workspace promotes Coder and Operator conversations into project scope');
   t.ok(rendererJs.includes('function addProjectPath'), 'project registration is centralized instead of mixed into every workspace change');
   t.ok(rendererJs.includes('if (promoteProjectForWorkspace) addProjectPath(folderPath)'), 'Dispatch workspace changes do not add folders to the Coder project list unless explicitly promoted');
   t.ok(rendererJs.includes('window.promoteWorkspaceToCoder'), 'renderer exposes an explicit Dispatch-to-Coder promotion path');

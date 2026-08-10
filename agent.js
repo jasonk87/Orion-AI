@@ -1620,8 +1620,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     : '';
   // Session continuity: build prev-session context on first message, clear otherwise
   const isOrionMode = conversation.mode === 'orion' ||
-    (conversation.mode !== 'coder' && typeof appMode !== 'undefined' && appMode === 'orion');
-  activeConversationMode = isOrionMode ? 'orion' : 'coder';
+    (conversation.mode !== 'coder' && conversation.mode !== 'operator' && typeof appMode !== 'undefined' && appMode === 'orion');
+  // Phase 3 of the Operator architecture plan: activeConversationMode is a genuine three-value
+  // resolution now, not a binary collapse. Everything downstream that branches on isOrionMode
+  // (a strict boolean, unaffected by this change) continues to treat Coder and Operator alike by
+  // construction. Only sites that need to distinguish Coder from Operator specifically read
+  // activeConversationMode directly - see workspace binding (get_workspace_info, change_workspace)
+  // and the computer_action role gate.
+  activeConversationMode = isOrionMode ? 'orion' : (conversation.mode === 'operator' ? 'operator' : 'coder');
   // Captured once per run (rather than re-reading the shared activeConversationMode later, e.g. in
   // the finally block) so a concurrently-started run can't change which bucket this run's
   // preferences land in.
@@ -5590,7 +5596,9 @@ async function executeTool(name, args, workspace, config, conversation, executio
     case 'get_workspace_info': {
       const entryResult = await window.api.getWorkspaceEntrypoint(workspace);
       const resolution = WorkspaceResolution ? WorkspaceResolution.classifyWorkspace({
-        mode: conversation.mode === 'coder' ? 'coder' : 'orion',
+        // Operator does real workspace-bound artifact work like Coder, not search-root-aware
+        // Dispatch resolution, so it takes the 'coder' branch here too.
+        mode: (conversation.mode === 'coder' || conversation.mode === 'operator') ? 'coder' : 'orion',
         workspacePath: workspace,
         projectPath: conversation.projectPath,
         dispatchProjectPath: conversation.dispatchProjectPath,
@@ -6029,7 +6037,10 @@ async function executeTool(name, args, workspace, config, conversation, executio
       }
       const targetPath = resolution.path;
       conversation.workspace = targetPath;
-      if (conversation.mode === 'coder') {
+      // Operator binds a concrete project path exactly like Coder (previously this was an
+      // if/else-if with no catch-all: an operator-mode conversation matched neither branch and
+      // silently kept both projectPath and dispatchProjectPath unset).
+      if (conversation.mode === 'coder' || conversation.mode === 'operator') {
         conversation.projectPath = targetPath;
       } else if (conversation.mode === 'orion' && window.getKnownProjects) {
         const normalizedTarget = String(targetPath).replace(/[\\/]+/g, '\\').replace(/\\+$/, '').toLowerCase();
@@ -6041,7 +6052,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
       if (typeof window.changeActiveWorkspace === 'function') {
         window.changeActiveWorkspace(targetPath, {
           conversationId: conversation.id,
-          promoteProject: conversation.mode === 'coder'
+          promoteProject: conversation.mode === 'coder' || conversation.mode === 'operator'
         });
       }
       return {
@@ -6745,8 +6756,8 @@ async function executeTool(name, args, workspace, config, conversation, executio
     }
 
     case 'computer_action': {
-      if (!conversation || conversation.mode !== 'coder') {
-        throw new Error('computer_action is Coder-only. Dispatch must hand executable desktop work to Coder.');
+      if (!conversation || (conversation.mode !== 'coder' && conversation.mode !== 'operator')) {
+        throw new Error('computer_action is Coder/Operator-only. Dispatch must hand executable desktop work to Coder or Operator.');
       }
       const snapshot = executionContext.lastDesktopSnapshot;
       if (!snapshot || !snapshot.width || !snapshot.height || Date.now() - snapshot.capturedAt > 120000) {
@@ -10683,7 +10694,12 @@ function resolveConversationWorkspace(conversation) {
   const conv = conversation && typeof conversation === 'object' ? conversation : {};
   const hasConversationShape = Object.keys(conv).length > 0;
   let mode = 'coder';
-  if (conv.mode === 'orion' || conv.mode === 'coder') {
+  if (conv.mode === 'orion' || conv.mode === 'coder' || conv.mode === 'operator') {
+    // Recognized explicitly rather than left to the projectPath/activeConversationMode fallback
+    // below, so an operator-tagged conversation resolves deterministically from its own mode field
+    // even before its projectPath happens to be set, and without depending on the shared
+    // module-level activeConversationMode possibly lagging behind (e.g. a stale value left over
+    // from the previous run in this process).
     mode = conv.mode;
   } else if (conv.projectPath) {
     mode = 'coder';
