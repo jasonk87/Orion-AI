@@ -1777,6 +1777,37 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         knownProjects: getKnownWorkspaceCandidates(conversation)
       }) : { kind: 'standalone_coder', path: resolveConversationWorkspace(conversation) });
   let workspacePath = workspaceResolution.path || resolveConversationWorkspace(conversation);
+  // Phase 3 (resource leases, item 11): Coder/Operator both do real workspace-bound work
+  // (writes, builds, background processes), and recon found nothing today registers who is
+  // currently working in a given workspace path. The global single-run lock (isAgentRunning)
+  // already prevents two conversations' tool calls from literally overlapping, so this is a
+  // best-effort ownership record, not the only thing preventing a collision — its real value is
+  // for the gap the global lock does NOT cover: a background process left running in this
+  // workspace by an earlier run (see start_command below) or a future relaxation of that lock.
+  // Deliberately acquired once per run rather than re-acquired on every tool call (too hot a
+  // path for a claim this coarse), and deliberately non-blocking: a conflict here is logged as a
+  // visible warning rather than aborting the run, since a workspace collision is recoverable
+  // (sequential writes) in a way a literal desktop/browser collision is not.
+  if ((activeConversationMode === 'coder' || activeConversationMode === 'operator') && workspacePath
+      && window.api && typeof window.api.acquireResourceLease === 'function') {
+    try {
+      const workspaceLease = await window.api.acquireResourceLease({
+        resourceType: 'workspace',
+        resourceKey: workspacePath,
+        conversationId: conversation.id,
+        taskId: runTaskId,
+        role: activeConversationMode
+      });
+      if (workspaceLease && workspaceLease.success === false && workspaceLease.conflict) {
+        currentAgentLogs.push({
+          type: 'thought',
+          content: `Heads up: another conversation (${workspaceLease.conflict.role || 'unknown role'}) is also recorded as working in this workspace. Proceeding, but be alert for concurrent changes.`
+        });
+      }
+    } catch (error) {
+      console.error('Workspace lease acquisition failed, proceeding without it:', error);
+    }
+  }
   const contextualTaskResolution = (isOrionMode && TaskOrchestration && TaskOrchestration.isContextDependentRequest(semanticIntent))
     ? TaskOrchestration.buildTaskPacket({
         originalUserMessage: userPrompt,
@@ -2683,6 +2714,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       filesCreatedThisRun,
       attachedResponseImages,
       lastDesktopSnapshot: null,
+      // Phase 3 (resource leases, item 11): carried into executeTool so the desktop/browser lease
+      // gate there can tag acquired leases with the durable task this run belongs to, letting
+      // restart reconciliation cross-reference them against reconcileInterrupted's output.
+      runTaskId,
       rememberCreatedFile: (key) => {
         if (!key) return;
         filesCreatedThisRun.add(key);
@@ -5231,6 +5266,24 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       agentExecutionMode = 'idle';
       agentSubStatus = '';
       stopRequestMode = 'none';
+      // Phase 3 (resource leases, item 11): desktop/browser/workspace leases acquired during this
+      // run are scoped to the run, not to the durable task, so they always release here regardless
+      // of why the run ended. Known limitation, not an oversight: a task that yields to 'pending'
+      // for an automatic continuation (see pendingTaskNeedsRuntimeQueue) briefly drops its
+      // workspace lease between the two runs rather than holding it across the gap. Process leases
+      // (start_command's background processes) are NOT released here - they track the actual OS
+      // process, which outlives this run on purpose; see the start_command/kill_command cases.
+      if (conversation && conversation.id && window.api && typeof window.api.releaseResourceLease === 'function') {
+        const releaseTargets = [
+          { resourceType: 'desktop', resourceKey: 'desktop' },
+          { resourceType: 'browser', resourceKey: 'browser-worker' }
+        ];
+        if (workspacePath) releaseTargets.push({ resourceType: 'workspace', resourceKey: workspacePath });
+        for (const target of releaseTargets) {
+          window.api.releaseResourceLease({ ...target, conversationId: conversation.id })
+            .catch(error => console.error('Resource lease release failed:', error));
+        }
+      }
     }
     if (startingRunTaskId === runTaskId) {
       isAgentStarting = false;
@@ -5653,9 +5706,55 @@ function appendBoundedCommandOutput(currentValue, chunkValue, maxChars = AGENT_C
   };
 }
 
+// Phase 3 (resource leases, item 11): a small set of tools act on resources shared across every
+// conversation in the app, not just this run's own conversation - the single native desktop
+// (mouse/keyboard) and the single shared browser-worker BrowserWindow (lib/ipc-shell.js). Neither
+// has any exclusivity of its own; see lib/resource-lease-store.js's header comment for the exact
+// collision this closes (two conversations, or a second run after this one's own run lock
+// releases, silently stomping each other's desktop/browser state). This gate runs once, before the
+// big tool-dispatch switch below, rather than being duplicated into each individual case.
+const DESKTOP_LEASE_TOOLS = new Set(['computer_action']);
+const BROWSER_LEASE_TOOLS = new Set([
+  'open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back',
+  'download_from_page', 'wait_for_page', 'take_screenshot'
+]);
+
+async function acquireToolResourceLease(name, conversation, executionContext) {
+  const resourceType = DESKTOP_LEASE_TOOLS.has(name) ? 'desktop' : (BROWSER_LEASE_TOOLS.has(name) ? 'browser' : '');
+  if (!resourceType || !conversation || !conversation.id) return { blocked: false };
+  if (!window.api || typeof window.api.acquireResourceLease !== 'function') return { blocked: false };
+  try {
+    const result = await window.api.acquireResourceLease({
+      resourceType,
+      resourceKey: resourceType,
+      conversationId: conversation.id,
+      taskId: (executionContext && executionContext.runTaskId) || '',
+      role: conversation.mode || ''
+    });
+    if (!result || result.success === false) {
+      const holderRole = result && result.conflict && result.conflict.role ? ` (${result.conflict.role})` : '';
+      const resourceLabel = resourceType === 'desktop' ? 'native desktop control' : 'the shared browser worker';
+      return {
+        blocked: true,
+        message: `Another conversation${holderRole} currently holds ${resourceLabel}. Wait for it to finish or ask the user before proceeding — acting now would collide with that conversation's in-progress work.`
+      };
+    }
+    return { blocked: false };
+  } catch (error) {
+    // A lease-service failure (e.g. a disk write error) must not itself block Coder/Operator from
+    // getting real work done — the lease is a collision guard, not a hard dependency every
+    // desktop/browser action needs in order to function at all. Fail open, log it, move on.
+    console.error('Resource lease acquisition failed, proceeding without it:', error);
+    return { blocked: false };
+  }
+}
+
 async function executeTool(name, args, workspace, config, conversation, executionContext = {}) {
   console.log(`Executing tool ${name} with args:`, args);
-  
+
+  const leaseGate = await acquireToolResourceLease(name, conversation, executionContext);
+  if (leaseGate.blocked) throw new Error(leaseGate.message);
+
   switch (name) {
     case 'get_workspace_info': {
       const entryResult = await window.api.getWorkspaceEntrypoint(workspace);
@@ -6668,6 +6767,35 @@ async function executeTool(name, args, workspace, config, conversation, executio
       const timeoutMs = args.timeoutMs || config.commandTimeoutMs || 120000;
       const result = await window.api.startCommand(args.command, workspace, processId, timeoutMs);
       if (!result.success) throw new Error(result.error || 'Failed to start command');
+      // Phase 3 (resource leases, item 11 / restart-recovery, item 12): start_command is the one
+      // process tool whose lifetime genuinely outlives this run - the child process keeps running
+      // as a background service (dev server, watcher, build daemon) after the tool call returns.
+      // Recording it here is what lets a restart tell "an orphaned process from a crashed run" from
+      // "nothing was running" (see lib/resource-lease-store.js reconcileInterrupted). Deliberately
+      // non-blocking on conflict, same reasoning as the workspace lease above: a second conversation
+      // starting a conflicting process in the same workspace is recoverable (the model can check
+      // get_command_status, or the OS will simply fail a duplicate port bind) in a way a desktop/
+      // browser collision is not, so this warns rather than throws.
+      if (workspace && window.api && typeof window.api.acquireResourceLease === 'function') {
+        try {
+          // The lease tracks the raw OS PID, not the app-level processId string — the string is
+          // meaningless after a restart (its session record is gone from memory), but the PID can
+          // still be checked directly for liveness. See lib/ipc-shell.js's isProcessAlive.
+          const processLease = await window.api.acquireResourceLease({
+            resourceType: 'process',
+            resourceKey: workspace,
+            conversationId: conversation.id,
+            taskId: (executionContext && executionContext.runTaskId) || '',
+            role: conversation.mode || '',
+            processIds: result.pid ? [String(result.pid)] : []
+          });
+          if (processLease && processLease.success === false && processLease.conflict) {
+            result.leaseWarning = `Another conversation (${processLease.conflict.role || 'unknown role'}) already has a background process recorded in this workspace. If this new command conflicts with it (e.g. the same port), that is likely why.`;
+          }
+        } catch (error) {
+          console.error('Process lease acquisition failed, proceeding without it:', error);
+        }
+      }
       return result;
     }
 
@@ -6691,6 +6819,16 @@ async function executeTool(name, args, workspace, config, conversation, executio
       // Remove from the active preview tracking list so auto-kill doesn't double-attempt it
       if (Array.isArray(conversation.activePreviewProcesses)) {
         conversation.activePreviewProcesses = conversation.activePreviewProcesses.filter(pid => pid !== args.processId);
+      }
+      // Phase 3 (resource leases): release this workspace's process lease. This is intentionally
+      // coarse (the lease tracks "something is running here," not each individual processId
+      // within it) - killing any one tracked process frees the whole workspace's process lease
+      // rather than requiring every background process to be individually accounted for. That is
+      // the safe direction to be imprecise in: it only makes the workspace available to another
+      // conversation sooner, never blocks one that should be allowed through.
+      if (workspace && window.api && typeof window.api.releaseResourceLease === 'function') {
+        window.api.releaseResourceLease({ resourceType: 'process', resourceKey: workspace, conversationId: conversation.id })
+          .catch(error => console.error('Process lease release failed:', error));
       }
       return killResult;
     }

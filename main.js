@@ -17,6 +17,7 @@ const ipcSkill = require('./lib/ipc-skill');
 const ipcMemory = require('./lib/ipc-memory');
 const ipcDatabase = require('./lib/ipc-database');
 const ipcOrchestration = require('./lib/ipc-orchestration');
+const ipcResourceLeases = require('./lib/ipc-resource-leases');
 const ipcSchedule = require('./lib/ipc-schedule');
 const conversationMemory = require('./lib/conversation-memory');
 const MAX_PERSISTED_TOOL_PAYLOAD_CHARS = 250000;
@@ -216,6 +217,9 @@ function registerAllHandlers() {
   ipcDatabase.registerHandlers(ipcMain);
   ipcOrchestration.registerHandlers(ipcMain, {
     filePath: () => path.join(app.getPath('userData'), 'orchestration-tasks.json')
+  });
+  ipcResourceLeases.registerHandlers(ipcMain, {
+    filePath: () => path.join(app.getPath('userData'), 'resource-leases.json')
   });
   // The schedule clock lives here, in main, so a renderer reload cannot erase pending
   // wake-ups the way the old in-renderer setTimeout did.

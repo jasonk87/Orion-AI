@@ -105,6 +105,13 @@ contextBridge.exposeInMainWorld('api', {
   cancelOrchestrationTask: (taskId, requester, reason) => ipcRenderer.invoke('orion:cancel-task', { taskId, requester, reason }),
   reconcileOrchestrationTasks: (payload) => ipcRenderer.invoke('orion:reconcile-tasks', payload || {}),
   migrateOrchestrationTasks: () => ipcRenderer.invoke('orion:migrate-tasks'),
+  acquireResourceLease: (payload) => ipcRenderer.invoke('orion:acquire-lease', payload || {}),
+  releaseResourceLease: (payload) => ipcRenderer.invoke('orion:release-lease', payload || {}),
+  releaseResourceLeasesForConversation: (conversationId) => ipcRenderer.invoke('orion:release-leases-for-conversation', conversationId),
+  heartbeatResourceLease: (payload) => ipcRenderer.invoke('orion:heartbeat-lease', payload || {}),
+  listResourceLeases: (filters) => ipcRenderer.invoke('orion:list-leases', filters || {}),
+  reconcileResourceLeases: (payload) => ipcRenderer.invoke('orion:reconcile-leases', payload || {}),
+  resolveResourceLeaseLiveness: (payload) => ipcRenderer.invoke('orion:resolve-lease-liveness', payload || {}),
   createSchedule: (input) => ipcRenderer.invoke('orion:create-schedule', input || {}),
   listSchedules: (filters) => ipcRenderer.invoke('orion:list-schedules', filters || {}),
   cancelSchedule: (scheduleId) => ipcRenderer.invoke('orion:cancel-schedule', { scheduleId }),
@@ -120,6 +127,7 @@ contextBridge.exposeInMainWorld('api', {
   getCommandStatus: (processId) => ipcRenderer.invoke('get-command-status', processId),
   readCommandOutput: (processId, maxChars) => ipcRenderer.invoke('read-command-output', { processId, maxChars }),
   killCommand: (processId) => ipcRenderer.invoke('kill-command', processId),
+  checkProcessAlive: (pid) => ipcRenderer.invoke('check-process-alive', pid),
   killCommandsForConversation: (conversationId) => ipcRenderer.invoke('kill-commands-for-conversation', conversationId),
   onCommandOutput: (processId, callback) => {
     const listener = (event, data) => callback(data);

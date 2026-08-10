@@ -3015,11 +3015,70 @@ function startOrQueueTaskContinuation(continuation, conv, options = {}) {
 }
 window.startOrQueueTaskContinuation = startOrQueueTaskContinuation;
 
+// Phase 3 (restart/recovery, item 12): populated by initializeOrchestrationTasks when a process
+// lease from an interrupted task is confirmed still alive after restart. Keyed by taskId, consumed
+// (and cleared) the first time notifySupervisorOfCoderCompletion/OfOperatorCompletion reports that
+// task, so the user is told the difference between "this task failed and left nothing behind" and
+// "this task failed, but the process it started may still be running."
+const interruptedTaskLivenessNotes = new Map();
+
+// Phase 3 (restart/recovery, item 12). The task store's own reconcileInterrupted already marks any
+// task that was ACTIVE when the app last stopped as FAILED unconditionally — safe, but dumb: it
+// cannot tell "this task's background process crashed with the app" from "this task's background
+// process is still out there running." This function is the smarter half. It takes the just-
+// reconciled tasks, asks the lease store which of them left a process lease behind (see
+// lib/resource-lease-store.js's reconcileInterrupted — desktop/browser/workspace leases are
+// released immediately there since none of those can survive a restart, but process leases are
+// flagged instead of resolved), actually checks whether each flagged PID is still alive via a raw
+// OS probe (lib/ipc-shell.js's isProcessAlive, which works even though the in-memory command-
+// session registry itself was wiped by the restart), and records a note for any task whose process
+// is confirmed still running so the eventual completion notification can say so instead of
+// silently treating the workspace as clean.
+async function reconcileResourceLeasesAfterRestart(taskReconciliation) {
+  if (!window.api || typeof window.api.reconcileResourceLeases !== 'function') return;
+  try {
+    const reconciledTasks = (taskReconciliation && Array.isArray(taskReconciliation.tasks)) ? taskReconciliation.tasks : [];
+    const interruptedTaskIds = reconciledTasks
+      .filter(task => task && task.failure && task.failure.code === 'interrupted')
+      .map(task => task.taskId)
+      .filter(Boolean);
+    const leaseReconciliation = await window.api.reconcileResourceLeases({ interruptedTaskIds });
+    const flagged = (leaseReconciliation && Array.isArray(leaseReconciliation.flaggedForLivenessCheck))
+      ? leaseReconciliation.flaggedForLivenessCheck
+      : [];
+    for (const lease of flagged) {
+      let stillAlive = false;
+      if (typeof window.api.checkProcessAlive === 'function') {
+        for (const pid of (lease.processIds || [])) {
+          try {
+            const checked = await window.api.checkProcessAlive(pid);
+            if (checked && checked.alive) { stillAlive = true; break; }
+          } catch (error) {
+            console.error('Could not check process liveness during restart recovery:', error);
+          }
+        }
+      }
+      if (typeof window.api.resolveResourceLeaseLiveness === 'function') {
+        await window.api.resolveResourceLeaseLiveness({ resourceKey: lease.resourceKey, stillAlive });
+      }
+      if (stillAlive && lease.taskId) {
+        interruptedTaskLivenessNotes.set(
+          lease.taskId,
+          'A background process this task started may still be running (confirmed alive after restart) — check before starting another one in the same workspace.'
+        );
+      }
+    }
+  } catch (error) {
+    console.error('Could not reconcile resource leases after restart:', error);
+  }
+}
+
 async function initializeOrchestrationTasks() {
   if (!window.api || typeof window.api.listOrchestrationTasks !== 'function') return;
   try {
     await window.api.migrateOrchestrationTasks?.();
-    await window.api.reconcileOrchestrationTasks?.({ reason: 'Orion restarted before the active task recorded a terminal result.' });
+    const taskReconciliation = await window.api.reconcileOrchestrationTasks?.({ reason: 'Orion restarted before the active task recorded a terminal result.' });
+    await reconcileResourceLeasesAfterRestart(taskReconciliation);
     const listed = await window.api.listOrchestrationTasks({ sort: 'desc' });
     const tasks = listed && Array.isArray(listed.tasks) ? listed.tasks : [];
     tasks.forEach(task => {
@@ -4412,8 +4471,16 @@ function scheduleTerminalDelegatedTaskReconciliation(conversation, durableTasks 
   if (String(task.target && task.target.conversationId || '') !== coderConversationId) return false;
   if (String(conversation._terminalTaskReconciliationScheduled || '') === taskId) return true;
   conversation._terminalTaskReconciliationScheduled = taskId;
+  // Route by the target conversation's own role rather than always assuming Coder - the same fix
+  // already applied to window.onOrchestrationTaskFinalized (Phase 3 piece 5) applies here too, for
+  // the separate startup-reconciliation path: a terminal Operator task discovered at startup
+  // (rather than during a live run) would otherwise still be reported as "Coder failed/completed."
+  const targetConv = conversations.find(c => c.id === coderConversationId);
+  const notifier = targetConv && conversationMode(targetConv) === 'operator'
+    ? notifySupervisorOfOperatorCompletion
+    : notifySupervisorOfCoderCompletion;
   Promise.resolve()
-    .then(() => notifySupervisorOfCoderCompletion(coderConversationId, taskId))
+    .then(() => notifier(coderConversationId, taskId))
     .catch(error => console.error('Could not reconcile terminal delegated task presentation:', error))
     .finally(() => {
       if (String(conversation._terminalTaskReconciliationScheduled || '') === taskId) {
@@ -9955,6 +10022,13 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
     const elapsed_str = elapsed ? ` (${elapsed}m)` : '';
     summaryText = `Coder finished **${taskTitle}**${elapsed_str}. ${doneTasks.length > 0 ? `${doneTasks.length} task${doneTasks.length > 1 ? 's' : ''} completed.` : ''} Ready for your next direction.`;
   }
+  // Phase 3 (restart/recovery, item 12): if this task was reconciled at startup and its background
+  // process was confirmed still alive, say so explicitly instead of letting a generic "failed"
+  // message imply the workspace is clean.
+  if (interruptedTaskLivenessNotes.has(taskId)) {
+    summaryText += `\n\n${interruptedTaskLivenessNotes.get(taskId)}`;
+    interruptedTaskLivenessNotes.delete(taskId);
+  }
 
   notifyOrionConversation(orionConv, summaryText, 'supervisor-completion', {
     orchestrationTaskId: taskId,
@@ -10218,6 +10292,11 @@ async function notifySupervisorOfOperatorCompletion(finishedOperatorConvId, expe
   } else {
     const elapsed_str = elapsed ? ` (${elapsed}m)` : '';
     summaryText = `Operator finished **${taskTitle}**${elapsed_str}. Ready for your next direction.`;
+  }
+  // Phase 3 (restart/recovery, item 12): see the matching comment in notifySupervisorOfCoderCompletion.
+  if (interruptedTaskLivenessNotes.has(taskId)) {
+    summaryText += `\n\n${interruptedTaskLivenessNotes.get(taskId)}`;
+    interruptedTaskLivenessNotes.delete(taskId);
   }
 
   notifyOrionConversation(orionConv, summaryText, 'supervisor-completion', {
