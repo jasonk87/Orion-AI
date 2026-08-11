@@ -349,6 +349,8 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
   t.notOk(root.text.includes('pair-code-123456'), 'clean phone shell does not embed the current setup code');
   t.ok(root.text.includes('<title>Orion</title>'), 'root shell serves the Orion mobile UI');
   t.notOk(root.text.includes('data-drawer-destination="history"'), 'root shell does not expose History as a top-level mode');
+  t.ok(root.text.includes('data-drawer-destination="operator"'), 'root shell exposes Operator in the app drawer');
+  t.ok(root.text.includes('id="mode-toggle-operator"'), 'root shell includes Operator in the specialist mode control');
   t.ok(root.text.includes('function enterDispatch'), 'root shell enters Dispatch through the chat-first route');
   t.ok(root.text.includes("companionFetch('/api/new-focus'"), 'phone New Focus asks the desktop to cancel pending owned work');
   t.ok(root.text.includes('permanentCredentialFailureCodes'), 'phone distinguishes durable auth revocation from transient transport failures');
@@ -632,8 +634,17 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
   }, session);
   t.equal(dispatchStart.statusCode, 200, 'first Dispatch message creates its conversation through one request');
 
+  const operatorStart = await request('POST', 1133, '/api/conversations/new', {
+    prompt: 'open the browser and inspect the page',
+    mode: 'operator'
+  }, session);
+  t.equal(operatorStart.statusCode, 200, 'new Operator task endpoint succeeds');
+
   const prompt = await request('POST', 1133, '/api/prompt', { prompt: 'hello', projectPath: 'C:\\Projects\\OrionTarget' }, session);
   t.equal(prompt.statusCode, 200, 'prompt submission succeeds');
+
+  const operatorPrompt = await request('POST', 1133, '/api/prompt', { prompt: 'inspect the desktop', mode: 'operator' }, session);
+  t.equal(operatorPrompt.statusCode, 200, 'Operator prompt submission succeeds');
 
   const steer = await request('POST', 1133, '/api/steer', { prompt: 'focus here' }, session);
   t.equal(steer.statusCode, 200, 'steering endpoint succeeds');
@@ -667,6 +678,14 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
   t.ok(!electron.calls.some(call => call.includes('switchPhoneCompanionConversation')), 'desktop bridge no longer switches global active conversation task');
   t.ok(electron.calls.some(call => call.includes('C:\\\\Projects\\\\OrionTarget')), 'new task endpoint forwards selected project path');
   t.ok(electron.calls.some(call => call.includes('C:\\\\Projects\\\\Chronicle') && call.includes('Last discussed expedition progression.')), 'Dispatch creation forwards project association and compact re-entry context');
+  t.ok(
+    electron.calls.some(call => call.includes('startPhoneCompanionTask') && call.includes('"mode":"operator"')),
+    'Operator creation preserves its role across the real phone-to-renderer bridge'
+  );
+  t.ok(
+    electron.calls.some(call => call.includes('submitPhoneCompanionPrompt') && call.includes('"mode":"operator"')),
+    'existing phone prompts preserve Operator mode across the server bridge'
+  );
   t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt') && call.includes('C:\\\\Projects\\\\OrionTarget')), 'prompt endpoint forwards selected project path');
   t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt')), 'desktop bridge submitted prompt');
   t.ok(electron.calls.some(call => call.includes('approvePhoneCompanionPlan')), 'desktop bridge approved plan');
@@ -1210,6 +1229,33 @@ test('new phone Coder conversations submit their initial prompt exactly once', t
   t.equal((flow.match(/companionFetch\('\/api\/prompt'/g) || []).length, 0,
     'new Coder flow does not post the same prompt again');
   t.ok(flow.includes('requestId:'), 'new chat supplies an idempotency key');
+  t.end();
+});
+
+test('phone Operator mode remains Operator across navigation, creation, and specialist controls', t => {
+  const html = companionHtml();
+  t.ok(html.includes('data-drawer-destination="operator"'), 'Operator is reachable from the phone drawer');
+  t.ok(html.includes('id="mode-toggle-operator"'), 'Operator has a phone mode control');
+  t.ok(
+    html.includes("return mode === 'coder' || mode === 'operator' ? mode : 'orion';"),
+    'phone navigation normalizes the complete three-role mode enum'
+  );
+  t.ok(
+    html.includes("companionMode = normalizeCompanionMode(target.mode || 'orion');"),
+    'opening an Operator conversation does not bounce it into Dispatch'
+  );
+  t.ok(
+    html.includes("const isSpecialist = mode === 'coder' || mode === 'operator';"),
+    'Operator receives the same task status and logs navigation as Coder'
+  );
+  t.ok(
+    rendererSource.includes("mode: requestedMode === 'operator' ? 'operator' : (normalizedProjectPath ? 'coder' : requestedMode)"),
+    'the renderer persists an explicitly requested Operator conversation as Operator'
+  );
+  t.ok(
+    rendererSource.includes("conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator'"),
+    'standalone Operator conversations receive a durable standalone workspace'
+  );
   t.end();
 });
 

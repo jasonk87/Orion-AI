@@ -48,7 +48,7 @@ test('phone companion finishes with the same dark theme and complete mission hie
   t.ok(companionHtml.includes('#task-list-card { grid-area: mission; }'), 'Task List has an explicit mobile layout area');
   t.ok(companionHtml.includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
   t.ok(companionHtml.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
-  t.ok(companionHtml.includes('optimistic-phone-send-v25'), 'phone shell exposes the current UI build version');
+  t.ok(companionHtml.includes('operator-phone-mode-v26'), 'phone shell exposes the current UI build version');
   t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v24"), 'phone service worker cache is bumped for the current UI build');
   t.ok(companionHtml.includes('window.isSecureContext'), 'phone explains when browser push is blocked by an insecure context');
   t.ok(companionHtml.includes('Phone push needs HTTPS or localhost'), 'phone tells the user that HTTPS is required for push notifications');
@@ -124,15 +124,17 @@ test('phone companion renders approvals and tool calls as first-class mobile UI'
   t.end();
 });
 
-test('phone companion uses a global drawer and Coder-only operations surfaces', (t) => {
+test('phone companion uses a global drawer and specialist operations surfaces', (t) => {
   t.ok(companionHtml.includes('id="app-drawer-overlay"'), 'phone has a global app drawer');
   t.ok(companionHtml.includes('data-drawer-destination="orion"'), 'drawer exposes Dispatch as a top-level destination');
   t.notOk(companionHtml.includes('data-drawer-destination="history"'), 'History is not a top-level destination');
   t.ok(companionHtml.includes('data-drawer-destination="coder"'), 'drawer exposes Coder as a top-level destination');
+  t.ok(companionHtml.includes('data-drawer-destination="operator"'), 'drawer exposes Operator as a top-level destination');
   t.ok(companionHtml.includes('data-drawer-destination="settings"'), 'drawer exposes Settings as an app-level destination');
   t.ok(companionHtml.includes('id="screen-settings"'), 'phone has a dedicated Settings screen');
   t.ok(companionHtml.includes('Check local Orion files'), 'update controls live in Settings copy');
-  t.ok(companionHtml.includes('bottomNav.classList.toggle(\'hidden\', !isCoder)'), 'Coder operations tabs are hidden outside Coder');
+  t.ok(companionHtml.includes("const isSpecialist = mode === 'coder' || mode === 'operator';"), 'Coder and Operator share specialist operations tabs');
+  t.ok(companionHtml.includes("bottomNav.classList.toggle('hidden', !isSpecialist)"), 'specialist operations tabs are hidden in Dispatch');
   t.ok(companionHtml.includes('id="task-list-card"'), 'Status shows the task-list card');
   t.ok(companionHtml.includes('function renderPhoneTaskList'), 'Status renders the actual conversation checklist');
   t.ok(companionHtml.includes('id="home-approvals-section"'), 'Coder home has a top-level approval section');
@@ -262,8 +264,8 @@ test('Dispatch opens as a focused front door without project-driven clutter', (t
   t.ok(renderer.includes("window.markConversationDirty(orionConv.id)"), 'delegated-work completion receipts persist with their Dispatch transcript');
   t.ok(companionHtml.includes("if (resetRequested) {\n      localStorage.removeItem(sessionKey);"), 'ordinary phone UI updates preserve the paired device session');
   t.ok(companionHtml.includes('coder-workspace-picker'), 'phone keeps the Coder workspace picker');
-  t.ok(companionHtml.includes("#screen-new-chat.dispatch-mode .coder-workspace-picker { display: none; }"), 'Dispatch hides the workspace picker on new chat');
-  t.ok(companionHtml.includes("newChatPromptEl.placeholder = isDispatchStart ? 'Ask Orion anything...' : 'What should we build?'"), 'new chat placeholder is mode-aware');
+  t.ok(companionHtml.includes('#screen-new-chat.dispatch-mode .coder-workspace-picker,') && companionHtml.includes('#screen-new-chat.operator-mode .coder-workspace-picker { display: none; }'), 'Dispatch and standalone Operator hide the Coder workspace picker on new chat');
+  t.ok(companionHtml.includes("newChatPromptEl.placeholder = isDispatchStart") && companionHtml.includes("isOperatorStart ? 'Ask Operator to open, click, type, or navigate...' : 'What should we build?'"), 'new chat placeholder is mode-aware across Dispatch, Coder, and Operator');
   t.end();
 });
 

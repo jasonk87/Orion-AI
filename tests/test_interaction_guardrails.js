@@ -108,7 +108,7 @@ test('accepted prompts cannot leave one-sided user-only transcripts', (t) => {
   t.ok(rendererJs.includes('window.persistAssistantStatusMessage = persistAssistantStatusMessage'), 'agent can persist assistant status through renderer');
   t.ok(agentJs.includes('agent-start-blocked'), 'runAgentLoop persists an assistant-side status when another task is already running');
   t.ok(rendererJs.includes('phone-queued-'), 'phone queued prompts persist an assistant-side queue status');
-  t.ok(rendererJs.includes('phone-start-error-'), 'phone run-start failures persist an assistant-side error status');
+  t.ok(rendererJs.includes('phone-run-error-'), 'phone-started run failures persist an assistant-side error status without mislabeling late failures as startup failures');
   t.ok(rendererJs.includes('function buildMissingAssistantResponseMessage'), 'reload path can recover old user-only transcripts');
   t.ok(rendererJs.includes('hasMeaningfulAssistantAfterUser'), 'reload recovery requires a meaningful assistant answer');
   t.ok(rendererJs.includes('!isEmptyThinkingPlaceholder(msg.text, logs)'), 'stale Thinking placeholders do not count as assistant answers');

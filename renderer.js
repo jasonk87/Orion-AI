@@ -4339,14 +4339,16 @@ function getConversationRunWorkspace(conv) {
 
 function createPhoneConversation({ projectPath = '', dispatchProjectPath = '', contextSummary = '', mode = 'orion', title = 'New Phone Task' } = {}) {
   const convId = 'conv-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
+  const requestedMode = mode === 'coder' || mode === 'operator' ? mode : 'orion';
   const normalizedProjectPath = String(projectPath || '').trim();
-  const normalizedDispatchProjectPath = mode === 'orion' ? String(dispatchProjectPath || '').trim() : '';
+  const normalizedDispatchProjectPath = requestedMode === 'orion' ? String(dispatchProjectPath || '').trim() : '';
   const conv = {
     id: convId,
     title,
-    // A project conversation only ever belongs to Coder, regardless of what the phone's mode
-    // toggle happened to be set to when the request came in.
-    mode: normalizedProjectPath ? 'coder' : (mode === 'coder' ? 'coder' : 'orion'),
+    // Coder remains the default owner for a project selected from the phone's project picker.
+    // An explicit Operator request is different: Operator may be standalone or workspace-bound,
+    // so preserve that role instead of silently coercing it into Dispatch or Coder.
+    mode: requestedMode === 'operator' ? 'operator' : (normalizedProjectPath ? 'coder' : requestedMode),
     messages: [],
     createdAt: Date.now(),
     workspace: normalizedProjectPath || normalizedDispatchProjectPath || '',
@@ -8433,9 +8435,9 @@ async function submitPhoneCompanionPromptOnce(options) {
   })
     .catch(err => {
       console.error("Phone-started agent loop failed:", err);
-      persistAssistantStatusMessage(targetId, `Orion could not start this phone request: ${err.message}`, {
-        source: 'agent-start-error',
-        dedupeKey: `phone-start-error-${targetId}-${text}`
+      persistAssistantStatusMessage(targetId, `The phone-started Orion run ended unexpectedly: ${err.message}`, {
+        source: 'agent-run-error',
+        dedupeKey: `phone-run-error-${targetId}-${text}`
       });
     });
 

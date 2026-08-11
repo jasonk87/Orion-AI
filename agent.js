@@ -1670,6 +1670,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   activeRunController = new AbortController();
   window.currentLoopCount = 0;
   currentAgentLogs = [];
+  // The resolved workspace is needed again by the sibling `finally` block when it releases
+  // run-scoped resource leases. Keep it in the function scope rather than declaring it inside
+  // `try`; a block-scoped declaration there is not visible from `finally` and caused otherwise
+  // successful phone turns to end with `ReferenceError: workspacePath is not defined`.
+  let workspacePath = '';
   try {
   const config = window.getAppConfig();
   // User-picked reasoning level from the selector next to the input box. 'auto' (the default)
@@ -1777,7 +1782,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         searchRoot: getDispatchWorkspaceRoot(),
         knownProjects: getKnownWorkspaceCandidates(conversation)
       }) : { kind: 'standalone_coder', path: resolveConversationWorkspace(conversation) });
-  let workspacePath = workspaceResolution.path || resolveConversationWorkspace(conversation);
+  workspacePath = workspaceResolution.path || resolveConversationWorkspace(conversation);
   // Phase 3 (resource leases, item 11): Coder/Operator both do real workspace-bound work
   // (writes, builds, background processes), and recon found nothing today registers who is
   // currently working in a given workspace path. The global single-run lock (isAgentRunning)

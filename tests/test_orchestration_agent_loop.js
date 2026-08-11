@@ -212,6 +212,41 @@ test('Dispatch accepts the first concise casual answer without a planning-gate r
   t.end();
 });
 
+test('a completed phone-style run releases run-scoped leases without throwing after the answer', async t => {
+  const originalFetch = global.fetch;
+  const releaseCalls = [];
+  installHarness([
+    [{ text: 'Got it — noted.' }]
+  ], {
+    semanticClassification: semanticClassification({ intent: 'conversation' }),
+    api: {
+      releaseResourceLease: async payload => {
+        releaseCalls.push(payload);
+        return { success: true };
+      }
+    }
+  });
+  const conv = conversation('phone-cleanup-regression');
+  let error = null;
+  try {
+    await global.window.runAgentLoop('You should have quite a bit of upgrades', 'gemini-1', conv, { source: 'phone' });
+    await new Promise(resolve => setTimeout(resolve, 0));
+  } catch (caught) {
+    error = caught;
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.error(error, 'successful answer cleanup does not throw a workspacePath ReferenceError');
+  const finalAssistant = [...conv.messages].reverse().find(message => message.role === 'assistant');
+  t.equal(finalAssistant && finalAssistant.text, 'Got it — noted.', 'the completed answer remains canonical after cleanup');
+  t.deepEqual(
+    releaseCalls.map(call => call.resourceType),
+    ['desktop', 'browser', 'workspace'],
+    'desktop, browser, and resolved-workspace leases are all released after the run'
+  );
+  t.end();
+});
+
 test('Dispatch retains immediate conversation even when semantic classification misses the reference', async t => {
   const originalFetch = global.fetch;
   let priorStatementReachedModel = false;
@@ -1517,6 +1552,7 @@ test('Dispatch loop corrects an invented recollection when no evidence exists', 
   try {
     await global.window.runAgentLoop('Do you remember our earlier conversation about the intent system?', 'gemini-1', conv);
     const answer = conv.messages.find(message => message.role === 'assistant');
+    t.equal(harness.modelTurns, 2, 'the unsupported recall claim is rejected and corrected');
     t.match(answer.text, /could not retrieve/i, 'the final answer states the retrieval gap honestly');
     t.notOk(/\bI remember\b/i.test(answer.text), 'the invented recall claim is rejected');
     t.equal(answer.responseBasis.conversationEvidence.length, 0, 'response basis records that no conversation evidence was found');
