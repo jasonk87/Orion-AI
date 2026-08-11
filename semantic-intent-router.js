@@ -454,9 +454,20 @@
     if (classification.standaloneSystemOperation === true || inspectionTarget === 'local_system') {
       return 'operator';
     }
-    if (inspectionTarget === 'workspace' || inspectionTarget === 'project') return 'coder';
 
     const explicitTarget = string(classification.executionTarget, 40).toLowerCase();
+    const executionSurface = string(classification.executionSurface, 40).toLowerCase();
+    // A project can be the thing shown on screen without turning the immediate work into source
+    // work. Playtesting a game, clicking through a desktop build, or visually checking a browser
+    // app still belongs to Operator even though the evidence is associated with a project. The old
+    // ordering returned Coder as soon as inspectionTarget was "project", silently discarding the
+    // classifier's correctly structured Operator + desktop/browser decision.
+    if (explicitTarget === 'operator'
+        && ['desktop', 'browser', 'process'].includes(executionSurface)) {
+      return 'operator';
+    }
+    if (inspectionTarget === 'workspace' || inspectionTarget === 'project') return 'coder';
+
     if (EXECUTION_TARGETS.includes(explicitTarget) && explicitTarget !== 'none') {
       return explicitTarget;
     }

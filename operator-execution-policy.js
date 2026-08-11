@@ -5,10 +5,8 @@
   const RAW_DIAGNOSTIC_TOOLS = new Set([
     'run_command',
     'terminal_exec',
-    'start_command',
     'get_command_status',
-    'read_command_output',
-    'kill_command'
+    'read_command_output'
   ]);
   const SCREEN_OBSERVATION_TOOLS = new Set([
     'capture_screen',
@@ -17,6 +15,7 @@
     'compare_screenshot_to_goal'
   ]);
   const SCREEN_ACTION_TOOLS = new Set(['computer_action', 'open_application']);
+  const PROCESS_ACTION_TOOLS = new Set(['start_command', 'kill_command']);
   const MAX_RAW_DIAGNOSTIC_CALLS = 3;
 
   function normalizeSurface(value) {
@@ -30,7 +29,10 @@
       rawDiagnosticCalls: 0,
       captured: false,
       inspected: false,
+      latestCapturePath: '',
+      latestInspectedPath: '',
       latestInspectionStatus: '',
+      screenActionAttempts: 0,
       screenActions: 0
     };
   }
@@ -46,9 +48,12 @@
     if (toolName === 'capture_screen') {
       state.captured = true;
       state.inspected = result.inspectionSkipped === true;
+      state.latestCapturePath = String(result.path || '').trim();
+      if (state.inspected) state.latestInspectedPath = state.latestCapturePath;
     }
     if (toolName === 'inspect_screenshot_with_model') {
       state.inspected = true;
+      state.latestInspectedPath = String(result.path || state.latestCapturePath || '').trim();
       state.latestInspectionStatus = String(result.status || '').trim().toLowerCase();
     }
     if (toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal') {
@@ -60,15 +65,49 @@
       state.inspected = false;
       state.latestInspectionStatus = '';
     }
+    if (PROCESS_ACTION_TOOLS.has(toolName)) {
+      // A process launch/stop can change the visible desktop asynchronously. The previous image
+      // remains historical evidence, but cannot authorize a later click or prove the new state.
+      state.captured = false;
+      state.inspected = false;
+      state.latestInspectionStatus = '';
+    }
     return state;
+  }
+
+  function recordToolAttempt(stateValue, toolName) {
+    const state = stateValue || createState();
+    if (SCREEN_ACTION_TOOLS.has(toolName)) state.screenActionAttempts += 1;
+    return state;
+  }
+
+  function sameScreenReference(leftValue, rightValue) {
+    const normalize = value => String(value || '').trim().replace(/\\/g, '/').toLowerCase();
+    const left = normalize(leftValue);
+    const right = normalize(rightValue);
+    if (!left || !right) return false;
+    if (left === right) return true;
+    return left.split('/').pop() === right.split('/').pop();
   }
 
   function gateTool(input = {}) {
     if (String(input.mode || '').toLowerCase() !== 'operator') return { allowed: true };
     const toolName = String(input.toolName || '');
+    const args = input.args && typeof input.args === 'object' ? input.args : {};
     const state = input.state || createState(input.surface);
     const surface = normalizeSurface(input.surface || state.surface);
     if (surface && state.surface === 'none') state.surface = surface;
+
+    if (toolName === 'inspect_screenshot_with_model') {
+      const requestedPath = resolveSnapshotReference(args.path, { path: state.latestCapturePath });
+      if (state.inspected && sameScreenReference(requestedPath, state.latestInspectedPath)) {
+        return {
+          allowed: false,
+          code: 'operator_stale_screenshot_reinspection',
+          reason: 'That exact screenshot was already judged. Capture a fresh screen before checking whether movement, navigation, or any other state change occurred; the same image cannot prove a later result.'
+        };
+      }
+    }
 
     if (RAW_DIAGNOSTIC_TOOLS.has(toolName)) {
       if (VISUAL_SURFACES.has(surface) && !state.inspected) {
@@ -78,11 +117,17 @@
           reason: 'This is a visual desktop/browser task. Capture the screen and inspect that exact image before running shell diagnostics. If the requested state is already visible, attach the screenshot and answer instead of probing processes.'
         };
       }
-      if (state.latestInspectionStatus === 'appears_satisfied') {
+      // A vision judgement applies only to the exact goal passed to that inspection call. It is
+      // evidence, not a task-completion receipt: treating any `appears_satisfied` result as proof
+      // that the whole playtest was done blocked legitimate later launch and verification steps.
+      if (VISUAL_SURFACES.has(surface)
+          && state.inspected
+          && state.latestInspectionStatus === 'not_satisfied'
+          && state.screenActionAttempts === 0) {
         return {
           allowed: false,
-          code: 'operator_goal_already_visible',
-          reason: 'The latest visual inspection says the requested state already appears satisfied. Stop diagnosing internals; attach the verified screenshot when requested and report the observed result.'
+          code: 'operator_visible_action_required',
+          reason: 'The screen has been inspected and the visible goal is not satisfied. Use computer_action for clicks/keystrokes or open_application for an absent app before falling back to shell diagnostics. Do not use PowerShell, WScript, SendKeys, or terminal commands as a substitute for visible input.'
         };
       }
       if (state.rawDiagnosticCalls >= MAX_RAW_DIAGNOSTIC_CALLS) {
@@ -92,6 +137,14 @@
           reason: `Operator has already used ${MAX_RAW_DIAGNOSTIC_CALLS} raw diagnostic calls. Do not keep digging through processes or installation metadata. Use the dedicated screen/application tools, act from visible evidence, or report the concrete blocker.`
         };
       }
+    }
+
+    if (toolName === 'start_command' && VISUAL_SURFACES.has(surface) && !state.inspected) {
+      return {
+        allowed: false,
+        code: 'operator_process_launch_requires_observation',
+        reason: 'Capture and inspect the current screen before launching a project-local process. If the app is absent, start_command is the correct launch action; then capture a fresh screen and verify the result.'
+      };
     }
 
     if (toolName === 'open_application' && VISUAL_SURFACES.has(surface) && !state.inspected) {
@@ -139,9 +192,11 @@
     RAW_DIAGNOSTIC_TOOLS,
     SCREEN_OBSERVATION_TOOLS,
     SCREEN_ACTION_TOOLS,
+    PROCESS_ACTION_TOOLS,
     normalizeSurface,
     createState,
     recordToolResult,
+    recordToolAttempt,
     gateTool,
     liveStatus,
     resolveSnapshotReference

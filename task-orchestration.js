@@ -5,7 +5,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function createOrionTaskOrchestration() {
   'use strict';
 
-  const SCHEMA_VERSION = 3;
+  const SCHEMA_VERSION = 4;
   const TASK_STATES = Object.freeze({
     PENDING: 'pending',
     ACTIVE: 'active',
@@ -501,6 +501,13 @@
       || semanticIntent.supersedesTaskId
       || ''
     );
+    const parentTaskId = compactInline(input.parentTaskId || '');
+    const rootOriginConversationId = compactInline(
+      input.rootOriginConversationId
+      || (input.rootOrigin && input.rootOrigin.conversationId)
+      || origin.conversationId
+      || ''
+    );
     const executionProfile = normalizeExecutionProfile(input.executionProfile, {
       modelSelectValue: input.modelSelectValue,
       reasoningEffort: input.reasoningEffort,
@@ -532,6 +539,8 @@
       executionSurface,
       origin,
       target,
+      parentTaskId,
+      rootOriginConversationId,
       supersedesTaskId,
       source: compactInline(input.source || 'user'),
       status: TASK_STATES.PENDING,
@@ -640,6 +649,13 @@
         : null,
       origin,
       target,
+      parentTaskId: compactInline(record.parentTaskId || ''),
+      rootOriginConversationId: compactInline(
+        record.rootOriginConversationId
+        || (record.rootOrigin && record.rootOrigin.conversationId)
+        || origin.conversationId
+        || ''
+      ),
       supersedesTaskId: compactInline(
         record.supersedesTaskId
         || record.predecessorTaskId
@@ -801,6 +817,7 @@
       const permitted = new Set([
         task.origin && task.origin.conversationId,
         task.target && task.target.conversationId,
+        task.rootOriginConversationId,
         task.ownerConversationId,
         task.supervisingConversationId
       ].map(compactInline).filter(Boolean));
@@ -883,6 +900,12 @@
       `Origin session: ${task.origin.sessionId || '(unknown)'}`,
       `Origin message: ${task.origin.messageId || '(unknown)'}`
     ];
+    if (task.parentTaskId) {
+      sections.push(
+        `Parent task: ${task.parentTaskId}`,
+        `Root owner conversation: ${task.rootOriginConversationId || '(unknown)'}`
+      );
+    }
     if (task.continuation && task.continuation.input) {
       sections.push(
         '',
@@ -1037,6 +1060,11 @@
       || taskValue.execution && taskValue.execution.resumePolicy
       || ''
     ).toLowerCase();
+    const reasonCode = compactInline(
+      context.reasonCode
+      || taskValue.execution && taskValue.execution.reasonCode
+      || ''
+    ).toLowerCase();
     const executionMode = compactInline(context.executionMode || taskValue.executionMode).toLowerCase();
     const subStatus = compactWhitespace(context.subStatus || taskValue.subStatus || '');
     const verifying = status === TASK_STATES.ACTIVE
@@ -1073,6 +1101,15 @@
       detail = detail || `${roleLabel} is applying your feedback and preparing a revised implementation plan.`;
       agentState = `${roleLabel} revising`;
       badgeClass = 'success';
+    } else if (status === TASK_STATES.PENDING && reasonCode === 'awaiting_delegated_task') {
+      const childRole = compactInline(taskValue.delegation && taskValue.delegation.childRole).toLowerCase() === 'operator'
+        ? 'Operator'
+        : 'specialist';
+      phase = 'delegated';
+      label = `${childRole} active`;
+      detail = detail || `${roleLabel} is waiting for ${childRole} to return the delegated result.`;
+      agentState = `${childRole} active`;
+      badgeClass = childRole === 'Operator' ? 'operator' : 'success';
     } else if (status === TASK_STATES.PENDING && resumePolicy === 'automatic') {
       phase = 'continuing';
       label = `${roleLabel} continuing`;

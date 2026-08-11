@@ -39,6 +39,7 @@ const test = require('tape');
 const fs = require('fs');
 const path = require('path');
 const agent = require('../agent');
+const taskOrchestration = require('../task-orchestration');
 const { loadRenderer } = require('./helpers/renderer-harness');
 
 const agentJs = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8').replace(/\r\n/g, '\n');
@@ -168,6 +169,88 @@ test('cancelling an owned Operator task appends one terminal message to the Disp
     && message.orchestrationTaskId === 'task_op_cancelled'
   );
   t.equal(cancellationMessages.length, 1, 'a late finalization callback cannot duplicate the cancellation message');
+  t.end();
+});
+
+test('a completed Operator child resumes the same pending Coder parent instead of completing at handoff', async t => {
+  let parentTask = taskOrchestration.normalizeTaskRecord({
+    taskId: 'task_parent_playtest',
+    title: 'Playtest This is Life project',
+    objective: 'Use Operator to playtest This is Life and return a verified result.',
+    originalUserMessage: 'Can we have Operator playtest our This is Life project?',
+    workspacePath: 'C:\\Projects\\This is Life',
+    workspace: {
+      role: 'active_project',
+      path: 'C:\\Projects\\This is Life',
+      project: { name: 'This is Life', path: 'C:\\Projects\\This is Life' },
+      source: 'dispatch-handoff'
+    },
+    origin: { conversationId: 'dispatch-root' },
+    target: { conversationId: 'coder-parent', mode: 'coder' },
+    status: 'pending',
+    createdAt: 100,
+    updatedAt: 200,
+    execution: {
+      attempt: 1,
+      executionId: 'task_parent_playtest:run:1',
+      state: 'pending',
+      reasonCode: 'awaiting_delegated_task',
+      resumePolicy: 'manual'
+    },
+    delegation: { childTaskId: 'task_operator_child', childRole: 'operator', status: 'active' }
+  });
+  const childTask = taskOrchestration.normalizeTaskRecord({
+    taskId: 'task_operator_child',
+    title: 'Playtest: This is Life',
+    objective: 'Interactively playtest the game.',
+    originalUserMessage: parentTask.originalUserMessage,
+    workspace: parentTask.workspace,
+    parentTaskId: parentTask.taskId,
+    rootOriginConversationId: 'dispatch-root',
+    origin: { conversationId: 'coder-parent' },
+    target: { conversationId: 'operator-child', mode: 'operator' },
+    status: 'completed',
+    createdAt: 300,
+    updatedAt: 400,
+    completedAt: 400,
+    result: {
+      summary: 'Gameplay launched and movement was verified from a fresh capture.',
+      images: [{ path: 'orion-artifact://operator-child/screenshots/final.png', mimeType: 'image/png' }]
+    }
+  });
+  const { win, expose } = loadRenderer({
+    t,
+    globals: { OrionTaskOrchestration: taskOrchestration },
+    expose: ['orchestrationTaskCache'],
+    api: {
+      getOrchestrationTask: async taskId => ({
+        success: true,
+        task: taskId === parentTask.taskId ? parentTask : childTask
+      }),
+      updateOrchestrationTask: async (taskId, patch) => {
+        parentTask = taskOrchestration.normalizeTaskRecord({ ...parentTask, ...patch, taskId });
+        return { success: true, task: parentTask };
+      }
+    },
+    set: {
+      conversations: [
+        { id: 'dispatch-root', mode: 'orion', messages: [] },
+        { id: 'coder-parent', mode: 'coder', title: parentTask.title, messages: [] },
+        { id: 'operator-child', mode: 'operator', title: childTask.title, messages: [] }
+      ]
+    }
+  });
+  expose.orchestrationTaskCache.set(parentTask.taskId, parentTask);
+  win.promptQueue = [];
+  const result = await win.resumeParentTaskAfterDelegatedChild(childTask);
+  t.equal(result.success, true, 'child reconciliation succeeds');
+  t.equal(result.action, 'parent_resumed', 'the child result resumes its parent');
+  t.equal(win.promptQueue.length, 1, 'exactly one continuation is queued');
+  t.equal(win.promptQueue[0].taskId, parentTask.taskId, 'the continuation retains the original parent task ID');
+  t.match(win.promptQueue[0].prompt, /movement was verified/i, 'the verified Operator result is carried back to Coder');
+  t.notOk(/Relevant preceding conversation:\s*Task:/i.test(win.promptQueue[0].prompt), 'the continuation does not recursively embed the rendered parent packet');
+  t.equal(parentTask.continuation.messageId, childTask.taskId, 'the child ID is an idempotency receipt on the parent continuation');
+  t.equal(parentTask.delegation.status, 'completed', 'the durable delegation records the child terminal state');
   t.end();
 });
 

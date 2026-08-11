@@ -129,6 +129,54 @@ test('computer action IPC hides Orion, performs one action, captures the result,
   t.end();
 });
 
+test('an active task-scoped control session prevents per-action Orion restoration', async t => {
+  let handler = null;
+  const calls = [];
+  const oldWindow = shared.mainWindow;
+  const oldSession = shared.operatorControlSession;
+  shared.operatorControlSession = { active: true, sessionId: 'task_operator_active' };
+  shared.mainWindow = {
+    isDestroyed: () => false,
+    hide: () => calls.push('hide'),
+    showInactive: () => calls.push('showInactive')
+  };
+  computerUse.registerHandlers({
+    handle: (name, fn) => { if (name === 'computer-action') handler = fn; }
+  }, {
+    screen: { getPrimaryDisplay: () => ({ bounds: DISPLAY.bounds, size: DISPLAY.bounds, scaleFactor: 1.25 }) },
+    runInput: async action => {
+      calls.push(`input:${action.action}`);
+      return { success: true, targetProcess: 'Game', targetWindow: 'This is Life' };
+    },
+    captureDesktopScreenshot: async () => {
+      calls.push('capture');
+      return {
+        rel: 'orion-artifact://conv_1/screenshots/result.png',
+        png: Buffer.from('png'),
+        size: { width: 1920, height: 1080 },
+        artifactPath: 'C:\\artifacts\\result.png',
+        artifactRelativePath: 'screenshots/result.png'
+      };
+    }
+  });
+  try {
+    const result = await handler(null, {
+      workspacePath: 'C:\\workspace',
+      conversationId: 'conv_1',
+      action: {
+        action: 'click', targetDescription: 'the visible game menu', x: 100, y: 100,
+        sourceWidth: 1920, sourceHeight: 1080, settleMs: 0
+      }
+    });
+    t.ok(result.success, 'the action still succeeds inside the control session');
+    t.deepEqual(calls, ['input:click', 'capture'], 'the action neither re-hides nor restores Orion between controls');
+  } finally {
+    shared.mainWindow = oldWindow;
+    shared.operatorControlSession = oldSession;
+  }
+  t.end();
+});
+
 test('attach_image records a safe reference with owning-conversation provenance', async t => {
   const oldApi = global.window.api;
   let readArgs = null;

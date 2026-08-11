@@ -67,6 +67,68 @@ test('convertGeminiToDeepSeekMessages preserves hidden reasoning_content without
   t.end();
 });
 
+test('lightweight conversational replies project visible DeepSeek content instead of private reasoning', t => {
+  const response = {
+    candidates: [{
+      content: {
+        parts: [
+          {
+            text: 'The user is asking why I routed this task. Let me reason through the possible explanations.',
+            thought: true,
+            _deepseekReasoningContent: true
+          },
+          { text: 'I routed it incorrectly. Interactive playtesting belongs to Operator.' }
+        ]
+      }
+    }]
+  };
+  t.equal(
+    agent.extractVisibleModelText(response),
+    'I routed it incorrectly. Interactive playtesting belongs to Operator.',
+    'the supervisor path selects the visible answer even when reasoning is the first provider part'
+  );
+  t.equal(
+    agent.extractVisibleModelText({
+      candidates: [{ content: { parts: [{ text: 'private draft only', thought: true, _deepseekReasoningContent: true }] } }]
+    }),
+    '',
+    'reasoning-only output fails closed instead of becoming the chat answer'
+  );
+  t.end();
+});
+
+test('the real lightweight Dispatch call returns DeepSeek visible content, not reasoning_content', async t => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      choices: [{
+        message: {
+          reasoning_content: 'The user is asking why the task was routed this way. I should reconstruct the old decision.',
+          content: 'That was routed incorrectly. An interactive playtest belongs to Operator.'
+        }
+      }]
+    })
+  });
+
+  try {
+    const reply = await global.window.quickOrionLLMCall(
+      'Answer conversationally.',
+      [{ role: 'user', content: 'Why did you route that to Coder?' }],
+      { modelName: 'deepseek-v4-flash', deepseekApiKey: 'test-key' }
+    );
+    t.equal(
+      reply,
+      'That was routed incorrectly. An interactive playtest belongs to Operator.',
+      'the integrated supervisor call returns the provider-visible answer'
+    );
+    t.notOk(reply.includes('The user is asking'), 'private provider reasoning never becomes chat content');
+  } finally {
+    global.fetch = originalFetch;
+  }
+  t.end();
+});
+
 test('convertGeminiToDeepSeekMessages adds reasoning continuity for tool-call turns that lost it', (t) => {
   const messages = [
     {

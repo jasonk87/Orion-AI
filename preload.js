@@ -5,6 +5,8 @@ contextBridge.exposeInMainWorld('api', {
   closeWindow: () => ipcRenderer.send('window-close'),
   minimizeWindow: () => ipcRenderer.send('window-minimize'),
   maximizeWindow: () => ipcRenderer.send('window-maximize'),
+  beginOperatorControl: (payload = {}) => ipcRenderer.invoke('orion:operator-control-begin', payload),
+  endOperatorControl: (payload = {}) => ipcRenderer.invoke('orion:operator-control-end', payload),
   
   // Workspace Actions
   selectWorkspace: () => ipcRenderer.invoke('select-workspace'),

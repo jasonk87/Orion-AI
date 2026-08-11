@@ -2652,10 +2652,13 @@ async function enqueueOrchestrationTask(options = {}) {
       sessionId: String(options.targetSessionId || targetConv.sessionId || targetConversationId),
       mode: conversationMode(targetConv)
     },
+    parentTaskId: String(options.parentTaskId || ''),
+    rootOriginConversationId: String(options.rootOriginConversationId || originConversationId),
     source: options.source || 'user-queue',
     images: Array.isArray(options.images) ? options.images : [],
     contextPacketIds: Array.isArray(options.contextPacketIds) ? options.contextPacketIds : [],
     executionProfile,
+    executionSurface: options.executionSurface || (semanticIntent && semanticIntent.executionSurface) || 'none',
     semanticIntent,
     timestamp: options.createdAt || Date.now()
   });
@@ -3008,7 +3011,10 @@ async function queueTaskContinuation(options = {}) {
         contextPacketIds: [
           ...(Array.isArray(existingTask.contextPacketIds) ? existingTask.contextPacketIds : []),
           ...(Array.isArray(options.contextPacketIds) ? options.contextPacketIds : [])
-        ]
+        ],
+        delegation: options.delegation && typeof options.delegation === 'object'
+          ? options.delegation
+          : existingTask.delegation
       });
       if (!updated || updated.success === false || !updated.task) {
         return {
@@ -4624,7 +4630,10 @@ function scheduleTerminalDelegatedTaskReconciliation(conversation, durableTasks 
     ? notifySupervisorOfOperatorCompletion
     : notifySupervisorOfCoderCompletion;
   Promise.resolve()
-    .then(() => notifier(coderConversationId, taskId))
+    .then(async () => {
+      await notifier(coderConversationId, taskId);
+      if (task.parentTaskId) await resumeParentTaskAfterDelegatedChild(task);
+    })
     .catch(error => console.error('Could not reconcile terminal delegated task presentation:', error))
     .finally(() => {
       if (String(conversation._terminalTaskReconciliationScheduled || '') === taskId) {
@@ -7471,6 +7480,8 @@ window.promoteWorkspaceToOperator = async function(options = {}) {
   const title = String(options.title || '').trim()
     || (prompt ? generateConversationTitle(prompt) : 'New Operator Task');
   const originConv = conversations.find(item => item.id === String(options.sourceConversationId || ''));
+  const specialistDelegation = !!String(options.parentTaskId || '');
+  const operatorTaskSource = specialistDelegation ? 'specialist-operator-handoff' : 'dispatch-operator-handoff';
   if (originConv) clearCurrentTurnTaskResolutionClarifications(originConv);
   const semanticIntent = options.semanticIntent || (originConv && prompt
     ? await classifyCurrentConversationIntent(originConv, originalUserMessage, { model: options.modelSelectValue })
@@ -7539,9 +7550,12 @@ window.promoteWorkspaceToOperator = async function(options = {}) {
       originMessageId: String(options.sourceMessageId || ''),
       targetConversationId: 'pending-operator-conversation',
       targetMode: 'operator',
-      source: 'dispatch-operator-handoff',
+      parentTaskId: String(options.parentTaskId || ''),
+      rootOriginConversationId: String(options.rootOriginConversationId || options.sourceConversationId || ''),
+      source: operatorTaskSource,
       semanticIntent,
       executionProfile,
+      executionSurface: options.executionSurface || (semanticIntent && semanticIntent.executionSurface) || 'desktop',
       timestamp: Date.now()
     });
     if (!preflight.success || !preflight.task) {
@@ -7617,6 +7631,8 @@ window.promoteWorkspaceToOperator = async function(options = {}) {
       originMessageId: String(options.sourceMessageId || ''),
       precedingMessages: taskContextMessages(originConv || conv),
       precedingConversationSummary: preflightTask ? preflightTask.precedingConversationSummary : '',
+      parentTaskId: String(options.parentTaskId || ''),
+      rootOriginConversationId: String(options.rootOriginConversationId || options.sourceConversationId || ''),
       workspace: handoffWorkspace,
       requirements: preflightTask
         ? [...new Set([...(preflightTask.requirements || []), ...looseFindings])]
@@ -7624,7 +7640,7 @@ window.promoteWorkspaceToOperator = async function(options = {}) {
       constraints: preflightTask ? preflightTask.constraints : [],
       semanticIntent,
       unresolvedDecisions: preflightTask ? preflightTask.unresolvedDecisions : [],
-      source: 'dispatch-operator-handoff',
+      source: operatorTaskSource,
       modelSelectValue: (preflightTask && preflightTask.executionProfile && preflightTask.executionProfile.requestedModel)
         || window.getSelectedModel(),
       reasoningEffort: (preflightTask && preflightTask.executionProfile && preflightTask.executionProfile.requestedReasoning)
@@ -7632,6 +7648,10 @@ window.promoteWorkspaceToOperator = async function(options = {}) {
         || 'auto',
       executionProfile: (preflightTask && preflightTask.executionProfile)
         || captureTaskExecutionProfile(options),
+      executionSurface: (preflightTask && preflightTask.executionSurface)
+        || options.executionSurface
+        || (semanticIntent && semanticIntent.executionSurface)
+        || 'desktop',
       contextPacketIds: assignedPacketIds,
       createdAt: Date.now()
     });
@@ -7649,7 +7669,8 @@ window.promoteWorkspaceToOperator = async function(options = {}) {
     createdTask = handoffTask.task;
     if (handoffTask.warning) handoffWarnings.push(handoffTask.warning);
     try {
-      persistAssistantStatusMessage(conv.id, `Queued from Dispatch as ${handoffTask.task.title}. Operator will start when the current turn finishes.`, {
+      const originLabel = originConv && conversationMode(originConv) === 'coder' ? 'Coder' : 'Dispatch';
+      persistAssistantStatusMessage(conv.id, `Queued from ${originLabel} as ${handoffTask.task.title}. Operator will start when the current turn finishes.`, {
         source: 'queue-status',
         dedupeKey: `dispatch-operator-handoff-${handoffTask.task.taskId}`
       });
@@ -7993,6 +8014,16 @@ window.getPhoneCompanionState = async (targetConversationId) => {
         workspacePath: task.workspacePath || '',
         originConversationId: task.origin && task.origin.conversationId,
         targetConversationId: task.target && task.target.conversationId,
+        // The phone recomputes presentation from the durable task so live sub-status can update
+        // without replacing the record. Preserve the structured specialist role across this
+        // transport boundary; targetConversationId alone loses whether the target is Coder or
+        // Operator and made both the header and bottom banner fall back to "Coder planning".
+        target: {
+          conversationId: task.target && task.target.conversationId || '',
+          sessionId: task.target && task.target.sessionId || '',
+          mode: task.target && task.target.mode || 'coder'
+        },
+        executionSurface: task.executionSurface || 'none',
         updatedAt: task.updatedAt || task.createdAt || 0,
         awaitingReview: !!(presentation && presentation.awaitingReview),
         revisingPlan: !!(presentation && presentation.revisingPlan),
@@ -10558,6 +10589,92 @@ async function notifySupervisorOfOperatorCompletion(finishedOperatorConvId, expe
   if (window.saveConversationsToStorage) window.saveConversationsToStorage();
 }
 
+async function resumeParentTaskAfterDelegatedChild(childTaskValue) {
+  const childTask = childTaskValue && typeof childTaskValue === 'object' ? childTaskValue : null;
+  const parentTaskId = String(childTask && childTask.parentTaskId || '');
+  if (!childTask || !parentTaskId || !window.api || typeof window.api.getOrchestrationTask !== 'function') {
+    return { success: true, action: 'none' };
+  }
+  const parentRead = await window.api.getOrchestrationTask(parentTaskId);
+  const parentTask = parentRead && parentRead.success ? parentRead.task : null;
+  if (!parentTask) return { success: false, action: 'missing_parent', error: `Parent task ${parentTaskId} could not be found.` };
+  if (['completed', 'failed', 'cancelled'].includes(String(parentTask.status || ''))) {
+    return { success: true, action: 'parent_terminal', task: parentTask };
+  }
+
+  const childStatus = String(childTask.status || '');
+  const childRole = String(childTask.target && childTask.target.mode || '').toLowerCase() === 'operator'
+    ? 'Operator'
+    : 'specialist';
+  if (childStatus === 'cancelled') {
+    if (typeof window.api.cancelOrchestrationTask !== 'function') {
+      return { success: false, action: 'cancel_parent_failed', error: 'Task cancellation service is unavailable.' };
+    }
+    const cancelled = await window.api.cancelOrchestrationTask(
+      parentTaskId,
+      { conversationId: String(childTask.origin && childTask.origin.conversationId || '') },
+      `${childRole} child task ${childTask.taskId} was cancelled.`
+    );
+    if (!cancelled || cancelled.success === false || !cancelled.task) {
+      return { success: false, action: 'cancel_parent_failed', error: cancelled && cancelled.error || 'Parent cancellation failed.' };
+    }
+    orchestrationTaskCache.set(parentTaskId, cancelled.task);
+    await notifySupervisorOfCoderCompletion(
+      String(cancelled.task.target && cancelled.task.target.conversationId || ''),
+      parentTaskId
+    );
+    return { success: true, action: 'parent_cancelled', task: cancelled.task };
+  }
+
+  if (!['completed', 'failed'].includes(childStatus)) return { success: true, action: 'child_nonterminal' };
+  if (parentTask.status !== 'pending') {
+    return { success: false, action: 'parent_not_pending', error: `Parent task ${parentTaskId} is ${parentTask.status}.` };
+  }
+  if (parentTask.continuation
+      && String(parentTask.continuation.source || '') === 'delegated-child-result'
+      && String(parentTask.continuation.messageId || '') === String(childTask.taskId || '')) {
+    return { success: true, action: 'already_resumed', task: parentTask };
+  }
+
+  const childSummary = String(
+    childTask.result && childTask.result.summary
+    || childTask.failure && childTask.failure.message
+    || `${childRole} task ended with state ${childStatus}.`
+  ).trim();
+  const continuationPrompt = childStatus === 'completed'
+    ? [
+        `The delegated ${childRole} task ${childTask.taskId} completed.`,
+        `Result: ${childSummary}`,
+        'Use this evidence to finish the original parent task now. Report the actual playtest/result to the user; do not create another handoff for the same completed child.'
+      ].join('\n\n')
+    : [
+        `The delegated ${childRole} task ${childTask.taskId} failed.`,
+        `Recorded failure: ${childSummary}`,
+        'Resume the original parent task, diagnose this concrete failure, and either recover with a justified next action or report the verified blocker. Do not claim the parent completed.'
+      ].join('\n\n');
+  const continuation = await queueTaskContinuation({
+    targetConversationId: String(parentTask.target && parentTask.target.conversationId || ''),
+    taskId: parentTaskId,
+    requireExistingTask: true,
+    prompt: continuationPrompt,
+    source: 'delegated-child-result',
+    originMessageId: String(childTask.taskId || ''),
+    images: childTask.result && Array.isArray(childTask.result.images) ? childTask.result.images : [],
+    delegation: {
+      ...(parentTask.delegation && typeof parentTask.delegation === 'object' ? parentTask.delegation : {}),
+      childTaskId: String(childTask.taskId || ''),
+      childRole: childRole.toLowerCase(),
+      status: childStatus,
+      resolvedAt: Date.now()
+    }
+  });
+  if (!continuation || continuation.success === false) {
+    return { success: false, action: 'resume_parent_failed', error: continuation && continuation.error || 'Parent continuation could not be queued.' };
+  }
+  return { success: true, action: 'parent_resumed', task: continuation.task };
+}
+window.resumeParentTaskAfterDelegatedChild = resumeParentTaskAfterDelegatedChild;
+
 window.onOrchestrationTaskFinalized = async function(taskId, targetConversationId, status) {
   if (!taskId || !targetConversationId || !['completed', 'failed', 'cancelled'].includes(String(status || ''))) return;
   // Route by the target conversation's own role rather than always assuming Coder. Before this
@@ -10569,6 +10686,16 @@ window.onOrchestrationTaskFinalized = async function(taskId, targetConversationI
     await notifySupervisorOfOperatorCompletion(targetConversationId, taskId);
   } else {
     await notifySupervisorOfCoderCompletion(targetConversationId, taskId);
+  }
+  if (window.api && typeof window.api.getOrchestrationTask === 'function') {
+    const finalizedRead = await window.api.getOrchestrationTask(taskId);
+    const finalizedTask = finalizedRead && finalizedRead.success ? finalizedRead.task : null;
+    if (finalizedTask && finalizedTask.parentTaskId) {
+      const resumed = await resumeParentTaskAfterDelegatedChild(finalizedTask);
+      if (!resumed || resumed.success === false) {
+        console.error('Could not reconcile the delegated child task with its parent:', resumed && resumed.error);
+      }
+    }
   }
 };
 

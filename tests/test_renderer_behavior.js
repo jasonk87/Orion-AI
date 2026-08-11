@@ -204,6 +204,85 @@ test('desktop replay hides internal compaction scaffolding from old and new conv
 
 // ── Orphaned turns ─────────────────────────────────────────────────────────────
 
+test('phone task transport preserves Operator role for the header and screen-control banner', async t => {
+  const dispatchConversation = {
+    id: 'dispatch-operator-owner',
+    title: 'Playtest This is Life',
+    mode: 'orion',
+    workspace: 'C:\\Projects',
+    messages: [{ role: 'user', text: 'Have Operator playtest This is Life.' }],
+    tasks: []
+  };
+  const operatorConversation = {
+    id: 'operator-playtest',
+    title: 'Operate playtest for This is Life',
+    mode: 'operator',
+    workspace: 'C:\\Projects\\This is Life',
+    messages: [],
+    tasks: []
+  };
+  const { win, expose } = loadRenderer({
+    t,
+    globals: {
+      OrionOperationalContext: operational,
+      OrionWorkspaceResolution: workspaceResolution,
+      OrionTaskOrchestration: taskOrchestration,
+      OrionSemanticIntentRouter: semanticIntentRouter,
+      OrionReasoningPolicy: reasoningPolicy
+    },
+    set: {
+      conversations: [dispatchConversation, operatorConversation],
+      activeConversationId: dispatchConversation.id,
+      appMode: 'orion',
+      currentWorkspace: 'C:\\Projects'
+    },
+    expose: ['orchestrationTaskCache']
+  });
+  const operatorTask = taskOrchestration.transitionTask(
+    taskOrchestration.normalizeTaskRecord({
+      schemaVersion: taskOrchestration.SCHEMA_VERSION,
+      taskId: 'task-phone-operator-role',
+      title: 'Operate playtest for This is Life',
+      objective: 'Interactively playtest This is Life.',
+      originalUserMessage: 'Have Operator playtest This is Life.',
+      workspacePath: 'C:\\Projects\\This is Life',
+      executionSurface: 'desktop',
+      origin: {
+        conversationId: dispatchConversation.id,
+        sessionId: dispatchConversation.id,
+        messageId: 'message-1'
+      },
+      target: {
+        conversationId: operatorConversation.id,
+        sessionId: operatorConversation.id,
+        mode: 'operator'
+      },
+      source: 'dispatch-operator-handoff',
+      status: 'pending',
+      createdAt: 1000,
+      updatedAt: 1000
+    }),
+    taskOrchestration.TASK_STATES.ACTIVE,
+    { timestamp: 1100 }
+  );
+  expose.orchestrationTaskCache.set(operatorTask.taskId, operatorTask);
+
+  const phoneState = await win.getPhoneCompanionState(dispatchConversation.id);
+  const transportedTask = phoneState.orchestrationTasks.find(task => task.taskId === operatorTask.taskId);
+  t.ok(transportedTask, 'the owning Dispatch conversation receives its supervised task');
+  t.equal(transportedTask.target.mode, 'operator', 'phone transport retains the durable specialist role');
+  t.equal(transportedTask.executionSurface, 'desktop', 'phone transport retains the visible execution surface');
+  t.equal(transportedTask.presentation.agentState, 'Operator active', 'the transported presentation is Operator-specific');
+
+  const phoneRecomputed = taskOrchestration.describeSupervisedTaskPresentation(transportedTask, {
+    roleMode: transportedTask.target.mode,
+    roleLabel: transportedTask.target.mode === 'operator' ? 'Operator' : 'Coder'
+  });
+  t.equal(phoneRecomputed.label, 'Operator active', 'the phone header recomputation no longer falls back to Coder planning');
+  t.notOk(/Coder/.test(phoneRecomputed.label), 'the bottom banner cannot describe this Operator task as Coder work');
+  t.end();
+});
+
 test('a queued follow-up gets a status bubble; a crashed run does not get a fake one', (t) => {
   const { win } = loadRenderer({ t });
   const build = win.buildMissingAssistantResponseMessage;

@@ -17,7 +17,11 @@ test('visual Operator work is screen-first and raw diagnostics are bounded', t =
   t.equal(gate.code, 'operator_screen_first');
 
   policy.recordToolResult(state, 'capture_screen', { success: true, path: 'shot.png' });
-  policy.recordToolResult(state, 'inspect_screenshot_with_model', { success: true, status: 'not_satisfied' });
+  policy.recordToolResult(state, 'inspect_screenshot_with_model', { success: true, status: 'not_satisfied', path: 'shot.png' });
+  gate = policy.gateTool({ mode: 'operator', surface: 'desktop', toolName: 'run_command', state });
+  t.equal(gate.allowed, false, 'shell input is blocked until Operator attempts the dedicated visible action');
+  t.equal(gate.code, 'operator_visible_action_required');
+  policy.recordToolAttempt(state, 'computer_action');
   for (let index = 0; index < policy.MAX_RAW_DIAGNOSTIC_CALLS; index += 1) {
     gate = policy.gateTool({ mode: 'operator', surface: 'desktop', toolName: 'run_command', state });
     t.equal(gate.allowed, true, `diagnostic ${index + 1} is allowed after inspection`);
@@ -29,18 +33,62 @@ test('visual Operator work is screen-first and raw diagnostics are bounded', t =
   t.end();
 });
 
-test('a visually satisfied goal stops process archaeology and resolves screenshot aliases', t => {
+test('Operator cannot judge a later visible result from the same screenshot', t => {
+  const state = policy.createState('desktop');
+  policy.recordToolResult(state, 'capture_screen', { success: true, path: 'orion-artifact://conv/screenshots/before.png' });
+  policy.recordToolResult(state, 'inspect_screenshot_with_model', {
+    success: true,
+    status: 'not_satisfied',
+    path: 'orion-artifact://conv/screenshots/before.png'
+  });
+  const gate = policy.gateTool({
+    mode: 'operator',
+    surface: 'desktop',
+    toolName: 'inspect_screenshot_with_model',
+    args: {
+      path: 'screenshots/before.png',
+      goal: 'Check whether the player moved after input.'
+    },
+    state
+  });
+  t.equal(gate.allowed, false, 'the already-inspected image cannot be reused as later-state evidence');
+  t.equal(gate.code, 'operator_stale_screenshot_reinspection');
+  t.match(gate.reason, /fresh screen/i, 'recovery requires a new capture');
+  t.end();
+});
+
+test('a visual sub-goal does not falsely complete the whole task and screenshot aliases still resolve', t => {
   const state = policy.createState('desktop');
   policy.recordToolResult(state, 'capture_screen', { success: true, path: 'orion-artifact://conv/screenshots/capture.png' });
   policy.recordToolResult(state, 'inspect_screenshot_with_model', { success: true, status: 'appears_satisfied' });
   const gate = policy.gateTool({ mode: 'operator', surface: 'desktop', toolName: 'terminal_exec', state });
-  t.equal(gate.allowed, false, 'satisfied screen evidence prevents extra system probing');
-  t.equal(gate.code, 'operator_goal_already_visible');
+  t.equal(gate.allowed, true, 'a successful judgement for one screenshot goal is evidence, not a whole-task completion gate');
   t.equal(
     policy.resolveSnapshotReference('screenshots/capture.png', { path: 'orion-artifact://conv/screenshots/capture.png' }),
     'orion-artifact://conv/screenshots/capture.png',
     'a relative screenshot alias resolves to the exact conversation artifact'
   );
+  t.end();
+});
+
+test('a project-local process launch is a first-class visible action after inspection', t => {
+  const state = policy.createState('desktop');
+  let gate = policy.gateTool({ mode: 'operator', surface: 'desktop', toolName: 'start_command', state });
+  t.equal(gate.allowed, false, 'Operator still observes the desktop before launching another instance');
+  t.equal(gate.code, 'operator_process_launch_requires_observation');
+
+  policy.recordToolResult(state, 'capture_screen', { success: true, path: 'desktop-before.png' });
+  policy.recordToolResult(state, 'inspect_screenshot_with_model', {
+    success: true,
+    status: 'appears_satisfied',
+    path: 'desktop-before.png'
+  });
+  gate = policy.gateTool({ mode: 'operator', surface: 'desktop', toolName: 'start_command', state });
+  t.equal(gate.allowed, true, 'the inspected absence/presence sub-goal cannot block the requested project launch');
+  t.equal(state.rawDiagnosticCalls, 0, 'launching a project is not charged against the raw-diagnostic budget');
+
+  policy.recordToolResult(state, 'start_command', { success: true, processId: 'game' });
+  t.equal(state.inspected, false, 'launch invalidates the old screen so the resulting app must be observed fresh');
   t.end();
 });
 

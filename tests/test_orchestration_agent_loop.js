@@ -1120,6 +1120,181 @@ test('Dispatch routes the exact Codex screenshot request to Operator once withou
   t.end();
 });
 
+test('Dispatch routes a project-bound interactive playtest directly to Operator', async t => {
+  const originalFetch = global.fetch;
+  const workspace = 'C:\\Users\\Owner\\Desktop\\Projects\\This is Life';
+  const rawRequest = 'Can we have operator playtest our This is Life project?';
+  const operatorHandoffs = [];
+  const coderHandoffs = [];
+  const harness = installHarness([], {
+    workspace,
+    projects: [workspace],
+    window: {
+      promoteWorkspaceToOperator: async payload => {
+        operatorHandoffs.push(payload);
+        return {
+          success: true,
+          conversationId: 'operator-this-is-life-playtest',
+          taskId: 'task-operator-this-is-life-playtest',
+          title: payload.title,
+          status: 'pending',
+          workspacePath: payload.path
+        };
+      },
+      promoteWorkspaceToCoder: async payload => {
+        coderHandoffs.push(payload);
+        return { success: true, conversationId: 'wrong-coder', taskId: 'wrong-coder-task', status: 'pending' };
+      },
+      startOperatorTaskMonitor: () => {}
+    }
+  });
+  const conv = conversation('dispatch-project-playtest', {
+    workspace,
+    dispatchProjectPath: workspace
+  });
+  try {
+    await global.window.runAgentLoop(rawRequest, 'gemini-1', conv, {
+      semanticIntent: semanticClassification({
+        intent: 'new_task',
+        requiresExecution: true,
+        target: 'current_conversation',
+        resolvedRequest: 'Launch This is Life, interactively playtest it through its visible desktop UI, and report verified findings with screenshots.',
+        reasoningPolicyHint: { complexity: 'medium', risk: 'low', contextNeed: 'project' },
+        executionScope: 'read_only',
+        executionTarget: 'operator',
+        executionSurface: 'desktop',
+        inspectionTarget: 'project',
+        standaloneSystemOperation: false,
+        taskResolution: {
+          title: 'Playtest This is Life',
+          requirements: ['Launch the game', 'Interact through the visible UI', 'Return screenshots and verified findings'],
+          constraints: [],
+          unresolvedDecisions: []
+        }
+      })
+    });
+
+    t.equal(harness.modelTurns, 0, 'the structured execution target routes without a Dispatch model turn');
+    t.equal(operatorHandoffs.length, 1, 'the project playtest creates exactly one Operator task');
+    t.equal(coderHandoffs.length, 0, 'the project binding does not force a redundant Coder task');
+    t.equal(operatorHandoffs[0].path, workspace, 'Operator receives the exact project workspace');
+    t.equal(operatorHandoffs[0].standalone, false, 'the project playtest retains its project binding');
+    t.equal(operatorHandoffs[0].executionSurface, 'desktop', 'the visible execution surface survives routing');
+    t.equal(operatorHandoffs[0].originalUserMessage, rawRequest, 'the original request remains provenance');
+    const finalAssistant = [...conv.messages].reverse().find(message => message.role === 'assistant');
+    t.match(finalAssistant.text, /Operator has task .* queued/i, 'Dispatch reports the real specialist owner');
+    t.notOk(/Coder has task/i.test(finalAssistant.text), 'Dispatch does not report a redundant Coder hop');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('Coder delegation to Operator keeps the same parent task pending until child evidence returns', async t => {
+  const originalFetch = global.fetch;
+  const workspace = 'C:\\Users\\Owner\\Desktop\\Projects\\This is Life';
+  const parentTaskId = 'task-coder-parent-playtest';
+  const childTaskId = 'task-operator-child-playtest';
+  const operatorHandoffs = [];
+  const parentUpdates = [];
+  const finalized = [];
+  installHarness([
+    [{
+      functionCall: {
+        name: 'handoff_to_operator',
+        args: {
+          path: workspace,
+          prompt: 'Launch This is Life, play it through the visible desktop UI, verify movement with fresh screenshots, and return findings.',
+          title: 'Playtest This is Life',
+          executionSurface: 'desktop'
+        }
+      }
+    }]
+  ], {
+    workspace,
+    projects: [workspace],
+    api: {
+      updateOrchestrationTask: async (taskId, patch) => {
+        parentUpdates.push({ taskId, patch });
+        return { success: true };
+      }
+    },
+    window: {
+      claimOrchestrationTask: async taskId => ({
+        success: true,
+        task: {
+          schemaVersion: 4,
+          taskId,
+          title: 'Playtest This is Life project',
+          objective: 'Use Operator to playtest This is Life at its visible desktop interface.',
+          originalUserMessage: 'Can we have operator playtest our This is Life project?',
+          precedingConversationSummary: 'The user asked Dispatch for an interactive playtest of This is Life.',
+          workspacePath: workspace,
+          rootOriginConversationId: 'dispatch-playtest-origin',
+          origin: { conversationId: 'dispatch-playtest-origin' },
+          target: { conversationId: 'coder-playtest-worker', mode: 'coder' },
+          status: 'active',
+          execution: { executionId: 'exec-coder-parent-playtest' }
+        },
+        prompt: 'Use Operator to playtest This is Life at its visible desktop interface.'
+      }),
+      promoteWorkspaceToOperator: async payload => {
+        operatorHandoffs.push(payload);
+        return {
+          success: true,
+          conversationId: 'operator-playtest-worker',
+          taskId: childTaskId,
+          title: payload.title,
+          status: 'pending',
+          workspacePath: payload.path,
+          task: {
+            taskId: childTaskId,
+            title: payload.title,
+            parentTaskId: payload.parentTaskId,
+            rootOriginConversationId: payload.rootOriginConversationId,
+            target: { conversationId: 'operator-playtest-worker', mode: 'operator' }
+          }
+        };
+      },
+      startOperatorTaskMonitor: () => {},
+      finalizeOrchestrationTask: async (taskId, status, details) => {
+        finalized.push({ taskId, status, details });
+        return { taskId, status, delegation: { childTaskId } };
+      },
+      onOrchestrationTaskFinalized: async () => {}
+    }
+  });
+  const conv = conversation('coder-playtest-worker', {
+    mode: 'coder',
+    workspace,
+    dispatchProjectPath: workspace
+  });
+  try {
+    await global.window.runAgentLoop(
+      'Use Operator to playtest This is Life at its visible desktop interface.',
+      'gemini-1',
+      conv,
+      { taskId: parentTaskId, internalPrompt: true }
+    );
+
+    t.equal(operatorHandoffs.length, 1, 'Coder creates one Operator child task');
+    t.equal(operatorHandoffs[0].parentTaskId, parentTaskId, 'the child is linked to the durable Coder parent');
+    t.equal(operatorHandoffs[0].rootOriginConversationId, 'dispatch-playtest-origin', 'root Dispatch ownership survives the second handoff');
+    t.equal(operatorHandoffs[0].originalUserMessage, 'Can we have operator playtest our This is Life project?', 'the child retains the original user request instead of the rendered parent packet');
+    t.match(operatorHandoffs[0].precedingConversationSummary, /Parent task task-coder-parent-playtest/i, 'the child gets a compact parent summary');
+    t.notOk(/Relevant preceding conversation:\s*Task:/i.test(operatorHandoffs[0].precedingConversationSummary), 'the child packet does not recursively embed the rendered parent packet');
+    t.equal(parentUpdates.length, 1, 'the parent records one durable child relationship');
+    t.equal(parentUpdates[0].patch.delegation.childTaskId, childTaskId, 'the relationship points at the exact Operator child');
+    t.equal(finalized.length, 1, 'the Coder parent is finalized once');
+    t.equal(finalized[0].status, 'pending', 'queueing Operator is not treated as parent completion');
+    t.equal(finalized[0].details.reasonCode, 'awaiting_delegated_task', 'the parent records why it is pending');
+    t.match(finalized[0].details.reason, /Waiting for delegated Operator task/i, 'the pending reason names the actual specialist');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
 test('a direct executable request preflights once to Operator and preserves durable handoff provenance', async t => {
   const originalFetch = global.fetch;
   const workspace = 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE';

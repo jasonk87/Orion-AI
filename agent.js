@@ -192,6 +192,8 @@ ${OrionOperatingContract.DOM_BEFORE_PIXEL_CONTROL}
 SCREEN-FIRST EXECUTION:
 - For visible desktop or browser work, inspect the current screen or page before probing processes, package metadata, installation folders, or window handles. If the requested state is already visible, stop investigating and report it.
 - Use open_application when a native app genuinely is not visible. It safely activates an existing matching window or launches the installed app without reverse-engineering AppX metadata through shell commands.
+- When the requested app is a project-local command rather than an installed Start-menu app, inspect the screen once and then use start_command to launch it directly. A launch is an action, not process archaeology; do not open a terminal window and type the same command through computer_action.
+- Use computer_action for visible clicks, typing, hotkeys, and game controls. Never use run_command, terminal_exec, PowerShell automation, WScript.Shell, or SendKeys as a substitute for screen input; those calls cannot ground the action in the screen you inspected.
 - Raw shell diagnostics are a bounded fallback for a concrete blocker, not the normal way to operate a screen. Code enforces a small diagnostic budget so repeated system probes cannot replace visible action.
 
 STATE FRESHNESS — WHEN A FRESH LOOK IS ACTUALLY REQUIRED:
@@ -1479,6 +1481,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let claimedTaskSource = '';
   let claimedTaskTitle = '';
   let claimedTaskExecutionSurface = '';
+  let claimedTaskRecord = null;
   let runTaskExecutionId = '';
   let finalizedTaskState = runTaskId ? 'active' : '';
   let finalizedTaskRecord = null;
@@ -1533,6 +1536,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       return { success: false, skipped: true, taskId: runTaskId };
     }
     runTaskExecutionId = String(claimed.task && claimed.task.execution && claimed.task.execution.executionId || '');
+    claimedTaskRecord = claimed.task && typeof claimed.task === 'object' ? claimed.task : null;
     claimedTaskPrompt = String(claimed.prompt || '');
     claimedTaskSource = String(claimed.task && claimed.task.source || '');
     claimedTaskTitle = String(claimed.task && claimed.task.title || '');
@@ -1697,6 +1701,14 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   // `try`; a block-scoped declaration there is not visible from `finally` and caused otherwise
   // successful phone turns to end with `ReferenceError: workspacePath is not defined`.
   let workspacePath = '';
+  // Specialist delegation is decided inside the model loop but reconciled after that loop during
+  // durable task finalization. Keep the child receipt in the run scope so ordinary runs and
+  // delegated runs both reach finalization without a block-scope ReferenceError.
+  let delegatedChildTask = null;
+  // Assigned once the model loop builds its execution context. Kept in run scope so the finalizer
+  // can close the exact monitor-visible computer/browser control session on success, failure, or
+  // cancellation without affecting a newer task.
+  let toolExecutionContext = null;
   try {
   const config = window.getAppConfig();
   // User-picked reasoning level from the selector next to the input box. 'auto' (the default)
@@ -2749,7 +2761,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     // destructive-command guard correctly blocked.
     if (!Array.isArray(conversation._orionCreatedFiles)) conversation._orionCreatedFiles = [];
     const filesCreatedThisRun = new Set(conversation._orionCreatedFiles);
-    const toolExecutionContext = {
+    toolExecutionContext = {
       filesCreatedThisRun,
       attachedResponseImages,
       lastDesktopSnapshot: null,
@@ -2761,6 +2773,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // gate there can tag acquired leases with the durable task this run belongs to, letting
       // restart reconciliation cross-reference them against reconcileInterrupted's output.
       runTaskId,
+      claimedTaskRecord,
+      operatorControlSession: null,
       rememberCreatedFile: (key) => {
         if (!key) return;
         filesCreatedThisRun.add(key);
@@ -4173,6 +4187,36 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           if (isDispatchHandoffTool(toolName) && result && result.success && !isFailedToolResult(result)) {
             const handoffRoleName = handoffRoleLabel(handoffRoleForTool(toolName));
             dispatchHandoffCommitted = true;
+            // Queueing a child specialist is not completion of the active parent task. Persist the
+            // relationship and leave this task pending until the child's terminal result is fed
+            // back into the same parent task ID.
+            if (runTaskId && runMode !== 'orion' && result.taskId) {
+              delegatedChildTask = result.task && typeof result.task === 'object'
+                ? result.task
+                : {
+                    taskId: String(result.taskId),
+                    title: String(result.title || args.title || `${handoffRoleName} task`),
+                    target: { conversationId: String(result.conversationId || ''), mode: handoffRoleForTool(toolName) }
+                  };
+              if (window.api && typeof window.api.updateOrchestrationTask === 'function') {
+                try {
+                  await window.api.updateOrchestrationTask(runTaskId, {
+                    delegation: {
+                      childTaskId: String(result.taskId),
+                      childConversationId: String(result.conversationId || ''),
+                      childRole: handoffRoleForTool(toolName),
+                      status: String(result.status || 'pending'),
+                      createdAt: Date.now()
+                    }
+                  });
+                } catch (error) {
+                  currentAgentLogs.push({
+                    type: 'thought',
+                    content: `The child task was queued, but parent-task delegation metadata could not be refreshed: ${error.message || error}`
+                  });
+                }
+              }
+            }
             lastTextResponse = `${handoffRoleName} has task ${result.taskId || ''} queued for **${result.title || args.title || 'the requested work'}**. I’ll keep this Dispatch conversation updated with the plan, questions, and verified result.`;
           }
           currentAgentLogs[logIndex].status = isFailedToolResult(result) ? 'error' : 'success';
@@ -5075,11 +5119,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     );
 
     if (runTaskId && typeof window.finalizeOrchestrationTask === 'function') {
+      const awaitingDelegatedChild = !!(delegatedChildTask && delegatedChildTask.taskId);
       const desiredTaskState = (userRequestedStop || currentTaskDeniedByPlanDecision)
         ? 'cancelled'
         : (criticalRunError
           ? 'failed'
-          : ((autoContinueExecution || forceYield || ranOutOfLoopBudget || hasPendingWork || conversation.awaitingPlanApproval || conversation.awaitingClarification)
+          : ((awaitingDelegatedChild || autoContinueExecution || forceYield || ranOutOfLoopBudget || hasPendingWork || conversation.awaitingPlanApproval || conversation.awaitingClarification)
             ? 'pending'
             : 'completed'));
       const finalizedTask = await window.finalizeOrchestrationTask(runTaskId, desiredTaskState, {
@@ -5089,11 +5134,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             ? 'Cancelled by user.'
             : (criticalRunError
               ? String(criticalRunError.message || criticalRunError)
-              : (autoContinueExecution
+              : (awaitingDelegatedChild
+                ? `Waiting for delegated ${handoffRoleLabel(delegatedChildTask.target && delegatedChildTask.target.mode)} task ${delegatedChildTask.taskId}.`
+                : (autoContinueExecution
                 ? 'Execution pass checkpointed after verified progress; the same task will continue automatically.'
                 : (forcedYieldFailure
                   ? `Paused after ${forcedYieldFailure.failureCount || 3} repeated ${forcedYieldFailure.toolName || 'tool'} failures.`
-                  : '')))),
+                  : ''))))),
         summary: userFacingResultSummary.replace(/\s+/g, ' ').slice(0, 1000),
         result: {
           summary: userFacingResultSummary.slice(0, 5000),
@@ -5115,16 +5162,18 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           images: attachedResponseImages.map(image => ({ ...image }))
         },
         conversationId: conversation.id,
-        pendingWork: !!(hasPendingWork || durableBoundaryWork),
+        pendingWork: !!(awaitingDelegatedChild || hasPendingWork || durableBoundaryWork),
         awaitingUser: awaitingUserAtExit,
         resumePolicy: autoContinueExecution ? 'automatic' : (awaitingUserAtExit ? 'user' : 'manual'),
-        reasonCode: autoContinueExecution
+        reasonCode: awaitingDelegatedChild
+          ? 'awaiting_delegated_task'
+          : (autoContinueExecution
           ? 'automatic_action_boundary'
           : (conversation.awaitingPlanApproval
               ? 'awaiting_plan_approval'
               : (conversation.awaitingClarification
                   ? 'awaiting_clarification'
-                  : (forcedYieldFailure ? 'repeated_tool_failure' : (ranOutOfLoopBudget ? 'action_boundary' : 'pending_work')))),
+                  : (forcedYieldFailure ? 'repeated_tool_failure' : (ranOutOfLoopBudget ? 'action_boundary' : 'pending_work'))))),
         continuation: automaticContinuationPrompt
           ? {
               input: automaticContinuationPrompt,
@@ -5160,7 +5209,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         ? 'cancelled'
         : (criticalRunError
           ? 'failed'
-          : ((autoContinueExecution || forceYield || ranOutOfLoopBudget || hasPendingWork
+          : (((delegatedChildTask && delegatedChildTask.taskId) || autoContinueExecution || forceYield || ranOutOfLoopBudget || hasPendingWork
               || conversation.awaitingPlanApproval || conversation.awaitingClarification)
             ? 'pending'
             : 'completed'));
@@ -5388,6 +5437,19 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       taskId: runTaskId
     };
   } finally {
+    if (toolExecutionContext && toolExecutionContext.operatorControlSession
+        && window.api && typeof window.api.endOperatorControl === 'function') {
+      try {
+        await window.api.endOperatorControl({
+          sessionId: toolExecutionContext.operatorControlSession.sessionId,
+          taskId: runTaskId,
+          conversationId: conversation && conversation.id ? conversation.id : ''
+        });
+      } catch (error) {
+        console.error('Could not end the monitor-visible computer control session:', error);
+      }
+      toolExecutionContext.operatorControlSession = null;
+    }
     // Release each reservation independently. The task ID still needs clearing if a
     // finalization await threw after the conversation reservation was altered.
     if (activeRunTaskId === runTaskId) {
@@ -5892,6 +5954,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
       mode: conversation && conversation.mode,
       surface: executionContext.operatorExecutionSurface,
       toolName: name,
+      args,
       state: operatorPolicyState
     });
     if (!policyGate.allowed) {
@@ -5905,10 +5968,51 @@ async function executeTool(name, args, workspace, config, conversation, executio
     if (OperatorExecutionPolicy.RAW_DIAGNOSTIC_TOOLS.has(name)) {
       OperatorExecutionPolicy.recordToolResult(operatorPolicyState, name, { success: true });
     }
+    if (OperatorExecutionPolicy.SCREEN_ACTION_TOOLS.has(name)
+        && typeof OperatorExecutionPolicy.recordToolAttempt === 'function') {
+      OperatorExecutionPolicy.recordToolAttempt(operatorPolicyState, name);
+    }
   }
 
   const leaseGate = await acquireToolResourceLease(name, conversation, executionContext);
   if (leaseGate.blocked) throw new Error(leaseGate.message);
+
+  const browserControlTools = new Set([
+    'open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back',
+    'download_from_page', 'wait_for_page', 'take_screenshot'
+  ]);
+  const desktopControlTools = new Set([
+    'preview_app', 'capture_screen', 'open_application', 'computer_action'
+  ]);
+  const controlSurface = browserControlTools.has(name)
+    ? 'browser'
+    : desktopControlTools.has(name)
+      ? 'desktop'
+      : '';
+  if (controlSurface && !executionContext.operatorControlSession
+      && window.api && typeof window.api.beginOperatorControl === 'function') {
+    const taskId = String(executionContext.runTaskId || '');
+    const conversationId = String(conversation && conversation.id || '');
+    const sessionId = taskId || conversationId;
+    try {
+      const begun = await window.api.beginOperatorControl({
+        sessionId,
+        taskId,
+        conversationId,
+        title: String(executionContext.claimedTaskRecord && executionContext.claimedTaskRecord.title
+          || conversation && conversation.title
+          || 'Active task'),
+        role: String(conversation && conversation.mode || 'operator'),
+        surface: controlSurface
+      });
+      if (begun && begun.success) executionContext.operatorControlSession = { sessionId, surface: controlSurface };
+    } catch (error) {
+      // The visual indicator is an important affordance, but it must not make a safely authorized
+      // action fail if the passive overlay itself cannot be created. The legacy per-action hiding
+      // path remains active in that case.
+      console.error('Could not start the monitor-visible computer control session:', error);
+    }
+  }
 
   switch (name) {
     case 'get_workspace_info': {
@@ -6525,11 +6629,25 @@ async function executeTool(name, args, workspace, config, conversation, executio
       ).trim();
       if (!requestedPath && !isolatedStandaloneHandoff) throw new Error("Missing workspace path to hand off to Operator");
       const prompt = String(args.prompt || '').trim();
+      const parentTask = executionContext.claimedTaskRecord && typeof executionContext.claimedTaskRecord === 'object'
+        ? executionContext.claimedTaskRecord
+        : null;
+      const parentTaskId = String(executionContext.runTaskId || '').trim();
       const originalUserMessage = String(
-        args.originalUserMessage
+        (parentTask && parentTask.originalUserMessage)
+        || args.originalUserMessage
         || [...(conversation.messages || [])].reverse().find(message => message && message.role === 'user')?.text
         || prompt
       ).trim();
+      const parentContextSummary = parentTaskId && parentTask
+        ? [
+            `Parent task ${parentTask.taskId}: ${parentTask.objective || parentTask.title || originalUserMessage}`,
+            parentTask.precedingConversationSummary
+              ? `Original context: ${String(parentTask.precedingConversationSummary).slice(0, 1800)}`
+              : '',
+            prompt ? `Delegated Operator objective: ${prompt}` : ''
+          ].filter(Boolean).join('\n')
+        : '';
       const resolution = isolatedStandaloneHandoff
         ? { success: true, path: '', fuzzyResolved: false, resolvedFrom: '', matchedName: 'Standalone' }
         : await resolveWorkspacePathForChange(requestedPath);
@@ -6576,6 +6694,19 @@ async function executeTool(name, args, workspace, config, conversation, executio
         sourceConversationId: conversation.id,
         sourceSessionId: conversation.sessionId || conversation.id,
         sourceMessageId: (conversation.messages || []).slice().reverse().find(message => message.role === 'user')?.id || '',
+        parentTaskId,
+        rootOriginConversationId: String(
+          parentTask && (parentTask.rootOriginConversationId
+            || (parentTask.origin && parentTask.origin.conversationId))
+          || conversation.id
+        ),
+        precedingConversationSummary: parentContextSummary,
+        executionSurface: String(
+          args.executionSurface
+          || (executionContext.authorizedDispatchHandoffIntent && executionContext.authorizedDispatchHandoffIntent.executionSurface)
+          || executionContext.operatorExecutionSurface
+          || 'desktop'
+        ),
         contextPacketIds,
         findings: Array.isArray(args.findings) ? args.findings : [],
         semanticIntent: executionContext.authorizedDispatchHandoffIntent || undefined
@@ -6922,6 +7053,11 @@ async function executeTool(name, args, workspace, config, conversation, executio
       const timeoutMs = args.timeoutMs || config.commandTimeoutMs || 120000;
       const result = await window.api.startCommand(args.command, workspace, processId, timeoutMs);
       if (!result.success) throw new Error(result.error || 'Failed to start command');
+      if (OperatorExecutionPolicy && operatorPolicyState
+          && OperatorExecutionPolicy.PROCESS_ACTION_TOOLS
+          && OperatorExecutionPolicy.PROCESS_ACTION_TOOLS.has(name)) {
+        OperatorExecutionPolicy.recordToolResult(operatorPolicyState, name, result);
+      }
       // Phase 3 (resource leases, item 11 / restart-recovery, item 12): start_command is the one
       // process tool whose lifetime genuinely outlives this run - the child process keeps running
       // as a background service (dev server, watcher, build daemon) after the tool call returns.
@@ -12167,6 +12303,7 @@ function buildAgentToolDeclarations() {
                 prompt: { type: "STRING", description: "Optional exact task for Operator to start, such as what to click through, fill in, launch, or verify on screen." },
                 originalUserMessage: { type: "STRING", description: "Exact latest user utterance retained separately when prompt is expanded. Orion injects this provenance; do not paraphrase it." },
                 standalone: { type: "BOOLEAN", description: "True when the task is not bound to an existing project. Orion creates an isolated Operator workspace, except local process/application/desktop operations use the home workspace. Never use standalone to bypass resolution for work that depends on project files, tests, builds, installs, or dependencies." },
+                executionSurface: { type: "STRING", enum: ["desktop", "browser", "process"], description: "The concrete surface Operator must control. Use desktop for a visible native app/game, browser for a live web page, and process only for non-visual process lifecycle work." },
                 findings: {
                   type: "ARRAY",
                   items: { type: "STRING" },
@@ -13872,6 +14009,24 @@ async function inspectScreenshotWithOllama({ imageBase64, path, goal, modelName 
 }
 
 // ── Quick single-turn LLM call for Orion's conversational layer (no tools) ─────
+function extractVisibleModelText(response) {
+  if (response && typeof response.text === 'string' && response.text.trim()) {
+    return response.text.trim();
+  }
+  const parts = response
+    && response.candidates
+    && response.candidates[0]
+    && response.candidates[0].content
+    && Array.isArray(response.candidates[0].content.parts)
+      ? response.candidates[0].content.parts
+      : [];
+  return parts
+    .filter(part => part && typeof part.text === 'string' && !part.thought && !part._deepseekReasoningContent)
+    .map(part => part.text)
+    .join('')
+    .trim();
+}
+
 window.quickOrionLLMCall = async function(systemPrompt, userMessages, config, options = {}) {
   // userMessages: array of { role: 'user'|'assistant', content: string }
   // Returns: string response text, or throws
@@ -13905,8 +14060,12 @@ window.quickOrionLLMCall = async function(systemPrompt, userMessages, config, op
     resp = await callGeminiAPI(messages, modelName || 'gemini-2.5-flash', config.geminiApiKey || '', () => {}, true, { reasoningPolicy });
   }
 
-  const text = resp && (resp.text || (resp.candidates && resp.candidates[0] && resp.candidates[0].content && resp.candidates[0].content.parts && resp.candidates[0].content.parts[0] && resp.candidates[0].content.parts[0].text) || '');
-  return String(text).trim();
+  // Provider-normalized responses can put private reasoning before visible content. DeepSeek in
+  // particular returns reasoning_content as a thought-marked first part. Selecting parts[0]
+  // exposed the private draft in lightweight Dispatch replies while the main agent loop correctly
+  // hid it. Project only structured, non-thought text and fail closed when no visible answer
+  // exists; never substitute private reasoning for a missing answer.
+  return extractVisibleModelText(resp);
 };
 
 // GEMINI API UTILITIES
@@ -14275,6 +14434,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     callAnthropicAPI,
     convertGeminiToDeepSeekTools,
     convertGeminiToDeepSeekMessages,
+    extractVisibleModelText,
     estimateDeepSeekRequestTokens,
     fitDeepSeekMessagesToContextWindow,
     callDeepSeekAPI,

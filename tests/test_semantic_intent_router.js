@@ -416,6 +416,20 @@ test('specialist selection distinguishes desktop operation from code and artifac
   t.equal(desktop.executionTarget, 'operator', 'native application and screenshot work selects Operator');
   t.equal(desktop.executionSurface, 'desktop', 'the classifier preserves the structured visible-control surface');
 
+  const projectPlaytest = await router.classify(baseContext('Have Operator playtest the selected game project.'), {
+    structureApi,
+    classify: async () => classification('new_task', {
+      requiresExecution: true,
+      resolvedRequest: 'Use Operator to launch and interactively playtest the selected game project.',
+      executionScope: 'read_only',
+      executionTarget: 'operator',
+      executionSurface: 'desktop',
+      inspectionTarget: 'project'
+    })
+  });
+  t.equal(projectPlaytest.executionTarget, 'operator', 'project-bound visible playtesting keeps the explicitly structured Operator target');
+  t.equal(projectPlaytest.executionSurface, 'desktop', 'project metadata does not erase the desktop interaction surface');
+
   const project = await router.classify(baseContext('Update the approval handling and run its tests.'), {
     structureApi,
     classify: async () => classification('new_task', {

@@ -12,6 +12,7 @@ const ipcComputerUse = require('./lib/ipc-computer-use');
 const ipcWorkspace = require('./lib/ipc-workspace');
 const ipcServer = require('./lib/ipc-server');
 const ipcUi = require('./lib/ipc-ui');
+const operatorControlSession = require('./lib/operator-control-session');
 const symbolIndex = require('./lib/symbol-index');
 const ipcSkill = require('./lib/ipc-skill');
 const ipcMemory = require('./lib/ipc-memory');
@@ -211,6 +212,7 @@ function registerAllHandlers() {
   ipcWorkspace.registerHandlers(ipcMain, { startStaticWorkspaceServer });
   ipcServer.registerHandlers(ipcMain, { Notification });
   ipcUi.registerHandlers(ipcMain);
+  operatorControlSession.registerHandlers(ipcMain);
   symbolIndex.registerHandlers(ipcMain);
   ipcSkill.registerHandlers(ipcMain);
   ipcMemory.registerHandlers(ipcMain);
@@ -385,6 +387,10 @@ if (!isTestRuntime && !gotTheLock) {
 } else {
   app.on('second-instance', () => {
     if (shared.mainWindow) {
+      // A second shortcut launch must not pull Orion over the application an active Operator run
+      // is controlling. The passive always-on-top indicator is the visible ownership signal until
+      // that exact run ends.
+      if (shared.operatorControlSession && shared.operatorControlSession.active) return;
       if (shared.mainWindow.isMinimized()) shared.mainWindow.restore();
       shared.mainWindow.focus();
     }
