@@ -507,6 +507,11 @@
       capturedAt: now,
       now
     });
+    const executionSurface = ['none', 'desktop', 'browser', 'process'].includes(
+      compactInline(input.executionSurface || semanticIntent.executionSurface).toLowerCase()
+    )
+      ? compactInline(input.executionSurface || semanticIntent.executionSurface).toLowerCase()
+      : 'none';
 
     const task = {
       schemaVersion: SCHEMA_VERSION,
@@ -524,6 +529,7 @@
       images: normalizeImageAttachments(taskImageInput(input)),
       contextPacketIds: taskContextPacketIds(input),
       executionProfile,
+      executionSurface,
       origin,
       target,
       supersedesTaskId,
@@ -620,6 +626,9 @@
         capturedAt: record.createdAt || record.timestamp || now,
         now
       }),
+      executionSurface: ['none', 'desktop', 'browser', 'process'].includes(compactInline(record.executionSurface).toLowerCase())
+        ? compactInline(record.executionSurface).toLowerCase()
+        : 'none',
       continuation: continuationRecord && compactWhitespace(continuationRecord.input || continuationRecord.prompt || '')
         ? {
             input: compactWhitespace(continuationRecord.input || continuationRecord.prompt || ''),
@@ -1036,6 +1045,16 @@
     // (defaulting to 'Coder', the only real specialist today) instead of hardcoded into every
     // branch below, so a second specialist's presentation reuses this same status machine.
     const roleLabel = compactWhitespace(context.roleLabel || taskValue.roleLabel || '') || 'Coder';
+    const roleMode = compactInline(
+      context.roleMode
+      || taskValue.target && taskValue.target.mode
+      || ''
+    ).toLowerCase();
+    const operatorTask = roleMode === 'operator' || roleLabel.toLowerCase() === 'operator';
+    const operatorControlling = operatorTask
+      && (subStatus.startsWith('Operator is controlling') || subStatus.startsWith('Operator is opening'));
+    const operatorObserving = operatorTask
+      && (subStatus.startsWith('Operator is observing') || subStatus.startsWith('Operator is inspecting'));
 
     let phase = status;
     let label;
@@ -1066,6 +1085,24 @@
       detail = detail || `Waiting for ${roleLabel} to claim this task.`;
       agentState = `${roleLabel} queued`;
       badgeClass = 'warning';
+    } else if (status === TASK_STATES.ACTIVE && operatorControlling) {
+      phase = 'controlling-screen';
+      label = 'Operator controlling';
+      detail = detail || 'Operator is controlling the desktop for this task.';
+      agentState = 'Operator active';
+      badgeClass = 'operator';
+    } else if (status === TASK_STATES.ACTIVE && operatorObserving) {
+      phase = 'observing-screen';
+      label = 'Operator observing';
+      detail = detail || 'Operator is inspecting the visible desktop state.';
+      agentState = 'Operator active';
+      badgeClass = 'operator';
+    } else if (status === TASK_STATES.ACTIVE && operatorTask) {
+      phase = 'operator-active';
+      label = 'Operator active';
+      detail = detail || 'Operator is working through the visible desktop task.';
+      agentState = 'Operator active';
+      badgeClass = 'operator';
     } else if (status === TASK_STATES.ACTIVE && verifying) {
       phase = 'verifying';
       label = `${roleLabel} verifying`;
@@ -1121,13 +1158,14 @@
       : null;
     const subStatus = compactWhitespace(input.subStatus || '');
     const executionMode = compactInline(input.executionMode || '').toLowerCase();
+    const liveRole = compactInline(input.liveRole || '').toLowerCase();
     const liveAgentState = /run_tests|test|verif/i.test(subStatus)
       ? 'Verifying'
       : (/running tool/i.test(subStatus) || executionMode === 'executing' || executionMode === 'direct'
         ? 'Acting'
         : 'Thinking');
     const agentState = conversationRunning
-      ? liveAgentState
+      ? (liveRole === 'operator' ? 'Operator active' : liveAgentState)
       : (awaitingPlanApproval
         ? 'Review'
         : (supervisedPresentation ? supervisedPresentation.agentState : 'Ready'));

@@ -1,3 +1,5 @@
+process.env.NODE_ENV = 'test';
+
 const test = require('tape');
 const fs = require('fs');
 const path = require('path');
@@ -1087,7 +1089,8 @@ test('Dispatch execution authority comes from structured intent, not request/ref
   t.ok(/identify the intended local target/i.test(prompt), 'the Coder prompt resolves ambiguous process identity safely');
   t.ok(/verify the result/i.test(prompt), 'the Coder prompt requires outcome verification');
   t.ok(agentJs.includes('MUST call handoff_to_coder'), 'Dispatch system instructions state the permission-boundary invariant');
-  t.ok(agentJs.includes('synthesize the allowed Coder'), 'the invariant is enforced in code, not only prose');
+  t.ok(agentJs.includes('handoffToolForRole(handoffRole)') && agentJs.includes('synthesize the allowed specialist'),
+    'the invariant is enforced through the role-aware handoff path, not only prose');
   t.ok(agentJs.includes('semanticIntent.requiresExecution === true'), 'the runtime consumes structured execution authority');
   t.notOk(agentJs.includes('instructionAnalysis.requiresCoderExecution'), 'the old phrase-analysis execution property is gone');
   t.end();
@@ -1176,8 +1179,9 @@ test('Operator receives a narrower, desktop/browser-execution tool surface, not 
 
   t.ok(operatorTools.length > 0 && operatorTools.length < coderTools.length,
     'Operator receives a strictly narrower tool surface than Coder');
-  t.ok(operatorTools.every(name => coderTools.includes(name)),
-    'Operator is offered only tools that exist in the full surface');
+  const operatorOnlyTools = new Set(['open_application']);
+  t.ok(operatorTools.every(name => coderTools.includes(name) || operatorOnlyTools.has(name)),
+    'Operator tools come from the shared surface except for its bounded role-specific app opener');
 
   // Not code/mission/skill tools, per the brief.
   t.notOk(operatorTools.includes('patch_file'), 'Operator cannot edit source files');
@@ -1193,6 +1197,8 @@ test('Operator receives a narrower, desktop/browser-execution tool surface, not 
 
   // The categories the brief did name.
   t.ok(operatorTools.includes('computer_action'), 'Operator has native desktop control');
+  t.ok(operatorTools.includes('open_application'), 'Operator has a bounded screen-first app opener');
+  t.notOk(coderTools.includes('open_application'), 'Coder does not receive the Operator-only app opener');
   for (const browserTool of ['open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back', 'download_from_page', 'wait_for_page', 'take_screenshot']) {
     t.ok(operatorTools.includes(browserTool), `Operator has the full browser-worker tool: ${browserTool}`);
   }

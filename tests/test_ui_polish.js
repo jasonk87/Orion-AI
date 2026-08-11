@@ -48,11 +48,13 @@ test('phone companion finishes with the same dark theme and complete mission hie
   t.ok(companionHtml.includes('#task-list-card { grid-area: mission; }'), 'Task List has an explicit mobile layout area');
   t.ok(companionHtml.includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
   t.ok(companionHtml.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
-  t.ok(companionHtml.includes('operator-phone-mode-v26'), 'phone shell exposes the current UI build version');
-  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v24"), 'phone service worker cache is bumped for the current UI build');
+  t.ok(companionHtml.includes('operator-phone-mode-v28'), 'phone shell exposes the current UI build version');
+  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v25"), 'phone service worker cache is bumped for the current UI build');
   t.ok(companionHtml.includes('window.isSecureContext'), 'phone explains when browser push is blocked by an insecure context');
   t.ok(companionHtml.includes('Phone push needs HTTPS or localhost'), 'phone tells the user that HTTPS is required for push notifications');
   t.ok(companionHtml.includes("companionFetch('/api/push-subscribe'"), 'phone stores push subscriptions through the authenticated fetch path');
+  t.ok(companionHtml.includes('PUSH_SUBSCRIPTION_REFRESH_REQUIRED'), 'phone silently renews a provider-expired push subscription');
+  t.ok(companionHtml.includes('setupPushNotifications({ forceRefresh: true })'), 'phone reacts to server-side invalidation without re-pairing');
   t.end();
 });
 
@@ -439,6 +441,22 @@ test('agent presence communicates meaningful execution phases', (t) => {
   t.ok(companionHtml.includes('resolvePhoneConversationPresentation')
       && taskOrchestration.includes("? 'Verifying'"),
     'phone uses the shared verification state language');
+  t.ok(styles.includes('data-agent-role="operator"') && styles.includes('SCREEN CONTROL'), 'desktop exposes a distinct compact screen-control banner');
+  t.ok(companionHtml.includes('operator-control') && companionHtml.includes('Screen control ·'), 'phone identifies active Operator takeover instead of generic activity');
+  t.ok(companionHtml.includes("roleLabel: supervisedTask.target && supervisedTask.target.mode === 'operator' ? 'Operator' : 'Coder'"), 'phone derives the specialist label from the durable task role');
+  t.end();
+});
+
+test('chat images open in zoomable viewers on desktop and phone', t => {
+  t.ok(html.includes('id="file-viewer-image-viewport"'), 'desktop has a scrollable full-size image viewport');
+  t.ok(html.includes('id="btn-file-viewer-zoom-in"'), 'desktop exposes explicit zoom controls');
+  t.ok(renderer.includes('wireChatImageOpeners(bubble)'), 'desktop binds rendered chat images to the viewer');
+  t.ok(renderer.includes('openChatImageViewer(image)'), 'desktop opens the selected rendered image itself');
+  t.ok(styles.includes('.file-viewer-image-viewport'), 'desktop zoomed images have a scrollable surface');
+  t.ok(companionHtml.includes('id="image-lightbox"'), 'phone has a full-screen image lightbox');
+  t.ok(companionHtml.includes("target.closest('.message-image')"), 'phone binds chat image taps through the real message container');
+  t.ok(companionHtml.includes('setImageLightboxZoom'), 'phone exposes bounded image zoom behavior');
+  t.ok(companionHtml.includes('img.sourceConversationId || defaultConversationId'), 'relayed worker images load from their actual source conversation');
   t.end();
 });
 
@@ -533,10 +551,14 @@ test('Dispatch routes cancellation and supervision by exact active task ownershi
   const cancelEnd = renderer.indexOf('\nasync function cancelPendingTasksForNewFocus', cancelStart);
   const cancelPath = renderer.slice(cancelStart, cancelEnd);
   const matchingReceiptGuard = cancelPath.indexOf('if (originConv && cancelledLaunchedTask)');
+  const reconcileStart = renderer.indexOf('function reconcileDelegatedTaskCancellation');
+  const reconcileEnd = renderer.indexOf('\n// ── Supervisor completion notification', reconcileStart);
+  const reconcilePath = renderer.slice(reconcileStart, reconcileEnd);
   t.ok(
     matchingReceiptGuard >= 0
-      && cancelPath.indexOf('originConv.lastDelegatedWork =', matchingReceiptGuard) > matchingReceiptGuard
-      && cancelPath.indexOf('originConv.launchedCoderTaskId = null', matchingReceiptGuard) > matchingReceiptGuard,
+      && cancelPath.indexOf('reconcileDelegatedTaskCancellation(originConv, result.task', matchingReceiptGuard) > matchingReceiptGuard
+      && reconcilePath.includes("if (String(orionConv.launchedCoderTaskId || '') === taskId)")
+      && reconcilePath.includes('orionConv.launchedCoderTaskId = null'),
     'cancelling pending task B cannot clear active task A pointers or receipt'
   );
   t.end();

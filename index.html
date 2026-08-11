@@ -371,7 +371,15 @@
         <pre id="file-viewer-content" class="file-viewer-content"></pre>
         <div id="file-viewer-markdown" class="file-viewer-markdown message-body" hidden></div>
         <div id="file-viewer-image-shell" class="file-viewer-image-shell" hidden>
-          <img id="file-viewer-image" class="file-viewer-image" alt="Screenshot artifact preview">
+          <div id="file-viewer-image-viewport" class="file-viewer-image-viewport">
+            <img id="file-viewer-image" class="file-viewer-image" alt="Screenshot artifact preview">
+          </div>
+          <div class="file-viewer-image-controls" aria-label="Image zoom controls">
+            <button id="btn-file-viewer-zoom-out" class="btn-secondary" type="button" aria-label="Zoom out">&minus;</button>
+            <button id="btn-file-viewer-zoom-reset" class="btn-secondary" type="button">Fit</button>
+            <button id="btn-file-viewer-zoom-in" class="btn-secondary" type="button" aria-label="Zoom in">+</button>
+            <span id="file-viewer-zoom-label" class="file-viewer-zoom-label">100%</span>
+          </div>
           <div id="file-viewer-image-meta" class="file-viewer-image-meta"></div>
         </div>
       </div>
@@ -634,6 +642,7 @@
   <script src="task-orchestration.js"></script>
   <script src="supervisor-orchestration.js"></script>
   <script src="prompt-submission.js"></script>
+  <script src="operator-execution-policy.js"></script>
   <script src="renderer.js"></script>
   <script src="agent.js"></script>
 </body>

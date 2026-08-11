@@ -3007,9 +3007,9 @@ test('a blank final response after real tool work is nudged to produce an actual
 });
 
 // Dispatch cannot execute process mutations itself, but that boundary must route work rather than
-// return it to the user. A real conversation required the user to explicitly demand Coder after a
-// long permission refusal. The loop now synthesizes the handoff tool call deterministically.
-test('Dispatch preflights a kill/restart request into one Coder handoff without a Dispatch model pass', async (t) => {
+// return it to the user. Native application/process work belongs to Operator, and the loop must
+// synthesize that handoff deterministically without accepting a permission refusal.
+test('Dispatch preflights a kill/restart request into one Operator handoff without a Dispatch model pass', async (t) => {
   const originalRunAgentLoop = global.window.runAgentLoop;
   const originalSetTimeout = global.setTimeout;
   const originalFetch = global.fetch;
@@ -3021,7 +3021,7 @@ test('Dispatch preflights a kill/restart request into one Coder handoff without 
   global.window.clearActiveAiBubble = () => {};
   global.window.saveConversationsToStorage = () => {};
   global.window.getKnownProjects = () => [];
-  global.window.startCoderTaskMonitor = () => {};
+  global.window.startOperatorTaskMonitor = () => {};
   global.window.api = {
     listFiles: async () => ([]),
     readFile: async () => '',
@@ -3030,9 +3030,9 @@ test('Dispatch preflights a kill/restart request into one Coder handoff without 
   };
 
   const handoffs = [];
-  global.window.promoteWorkspaceToCoder = async (payload) => {
+  global.window.promoteWorkspaceToOperator = async (payload) => {
     handoffs.push(payload);
-    return { success: true, conversationId: 'coder-kill-restart', title: payload.title || 'Coder Task' };
+    return { success: true, conversationId: 'operator-kill-restart', title: payload.title || 'Operator Task' };
   };
 
   const request = 'Can you kill Claude and restart it again?';
@@ -3070,21 +3070,21 @@ test('Dispatch preflights a kill/restart request into one Coder handoff without 
         })
       };
     }
-    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'Coder has the kill/restart task and will verify the replacement process.' }] } }] }) };
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'Operator has the kill/restart task and will verify the replacement process.' }] } }] }) };
   };
 
   try {
     global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
     await window.runAgentLoop(request, 'gemini-1', conversation);
 
-    t.equal(handoffs.length, 1, 'handoff_to_coder executes exactly once');
+    t.equal(handoffs.length, 1, 'handoff_to_operator executes exactly once');
     t.equal(modelTurn, 0, 'the full Dispatch model is never called before delegation');
-    t.equal(handoffs[0].open, false, 'Dispatch remains visible to supervise the Coder task');
+    t.equal(handoffs[0].open, false, 'Dispatch remains visible to supervise the Operator task');
     t.ok(handoffs[0].prompt.includes(request), 'the handoff preserves the exact user request');
-    t.ok(/identify the intended local target/i.test(handoffs[0].prompt), 'Coder is instructed to resolve which Claude process is meant');
+    t.ok(/identify the intended local target/i.test(handoffs[0].prompt), 'Operator is instructed to resolve which Claude process is meant');
     const aiMessage = conversation.messages.find(m => m.role === 'assistant');
     const calledTools = (aiMessage?.turns || []).flatMap(turn => turn.modelParts || []).map(part => part.functionCall?.name).filter(Boolean);
-    t.ok(calledTools.includes('handoff_to_coder'), 'the persisted model turn contains a real matching handoff function call');
+    t.ok(calledTools.includes('handoff_to_operator'), 'the persisted model turn contains a real matching handoff function call');
     t.notOk(/you(?:'ll| will)? need to|manually from your terminal/i.test(aiMessage?.text || ''), 'the forbidden manual-restart refusal is not accepted as the final answer');
   } finally {
     global.window.runAgentLoop = originalRunAgentLoop;

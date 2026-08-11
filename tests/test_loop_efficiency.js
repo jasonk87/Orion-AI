@@ -495,9 +495,15 @@ test('personal facts are retrieved during casual conversation, not just task wor
 
   try {
     // 'recent' is the scope a casual greeting/question resolves to — the exact case that lost memory.
-    await agent.refreshOrionMemoryBlock({ someKey: true }, 'how is the weather here today?', 'orion', { contextScope: 'recent' });
+    await agent.refreshOrionMemoryBlock(
+      { someKey: true },
+      'how is the weather here today?',
+      'orion',
+      { contextScope: 'recent' },
+      { needed: true, query: 'user home location', confidence: 0.98 }
+    );
     t.equal(rankCalls.length, 1, 'facts are ranked even on a low-effort casual turn');
-    t.ok(/weather/.test(rankCalls[0].query), 'ranking uses the actual user message');
+    t.equal(rankCalls[0].query, 'user home location', 'ranking uses the resolved semantic dependency instead of literal wording');
 
     // A truly context-free turn (no query) still has nothing to rank against — that is fine.
     rankCalls.length = 0;

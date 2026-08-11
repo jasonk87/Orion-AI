@@ -214,13 +214,21 @@ const el = {
   fileViewerContent: document.getElementById('file-viewer-content'),
   fileViewerMarkdown: document.getElementById('file-viewer-markdown'),
   fileViewerImageShell: document.getElementById('file-viewer-image-shell'),
+  fileViewerImageViewport: document.getElementById('file-viewer-image-viewport'),
   fileViewerImage: document.getElementById('file-viewer-image'),
   fileViewerImageMeta: document.getElementById('file-viewer-image-meta'),
+  fileViewerZoomLabel: document.getElementById('file-viewer-zoom-label'),
+  btnFileViewerZoomOut: document.getElementById('btn-file-viewer-zoom-out'),
+  btnFileViewerZoomReset: document.getElementById('btn-file-viewer-zoom-reset'),
+  btnFileViewerZoomIn: document.getElementById('btn-file-viewer-zoom-in'),
   btnFileViewerClose: document.getElementById('btn-file-viewer-close'),
   btnFileViewerMention: document.getElementById('btn-file-viewer-mention')
 };
 
 let viewedFilePath = '';
+let fileViewerImageZoom = 1;
+let fileViewerImageFitWidth = 0;
+let fileViewerImageFitHeight = 0;
 let agentPresenceTimer = null;
 let agentCompletionTimer = null;
 
@@ -2008,6 +2016,76 @@ function setupFileViewerModal() {
     if (viewedFilePath) insertFileReference(viewedFilePath);
     closeFileViewer();
   });
+  if (el.btnFileViewerZoomOut) el.btnFileViewerZoomOut.addEventListener('click', () => setFileViewerImageZoom(fileViewerImageZoom / 1.25));
+  if (el.btnFileViewerZoomReset) el.btnFileViewerZoomReset.addEventListener('click', () => setFileViewerImageZoom(1));
+  if (el.btnFileViewerZoomIn) el.btnFileViewerZoomIn.addEventListener('click', () => setFileViewerImageZoom(fileViewerImageZoom * 1.25));
+  if (el.fileViewerImage) {
+    el.fileViewerImage.addEventListener('load', fitFileViewerImage);
+    el.fileViewerImage.addEventListener('dblclick', () => setFileViewerImageZoom(fileViewerImageZoom > 1 ? 1 : 2));
+  }
+  if (el.fileViewerImageViewport) {
+    el.fileViewerImageViewport.addEventListener('wheel', event => {
+      if (!event.ctrlKey) return;
+      event.preventDefault();
+      setFileViewerImageZoom(fileViewerImageZoom * (event.deltaY < 0 ? 1.15 : (1 / 1.15)));
+    }, { passive: false });
+  }
+}
+
+function fitFileViewerImage() {
+  if (!el.fileViewerImage || !el.fileViewerImageViewport || !el.fileViewerImage.naturalWidth) return;
+  const viewportWidth = Math.max(1, el.fileViewerImageViewport.clientWidth - 2);
+  const viewportHeight = Math.max(1, el.fileViewerImageViewport.clientHeight - 2);
+  const fitScale = Math.min(
+    1,
+    viewportWidth / el.fileViewerImage.naturalWidth,
+    viewportHeight / el.fileViewerImage.naturalHeight
+  );
+  fileViewerImageFitWidth = Math.max(1, Math.round(el.fileViewerImage.naturalWidth * fitScale));
+  fileViewerImageFitHeight = Math.max(1, Math.round(el.fileViewerImage.naturalHeight * fitScale));
+  setFileViewerImageZoom(1);
+}
+
+function setFileViewerImageZoom(value) {
+  fileViewerImageZoom = Math.min(8, Math.max(0.25, Number(value) || 1));
+  if (el.fileViewerImage && fileViewerImageFitWidth && fileViewerImageFitHeight) {
+    el.fileViewerImage.style.width = `${Math.round(fileViewerImageFitWidth * fileViewerImageZoom)}px`;
+    el.fileViewerImage.style.height = `${Math.round(fileViewerImageFitHeight * fileViewerImageZoom)}px`;
+    el.fileViewerImage.style.cursor = fileViewerImageZoom > 1 ? 'zoom-out' : 'zoom-in';
+  }
+  if (el.fileViewerZoomLabel) el.fileViewerZoomLabel.textContent = `${Math.round(fileViewerImageZoom * 100)}%`;
+}
+
+function openChatImageViewer(image) {
+  const source = image && (image.currentSrc || image.getAttribute('src'));
+  if (!source) {
+    showToast('That image is still loading.', 'attention');
+    return;
+  }
+  viewedFilePath = '';
+  el.fileViewerTitle.textContent = image.getAttribute('alt') || 'Chat image';
+  setFileViewerMode('image');
+  if (el.fileViewerImageMeta) el.fileViewerImageMeta.textContent = 'Use the controls, Ctrl+wheel, or double-click to zoom.';
+  if (el.fileViewerImage) el.fileViewerImage.src = source;
+  if (el.btnFileViewerMention) el.btnFileViewerMention.hidden = true;
+  el.fileViewerModal.classList.add('active');
+  if (el.fileViewerImage && el.fileViewerImage.complete) requestAnimationFrame(fitFileViewerImage);
+}
+
+function wireChatImageOpeners(container) {
+  if (!container) return;
+  container.querySelectorAll('.assistant-response-image img, .user-message-image').forEach(image => {
+    image.tabIndex = 0;
+    image.setAttribute('role', 'button');
+    image.setAttribute('aria-label', `Open ${image.getAttribute('alt') || 'chat image'} at full size`);
+    image.addEventListener('click', () => openChatImageViewer(image));
+    image.addEventListener('keydown', event => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openChatImageViewer(image);
+      }
+    });
+  });
 }
 
 async function openFileViewer(relPath) {
@@ -2067,6 +2145,7 @@ async function openImageArtifact(item) {
     return;
   }
   viewedFilePath = relPath;
+  if (el.btnFileViewerMention) el.btnFileViewerMention.hidden = false;
   el.fileViewerTitle.textContent = relPath;
   setFileViewerMode('image');
   if (el.fileViewerImageMeta) el.fileViewerImageMeta.textContent = 'Loading screenshot...';
@@ -2219,6 +2298,11 @@ function setFileViewerMode(mode) {
 
 function closeFileViewer() {
   viewedFilePath = '';
+  fileViewerImageFitWidth = 0;
+  fileViewerImageFitHeight = 0;
+  setFileViewerImageZoom(1);
+  if (el.fileViewerImage) el.fileViewerImage.removeAttribute('src');
+  if (el.btnFileViewerMention) el.btnFileViewerMention.hidden = false;
   setFileViewerMode('text');
   if (el.fileViewerModal) el.fileViewerModal.classList.remove('active');
 }
@@ -3524,20 +3608,7 @@ window.cancelOwnedOrchestrationTask = async function(taskId, requesterConversati
     && String(originConv.launchedCoderTaskId || '') === String(taskId)
   );
   if (originConv && cancelledLaunchedTask) {
-    originConv.lastDelegatedWork = {
-      taskId,
-      coderConversationId: targetId || '',
-      title: result.task.title,
-      projectPath: result.task.workspacePath || '',
-      status: 'cancelled',
-      subStatus: 'Cancelled',
-      startedAt: result.task.startedAt || 0,
-      completedAt: result.task.cancelledAt || Date.now(),
-      pendingCount: 0
-    };
-    originConv.launchedCoderConvId = null;
-    originConv.launchedCoderTaskId = null;
-    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(originConv.id);
+    reconcileDelegatedTaskCancellation(originConv, result.task, originConv.launchedTaskRole || 'coder');
   }
   saveConversationsToStorage();
   renderDesktopDispatchLanding();
@@ -5903,7 +5974,7 @@ function renderUserMessage(text, images = [], timestamp = null) {
   const timeStr = formatMsgTime(timestamp || Date.now());
   const imgsHtml = (images && images.length)
     ? images.map(img =>
-        `<img src="data:${escapeHtml(img.mimeType)};base64,${img.data}" alt="attached image" `
+        `<img class="user-message-image" src="data:${escapeHtml(img.mimeType)};base64,${img.data}" alt="attached image" `
         `style="max-width:100%;max-height:280px;border-radius:8px;margin-top:8px;display:block;border:1px solid rgba(151,164,196,.15);">`
       ).join('')
     : '';
@@ -5915,6 +5986,7 @@ function renderUserMessage(text, images = [], timestamp = null) {
     <div class="message-body">${escapeHtml(text).replace(/\n/g, '<br>')}${imgsHtml}</div>
   `;
   sanitizeRenderedMarkdown(bubble);
+  wireChatImageOpeners(bubble);
   el.messagesContainer.appendChild(bubble);
   scrollChatToBottomIfNeeded(stickToBottom);
 }
@@ -6518,6 +6590,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
   `;
   sanitizeRenderedMarkdown(bubble);
   hydrateAssistantResponseImages(bubble);
+  wireChatImageOpeners(bubble);
 
   // Format code blocks
   if (isNew) {
@@ -10032,6 +10105,59 @@ function summarizeCoderCompletion(durableTask, coderConv) {
   };
 }
 
+function reconcileDelegatedTaskCancellation(orionConv, durableTask, fallbackRole = 'coder') {
+  if (!orionConv || !durableTask || String(durableTask.status || '') !== 'cancelled') return false;
+  const taskId = String(durableTask.taskId || durableTask.id || '');
+  if (!taskId) return false;
+  const targetConversationId = String(durableTask.target && durableTask.target.conversationId || '');
+  const targetConv = targetConversationId ? conversations.find(conv => conv.id === targetConversationId) : null;
+  const targetMode = String(
+    durableTask.target && durableTask.target.mode
+    || targetConv && conversationMode(targetConv)
+    || orionConv.launchedTaskRole
+    || fallbackRole
+  ).toLowerCase();
+  const role = targetMode === 'operator' ? 'operator' : 'coder';
+  const roleName = role === 'operator' ? 'Operator' : 'Coder';
+  const taskTitle = String(durableTask.title || orionConv.launchedCoderTaskTitle || `${roleName} task`);
+
+  notifyOrionConversation(
+    orionConv,
+    `Cancelled **${taskTitle}**. ${roleName} will not continue this task, and it was not recorded as completed.`,
+    'supervisor-cancellation',
+    {
+      orchestrationTaskId: taskId,
+      orchestrationStatus: 'cancelled'
+    }
+  );
+  orionConv.lastDelegatedWork = {
+    taskId,
+    coderConversationId: targetConversationId,
+    title: taskTitle,
+    objective: durableTask.objective || '',
+    projectPath: durableTask.workspacePath || inferDispatchProjectPath(orionConv),
+    status: 'cancelled',
+    subStatus: 'Cancelled',
+    startedAt: durableTask.startedAt || orionConv.launchedCoderTaskStart || 0,
+    completedAt: durableTask.cancelledAt || Date.now(),
+    pendingCount: 0,
+    role
+  };
+  if (String(orionConv.launchedCoderTaskId || '') === taskId) {
+    orionConv.launchedCoderConvId = null;
+    orionConv.launchedCoderTaskId = null;
+    orionConv.launchedCoderTaskTitle = null;
+    orionConv.launchedCoderTaskStart = null;
+    orionConv.launchedTaskRole = null;
+    orionConv.awaitingDelegatedPlan = null;
+    orionConv.revisingDelegatedPlan = null;
+  }
+  orionConv.updatedAt = Date.now();
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+  if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+  return true;
+}
+
 // ── Supervisor completion notification ────────────────────────────────────────
 async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTaskId = '') {
   if (!finishedCoderConvId) return;
@@ -10073,14 +10199,7 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
         && (!_coderTaskMonitorMeta.taskId || _coderTaskMonitorMeta.taskId === taskId)) {
       stopCoderTaskMonitor(_coderTaskMonitorMeta);
     }
-    orionConv.launchedCoderConvId = null;
-    orionConv.launchedCoderTaskId = null;
-    orionConv.launchedCoderTaskTitle = null;
-    orionConv.launchedCoderTaskStart = null;
-    orionConv.awaitingDelegatedPlan = null;
-    orionConv.revisingDelegatedPlan = null;
-    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
-    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    reconcileDelegatedTaskCancellation(orionConv, durableTask, 'coder');
     return;
   }
 
@@ -10363,13 +10482,7 @@ async function notifySupervisorOfOperatorCompletion(finishedOperatorConvId, expe
         && (!_operatorTaskMonitorMeta.taskId || _operatorTaskMonitorMeta.taskId === taskId)) {
       stopOperatorTaskMonitor(_operatorTaskMonitorMeta);
     }
-    orionConv.launchedCoderConvId = null;
-    orionConv.launchedCoderTaskId = null;
-    orionConv.launchedCoderTaskTitle = null;
-    orionConv.launchedCoderTaskStart = null;
-    orionConv.launchedTaskRole = null;
-    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
-    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    reconcileDelegatedTaskCancellation(orionConv, durableTask, 'operator');
     return;
   }
 
@@ -10622,13 +10735,20 @@ function syncDispatchCoderStatusCard(
     card.dataset.taskId = String(task.taskId || '');
     card.dataset.taskStatus = presentation.status;
     card.dataset.taskPhase = presentation.phase;
+    card.dataset.agentRole = String(task.target && task.target.mode || 'coder').toLowerCase();
+    card.setAttribute('aria-label', card.dataset.agentRole === 'operator'
+      ? `Operator screen control: ${task.title || 'desktop task'}`
+      : `Coder task: ${task.title || 'task'}`);
   }
   return true;
 }
 
 function hideCoderStatusCard() {
   const card = document.getElementById('coder-task-status-card');
-  if (card) card.classList.remove('visible');
+  if (card) {
+    card.classList.remove('visible');
+    delete card.dataset.agentRole;
+  }
 }
 
 // The label shown on the live progress pill.

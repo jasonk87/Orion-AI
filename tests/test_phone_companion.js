@@ -1107,7 +1107,11 @@ test('Phone Companion v2 notify IPC reports desktop and phone delivery', async (
   const notifyHandler = electron.ipcHandlers['notify-phone'];
   t.ok(notifyHandler, 'notify-phone IPC handler is registered');
 
-  const result = await notifyHandler(null, { title: 'Orion AI', body: 'Task complete' });
+  const result = await notifyHandler(null, {
+    title: 'Orion AI',
+    body: 'Task complete',
+    conversationId: 'dispatch-reminder-conversation'
+  });
   t.equal(result.success, true, 'notification handler reports overall success');
   t.equal(result.desktop.success, true, 'desktop notification succeeds');
   t.equal(result.phone.sent, 1, 'phone push sends to the subscribed device');
@@ -1117,7 +1121,17 @@ test('Phone Companion v2 notify IPC reports desktop and phone delivery', async (
   const pushSend = webPushCalls.find(call => call.type === 'sendNotification');
   t.ok(pushSend, 'web-push sendNotification is called');
   t.deepEqual(pushSend.subscription, pushSubscription, 'web-push receives the stored subscription');
-  t.deepEqual(JSON.parse(pushSend.payload), { title: 'Orion AI', body: 'Task complete' }, 'web-push payload carries title and body');
+  t.deepEqual(JSON.parse(pushSend.payload), {
+    title: 'Orion AI',
+    body: 'Task complete',
+    conversationId: 'dispatch-reminder-conversation'
+  }, 'web-push payload carries the visible conversation deep-link target');
+
+  const serviceWorker = await request('GET', 1146, '/sw.js');
+  t.equal(serviceWorker.statusCode, 200, 'the companion service worker is available');
+  t.ok(serviceWorker.text.includes("data: {\n      conversationId"), 'the notification stores its conversation target');
+  t.ok(serviceWorker.text.includes("type: 'orion-notification-open'"), 'an already-open companion receives the exact conversation target');
+  t.ok(serviceWorker.text.includes("/?conversation="), 'a closed companion opens on a conversation deep link');
 
   await closeServer(main.getCompanionServer());
 });
@@ -1151,6 +1165,126 @@ test('paired phone authenticates VAPID setup, persists its subscription, and rec
   t.equal(delivered.phone.sent, 1, 'the newly persisted subscription receives the next push');
   const pushSend = webPushCalls.find(call => call.type === 'sendNotification');
   t.deepEqual(pushSend.subscription, pushSubscription, 'delivery uses the subscription saved by the phone endpoint');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('expired push subscription renews without pairing and replays the missed completion', async (t) => {
+  const session = { deviceId: 'dev-expired', secret: 'sec-expired' };
+  const staleSubscription = {
+    endpoint: 'https://fcm.googleapis.com/expired-subscription',
+    keys: { p256dh: 'stale-p256dh', auth: 'stale-auth' }
+  };
+  const freshSubscription = {
+    endpoint: 'https://fcm.googleapis.com/fresh-subscription',
+    keys: { p256dh: 'fresh-p256dh', auth: 'fresh-auth' }
+  };
+  const pushCalls = [];
+  const expiredError = new Error('Received unexpected response code');
+  expiredError.statusCode = 410;
+  expiredError.body = 'push subscription has unsubscribed or expired.';
+  const webPush = {
+    generateVAPIDKeys: () => ({ publicKey: 'test-public-key', privateKey: 'test-private-key' }),
+    setVapidDetails: () => {},
+    sendNotification: async (subscription, payload) => {
+      pushCalls.push({ subscription, payload });
+      if (subscription.endpoint === staleSubscription.endpoint) throw expiredError;
+    },
+    '@global': true,
+    '@noCallThru': true
+  };
+  const { main, electron, fsMock } = await startMainWithConfig(1157, {
+    phoneCompanionDevices: [{
+      id: session.deviceId,
+      name: 'Phone',
+      secret: session.secret,
+      approved: true,
+      revoked: false,
+      pushSubscription: staleSubscription,
+      pushSubscriptionSavedAt: '2026-08-10T00:00:00.000Z'
+    }]
+  }, { webPush });
+
+  const notifyHandler = electron.ipcHandlers['notify-phone'];
+  const missed = await notifyHandler(null, {
+    title: 'Orion AI',
+    body: 'Coder completed the task.',
+    conversationId: 'dispatch-origin'
+  });
+  t.equal(missed.phone.sent, 0, 'the expired endpoint is not reported as delivered');
+  t.equal(missed.phone.failed, 1, 'the failed device is counted');
+  t.match(missed.phone.reason, /expired/i, 'the provider failure is preserved instead of discarded');
+
+  const invalidated = fsMock._config().phoneCompanionDevices.find(device => device.id === session.deviceId);
+  t.notOk(invalidated.pushSubscription, 'the expired endpoint is removed');
+  t.equal(invalidated.pushSubscriptionNeedsRefresh, true, 'the paired phone is marked for silent renewal');
+  t.equal(invalidated.pendingPushNotification.context.conversationId, 'dispatch-origin', 'the missed deep-link notification is retained for replay');
+
+  const state = await request('GET', 1157, '/api/state', null, session);
+  t.equal(state.statusCode, 200, 'the existing paired session remains valid');
+  t.equal(state.json.device.pushSubscriptionNeedsRefresh, true, 'the phone learns that only its push subscription needs renewal');
+
+  const staleSync = await request('POST', 1157, '/api/push-subscribe', { subscription: staleSubscription }, session);
+  t.equal(staleSync.statusCode, 409, 'blindly re-saving the known-dead endpoint is rejected');
+  t.equal(staleSync.json.code, 'PUSH_SUBSCRIPTION_REFRESH_REQUIRED', 'the response requests subscription renewal, not re-pairing');
+
+  const renewed = await request('POST', 1157, '/api/push-subscribe', {
+    subscription: freshSubscription,
+    refreshed: true
+  }, session);
+  t.equal(renewed.statusCode, 200, 'a fresh subscription is accepted using the existing device session');
+  t.equal(renewed.json.replayedNotification, true, 'the missed completion is replayed after renewal');
+  t.equal(pushCalls.length, 2, 'one failed delivery and one successful replay occur');
+  t.deepEqual(JSON.parse(pushCalls[1].payload), {
+    title: 'Orion AI',
+    body: 'Coder completed the task.',
+    conversationId: 'dispatch-origin'
+  }, 'the replay preserves the original completion and conversation target');
+
+  const recovered = fsMock._config().phoneCompanionDevices.find(device => device.id === session.deviceId);
+  t.deepEqual(recovered.pushSubscription, freshSubscription, 'the fresh endpoint replaces the expired endpoint');
+  t.equal(recovered.pushSubscriptionNeedsRefresh, false, 'the refresh marker clears after renewal');
+  t.notOk(recovered.pendingPushNotification, 'the replay receipt clears after successful delivery');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('legacy paired push state gets one silent subscription refresh', async (t) => {
+  const session = { deviceId: 'dev-legacy-push', secret: 'sec-legacy-push' };
+  const legacySubscription = {
+    endpoint: 'https://fcm.googleapis.com/legacy-subscription',
+    keys: { p256dh: 'legacy-p256dh', auth: 'legacy-auth' }
+  };
+  const refreshedSubscription = {
+    endpoint: 'https://fcm.googleapis.com/refreshed-subscription',
+    keys: { p256dh: 'refreshed-p256dh', auth: 'refreshed-auth' }
+  };
+  const { main } = await startMainWithConfig(1158, {
+    phoneCompanionDevices: [{
+      id: session.deviceId,
+      name: 'Existing paired phone',
+      secret: session.secret,
+      approved: true,
+      revoked: false,
+      pushSubscription: legacySubscription
+    }]
+  });
+
+  const state = await request('GET', 1158, '/api/state', null, session);
+  t.equal(state.statusCode, 200, 'the durable device session is still authenticated');
+  t.equal(state.json.device.pushSubscriptionNeedsRefresh, true, 'a legacy endpoint is selected for one silent refresh');
+  t.ok(state.json.device.pushSubscriptionRefreshToken, 'the phone receives a stable refresh trigger');
+
+  const blindSync = await request('POST', 1158, '/api/push-subscribe', { subscription: legacySubscription }, session);
+  t.equal(blindSync.statusCode, 409, 'the stale endpoint cannot be re-saved as though it were renewed');
+
+  const refreshed = await request('POST', 1158, '/api/push-subscribe', {
+    subscription: refreshedSubscription,
+    refreshed: true
+  }, session);
+  t.equal(refreshed.statusCode, 200, 'the same pairing accepts the replacement endpoint');
+  const recoveredState = await request('GET', 1158, '/api/state', null, session);
+  t.equal(recoveredState.json.device.pushSubscriptionNeedsRefresh, false, 'one successful renewal clears the migration trigger');
 
   await closeServer(main.getCompanionServer());
 });

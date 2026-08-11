@@ -52,7 +52,11 @@ contextBridge.exposeInMainWorld('api', {
   getPhoneCompanionDevices: () => ipcRenderer.invoke('get-phone-companion-devices'),
   revokePhoneCompanionDevice: (deviceId) => ipcRenderer.invoke('revoke-phone-companion-device', deviceId),
   revokeAllPhoneCompanionDevices: () => ipcRenderer.invoke('revoke-all-phone-companion-devices'),
-  notifyPhone: (title, body) => ipcRenderer.invoke('notify-phone', { title, body }),
+  notifyPhone: (title, body, context = {}) => ipcRenderer.invoke('notify-phone', {
+    title,
+    body,
+    conversationId: String(context && context.conversationId || '')
+  }),
   syncPhoneCompanion: () => ipcRenderer.send('orion:phone-companion-sync'),
   browserOpenUrl: (url) => ipcRenderer.invoke('browser-open-url', { url }),
   browserSearchWeb: (query) => ipcRenderer.invoke('browser-search-web', { query }),
@@ -67,6 +71,7 @@ contextBridge.exposeInMainWorld('api', {
   captureScreen: (workspacePath, options = {}) => ipcRenderer.invoke('capture-screen', { workspacePath, destination: options.destination, delayMs: options.delayMs, conversationId: options.conversationId, displayId: options.displayId }),
   recordInspectedScreenshot: (workspacePath, relativePath, conversationId = '') => ipcRenderer.invoke('record-inspected-screenshot', { workspacePath, path: relativePath, conversationId }),
   computerAction: (workspacePath, action, conversationId, destination = '', displayId = '') => ipcRenderer.invoke('computer-action', { workspacePath, action, conversationId, destination, displayId }),
+  openApplication: (payload = {}) => ipcRenderer.invoke('open-application', payload),
   inspectScreenshot: (workspacePath, relativePath) => ipcRenderer.invoke('inspect-screenshot', { workspacePath, relativePath }),
   readWorkspaceFileBase64: (workspacePath, relativePath, conversationId = '') => ipcRenderer.invoke('read-workspace-file-base64', { workspacePath, relativePath, conversationId }),
   compareScreenshotToGoal: (workspacePath, relativePath, goal, observations) => ipcRenderer.invoke('compare-screenshot-to-goal', { workspacePath, relativePath, goal, observations }),

@@ -1,5 +1,7 @@
 'use strict';
 
+process.env.NODE_ENV = 'test';
+
 // Phase 3 (item 15 - regression harness pass). Rather than re-testing every scenario on Jason's
 // checklist from scratch, this file targets the specific gaps found by auditing existing coverage
 // against that checklist:
@@ -102,6 +104,70 @@ test('a recorded liveness note is surfaced by notifySupervisorOfOperatorCompleti
   t.ok(lastMsg && lastMsg.text.includes('TEST-OPERATOR-LIVENESS-NOTE'), 'the liveness note reaches the Operator completion notification text');
   t.ok(/^Operator (completed|finished|failed)/.test(lastMsg.text || ''), 'Operator phrasing is used, not Coder\'s');
   t.notOk(expose.interruptedTaskLivenessNotes.has('task_op_interrupted'), 'the note is cleared after being consumed so it cannot be shown twice');
+  t.end();
+});
+
+test('cancelling an owned Operator task appends one terminal message to the Dispatch conversation', async t => {
+  const cancelledTask = {
+    taskId: 'task_op_cancelled',
+    title: 'Test operator with Codex',
+    objective: 'Open Codex and inspect the visible state.',
+    status: 'cancelled',
+    workspacePath: 'C:\\Users\\Owner',
+    startedAt: 100,
+    cancelledAt: 200,
+    origin: { conversationId: 'dispatch-cancel' },
+    target: { conversationId: 'operator-cancel', mode: 'operator' }
+  };
+  const { win, read } = loadRenderer({
+    t,
+    api: {
+      cancelOrchestrationTask: async () => ({ success: true, wasActive: true, task: cancelledTask }),
+      getOrchestrationTask: async () => ({ success: true, task: cancelledTask })
+    },
+    set: {
+      activeConversationId: 'dispatch-cancel',
+      conversations: [
+        {
+          id: 'dispatch-cancel',
+          mode: 'orion',
+          title: 'What do you think about Orion?',
+          launchedCoderConvId: 'operator-cancel',
+          launchedCoderTaskId: 'task_op_cancelled',
+          launchedCoderTaskTitle: 'Test operator with Codex',
+          launchedCoderTaskStart: 100,
+          launchedTaskRole: 'operator',
+          messages: [{ role: 'assistant', text: 'Operator has the task queued.', source: 'handoff' }]
+        },
+        { id: 'operator-cancel', mode: 'operator', title: 'Test operator with Codex', messages: [] }
+      ]
+    }
+  });
+
+  const result = await win.cancelOwnedOrchestrationTask(
+    'task_op_cancelled',
+    'dispatch-cancel',
+    'Cancelled from the Stop control.'
+  );
+  t.equal(result.task.status, 'cancelled', 'the durable cancellation succeeds');
+  let dispatch = read('conversations').find(conv => conv.id === 'dispatch-cancel');
+  let cancellationMessages = dispatch.messages.filter(message =>
+    message.source === 'supervisor-cancellation'
+    && message.orchestrationTaskId === 'task_op_cancelled'
+  );
+  t.equal(cancellationMessages.length, 1, 'the owning transcript receives exactly one cancellation message');
+  t.match(cancellationMessages[0].text, /Cancelled \*\*Test operator with Codex\*\*/i, 'the message names the cancelled task');
+  t.match(cancellationMessages[0].text, /Operator .*not recorded as completed/i, 'the message names the real specialist and preserves terminal semantics');
+  t.equal(dispatch.lastDelegatedWork.status, 'cancelled', 'the conversation receipt records the cancelled state');
+  t.equal(dispatch.launchedCoderTaskId, null, 'the active task pointer is cleared after presentation is reconciled');
+
+  await win.onOrchestrationTaskFinalized('task_op_cancelled', 'operator-cancel', 'cancelled');
+  dispatch = read('conversations').find(conv => conv.id === 'dispatch-cancel');
+  cancellationMessages = dispatch.messages.filter(message =>
+    message.source === 'supervisor-cancellation'
+    && message.orchestrationTaskId === 'task_op_cancelled'
+  );
+  t.equal(cancellationMessages.length, 1, 'a late finalization callback cannot duplicate the cancellation message');
   t.end();
 });
 

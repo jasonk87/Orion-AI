@@ -117,6 +117,26 @@ test('a pending schedule survives a full restart of the store', async t => {
   t.end();
 });
 
+test('a schedule preserves its user-facing delivery conversation across restarts', async t => {
+  const clock = { now: BASE };
+  const h = makeStore(clock);
+  try {
+    await h.store.create({
+      conversationId: 'operator-worker',
+      deliveryConversationId: 'dispatch-origin',
+      sourceTaskId: 'task-reminder',
+      purpose: 'weather-update',
+      prompt: 'Give the user a weather update.',
+      delayMs: MINUTE
+    });
+    const [restored] = await h.reopen().list({ status: 'pending' });
+    t.equal(restored.conversationId, 'operator-worker', 'execution remains bound to the worker conversation');
+    t.equal(restored.deliveryConversationId, 'dispatch-origin', 'delivery remains bound to the visible conversation');
+    t.equal(restored.sourceTaskId, 'task-reminder', 'the originating task provenance is durable');
+  } finally { h.cleanup(); }
+  t.end();
+});
+
 test('re-scheduling the same purpose replaces rather than stacking wake-ups', async t => {
   const clock = { now: BASE };
   const h = makeStore(clock);
@@ -307,6 +327,20 @@ test('a late run tells the conversation it is late', t => {
   const body = agentJs.slice(start, agentJs.indexOf('\n};', start));
   t.ok(body.includes('payload.delayNote'),
     'the lateness note reaches the transcript so the model does not assume no time passed');
+  t.end();
+});
+
+test('the integrated schedule path carries delivery provenance into execution', t => {
+  const agentJs = fs.readFileSync(path.join(__dirname, '..', 'agent.js'), 'utf8');
+  const scheduleStart = agentJs.indexOf('async function scheduleAgentFollowup');
+  const scheduleBody = agentJs.slice(scheduleStart, agentJs.indexOf('// A conditional watch', scheduleStart));
+  const runStart = agentJs.indexOf('window.runDurableSchedule = async function');
+  const runBody = agentJs.slice(runStart, agentJs.indexOf('\n};', runStart));
+  const scheduleIpc = fs.readFileSync(path.join(__dirname, '..', 'lib', 'ipc-schedule.js'), 'utf8');
+  t.ok(scheduleBody.includes('resolveScheduledDeliveryConversation'), 'schedule creation resolves the originating visible conversation from task provenance');
+  t.ok(scheduleBody.includes('deliveryConversationId: delivery.conversationId'), 'the visible destination is persisted with the schedule');
+  t.ok(scheduleIpc.includes('deliveryConversationId: schedule.deliveryConversationId'), 'main-process dispatch preserves the destination');
+  t.ok(runBody.includes('scheduleDeliveryConversationId'), 'the fired run receives the destination before model execution');
   t.end();
 });
 

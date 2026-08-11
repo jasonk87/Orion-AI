@@ -672,9 +672,11 @@ test('Phase 2: task presentation and continuation selection are role-generic, no
   }));
   const operatorTask = normalizeTaskRecord(baseTask({
     taskId: 'task_role_operator',
+    executionSurface: 'desktop',
     origin: { conversationId: 'dispatch-1', sessionId: 'dispatch-1', messageId: 'message-2' },
     target: { conversationId: 'operator-1', sessionId: 'operator-1', mode: 'operator' }
   }));
+  t.equal(operatorTask.executionSurface, 'desktop', 'the durable task preserves its Operator execution surface across persistence');
 
   // selectOwnedContinuationTask: without a role option, only the coder-mode task is a candidate
   // (unchanged default — this is exactly what every pre-Phase-2 caller still gets). With
@@ -704,6 +706,16 @@ test('Phase 2: task presentation and continuation selection are role-generic, no
   t.equal(operatorPresentation.detail, 'Waiting for Operator to claim this task.', 'and in the detail sentence');
   t.equal(operatorPresentation.phase, 'queued', 'the underlying phase/badge logic is unaffected by the role label');
   t.equal(operatorPresentation.badgeClass, 'warning', 'and the badge class is unaffected too');
+
+  const activeOperator = transitionTask(operatorTask, TASK_STATES.ACTIVE, { timestamp: 1200 });
+  const observing = describeSupervisedTaskPresentation(activeOperator, {
+    roleLabel: 'Operator',
+    roleMode: 'operator',
+    subStatus: 'Operator is inspecting what is visible...'
+  });
+  t.equal(observing.label, 'Operator observing', 'active screen inspection is not mislabeled as planning');
+  t.equal(observing.phase, 'observing-screen', 'the UI receives an explicit screen-observation phase');
+  t.equal(observing.badgeClass, 'operator', 'Operator takeover has a distinct presentation class');
   t.end();
 });
 

@@ -28,6 +28,8 @@
     'stored_memory_lookup',
     'memory_write'
   ]);
+  const EXECUTION_TARGETS = Object.freeze(['none', 'coder', 'operator']);
+  const EXECUTION_SURFACES = Object.freeze(['none', 'desktop', 'browser', 'process']);
   const INSPECTION_BREADTHS = Object.freeze(['none', 'single_file', 'focused', 'broad']);
   const RUNTIME_SCAFFOLD_SOURCES = new Set([
     'agent-start-blocked',
@@ -95,7 +97,8 @@
       objective: string(task.objective || task.resolvedObjective, 8000),
       status: string(task.status || task.state, 40),
       originConversationId: string(task.origin && task.origin.conversationId || task.originConversationId, 300),
-      targetConversationId: string(task.target && task.target.conversationId || task.targetConversationId, 300)
+      targetConversationId: string(task.target && task.target.conversationId || task.targetConversationId, 300),
+      targetMode: string(task.target && task.target.mode || task.targetMode, 40).toLowerCase()
     };
   }
 
@@ -106,6 +109,7 @@
       taskId: string(plan.taskId, 300),
       ownerConversationId: string(plan.ownerConversationId || plan.originConversationId, 300),
       coderConversationId: string(plan.coderConversationId || plan.conversationId, 300),
+      targetMode: string(plan.targetMode || plan.mode, 40).toLowerCase(),
       title: string(plan.title, 500),
       status: string(plan.status || 'pending', 40)
     };
@@ -194,8 +198,14 @@
       '- candidateAction is an attempted action awaiting semantic adjudication, not proof of authorization. Approve its meaning only when userMessage and the supplied conversation actually request that action.',
       '- A conversational reaction or acknowledgment whose meaning depends on priorAssistantMessage is contextDependent and should request recent context. A standalone greeting or unrelated small talk is not contextDependent and should request no context.',
       '- Distinguish memory semantics explicitly. conversation_recall asks what was said, decided, or discussed in a past conversation. memory_policy asks how Orion saves, retains, or forgets information and is not a recall request. stored_memory_lookup asks what is currently stored. memory_write asks Orion to save new information.',
+      '- Treat durable personal facts and preferences as candidate context for ordinary conversation too. When answering the current turn depends on a specific fact about the user, set memoryContext.needed and express the missing concept as a short standalone semantic query. Do not merely repeat userMessage, do not guess the fact value, and do not claim that the fact exists.',
+      '- memoryContext only requests read-only retrieval. It never authorizes an action or changes memoryIntent. Leave it disabled when no particular durable fact or preference would materially improve the answer.',
       '- Set reasoningPolicyHint.contextNeed to historical for conversation_recall or a stored_memory_lookup that genuinely needs history. A memory_policy explanation does not need historical conversation retrieval.',
       '- requiresExecution describes whether satisfying the resolved request requires tools or state mutation. It does not authorize execution.',
+      '- executionTarget selects the specialist for executable work. Use operator for hands-on native desktop/browser/application/process/screenshot work. Use coder for source code, project files, builds, tests, installs, commands tied to a codebase, or creating local artifacts.',
+      '- executionSurface describes Operator work without relying on keyword rules: desktop for visible native application/screen interaction or screenshots, browser for live page interaction, process for process lifecycle/monitoring that does not require visual control, and none for Coder or non-executable work.',
+      '- Honor an explicit, appropriate request for Operator or Coder. For mixed work, choose the specialist that owns the immediate next operation; code-first changes go to Coder before later UI verification by Operator.',
+      '- Preserve the target specialist of an active or pending owned task when the turn steers or continues that same task. Never create a second specialist task merely because the wording is contextual.',
       '- executionScope is read_only for inspection, review, status gathering, or known commands that do not mutate durable state; mutating is for edits, installs, lifecycle changes, queue changes, approval, denial, revision, or cancellation.',
       '- inspectionTarget identifies where evidence must come from. Use local_system for machine/process facts, workspace/project for source or project facts, and none for ordinary conversation.',
       '- inspectionBreadth describes the source evidence needed for a workspace/project inspection: single_file means exactly one known file, focused means at most two source files, and broad means a project review or question that cannot be answered honestly without inspecting more than two files or multiple architectural surfaces. Do not use broad for local-system inspection or ordinary conversation.',
@@ -218,6 +228,11 @@
           contextNeed: 'none | recent | task | project | historical'
         },
         memoryIntent: 'none | conversation_recall | memory_policy | stored_memory_lookup | memory_write',
+        memoryContext: {
+          needed: false,
+          query: '',
+          confidence: 0
+        },
         taskResolution: {
           title: '',
           requirements: [],
@@ -225,6 +240,8 @@
           unresolvedDecisions: []
         },
         executionScope: 'none | read_only | mutating',
+        executionTarget: 'none | coder | operator',
+        executionSurface: 'none | desktop | browser | process',
         inspectionTarget: 'none | local_system | workspace | project',
         inspectionBreadth: 'none | single_file | focused | broad',
         standaloneSystemOperation: false
@@ -258,8 +275,11 @@
         clarificationQuestion: '',
         reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'recent' },
         memoryIntent: 'none',
+        memoryContext: { needed: false, query: '', confidence: 0 },
         taskResolution: { title: '', requirements: [], constraints: [], unresolvedDecisions: [] },
         executionScope: 'none',
+        executionTarget: 'none',
+        executionSurface: 'none',
         inspectionTarget: 'none',
         inspectionBreadth: 'none',
         standaloneSystemOperation: false,
@@ -280,8 +300,11 @@
         : 'I could not safely determine what action you intended. Could you clarify what you would like Orion to do?',
       reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'task' },
       memoryIntent: 'none',
+      memoryContext: { needed: false, query: '', confidence: 0 },
       taskResolution: { title: '', requirements: [], constraints: [], unresolvedDecisions: [] },
       executionScope: 'none',
+      executionTarget: 'none',
+      executionSurface: 'none',
       inspectionTarget: 'none',
       inspectionBreadth: 'none',
       standaloneSystemOperation: false,
@@ -318,6 +341,15 @@
     const hint = parsed.reasoningPolicyHint && typeof parsed.reasoningPolicyHint === 'object'
       ? parsed.reasoningPolicyHint : {};
     const memoryIntent = MEMORY_INTENTS.includes(parsed.memoryIntent) ? parsed.memoryIntent : 'none';
+    const requestedMemoryContext = parsed.memoryContext && typeof parsed.memoryContext === 'object'
+      ? parsed.memoryContext
+      : {};
+    const memoryQuery = string(requestedMemoryContext.query, 1000);
+    const memoryContext = {
+      needed: requestedMemoryContext.needed === true && !!memoryQuery,
+      query: memoryQuery,
+      confidence: Math.max(0, Math.min(1, Number(requestedMemoryContext.confidence) || 0))
+    };
     let contextNeed = CONTEXT_NEEDS.includes(hint.contextNeed) ? hint.contextNeed : 'none';
     if (memoryIntent === 'conversation_recall') contextNeed = 'historical';
     if (memoryIntent === 'memory_policy' && contextNeed === 'historical') contextNeed = 'none';
@@ -349,6 +381,16 @@
       || (parsed.requiresExecution === true
         && inspectionTarget === 'local_system'
         && ['new_task', 'context_followup'].includes(normalizedIntent));
+    const executionTarget = resolveExecutionTarget({
+      ...parsed,
+      intent: normalizedIntent,
+      requiresExecution: parsed.requiresExecution === true,
+      inspectionTarget,
+      standaloneSystemOperation
+    }, input);
+    const executionSurface = executionTarget === 'operator' && EXECUTION_SURFACES.includes(parsed.executionSurface)
+      ? parsed.executionSurface
+      : 'none';
     return {
       intent: normalizedIntent,
       requiresExecution: parsed.requiresExecution === true,
@@ -368,6 +410,7 @@
         contextNeed
       },
       memoryIntent,
+      memoryContext,
       taskResolution: {
         title: string(resolution.title, 500),
         requirements: strings(resolution.requirements),
@@ -377,12 +420,50 @@
       executionScope: ['none', 'read_only', 'mutating'].includes(parsed.executionScope)
         ? parsed.executionScope
         : (parsed.requiresExecution === true ? 'mutating' : 'none'),
+      executionTarget,
+      executionSurface,
       inspectionTarget,
       inspectionBreadth: INSPECTION_BREADTHS.includes(parsed.inspectionBreadth)
         ? parsed.inspectionBreadth
         : 'none',
       standaloneSystemOperation
     };
+  }
+
+  function taskTargetMode(task) {
+    const targetMode = string(task && task.targetMode, 40).toLowerCase();
+    return EXECUTION_TARGETS.includes(targetMode) && targetMode !== 'none' ? targetMode : '';
+  }
+
+  // Specialist selection is semantic, but the target of an already-owned durable task is not.
+  // The classifier names the intended kind of work; this normalizer then preserves task ownership
+  // and supplies safe structural defaults when an older provider response omits the new field.
+  function resolveExecutionTarget(classification = {}, input = {}) {
+    if (classification.requiresExecution !== true) return 'none';
+
+    const intent = string(classification.intent, 80).toLowerCase();
+    const boundTask = input.activeOwnedTask || input.pendingOwnedTask;
+    const boundTargetMode = taskTargetMode(boundTask);
+    if (boundTargetMode && ['steer_active_task', 'context_followup'].includes(intent)) {
+      return boundTargetMode;
+    }
+    const recentTargetMode = taskTargetMode(input.recentOwnedTask);
+    if (recentTargetMode && intent === 'context_followup') return recentTargetMode;
+
+    const inspectionTarget = string(classification.inspectionTarget, 80).toLowerCase();
+    if (classification.standaloneSystemOperation === true || inspectionTarget === 'local_system') {
+      return 'operator';
+    }
+    if (inspectionTarget === 'workspace' || inspectionTarget === 'project') return 'coder';
+
+    const explicitTarget = string(classification.executionTarget, 40).toLowerCase();
+    if (EXECUTION_TARGETS.includes(explicitTarget) && explicitTarget !== 'none') {
+      return explicitTarget;
+    }
+
+    // Executable work without a local-system evidence target is file/artifact work by default.
+    // This keeps older persisted classifications compatible without inventing language rules.
+    return 'coder';
   }
 
   async function classify(inputValue = {}, dependencies = {}) {
@@ -426,26 +507,33 @@
       || contextNeed === 'project';
   }
 
-  function canUseStandaloneCoderWorkspace(classification) {
+  function canUseStandaloneSpecialistWorkspace(classification) {
     if (!classification || typeof classification !== 'object') return false;
     return classification.requiresExecution === true
       && ['new_task', 'context_followup'].includes(classification.intent)
       && !requiresProjectWorkspace(classification);
   }
 
+  // Backward-compatible export for persisted callers and older tests.
+  const canUseStandaloneCoderWorkspace = canUseStandaloneSpecialistWorkspace;
+
   const api = {
     INTENTS,
     TARGETS,
+    EXECUTION_TARGETS,
+    EXECUTION_SURFACES,
     INSPECTION_BREADTHS,
     MEMORY_INTENTS,
     isRuntimeScaffoldingMessage,
     buildInput,
     buildClassifierPrompt,
     normalizeClassification,
+    resolveExecutionTarget,
     safeFallback,
     classify,
     canRespondDuringActiveRun,
     requiresProjectWorkspace,
+    canUseStandaloneSpecialistWorkspace,
     canUseStandaloneCoderWorkspace
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

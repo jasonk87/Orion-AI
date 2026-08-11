@@ -30,8 +30,11 @@ function semanticClassification(overrides = {}) {
     needsClarification: false,
     clarificationQuestion: '',
     reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'none' },
+    memoryIntent: 'none',
+    memoryContext: { needed: false, query: '', confidence: 0 },
     taskResolution: { title: '', requirements: [], constraints: [], unresolvedDecisions: [] },
     executionScope: 'none',
+    executionTarget: 'none',
     inspectionTarget: 'none',
     standaloneSystemOperation: false,
     ...overrides
@@ -515,6 +518,35 @@ test('Dispatch loop ignores a quoted executable request inside a pushed-fix stat
   t.end();
 });
 
+test('Dispatch loop ignores a quoted Operator command inside a transcript report', async t => {
+  const originalFetch = global.fetch;
+  const operatorHandoffs = [];
+  const prompt = 'Transcript from the regression test:\n> Open Codex and take a screenshot.\nExpected: analyze this report without executing the quoted command.';
+  installHarness([
+    [
+      { text: 'I will open Codex now.' },
+      { functionCall: { name: 'handoff_to_operator', args: { prompt: 'Open Codex and take a screenshot.' } } }
+    ],
+    [{ text: 'The transcript describes a covered Operator scenario; it does not request execution.' }]
+  ], {
+    window: {
+      promoteWorkspaceToOperator: async payload => {
+        operatorHandoffs.push(payload);
+        return { success: true, conversationId: 'unexpected-operator' };
+      }
+    }
+  });
+  const conv = conversation('quoted-operator-transcript');
+  try {
+    await global.window.runAgentLoop(prompt, 'gemini-1', conv);
+    t.equal(operatorHandoffs.length, 0, 'reported desktop command causes no Operator handoff');
+    t.match(conv.messages.find(message => message.role === 'assistant').text, /transcript|does not request execution/i, 'the surrounding report is analyzed');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
 test('Dispatch adjudicates an explicit contextual handoff and commits exactly one proposed Coder task', async t => {
   const originalFetch = global.fetch;
   const handoffs = [];
@@ -603,6 +635,80 @@ test('Dispatch adjudicates an explicit contextual handoff and commits exactly on
     t.match(handoffs[0].prompt, /Wire RetirementSystem/i, 'the resolved objective, not the raw approval phrase, is handed off');
     const finalAssistant = [...conv.messages].reverse().find(message => message.role === 'assistant');
     t.match(finalAssistant.text, /task-retirement-retry|queued/i, 'Dispatch reports the committed task rather than narrating future intent');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('semantic adjudication corrects a model-selected Coder handoff to Operator', async t => {
+  const originalFetch = global.fetch;
+  const operatorHandoffs = [];
+  const coderHandoffs = [];
+  const resolvedObjective = 'Open Codex, inspect its visible state, capture a screenshot, and return the image with a concise report.';
+  installHarness([
+    [
+      { text: 'I will send that to Coder.' },
+      {
+        functionCall: {
+          name: 'handoff_to_coder',
+          args: { prompt: resolvedObjective, title: 'Inspect Codex', open: false }
+        }
+      }
+    ]
+  ], {
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects',
+    semanticClassification: semanticClassification({
+      intent: 'context_followup',
+      requiresExecution: true,
+      target: 'current_conversation',
+      resolvedRequest: resolvedObjective,
+      contextDependent: true,
+      reasoningPolicyHint: { complexity: 'medium', risk: 'low', contextNeed: 'recent' },
+      executionScope: 'read_only',
+      executionTarget: 'operator',
+      inspectionTarget: 'local_system',
+      standaloneSystemOperation: true,
+      taskResolution: { title: 'Inspect Codex', requirements: ['Return a screenshot'], constraints: [], unresolvedDecisions: [] }
+    }),
+    window: {
+      promoteWorkspaceToOperator: async payload => {
+        operatorHandoffs.push(payload);
+        return {
+          success: true,
+          conversationId: 'operator-corrected-target',
+          taskId: 'task-operator-corrected-target',
+          title: payload.title,
+          status: 'pending'
+        };
+      },
+      promoteWorkspaceToCoder: async payload => {
+        coderHandoffs.push(payload);
+        return { success: true, conversationId: 'wrong-coder', taskId: 'wrong-coder-task', status: 'pending' };
+      }
+    }
+  });
+  const conv = conversation('dispatch-correct-specialist', {
+    messages: [
+      { role: 'assistant', text: 'Want me to have Operator open Codex, inspect it, and send back a screenshot?' },
+      { role: 'user', text: 'Yes, do that.' }
+    ]
+  });
+  try {
+    await global.window.runAgentLoop('Yes, do that.', 'gemini-1', conv, {
+      semanticIntent: semanticClassification({
+        intent: 'conversation',
+        requiresExecution: false,
+        target: 'none',
+        contextDependent: true
+      })
+    });
+    t.equal(operatorHandoffs.length, 1, 'the adjudicated task reaches Operator exactly once');
+    t.equal(coderHandoffs.length, 0, 'the model-selected wrong Coder target is never executed');
+    t.equal(operatorHandoffs[0].originalUserMessage, 'Yes, do that.', 'contextual provenance remains exact');
+    t.equal(operatorHandoffs[0].semanticIntent.executionTarget, 'operator', 'the durable task carries the adjudicated specialist');
+    const finalAssistant = [...conv.messages].reverse().find(message => message.role === 'assistant');
+    t.match(finalAssistant.text, /Operator has task .* queued/i, 'the committed result names the corrected specialist');
   } finally {
     restoreGlobals(originalFetch);
   }
@@ -946,7 +1052,75 @@ test('clarification answers resume their durable Dispatch task and can hand impl
   t.end();
 });
 
-test('a direct executable request preflights once and preserves durable handoff provenance', async t => {
+test('Dispatch routes the exact Codex screenshot request to Operator once without a Coder detour', async t => {
+  const originalFetch = global.fetch;
+  const rawRequest = "Let's test it out. Let's see if we can get the operator to open codex and take a picture and see what it's up to";
+  const operatorHandoffs = [];
+  const coderHandoffs = [];
+  const monitorCalls = [];
+  const harness = installHarness([], {
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects',
+    window: {
+      promoteWorkspaceToOperator: async payload => {
+        operatorHandoffs.push(payload);
+        return {
+          success: true,
+          conversationId: 'operator-codex-screenshot',
+          taskId: 'task-operator-codex-screenshot',
+          title: payload.title,
+          status: 'pending',
+          workspacePath: payload.path
+        };
+      },
+      promoteWorkspaceToCoder: async payload => {
+        coderHandoffs.push(payload);
+        return { success: true, conversationId: 'wrong-coder', taskId: 'wrong-coder-task', status: 'pending' };
+      },
+      startOperatorTaskMonitor: (...args) => monitorCalls.push(args)
+    }
+  });
+  const conv = conversation('dispatch-operator-codex-screenshot');
+  try {
+    await global.window.runAgentLoop(rawRequest, 'gemini-1', conv, {
+      semanticIntent: semanticClassification({
+        intent: 'new_task',
+        requiresExecution: true,
+        target: 'current_conversation',
+        resolvedRequest: 'Open Codex, inspect what it is visibly doing right now, capture a screenshot, and return the screenshot with a useful report.',
+        reasoningPolicyHint: { complexity: 'medium', risk: 'low', contextNeed: 'none' },
+        executionScope: 'read_only',
+        executionTarget: 'operator',
+        inspectionTarget: 'local_system',
+        standaloneSystemOperation: true,
+        taskResolution: {
+          title: 'Inspect Codex and capture its screen',
+          requirements: ['Open Codex', 'Inspect the visible state', 'Capture and return a screenshot'],
+          constraints: [],
+          unresolvedDecisions: []
+        }
+      })
+    });
+
+    t.equal(harness.modelTurns, 0, 'deterministic preflight does not spend a Dispatch answer turn');
+    t.equal(operatorHandoffs.length, 1, 'exactly one Operator task is created');
+    t.equal(coderHandoffs.length, 0, 'Coder is never used for native desktop inspection');
+    t.equal(operatorHandoffs[0].standalone, true, 'the desktop task does not invent a project dependency');
+    t.equal(operatorHandoffs[0].path, 'C:\\Users\\Owner', 'native desktop work is rooted at the local user environment');
+    t.equal(operatorHandoffs[0].originalUserMessage, rawRequest, 'the exact user request is retained as provenance');
+    t.match(operatorHandoffs[0].prompt, /open codex/i, 'the resolved task preserves the requested application');
+    t.match(operatorHandoffs[0].prompt, /screenshot|picture/i, 'the resolved task preserves the screenshot deliverable');
+    t.equal(monitorCalls.length, 1, 'the Operator supervisor monitor starts once');
+    t.equal(conv.launchedTaskRole, 'operator', 'the Dispatch ownership pointer records the real specialist');
+    const finalAssistant = [...conv.messages].reverse().find(message => message.role === 'assistant');
+    t.match(finalAssistant.text, /Operator has task .* queued/i, 'the user-facing result names Operator');
+    t.notOk(/Coder has task/i.test(finalAssistant.text), 'the user-facing result never claims Coder owns it');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('a direct executable request preflights once to Operator and preserves durable handoff provenance', async t => {
   const originalFetch = global.fetch;
   const workspace = 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE';
   const handoffs = [];
@@ -967,11 +1141,11 @@ test('a direct executable request preflights once and preserves durable handoff 
     projects: [workspace],
     workspace,
     window: {
-      promoteWorkspaceToCoder: async payload => {
+      promoteWorkspaceToOperator: async payload => {
         handoffs.push(payload);
         return {
           success: true,
-          conversationId: 'coder-one-handoff',
+          conversationId: 'operator-one-handoff',
           taskId: 'task-one-handoff',
           title: payload.title,
           status: 'pending'
@@ -999,12 +1173,13 @@ test('a direct executable request preflights once and preserves durable handoff 
           needsClarification: false,
           reasoningPolicyHint: { complexity: 'medium', risk: 'medium', contextNeed: 'none' },
           executionScope: 'mutating',
+          executionTarget: 'operator',
           inspectionTarget: 'local_system',
           standaloneSystemOperation: true
         }
       }
     );
-    t.equal(handoffs.length, 1, 'the genuine handoff creates exactly one durable Coder task');
+    t.equal(handoffs.length, 1, 'the genuine handoff creates exactly one durable Operator task');
     t.equal(handoffs[0].standalone, true, 'local-system work remains standalone even with an active project selected');
     t.equal(handoffs[0].path, 'C:\\Users\\Owner', 'the standalone task is rooted at the user home, not the selected project');
     t.match(handoffs[0].prompt, /identify the intended local target/i, 'the deterministic packet requires safe target identification');
@@ -1120,22 +1295,22 @@ test('a broad read-only project inspection preflights once to Coder without dupl
   t.end();
 });
 
-test('Projects-root Claude restart creates one standalone Coder handoff with raw provenance', async t => {
+test('Projects-root Claude restart creates one standalone Operator handoff with raw provenance', async t => {
   const originalFetch = global.fetch;
   const projectsRoot = 'C:\\Users\\Owner\\Desktop\\Projects';
   const rawRequest = 'Can you kill Claude and restart it again?';
   const handoffs = [];
   installHarness([
     [{ text: "I can't control local processes from Dispatch. You'll need to restart Claude manually." }],
-    [{ text: 'Coder has the standalone process task and will verify the replacement.' }]
+    [{ text: 'Operator has the standalone process task and will verify the replacement.' }]
   ], {
     workspace: projectsRoot,
     window: {
-      promoteWorkspaceToCoder: async payload => {
+      promoteWorkspaceToOperator: async payload => {
         handoffs.push(payload);
         return {
           success: true,
-          conversationId: 'coder-standalone-claude',
+          conversationId: 'operator-standalone-claude',
           taskId: 'task-standalone-claude',
           title: 'Restart Claude',
           status: 'pending'
@@ -1159,6 +1334,7 @@ test('Projects-root Claude restart creates one standalone Coder handoff with raw
         needsClarification: false,
         reasoningPolicyHint: { complexity: 'medium', risk: 'medium', contextNeed: 'none' },
         executionScope: 'mutating',
+        executionTarget: 'operator',
         inspectionTarget: 'local_system',
         standaloneSystemOperation: true
       }
@@ -1169,8 +1345,8 @@ test('Projects-root Claude restart creates one standalone Coder handoff with raw
     t.equal(handoffs[0].originalUserMessage, rawRequest, 'the exact latest utterance is carried as provenance');
     t.notEqual(handoffs[0].prompt, rawRequest, 'the resolved execution prompt may be expanded independently');
     t.ok(handoffs[0].prompt.includes(rawRequest), 'the expanded prompt still preserves the requested operation');
-    t.match(handoffs[0].prompt, /identify the intended local target/i, 'Coder must identify the correct local process');
-    t.match(handoffs[0].prompt, /verify the result/i, 'Coder must verify the replacement process');
+    t.match(handoffs[0].prompt, /identify the intended local target/i, 'Operator must identify the correct local process');
+    t.match(handoffs[0].prompt, /verify the result/i, 'Operator must verify the replacement process');
   } finally {
     restoreGlobals(originalFetch);
   }
@@ -1403,6 +1579,63 @@ test('Dispatch explains memory behavior without entering the conversation-recall
     t.equal(memoryPolicyReachedModel, true, 'the response model receives authoritative memory-mechanism context');
     t.equal(answer.text, answerText, 'the direct answer survives without an unrelated retrieval fallback');
     t.notOk(/couldn.?t retrieve that specific earlier conversation/i.test(answer.text), 'the conversation-recall fallback is absent');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('Dispatch resolves an implicit personal-fact dependency before answering ordinary conversation', async t => {
+  const originalFetch = global.fetch;
+  const rankQueries = [];
+  let answerRequestSawLocation = false;
+  const harness = installHarness([
+    body => {
+      answerRequestSawLocation = JSON.stringify(body).includes('Jason lives in south-central Kentucky');
+      return [{ text: 'For your area around Glasgow and Bowling Green, I can pull the current forecast now.' }];
+    }
+  ], {
+    semanticClassification: {
+      intent: 'conversation',
+      target: 'current_conversation',
+      resolvedRequest: "Answer the user's weather question using their known home location if available.",
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'recent' },
+      memoryContext: {
+        needed: true,
+        query: 'user home location',
+        confidence: 0.98
+      }
+    },
+    api: {
+      readGlobalMemory: async () => ({
+        success: true,
+        user: { name: 'Jason', preferences: [] },
+        facts: [{ text: 'Jason lives in south-central Kentucky', category: 'personal' }]
+      }),
+      rankMemoryFacts: async query => {
+        rankQueries.push(query);
+        return query === 'user home location'
+          ? {
+              success: true,
+              results: [{
+                type: 'fact',
+                text: 'Jason lives in south-central Kentucky',
+                category: 'personal'
+              }]
+            }
+          : { success: true, results: [] };
+      }
+    }
+  });
+  const conv = conversation('implicit-personal-memory');
+  try {
+    await global.window.runAgentLoop("What's the weather today?", 'gemini-1', conv);
+    const answer = conv.messages.find(message => message.role === 'assistant');
+    t.deepEqual(rankQueries, ['user home location'], 'the integrated loop retrieves the concept required by the answer');
+    t.equal(answerRequestSawLocation, true, 'the stored fact reaches the response model before its first answer');
+    t.equal(harness.modelTurns, 1, 'the first answer is grounded without a correction or second user prompt');
+    t.match(answer.text, /Glasgow and Bowling Green/i, 'the answer uses the retrieved location naturally');
+    t.notOk(/where are you located/i.test(answer.text), 'Orion does not ask for a fact it already retrieved');
   } finally {
     restoreGlobals(originalFetch);
   }
@@ -2874,6 +3107,104 @@ test('Dispatch loop resolves a named project from the Projects search root befor
     t.equal(conv.workspace, gritlifePath, 'conversation binds the exact project path');
     t.equal(conv.dispatchProjectPath, gritlifePath, 'Dispatch project binding is persisted separately from the search root');
     t.equal(global.window.changedWorkspace, gritlifePath, 'a real workspace change was requested');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('a scheduled worker result is flushed into its visible conversation before notification', async t => {
+  const originalFetch = global.fetch;
+  const notifications = [];
+  const flushedConversationIds = [];
+  const worker = conversation('scheduled-operator-worker', { mode: 'operator' });
+  const visible = conversation('scheduled-dispatch-origin', { mode: 'orion' });
+  global.conversations = [worker, visible];
+  installHarness([[{ text: 'The current weather is 78Â°F with rain arriving this evening.' }]], {
+    api: {
+      notifyPhone: async (title, body, context) => {
+        notifications.push({ title, body, context });
+        return { success: true, phone: { success: true, sent: 1 } };
+      }
+    },
+    window: {
+      flushConversationsToStorage: async conversationId => {
+        flushedConversationIds.push(conversationId);
+        return { success: true };
+      }
+    }
+  });
+  try {
+    await global.window.runAgentLoop(
+      'Give the user a weather update now.',
+      'gemini-1',
+      worker,
+      {
+        source: 'followup',
+        internalPrompt: true,
+        scheduleId: 'schedule-weather-1',
+        scheduleDeliveryConversationId: visible.id
+      }
+    );
+    const delivered = visible.messages.find(message =>
+      message.source === 'scheduled-delivery' && message.scheduleId === 'schedule-weather-1'
+    );
+    t.ok(delivered, 'the visible conversation receives a durable scheduled-delivery message');
+    t.match(delivered.text, /78Â°F/, 'the actual scheduled result is preserved, not just an alarm label');
+    t.ok(flushedConversationIds.includes(visible.id), 'the visible transcript is flushed before the run finishes');
+    t.equal(notifications.length, 1, 'the scheduled result emits one terminal notification');
+    t.equal(notifications[0].context.conversationId, visible.id, 'the push deep-links to the visible conversation');
+  } finally {
+    delete global.conversations;
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('a delegated specialist completion notification opens the owning Dispatch conversation', async t => {
+  const originalFetch = global.fetch;
+  const notifications = [];
+  const dispatchConversationId = 'delegated-notification-dispatch';
+  const specialist = conversation('delegated-notification-coder', { mode: 'coder' });
+  installHarness([[{ text: 'The requested documentation file is complete.' }]], {
+    api: {
+      notifyPhone: async (title, body, context) => {
+        notifications.push({ title, body, context });
+        return { success: true, phone: { success: true, sent: 1 } };
+      }
+    },
+    window: {
+      claimOrchestrationTask: async taskId => ({
+        success: true,
+        task: {
+          taskId,
+          status: 'active',
+          execution: { executionId: 'delegated-notification-execution' },
+          origin: { conversationId: dispatchConversationId }
+        },
+        prompt: 'Create the requested documentation file.'
+      }),
+      finalizeOrchestrationTask: async (taskId, status) => ({
+        taskId,
+        status,
+        origin: { conversationId: dispatchConversationId }
+      }),
+      onOrchestrationTaskFinalized: async () => {}
+    }
+  });
+  try {
+    await global.window.runAgentLoop(
+      'Create the requested documentation file.',
+      'gemini-1',
+      specialist,
+      { taskId: 'task-delegated-notification' }
+    );
+    t.equal(notifications.length, 1, 'the specialist emits exactly one terminal push');
+    t.equal(
+      notifications[0].context.conversationId,
+      dispatchConversationId,
+      'the notification opens the Dispatch conversation that owns the task'
+    );
   } finally {
     restoreGlobals(originalFetch);
   }
