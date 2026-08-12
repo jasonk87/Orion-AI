@@ -10,7 +10,7 @@ const computerUse = require('../lib/ipc-computer-use');
 const shared = require('../lib/shared');
 const agent = require('../agent');
 
-test('visual Operator work is screen-first and raw diagnostics are bounded', t => {
+test('visual Operator work is screen-first and only repeated no-evidence diagnostics are bounded', t => {
   const state = policy.createState('desktop');
   let gate = policy.gateTool({ mode: 'operator', surface: 'desktop', toolName: 'run_command', state });
   t.equal(gate.allowed, false, 'shell probing is blocked before visual inspection');
@@ -22,18 +22,26 @@ test('visual Operator work is screen-first and raw diagnostics are bounded', t =
   t.equal(gate.allowed, false, 'shell input is blocked until Operator attempts the dedicated visible action');
   t.equal(gate.code, 'operator_visible_action_required');
   policy.recordToolAttempt(state, 'computer_action');
-  for (let index = 0; index < policy.MAX_RAW_DIAGNOSTIC_CALLS; index += 1) {
+  const args = { command: 'Get-Process Codex' };
+  policy.recordToolResult(state, 'run_command', { success: true, stdout: 'pid 123' }, args);
+  for (let index = 0; index < policy.MAX_UNPRODUCTIVE_DIAGNOSTICS; index += 1) {
     gate = policy.gateTool({ mode: 'operator', surface: 'desktop', toolName: 'run_command', state });
-    t.equal(gate.allowed, true, `diagnostic ${index + 1} is allowed after inspection`);
-    policy.recordToolResult(state, 'run_command', { success: true });
+    t.equal(gate.allowed, true, `unchanged diagnostic repeat ${index + 1} is allowed before the loop threshold`);
+    policy.recordToolResult(state, 'run_command', { success: true, stdout: 'pid 123' }, args);
   }
   gate = policy.gateTool({ mode: 'operator', surface: 'desktop', toolName: 'run_command', state });
-  t.equal(gate.allowed, false, 'a fourth diagnostic is blocked');
-  t.equal(gate.code, 'operator_diagnostic_budget_exhausted');
+  t.equal(gate.allowed, false, 'continued identical probing is blocked');
+  t.equal(gate.code, 'operator_unproductive_diagnostic_loop');
+
+  policy.recordToolResult(state, 'get_command_status', { success: true, status: 'completed', output: 'done' }, { processId: 'cmd_1' });
+  gate = policy.gateTool({ mode: 'operator', surface: 'desktop', toolName: 'get_command_status', state });
+  t.equal(gate.allowed, true, 'new process evidence resets the unproductive streak');
+  policy.recordToolResult(state, 'run_command', { success: true, stdout: 'different evidence' }, args);
+  t.equal(state.unproductiveDiagnosticStreak, 0, 'changed output is productive rather than mechanically charged');
   t.end();
 });
 
-test('Operator cannot judge a later visible result from the same screenshot', t => {
+test('Operator may ask a second question about immutable evidence but cannot reuse pre-action evidence as post-action proof', t => {
   const state = policy.createState('desktop');
   policy.recordToolResult(state, 'capture_screen', { success: true, path: 'orion-artifact://conv/screenshots/before.png' });
   policy.recordToolResult(state, 'inspect_screenshot_with_model', {
@@ -41,19 +49,32 @@ test('Operator cannot judge a later visible result from the same screenshot', t 
     status: 'not_satisfied',
     path: 'orion-artifact://conv/screenshots/before.png'
   });
-  const gate = policy.gateTool({
+  let gate = policy.gateTool({
     mode: 'operator',
     surface: 'desktop',
     toolName: 'inspect_screenshot_with_model',
     args: {
       path: 'screenshots/before.png',
-      goal: 'Check whether the player moved after input.'
+      goal: 'Read the controls shown in this immutable screenshot.'
     },
     state
   });
-  t.equal(gate.allowed, false, 'the already-inspected image cannot be reused as later-state evidence');
+  t.equal(gate.allowed, true, 'the same screenshot may answer a genuinely different question before any action');
+
+  policy.recordToolResult(state, 'computer_action', {
+    success: true,
+    path: 'orion-artifact://conv/screenshots/after.png'
+  });
+  gate = policy.gateTool({
+    mode: 'operator',
+    surface: 'desktop',
+    toolName: 'inspect_screenshot_with_model',
+    args: { path: 'screenshots/before.png', goal: 'Did the player move after input?' },
+    state
+  });
+  t.equal(gate.allowed, false, 'pre-action evidence cannot prove post-action state');
   t.equal(gate.code, 'operator_stale_screenshot_reinspection');
-  t.match(gate.reason, /fresh screen/i, 'recovery requires a new capture');
+  t.match(gate.reason, /predates the latest visible action/i);
   t.end();
 });
 
@@ -85,7 +106,7 @@ test('a project-local process launch is a first-class visible action after inspe
   });
   gate = policy.gateTool({ mode: 'operator', surface: 'desktop', toolName: 'start_command', state });
   t.equal(gate.allowed, true, 'the inspected absence/presence sub-goal cannot block the requested project launch');
-  t.equal(state.rawDiagnosticCalls, 0, 'launching a project is not charged against the raw-diagnostic budget');
+  t.equal(state.diagnosticCalls, 0, 'launching a project is not a diagnostic probe');
 
   policy.recordToolResult(state, 'start_command', { success: true, processId: 'game' });
   t.equal(state.inspected, false, 'launch invalidates the old screen so the resulting app must be observed fresh');

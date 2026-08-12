@@ -5,7 +5,16 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function createOrionTaskOrchestration() {
   'use strict';
 
-  const SCHEMA_VERSION = 4;
+  const SpecialistRegistry = typeof require === 'function'
+    ? require('./specialist-registry')
+    : (typeof globalThis !== 'undefined' ? globalThis.OrionSpecialistRegistry : null);
+
+  function isRegisteredTaskTarget(modeValue) {
+    const mode = String(modeValue || '').trim().toLowerCase();
+    return mode === 'orion' || !!(SpecialistRegistry && SpecialistRegistry.has(mode));
+  }
+
+  const SCHEMA_VERSION = 5;
   const TASK_STATES = Object.freeze({
     PENDING: 'pending',
     ACTIVE: 'active',
@@ -315,8 +324,10 @@
       search_root: 'project_search_root',
       projects_root: 'project_search_root',
       generic_projects_root: 'project_search_root',
-      standalone: 'standalone_coder',
-      coder: 'standalone_coder',
+      standalone: 'standalone_specialist',
+      coder: 'standalone_specialist',
+      operator: 'standalone_specialist',
+      standalone_coder: 'standalone_specialist',
       unknown: 'unresolved'
     };
     role = aliases[role] || role;
@@ -338,9 +349,9 @@
         workspaceSource = workspaceSource || project.source;
       }
     }
-    if (!['active_project', 'project_search_root', 'standalone_coder', 'unresolved'].includes(role)) {
+    if (!['active_project', 'project_search_root', 'standalone_specialist', 'unresolved'].includes(role)) {
       if (projectPath && path) role = 'active_project';
-      else if (/standalone-workspaces/i.test(path)) role = 'standalone_coder';
+      else if (/standalone-workspaces/i.test(path)) role = 'standalone_specialist';
       else role = 'unresolved';
     }
     return {
@@ -351,7 +362,7 @@
         path: projectPath
       },
       source: workspaceSource,
-      resolved: (role === 'active_project' || role === 'standalone_coder') && !!path
+      resolved: (role === 'active_project' || role === 'standalone_specialist') && !!path
     };
   }
 
@@ -479,11 +490,17 @@
       sessionId: input.targetSessionId,
       messageId: ''
     });
-    // target.mode is this task's specialist-role field (Phase 2 of the Operator architecture
-    // plan reuses it rather than adding a parallel "role" field): 'coder' today, and the value a
-    // future specialist would be dispatched with. Defaults to 'coder' because Coder is currently
-    // the only real specialist a task can target.
+    // target.mode is the canonical specialist-role field. Missing legacy values default to Coder;
+    // an explicit unknown role fails closed instead of inheriting Coder behavior.
     target.mode = compactInline((input.target && input.target.mode) || input.targetMode || 'coder') || 'coder';
+    if (!isRegisteredTaskTarget(target.mode)) {
+      return {
+        success: false,
+        needsClarification: true,
+        clarification: `Orion does not have a registered task role named "${target.mode}". Choose Dispatch, Coder, or Operator before this task is queued.`,
+        task: null
+      };
+    }
     const requirements = uniqueStrings([
       ...(input.requirements || input.knownRequirements || []),
       ...(taskResolution.requirements || [])
@@ -584,8 +601,10 @@
       sessionId: record.targetSessionId,
       messageId: ''
     });
-    // See the matching comment in buildTaskPacket() above: target.mode is the specialist-role field.
+    // Legacy records without a role are Coder tasks. Unknown persisted roles are retained for
+    // provenance but made non-runnable below.
     target.mode = compactInline((record.target && record.target.mode) || record.targetMode || 'coder') || 'coder';
+    const invalidTargetMode = isRegisteredTaskTarget(target.mode) ? '' : target.mode;
     const createdAt = resolveNow(record.createdAt || record.timestamp || now);
     const updatedAt = resolveNow(record.updatedAt || createdAt);
     const rawStatus = record.status == null ? record.state : record.status;
@@ -609,6 +628,7 @@
     const legacyCompletedProviderFailure = status === TASK_STATES.COMPLETED
       && persistedResultSummary.startsWith('Error contacting Model API:');
     if (legacyCompletedProviderFailure) status = TASK_STATES.FAILED;
+    if (invalidTargetMode && !TERMINAL_STATES.has(status)) status = TASK_STATES.FAILED;
     const persistedTitle = compactInline(record.title);
     const title = !persistedTitle || persistedTitle.toLowerCase() === 'execute dispatch request'
       ? titleFromObjective(objective || originalUserMessage, workspace.project.name)
@@ -662,6 +682,12 @@
         || record.continuationOfTaskId
         || ''
       ),
+      ...(invalidTargetMode ? {
+        failure: {
+          code: 'unknown_specialist_role',
+          message: `Persisted task targets unregistered specialist "${invalidTargetMode}" and cannot be executed.`
+        }
+      } : {}),
       supersededByTaskId: compactInline(record.supersededByTaskId || ''),
       source: compactInline(record.source || 'unknown'),
       status,
@@ -827,13 +853,14 @@
     return !conversationId && !!sessionId && !!task.origin.sessionId && sessionId === task.origin.sessionId;
   }
 
-  // Phase 2 of the Operator architecture plan: which specialist a continuation task must target is
-  // now a parameter (defaulting to 'coder', the only real specialist today) instead of a hardcoded
-  // literal, so this function keeps working unmodified once a second role exists to resume.
+  // Continuations remain bound to one explicit registered specialist role.
   function selectOwnedContinuationTask(tasksValue, requesterConversationIdValue, preferredTaskIdsValue = [], options = {}) {
     const requesterConversationId = compactInline(requesterConversationIdValue);
     const preferredTaskIds = uniqueStrings(preferredTaskIdsValue).map(compactInline).filter(Boolean);
     const role = compactInline(options.role).toLowerCase() || 'coder';
+    if (!SpecialistRegistry || !SpecialistRegistry.has(role)) {
+      return { action: 'unknown_specialist', task: null, candidates: [] };
+    }
     const tasks = filterSupersededTasks(tasksValue)
       .filter(task =>
         task.taskId
@@ -1069,15 +1096,15 @@
     const subStatus = compactWhitespace(context.subStatus || taskValue.subStatus || '');
     const verifying = status === TASK_STATES.ACTIVE
       && (/verif|test/.test(executionMode) || /run_tests|test|verif/i.test(subStatus));
-    // Phase 2 of the Operator architecture plan: the specialist display name is a parameter
-    // (defaulting to 'Coder', the only real specialist today) instead of hardcoded into every
-    // branch below, so a second specialist's presentation reuses this same status machine.
-    const roleLabel = compactWhitespace(context.roleLabel || taskValue.roleLabel || '') || 'Coder';
     const roleMode = compactInline(
       context.roleMode
       || taskValue.target && taskValue.target.mode
       || ''
     ).toLowerCase();
+    const registeredRole = SpecialistRegistry && SpecialistRegistry.get(roleMode);
+    const roleLabel = compactWhitespace(context.roleLabel || taskValue.roleLabel || '')
+      || (registeredRole && registeredRole.label)
+      || 'Specialist';
     const operatorTask = roleMode === 'operator' || roleLabel.toLowerCase() === 'operator';
     const operatorControlling = operatorTask
       && (subStatus.startsWith('Operator is controlling') || subStatus.startsWith('Operator is opening'));

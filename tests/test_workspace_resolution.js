@@ -127,7 +127,7 @@ test('standalone Coder and unresolved Dispatch workspaces remain distinct', (t) 
   });
   const unresolved = workspace.classifyWorkspace({ mode: 'orion' });
 
-  t.equal(standalone.kind, workspace.KINDS.STANDALONE_CODER, 'identifies a standalone Coder workspace');
+  t.equal(standalone.kind, workspace.KINDS.STANDALONE_SPECIALIST, 'identifies a standalone specialist workspace');
   t.equal(standalone.projectPath, '', 'does not represent standalone work as a registered project');
   t.equal(workspace.canHandoffWorkspace(standalone).allowed, true, 'standalone Coder work remains a valid concrete target');
   t.equal(unresolved.kind, workspace.KINDS.UNRESOLVED, 'represents missing workspace information explicitly');

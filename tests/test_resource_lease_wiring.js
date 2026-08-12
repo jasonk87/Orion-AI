@@ -191,12 +191,12 @@ test('start_command with no pid reported records no processIds rather than fabri
   t.end();
 });
 
-test('kill_command releases the workspace process lease', async t => {
+test('kill_command releases only the killed PID from the workspace process lease', async t => {
   const oldWindow = global.window;
   const releaseCalls = [];
   global.window = {
     api: {
-      killCommand: async () => ({ success: true }),
+      killCommand: async () => ({ success: true, pid: '4242' }),
       releaseResourceLease: async (payload) => { releaseCalls.push(payload); return { success: true }; }
     }
   };
@@ -208,6 +208,7 @@ test('kill_command releases the workspace process lease', async t => {
   t.equal(releaseCalls[0].resourceType, 'process');
   t.equal(releaseCalls[0].resourceKey, 'C:\\workspace');
   t.equal(releaseCalls[0].conversationId, 'conv_new');
+  t.deepEqual(releaseCalls[0].processIds, ['4242'], 'other live PIDs in the same workspace stay protected');
   t.end();
 });
 

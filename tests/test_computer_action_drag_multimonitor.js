@@ -93,14 +93,18 @@ test('the PowerShell script dispatches drag to a real interpolated-motion method
 
 // ── resolveTargetDisplay ──────────────────────────────────────────────────────────────────────
 
-test('resolveTargetDisplay falls back to primary for a blank, missing, or stale display id', t => {
+test('resolveTargetDisplay defaults only omitted display ids to primary and rejects stale explicit ids', t => {
   const primary = { id: 1, label: 'Primary' };
   const secondary = { id: 2, label: 'Secondary' };
   const electronScreen = { getPrimaryDisplay: () => primary, getAllDisplays: () => [primary, secondary] };
   t.equal(computerUse.resolveTargetDisplay(electronScreen, undefined), primary, 'undefined id -> primary');
   t.equal(computerUse.resolveTargetDisplay(electronScreen, ''), primary, 'empty string id -> primary');
   t.equal(computerUse.resolveTargetDisplay(electronScreen, null), primary, 'null id -> primary');
-  t.equal(computerUse.resolveTargetDisplay(electronScreen, '999-unplugged'), primary, 'an id that matches no connected display falls back rather than throwing');
+  t.throws(
+    () => computerUse.resolveTargetDisplay(electronScreen, '999-unplugged'),
+    error => error && error.code === 'STALE_DISPLAY_ID' && /fresh screen/i.test(error.message),
+    'an explicit missing monitor fails closed and requires fresh evidence'
+  );
   t.end();
 });
 
@@ -222,7 +226,7 @@ test('captureDesktopScreenshot picks the source matching a requested displayId a
   t.end();
 });
 
-test('captureDesktopScreenshot falls back to the primary display for a stale displayId instead of failing', async t => {
+test('captureDesktopScreenshot rejects a stale explicit displayId instead of capturing an uninspected monitor', async t => {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-multimonitor-stale-'));
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-multimonitor-stale-ws-'));
   const primary = { id: 'A', label: 'Built-in', bounds: { x: 0, y: 0, width: 1536, height: 864 }, size: { width: 1536, height: 864 }, scaleFactor: 1 };
@@ -238,8 +242,14 @@ test('captureDesktopScreenshot falls back to the primary display for a stale dis
     }
   });
 
-  const shot = await ipcShell.captureDesktopScreenshot(workspace, '', 'test', { displayId: 'unplugged-monitor' });
-  t.equal(shot.displayId, 'A', 'a monitor that is no longer connected degrades to the primary display rather than throwing');
+  try {
+    await ipcShell.captureDesktopScreenshot(workspace, '', 'test', { displayId: 'unplugged-monitor' });
+    t.fail('a disappeared inspected monitor must not fall back to primary');
+  } catch (error) {
+    t.match(error.message, /no longer connected/i,
+      'a disappeared inspected monitor requires a new capture decision');
+    t.equal(error.code, 'STALE_DISPLAY_ID', 'the failure has a stable machine-readable code');
+  }
 
   fs.rmSync(userData, { recursive: true, force: true });
   fs.rmSync(workspace, { recursive: true, force: true });

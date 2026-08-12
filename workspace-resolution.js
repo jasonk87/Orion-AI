@@ -5,10 +5,17 @@
 })(typeof window !== 'undefined' ? window : globalThis, function () {
   'use strict';
 
+  const SpecialistRegistry = typeof require === 'function'
+    ? require('./specialist-registry')
+    : (typeof globalThis !== 'undefined' ? globalThis.OrionSpecialistRegistry : null);
+
   const KINDS = Object.freeze({
     ACTIVE_PROJECT: 'active_project',
     PROJECT_SEARCH_ROOT: 'project_search_root',
-    STANDALONE_CODER: 'standalone_coder',
+    STANDALONE_SPECIALIST: 'standalone_specialist',
+    // Compatibility name for callers compiled against the older constant. New persisted records
+    // use the role-neutral value.
+    STANDALONE_CODER: 'standalone_specialist',
     UNRESOLVED: 'unresolved'
   });
 
@@ -55,12 +62,10 @@
   }
 
   function classifyWorkspace(input = {}) {
-    // Operator (Phase 3 of the Operator architecture plan) does real workspace-bound artifact work
-    // like Coder, not Dispatch's search-root-aware resolution, so it takes the same 'coder' branch
-    // below. Normalized here rather than only at each call site so any caller that forwards
-    // conversation.mode straight through (e.g. recall_memory's `mode: conversation.mode`) is
-    // covered even without its own explicit coder-or-operator check.
-    const mode = (input.mode === 'coder' || input.mode === 'operator') ? 'coder' : 'orion';
+    const requestedMode = String(input.mode || 'orion').trim().toLowerCase();
+    const mode = requestedMode === 'orion'
+      ? 'orion'
+      : (SpecialistRegistry && SpecialistRegistry.has(requestedMode) ? 'specialist' : 'unknown');
     const searchRoot = cleanPath(input.searchRoot);
     const standaloneRoot = cleanPath(input.standaloneRoot);
     const declaredProjectPath = cleanPath(input.projectPath || input.dispatchProjectPath);
@@ -73,9 +78,20 @@
       .filter(project => !(searchRoot && samePath(project.path, searchRoot)));
     const known = knownProjects.find(project => samePath(project.path, projectPath || workspacePath));
 
-    if (mode === 'coder' && workspacePath && standaloneRoot && isWithinPath(workspacePath, standaloneRoot) && !projectPath) {
+    if (mode === 'unknown') {
       return {
-        kind: KINDS.STANDALONE_CODER,
+        kind: KINDS.UNRESOLVED,
+        path: '',
+        projectPath: '',
+        projectName: '',
+        source: 'unknown_specialist_role',
+        changed: false
+      };
+    }
+
+    if (mode === 'specialist' && workspacePath && standaloneRoot && isWithinPath(workspacePath, standaloneRoot) && !projectPath) {
+      return {
+        kind: KINDS.STANDALONE_SPECIALIST,
         path: workspacePath,
         projectPath: '',
         projectName: baseName(workspacePath) || 'Standalone',
@@ -119,9 +135,9 @@
       };
     }
 
-    if (mode === 'coder' && workspacePath) {
+    if (mode === 'specialist' && workspacePath) {
       return {
-        kind: KINDS.STANDALONE_CODER,
+        kind: KINDS.STANDALONE_SPECIALIST,
         path: workspacePath,
         projectPath: '',
         projectName: baseName(workspacePath) || 'Standalone',
@@ -234,12 +250,12 @@
         ? `This conversation is not attached to a specific project yet. I will search the Projects directory for ${target}. Search root: ${value.path}.`
         : `This conversation is not attached to a specific project yet. ${value.path} is the project search root, not a selected project workspace.`;
     }
-    if (value.kind === KINDS.STANDALONE_CODER) return `Standalone Coder workspace: ${value.path}.`;
+    if (value.kind === KINDS.STANDALONE_SPECIALIST) return `Standalone specialist workspace: ${value.path}.`;
     return 'This conversation does not have a resolved workspace yet.';
   }
 
   function canHandoffWorkspace(resolution) {
-    const allowed = !!(resolution && (resolution.kind === KINDS.ACTIVE_PROJECT || resolution.kind === KINDS.STANDALONE_CODER) && resolution.path);
+    const allowed = !!(resolution && (resolution.kind === KINDS.ACTIVE_PROJECT || resolution.kind === KINDS.STANDALONE_SPECIALIST) && resolution.path);
     return allowed
       ? { allowed: true }
       : { allowed: false, reason: resolution && resolution.kind === KINDS.PROJECT_SEARCH_ROOT

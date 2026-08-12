@@ -736,7 +736,7 @@ test('Phase 2: task presentation and continuation selection are role-generic, no
   t.equal(operatorRole.task.taskId, 'task_role_operator', 'role: "operator" selects only the operator task, not the coder one');
 
   const noSuchRole = selectOwnedContinuationTask([coderTask, operatorTask], 'dispatch-1', [], { role: 'reviewer' });
-  t.equal(noSuchRole.action, 'none', 'a role with no matching tasks finds nothing, rather than falling back to any role');
+  t.equal(noSuchRole.action, 'unknown_specialist', 'an unregistered role fails closed rather than falling back to any specialist');
 
   // describeSupervisedTaskPresentation: roleLabel defaults to 'Coder' (already covered by the
   // exact-string assertions above), and an explicit roleLabel substitutes cleanly everywhere the

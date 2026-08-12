@@ -131,6 +131,26 @@ test('a heartbeat keeps a long-held lease from going stale and can merge in new 
   t.end();
 });
 
+test('releasing one process PID preserves the workspace lease until its final PID is removed', async t => {
+  const { store } = makeTempStore(t);
+  await store.acquire({
+    resourceType: 'process', resourceKey: 'C:\\Projects\\Orion', conversationId: 'coder-1',
+    taskId: 'task_a', processIds: ['1111', '2222']
+  });
+  const partial = await store.release({
+    resourceType: 'process', resourceKey: 'C:\\Projects\\Orion', conversationId: 'coder-1', processIds: ['1111']
+  });
+  t.equal(partial.partial, true, 'one PID is removed without freeing the workspace process lease');
+  t.equal(partial.released, false);
+  t.deepEqual(partial.lease.processIds, ['2222'], 'the other live PID remains protected');
+  const final = await store.release({
+    resourceType: 'process', resourceKey: 'C:\\Projects\\Orion', conversationId: 'coder-1', processIds: ['2222']
+  });
+  t.equal(final.released, true, 'the lease is released when no tracked process IDs remain');
+  t.equal((await store.list({ resourceType: 'process' })).length, 0);
+  t.end();
+});
+
 test('release only succeeds for the actual holder, and releasing an unheld resource is a harmless no-op', async t => {
   const { store } = makeTempStore(t);
   await store.acquire({ resourceType: 'workspace', resourceKey: 'C:\\Projects\\Orion', conversationId: 'coder-1' });

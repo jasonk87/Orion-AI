@@ -16,7 +16,7 @@
   ]);
   const SCREEN_ACTION_TOOLS = new Set(['computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite']);
   const PROCESS_ACTION_TOOLS = new Set(['start_command', 'kill_command']);
-  const MAX_RAW_DIAGNOSTIC_CALLS = 3;
+  const MAX_UNPRODUCTIVE_DIAGNOSTICS = 3;
 
   function normalizeSurface(value) {
     const surface = String(value || '').trim().toLowerCase();
@@ -26,7 +26,10 @@
   function createState(surface = 'none') {
     return {
       surface: normalizeSurface(surface),
-      rawDiagnosticCalls: 0,
+      diagnosticCalls: 0,
+      unproductiveDiagnosticStreak: 0,
+      lastDiagnosticRequestKey: '',
+      lastDiagnosticEvidenceKey: '',
       captured: false,
       inspected: false,
       latestCapturePath: '',
@@ -41,9 +44,49 @@
     return !!(result && typeof result === 'object' && result.success !== false && !result.error);
   }
 
-  function recordToolResult(stateValue, toolName, result) {
+  function stableObject(value) {
+    if (Array.isArray(value)) return value.map(stableObject);
+    if (!value || typeof value !== 'object') return value;
+    const output = {};
+    for (const key of Object.keys(value).sort()) output[key] = stableObject(value[key]);
+    return output;
+  }
+
+  function boundedFingerprint(value) {
+    try { return JSON.stringify(stableObject(value)).slice(0, 12000); }
+    catch (_) { return String(value || '').slice(0, 12000); }
+  }
+
+  function diagnosticEvidence(result) {
+    const value = result && typeof result === 'object' ? result : { value: result };
+    return {
+      success: value.success !== false,
+      status: value.status,
+      exitCode: value.exitCode,
+      timedOut: value.timedOut,
+      killed: value.killed,
+      pid: value.pid,
+      stdout: value.stdout,
+      stderr: value.stderr,
+      output: value.output,
+      error: value.error
+    };
+  }
+
+  function recordToolResult(stateValue, toolName, result, args = {}) {
     const state = stateValue || createState();
-    if (RAW_DIAGNOSTIC_TOOLS.has(toolName)) state.rawDiagnosticCalls += 1;
+    if (RAW_DIAGNOSTIC_TOOLS.has(toolName)) {
+      state.diagnosticCalls += 1;
+      const requestKey = `${toolName}:${boundedFingerprint(args)}`;
+      const evidenceKey = boundedFingerprint(diagnosticEvidence(result));
+      if (requestKey === state.lastDiagnosticRequestKey && evidenceKey === state.lastDiagnosticEvidenceKey) {
+        state.unproductiveDiagnosticStreak += 1;
+      } else {
+        state.unproductiveDiagnosticStreak = 0;
+      }
+      state.lastDiagnosticRequestKey = requestKey;
+      state.lastDiagnosticEvidenceKey = evidenceKey;
+    }
     if (!isSuccessful(result)) return state;
     if (toolName === 'capture_screen') {
       state.captured = true;
@@ -59,11 +102,14 @@
     if (toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal') {
       state.inspected = true;
     }
+    if (SCREEN_OBSERVATION_TOOLS.has(toolName)) state.unproductiveDiagnosticStreak = 0;
     if (SCREEN_ACTION_TOOLS.has(toolName)) {
       state.screenActions += 1;
       state.captured = !!result.path;
+      state.latestCapturePath = String(result.path || '').trim();
       state.inspected = false;
       state.latestInspectionStatus = '';
+      state.unproductiveDiagnosticStreak = 0;
     }
     if (PROCESS_ACTION_TOOLS.has(toolName)) {
       // A process launch/stop can change the visible desktop asynchronously. The previous image
@@ -71,6 +117,7 @@
       state.captured = false;
       state.inspected = false;
       state.latestInspectionStatus = '';
+      state.unproductiveDiagnosticStreak = 0;
     }
     return state;
   }
@@ -100,11 +147,12 @@
 
     if (toolName === 'inspect_screenshot_with_model') {
       const requestedPath = resolveSnapshotReference(args.path, { path: state.latestCapturePath });
-      if (state.inspected && sameScreenReference(requestedPath, state.latestInspectedPath)) {
+      const inspectingCurrentCapture = sameScreenReference(requestedPath, state.latestCapturePath);
+      if (state.screenActions > 0 && (!state.captured || !inspectingCurrentCapture)) {
         return {
           allowed: false,
           code: 'operator_stale_screenshot_reinspection',
-          reason: 'That exact screenshot was already judged. Capture a fresh screen before checking whether movement, navigation, or any other state change occurred; the same image cannot prove a later result.'
+          reason: 'That screenshot predates the latest visible action and cannot prove the resulting state. Capture and inspect the current screen instead.'
         };
       }
     }
@@ -130,11 +178,11 @@
           reason: 'The screen has been inspected and the visible goal is not satisfied. Use open_application for a named app, open_chrome_favorite for a saved Chrome item, click_ui_element for a labeled accessible control, or computer_action only for a visual target with no accessible identity. Do not use PowerShell, WScript, SendKeys, or terminal commands as a substitute for visible input.'
         };
       }
-      if (state.rawDiagnosticCalls >= MAX_RAW_DIAGNOSTIC_CALLS) {
+      if (state.unproductiveDiagnosticStreak >= MAX_UNPRODUCTIVE_DIAGNOSTICS) {
         return {
           allowed: false,
-          code: 'operator_diagnostic_budget_exhausted',
-          reason: `Operator has already used ${MAX_RAW_DIAGNOSTIC_CALLS} raw diagnostic calls. Do not keep digging through processes or installation metadata. Use the dedicated screen/application tools, act from visible evidence, or report the concrete blocker.`
+          code: 'operator_unproductive_diagnostic_loop',
+          reason: `Operator repeated the same diagnostic without gaining new evidence ${MAX_UNPRODUCTIVE_DIAGNOSTICS} times. Change the action or evidence source, use the dedicated screen/application tools, or report the concrete blocker. A changed process state, output, command, or screen action will allow useful monitoring to continue.`
         };
       }
     }
@@ -190,7 +238,7 @@
   }
 
   const api = {
-    MAX_RAW_DIAGNOSTIC_CALLS,
+    MAX_UNPRODUCTIVE_DIAGNOSTICS,
     RAW_DIAGNOSTIC_TOOLS,
     SCREEN_OBSERVATION_TOOLS,
     SCREEN_ACTION_TOOLS,

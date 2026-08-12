@@ -68,7 +68,7 @@ test('get_workspace_info classifies an operator workspace the way Coder is class
   global.window.api = { getWorkspaceEntrypoint: async () => ({ success: false }) };
   try {
     // A workspace path with no registered project and no search-root match: Coder-mode
-    // classification treats this as a real standalone workspace (STANDALONE_CODER); Dispatch-mode
+    // classification treats this as a real standalone specialist workspace; Dispatch-mode
     // classification treats the identical path as UNRESOLVED, because Dispatch expects a known
     // project or its own search root, not an arbitrary directory. Operator does real workspace-
     // bound artifact work like Coder, so it must get the Coder-style classification.
@@ -87,7 +87,7 @@ test('get_workspace_info classifies an operator workspace the way Coder is class
       { id: 'conv_dispatch', mode: 'orion', projectPath: '' }, {}
     );
 
-    t.equal(operatorResult.workspaceKind, 'standalone_coder', 'operator gets Coder-style standalone classification');
+    t.equal(operatorResult.workspaceKind, 'standalone_specialist', 'operator gets role-neutral standalone classification');
     t.equal(operatorResult.workspaceKind, coderResult.workspaceKind, 'operator and coder classify the same workspace identically');
     t.notEqual(operatorResult.workspaceKind, dispatchResult.workspaceKind, 'operator classification differs from Dispatch for the same path, proving the mode actually mattered');
   } finally {
@@ -143,13 +143,14 @@ test('WorkspaceResolution.classifyWorkspace treats operator mode as coder-equiva
   const operatorClassification = WorkspaceResolution.classifyWorkspace({ mode: 'operator', workspacePath });
   const coderClassification = WorkspaceResolution.classifyWorkspace({ mode: 'coder', workspacePath });
   t.equal(operatorClassification.kind, coderClassification.kind, 'operator mode classifies identically to coder mode');
-  t.equal(operatorClassification.kind, WorkspaceResolution.KINDS.STANDALONE_CODER, 'operator gets a real standalone classification, not the orion fallback');
+  t.equal(operatorClassification.kind, WorkspaceResolution.KINDS.STANDALONE_SPECIALIST, 'operator gets a real standalone classification, not the orion fallback');
   t.end();
 });
 
-test('source-level sanity: the four fixed call sites and the shared classifier all name operator explicitly', (t) => {
-  t.ok(agentJs.includes("conversation.mode === 'operator'") || agentJs.includes("|| conversation.mode === 'operator'"),
-    'at least the activeConversationMode derivation names operator explicitly');
-  t.ok(workspaceResolutionJs.includes("'operator'"), 'the shared workspace classifier names operator explicitly');
+test('source-level sanity: runtime and workspace routing use the specialist registry', (t) => {
+  t.ok(agentJs.includes('OrionSpecialistRegistry.requireRole'),
+    'the agent runtime validates specialist roles through the registry');
+  t.ok(workspaceResolutionJs.includes('SpecialistRegistry.has'),
+    'the shared workspace classifier recognizes specialists through the registry');
   t.end();
 });

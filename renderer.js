@@ -2509,7 +2509,7 @@ function structuredWorkspaceForConversation(conv, explicitPath = '') {
   const workspacePath = String(explicitPath || (conv && (conv.workspace || conv.projectPath || conv.dispatchProjectPath)) || '').trim();
   if (!RendererWorkspaceResolution) {
     return {
-      role: workspacePath ? ((mode === 'coder' || mode === 'operator') ? 'standalone_coder' : 'active_project') : 'unresolved',
+      role: workspacePath ? ((mode === 'coder' || mode === 'operator') ? 'standalone_specialist' : 'active_project') : 'unresolved',
       path: workspacePath,
       project: { name: workspacePath.split(/[\\/]/).pop() || '', path: (conv && (conv.projectPath || conv.dispatchProjectPath)) || '' },
       source: 'legacy',
@@ -2849,7 +2849,7 @@ async function queueDispatchWorkForCoder(options = {}) {
   const workspace = standaloneSystemWork
     ? structuredWorkspaceForConversation(originConv)
     : await bindNamedProjectForSupervisor(originConv, contextText);
-  const hasConcreteWorkspace = workspace.role === 'active_project' || workspace.role === 'standalone_coder';
+  const hasConcreteWorkspace = workspace.role === 'active_project' || workspace.role === 'standalone_specialist';
   const standalone = standaloneSystemWork || (!hasConcreteWorkspace
     && RendererSemanticIntentRouter
     && RendererSemanticIntentRouter.canUseStandaloneCoderWorkspace(semanticIntent));
@@ -2875,7 +2875,7 @@ async function queueDispatchWorkForCoder(options = {}) {
   }
   const taskWorkspace = standalone
     ? {
-        role: 'standalone_coder',
+        role: 'standalone_specialist',
         path: standaloneWorkspacePath || getDispatchWorkspaceRoot(),
         project: { name: '', path: '' },
         source: standaloneSystemWork ? 'standalone-system-task' : 'standalone-coder-task',
@@ -2883,7 +2883,7 @@ async function queueDispatchWorkForCoder(options = {}) {
       }
     : workspace;
 
-  if (!standalone && taskWorkspace.role !== 'active_project' && taskWorkspace.role !== 'standalone_coder') {
+  if (!standalone && taskWorkspace.role !== 'active_project' && taskWorkspace.role !== 'standalone_specialist') {
     const reference = (RendererWorkspaceResolution.extractProjectReferences(contextText) || [])[0] || '';
     const clarification = reference
       ? `I could not resolve ${reference} to a specific project workspace. Which project folder should Coder use?`
@@ -7312,7 +7312,7 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
     ? RendererTaskOrchestration.normalizeTaskRecord(options.taskPacket)
     : null;
   const handoffWorkspace = {
-    role: standalone ? 'standalone_coder' : 'active_project',
+    role: standalone ? 'standalone_specialist' : 'active_project',
     path: folderPath,
     project: {
       name: standalone ? '' : (folderPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || ''),
@@ -7547,12 +7547,10 @@ window.promoteWorkspaceToOperator = async function(options = {}) {
   let preflightTask = options.taskPacket && RendererTaskOrchestration
     ? RendererTaskOrchestration.normalizeTaskRecord(options.taskPacket)
     : null;
-  // role stays 'active_project'/'standalone_coder' even for Operator: those are WorkspaceResolution's
-  // own KINDS constants (see workspace-resolution.js), and piece 2's classifyWorkspace fix already
-  // made 'operator' mode classify identically to 'coder' mode — there is no separate "standalone
-  // operator" kind, by design.
+  // Workspace roles stay role-neutral for every specialist. task.target.mode carries the Coder or
+  // Operator identity; there is no role-specific standalone workspace kind by design.
   const handoffWorkspace = {
-    role: standalone ? 'standalone_coder' : 'active_project',
+    role: standalone ? 'standalone_specialist' : 'active_project',
     path: folderPath,
     project: {
       name: standalone ? '' : (folderPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || ''),

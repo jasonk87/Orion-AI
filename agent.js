@@ -5,6 +5,7 @@
 // SYSTEM_INSTRUCTION and DISPATCHER_INSTRUCTION below. See orion-operating-contract.js.
 const OrionOperatingContract = window.OrionOperatingContract || (typeof require === 'function' ? require('./orion-operating-contract') : null);
 const OperatorExecutionPolicy = window.OrionOperatorExecutionPolicy || (typeof require === 'function' ? require('./operator-execution-policy') : null);
+const OrionSpecialistRegistry = window.OrionSpecialistRegistry || (typeof require === 'function' ? require('./specialist-registry') : null);
 
 // System Instruction for the Pair Programmer
 const SYSTEM_INSTRUCTION = `You are Orion AI, the ultimate pair programmer agent running locally on the user's workspace.
@@ -259,10 +260,12 @@ function getSystemInstruction(disableTools = false, cachedMemory = '', modelName
       : '';
     base = DISPATCHER_INSTRUCTION.replace('{{user_memory}}', memBlock) + timeContext + continuityDirective + orionSessionContinuityContext;
   } else {
-    // Phase 3 of the Operator architecture plan: activeConversationMode can now be 'operator' as
-    // well as 'coder' (anything else falls back to Coder's prompt, matching the pre-Phase-3
-    // behavior for any value this switch doesn't recognize).
-    base = activeConversationMode === 'operator' ? OPERATOR_INSTRUCTION : SYSTEM_INSTRUCTION;
+    // Specialist roles are explicit. An unknown future role must never silently inherit Coder's
+    // authority, prompt, or tools merely because it is not Operator.
+    const specialist = OrionSpecialistRegistry.requireRole(activeConversationMode);
+    const prompts = { coder: SYSTEM_INSTRUCTION, operator: OPERATOR_INSTRUCTION };
+    base = prompts[specialist.promptKey];
+    if (!base) throw new Error(`No system prompt is registered for Orion specialist role "${specialist.role}".`);
     if (modelName && (modelName.startsWith('deepseek') || modelName.includes('pro') || modelName.includes('claude-3-7'))) {
       base = `SYSTEM AWARENESS: You are currently running on ${modelName}, which features a large context window. Read entire files when they fit the active acquisition budget and whole-file structure matters. Oversized reads are capped so one tool result cannot crowd out the task; use inspect_code_context, semantic_search, or get_symbol_index for very large files.\n\n` + base;
     } else if (modelName) {
@@ -1725,15 +1728,16 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     ? (normalized => normalized === 'auto' ? '' : normalized)(ReasoningPolicy.normalizeEffortOverride(requestedReasoningEffort))
     : '';
   // Session continuity: build prev-session context on first message, clear otherwise
-  const isOrionMode = conversation.mode === 'orion' ||
-    (conversation.mode !== 'coder' && conversation.mode !== 'operator' && typeof appMode !== 'undefined' && appMode === 'orion');
-  // Phase 3 of the Operator architecture plan: activeConversationMode is a genuine three-value
-  // resolution now, not a binary collapse. Everything downstream that branches on isOrionMode
-  // (a strict boolean, unaffected by this change) continues to treat Coder and Operator alike by
-  // construction. Only sites that need to distinguish Coder from Operator specifically read
-  // activeConversationMode directly - see workspace binding (get_workspace_info, change_workspace)
-  // and the computer_action role gate.
-  activeConversationMode = isOrionMode ? 'orion' : (conversation.mode === 'operator' ? 'operator' : 'coder');
+  const recordedConversationMode = String(conversation.mode || '').trim().toLowerCase();
+  const fallbackAppMode = typeof appMode !== 'undefined' ? String(appMode || '').trim().toLowerCase() : '';
+  // Legacy conversations without an explicit mode used Coder unless the application supplied its
+  // Dispatch mode. Preserve that migration behavior; explicit unknown values still fail closed.
+  const resolvedConversationMode = recordedConversationMode || fallbackAppMode || 'coder';
+  const isOrionMode = resolvedConversationMode === 'orion';
+  if (!isOrionMode) OrionSpecialistRegistry.requireRole(resolvedConversationMode);
+  // A missing legacy mode may still use the explicit application mode, but an unknown persisted
+  // role must never inherit Coder's prompt, tools, workspace rules, or completion behavior.
+  activeConversationMode = isOrionMode ? 'orion' : resolvedConversationMode;
   // Captured once per run (rather than re-reading the shared activeConversationMode later, e.g. in
   // the finally block) so a concurrently-started run can't change which bucket this run's
   // preferences land in.
@@ -1744,7 +1748,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         taskId: conversation.awaitingPlanApprovalTaskId || runTaskId || '',
         ownerConversationId: conversation.id,
         coderConversationId: conversation.id,
-        targetMode: conversation.launchedTaskRole === 'operator' || conversation.mode === 'operator' ? 'operator' : 'coder',
+        targetMode: conversation.launchedTaskRole
+          ? OrionSpecialistRegistry.requireRole(conversation.launchedTaskRole).role
+          : (activeConversationMode === 'orion'
+              ? 'coder'
+              : OrionSpecialistRegistry.requireRole(activeConversationMode).role),
         title: conversation.title || '',
         status: 'pending'
       }
@@ -1822,7 +1830,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         projectPath: conversation.projectPath,
         searchRoot: getDispatchWorkspaceRoot(),
         knownProjects: getKnownWorkspaceCandidates(conversation)
-      }) : { kind: 'standalone_coder', path: resolveConversationWorkspace(conversation) });
+      }) : { kind: 'standalone_specialist', path: resolveConversationWorkspace(conversation) });
   workspacePath = workspaceResolution.path || resolveConversationWorkspace(conversation);
   // Phase 3 (resource leases, item 11): Coder/Operator both do real workspace-bound work
   // (writes, builds, background processes), and recon found nothing today registers who is
@@ -5951,6 +5959,13 @@ async function executeTool(name, args, workspace, config, conversation, executio
   console.log(`Executing tool ${name} with args:`, args);
 
   const operatorPolicyState = executionContext.operatorPolicyState;
+  const finishOperatorToolResult = result => {
+    if (OperatorExecutionPolicy && operatorPolicyState
+        && OperatorExecutionPolicy.RAW_DIAGNOSTIC_TOOLS.has(name)) {
+      OperatorExecutionPolicy.recordToolResult(operatorPolicyState, name, result, args);
+    }
+    return result;
+  };
   if (OperatorExecutionPolicy && operatorPolicyState) {
     const policyGate = OperatorExecutionPolicy.gateTool({
       mode: conversation && conversation.mode,
@@ -5966,9 +5981,6 @@ async function executeTool(name, args, workspace, config, conversation, executio
         error: policyGate.reason,
         recoveryGuidance: policyGate.reason
       };
-    }
-    if (OperatorExecutionPolicy.RAW_DIAGNOSTIC_TOOLS.has(name)) {
-      OperatorExecutionPolicy.recordToolResult(operatorPolicyState, name, { success: true });
     }
     if (OperatorExecutionPolicy.SCREEN_ACTION_TOOLS.has(name)
         && typeof OperatorExecutionPolicy.recordToolAttempt === 'function') {
@@ -6020,9 +6032,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
     case 'get_workspace_info': {
       const entryResult = await window.api.getWorkspaceEntrypoint(workspace);
       const resolution = WorkspaceResolution ? WorkspaceResolution.classifyWorkspace({
-        // Operator does real workspace-bound artifact work like Coder, not search-root-aware
-        // Dispatch resolution, so it takes the 'coder' branch here too.
-        mode: (conversation.mode === 'coder' || conversation.mode === 'operator') ? 'coder' : 'orion',
+        mode: conversation.mode || 'orion',
         workspacePath: workspace,
         projectPath: conversation.projectPath,
         dispatchProjectPath: conversation.dispatchProjectPath,
@@ -6037,7 +6047,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
         conversationId: conversation.id,
         title: conversation.title,
         projectPath: (resolution && resolution.projectPath) || conversation.projectPath || conversation.dispatchProjectPath || '',
-        scope: resolution ? resolution.kind : (conversation.projectPath ? 'active_project' : 'standalone_coder'),
+        scope: resolution ? resolution.kind : (conversation.projectPath ? 'active_project' : 'standalone_specialist'),
         entrypoint: entryResult && entryResult.success ? entryResult.entrypoint : null
       };
     }
@@ -6521,7 +6531,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
         throw new Error('Coder handoff is not available in this Orion build.');
       }
       let handoffWorkspace = isolatedStandaloneHandoff
-        ? { kind: WorkspaceResolution ? WorkspaceResolution.KINDS.STANDALONE_CODER : 'standalone_coder', path: 'pending-standalone-workspace' }
+        ? { kind: WorkspaceResolution ? WorkspaceResolution.KINDS.STANDALONE_SPECIALIST : 'standalone_specialist', path: 'pending-standalone-workspace' }
         : WorkspaceResolution ? WorkspaceResolution.classifyWorkspace({
         mode: 'orion',
         workspacePath: resolution.path,
@@ -6662,7 +6672,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
         throw new Error('Operator handoff is not available in this Orion build.');
       }
       let handoffWorkspace = isolatedStandaloneHandoff
-        ? { kind: WorkspaceResolution ? WorkspaceResolution.KINDS.STANDALONE_CODER : 'standalone_coder', path: 'pending-standalone-workspace' }
+        ? { kind: WorkspaceResolution ? WorkspaceResolution.KINDS.STANDALONE_SPECIALIST : 'standalone_specialist', path: 'pending-standalone-workspace' }
         : WorkspaceResolution ? WorkspaceResolution.classifyWorkspace({
         mode: 'operator',
         workspacePath: resolution.path,
@@ -6848,7 +6858,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
       }
       const teCleanStdout = teRawStdout.replace(/::ORION_CWD::.+(\r?\n)?/, '').slice(0, 16000);
 
-      return {
+      return finishOperatorToolResult({
         sessionId: teSessionId,
         command: teCmd,
         exitCode: teResult.code,
@@ -6856,7 +6866,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
         stderr: (teStderr || teResult.stderr || '').slice(0, 4000),
         cwd: teSession.cwd,
         timedOut: !!teResult.timedOut
-      };
+      });
     }
 
     case 'db_query': {
@@ -6932,13 +6942,13 @@ async function executeTool(name, args, workspace, config, conversation, executio
       const timeoutMs = args.timeoutMs || config.commandTimeoutMs || 120000;
       const interactiveGate = await validateRunCommandForAgentUse(args.command, workspace);
       if (!interactiveGate.allowed) {
-        return {
+        return finishOperatorToolResult({
           success: false,
           error: interactiveGate.reason,
           failureCategory: 'interactive_command_needs_input',
           recoveryGuidance: buildFailureRecoveryGuidance({ category: 'interactive_command_needs_input' }),
           timeoutMs
-        };
+        });
       }
       
       const processId = `cmd_${conversation.id}_${Date.now()}`;
@@ -6971,7 +6981,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
       // "success" and the model kept retrying near-identical variants instead of treating it as
       // a hard policy block.
       if (result.error && result.code == null && !result.timedOut && !result.killed) {
-        return {
+        return finishOperatorToolResult({
           success: false,
           error: result.error,
           exitCode: null,
@@ -6979,7 +6989,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
           stdout: '',
           stderr: '',
           timeoutMs: result.timeoutMs || timeoutMs
-        };
+        });
       }
 
       // Auto-recovery: if pip install X==version failed with a source-build error, retry without version pin
@@ -7011,7 +7021,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
         cleanRetry();
         const boundedRetryStdout = appendBoundedCommandOutput('', retryStdout || retryResult.stdout || '');
         const boundedRetryStderr = appendBoundedCommandOutput('', retryStderr || retryResult.stderr || retryResult.error || '');
-        return {
+        return finishOperatorToolResult({
           exitCode: retryResult.code,
           stdout: boundedRetryStdout.output,
           stderr: boundedRetryStderr.output,
@@ -7024,12 +7034,12 @@ async function executeTool(name, args, workspace, config, conversation, executio
           originalCommand: args.command,
           retryCommand: retryCmd,
           retryReason: 'pip source-build failure — retried without version pin'
-        };
+        });
       }
 
       const boundedStdout = appendBoundedCommandOutput('', stdoutOutput || result.stdout || '');
       const boundedStderr = appendBoundedCommandOutput('', stderrOutput || result.stderr || result.error || '');
-      return {
+      return finishOperatorToolResult({
         exitCode: result.code,
         stdout: boundedStdout.output,
         stderr: boundedStderr.output,
@@ -7038,7 +7048,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
         timedOut: !!result.timedOut,
         killed: !!result.killed,
         timeoutMs: result.timeoutMs || timeoutMs
-      };
+      });
     }
 
     case 'start_command': {
@@ -7095,15 +7105,21 @@ async function executeTool(name, args, workspace, config, conversation, executio
     case 'get_command_status': {
       if (!args.processId) throw new Error("Missing 'processId' parameter");
       const result = await window.api.getCommandStatus(args.processId);
-      if (!result.success) throw new Error(result.error || 'Failed to get command status');
-      return result;
+      if (!result.success) {
+        finishOperatorToolResult(result);
+        throw new Error(result.error || 'Failed to get command status');
+      }
+      return finishOperatorToolResult(result);
     }
 
     case 'read_command_output': {
       if (!args.processId) throw new Error("Missing 'processId' parameter");
       const result = await window.api.readCommandOutput(args.processId, args.maxChars || 12000);
-      if (!result.success) throw new Error(result.error || 'Failed to read command output');
-      return result;
+      if (!result.success) {
+        finishOperatorToolResult(result);
+        throw new Error(result.error || 'Failed to read command output');
+      }
+      return finishOperatorToolResult(result);
     }
 
     case 'kill_command': {
@@ -7113,15 +7129,21 @@ async function executeTool(name, args, workspace, config, conversation, executio
       if (Array.isArray(conversation.activePreviewProcesses)) {
         conversation.activePreviewProcesses = conversation.activePreviewProcesses.filter(pid => pid !== args.processId);
       }
-      // Phase 3 (resource leases): release this workspace's process lease. This is intentionally
-      // coarse (the lease tracks "something is running here," not each individual processId
-      // within it) - killing any one tracked process frees the whole workspace's process lease
-      // rather than requiring every background process to be individually accounted for. That is
-      // the safe direction to be imprecise in: it only makes the workspace available to another
-      // conversation sooner, never blocks one that should be allowed through.
-      if (workspace && window.api && typeof window.api.releaseResourceLease === 'function') {
-        window.api.releaseResourceLease({ resourceType: 'process', resourceKey: workspace, conversationId: conversation.id })
-          .catch(error => console.error('Process lease release failed:', error));
+      // Remove only the OS PID that was actually killed. A workspace can own several background
+      // processes; releasing the whole lease here would advertise the workspace as process-free
+      // while its other server/watcher/build processes were still alive.
+      if (killResult && killResult.success && killResult.pid && workspace
+          && window.api && typeof window.api.releaseResourceLease === 'function') {
+        try {
+          await window.api.releaseResourceLease({
+            resourceType: 'process',
+            resourceKey: workspace,
+            conversationId: conversation.id,
+            processIds: [String(killResult.pid)]
+          });
+        } catch (error) {
+          console.error('Process lease PID release failed:', error);
+        }
       }
       return killResult;
     }
@@ -11546,19 +11568,11 @@ function formatKnownProjectsForSystemFacts() {
 function resolveConversationWorkspace(conversation) {
   const conv = conversation && typeof conversation === 'object' ? conversation : {};
   const hasConversationShape = Object.keys(conv).length > 0;
-  let mode = 'coder';
-  if (conv.mode === 'orion' || conv.mode === 'coder' || conv.mode === 'operator') {
-    // Recognized explicitly rather than left to the projectPath/activeConversationMode fallback
-    // below, so an operator-tagged conversation resolves deterministically from its own mode field
-    // even before its projectPath happens to be set, and without depending on the shared
-    // module-level activeConversationMode possibly lagging behind (e.g. a stale value left over
-    // from the previous run in this process).
-    mode = conv.mode;
-  } else if (conv.projectPath) {
-    mode = 'coder';
-  } else if (hasConversationShape) {
-    mode = activeConversationMode;
-  }
+  const recordedMode = String(conv.mode || '').trim().toLowerCase();
+  // Legacy specialist conversations predate the explicit mode field but do carry projectPath.
+  // Preserve that migration signal; only an explicitly recorded unknown mode fails closed.
+  let mode = recordedMode || (conv.projectPath ? 'coder' : (hasConversationShape ? activeConversationMode : 'coder'));
+  if (mode !== 'orion') mode = OrionSpecialistRegistry.requireRole(mode).role;
   if (mode === 'orion') {
     const workspace = String(conv.workspace || '').trim();
     if (workspace && !isGeneratedStandaloneWorkspacePath(workspace)) return workspace;
@@ -13216,10 +13230,14 @@ function buildAgentToolDeclarations() {
   if (activeConversationMode === 'orion') {
     return gatedTools.filter(tool => DISPATCH_TOOL_ALLOWLIST.has(tool.name));
   }
+  if (activeConversationMode !== 'orion') OrionSpecialistRegistry.requireRole(activeConversationMode);
   if (activeConversationMode === 'operator') {
     return gatedTools.filter(tool => OPERATOR_TOOL_ALLOWLIST.has(tool.name));
   }
-  return gatedTools.filter(tool => !['open_application', 'click_ui_element', 'open_chrome_favorite'].includes(tool.name));
+  if (activeConversationMode === 'coder') {
+    return gatedTools.filter(tool => !['open_application', 'click_ui_element', 'open_chrome_favorite'].includes(tool.name));
+  }
+  return gatedTools;
 }
 
 const GEMINI_SCHEMA_FIELDS = new Set([

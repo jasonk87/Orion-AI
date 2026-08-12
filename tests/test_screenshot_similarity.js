@@ -66,6 +66,19 @@ test('compareBitmaps: a single-pixel-scale change (cursor blink) stays under the
   t.end();
 });
 
+test('compareBitmaps: a small localized control-state change cannot hide inside coarse block averages', t => {
+  const width = 320;
+  const height = 240;
+  const a = makeSolidBitmap(width, height, 40, 40, 40);
+  const b = makeSolidBitmap(width, height, 40, 40, 40);
+  paintRect(b, width, 10, 10, 18, 18, 220, 220, 220);
+  const result = compareBitmaps(a, width, height, b, width, height);
+  t.notOk(result.identical, 'an 8x8 checkbox/badge-scale change forces semantic reinspection');
+  t.equal(result.reason, 'localized_change');
+  t.ok(result.fineChangedPixels > 24, 'the fine pass found the local evidence the coarse average missed');
+  t.end();
+});
+
 test('compareBitmaps: dimension mismatch is never treated as unchanged', (t) => {
   const a = makeSolidBitmap(320, 240, 10, 10, 10);
   const b = makeSolidBitmap(640, 480, 10, 10, 10);
@@ -121,7 +134,7 @@ test('compareBitmaps: a full-frame color change is always detected regardless of
   t.end();
 });
 
-test('compareBitmaps: respects a custom maxChangedFraction option', (t) => {
+test('compareBitmaps: respects custom coarse and fine tolerance options', (t) => {
   const width = 320;
   const height = 240;
   const a = makeSolidBitmap(width, height, 40, 40, 40);
@@ -129,7 +142,10 @@ test('compareBitmaps: respects a custom maxChangedFraction option', (t) => {
   paintRect(b, width, 0, 0, 40, 40, 255, 255, 255); // one block changed out of many
   const strict = compareBitmaps(a, width, height, b, width, height, { maxChangedFraction: 0 });
   t.notOk(strict.identical, 'zero-tolerance threshold rejects any change');
-  const lenient = compareBitmaps(a, width, height, b, width, height, { maxChangedFraction: 0.5 });
-  t.ok(lenient.identical, 'lenient threshold accepts a small localized change');
+  const lenient = compareBitmaps(a, width, height, b, width, height, {
+    maxChangedFraction: 0.5,
+    maxFineChangedPixels: 2000
+  });
+  t.ok(lenient.identical, 'explicitly lenient coarse and fine thresholds accept a localized change');
   t.end();
 });

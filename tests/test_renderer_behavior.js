@@ -1110,7 +1110,7 @@ test('Dispatch creates an isolated Coder workspace for self-contained work witho
 
   t.equal(result.success, true, 'the real renderer handoff succeeds without a selected project');
   t.equal(result.standalone, true, 'the handoff is explicitly standalone');
-  t.equal(persistedTask.workspace.role, 'standalone_coder', 'the durable packet records standalone scope');
+  t.equal(persistedTask.workspace.role, 'standalone_specialist', 'the durable packet records role-neutral standalone scope');
   t.match(persistedTask.workspace.path, /standalone-workspaces/i, 'an isolated generated workspace is assigned');
   t.notEqual(persistedTask.workspace.path, projectsRoot, 'the generic Projects root is never presented as the task workspace');
   const coderConversation = read('conversations').find(conversation => conversation.id === result.conversationId);
