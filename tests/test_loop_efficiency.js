@@ -479,6 +479,22 @@ test('the progress pill tells the truth before the request has been classified',
 // one project's facts bleeding into unrelated chat, but the effect was total amnesia during
 // ordinary talk: asked "how is the weather here today?", Orion answered "I don't know where you
 // are" while holding the stored fact "Jason lives in south-central Kentucky".
+test('run artifacts preserve the reasoning level selected for the turn', (t) => {
+  const payload = agent.buildRunArtifactPayload({
+    conversation: { id: 'conv-reasoning' },
+    userPrompt: 'Why did you use Houston?',
+    modelName: 'deepseek-v4-flash',
+    reasoningEffort: 'max',
+    workspacePath: '',
+    workWalkthrough: [],
+    finalText: 'The selected reasoning level is now auditable.'
+  });
+
+  t.equal(payload.task.model, 'deepseek-v4-flash', 'the selected model remains recorded');
+  t.equal(payload.task.requestedReasoning, 'max', 'the selected reasoning level is recorded with the run');
+  t.end();
+});
+
 test('personal facts are retrieved during casual conversation, not just task work', async (t) => {
   global.window = global.window || {};
   const rankCalls = [];

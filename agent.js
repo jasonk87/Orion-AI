@@ -327,7 +327,7 @@ async function refreshOrionMemoryBlock(config, queryText, mode, reasoningPolicy 
     // The cost is one embedding call against a 15-fact corpus. The 4-minute startup this was
     // partly meant to address turned out to be getKnowledgeBrief, not this.
 
-    // RAG: rank facts/preferences against the semantic dependency identified while classifying
+    // RAG: rank durable facts against the semantic dependency identified while classifying
     // this turn. A literal request such as "What's the weather today?" does not name the missing
     // fact (the user's home location), so ranking only against the raw message made relevant
     // memory invisible. The classifier may describe that dependency, but it never supplies or
@@ -336,8 +336,8 @@ async function refreshOrionMemoryBlock(config, queryText, mode, reasoningPolicy 
     // Older classifier responses and safe fallbacks omit memoryContext, so the exact user message
     // remains the backward-compatible query. If semantic ranking is unavailable, facts are omitted
     // rather than treating recency as relevance.
-    // Preferences are filtered to this mode (or untagged, for backward compat) before ranking, so
-    // coder-mode preferences never bleed into the Orion prompt block and vice versa.
+    // Preferences use the explicit, source-aware path above. Keeping them out of this factual
+    // channel prevents casual style/history snippets from displacing identity and location facts.
     let ranked = null;
     const semanticMemoryQuery = memoryContext
       && memoryContext.needed === true
@@ -5078,6 +5078,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         conversation,
         userPrompt,
         modelName: config.modelName || 'gemini-2.5-flash-lite',
+        reasoningEffort: requestedReasoningEffort,
         workspacePath,
         workWalkthrough,
         finalText: lastTextResponse
@@ -9599,7 +9600,7 @@ function buildFinalVerificationSummary(items) {
   return lines.join('\n');
 }
 
-function buildRunArtifactPayload({ conversation, userPrompt, modelName, workspacePath, workWalkthrough, finalText }) {
+function buildRunArtifactPayload({ conversation, userPrompt, modelName, reasoningEffort, workspacePath, workWalkthrough, finalText }) {
   const filesTouched = [...new Set((workWalkthrough || []).filter(isFileMutationItem).map(item => item.path))];
   const visualArtifacts = collectVisualArtifacts(workWalkthrough, workspacePath);
   return {
@@ -9609,6 +9610,7 @@ function buildRunArtifactPayload({ conversation, userPrompt, modelName, workspac
     task: {
       prompt: userPrompt,
       model: modelName,
+      requestedReasoning: String(reasoningEffort || 'auto'),
       workspace: workspacePath
     },
     implementation: {
@@ -14635,6 +14637,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
   module.exports.getSystemInstruction = getSystemInstruction;
   module.exports.setOrionConversationHasHistory = setOrionConversationHasHistory;
   module.exports.refreshOrionMemoryBlock = refreshOrionMemoryBlock;
+  module.exports.buildRunArtifactPayload = buildRunArtifactPayload;
   module.exports.__setActiveConversationModeForTest = (mode) => { activeConversationMode = mode; };
   module.exports.__setAgentExecutionModeForTest = (mode) => { agentExecutionMode = mode; };
   module.exports.computeNextModelRetryDelay = computeNextModelRetryDelay;

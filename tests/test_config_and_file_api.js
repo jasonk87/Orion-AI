@@ -74,7 +74,11 @@ function makeElectronMock(handlers = {}) {
   return {
     calls,
     mock: {
-      app: { whenReady: () => ({ then: (cb) => { cb(); } }), on: () => {} },
+      app: {
+        whenReady: () => ({ then: (cb) => { cb(); } }),
+        on: () => {},
+        getPath: () => os.tmpdir()
+      },
       BrowserWindow: class {
         constructor() {
           this.webContents = {
@@ -340,9 +344,12 @@ test('/api/prompt: file attachment is prepended to prompt sent to renderer', asy
     prompt: { success: true, queued: false }
   });
   const session = await pairDevice(1234);
+  const state = await request('GET', 1234, '/api/state', null, session);
 
   const res = await request('POST', 1234, '/api/prompt', {
     prompt: 'what does this file do?',
+    conversationId: state.json.conversationId,
+    selectionRevision: state.json.device.selectionRevision,
     fileContent: 'console.log("hello");',
     fileName: 'hello.js'
   }, session);
@@ -362,10 +369,13 @@ test('/api/prompt: oversized file attachment is truncated', async (t) => {
     prompt: { success: true, queued: false }
   });
   const session = await pairDevice(1235);
+  const state = await request('GET', 1235, '/api/state', null, session);
 
   const bigContent = 'x'.repeat(90000); // > 80000 char limit
   const res = await request('POST', 1235, '/api/prompt', {
     prompt: 'review this',
+    conversationId: state.json.conversationId,
+    selectionRevision: state.json.device.selectionRevision,
     fileContent: bigContent,
     fileName: 'big.txt'
   }, session);
@@ -382,8 +392,13 @@ test('/api/prompt: prompt without file attachment is not modified', async (t) =>
     prompt: { success: true, queued: false }
   });
   const session = await pairDevice(1236);
+  const state = await request('GET', 1236, '/api/state', null, session);
 
-  await request('POST', 1236, '/api/prompt', { prompt: 'just a plain prompt' }, session);
+  await request('POST', 1236, '/api/prompt', {
+    prompt: 'just a plain prompt',
+    conversationId: state.json.conversationId,
+    selectionRevision: state.json.device.selectionRevision
+  }, session);
   const promptCall = electron.calls.find(c => c.includes('submitPhoneCompanionPrompt'));
   t.ok(promptCall, 'submitPhoneCompanionPrompt was called');
   t.notOk(promptCall.includes('Attached file'), 'no attachment prefix when no file is sent');

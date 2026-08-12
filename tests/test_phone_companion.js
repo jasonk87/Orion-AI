@@ -623,6 +623,40 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
     'the phone selection is persisted independently of desktop activity'
   );
 
+  const promptCallsBeforeStaleSubmit = electron.calls.filter(call => call.includes('submitPhoneCompanionPrompt')).length;
+  const stalePrompt = await request('POST', 1133, '/api/prompt', {
+    prompt: 'this belongs to the old transcript',
+    conversationId: 'conv1',
+    selectionRevision: switchRes.json.selectionRevision
+  }, session);
+  t.equal(stalePrompt.statusCode, 409, 'a prompt submitted from a stale visible conversation is rejected');
+  t.equal(
+    electron.calls.filter(call => call.includes('submitPhoneCompanionPrompt')).length,
+    promptCallsBeforeStaleSubmit,
+    'a stale prompt never reaches the renderer or another conversation'
+  );
+
+  const staleRevisionPrompt = await request('POST', 1133, '/api/prompt', {
+    prompt: 'same conversation, obsolete view',
+    conversationId: 'conv2',
+    selectionRevision: Math.max(0, switchRes.json.selectionRevision - 1)
+  }, session);
+  t.equal(staleRevisionPrompt.statusCode, 409, 'an obsolete revision of the same conversation is rejected');
+
+  const unboundPrompt = await request('POST', 1133, '/api/prompt', { prompt: 'unbound turn' }, session);
+  t.equal(unboundPrompt.statusCode, 409, 'an existing-conversation prompt must identify its visible transcript');
+
+  const currentPrompt = await request('POST', 1133, '/api/prompt', {
+    prompt: 'this belongs here',
+    conversationId: 'conv2',
+    selectionRevision: switchRes.json.selectionRevision
+  }, session);
+  t.equal(currentPrompt.statusCode, 200, 'a prompt bound to the visible conversation succeeds');
+  t.ok(
+    electron.calls.some(call => call.includes('submitPhoneCompanionPrompt') && call.includes('conv2') && call.includes('this belongs here')),
+    'the renderer receives the exact visible conversation identity'
+  );
+
   const newTask = await request('POST', 1133, '/api/conversations/new', { prompt: 'new task', projectPath: 'C:\\Projects\\OrionTarget' }, session);
   t.equal(newTask.statusCode, 200, 'new task endpoint succeeds');
 
@@ -640,13 +674,27 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
   }, session);
   t.equal(operatorStart.statusCode, 200, 'new Operator task endpoint succeeds');
 
-  const prompt = await request('POST', 1133, '/api/prompt', { prompt: 'hello', projectPath: 'C:\\Projects\\OrionTarget' }, session);
+  const prompt = await request('POST', 1133, '/api/prompt', {
+    prompt: 'hello',
+    conversationId: operatorStart.json.conversationId,
+    selectionRevision: operatorStart.json.selectionRevision,
+    projectPath: 'C:\\Projects\\OrionTarget'
+  }, session);
   t.equal(prompt.statusCode, 200, 'prompt submission succeeds');
 
-  const operatorPrompt = await request('POST', 1133, '/api/prompt', { prompt: 'inspect the desktop', mode: 'operator' }, session);
+  const operatorPrompt = await request('POST', 1133, '/api/prompt', {
+    prompt: 'inspect the desktop',
+    conversationId: operatorStart.json.conversationId,
+    selectionRevision: operatorStart.json.selectionRevision,
+    mode: 'operator'
+  }, session);
   t.equal(operatorPrompt.statusCode, 200, 'Operator prompt submission succeeds');
 
-  const steer = await request('POST', 1133, '/api/steer', { prompt: 'focus here' }, session);
+  const steer = await request('POST', 1133, '/api/steer', {
+    prompt: 'focus here',
+    conversationId: operatorStart.json.conversationId,
+    selectionRevision: operatorStart.json.selectionRevision
+  }, session);
   t.equal(steer.statusCode, 200, 'steering endpoint succeeds');
 
   const approve = await request('POST', 1133, '/api/approve-plan', {}, session);
@@ -969,6 +1017,10 @@ test('phone renders an outgoing message before waiting for Orion to answer', t =
   t.ok(optimisticIndex < newConversationPost, 'a first-message bubble also renders before conversation creation waits');
   t.ok(flow.indexOf("promptEl.value = '';", optimisticIndex) < existingConversationPost,
     'the composer clears immediately rather than looking unsent while Orion works');
+  t.ok(flow.includes('conversationId: currentConversationId'),
+    'every existing-conversation prompt names the transcript visible on the phone');
+  t.ok(flow.includes('selectionRevision: acceptedConversationSelectionRevision'),
+    'every existing-conversation prompt carries the accepted view revision');
   t.ok(html.includes('optimisticPhoneSend') && html.includes('canonicalMessageArrived'),
     'intermediate state snapshots preserve the local bubble until its canonical message arrives');
   t.ok(rendererSource.includes("requestId: replayMsg.requestId || ''"),
