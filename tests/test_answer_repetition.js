@@ -173,6 +173,60 @@ test('the first turn of a conversation has nothing to compare against', async t 
   t.end();
 });
 
+test('contextNeed none preserves the immediate exchange for a conversational follow-up', async t => {
+  const prompt = 'What do you have in mind? What would be useful?';
+  const conversation = {
+    id: 'c1',
+    messages: [
+      { role: 'user', text: "I'm bored. What can we do?" },
+      { role: 'assistant', text: FIRST_ANSWER },
+      { role: 'user', text: prompt }
+    ]
+  };
+  const messages = supervisor.buildConversationalGenerationMessages(conversation.messages, {
+    contextNeed: 'none'
+  });
+
+  t.equal(messages.length, 2, 'only the immediate assistant/user pair is retained');
+  t.equal(messages[0].role, 'assistant', 'the answer being followed up is present');
+  t.equal(messages[0].content, FIRST_ANSWER, 'the prior answer is not cut down to an unusable fragment');
+  t.equal(messages[1].content, prompt, 'the exact current turn remains last');
+
+  let calls = 0;
+  const result = await supervisor.buildContractedConversationalReply({
+    conversation,
+    prompt,
+    systemPrompt: 'You are Orion.',
+    messages
+  }, {
+    contracts,
+    generateReply: async (_systemPrompt, receivedMessages) => {
+      calls++;
+      t.ok(receivedMessages.some(message => message.role === 'assistant' && message.content === FIRST_ANSWER),
+        'the live reply call can reason from the answer the user referenced');
+      return GENUINE_COMPARISON;
+    }
+  });
+
+  t.equal(calls, 1, 'a context-aware answer does not need a repetition retry');
+  t.equal(result.text, GENUINE_COMPARISON, 'new information is returned instead of the previous answer');
+  t.end();
+});
+
+test('bounded conversational context excludes older unrelated turns', t => {
+  const messages = supervisor.buildConversationalGenerationMessages([
+    { role: 'user', text: 'Old project question' },
+    { role: 'assistant', text: 'Old project answer' },
+    { role: 'user', text: "I'm bored. What can we do?" },
+    { role: 'assistant', text: FIRST_ANSWER },
+    { role: 'user', text: 'What do you have in mind?' }
+  ], { contextNeed: 'none' });
+
+  t.deepEqual(messages.map(message => message.content), [FIRST_ANSWER, 'What do you have in mind?'],
+    'no old project/session history leaks into a no-history conversational turn');
+  t.end();
+});
+
 // ── Reasoning budget ──────────────────────────────────────────────────────────
 
 test('substantive conversational turns are not answered at the casual tier', t => {

@@ -1266,6 +1266,39 @@ function getSupervisedTaskForConversation(conversationId, activeTaskId = '') {
   );
 }
 
+function getOwnedSpecialistContext(dispatchConversation) {
+  const preferredTaskId = String(
+    dispatchConversation && (dispatchConversation.launchedCoderTaskId || dispatchConversation.lastOwnedTaskId)
+    || ''
+  );
+  const task = preferredTaskId
+    ? (orchestrationTaskCache.get(preferredTaskId)
+      || getSupervisedTaskForConversation(dispatchConversation && dispatchConversation.id, preferredTaskId))
+    : getSupervisedTaskForConversation(dispatchConversation && dispatchConversation.id, '');
+  const targetConversationId = String(
+    (task && task.target && task.target.conversationId)
+    || (dispatchConversation && dispatchConversation.launchedCoderConvId)
+    || ''
+  );
+  const targetConversation = targetConversationId
+    ? conversations.find(conversation => conversation.id === targetConversationId)
+    : null;
+  const role = String(
+    (task && task.target && task.target.mode)
+    || (targetConversation && conversationMode(targetConversation))
+    || (dispatchConversation && dispatchConversation.launchedTaskRole)
+    || 'coder'
+  ).toLowerCase();
+  return {
+    task,
+    taskId: String((task && task.taskId) || preferredTaskId),
+    targetConversation,
+    targetConversationId,
+    role,
+    roleLabel: AGENT_ROLE_DISPLAY_NAMES[role] || 'Specialist'
+  };
+}
+
 function getSupervisedTaskPresentation(task, isGlobalRunning = false, globalRunningId = '') {
   if (!task || !RendererTaskOrchestration
       || typeof RendererTaskOrchestration.describeSupervisedTaskPresentation !== 'function') return null;
@@ -9569,16 +9602,12 @@ async function respondOrionConversationally(orionConv, prompt, model, options = 
     && options.semanticIntent.reasoningPolicyHint
     && options.semanticIntent.reasoningPolicyHint.contextNeed
     || 'none';
-  const recentLimit = contextNeed === 'none' ? 0 : (contextNeed === 'recent' ? 4 : 10);
-  // Recent conversation is candidate evidence only when the semantic route says it is needed.
-  const recentMsgs = (orionConv.messages || [])
-    .filter(message => !options.statusCheckin || !String(message && message.source || '').startsWith('supervisor-checkin'))
-    .slice(recentLimit ? -recentLimit : 0)
-    .map(m => ({
-      role: m.role === 'assistant' || m.role === 'model' ? 'assistant' : 'user',
-      content: String(m.text || m.content || '').slice(0, 500)
-    }));
-  if (recentLimit === 0) recentMsgs.length = 0;
+  const conversationalMessages = (orionConv.messages || [])
+    .filter(message => !options.statusCheckin || !String(message && message.source || '').startsWith('supervisor-checkin'));
+  const recentMsgs = RendererSupervisorOrchestration.buildConversationalGenerationMessages(
+    conversationalMessages,
+    { contextNeed }
+  );
 
   // Add coder context if a coder task is running
   let coderContext = '';
@@ -9726,7 +9755,8 @@ async function respondOrionConversationally(orionConv, prompt, model, options = 
 // ── Main supervisor message handler ──────────────────────────────────────────
 // Called from submitMessage() when user types in Orion while Coder is running.
 async function handleSupervisorMessage(orionConv, prompt, model, options = {}) {
-  const coderConvId = orionConv.launchedCoderConvId;
+  const specialist = getOwnedSpecialistContext(orionConv);
+  const coderConvId = specialist.targetConversationId;
   if (!RendererSupervisorOrchestration) {
     throw new Error('Supervisor orchestration is unavailable.');
   }
@@ -9751,7 +9781,7 @@ async function handleSupervisorMessage(orionConv, prompt, model, options = {}) {
       semanticIntent: classification || semanticIntent
     });
     if (queued.success) {
-      persistAssistantStatusMessage(orionConv.id, `Queued as ${queued.task.title}. Orion will handle it after the active Coder task.`, {
+      persistAssistantStatusMessage(orionConv.id, `Queued as ${queued.task.title}. Orion will handle it after the active ${specialist.roleLabel} task.`, {
         source: 'queue-status',
         dedupeKey: `supervisor-queued-${queued.task.taskId}`
       });
@@ -9775,8 +9805,8 @@ async function handleSupervisorMessage(orionConv, prompt, model, options = {}) {
       const cancelled = await stopExpectedTaskForConversation(orionConv.id);
       const taskId = String((cancelled && cancelled.task && cancelled.task.taskId) || (cancelled && cancelled.taskId) || '');
       const replyText = cancelled && cancelled.success
-        ? `Cancelled **${(cancelled.task && cancelled.task.title) || 'Coder task'}**${taskId ? ` (${taskId})` : ''}. Its final state is cancelled.`
-        : `I could not cancel the owned Coder task: ${(cancelled && (cancelled.error || cancelled.reason)) || 'cancellation failed'}.`;
+        ? `Cancelled **${(cancelled.task && cancelled.task.title) || `${specialist.roleLabel} task`}**${taskId ? ` (${taskId})` : ''}. Its final state is cancelled.`
+        : `I could not cancel the owned ${specialist.roleLabel} task: ${(cancelled && (cancelled.error || cancelled.reason)) || 'cancellation failed'}.`;
       notifyOrionConversation(orionConv, replyText, 'supervisor-cancellation');
       return cancelled;
     },
@@ -9787,20 +9817,34 @@ async function handleSupervisorMessage(orionConv, prompt, model, options = {}) {
     },
     steerActiveTask: async ({ reason, classification }) => {
       const steeringPrompt = String(classification && classification.resolvedRequest || prompt);
+      if (!coderConvId) {
+        const replyText = 'I could not attach that update because the active specialist conversation is no longer available.';
+        notifyOrionConversation(orionConv, replyText, 'supervisor-steering-error');
+        return { success: false, steered: false, error: replyText };
+      }
       window.steeringQueue = window.steeringQueue || {};
       window.steeringQueue[coderConvId] = window.steeringQueue[coderConvId] || [];
       window.steeringQueue[coderConvId].push(steeringPrompt);
-      appendSystemMessage(
-        `Steering sent to the active Coder task: "${steeringPrompt.slice(0, 80)}${steeringPrompt.length > 80 ? '…' : ''}"`,
-        { conversationId: orionConv.id }
-      );
-      return { success: true, steered: true, coderConversationId: coderConvId };
+      const replyText = `Got it — I passed that update to ${specialist.roleLabel}, and it will use it on the active task.`;
+      notifyOrionConversation(orionConv, replyText, 'supervisor-steering', {
+        taskId: specialist.taskId,
+        targetConversationId: coderConvId,
+        targetRole: specialist.role
+      });
+      return {
+        success: true,
+        steered: true,
+        coderConversationId: coderConvId,
+        targetConversationId: coderConvId,
+        targetRole: specialist.role,
+        replyText
+      };
     },
     respondCheckin: async () => {
       const summary = buildCoderStatusSummary(coderConvId);
       const fallbackText = (summary && summary.text)
-        ? `Coder is still working. ${summary.text.replace(/\n+/g, ' ')}`
-        : 'Coder is active, but it has not recorded a detailed progress update yet.';
+        ? `${specialist.roleLabel} is still working. ${summary.text.replace(/\n+/g, ' ')}`
+        : `${specialist.roleLabel} is active, but it has not recorded a detailed progress update yet.`;
       return respondOrionConversationally(orionConv, prompt, model, {
         ...options,
         semanticIntent,

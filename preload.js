@@ -74,6 +74,8 @@ contextBridge.exposeInMainWorld('api', {
   recordInspectedScreenshot: (workspacePath, relativePath, conversationId = '') => ipcRenderer.invoke('record-inspected-screenshot', { workspacePath, path: relativePath, conversationId }),
   computerAction: (workspacePath, action, conversationId, destination = '', displayId = '') => ipcRenderer.invoke('computer-action', { workspacePath, action, conversationId, destination, displayId }),
   openApplication: (payload = {}) => ipcRenderer.invoke('open-application', payload),
+  clickAccessibleUi: (payload = {}) => ipcRenderer.invoke('click-accessible-ui', payload),
+  openChromeFavorite: (payload = {}) => ipcRenderer.invoke('open-chrome-favorite', payload),
   inspectScreenshot: (workspacePath, relativePath) => ipcRenderer.invoke('inspect-screenshot', { workspacePath, relativePath }),
   readWorkspaceFileBase64: (workspacePath, relativePath, conversationId = '') => ipcRenderer.invoke('read-workspace-file-base64', { workspacePath, relativePath, conversationId }),
   compareScreenshotToGoal: (workspacePath, relativePath, goal, observations) => ipcRenderer.invoke('compare-screenshot-to-goal', { workspacePath, relativePath, goal, observations }),

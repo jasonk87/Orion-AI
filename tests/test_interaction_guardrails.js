@@ -1179,9 +1179,9 @@ test('Operator receives a narrower, desktop/browser-execution tool surface, not 
 
   t.ok(operatorTools.length > 0 && operatorTools.length < coderTools.length,
     'Operator receives a strictly narrower tool surface than Coder');
-  const operatorOnlyTools = new Set(['open_application']);
+  const operatorOnlyTools = new Set(['open_application', 'click_ui_element', 'open_chrome_favorite']);
   t.ok(operatorTools.every(name => coderTools.includes(name) || operatorOnlyTools.has(name)),
-    'Operator tools come from the shared surface except for its bounded role-specific app opener');
+    'Operator tools come from the shared surface except for bounded role-specific desktop controls');
 
   // Not code/mission/skill tools, per the brief.
   t.notOk(operatorTools.includes('patch_file'), 'Operator cannot edit source files');
@@ -1198,7 +1198,11 @@ test('Operator receives a narrower, desktop/browser-execution tool surface, not 
   // The categories the brief did name.
   t.ok(operatorTools.includes('computer_action'), 'Operator has native desktop control');
   t.ok(operatorTools.includes('open_application'), 'Operator has a bounded screen-first app opener');
+  t.ok(operatorTools.includes('click_ui_element'), 'Operator can activate accessible controls by stable label');
+  t.ok(operatorTools.includes('open_chrome_favorite'), 'Operator can resolve saved Chrome favorites without pixel guessing');
   t.notOk(coderTools.includes('open_application'), 'Coder does not receive the Operator-only app opener');
+  t.notOk(coderTools.includes('click_ui_element'), 'Coder does not receive Operator-only accessibility control');
+  t.notOk(coderTools.includes('open_chrome_favorite'), 'Coder does not receive Operator-only Chrome profile control');
   for (const browserTool of ['open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back', 'download_from_page', 'wait_for_page', 'take_screenshot']) {
     t.ok(operatorTools.includes(browserTool), `Operator has the full browser-worker tool: ${browserTool}`);
   }

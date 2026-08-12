@@ -14,7 +14,7 @@
     'inspect_screenshot_with_model',
     'compare_screenshot_to_goal'
   ]);
-  const SCREEN_ACTION_TOOLS = new Set(['computer_action', 'open_application']);
+  const SCREEN_ACTION_TOOLS = new Set(['computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite']);
   const PROCESS_ACTION_TOOLS = new Set(['start_command', 'kill_command']);
   const MAX_RAW_DIAGNOSTIC_CALLS = 3;
 
@@ -127,7 +127,7 @@
         return {
           allowed: false,
           code: 'operator_visible_action_required',
-          reason: 'The screen has been inspected and the visible goal is not satisfied. Use computer_action for clicks/keystrokes or open_application for an absent app before falling back to shell diagnostics. Do not use PowerShell, WScript, SendKeys, or terminal commands as a substitute for visible input.'
+          reason: 'The screen has been inspected and the visible goal is not satisfied. Use open_application for a named app, open_chrome_favorite for a saved Chrome item, click_ui_element for a labeled accessible control, or computer_action only for a visual target with no accessible identity. Do not use PowerShell, WScript, SendKeys, or terminal commands as a substitute for visible input.'
         };
       }
       if (state.rawDiagnosticCalls >= MAX_RAW_DIAGNOSTIC_CALLS) {
@@ -147,11 +147,11 @@
       };
     }
 
-    if (toolName === 'open_application' && VISUAL_SURFACES.has(surface) && !state.inspected) {
+    if (SCREEN_ACTION_TOOLS.has(toolName) && toolName !== 'computer_action' && VISUAL_SURFACES.has(surface) && !state.inspected) {
       return {
         allowed: false,
         code: 'operator_open_requires_observation',
-        reason: 'Capture and inspect the screen before opening another app instance. The requested application may already be visible.'
+        reason: 'Capture and inspect the screen before activating an application or labeled desktop control. The current visible state may already satisfy the request.'
       };
     }
     return { allowed: true };
@@ -166,6 +166,8 @@
       case 'compare_screenshot_to_goal': return 'Operator is inspecting what is visible...';
       case 'computer_action': return `Operator is controlling the screen${args.targetDescription ? `: ${String(args.targetDescription).slice(0, 90)}` : ''}...`;
       case 'open_application': return `Operator is opening ${String(args.appName || 'the application').slice(0, 80)}...`;
+      case 'click_ui_element': return `Operator is activating ${String(args.targetText || 'the labeled control').slice(0, 80)}...`;
+      case 'open_chrome_favorite': return `Operator is opening Chrome favorite ${String(args.name || '').slice(0, 80)}...`;
       case 'attach_image': return 'Operator is attaching the verified screenshot...';
       case 'run_command':
       case 'terminal_exec': return 'Operator is checking a bounded system detail...';

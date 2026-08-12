@@ -399,7 +399,7 @@
   }
 
   function buildRestatementCorrectionPrompt(userPrompt) {
-    return `[SYSTEM: Your draft reply repeats your previous message almost word for word. The user has now asked something different: "${String(userPrompt || '').slice(0, 500)}". Answer THAT question specifically. If they asked why you chose one thing over named alternatives, compare it against each alternative they named and give the actual reasons for the ranking. Do not restate your earlier answer, and do not open by repeating your previous conclusion.]`;
+    return `[SYSTEM: Your draft reply repeats your previous message almost word for word. The user has now asked something different: "${String(userPrompt || '').slice(0, 500)}". Answer THAT question specifically using the preceding exchange to resolve references. Contribute new information or one concrete next step; do not reproduce the previous answer's list or structure. If they asked why you chose one thing over named alternatives, compare it against each alternative they named and give the actual reasons for the ranking. Do not restate your earlier answer, and do not open by repeating your previous conclusion.]`;
   }
 
   function normalizeStatusIdentityPart(value) {

@@ -191,7 +191,9 @@ ${OrionOperatingContract.DOM_BEFORE_PIXEL_CONTROL}
 
 SCREEN-FIRST EXECUTION:
 - For visible desktop or browser work, inspect the current screen or page before probing processes, package metadata, installation folders, or window handles. If the requested state is already visible, stop investigating and report it.
-- Use open_application when a native app genuinely is not visible. It safely activates an existing matching window or launches the installed app without reverse-engineering AppX metadata through shell commands.
+- When the user names a native application, use open_application after the first inspection to activate its existing window even if it is merely covered, minimized, or in the background; it launches a new instance only when none exists. Never guess an application's taskbar coordinates from a screenshot.
+- Use open_chrome_favorite for a Chrome favorite/bookmark named by the user. It resolves the saved item from Chrome's profile and opens the exact URL; never click a guessed taskbar icon, Favorites-menu row, or bookmark-bar coordinate for this job.
+- Use click_ui_element for a labeled native control exposed through Windows accessibility. Prefer its app name + visible label over model-guessed pixels. Use computer_action coordinates only for canvas/game/image targets that have no stable accessible label.
 - When the requested app is a project-local command rather than an installed Start-menu app, inspect the screen once and then use start_command to launch it directly. A launch is an action, not process archaeology; do not open a terminal window and type the same command through computer_action.
 - Use computer_action for visible clicks, typing, hotkeys, and game controls. Never use run_command, terminal_exec, PowerShell automation, WScript.Shell, or SendKeys as a substitute for screen input; those calls cannot ground the action in the screen you inspected.
 - Raw shell diagnostics are a bounded fallback for a concrete blocker, not the normal way to operate a screen. Code enforces a small diagnostic budget so repeated system probes cannot replace visible action.
@@ -5909,7 +5911,7 @@ function appendBoundedCommandOutput(currentValue, chunkValue, maxChars = AGENT_C
 // collision this closes (two conversations, or a second run after this one's own run lock
 // releases, silently stomping each other's desktop/browser state). This gate runs once, before the
 // big tool-dispatch switch below, rather than being duplicated into each individual case.
-const DESKTOP_LEASE_TOOLS = new Set(['computer_action', 'open_application']);
+const DESKTOP_LEASE_TOOLS = new Set(['computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite']);
 const BROWSER_LEASE_TOOLS = new Set([
   'open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back',
   'download_from_page', 'wait_for_page', 'take_screenshot'
@@ -5982,7 +5984,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
     'download_from_page', 'wait_for_page', 'take_screenshot'
   ]);
   const desktopControlTools = new Set([
-    'preview_app', 'capture_screen', 'open_application', 'computer_action'
+    'preview_app', 'capture_screen', 'open_application', 'click_ui_element', 'open_chrome_favorite', 'computer_action'
   ]);
   const controlSurface = browserControlTools.has(name)
     ? 'browser'
@@ -7428,6 +7430,86 @@ async function executeTool(name, args, workspace, config, conversation, executio
       return result;
     }
 
+    case 'click_ui_element': {
+      if (!conversation || conversation.mode !== 'operator') {
+        throw new Error('click_ui_element is Operator-only. Route native application work to Operator.');
+      }
+      if (!args.targetText) throw new Error("Missing 'targetText' parameter");
+      const snapshot = executionContext.lastDesktopSnapshot;
+      if (!snapshot || !snapshot.inspectedAt || snapshot.inspectedAt < snapshot.capturedAt) {
+        throw new Error('Accessible UI control requires a fresh captured and inspected screen.');
+      }
+      const result = await window.api.clickAccessibleUi({
+        targetText: String(args.targetText),
+        appName: args.appName ? String(args.appName) : '',
+        controlType: args.controlType ? String(args.controlType) : '',
+        matchMode: args.matchMode || 'exact',
+        occurrence: args.occurrence,
+        settleMs: args.settleMs,
+        workspacePath: workspace,
+        destination: args.destination || '',
+        conversationId: conversation.id,
+        displayId: snapshot.displayId || ''
+      });
+      if (!result || !result.success) throw new Error((result && result.error) || 'Accessible UI control could not be activated');
+      if (result.path && result.width && result.height) {
+        executionContext.lastDesktopSnapshot = {
+          path: result.path,
+          width: Number(result.width) || snapshot.width,
+          height: Number(result.height) || snapshot.height,
+          capturedAt: Date.now(),
+          inspectedAt: 0,
+          displayId: result.displayId != null ? String(result.displayId) : (snapshot.displayId || ''),
+          availableDisplays: snapshot.availableDisplays || []
+        };
+      }
+      if (OperatorExecutionPolicy && operatorPolicyState) {
+        OperatorExecutionPolicy.recordToolResult(operatorPolicyState, name, result);
+      }
+      return result;
+    }
+
+    case 'open_chrome_favorite': {
+      if (!conversation || conversation.mode !== 'operator') {
+        throw new Error('open_chrome_favorite is Operator-only. Route browser favorite work to Operator.');
+      }
+      if (!args.name) throw new Error("Missing 'name' parameter");
+      const snapshot = executionContext.lastDesktopSnapshot;
+      if (!snapshot || !snapshot.inspectedAt || snapshot.inspectedAt < snapshot.capturedAt) {
+        throw new Error('Opening a Chrome favorite requires a fresh captured and inspected screen.');
+      }
+      const result = await window.api.openChromeFavorite({
+        name: String(args.name),
+        folder: args.folder ? String(args.folder) : '',
+        settleMs: args.settleMs,
+        workspacePath: workspace,
+        destination: args.destination || '',
+        conversationId: conversation.id,
+        displayId: snapshot.displayId || ''
+      });
+      if (!result || !result.success) {
+        const detail = result && result.ambiguous && Array.isArray(result.matches)
+          ? `${result.error} Matches: ${result.matches.map(item => `${item.name}${item.folder ? ` (${item.folder})` : ''}`).join('; ')}`
+          : ((result && result.error) || 'Chrome favorite could not be opened');
+        throw new Error(detail);
+      }
+      if (result.path && result.width && result.height) {
+        executionContext.lastDesktopSnapshot = {
+          path: result.path,
+          width: Number(result.width) || snapshot.width,
+          height: Number(result.height) || snapshot.height,
+          capturedAt: Date.now(),
+          inspectedAt: 0,
+          displayId: result.displayId != null ? String(result.displayId) : (snapshot.displayId || ''),
+          availableDisplays: snapshot.availableDisplays || []
+        };
+      }
+      if (OperatorExecutionPolicy && operatorPolicyState) {
+        OperatorExecutionPolicy.recordToolResult(operatorPolicyState, name, result);
+      }
+      return result;
+    }
+
     case 'computer_action': {
       if (!conversation || (conversation.mode !== 'coder' && conversation.mode !== 'operator')) {
         throw new Error('computer_action is Coder/Operator-only. Dispatch must hand executable desktop work to Coder or Operator.');
@@ -8315,7 +8397,7 @@ function buildDiscoveryFromToolOutcome(toolName, args = {}, result = {}, outcome
   if (!result || result.error || result.success === false) return null;
   const assetTools = new Set(['download_file', 'inspect_archive', 'extract_archive', 'inspect_binary_asset', 'list_asset_metadata']);
   const browserTools = new Set(['open_url', 'search_web', 'click_element', 'download_from_page']);
-  const visualTools = new Set(['take_screenshot', 'preview_app', 'capture_screen', 'computer_action', 'open_application', 'attach_image', 'inspect_screenshot', 'compare_screenshot_to_goal', 'inspect_screenshot_with_model']);
+  const visualTools = new Set(['take_screenshot', 'preview_app', 'capture_screen', 'computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite', 'attach_image', 'inspect_screenshot', 'compare_screenshot_to_goal', 'inspect_screenshot_with_model']);
   if (assetTools.has(toolName)) {
     const source = result.url || args.url || '';
     const path = result.path || result.destination || args.path || '';
@@ -8838,20 +8920,20 @@ If STRATEGY.md finds mission-critical ambiguity, ask the user before planning. I
 const PLANNING_BLOCKED_TOOLS = Object.freeze([
   'modify_file', 'patch_file', 'delete_created_file', 'start_command', 'run_tests', 'run_linter',
   'sync_workspace_env', 'launch_workspace_app', 'preview_app', 'git_push', 'download_file',
-  'download_from_page', 'extract_archive', 'take_screenshot', 'computer_action', 'open_application'
+  'download_from_page', 'extract_archive', 'take_screenshot', 'computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite'
 ]);
 
 const PLAN_REVISION_BLOCKED_TOOLS = Object.freeze([
   'delete_created_file', 'start_command', 'run_tests', 'run_linter', 'sync_workspace_env',
   'launch_workspace_app', 'preview_app', 'git_push', 'download_file', 'download_from_page',
-  'extract_archive', 'computer_action', 'open_application'
+  'extract_archive', 'computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite'
 ]);
 
 const REVIEW_ONLY_BLOCKED_TOOLS = Object.freeze([
   'modify_file', 'patch_file', 'delete_created_file', 'sync_workspace_env',
   'set_workspace_entrypoint', 'start_command', 'launch_workspace_app', 'preview_app', 'git_push',
   'download_file', 'download_from_page', 'extract_archive', 'set_task_checklist',
-  'computer_action', 'open_application',
+  'computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite',
   'update_mission_context', 'start_subplan', 'update_subplan_context', 'complete_subplan',
   'evaluate_win_conditions', 'record_blocker', 'resolve_blocker'
 ]);
@@ -9046,6 +9128,8 @@ function summarizeToolStart(toolName, args = {}) {
   if (toolName === 'capture_screen') return { toolName, kind: 'visual', status: 'running', label: 'Captured a fresh screen screenshot' };
   if (toolName === 'computer_action') return { toolName, kind: 'computer', status: 'running', label: `${args.action || 'Acted'} on ${args.targetDescription || 'the visible desktop'}` };
   if (toolName === 'open_application') return { toolName, kind: 'computer', status: 'running', label: `Opened ${args.appName || 'application'}` };
+  if (toolName === 'click_ui_element') return { toolName, kind: 'computer', status: 'running', label: `Activated ${args.targetText || 'accessible control'}` };
+  if (toolName === 'open_chrome_favorite') return { toolName, kind: 'computer', status: 'running', label: `Opened Chrome favorite ${args.name || ''}` };
   if (toolName === 'attach_image') return { toolName, kind: 'visual', status: 'running', label: `Attached image \`${args.path || 'screenshot'}\`` };
   if (toolName === 'inspect_screenshot') return { toolName, kind: 'visual', status: 'running', label: `Inspected screenshot \`${args.path || 'screenshot'}\`` };
   if (toolName === 'compare_screenshot_to_goal') return { toolName, kind: 'visual', status: 'running', label: `Compared screenshot to goal` };
@@ -9183,10 +9267,10 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
   } else if (result && result.summary && (
     toolName === 'download_file' || toolName === 'inspect_archive' || toolName === 'extract_archive' ||
     toolName === 'inspect_binary_asset' || toolName === 'list_asset_metadata' ||
-    toolName === 'take_screenshot' || toolName === 'preview_app' || toolName === 'capture_screen' || toolName === 'computer_action' || toolName === 'open_application' || toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal' || toolName === 'inspect_screenshot_with_model'
+    toolName === 'take_screenshot' || toolName === 'preview_app' || toolName === 'capture_screen' || toolName === 'computer_action' || toolName === 'open_application' || toolName === 'click_ui_element' || toolName === 'open_chrome_favorite' || toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal' || toolName === 'inspect_screenshot_with_model'
   )) {
     item.detail = result.summary;
-    if (result.path && (toolName === 'take_screenshot' || toolName === 'preview_app' || toolName === 'capture_screen' || toolName === 'computer_action' || toolName === 'open_application' || toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal' || toolName === 'inspect_screenshot_with_model')) {
+    if (result.path && (toolName === 'take_screenshot' || toolName === 'preview_app' || toolName === 'capture_screen' || toolName === 'computer_action' || toolName === 'open_application' || toolName === 'click_ui_element' || toolName === 'open_chrome_favorite' || toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal' || toolName === 'inspect_screenshot_with_model')) {
       item.path = result.path;
       item.width = result.width || item.width || 0;
       item.height = result.height || item.height || 0;
@@ -9517,7 +9601,7 @@ function buildRunArtifactPayload({ conversation, userPrompt, modelName, workspac
 }
 
 function isScreenshotProducingTool(toolName) {
-  return toolName === 'take_screenshot' || toolName === 'preview_app' || toolName === 'capture_screen' || toolName === 'computer_action' || toolName === 'open_application';
+  return toolName === 'take_screenshot' || toolName === 'preview_app' || toolName === 'capture_screen' || toolName === 'computer_action' || toolName === 'open_application' || toolName === 'click_ui_element' || toolName === 'open_chrome_favorite';
 }
 
 function collectVisualArtifacts(items = [], workspacePath = '') {
@@ -12166,7 +12250,7 @@ const DISPATCH_TOOL_ALLOWLIST = new Set([
 // it is bound to, which both piece 2's change_workspace fix and OPERATOR_INSTRUCTION's identity
 // assume it can do. Flagged here as a judgment call rather than a silent addition.
 const OPERATOR_TOOL_ALLOWLIST = new Set([
-  'computer_action', 'open_application',
+  'computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite',
   'open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back', 'download_from_page', 'wait_for_page', 'take_screenshot',
   'run_command', 'start_command', 'get_command_status', 'read_command_output', 'kill_command', 'terminal_exec',
   'capture_screen', 'inspect_screenshot', 'compare_screenshot_to_goal', 'inspect_screenshot_with_model', 'attach_image',
@@ -12623,12 +12707,35 @@ function buildAgentToolDeclarations() {
           },
           {
             name: 'open_application',
-            description: 'Operator-only Windows application control. After capture_screen and inspect_screenshot_with_model confirm the app is not already visible, safely activate an existing matching application window or launch the installed Start-menu app by display name, then capture the resulting screen. Use this instead of shell commands, AppX/package discovery, or custom window-handle scripts.',
+            description: 'Operator-only Windows application control. After capture_screen and inspect_screenshot_with_model, safely activate an existing matching application window whether it is covered, minimized, or in the background; launch the installed Start-menu app only when no matching window exists. Then capture the resulting screen. For a named app, use this instead of clicking a guessed taskbar coordinate, shell commands, AppX/package discovery, or custom window-handle scripts.',
             parameters: { type: 'OBJECT', properties: {
               appName: { type: 'STRING', description: 'Installed application display name, for example Codex, Calculator, or Notepad.' },
               settleMs: { type: 'NUMBER', description: 'Optional 0-10000 ms wait before capturing the resulting screen. Defaults to 1200 ms.' },
               destination: { type: 'STRING', description: 'Optional conversation-scoped screenshot filename.' }
             }, required: ['appName'] }
+          },
+          {
+            name: 'click_ui_element',
+            description: 'Operator-only semantic Windows control. After observing the screen, activate a visible native UI control by its accessibility name or automation ID and optional application/control type. This invokes/selects the exact accessible element and captures the result, avoiding vision-guessed pixel coordinates. Use computer_action only when the target is canvas/game/image content with no accessible label.',
+            parameters: { type: 'OBJECT', properties: {
+              targetText: { type: 'STRING', description: 'Visible control label or accessibility automation ID.' },
+              appName: { type: 'STRING', description: 'Optional application/process/window name used to activate and scope the target window.' },
+              controlType: { type: 'STRING', description: 'Optional Windows UI Automation control type such as Button, MenuItem, TabItem, or ListItem.' },
+              matchMode: { type: 'STRING', enum: ['exact', 'contains'], description: 'Exact is safest and the default; contains is for a known partial label.' },
+              occurrence: { type: 'NUMBER', description: 'One-based occurrence if identical accessible labels exist. Defaults to 1.' },
+              settleMs: { type: 'NUMBER', description: 'Optional 0-10000 ms wait before capturing the resulting screen.' },
+              destination: { type: 'STRING', description: 'Optional conversation-scoped screenshot filename.' }
+            }, required: ['targetText'] }
+          },
+          {
+            name: 'open_chrome_favorite',
+            description: 'Operator-only Google Chrome favorite/bookmark control. Resolve a saved favorite by its actual Chrome profile data, open the exact matching URL in Chrome, and capture the resulting screen. Prefer this over clicking taskbar, Favorites-menu, or bookmark-bar pixels. If multiple saved favorites share the name, this returns bounded choices instead of opening one arbitrarily.',
+            parameters: { type: 'OBJECT', properties: {
+              name: { type: 'STRING', description: 'Saved Chrome favorite/bookmark name supplied by the user.' },
+              folder: { type: 'STRING', description: 'Optional favorite folder path or partial folder name used to resolve duplicates.' },
+              settleMs: { type: 'NUMBER', description: 'Optional 0-10000 ms wait before capturing the opened tab.' },
+              destination: { type: 'STRING', description: 'Optional conversation-scoped screenshot filename.' }
+            }, required: ['name'] }
           },
           {
             name: 'attach_image',
@@ -13112,7 +13219,7 @@ function buildAgentToolDeclarations() {
   if (activeConversationMode === 'operator') {
     return gatedTools.filter(tool => OPERATOR_TOOL_ALLOWLIST.has(tool.name));
   }
-  return gatedTools.filter(tool => tool.name !== 'open_application');
+  return gatedTools.filter(tool => !['open_application', 'click_ui_element', 'open_chrome_favorite'].includes(tool.name));
 }
 
 const GEMINI_SCHEMA_FIELDS = new Set([

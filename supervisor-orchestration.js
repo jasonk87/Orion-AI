@@ -56,6 +56,23 @@
     return `[RETRIEVED CONVERSATION EVIDENCE]\nUse only these retrieved excerpts for claims about prior conversations. Do not fill gaps with a plausible reconstruction.\n\n${lines.join('\n')}`;
   }
 
+  function buildConversationalGenerationMessages(messages, options = {}) {
+    const contextNeed = String(options.contextNeed || 'none');
+    // `none` means no historical/session retrieval. It must not erase the immediately preceding
+    // conversational turn: a follow-up such as "What do you have in mind?" has no durable meaning
+    // without the answer it follows. Keeping only that local pair avoids injecting unrelated old
+    // sessions while preserving ordinary dialogue continuity without language heuristics.
+    const limit = contextNeed === 'recent' ? 4 : (contextNeed === 'none' ? 2 : 10);
+    return (Array.isArray(messages) ? messages : [])
+      .filter(message => message && ['user', 'assistant', 'model'].includes(String(message.role || '').toLowerCase()))
+      .slice(-limit)
+      .map(message => ({
+        role: ['assistant', 'model'].includes(String(message.role || '').toLowerCase()) ? 'assistant' : 'user',
+        content: String(message.text || message.content || '').slice(0, 4000)
+      }))
+      .filter(message => message.content.trim());
+  }
+
   function memoryText(memory) {
     if (!memory || typeof memory !== 'object') return '';
     return [
@@ -371,6 +388,7 @@
   const api = {
     classifySupervisorIntent,
     buildEvidenceSearchPayload,
+    buildConversationalGenerationMessages,
     resolveNamedProjectWorkspace,
     buildContractedConversationalReply,
     handleSupervisorMessage
