@@ -75,6 +75,17 @@ test('Operator may ask a second question about immutable evidence but cannot reu
   t.equal(gate.allowed, false, 'pre-action evidence cannot prove post-action state');
   t.equal(gate.code, 'operator_stale_screenshot_reinspection');
   t.match(gate.reason, /predates the latest visible action/i);
+
+  policy.recordToolResult(state, 'start_command', { success: true, processId: 'game-2' });
+  gate = policy.gateTool({
+    mode: 'operator',
+    surface: 'desktop',
+    toolName: 'inspect_screenshot_with_model',
+    args: { path: 'orion-artifact://conv/screenshots/after.png', goal: 'Did the process relaunch change the window?' },
+    state
+  });
+  t.equal(gate.allowed, false, 'a process lifecycle action also invalidates the prior capture epoch');
+  t.equal(gate.code, 'operator_stale_screenshot_reinspection');
   t.end();
 });
 

@@ -1,35 +1,18 @@
 'use strict';
 
-// Regression coverage for a real playtest bug: Operator handed off to play "This is Life" (a
-// separate tcod roguelike), confirmed via inspect_screenshot_with_model that it was in real
-// gameplay, then - without calling capture_screen again - called inspect_screenshot_with_model a
-// SECOND time on the exact same screenshot path with a new goal ("did movement happen?"). That
-// judged an image against itself: meaningless, but nothing in the code stopped it.
-//
-// The existing state-freshness gate (lib/screenshot-similarity.js, operator-execution-policy.js's
-// 'operator_stale_screenshot_reinspection' check) protects a different, narrower case: it only
-// treats a screenshot as stale once a SCREEN_ACTION_TOOLS call (computer_action, open_application,
-// click_ui_element, open_chrome_favorite) has been recorded. It does not fire when zero screen
-// actions have been recorded yet - which is exactly the reported scenario, and is also exactly
-// what happens whenever real input bypasses those tools entirely (the second bug in this pair:
-// Operator shelling out to PowerShell for keystrokes, invisible to that policy layer). That gate
-// is also Operator-mode-only; Coder has the same computer_action/inspect_screenshot_with_model
-// pair available to it with no equivalent protection at all.
-//
-// This file covers the fix: a mode-agnostic, path-identity-based hard gate directly in agent.js's
-// inspect_screenshot_with_model case. It tracks which resolved screenshot paths have already had a
-// COMPLETED inspect_screenshot_with_model call in this run (executionContext.inspectedScreenshotPaths,
-// a Set) and refuses to inspect the same path again until a fresh capture_screen (which always
-// writes a new, uniquely timestamped path - see lib/ipc-shell.js's captureDesktopScreenshot) produces
-// a new one. This is real state tracking keyed on file identity, never on parsing or pattern-matching
-// the goal text, so it cannot be defeated by rephrasing the goal and cannot misfire on two genuinely
-// different screenshots.
+process.env.NODE_ENV = 'test';
+
+// Screenshot evidence is immutable and may answer multiple static questions. What it cannot do is
+// prove a state transition that occurred after it was captured. These tests exercise that boundary
+// through the real agent tool path: same-frame reuse is allowed before action, while
+// OperatorExecutionPolicy rejects pre-action evidence after a visible action changes the epoch.
 
 global.window = {};
 global.fetch = async () => ({ ok: false });
 
 const test = require('tape');
 const agent = require('../agent');
+const policy = require('../operator-execution-policy');
 
 function stubWindowForInspection({ onRead, onInspectFetch } = {}) {
   global.window = {
@@ -46,10 +29,12 @@ function stubWindowForInspection({ onRead, onInspectFetch } = {}) {
   }));
 }
 
-test('a second inspect_screenshot_with_model call on the identical resolved path is refused without a fresh capture_screen in between', async t => {
+test('the same immutable screenshot can answer multiple static questions before any action', async t => {
   stubWindowForInspection();
   const conversation = { id: 'conv_stale_1', mode: 'operator' };
-  const executionContext = {};
+  const operatorPolicyState = policy.createState('desktop');
+  policy.recordToolResult(operatorPolicyState, 'capture_screen', { success: true, path: 'screenshots/gameplay.png' });
+  const executionContext = { operatorExecutionSurface: 'desktop', operatorPolicyState };
 
   const first = await agent.executeTool(
     'inspect_screenshot_with_model', { path: 'screenshots/gameplay.png', goal: 'Confirm the game is in real gameplay, not a menu.' },
@@ -58,39 +43,36 @@ test('a second inspect_screenshot_with_model call on the identical resolved path
   );
   t.ok(first && first.success !== false, 'the first inspection of a never-before-seen path succeeds');
 
-  let threw = null;
-  try {
-    await agent.executeTool(
-      'inspect_screenshot_with_model', { path: 'screenshots/gameplay.png', goal: 'Did movement happen after the key press?' },
-      'C:\\workspace', { geminiApiKey: 'fake-key', activeRunModelName: 'gemini-2.5-flash-lite' },
-      conversation, executionContext
-    );
-  } catch (error) { threw = error; }
-
-  t.ok(threw, 'inspecting the exact same path a second time throws instead of silently judging a picture against itself');
-  t.match(threw.message, /already been inspected/i, 'the error explains the screenshot was already judged');
-  t.match(threw.message, /capture_screen/i, 'the error tells the model what to do instead: capture again');
+  const second = await agent.executeTool(
+    'inspect_screenshot_with_model', { path: 'screenshots/gameplay.png', goal: 'Read the visible controls in the upper-right corner.' },
+    'C:\\workspace', { geminiApiKey: 'fake-key', activeRunModelName: 'gemini-2.5-flash-lite' },
+    conversation, executionContext
+  );
+  t.ok(second && second.success !== false, 'a second static question can reuse the immutable evidence');
   t.end();
 });
 
-test('the block is keyed on the different GOAL TEXT, not on file identity - rephrasing the question does not bypass it', async t => {
-  // This is the "no regex/string-matching on goal text" requirement made concrete: two calls with
-  // completely different, unrelated goal strings against the same path are both still refused.
+test('pre-action screenshot evidence cannot prove the result of a later visible action', async t => {
   stubWindowForInspection();
   const conversation = { id: 'conv_stale_2', mode: 'operator' };
-  const executionContext = {};
+  const operatorPolicyState = policy.createState('desktop');
+  policy.recordToolResult(operatorPolicyState, 'capture_screen', { success: true, path: 'screenshots/before.png' });
+  const executionContext = { operatorExecutionSurface: 'desktop', operatorPolicyState };
   await agent.executeTool(
-    'inspect_screenshot_with_model', { path: 'screenshots/x.png', goal: 'What color is the background?' },
+    'inspect_screenshot_with_model', { path: 'screenshots/before.png', goal: 'Locate the player before movement.' },
     'C:\\workspace', { geminiApiKey: 'fake-key', activeRunModelName: 'gemini-2.5-flash-lite' }, conversation, executionContext
   );
-  let threw = null;
-  try {
-    await agent.executeTool(
-      'inspect_screenshot_with_model', { path: 'screenshots/x.png', goal: 'Completely unrelated question about a totally different detail.' },
-      'C:\\workspace', { geminiApiKey: 'fake-key', activeRunModelName: 'gemini-2.5-flash-lite' }, conversation, executionContext
-    );
-  } catch (error) { threw = error; }
-  t.ok(threw, 'a wildly different goal on the same path is still refused - the gate does not read or match goal text at all');
+  policy.recordToolResult(operatorPolicyState, 'computer_action', {
+    success: true,
+    path: 'screenshots/after.png'
+  });
+  const blocked = await agent.executeTool(
+    'inspect_screenshot_with_model', { path: 'screenshots/before.png', goal: 'Did movement happen?' },
+    'C:\\workspace', { geminiApiKey: 'fake-key', activeRunModelName: 'gemini-2.5-flash-lite' }, conversation, executionContext
+  );
+  t.equal(blocked.success, false, 'the stale frame is refused after the screen action');
+  t.equal(blocked.blocked, 'operator_stale_screenshot_reinspection', 'the action-aware freshness gate owns the refusal');
+  t.match(blocked.error, /predates the latest visible action/i, 'the recovery guidance explains the real evidence boundary');
   t.end();
 });
 
@@ -158,7 +140,7 @@ test('a failed inspection does not permanently block retrying the same path', as
   t.end();
 });
 
-test('path identity is normalized so a trivial backslash/case rewrite of the same file cannot bypass the gate', async t => {
+test('a path alias does not prevent legitimate static reinspection', async t => {
   stubWindowForInspection();
   const conversation = { id: 'conv_stale_5', mode: 'operator' };
   const executionContext = {};
@@ -166,22 +148,15 @@ test('path identity is normalized so a trivial backslash/case rewrite of the sam
     'inspect_screenshot_with_model', { path: 'screenshots/Case.png', goal: 'first look' },
     'C:\\workspace', { geminiApiKey: 'fake-key', activeRunModelName: 'gemini-2.5-flash-lite' }, conversation, executionContext
   );
-  let threw = null;
-  try {
-    await agent.executeTool(
-      // Same file, different slash direction and casing - resolveSnapshotReference would not
-      // necessarily normalize this on its own since it only rewrites references back to the
-      // *current* lastDesktopSnapshot path; the already-inspected-paths check must normalize
-      // independently.
-      'inspect_screenshot_with_model', { path: 'screenshots\\CASE.PNG', goal: 'second look, same file' },
-      'C:\\workspace', { geminiApiKey: 'fake-key', activeRunModelName: 'gemini-2.5-flash-lite' }, conversation, executionContext
-    );
-  } catch (error) { threw = error; }
-  t.ok(threw, 'a case/slash rewrite of an already-inspected path is still recognized as the same file');
+  const second = await agent.executeTool(
+    'inspect_screenshot_with_model', { path: 'screenshots\\CASE.PNG', goal: 'second static detail, same file' },
+    'C:\\workspace', { geminiApiKey: 'fake-key', activeRunModelName: 'gemini-2.5-flash-lite' }, conversation, executionContext
+  );
+  t.ok(second && second.success !== false, 'path spelling is irrelevant when no intervening action made the evidence stale');
   t.end();
 });
 
-test('two different conversations do not share the already-inspected set (each run tracks its own state)', async t => {
+test('two different conversations may independently inspect the same immutable artifact name', async t => {
   stubWindowForInspection();
   const conversationA = { id: 'conv_stale_a', mode: 'operator' };
   const conversationB = { id: 'conv_stale_b', mode: 'operator' };

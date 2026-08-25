@@ -994,13 +994,20 @@ test('Phone Companion replaces suspended mobile connections immediately on foreg
     'a network handoff recovers immediately without waiting for the poll interval');
   t.ok(html.includes("window.addEventListener('focus', recoverForegroundConnection)"),
     'returning focus also recovers browsers with unreliable visibility events');
-  t.ok(html.includes("if (!sseConnected && !stateFetchController) loadState();")
-      && html.includes("if (!sseConnected && lastSseMessageAt < recoveryStartedAt && !stateFetchController) loadState({ force: true });"),
-    'transport and full-state fallbacks are staged instead of racing the replacement stream');
+  t.ok(html.includes("if (lastStatePayloadAt < recoveryStartedAt && !stateFetchController) loadState({ force: true });")
+      && html.includes("if (lastStatePayloadAt < recoveryStartedAt) {"),
+    'foreground recovery waits for a real state payload rather than trusting the stream handshake');
   t.ok(html.includes("requestTimeout = setTimeout(() => requestController.abort(), 7000)"),
     'a stalled state request cannot block foreground recovery indefinitely');
-  t.ok(html.includes("lastSseActivityAt = Date.now();"),
-    'SSE keepalive bytes count as live activity and suppress redundant status polling');
+  t.ok(html.includes("lastSseActivityAt = Date.now();")
+      && html.includes("Date.now() - lastStatePayloadAt < PHONE_STATE_FRESHNESS_MS")
+      && !html.includes("Date.now() - lastSseActivityAt < 25000"),
+    'keepalive bytes prove transport liveness but only JSON state payloads suppress fallback polling');
+  t.ok(html.includes('lastStatePayloadAt = Date.now();')
+      && html.includes('lastStatePayloadAt = lastSseMessageAt;'),
+    'both HTTP and SSE JSON payloads advance the shared state-freshness clock');
+  t.ok(html.includes("if (!sseStateReceived && !stateFetchController) loadState({ force: true });"),
+    'a connected stream without an initial state payload receives a bounded HTTP fallback');
   t.ok(ipcServerSource.includes('if (pushInFlight)') && ipcServerSource.includes('pushAgain = true'),
     'server state pushes are coalesced while a renderer snapshot is in flight');
   t.ok(mainSource.includes('backgroundThrottling: false'),

@@ -48,8 +48,8 @@ test('phone companion finishes with the same dark theme and complete mission hie
   t.ok(companionHtml.includes('#task-list-card { grid-area: mission; }'), 'Task List has an explicit mobile layout area');
   t.ok(companionHtml.includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
   t.ok(companionHtml.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
-  t.ok(companionHtml.includes('responsive-phone-state-v29'), 'phone shell exposes the current UI build version');
-  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v26"), 'phone service worker cache is bumped for the current UI build');
+  t.ok(companionHtml.includes('state-freshness-v30'), 'phone shell exposes the current UI build version');
+  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v27"), 'phone service worker cache is bumped for the current UI build');
   t.ok(companionHtml.includes('window.isSecureContext'), 'phone explains when browser push is blocked by an insecure context');
   t.ok(companionHtml.includes('Phone push needs HTTPS or localhost'), 'phone tells the user that HTTPS is required for push notifications');
   t.ok(companionHtml.includes("companionFetch('/api/push-subscribe'"), 'phone stores push subscriptions through the authenticated fetch path');

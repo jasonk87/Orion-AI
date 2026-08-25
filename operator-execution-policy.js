@@ -35,6 +35,8 @@
       latestCapturePath: '',
       latestInspectedPath: '',
       latestInspectionStatus: '',
+      visualActionEpoch: 0,
+      latestCaptureEpoch: 0,
       screenActionAttempts: 0,
       screenActions: 0
     };
@@ -92,6 +94,7 @@
       state.captured = true;
       state.inspected = result.inspectionSkipped === true;
       state.latestCapturePath = String(result.path || '').trim();
+      state.latestCaptureEpoch = Number(state.visualActionEpoch) || 0;
       if (state.inspected) state.latestInspectedPath = state.latestCapturePath;
     }
     if (toolName === 'inspect_screenshot_with_model') {
@@ -104,9 +107,11 @@
     }
     if (SCREEN_OBSERVATION_TOOLS.has(toolName)) state.unproductiveDiagnosticStreak = 0;
     if (SCREEN_ACTION_TOOLS.has(toolName)) {
+      state.visualActionEpoch = (Number(state.visualActionEpoch) || 0) + 1;
       state.screenActions += 1;
       state.captured = !!result.path;
       state.latestCapturePath = String(result.path || '').trim();
+      state.latestCaptureEpoch = Number(state.visualActionEpoch) || 0;
       state.inspected = false;
       state.latestInspectionStatus = '';
       state.unproductiveDiagnosticStreak = 0;
@@ -114,6 +119,7 @@
     if (PROCESS_ACTION_TOOLS.has(toolName)) {
       // A process launch/stop can change the visible desktop asynchronously. The previous image
       // remains historical evidence, but cannot authorize a later click or prove the new state.
+      state.visualActionEpoch = (Number(state.visualActionEpoch) || 0) + 1;
       state.captured = false;
       state.inspected = false;
       state.latestInspectionStatus = '';
@@ -124,7 +130,9 @@
 
   function recordToolAttempt(stateValue, toolName) {
     const state = stateValue || createState();
-    if (SCREEN_ACTION_TOOLS.has(toolName)) state.screenActionAttempts += 1;
+    if (SCREEN_ACTION_TOOLS.has(toolName)) {
+      state.screenActionAttempts += 1;
+    }
     return state;
   }
 
@@ -148,7 +156,9 @@
     if (toolName === 'inspect_screenshot_with_model') {
       const requestedPath = resolveSnapshotReference(args.path, { path: state.latestCapturePath });
       const inspectingCurrentCapture = sameScreenReference(requestedPath, state.latestCapturePath);
-      if (state.screenActions > 0 && (!state.captured || !inspectingCurrentCapture)) {
+      const actionEpoch = Number(state.visualActionEpoch) || 0;
+      const captureEpoch = Number(state.latestCaptureEpoch) || 0;
+      if (actionEpoch > 0 && (!state.captured || captureEpoch !== actionEpoch || !inspectingCurrentCapture)) {
         return {
           allowed: false,
           code: 'operator_stale_screenshot_reinspection',
