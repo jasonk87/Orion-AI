@@ -12644,7 +12644,7 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "run_command",
-            description: "Runs a command in powershell in the workspace directory, waits for completion, and returns code, stdout, stderr, and timeout status. For local machine facts, a non-zero exit proves only that this command attempt failed; try a different local route before concluding the task is blocked. For a top-level Desktop/folder listing, use a non-recursive command such as Get-ChildItem -LiteralPath \"C:\\Users\\Owner\\Desktop\" -Directory | Select-Object -ExpandProperty Name; do not add -Depth/-Recurse unless nested folders are explicitly requested.",
+            description: "Runs a command in powershell in the workspace directory, waits for completion, and returns code, stdout, stderr, and timeout status. For local machine facts, a non-zero exit proves only that this command attempt failed; try a different local route before concluding the task is blocked. For a top-level Desktop/folder listing, use a non-recursive command such as Get-ChildItem -LiteralPath \"C:\\Users\\Owner\\Desktop\" -Directory | Select-Object -ExpandProperty Name; do not add -Depth/-Recurse unless nested folders are explicitly requested. Never use this for keyboard/mouse input or window focus/activation - not AppActivate, SendKeys, WScript.Shell, or any other scripted input path. Those calls cannot be grounded in an inspected screenshot and bypass Orion's screen-state tracking entirely. Use computer_action for input and open_application (or click_ui_element) for window focus/activation instead.",
             parameters: {
               type: "OBJECT",
               properties: {
