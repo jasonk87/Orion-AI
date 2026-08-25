@@ -56,6 +56,23 @@
     return `[RETRIEVED CONVERSATION EVIDENCE]\nUse only these retrieved excerpts for claims about prior conversations. Do not fill gaps with a plausible reconstruction.\n\n${lines.join('\n')}`;
   }
 
+  function buildConversationalGenerationMessages(messages, options = {}) {
+    const contextNeed = String(options.contextNeed || 'none');
+    // `none` means no historical/session retrieval. It must not erase the immediately preceding
+    // conversational turn: a follow-up such as "What do you have in mind?" has no durable meaning
+    // without the answer it follows. Keeping only that local pair avoids injecting unrelated old
+    // sessions while preserving ordinary dialogue continuity without language heuristics.
+    const limit = contextNeed === 'recent' ? 4 : (contextNeed === 'none' ? 2 : 10);
+    return (Array.isArray(messages) ? messages : [])
+      .filter(message => message && ['user', 'assistant', 'model'].includes(String(message.role || '').toLowerCase()))
+      .slice(-limit)
+      .map(message => ({
+        role: ['assistant', 'model'].includes(String(message.role || '').toLowerCase()) ? 'assistant' : 'user',
+        content: String(message.text || message.content || '').slice(0, 4000)
+      }))
+      .filter(message => message.content.trim());
+  }
+
   function memoryText(memory) {
     if (!memory || typeof memory !== 'object') return '';
     return [
@@ -213,8 +230,9 @@
     const semanticIntent = input.semanticIntent && typeof input.semanticIntent === 'object'
       ? input.semanticIntent
       : {};
-    const recallRequested = semanticIntent.reasoningPolicyHint
-      && semanticIntent.reasoningPolicyHint.contextNeed === 'historical';
+    const memoryIntent = String(semanticIntent.memoryIntent || 'none');
+    const recallRequested = memoryIntent === 'conversation_recall';
+    const memoryPolicyQuestion = memoryIntent === 'memory_policy';
     const suppliedStatuses = Array.isArray(input.structuredStatuses) ? input.structuredStatuses : [];
     const extractedStatuses = contracts
       ? contracts.extractStructuredStatusFacts([prompt, input.statusText || ''].filter(Boolean).join('\n'))
@@ -243,6 +261,9 @@
       recallRequested
         ? (evidencePrompt || '[MEMORY RETRIEVAL RESULT]\nNo relevant prior-conversation evidence was retrieved. Say so plainly and label any reasoning as inference.')
         : '',
+      memoryPolicyQuestion && contracts && typeof contracts.buildMemoryPolicyContext === 'function'
+        ? contracts.buildMemoryPolicyContext()
+        : '',
       statuses.length
         ? `[STRUCTURED STATUS FACTS]\n${JSON.stringify(statuses)}\nPreserve these exact states; mergeable is not merged, queued is not running, cancelled is not completed, and reported/mock results are not independently verified.`
         : ''
@@ -266,7 +287,39 @@
     }
     const rawReply = await dependencies.generateReply(systemPrompt, generationMessages);
     let text = String(rawReply || '').trim();
-    if (contracts && (recallRequested || contracts.hasExplicitRecallClaim(text))) {
+
+    // A follow-up must get a new answer. Asked "why that one over these others?", a model on a
+    // low reasoning budget will often re-emit its previous message nearly verbatim — responsive
+    // in shape, useless in substance. One regeneration with the restatement named explicitly is
+    // enough to break it; a second would just burn tokens, so this never loops.
+    const priorAssistantText = (() => {
+      const messages = Array.isArray(conversation.messages) ? conversation.messages : [];
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const message = messages[i];
+        if (!message || (message.role !== 'assistant' && message.role !== 'model')) continue;
+        const value = String(message.text || message.content || '').trim();
+        if (value && value !== 'Thinking...') return value;
+      }
+      return '';
+    })();
+    let restated = false;
+    if (contracts && typeof contracts.isRestatementOfPrevious === 'function'
+        && priorAssistantText && contracts.isRestatementOfPrevious(text, priorAssistantText)) {
+      restated = true;
+      const retryMessages = [
+        ...generationMessages,
+        { role: 'assistant', content: text },
+        { role: 'user', content: contracts.buildRestatementCorrectionPrompt(prompt) }
+      ];
+      const retryReply = await dependencies.generateReply(systemPrompt, retryMessages);
+      const retryText = String(retryReply || '').trim();
+      // Only accept the retry if it actually stopped restating; otherwise the original at least
+      // answers in the user's own terms rather than being replaced by a second copy.
+      if (retryText && !contracts.isRestatementOfPrevious(retryText, priorAssistantText)) {
+        text = retryText;
+      }
+    }
+    if (contracts && (recallRequested || (!memoryPolicyQuestion && contracts.hasExplicitRecallClaim(text)))) {
       const validation = contracts.validateMemoryResponse(text, {
         conversationEvidence: evidence,
         recallRequested
@@ -287,7 +340,7 @@
           structuredStatuses: statuses
         })
       : null;
-    return { text, responseBasis, searchResult, recallRequested, statuses };
+    return { text, responseBasis, searchResult, recallRequested, statuses, restated };
   }
 
   async function handleSupervisorMessage(input = {}, dependencies = {}) {
@@ -335,6 +388,7 @@
   const api = {
     classifySupervisorIntent,
     buildEvidenceSearchPayload,
+    buildConversationalGenerationMessages,
     resolveNamedProjectWorkspace,
     buildContractedConversationalReply,
     handleSupervisorMessage

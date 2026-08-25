@@ -1,5 +1,6 @@
 const test = require('tape');
 global.window = {};
+const operational = require('../operational-context');
 
 function semanticClassifierResponse({
   intent = 'new_task',
@@ -193,6 +194,28 @@ test('classifyPlanningNeed returns correct modes', async (t) => {
   }));
   t.equal(answerRes.mode, 'answer', 'Recognizes answer mode');
 
+  t.end();
+});
+
+test('planning completion gate applies only to unresolved executable plan work', (t) => {
+  const base = {
+    planningMode: true,
+    requiresExecution: true,
+    planningModeDecision: 'plan',
+    executionMode: 'planning',
+    canExecute: false,
+    hasChecklist: false,
+    answerText: 'I am still getting ready.',
+    consecutiveNoToolCalls: 1,
+    loopCount: 1,
+    maxLoops: 10
+  };
+
+  t.equal(agent.shouldApplyPlanningCompletionGate(base), true, 'unfinished plan work receives the completion nudge');
+  t.equal(agent.shouldApplyPlanningCompletionGate({ ...base, executionMode: 'analyzing' }), true, 'fresh plan work receives the nudge before the UI mode changes');
+  t.equal(agent.shouldApplyPlanningCompletionGate({ ...base, requiresExecution: false, planningModeDecision: 'answer', executionMode: 'answer', answerText: "Hey Jason — I'm here." }), false, 'casual conversation never receives the planning nudge');
+  t.equal(agent.shouldApplyPlanningCompletionGate({ ...base, planningModeDecision: 'direct', executionMode: 'direct' }), false, 'direct work is not forced into planning');
+  t.equal(agent.shouldApplyPlanningCompletionGate({ ...base, hasChecklist: true }), false, 'existing checklist uses the normal task continuation path');
   t.end();
 });
 
@@ -2444,11 +2467,147 @@ test('a task classified as deep complexity proactively upgrades the model from t
   };
 
   try {
-    await window.runAgentLoop('do a large multi-file refactor', 'gemini-2.5-flash-lite', conversation);
-    t.equal(modelsRequested[0], 'gemini-2.5-flash', 'turn 1 is already upgraded to the stronger model for a deep task, before any edits happen');
+    await window.runAgentLoop('do a large multi-file refactor', 'gemini-2.5-flash-lite', conversation, {
+      executionProfile: {
+        requestedModel: 'gemini-2.5-flash-lite',
+        requestedReasoning: 'max',
+        allowEscalation: true,
+        allowDowngrade: false
+      }
+    });
+    t.equal(modelsRequested[0], 'gemini-2.5-flash', 'turn 1 is already upgraded to the stronger model for a deep task, even when the durable handoff profile names the lower tier');
   } finally {
     global.window.runAgentLoop = originalRunAgentLoop;
     global.fetch = originalFetch;
+  }
+  t.end();
+});
+
+test('an internal completion gate cannot replace a detailed answer with gate bookkeeping', async (t) => {
+  const originalRunAgentLoop = global.window.runAgentLoop;
+  const originalFetch = global.fetch;
+  const originalClaimOrchestrationTask = global.window.claimOrchestrationTask;
+  const originalFinalizeOrchestrationTask = global.window.finalizeOrchestrationTask;
+  const originalOnOrchestrationTaskFinalized = global.window.onOrchestrationTaskFinalized;
+  const finalized = [];
+
+  let persistedState = operational.createEmptyContext(1000);
+  persistedState = operational.applyAction(persistedState, 'update_mission_context', {
+    mission: 'Assess browser conversion feasibility for GRITLIFE.',
+    winConditions: [{ id: 'assessment', title: 'Deliver a grounded feasibility assessment.' }]
+  }, 1001).state;
+  persistedState = operational.applyAction(persistedState, 'evaluate_win_conditions', {
+    evaluations: [{ id: 'assessment', status: 'satisfied', evidence: ['Source architecture was inspected.'] }]
+  }, 1002).state;
+  persistedState = operational.applyAction(persistedState, 'record_tool_result', {
+    toolName: 'read_file',
+    success: true,
+    summary: 'Inspected the simulation and rendering boundaries.'
+  }, 1003).state;
+  persistedState = operational.applyAction(persistedState, 'set_coverage_frontier', {
+    risk: 'high',
+    requiredSurfaces: ['Simulation/rendering boundary'],
+    notInspected: [],
+    adversarialReviewRequired: true
+  }, 1004).state;
+  persistedState = operational.applyAction(persistedState, 'update_coverage_frontier', {
+    inspected: ['Simulation/rendering boundary'],
+    verified: ['Simulation/rendering boundary']
+  }, 1005).state;
+
+  global.window.appendSystemMessage = () => {};
+  global.window.renderAiMessage = () => {};
+  global.window.getAppConfig = () => ({ planningMode: false, geminiApiKey: 'test-key', modelCallDelayMs: 0, autoTest: false });
+  global.window.getCurrentWorkspace = () => '/test/gritlife';
+  global.window.clearActiveAiBubble = () => {};
+  global.window.saveConversationsToStorage = () => {};
+  global.window.claimOrchestrationTask = async taskId => ({
+    success: true,
+    task: { taskId, status: 'active', execution: { executionId: 'exec-gate-answer-continuity' } },
+    prompt: 'Assess browser conversion feasibility for GRITLIFE.'
+  });
+  global.window.finalizeOrchestrationTask = async (taskId, status, details) => {
+    finalized.push({ taskId, status, details });
+    return { taskId, status };
+  };
+  global.window.onOrchestrationTaskFinalized = async () => {};
+  global.window.api = {
+    readFile: async (_workspace, filePath) => {
+      if (filePath === '.orion/context/operational-context.json') return JSON.stringify(persistedState);
+      if (filePath === '.orion/context/journal.jsonl') return '';
+      return 'The simulation is Python and the rendering boundary is isolated.';
+    },
+    writeFile: async (_workspace, filePath, content) => {
+      if (filePath === '.orion/context/operational-context.json') persistedState = JSON.parse(content);
+      return { success: true };
+    },
+    getWorkspaceEntrypoint: async () => ({ success: true, entrypoint: null })
+  };
+
+  const detailedAnswer = [
+    'The practical route is a Python simulation service with a browser frontend, not a full rewrite.',
+    '',
+    '- Keep the existing simulation and save logic on the server.',
+    '- Replace the current rendering layer with a responsive browser UI.',
+    '- Add authenticated family accounts and a hosted multiplayer session layer.',
+    '- Start with a LAN prototype, then add internet hosting after save synchronization is proven.',
+    '',
+    'That preserves the mature game logic while making phone and computer play realistic.'
+  ].join('\n');
+  let turn = 0;
+  global.fetch = async (url) => {
+    if (String(url).includes(':countTokens')) return { ok: true, json: async () => ({ totalTokens: 100 }) };
+    turn++;
+    if (turn === 1) {
+      return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'read_file', args: { path: 'README.md' } } }] } }] }) };
+    }
+    if (turn === 2) {
+      return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: detailedAnswer }] } }] }) };
+    }
+    if (turn === 3) {
+      return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ functionCall: { name: 'record_adversarial_review', args: { status: 'passed', summary: 'Checked the main migration risk.', evidence: ['rendering boundary inspected'] } } }] } }] }) };
+    }
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'The assessment I delivered above is complete and grounded. No further inspection is needed; the report stands.' }] } }] }) };
+  };
+
+  const conversation = {
+    id: 'test-gate-answer-continuity',
+    mode: 'coder',
+    messages: [],
+    tasks: [],
+    awaitingPlanApproval: false,
+    planApproved: true
+  };
+  try {
+    await window.runAgentLoop(
+      'Assess how hard it would be to move GRITLIFE to the browser for phones and computers.',
+      'gemini-1',
+      conversation,
+      {
+        taskId: 'task-gate-answer-continuity',
+        semanticIntent: {
+          intent: 'new_task', requiresExecution: true, target: 'current_conversation',
+          resolvedRequest: 'Assess browser conversion feasibility for GRITLIFE.',
+          contextDependent: false, confidence: 1, needsClarification: false,
+          reasoningPolicyHint: { complexity: 'high', risk: 'high', contextNeed: 'project' },
+          taskResolution: { title: 'Assess browser conversion', requirements: [], constraints: [], unresolvedDecisions: [] },
+          executionScope: 'read_only', inspectionTarget: 'project', inspectionBreadth: 'focused'
+        }
+      }
+    );
+    const final = conversation.messages.find(message => message.role === 'assistant');
+    t.ok(final, 'the run saves a final assistant response');
+    t.ok(final.text.startsWith(detailedAnswer), 'the original detailed assessment remains visible after the gate bookkeeping turn');
+    t.notOk(/report stands/i.test(final.text), 'the gate-directed acknowledgement never becomes the visible or durable answer');
+    t.equal(finalized.length, 1, 'the durable task finalizes once');
+    t.equal(finalized[0].details.result.summary, detailedAnswer, 'the Dispatch relay receives the detailed assessment without the generated walkthrough');
+    t.equal(persistedState.coverageFrontier.adversarialReview.status, 'passed', 'the gate itself still performs and records its required validation');
+  } finally {
+    global.window.runAgentLoop = originalRunAgentLoop;
+    global.fetch = originalFetch;
+    global.window.claimOrchestrationTask = originalClaimOrchestrationTask;
+    global.window.finalizeOrchestrationTask = originalFinalizeOrchestrationTask;
+    global.window.onOrchestrationTaskFinalized = originalOnOrchestrationTaskFinalized;
   }
   t.end();
 });
@@ -2710,6 +2869,25 @@ test('compactHistory still trims to a short tail when the boundary already falls
   }
 });
 
+test('persisted compaction context remains durable but is explicitly hidden from transcript replay', (t) => {
+  const conversation = {
+    messages: [
+      { role: 'user', text: 'Earlier real question.' },
+      { role: 'assistant', text: 'Earlier real answer.' }
+    ]
+  };
+  agent.persistCompactedConversation(conversation, 'Private compacted summary.');
+  const [summary, acknowledgement] = conversation.messages;
+
+  t.equal(summary.source, 'context-compaction', 'summary has a structured internal source');
+  t.equal(summary.internalContext, true, 'summary is marked internal');
+  t.equal(summary.hiddenFromTranscript, true, 'summary is hidden from transcript replay');
+  t.equal(acknowledgement.source, 'context-compaction', 'acknowledgement has the same structured source');
+  t.equal(acknowledgement.hiddenFromTranscript, true, 'acknowledgement is hidden from transcript replay');
+  t.ok(conversation.compactionHistory.length === 1, 'the complete pre-compaction transcript is still backed up');
+  t.end();
+});
+
 test('compactHistory dynamically truncates conversation context to protect summarizer from overflow', async (t) => {
   const originalFetch = global.fetch;
   let interceptedPrompt = '';
@@ -2829,9 +3007,9 @@ test('a blank final response after real tool work is nudged to produce an actual
 });
 
 // Dispatch cannot execute process mutations itself, but that boundary must route work rather than
-// return it to the user. A real conversation required the user to explicitly demand Coder after a
-// long permission refusal. The loop now synthesizes the handoff tool call deterministically.
-test('Dispatch preflights a kill/restart request into one Coder handoff without a Dispatch model pass', async (t) => {
+// return it to the user. Native application/process work belongs to Operator, and the loop must
+// synthesize that handoff deterministically without accepting a permission refusal.
+test('Dispatch preflights a kill/restart request into one Operator handoff without a Dispatch model pass', async (t) => {
   const originalRunAgentLoop = global.window.runAgentLoop;
   const originalSetTimeout = global.setTimeout;
   const originalFetch = global.fetch;
@@ -2843,7 +3021,7 @@ test('Dispatch preflights a kill/restart request into one Coder handoff without 
   global.window.clearActiveAiBubble = () => {};
   global.window.saveConversationsToStorage = () => {};
   global.window.getKnownProjects = () => [];
-  global.window.startCoderTaskMonitor = () => {};
+  global.window.startOperatorTaskMonitor = () => {};
   global.window.api = {
     listFiles: async () => ([]),
     readFile: async () => '',
@@ -2852,9 +3030,9 @@ test('Dispatch preflights a kill/restart request into one Coder handoff without 
   };
 
   const handoffs = [];
-  global.window.promoteWorkspaceToCoder = async (payload) => {
+  global.window.promoteWorkspaceToOperator = async (payload) => {
     handoffs.push(payload);
-    return { success: true, conversationId: 'coder-kill-restart', title: payload.title || 'Coder Task' };
+    return { success: true, conversationId: 'operator-kill-restart', title: payload.title || 'Operator Task' };
   };
 
   const request = 'Can you kill Claude and restart it again?';
@@ -2892,21 +3070,21 @@ test('Dispatch preflights a kill/restart request into one Coder handoff without 
         })
       };
     }
-    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'Coder has the kill/restart task and will verify the replacement process.' }] } }] }) };
+    return { ok: true, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'Operator has the kill/restart task and will verify the replacement process.' }] } }] }) };
   };
 
   try {
     global.setTimeout = (fn, delay) => (delay === 500 ? null : originalSetTimeout(fn, delay));
     await window.runAgentLoop(request, 'gemini-1', conversation);
 
-    t.equal(handoffs.length, 1, 'handoff_to_coder executes exactly once');
+    t.equal(handoffs.length, 1, 'handoff_to_operator executes exactly once');
     t.equal(modelTurn, 0, 'the full Dispatch model is never called before delegation');
-    t.equal(handoffs[0].open, false, 'Dispatch remains visible to supervise the Coder task');
+    t.equal(handoffs[0].open, false, 'Dispatch remains visible to supervise the Operator task');
     t.ok(handoffs[0].prompt.includes(request), 'the handoff preserves the exact user request');
-    t.ok(/identify the intended local target/i.test(handoffs[0].prompt), 'Coder is instructed to resolve which Claude process is meant');
+    t.ok(/identify the intended local target/i.test(handoffs[0].prompt), 'Operator is instructed to resolve which Claude process is meant');
     const aiMessage = conversation.messages.find(m => m.role === 'assistant');
     const calledTools = (aiMessage?.turns || []).flatMap(turn => turn.modelParts || []).map(part => part.functionCall?.name).filter(Boolean);
-    t.ok(calledTools.includes('handoff_to_coder'), 'the persisted model turn contains a real matching handoff function call');
+    t.ok(calledTools.includes('handoff_to_operator'), 'the persisted model turn contains a real matching handoff function call');
     t.notOk(/you(?:'ll| will)? need to|manually from your terminal/i.test(aiMessage?.text || ''), 'the forbidden manual-restart refusal is not accepted as the final answer');
   } finally {
     global.window.runAgentLoop = originalRunAgentLoop;

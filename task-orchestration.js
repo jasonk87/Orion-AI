@@ -5,7 +5,16 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function createOrionTaskOrchestration() {
   'use strict';
 
-  const SCHEMA_VERSION = 2;
+  const SpecialistRegistry = typeof require === 'function'
+    ? require('./specialist-registry')
+    : (typeof globalThis !== 'undefined' ? globalThis.OrionSpecialistRegistry : null);
+
+  function isRegisteredTaskTarget(modeValue) {
+    const mode = String(modeValue || '').trim().toLowerCase();
+    return mode === 'orion' || !!(SpecialistRegistry && SpecialistRegistry.has(mode));
+  }
+
+  const SCHEMA_VERSION = 5;
   const TASK_STATES = Object.freeze({
     PENDING: 'pending',
     ACTIVE: 'active',
@@ -315,8 +324,10 @@
       search_root: 'project_search_root',
       projects_root: 'project_search_root',
       generic_projects_root: 'project_search_root',
-      standalone: 'standalone_coder',
-      coder: 'standalone_coder',
+      standalone: 'standalone_specialist',
+      coder: 'standalone_specialist',
+      operator: 'standalone_specialist',
+      standalone_coder: 'standalone_specialist',
       unknown: 'unresolved'
     };
     role = aliases[role] || role;
@@ -338,9 +349,9 @@
         workspaceSource = workspaceSource || project.source;
       }
     }
-    if (!['active_project', 'project_search_root', 'standalone_coder', 'unresolved'].includes(role)) {
+    if (!['active_project', 'project_search_root', 'standalone_specialist', 'unresolved'].includes(role)) {
       if (projectPath && path) role = 'active_project';
-      else if (/standalone-workspaces/i.test(path)) role = 'standalone_coder';
+      else if (/standalone-workspaces/i.test(path)) role = 'standalone_specialist';
       else role = 'unresolved';
     }
     return {
@@ -351,7 +362,7 @@
         path: projectPath
       },
       source: workspaceSource,
-      resolved: (role === 'active_project' || role === 'standalone_coder') && !!path
+      resolved: (role === 'active_project' || role === 'standalone_specialist') && !!path
     };
   }
 
@@ -361,6 +372,37 @@
       conversationId: compactInline(supplied.conversationId || fallbacks.conversationId || ''),
       sessionId: compactInline(supplied.sessionId || fallbacks.sessionId || ''),
       messageId: compactInline(supplied.messageId || fallbacks.messageId || '')
+    };
+  }
+
+  function normalizeExecutionProfile(value, fallbacks = {}) {
+    const supplied = value && typeof value === 'object' ? value : {};
+    const requestedModel = compactInline(
+      supplied.requestedModel
+      || supplied.model
+      || fallbacks.requestedModel
+      || fallbacks.modelSelectValue
+      || ''
+    );
+    const requestedReasoningValue = compactInline(
+      supplied.requestedReasoning
+      || supplied.reasoningEffort
+      || supplied.reasoning
+      || fallbacks.requestedReasoning
+      || fallbacks.reasoningEffort
+      || 'auto'
+    ).toLowerCase() || 'auto';
+    const requestedReasoning = requestedReasoningValue === 'ultra'
+      ? 'max'
+      : (['auto', 'low', 'medium', 'high', 'max'].includes(requestedReasoningValue)
+          ? requestedReasoningValue
+          : 'auto');
+    return {
+      requestedModel,
+      requestedReasoning,
+      allowEscalation: supplied.allowEscalation !== false,
+      allowDowngrade: supplied.allowDowngrade === true,
+      capturedAt: resolveNow(supplied.capturedAt || fallbacks.capturedAt || fallbacks.now)
     };
   }
 
@@ -448,7 +490,17 @@
       sessionId: input.targetSessionId,
       messageId: ''
     });
+    // target.mode is the canonical specialist-role field. Missing legacy values default to Coder;
+    // an explicit unknown role fails closed instead of inheriting Coder behavior.
     target.mode = compactInline((input.target && input.target.mode) || input.targetMode || 'coder') || 'coder';
+    if (!isRegisteredTaskTarget(target.mode)) {
+      return {
+        success: false,
+        needsClarification: true,
+        clarification: `Orion does not have a registered task role named "${target.mode}". Choose Dispatch, Coder, or Operator before this task is queued.`,
+        task: null
+      };
+    }
     const requirements = uniqueStrings([
       ...(input.requirements || input.knownRequirements || []),
       ...(taskResolution.requirements || [])
@@ -466,6 +518,24 @@
       || semanticIntent.supersedesTaskId
       || ''
     );
+    const parentTaskId = compactInline(input.parentTaskId || '');
+    const rootOriginConversationId = compactInline(
+      input.rootOriginConversationId
+      || (input.rootOrigin && input.rootOrigin.conversationId)
+      || origin.conversationId
+      || ''
+    );
+    const executionProfile = normalizeExecutionProfile(input.executionProfile, {
+      modelSelectValue: input.modelSelectValue,
+      reasoningEffort: input.reasoningEffort,
+      capturedAt: now,
+      now
+    });
+    const executionSurface = ['none', 'desktop', 'browser', 'process'].includes(
+      compactInline(input.executionSurface || semanticIntent.executionSurface).toLowerCase()
+    )
+      ? compactInline(input.executionSurface || semanticIntent.executionSurface).toLowerCase()
+      : 'none';
 
     const task = {
       schemaVersion: SCHEMA_VERSION,
@@ -482,8 +552,12 @@
       unresolvedDecisions,
       images: normalizeImageAttachments(taskImageInput(input)),
       contextPacketIds: taskContextPacketIds(input),
+      executionProfile,
+      executionSurface,
       origin,
       target,
+      parentTaskId,
+      rootOriginConversationId,
       supersedesTaskId,
       source: compactInline(input.source || 'user'),
       status: TASK_STATES.PENDING,
@@ -527,7 +601,10 @@
       sessionId: record.targetSessionId,
       messageId: ''
     });
+    // Legacy records without a role are Coder tasks. Unknown persisted roles are retained for
+    // provenance but made non-runnable below.
     target.mode = compactInline((record.target && record.target.mode) || record.targetMode || 'coder') || 'coder';
+    const invalidTargetMode = isRegisteredTaskTarget(target.mode) ? '' : target.mode;
     const createdAt = resolveNow(record.createdAt || record.timestamp || now);
     const updatedAt = resolveNow(record.updatedAt || createdAt);
     const rawStatus = record.status == null ? record.state : record.status;
@@ -545,6 +622,13 @@
         invalidStatus = compactInline(rawStatus);
       }
     }
+    const persistedResultSummary = compactWhitespace(
+      record.result && typeof record.result === 'object' ? record.result.summary : ''
+    );
+    const legacyCompletedProviderFailure = status === TASK_STATES.COMPLETED
+      && persistedResultSummary.startsWith('Error contacting Model API:');
+    if (legacyCompletedProviderFailure) status = TASK_STATES.FAILED;
+    if (invalidTargetMode && !TERMINAL_STATES.has(status)) status = TASK_STATES.FAILED;
     const persistedTitle = compactInline(record.title);
     const title = !persistedTitle || persistedTitle.toLowerCase() === 'execute dispatch request'
       ? titleFromObjective(objective || originalUserMessage, workspace.project.name)
@@ -565,6 +649,15 @@
       unresolvedDecisions: uniqueStrings(record.unresolvedDecisions || []),
       images: normalizeImageAttachments(taskImageInput(record)),
       contextPacketIds: taskContextPacketIds(record),
+      executionProfile: normalizeExecutionProfile(record.executionProfile, {
+        modelSelectValue: record.modelSelectValue,
+        reasoningEffort: record.reasoningEffort,
+        capturedAt: record.createdAt || record.timestamp || now,
+        now
+      }),
+      executionSurface: ['none', 'desktop', 'browser', 'process'].includes(compactInline(record.executionSurface).toLowerCase())
+        ? compactInline(record.executionSurface).toLowerCase()
+        : 'none',
       continuation: continuationRecord && compactWhitespace(continuationRecord.input || continuationRecord.prompt || '')
         ? {
             input: compactWhitespace(continuationRecord.input || continuationRecord.prompt || ''),
@@ -576,12 +669,25 @@
         : null,
       origin,
       target,
+      parentTaskId: compactInline(record.parentTaskId || ''),
+      rootOriginConversationId: compactInline(
+        record.rootOriginConversationId
+        || (record.rootOrigin && record.rootOrigin.conversationId)
+        || origin.conversationId
+        || ''
+      ),
       supersedesTaskId: compactInline(
         record.supersedesTaskId
         || record.predecessorTaskId
         || record.continuationOfTaskId
         || ''
       ),
+      ...(invalidTargetMode ? {
+        failure: {
+          code: 'unknown_specialist_role',
+          message: `Persisted task targets unregistered specialist "${invalidTargetMode}" and cannot be executed.`
+        }
+      } : {}),
       supersededByTaskId: compactInline(record.supersededByTaskId || ''),
       source: compactInline(record.source || 'unknown'),
       status,
@@ -598,6 +704,12 @@
         ...(normalized.failure && typeof normalized.failure === 'object' ? normalized.failure : {}),
         code: 'invalid_persisted_status',
         message: `Unrecognized persisted task state: ${invalidStatus}`
+      };
+    } else if (legacyCompletedProviderFailure) {
+      normalized.failure = {
+        ...(normalized.failure && typeof normalized.failure === 'object' ? normalized.failure : {}),
+        code: 'legacy_model_api_failure',
+        message: persistedResultSummary.slice(0, 1000)
       };
     }
     return normalized;
@@ -731,6 +843,7 @@
       const permitted = new Set([
         task.origin && task.origin.conversationId,
         task.target && task.target.conversationId,
+        task.rootOriginConversationId,
         task.ownerConversationId,
         task.supervisingConversationId
       ].map(compactInline).filter(Boolean));
@@ -740,14 +853,19 @@
     return !conversationId && !!sessionId && !!task.origin.sessionId && sessionId === task.origin.sessionId;
   }
 
-  function selectOwnedContinuationTask(tasksValue, requesterConversationIdValue, preferredTaskIdsValue = []) {
+  // Continuations remain bound to one explicit registered specialist role.
+  function selectOwnedContinuationTask(tasksValue, requesterConversationIdValue, preferredTaskIdsValue = [], options = {}) {
     const requesterConversationId = compactInline(requesterConversationIdValue);
     const preferredTaskIds = uniqueStrings(preferredTaskIdsValue).map(compactInline).filter(Boolean);
+    const role = compactInline(options.role).toLowerCase() || 'coder';
+    if (!SpecialistRegistry || !SpecialistRegistry.has(role)) {
+      return { action: 'unknown_specialist', task: null, candidates: [] };
+    }
     const tasks = filterSupersededTasks(tasksValue)
       .filter(task =>
         task.taskId
         && [TASK_STATES.PENDING, TASK_STATES.ACTIVE].includes(task.status)
-        && compactInline(task.target && task.target.mode).toLowerCase() === 'coder'
+        && compactInline(task.target && task.target.mode).toLowerCase() === role
         && canRequesterControlTask(task, { conversationId: requesterConversationId }))
       .sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0));
     if (!tasks.length) return { action: 'none', task: null, candidates: [] };
@@ -793,6 +911,8 @@
       `Workspace role: ${workspace.role}`,
       `Exact workspace path: ${workspace.path || '(unresolved)'}`,
       `Selected project: ${project.name || '(none)'}${project.path ? ` (${project.path})` : ''}`,
+      `Requested model: ${task.executionProfile.requestedModel || '(use current default)'}`,
+      `Requested reasoning: ${task.executionProfile.requestedReasoning || 'auto'}`,
       '',
       renderList('Known requirements', task.requirements),
       '',
@@ -807,6 +927,12 @@
       `Origin session: ${task.origin.sessionId || '(unknown)'}`,
       `Origin message: ${task.origin.messageId || '(unknown)'}`
     ];
+    if (task.parentTaskId) {
+      sections.push(
+        `Parent task: ${task.parentTaskId}`,
+        `Root owner conversation: ${task.rootOriginConversationId || '(unknown)'}`
+      );
+    }
     if (task.continuation && task.continuation.input) {
       sections.push(
         '',
@@ -896,8 +1022,8 @@
     const viewingConversationId = compactInline(viewingConversationIdValue);
     const activeTaskId = compactInline(activeTaskIdValue);
     const delegatedOnly = options.delegatedOnly === true;
-    const tasks = filterSupersededTasks(tasksValue)
-      .filter(task => {
+    const allTasks = filterSupersededTasks(tasksValue);
+    const tasks = allTasks.filter(task => {
         if (!viewingConversationId) return false;
         const originConversationId = taskConversationId(task, 'origin');
         const targetConversationId = taskConversationId(task, 'target');
@@ -914,14 +1040,36 @@
     const byNewest = (a, b) => Number(b.updatedAt || b.createdAt || 0)
       - Number(a.updatedAt || a.createdAt || 0)
       || compactInline(a.taskId).localeCompare(compactInline(b.taskId));
-    const exactActive = activeTaskId
+    let selected = activeTaskId
       ? tasks.find(task => compactInline(task.taskId) === activeTaskId)
       : null;
-    if (exactActive) return exactActive;
-    return tasks.filter(task => task.status === TASK_STATES.ACTIVE).sort(byNewest)[0]
+    selected = selected
+      || tasks.filter(task => task.status === TASK_STATES.ACTIVE).sort(byNewest)[0]
       || tasks.filter(task => task.status === TASK_STATES.PENDING).sort(byNewest)[0]
       || tasks.sort(byNewest)[0]
       || null;
+    if (!selected || options.followDescendants !== true) return selected;
+
+    // The visible Dispatch conversation owns the root task, while Coder/Operator descendants are
+    // owned by their immediate specialist conversations. Follow the durable lineage instead of
+    // requiring every descendant to pretend Dispatch is its direct origin. This keeps the phone
+    // on the task that is actually executing through arbitrarily deep specialist handoffs.
+    const visited = new Set();
+    while (selected && !visited.has(selected.taskId)) {
+      visited.add(selected.taskId);
+      const delegatedChildId = compactInline(selected.delegation && selected.delegation.childTaskId);
+      const children = allTasks.filter(task =>
+        compactInline(task.parentTaskId) === compactInline(selected.taskId)
+        || (delegatedChildId && compactInline(task.taskId) === delegatedChildId)
+      );
+      if (!children.length) break;
+      const child = children.filter(task => task.status === TASK_STATES.ACTIVE).sort(byNewest)[0]
+        || children.filter(task => task.status === TASK_STATES.PENDING).sort(byNewest)[0]
+        || children.sort(byNewest)[0];
+      if (!child) break;
+      selected = child;
+    }
+    return selected;
   }
 
   function pendingTaskNeedsRuntimeQueue(taskValue) {
@@ -961,10 +1109,29 @@
       || taskValue.execution && taskValue.execution.resumePolicy
       || ''
     ).toLowerCase();
+    const reasonCode = compactInline(
+      context.reasonCode
+      || taskValue.execution && taskValue.execution.reasonCode
+      || ''
+    ).toLowerCase();
     const executionMode = compactInline(context.executionMode || taskValue.executionMode).toLowerCase();
     const subStatus = compactWhitespace(context.subStatus || taskValue.subStatus || '');
     const verifying = status === TASK_STATES.ACTIVE
       && (/verif|test/.test(executionMode) || /run_tests|test|verif/i.test(subStatus));
+    const roleMode = compactInline(
+      context.roleMode
+      || taskValue.target && taskValue.target.mode
+      || ''
+    ).toLowerCase();
+    const registeredRole = SpecialistRegistry && SpecialistRegistry.get(roleMode);
+    const roleLabel = compactWhitespace(context.roleLabel || taskValue.roleLabel || '')
+      || (registeredRole && registeredRole.label)
+      || 'Specialist';
+    const operatorTask = roleMode === 'operator' || roleLabel.toLowerCase() === 'operator';
+    const operatorControlling = operatorTask
+      && (subStatus.startsWith('Operator is controlling') || subStatus.startsWith('Operator is opening'));
+    const operatorObserving = operatorTask
+      && (subStatus.startsWith('Operator is observing') || subStatus.startsWith('Operator is inspecting'));
 
     let phase = status;
     let label;
@@ -974,58 +1141,86 @@
     if (awaitingReview && (status === TASK_STATES.PENDING || status === TASK_STATES.ACTIVE)) {
       phase = 'review';
       label = 'Review';
-      detail = detail || 'Coder’s implementation plan is ready for approval.';
+      detail = detail || `${roleLabel}’s implementation plan is ready for approval.`;
       agentState = 'Review';
       badgeClass = 'warning';
     } else if (revisingPlan && (status === TASK_STATES.PENDING || status === TASK_STATES.ACTIVE)) {
       phase = 'revising-plan';
-      label = 'Coder revising plan';
-      detail = detail || 'Coder is applying your feedback and preparing a revised implementation plan.';
-      agentState = 'Coder revising';
+      label = `${roleLabel} revising plan`;
+      detail = detail || `${roleLabel} is applying your feedback and preparing a revised implementation plan.`;
+      agentState = `${roleLabel} revising`;
       badgeClass = 'success';
+    } else if (status === TASK_STATES.PENDING && reasonCode === 'awaiting_delegated_task') {
+      const childRoleMode = compactInline(taskValue.delegation && taskValue.delegation.childRole).toLowerCase();
+      const childRoleRecord = SpecialistRegistry && SpecialistRegistry.get(childRoleMode);
+      const childRole = childRoleRecord && childRoleRecord.label
+        || (childRoleMode === 'operator' ? 'Operator' : (childRoleMode === 'coder' ? 'Coder' : 'Specialist'));
+      phase = 'delegated';
+      label = `${childRole} active`;
+      detail = detail || `${roleLabel} is waiting for ${childRole} to return the delegated result.`;
+      agentState = `${childRole} active`;
+      badgeClass = childRoleMode === 'operator' ? 'operator' : 'success';
     } else if (status === TASK_STATES.PENDING && resumePolicy === 'automatic') {
       phase = 'continuing';
-      label = 'Coder continuing';
-      detail = detail || 'Coder checkpointed its progress and is starting the next pass automatically.';
-      agentState = 'Coder continuing';
+      label = `${roleLabel} continuing`;
+      detail = detail || `${roleLabel} checkpointed its progress and is starting the next pass automatically.`;
+      agentState = `${roleLabel} continuing`;
       badgeClass = 'success';
     } else if (status === TASK_STATES.PENDING) {
       phase = 'queued';
-      label = 'Coder queued';
-      detail = detail || 'Waiting for Coder to claim this task.';
-      agentState = 'Coder queued';
+      label = `${roleLabel} queued`;
+      detail = detail || `Waiting for ${roleLabel} to claim this task.`;
+      agentState = `${roleLabel} queued`;
       badgeClass = 'warning';
+    } else if (status === TASK_STATES.ACTIVE && operatorControlling) {
+      phase = 'controlling-screen';
+      label = 'Operator controlling';
+      detail = detail || 'Operator is controlling the desktop for this task.';
+      agentState = 'Operator active';
+      badgeClass = 'operator';
+    } else if (status === TASK_STATES.ACTIVE && operatorObserving) {
+      phase = 'observing-screen';
+      label = 'Operator observing';
+      detail = detail || 'Operator is inspecting the visible desktop state.';
+      agentState = 'Operator active';
+      badgeClass = 'operator';
+    } else if (status === TASK_STATES.ACTIVE && operatorTask) {
+      phase = 'operator-active';
+      label = 'Operator active';
+      detail = detail || 'Operator is working through the visible desktop task.';
+      agentState = 'Operator active';
+      badgeClass = 'operator';
     } else if (status === TASK_STATES.ACTIVE && verifying) {
       phase = 'verifying';
-      label = 'Coder verifying';
-      detail = detail || 'Coder is verifying the implementation.';
-      agentState = 'Coder verifying';
+      label = `${roleLabel} verifying`;
+      detail = detail || `${roleLabel} is verifying the implementation.`;
+      agentState = `${roleLabel} verifying`;
       badgeClass = 'success';
     } else if (status === TASK_STATES.ACTIVE && planApproved) {
       phase = 'implementing';
-      label = 'Coder implementing';
-      detail = detail || 'Coder is implementing the approved plan.';
-      agentState = 'Coder implementing';
+      label = `${roleLabel} implementing`;
+      detail = detail || `${roleLabel} is implementing the approved plan.`;
+      agentState = `${roleLabel} implementing`;
       badgeClass = 'success';
     } else if (status === TASK_STATES.ACTIVE) {
       phase = 'planning';
-      label = 'Coder planning';
-      detail = detail || 'Coder is inspecting the workspace and preparing the plan.';
-      agentState = 'Coder planning';
+      label = `${roleLabel} planning`;
+      detail = detail || `${roleLabel} is inspecting the workspace and preparing the plan.`;
+      agentState = `${roleLabel} planning`;
       badgeClass = 'success';
     } else if (status === TASK_STATES.COMPLETED) {
       label = 'Completed';
-      detail = detail || 'Coder recorded this task as completed.';
+      detail = detail || `${roleLabel} recorded this task as completed.`;
       agentState = 'Complete';
       badgeClass = 'success';
     } else if (status === TASK_STATES.CANCELLED) {
       label = 'Cancelled';
-      detail = detail || 'This Coder task was cancelled.';
+      detail = detail || `This ${roleLabel} task was cancelled.`;
       agentState = 'Cancelled';
       badgeClass = 'muted';
     } else {
       label = 'Failed';
-      detail = detail || 'Coder recorded this task as failed.';
+      detail = detail || `${roleLabel} recorded this task as failed.`;
       agentState = 'Failed';
       badgeClass = 'danger';
     }
@@ -1050,13 +1245,14 @@
       : null;
     const subStatus = compactWhitespace(input.subStatus || '');
     const executionMode = compactInline(input.executionMode || '').toLowerCase();
+    const liveRole = compactInline(input.liveRole || '').toLowerCase();
     const liveAgentState = /run_tests|test|verif/i.test(subStatus)
       ? 'Verifying'
       : (/running tool/i.test(subStatus) || executionMode === 'executing' || executionMode === 'direct'
         ? 'Acting'
         : 'Thinking');
     const agentState = conversationRunning
-      ? liveAgentState
+      ? (liveRole === 'operator' ? 'Operator active' : liveAgentState)
       : (awaitingPlanApproval
         ? 'Review'
         : (supervisedPresentation ? supervisedPresentation.agentState : 'Ready'));
@@ -1128,6 +1324,7 @@
     SCHEMA_VERSION,
     TASK_STATES,
     normalizeTransitionStatus,
+    normalizeExecutionProfile,
     isContextDependentRequest,
     isContinuationRequest,
     deriveTaskTitle: titleFromObjective,

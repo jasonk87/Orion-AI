@@ -48,11 +48,13 @@ test('phone companion finishes with the same dark theme and complete mission hie
   t.ok(companionHtml.includes('#task-list-card { grid-area: mission; }'), 'Task List has an explicit mobile layout area');
   t.ok(companionHtml.includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
   t.ok(companionHtml.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
-  t.ok(companionHtml.includes('durable-phone-auth-v23'), 'phone shell exposes the current UI build version');
-  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v22"), 'phone service worker cache is bumped for the current UI build');
+  t.ok(companionHtml.includes('responsive-phone-state-v29'), 'phone shell exposes the current UI build version');
+  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v26"), 'phone service worker cache is bumped for the current UI build');
   t.ok(companionHtml.includes('window.isSecureContext'), 'phone explains when browser push is blocked by an insecure context');
   t.ok(companionHtml.includes('Phone push needs HTTPS or localhost'), 'phone tells the user that HTTPS is required for push notifications');
   t.ok(companionHtml.includes("companionFetch('/api/push-subscribe'"), 'phone stores push subscriptions through the authenticated fetch path');
+  t.ok(companionHtml.includes('PUSH_SUBSCRIPTION_REFRESH_REQUIRED'), 'phone silently renews a provider-expired push subscription');
+  t.ok(companionHtml.includes('setupPushNotifications({ forceRefresh: true })'), 'phone reacts to server-side invalidation without re-pairing');
   t.end();
 });
 
@@ -124,15 +126,17 @@ test('phone companion renders approvals and tool calls as first-class mobile UI'
   t.end();
 });
 
-test('phone companion uses a global drawer and Coder-only operations surfaces', (t) => {
+test('phone companion uses a global drawer and specialist operations surfaces', (t) => {
   t.ok(companionHtml.includes('id="app-drawer-overlay"'), 'phone has a global app drawer');
   t.ok(companionHtml.includes('data-drawer-destination="orion"'), 'drawer exposes Dispatch as a top-level destination');
   t.notOk(companionHtml.includes('data-drawer-destination="history"'), 'History is not a top-level destination');
   t.ok(companionHtml.includes('data-drawer-destination="coder"'), 'drawer exposes Coder as a top-level destination');
+  t.ok(companionHtml.includes('data-drawer-destination="operator"'), 'drawer exposes Operator as a top-level destination');
   t.ok(companionHtml.includes('data-drawer-destination="settings"'), 'drawer exposes Settings as an app-level destination');
   t.ok(companionHtml.includes('id="screen-settings"'), 'phone has a dedicated Settings screen');
   t.ok(companionHtml.includes('Check local Orion files'), 'update controls live in Settings copy');
-  t.ok(companionHtml.includes('bottomNav.classList.toggle(\'hidden\', !isCoder)'), 'Coder operations tabs are hidden outside Coder');
+  t.ok(companionHtml.includes("const isSpecialist = mode === 'coder' || mode === 'operator';"), 'Coder and Operator share specialist operations tabs');
+  t.ok(companionHtml.includes("bottomNav.classList.toggle('hidden', !isSpecialist)"), 'specialist operations tabs are hidden in Dispatch');
   t.ok(companionHtml.includes('id="task-list-card"'), 'Status shows the task-list card');
   t.ok(companionHtml.includes('function renderPhoneTaskList'), 'Status renders the actual conversation checklist');
   t.ok(companionHtml.includes('id="home-approvals-section"'), 'Coder home has a top-level approval section');
@@ -262,8 +266,8 @@ test('Dispatch opens as a focused front door without project-driven clutter', (t
   t.ok(renderer.includes("window.markConversationDirty(orionConv.id)"), 'delegated-work completion receipts persist with their Dispatch transcript');
   t.ok(companionHtml.includes("if (resetRequested) {\n      localStorage.removeItem(sessionKey);"), 'ordinary phone UI updates preserve the paired device session');
   t.ok(companionHtml.includes('coder-workspace-picker'), 'phone keeps the Coder workspace picker');
-  t.ok(companionHtml.includes("#screen-new-chat.dispatch-mode .coder-workspace-picker { display: none; }"), 'Dispatch hides the workspace picker on new chat');
-  t.ok(companionHtml.includes("newChatPromptEl.placeholder = isDispatchStart ? 'Ask Orion anything...' : 'What should we build?'"), 'new chat placeholder is mode-aware');
+  t.ok(companionHtml.includes('#screen-new-chat.dispatch-mode .coder-workspace-picker,') && companionHtml.includes('#screen-new-chat.operator-mode .coder-workspace-picker { display: none; }'), 'Dispatch and standalone Operator hide the Coder workspace picker on new chat');
+  t.ok(companionHtml.includes("newChatPromptEl.placeholder = isDispatchStart") && companionHtml.includes("isOperatorStart ? 'Ask Operator to open, click, type, or navigate...' : 'What should we build?'"), 'new chat placeholder is mode-aware across Dispatch, Coder, and Operator');
   t.end();
 });
 
@@ -437,6 +441,22 @@ test('agent presence communicates meaningful execution phases', (t) => {
   t.ok(companionHtml.includes('resolvePhoneConversationPresentation')
       && taskOrchestration.includes("? 'Verifying'"),
     'phone uses the shared verification state language');
+  t.ok(styles.includes('data-agent-role="operator"') && styles.includes('SCREEN CONTROL'), 'desktop exposes a distinct compact screen-control banner');
+  t.ok(companionHtml.includes('operator-control') && companionHtml.includes('Screen control ·'), 'phone identifies active Operator takeover instead of generic activity');
+  t.ok(companionHtml.includes("roleLabel: supervisedTask.target && supervisedTask.target.mode === 'operator' ? 'Operator' : 'Coder'"), 'phone derives the specialist label from the durable task role');
+  t.end();
+});
+
+test('chat images open in zoomable viewers on desktop and phone', t => {
+  t.ok(html.includes('id="file-viewer-image-viewport"'), 'desktop has a scrollable full-size image viewport');
+  t.ok(html.includes('id="btn-file-viewer-zoom-in"'), 'desktop exposes explicit zoom controls');
+  t.ok(renderer.includes('wireChatImageOpeners(bubble)'), 'desktop binds rendered chat images to the viewer');
+  t.ok(renderer.includes('openChatImageViewer(image)'), 'desktop opens the selected rendered image itself');
+  t.ok(styles.includes('.file-viewer-image-viewport'), 'desktop zoomed images have a scrollable surface');
+  t.ok(companionHtml.includes('id="image-lightbox"'), 'phone has a full-screen image lightbox');
+  t.ok(companionHtml.includes("target.closest('.message-image')"), 'phone binds chat image taps through the real message container');
+  t.ok(companionHtml.includes('setImageLightboxZoom'), 'phone exposes bounded image zoom behavior');
+  t.ok(companionHtml.includes('img.sourceConversationId || defaultConversationId'), 'relayed worker images load from their actual source conversation');
   t.end();
 });
 
@@ -531,10 +551,14 @@ test('Dispatch routes cancellation and supervision by exact active task ownershi
   const cancelEnd = renderer.indexOf('\nasync function cancelPendingTasksForNewFocus', cancelStart);
   const cancelPath = renderer.slice(cancelStart, cancelEnd);
   const matchingReceiptGuard = cancelPath.indexOf('if (originConv && cancelledLaunchedTask)');
+  const reconcileStart = renderer.indexOf('function reconcileDelegatedTaskCancellation');
+  const reconcileEnd = renderer.indexOf('\n// ── Supervisor completion notification', reconcileStart);
+  const reconcilePath = renderer.slice(reconcileStart, reconcileEnd);
   t.ok(
     matchingReceiptGuard >= 0
-      && cancelPath.indexOf('originConv.lastDelegatedWork =', matchingReceiptGuard) > matchingReceiptGuard
-      && cancelPath.indexOf('originConv.launchedCoderTaskId = null', matchingReceiptGuard) > matchingReceiptGuard,
+      && cancelPath.indexOf('reconcileDelegatedTaskCancellation(originConv, result.task', matchingReceiptGuard) > matchingReceiptGuard
+      && reconcilePath.includes("if (String(orionConv.launchedCoderTaskId || '') === taskId)")
+      && reconcilePath.includes('orionConv.launchedCoderTaskId = null'),
     'cancelling pending task B cannot clear active task A pointers or receipt'
   );
   t.end();
@@ -680,7 +704,7 @@ test('Dispatch/Coder navigation is user-owned and stale background state cannot 
 
   t.ok(companionHtml.includes('pendingConversationSelectionId = taskId'), 'phone locks the requested destination before switching');
   t.ok(
-    companionHtml.includes('stateSelectionRevision < acceptedSelectionRevision'),
+    companionHtml.includes('stateSelectionRevision < acceptedConversationSelectionRevision'),
     'phone rejects a stale poll or SSE selection revision'
   );
   t.ok(
@@ -758,6 +782,15 @@ test('screenshot artifacts are previewable from the artifact panel', (t) => {
   t.ok(styles.includes('.artifact-item.previewable'), 'previewable artifacts have interaction styling');
   t.ok(styles.includes('.inline-artifact-card'), 'inline artifact cards are styled');
   t.ok(styles.includes('.file-viewer-image'), 'screenshot preview image is styled');
+  t.end();
+});
+
+test('assistant responses can render persisted screenshot references as inline chat images', (t) => {
+  const agentJsSource = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8').replace(/\r\n/g, '\n');
+  t.ok(renderer.includes('function renderAssistantResponseImages'), 'desktop chat renders assistant image attachments');
+  t.ok(renderer.includes('function hydrateAssistantResponseImages'), 'conversation-scoped references are hydrated through the safe file API');
+  t.ok(agentJsSource.includes('finalizedRunMessage.images = attachedResponseImages'), 'the agent persists response image references on its own message');
+  t.ok(styles.includes('.assistant-response-images'), 'assistant image layout is styled with the rest of the chat UI');
   t.end();
 });
 
@@ -921,8 +954,58 @@ test('Dispatch relays delegated plans and completion evidence without forcing a 
     'Dispatch no longer tells the user to switch conversations for plan review');
   t.ok(renderer.includes('const completion = summarizeCoderCompletion(durableTask, coderConv)'),
     'completion notices use the durable Coder result');
-  t.ok(renderer.includes('completion.changedFiles') && renderer.includes('completion.verification'),
-    'completion relay includes changed files and verification evidence');
+  t.ok(renderer.includes('completion.changedFiles'),
+    'completion relay names the changed files');
+  t.notOk(renderer.includes('\\n\\nVerified:\\n'),
+    'the Dispatch relay never dumps a bulleted verification list at the user');
+  t.ok(renderer.includes('verificationEvidence: completion.verification'),
+    'verification evidence is still carried on the completion message metadata');
+  t.ok(renderer.includes('images: completion.images'),
+    'screenshots attached by Coder are relayed into the supervising Dispatch completion message');
+  t.ok(renderer.includes('sourceConversationId: image.sourceConversationId || (coderConv && coderConv.id)'),
+    'relayed screenshots retain their exact source-conversation provenance');
+  t.end();
+});
+
+test('Dispatch can still answer what the finished Coder run verified', (t) => {
+  const responseStart = renderer.indexOf('async function respondOrionConversationally');
+  const responseEnd = renderer.indexOf('\nasync function handleSupervisorMessage', responseStart);
+  const responsePath = renderer.slice(responseStart, responseEnd);
+
+  t.ok(responsePath.includes('const finished = orionConv.lastDelegatedWork'),
+    'a Dispatch turn with no live task falls back to the last delegated run');
+  t.ok(responsePath.includes('Verification Coder recorded:'),
+    'the finished-run context carries the recorded verification evidence');
+  t.ok(responsePath.includes('none was recorded for this run.'),
+    'a run with no verification is stated plainly instead of being left blank');
+  t.ok(responsePath.includes('Most recent Coder run (already finished, not running)'),
+    'the finished run is labelled as finished so it cannot be reported as active');
+
+  // The live-vs-finished distinction is load-bearing: reusing the running-task wording for a
+  // completed run would make Dispatch claim a Coder task is still in flight.
+  t.ok(responsePath.includes('const concurrencyGuidance = liveCoderContext'),
+    'concurrency guidance keys off a live task, not merely the presence of coder context');
+  const guidanceStart = responsePath.indexOf('const concurrencyGuidance =');
+  const guidanceEnd = responsePath.indexOf('const systemPrompt =', guidanceStart);
+  const guidancePath = responsePath.slice(guidanceStart, guidanceEnd);
+  t.ok(guidancePath.includes('Do not say a Coder task is still running.'),
+    'the finished-run branch forbids claiming the run is still active');
+  t.ok(guidancePath.includes('never as a bulleted evidence dump'),
+    'the finished-run branch asks for prose rather than a rebuilt evidence list');
+
+  // The cached receipt is what survives launchedCoderConvId being cleared at completion.
+  const notifyStart = renderer.indexOf('async function notifySupervisorOfCoderCompletion');
+  const notifyEnd = renderer.indexOf('\nwindow.onOrchestrationTaskFinalized', notifyStart);
+  const notifyPath = renderer.slice(notifyStart, notifyEnd);
+  t.ok(notifyPath.includes('verification: completion.verification'),
+    'the durable receipt caches verification for later Dispatch questions');
+  t.ok(notifyPath.includes('changedFiles: completion.changedFiles'),
+    'the durable receipt caches the changed files alongside the verification');
+  // Guard the completed path specifically — the early-return branches clear the same field first.
+  const receiptIndex = notifyPath.indexOf('verification: completion.verification');
+  const clearAfterReceipt = notifyPath.indexOf('orionConv.launchedCoderConvId = null', receiptIndex);
+  t.ok(receiptIndex >= 0 && clearAfterReceipt > receiptIndex,
+    'the receipt is written before the live coder reference is cleared');
   t.end();
 });
 

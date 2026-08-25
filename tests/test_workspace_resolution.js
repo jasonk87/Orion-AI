@@ -87,6 +87,22 @@ test('named registered project resolves from the search root to its exact worksp
   t.end();
 });
 
+test('the most recent exact project mention wins when conversation history names multiple projects', (t) => {
+  const projects = [
+    'C:\\Users\\Owner\\Desktop\\Projects\\Self Evolving AI',
+    'C:\\Users\\Owner\\Desktop\\Projects\\This is Life'
+  ];
+  const match = workspace.findNamedProject([
+    'The current workspace is Self Evolving AI.',
+    'Let us discuss the This is Life project.',
+    'Look through This is Life and see for yourself.'
+  ].join('\n'), projects);
+
+  t.ok(match, 'a named project is resolved');
+  t.equal(match.path, projects[1], 'the latest concrete target wins instead of the longest older name');
+  t.end();
+});
+
 test('preselected exact project remains active without pretending a workspace change occurred', (t) => {
   const resolution = workspace.classifyWorkspace({
     mode: 'orion',
@@ -111,7 +127,7 @@ test('standalone Coder and unresolved Dispatch workspaces remain distinct', (t) 
   });
   const unresolved = workspace.classifyWorkspace({ mode: 'orion' });
 
-  t.equal(standalone.kind, workspace.KINDS.STANDALONE_CODER, 'identifies a standalone Coder workspace');
+  t.equal(standalone.kind, workspace.KINDS.STANDALONE_SPECIALIST, 'identifies a standalone specialist workspace');
   t.equal(standalone.projectPath, '', 'does not represent standalone work as a registered project');
   t.equal(workspace.canHandoffWorkspace(standalone).allowed, true, 'standalone Coder work remains a valid concrete target');
   t.equal(unresolved.kind, workspace.KINDS.UNRESOLVED, 'represents missing workspace information explicitly');

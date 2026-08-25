@@ -1757,6 +1757,45 @@ code {
   outline: none;
 }
 
+.assistant-response-images {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+  gap: 10px;
+  margin: 12px 0;
+}
+
+.assistant-response-image {
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid rgba(151, 164, 196, 0.18);
+  border-radius: 12px;
+  background: rgba(5, 8, 18, 0.6);
+}
+
+.assistant-response-image img {
+  display: block;
+  width: 100%;
+  max-height: 520px;
+  object-fit: contain;
+  background: #070a12;
+  cursor: zoom-in;
+}
+
+.assistant-response-image figcaption {
+  padding: 8px 10px;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.assistant-response-image.image-load-failed::after {
+  content: 'Image unavailable';
+  display: block;
+  padding: 12px;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
 .inline-artifact-icon {
   flex: 0 0 auto;
   display: grid;
@@ -1817,7 +1856,7 @@ code {
 .file-viewer-image-shell {
   height: 100%;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr) auto auto;
   gap: 10px;
   padding: 14px;
   background: #070a10;
@@ -1827,14 +1866,44 @@ code {
   display: none;
 }
 
-.file-viewer-image {
-  width: 100%;
-  height: 100%;
+.file-viewer-image-viewport {
+  min-width: 0;
   min-height: 0;
-  object-fit: contain;
+  overflow: auto;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-start;
+  background: #05070b;
   border: 1px solid rgba(151,164,196,.18);
   border-radius: 8px;
-  background: #05070b;
+}
+
+.file-viewer-image {
+  display: block;
+  flex: 0 0 auto;
+  max-width: none;
+  max-height: none;
+  cursor: zoom-in;
+}
+
+.file-viewer-image-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.file-viewer-image-controls button {
+  min-width: 42px;
+  padding: 6px 12px;
+}
+
+.file-viewer-zoom-label {
+  min-width: 52px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: .74rem;
+  text-align: center;
 }
 
 .file-viewer-image-meta {
@@ -2146,8 +2215,9 @@ code {
   color: #fecaca;
 }
 
-/* DELETE BUTTON STYLING FOR SIDEBAR ITEMS */
-.project-item .delete-btn, .conversation-item .delete-btn {
+/* DELETE/RENAME BUTTON STYLING FOR SIDEBAR ITEMS */
+.project-item .delete-btn, .conversation-item .delete-btn,
+.conversation-item .rename-btn {
   opacity: 0.62;
   transition: var(--transition-fast);
   color: var(--text-muted);
@@ -2156,13 +2226,43 @@ code {
   border-radius: 6px !important;
 }
 
-.project-item:hover .delete-btn, .conversation-item:hover .delete-btn {
+.project-item:hover .delete-btn, .conversation-item:hover .delete-btn,
+.conversation-item:hover .rename-btn {
   opacity: 0.82;
 }
 
 .project-item:hover .delete-btn:hover, .conversation-item:hover .delete-btn:hover {
   opacity: 1;
   color: var(--error-color) !important;
+}
+
+.conversation-item:hover .rename-btn:hover {
+  opacity: 1;
+  color: var(--text-primary) !important;
+}
+
+/* Sidebar conversation search - a plain text filter above each conversation list */
+.conversation-search-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  margin: 2px 0 4px;
+  font-size: 0.78rem;
+  font-family: var(--font-sans);
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+
+.conversation-search-input::placeholder {
+  color: var(--text-muted);
+}
+
+.conversation-search-input:focus {
+  outline: none;
+  border-color: var(--accent-color);
 }
 
 /* Ghost icon button used for sidebar row actions (delete, add-conversation) */
@@ -2635,6 +2735,29 @@ code {
   display: flex;
 }
 
+.coder-task-status-card[data-agent-role="operator"] {
+  background: rgba(109, 40, 217, 0.09);
+  border-color: rgba(139, 92, 246, 0.34);
+  animation-name: operator-status-border-pulse;
+}
+
+.coder-task-status-card[data-agent-role="operator"] .coder-status-dot {
+  background: #a78bfa;
+}
+
+.coder-task-status-card[data-agent-role="operator"] .coder-status-label::before {
+  content: "SCREEN CONTROL";
+  display: inline-flex;
+  margin-right: 7px;
+  padding: 2px 6px;
+  border: 1px solid rgba(139, 92, 246, 0.38);
+  border-radius: 999px;
+  color: #c4b5fd;
+  font-size: 0.61rem;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+}
+
 .coder-status-spinner {
   display: flex;
   gap: 3px;
@@ -2660,6 +2783,11 @@ code {
 @keyframes coder-status-border-pulse {
   0% { border-color: rgba(16, 185, 129, 0.14); box-shadow: none; }
   100% { border-color: rgba(16, 185, 129, 0.36); box-shadow: 0 0 10px rgba(16, 185, 129, 0.08); }
+}
+
+@keyframes operator-status-border-pulse {
+  0% { border-color: rgba(139, 92, 246, 0.22); box-shadow: none; }
+  100% { border-color: rgba(139, 92, 246, 0.48); box-shadow: 0 0 12px rgba(109, 40, 217, 0.12); }
 }
 
 .coder-status-body {
@@ -3618,6 +3746,15 @@ body[data-mode="orion"] .messages-container {
 .model-select-wrapper select:focus {
   border-color: rgba(130, 115, 244, 0.4);
   outline: none;
+}
+
+/* ── Reasoning level selector ────────────────────────── */
+/* Sits beside the model select and shares its ghost style. Auto stays muted like the
+   model select; a forced level is tinted so a pinned Ultra is never an invisible cost. */
+.reasoning-select-wrapper select.reasoning-forced {
+  color: #8273f4;
+  border-color: rgba(130, 115, 244, 0.28);
+  background: rgba(130, 115, 244, 0.07);
 }
 
 /* ── Send button — slightly larger ───────────────────── */

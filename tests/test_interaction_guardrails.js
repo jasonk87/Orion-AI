@@ -1,11 +1,19 @@
+process.env.NODE_ENV = 'test';
+
 const test = require('tape');
 const fs = require('fs');
 const path = require('path');
 
-const rendererJs = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8');
-const agentJs = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
-const preloadJs = fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8');
-const semanticSearchJs = fs.readFileSync(path.join(__dirname, '../lib/semantic-search.js'), 'utf8');
+// Normalized to LF like every other test file that grep-matches these sources (see
+// test_ui_polish.js, test_renderer_behavior.js, test_phone_companion.js): this checkout has
+// agent.js checked out with CRLF line endings, and a handful of assertions below match
+// multi-line literals containing a bare '\n'. Without normalizing, those never match on Windows
+// even though the source they're checking is unchanged.
+const rendererJs = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8').replace(/\r\n/g, '\n');
+const agentJs = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8').replace(/\r\n/g, '\n');
+const preloadJs = fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8').replace(/\r\n/g, '\n');
+const semanticSearchJs = fs.readFileSync(path.join(__dirname, '../lib/semantic-search.js'), 'utf8').replace(/\r\n/g, '\n');
+const orionOperatingContractJs = fs.readFileSync(path.join(__dirname, '../orion-operating-contract.js'), 'utf8').replace(/\r\n/g, '\n');
 const SemanticIntentRouter = require('../semantic-intent-router.js');
 global.window = {};
 global.fetch = async () => ({ ok: false });
@@ -34,17 +42,20 @@ test('queued prompt cards can steer or run next after submission', (t) => {
   t.end();
 });
 
-test('chat scrolling only sticks when the user is already near the bottom', (t) => {
+// Auto-scroll behavior itself is executed against a real DOM in test_renderer_behavior.js.
+// What remains here is the one property that is structural rather than observable: the raw
+// scroll assignment must live in exactly one helper, so no call site can bypass the
+// sticky-bottom gate and yank the view down while the user is reading earlier output.
+test('the raw chat scroll assignment stays isolated to its helper', (t) => {
   const directScrollAssignments = rendererJs.match(/el\.chatFeed\.scrollTop = el\.chatFeed\.scrollHeight/g) || [];
   t.equal(directScrollAssignments.length, 1, 'direct chat scroll assignment is isolated to the helper');
-  t.ok(rendererJs.includes('function shouldAutoScrollChat'), 'renderer can detect whether the chat is near the bottom');
-  t.ok(rendererJs.includes('CHAT_BOTTOM_THRESHOLD_PX'), 'auto-scroll has a small bottom threshold');
   t.ok(rendererJs.includes('scrollChatToBottomIfNeeded(stickToBottom)'), 'message renderers respect the sticky-bottom gate');
   t.end();
 });
 
+// isEmptyThinkingPlaceholder's own logic is executed in test_renderer_behavior.js; these
+// assertions cover the call sites that wire it into the render paths.
 test('empty Thinking placeholders are not rendered as extra chat bubbles', (t) => {
-  t.ok(rendererJs.includes('function isEmptyThinkingPlaceholder'), 'history replay can identify empty Thinking placeholders');
   t.ok(rendererJs.includes('if (isEmptyThinkingPlaceholder(replayMsg.text, replayLogs)) return;'), 'history replay skips empty Thinking placeholders after normalization');
   t.ok(rendererJs.includes('if (!activeAiBubble && isThinkingPlaceholder && !hasLogs)'), 'live rendering suppresses empty Thinking bubbles');
   t.ok(rendererJs.includes("const displayText = isThinkingPlaceholder ? ''"), 'Thinking placeholder text is hidden when logs/status are rendered');
@@ -64,15 +75,13 @@ test('completed assistant responses are flushed for background phone conversatio
   t.end();
 });
 
+// The renderer half of replay normalization — role mapping, text recovery across every
+// historical stored shape, and log rebuilding from legacy turns — is executed against real
+// message objects in test_renderer_behavior.js. What stays here is the wiring into the
+// reload/preview call sites and the agent.js side, which that harness does not load.
 test('conversation reload normalizes stored assistant message shapes', (t) => {
-  t.ok(rendererJs.includes('function normalizeConversationMessageForReplay'), 'renderer normalizes stored messages before replay');
-  t.ok(rendererJs.includes("role === 'assistant' || role === 'model' || role === 'ai' || role === 'orion'"), 'model/AI/orion roles replay as assistant answers');
-  t.ok(rendererJs.includes('const directFields = [msg.text, msg.content, msg.output, msg.result, msg.message]'), 'replay reads assistant text from common stored fields');
-  t.ok(rendererJs.includes('const arrayFields = [msg.parts, msg.content]'), 'replay reads Gemini/OpenAI-style message parts');
   t.ok(rendererJs.includes('renderAiMessage(replayMsg.text, replayLogs, activeConversationId, replayMsg)'), 'bulk reload renders normalized assistant text and metadata');
   t.ok(rendererJs.includes("map(normalizeConversationMessageForReplay).find(msg => msg.role === 'assistant')"), 'phone preview finds normalized assistant messages');
-  t.ok(rendererJs.includes('function extractConversationMessageLogs'), 'replay rebuilds logs when old messages only stored turns');
-  t.ok(rendererJs.includes('turn.toolResponseParts'), 'replay reads saved tool responses from old turns');
   t.ok(rendererJs.includes('responseLooksFailed'), 'replay preserves error status from saved tool responses');
   t.ok(agentJs.includes('function persistCurrentAgentLogs'), 'agent has a single persistence helper for live logs');
   t.ok(agentJs.includes('persistCurrentAgentLogs({ render: true });'), 'agent persists tool logs while rendering live activity');
@@ -101,7 +110,7 @@ test('accepted prompts cannot leave one-sided user-only transcripts', (t) => {
   t.ok(rendererJs.includes('window.persistAssistantStatusMessage = persistAssistantStatusMessage'), 'agent can persist assistant status through renderer');
   t.ok(agentJs.includes('agent-start-blocked'), 'runAgentLoop persists an assistant-side status when another task is already running');
   t.ok(rendererJs.includes('phone-queued-'), 'phone queued prompts persist an assistant-side queue status');
-  t.ok(rendererJs.includes('phone-start-error-'), 'phone run-start failures persist an assistant-side error status');
+  t.ok(rendererJs.includes('phone-run-error-'), 'phone-started run failures persist an assistant-side error status without mislabeling late failures as startup failures');
   t.ok(rendererJs.includes('function buildMissingAssistantResponseMessage'), 'reload path can recover old user-only transcripts');
   t.ok(rendererJs.includes('hasMeaningfulAssistantAfterUser'), 'reload recovery requires a meaningful assistant answer');
   t.ok(rendererJs.includes('!isEmptyThinkingPlaceholder(msg.text, logs)'), 'stale Thinking placeholders do not count as assistant answers');
@@ -193,7 +202,12 @@ test('repeated failure guard warns on second failure and pauses on third', (t) =
 });
 
 test('tool contract separates failed tools from task truth', (t) => {
-  t.ok(agentJs.includes('A failed tool path is evidence about that tool attempt, not proof'), 'system prompt separates tool failure from task truth');
+  // Phase 3 of the Operator architecture plan promoted this rule (Coder's old "7A." text) into
+  // orion-operating-contract.js's ADAPT_INSTEAD_OF_QUITTING fragment, which agent.js now
+  // interpolates rather than containing verbatim — see test_prompt_layering.js for the assembled-
+  // prompt-level guard. This checks the fragment's actual source instead of the (now-templated)
+  // spot in agent.js.
+  t.ok(orionOperatingContractJs.includes('A failed attempt is evidence about that specific approach, not proof'), 'system prompt separates tool failure from task truth');
   t.ok(agentJs.includes("Do not use web search to answer facts about the user's local machine"), 'system prompt blocks local-machine web fallback');
   t.ok(agentJs.includes('For local machine facts, a non-zero exit proves only that this command attempt failed'), 'run_command schema warns against overclaiming failed commands');
   t.ok(agentJs.includes('Do not use for facts about this local machine'), 'google_search schema blocks local-state usage');
@@ -571,6 +585,16 @@ test('local inspection enforcement consumes structured intent instead of respons
       oneFileReview
     ).includes('not inspected enough'),
     'review-only gate rejects one-file generic potential-areas reviews'
+  );
+  t.equal(
+    agent.buildReviewOnlyCompletionGatePrompt(
+      'What does this command parsing function do, and is there a problem with it?',
+      'In `ai_assistant/communication/cli.py:42`, the parser splits the command on whitespace. That makes quoted Windows paths unsafe because a path containing spaces is divided into separate arguments.',
+      oneFileReview,
+      { inspectionBreadth: 'single_file' }
+    ),
+    '',
+    'a grounded one-file inspection remains lightweight instead of being forced into a broad review'
   );
   const broadReview = [
     { toolName: 'list_files', label: 'Listed workspace files', status: 'done' },
@@ -1005,14 +1029,27 @@ test('Dispatch uses Projects fallback while Coder standalone conversations get i
   t.ok(rendererJs.includes("!c.projectPath && c.mode !== 'orion' && c.mode !== 'coder'"), 'legacy coder backfill does not overwrite explicit Dispatch/Coder modes');
   t.ok(rendererJs.includes("if (c.mode === 'orion' && c.projectPath)"), 'migration clears accidental project linkage from explicit Dispatch conversations');
   t.ok(rendererJs.includes("c.mode === 'orion' && c.workspace && isGeneratedStandaloneWorkspace(c.workspace)"), 'migration clears generated standalone workspaces from Dispatch conversations');
-  t.ok(rendererJs.includes("return mode === 'orion' || !c.projectPath;"), 'Dispatch list keeps Dispatch conversations even when they inspected a project workspace');
+  // Item 10 of the Operator architecture plan: this became "mode !== 'coder'" instead of
+  // "mode === 'orion'" so the same project-path exclusion that already applied to Coder's list
+  // also applies to the new Operator list, without special-casing a third mode name here.
+  t.ok(rendererJs.includes("return mode !== 'coder' || !c.projectPath;"), 'Dispatch and Operator lists keep their conversations even when they inspected a project workspace; only Coder filters standalone-vs-project');
   t.ok(rendererJs.includes('c.projectPath && isGeneratedStandaloneWorkspace(c.workspace)'), 'migration clears accidental project linkage from generated standalone workspaces');
-  t.ok(rendererJs.includes("conversationMode(c) === 'coder' && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)"), 'migration never promotes generated standalone workspaces or Dispatch conversations into projects');
-  t.ok(agentJs.includes("if (conversation.mode === 'coder')") && agentJs.includes('conversation.projectPath = targetPath'), 'change_workspace only promotes Coder conversations into project scope');
+  // Phase 3 of the Operator architecture plan: operator conversations get this same auto-bind
+  // treatment as Coder now (both do real workspace-bound artifact work), so the condition gained
+  // an explicit operator clause alongside coder.
+  t.ok(rendererJs.includes("(conversationMode(c) === 'coder' || conversationMode(c) === 'operator') && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)"), 'migration never promotes generated standalone workspaces or Dispatch conversations into projects, and now treats operator the same as coder');
+  // Phase 3 of the Operator architecture plan: Operator does real workspace-bound artifact work
+  // like Coder, so change_workspace promotes both into project scope now, not Coder alone. Dispatch
+  // still takes the separate known-projects branch below, unaffected by this change.
+  t.ok(agentJs.includes("if (conversation.mode === 'coder' || conversation.mode === 'operator')") && agentJs.includes('conversation.projectPath = targetPath'), 'change_workspace promotes Coder and Operator conversations into project scope');
   t.ok(rendererJs.includes('function addProjectPath'), 'project registration is centralized instead of mixed into every workspace change');
   t.ok(rendererJs.includes('if (promoteProjectForWorkspace) addProjectPath(folderPath)'), 'Dispatch workspace changes do not add folders to the Coder project list unless explicitly promoted');
   t.ok(rendererJs.includes('window.promoteWorkspaceToCoder'), 'renderer exposes an explicit Dispatch-to-Coder promotion path');
-  t.ok(rendererJs.includes("source: 'dispatch-handoff'"), 'Dispatch handoffs queue Coder prompts with a distinct source');
+  t.ok(
+    rendererJs.includes("const coderTaskSource = specialistDelegation ? 'specialist-coder-handoff' : 'dispatch-handoff'")
+      && rendererJs.includes('source: coderTaskSource'),
+    'Dispatch and specialist handoffs queue Coder prompts with distinct durable sources'
+  );
   t.ok(rendererJs.includes('assignContextPackets') && rendererJs.includes('conv.inheritedContext'), 'Dispatch assigns validated packet IDs to the new Coder conversation');
   t.ok(agentJs.includes("'handoff_to_coder'"), 'Dispatch allowlist includes the explicit Coder handoff tool');
   t.ok(agentJs.includes('change_workspace alone must not add folders to Coder'), 'handoff tool declaration teaches the model that workspace inspection is not project promotion');
@@ -1056,7 +1093,8 @@ test('Dispatch execution authority comes from structured intent, not request/ref
   t.ok(/identify the intended local target/i.test(prompt), 'the Coder prompt resolves ambiguous process identity safely');
   t.ok(/verify the result/i.test(prompt), 'the Coder prompt requires outcome verification');
   t.ok(agentJs.includes('MUST call handoff_to_coder'), 'Dispatch system instructions state the permission-boundary invariant');
-  t.ok(agentJs.includes('synthesize the allowed Coder'), 'the invariant is enforced in code, not only prose');
+  t.ok(agentJs.includes('handoffToolForRole(handoffRole)') && agentJs.includes('synthesize the allowed specialist'),
+    'the invariant is enforced through the role-aware handoff path, not only prose');
   t.ok(agentJs.includes('semanticIntent.requiresExecution === true'), 'the runtime consumes structured execution authority');
   t.notOk(agentJs.includes('instructionAnalysis.requiresCoderExecution'), 'the old phrase-analysis execution property is gone');
   t.end();
@@ -1101,8 +1139,23 @@ test('Dispatch semantic routing retains terminal task context for retry approval
 test('token-saving prompt cleanup keeps tool schemas authoritative', (t) => {
   t.notOk(agentJs.includes('\nTools available:'), 'system prompts do not duplicate the formal tool schemas as prose lists');
   t.ok(agentJs.includes('TOOL USE:'), 'system prompts keep compact tool-use guidance');
-  t.ok(agentJs.includes("if (activeConversationMode === 'orion')"), 'tool builder branches for Dispatch conversations');
-  t.ok(agentJs.includes('allTools.filter(tool => DISPATCH_TOOL_ALLOWLIST.has(tool.name))'), 'Dispatch receives only allowlisted tool declarations');
+  // Verified by running the builder rather than grepping for its implementation: this assertion
+  // previously pinned the exact filter expression and broke when gate-filtering was added ahead
+  // of the allowlist, even though the behavior it cared about was unchanged.
+  const namesForMode = (mode) => {
+    agent.__setActiveConversationModeForTest(mode);
+    const names = agent.buildAgentToolDeclarations().map(tool => tool.name);
+    agent.__setActiveConversationModeForTest('orion');
+    return names;
+  };
+  const dispatchTools = namesForMode('orion');
+  const coderTools = namesForMode('coder');
+  t.ok(dispatchTools.length > 0 && dispatchTools.length < coderTools.length,
+    'Dispatch receives a strictly narrower tool surface than Coder');
+  t.ok(dispatchTools.every(name => coderTools.includes(name)),
+    'Dispatch is offered only tools that exist in the full surface');
+  t.notOk(dispatchTools.includes('patch_file'), 'Dispatch is not offered direct file editing');
+  t.ok(dispatchTools.includes('handoff_to_coder'), 'Dispatch keeps the handoff tool it exists to use');
   t.ok(agentJs.includes("'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model'"), 'Dispatch can inspect existing project artwork through read-only visual tools');
   t.ok(agentJs.includes('conversation._systemFactsSignature'), 'stable system facts are tracked by conversation signature');
   t.ok(agentJs.includes('[ORION SYSTEM FACTS - compact]'), 'unchanged system facts use a compact repeat block');
@@ -1110,6 +1163,168 @@ test('token-saving prompt cleanup keeps tool schemas authoritative', (t) => {
   t.notOk(agentJs.includes('buildToolUseContractPrompt()'), 'the redundant per-turn tool contract is no longer injected');
   t.ok(agentJs.includes('const TOOL_RESULT_TRIM_THRESHOLD_CHARS = 1500') && agentJs.includes('const TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES = 3'), 'older read-only tool payloads are compacted aggressively');
   t.ok(agentJs.includes('msgs.slice(-10)') && agentJs.includes("substring(0, 300)"), 'background memory extraction uses a bounded transcript');
+  t.end();
+});
+
+// Phase 3 piece 4 of the Operator architecture plan: before this piece landed, activeConversationMode
+// could already become 'operator' (piece 2b), but buildAgentToolDeclarations had no 'operator' branch,
+// so it fell through to the bare `return gatedTools;` — the exact same FULL Coder tool surface,
+// including patch_file and every operational-context mission tool. This test would have failed
+// against that pre-piece-4 code (patch_file would have been present) and pins the fix.
+test('Operator receives a narrower, desktop/browser-execution tool surface, not Coder\'s full surface', (t) => {
+  const namesForMode = (mode) => {
+    agent.__setActiveConversationModeForTest(mode);
+    const names = agent.buildAgentToolDeclarations().map(tool => tool.name);
+    agent.__setActiveConversationModeForTest('orion');
+    return names;
+  };
+  const coderTools = namesForMode('coder');
+  const operatorTools = namesForMode('operator');
+
+  t.ok(operatorTools.length > 0 && operatorTools.length < coderTools.length,
+    'Operator receives a strictly narrower tool surface than Coder');
+  const operatorOnlyTools = new Set(['open_application', 'click_ui_element', 'open_chrome_favorite']);
+  t.ok(operatorTools.every(name => coderTools.includes(name) || operatorOnlyTools.has(name)),
+    'Operator tools come from the shared surface except for bounded role-specific desktop controls');
+
+  // Not code/mission/skill tools, per the brief.
+  t.notOk(operatorTools.includes('patch_file'), 'Operator cannot edit source files');
+  t.notOk(operatorTools.includes('write_file'), 'Operator cannot write source files');
+  t.notOk(operatorTools.includes('read_file'), 'Operator is not offered code-reading tools');
+  t.notOk(operatorTools.includes('find_references'), 'Operator is not offered code-navigation tools');
+  t.notOk(operatorTools.includes('run_tests'), 'Operator has no test runner - there is no code to test');
+  t.notOk(operatorTools.includes('update_mission_context'), 'Operator is not offered mission tracking');
+  t.notOk(operatorTools.includes('start_subplan'), 'Operator is not offered subplan tracking');
+  t.notOk(operatorTools.includes('discover_skills'), 'Operator is not offered the skill registry');
+  t.notOk(operatorTools.includes('create_skill'), 'Operator cannot author skills');
+  t.notOk(operatorTools.includes('step_complete'), 'Operator does not get Coder\'s test-coupled step-completion tool');
+
+  // The categories the brief did name.
+  t.ok(operatorTools.includes('computer_action'), 'Operator has native desktop control');
+  t.ok(operatorTools.includes('open_application'), 'Operator has a bounded screen-first app opener');
+  t.ok(operatorTools.includes('click_ui_element'), 'Operator can activate accessible controls by stable label');
+  t.ok(operatorTools.includes('open_chrome_favorite'), 'Operator can resolve saved Chrome favorites without pixel guessing');
+  t.notOk(coderTools.includes('open_application'), 'Coder does not receive the Operator-only app opener');
+  t.notOk(coderTools.includes('click_ui_element'), 'Coder does not receive Operator-only accessibility control');
+  t.notOk(coderTools.includes('open_chrome_favorite'), 'Coder does not receive Operator-only Chrome profile control');
+  for (const browserTool of ['open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back', 'download_from_page', 'wait_for_page', 'take_screenshot']) {
+    t.ok(operatorTools.includes(browserTool), `Operator has the full browser-worker tool: ${browserTool}`);
+  }
+  for (const processTool of ['run_command', 'start_command', 'get_command_status', 'read_command_output', 'kill_command', 'terminal_exec']) {
+    t.ok(operatorTools.includes(processTool), `Operator has the process-management tool: ${processTool}`);
+  }
+  for (const inspectionTool of ['capture_screen', 'inspect_screenshot', 'compare_screenshot_to_goal', 'inspect_screenshot_with_model', 'attach_image']) {
+    t.ok(operatorTools.includes(inspectionTool), `Operator has the screenshot/inspection tool: ${inspectionTool}`);
+  }
+  for (const memoryTool of ['schedule_followup', 'watch_condition', 'recall_memory', 'remember_fact', 'remember_decision', 'remember_preference']) {
+    t.ok(operatorTools.includes(memoryTool), `Operator has the memory/scheduling tool: ${memoryTool}`);
+  }
+  t.ok(operatorTools.includes('set_task_checklist'), 'Operator has its own task-status tool');
+  t.end();
+});
+
+test('Dispatch can hand work to Operator through its own dedicated tool, distinct from handoff_to_coder', (t) => {
+  // Phase 3 piece 5: handoff_to_operator is a sibling tool to handoff_to_coder, not a generalized
+  // replacement for it - Dispatch chooses explicitly between the two.
+  t.ok(agentJs.includes("'handoff_to_operator'"), 'Dispatch allowlist includes the explicit Operator handoff tool');
+  t.ok(agentJs.includes('name: "handoff_to_operator"'), 'the model is actually offered a handoff_to_operator tool declaration');
+  t.ok(agentJs.includes("case 'handoff_to_operator'"), 'the executor implements handoff_to_operator as its own case, not by aliasing handoff_to_coder');
+  t.ok(agentJs.includes('change_workspace alone must not add folders to Operator'), 'Operator handoff tool declaration teaches the model that workspace inspection is not project promotion, mirroring the Coder tool');
+  t.ok(agentJs.includes('window.promoteWorkspaceToOperator'), 'handoff_to_operator executes through its own renderer promotion API, not Coder\'s');
+
+  agent.__setActiveConversationModeForTest('orion');
+  const dispatchTools = agent.buildAgentToolDeclarations().map(tool => tool.name);
+  agent.__setActiveConversationModeForTest('orion');
+  t.ok(dispatchTools.includes('handoff_to_operator'), 'Dispatch is actually offered handoff_to_operator, not just declared in source');
+  t.ok(dispatchTools.includes('handoff_to_coder'), 'Dispatch keeps handoff_to_coder alongside the new tool');
+
+  // Registry: AGENT_HANDOFF_IMPLEMENTATIONS grew a real second entry rather than a stub.
+  t.ok(agentJs.includes('operator: {') && agentJs.includes("promote: (payload) => window.promoteWorkspaceToOperator(payload)"),
+    'AGENT_HANDOFF_IMPLEMENTATIONS registers a real Operator promote implementation');
+  t.ok(agentJs.includes('startMonitor: (dispatchConvId, targetConvId, taskId) => window.startOperatorTaskMonitor(dispatchConvId, targetConvId, taskId)'),
+    'AGENT_HANDOFF_IMPLEMENTATIONS registers a real Operator monitor implementation');
+
+  // Field reuse: Operator handoffs are tracked through the same launchedCoder* field names as
+  // Coder (by design - see the comment on both handoff cases), distinguished by launchedTaskRole.
+  t.ok(agentJs.includes("conversation.launchedTaskRole = handoffRole") , 'the Operator handoff case records its role the same way the Coder handoff case does');
+
+  // Routing prose: Dispatch's own prompt actually tells it when to prefer Operator over Coder.
+  t.ok(agentJs.includes('Route to the operator'), 'DISPATCHER_INSTRUCTION explains when to route to Operator instead of Coder');
+  t.ok(agentJs.includes('MUST call handoff_to_coder or handoff_to_operator'), 'the permission-boundary invariant now names both specialists');
+
+  // Renderer: the promotion + monitor + notification trio actually exist, not just referenced.
+  t.ok(rendererJs.includes('window.promoteWorkspaceToOperator = async function'), 'renderer implements the Operator promotion entry point');
+  t.ok(rendererJs.includes('window.startOperatorTaskMonitor = function'), 'renderer implements the Operator task monitor');
+  t.ok(rendererJs.includes('function stopOperatorTaskMonitor'), 'renderer implements a matching Operator monitor stop function');
+  t.ok(rendererJs.includes('async function notifySupervisorOfOperatorCompletion'), 'renderer implements an Operator-phrased completion notifier, not a reuse of the Coder-phrased one');
+  t.ok(rendererJs.includes('function createOperatorConversationForProject'), 'renderer implements an Operator-specific project conversation constructor');
+  t.ok(rendererJs.includes('function createStandaloneOperatorConversation'), 'renderer implements an Operator-specific standalone conversation constructor');
+
+  // The finalization hook is role-aware instead of always assuming Coder.
+  t.ok(rendererJs.includes("conversationMode(targetConv) === 'operator'") && rendererJs.includes('notifySupervisorOfOperatorCompletion(targetConversationId, taskId)'),
+    'window.onOrchestrationTaskFinalized routes Operator task completions to the Operator notifier, not the Coder one');
+
+  // Display name registry (piece 6).
+  t.ok(rendererJs.includes("operator: 'Operator'"), 'AGENT_ROLE_DISPLAY_NAMES includes a display name for the operator role');
+
+  t.end();
+});
+
+test('Dispatch can see and actually invoke the durable scheduling tools its own prompt tells it to use', async (t) => {
+  // Declaration: Dispatch's own system prompt says "if you promise to check later, you MUST use
+  // schedule_followup; schedules are durable." That instruction was a lie until these two tools
+  // were on the allowlist below — the model literally never received their schemas in Dispatch mode.
+  agent.__setActiveConversationModeForTest('orion');
+  const dispatchTools = agent.buildAgentToolDeclarations().map(tool => tool.name);
+  agent.__setActiveConversationModeForTest('orion');
+  t.ok(dispatchTools.includes('schedule_followup'), 'Dispatch is offered schedule_followup');
+  t.ok(dispatchTools.includes('watch_condition'), 'Dispatch is offered watch_condition');
+
+  // Invocation: seeing the tool is not the same as being able to use it. Actually run both
+  // executors as Dispatch and confirm a durable schedule comes back, the way runAgentLoop would
+  // derive activeConversationMode from conversation.mode === 'orion' for a real Dispatch turn.
+  const oldApi = global.window.api;
+  const oldActiveConversationId = global.activeConversationId;
+  let createScheduleCalls = [];
+  global.window.api = {
+    createSchedule: async (input) => {
+      createScheduleCalls.push(input);
+      return {
+        success: true,
+        schedule: { scheduleId: `sched_${createScheduleCalls.length}`, dueAt: Date.now() + 60000, calendar: null }
+      };
+    }
+  };
+  global.activeConversationId = 'conv_dispatch_1';
+  try {
+    const followupResult = await agent.executeTool(
+      'schedule_followup',
+      { prompt: 'check the deploy status', delaySeconds: 60, purpose: 'deploy-check' },
+      'C:\\workspace',
+      {},
+      { id: 'conv_dispatch_1', mode: 'orion' },
+      {}
+    );
+    t.ok(followupResult && followupResult.success, 'Dispatch can invoke schedule_followup and get a real result, not a missing-tool error');
+    t.ok(followupResult.durable, 'the result confirms the follow-up survives restarts, matching what Dispatch is told to promise the user');
+
+    const watchResult = await agent.executeTool(
+      'watch_condition',
+      { type: 'file', path: 'C:\\workspace\\build.log', prompt: 'The build log changed.', purpose: 'build-log' },
+      'C:\\workspace',
+      {},
+      { id: 'conv_dispatch_1', mode: 'orion' },
+      {}
+    );
+    t.ok(watchResult && watchResult.success, 'Dispatch can invoke watch_condition and get a real result, not a missing-tool error');
+    t.equal(createScheduleCalls.length, 2, 'both calls actually reached the durable schedule store');
+    t.ok(createScheduleCalls.every(call => call.conversationId === 'conv_dispatch_1'),
+      'both schedules are attached to the calling Dispatch conversation, so they fire back into it specifically');
+  } finally {
+    global.window.api = oldApi;
+    global.activeConversationId = oldActiveConversationId;
+    agent.__setActiveConversationModeForTest('orion');
+  }
   t.end();
 });
 
@@ -1175,6 +1390,16 @@ test('post-final cleanup gates and repeated completion blocks cannot consume use
     fileMutationCount: 2,
     previousFileMutationCount: 1
   }), false, 'new file mutations reset the repeated-block escape');
+  t.equal(agent.getUserFacingWorkRevision([
+    { toolName: 'read_file', status: 'done' },
+    { toolName: 'record_adversarial_review', status: 'done' },
+    { toolName: 'append_project_memory', status: 'done' }
+  ]), 1, 'gate bookkeeping does not masquerade as new user-facing work');
+  t.equal(agent.getUserFacingWorkRevision([
+    { toolName: 'read_file', status: 'done' },
+    { toolName: 'record_adversarial_review', status: 'done' },
+    { toolName: 'run_tests', status: 'error' }
+  ]), 2, 'a real verification step permits a later answer to supersede the pre-gate draft');
   t.end();
 });
 
@@ -1268,5 +1493,43 @@ test('checklist updates allow marking a milestone in-progress but block repeated
     { title: 'Add regression test', status: 'pending' },
   ]);
   t.equal(revised.allowed, true, 'task list revisions are allowed');
+  t.end();
+});
+
+test('completion-gate narration cannot become the final answer or the durable task summary', (t) => {
+  const rememberStart = agentJs.indexOf('function rememberBestVisibleAnswer(');
+  const rememberEnd = agentJs.indexOf('function useBestVisibleAnswerIfGateEcho(', rememberStart);
+  const rememberPath = agentJs.slice(rememberStart, rememberEnd);
+  t.ok(rememberPath.includes('isCompletionGateNarration(text)) return'),
+    'gate narration is never remembered as the best visible answer');
+
+  t.ok(agentJs.includes('|| (OrchestrationContracts && OrchestrationContracts.isCompletionGateNarration(lastTextResponse))'),
+    'a gate-narration final response is replaced by the substantive answer before finalize');
+  const substitutionIndex = agentJs.indexOf('isCompletionGateNarration(lastTextResponse)');
+  const finalizeIndex = agentJs.indexOf('await window.finalizeOrchestrationTask(runTaskId', substitutionIndex);
+  t.ok(substitutionIndex > 0 && finalizeIndex > substitutionIndex,
+    'the substitution happens before the durable result.summary is recorded');
+  t.end();
+});
+
+test('a user-picked reasoning level is forced through every policy selection in the run', (t) => {
+  t.ok(agentJs.includes('const forcedReasoningEffort = (ReasoningPolicy && config)'),
+    'the run reads the picked level from appConfig once at startup');
+  t.ok(agentJs.includes("normalized === 'auto' ? '' : normalized"),
+    "auto resolves to no override so the phase engine stays in charge");
+  // The override governs the reasoning behind the USER'S answer — the three policy selections
+  // the answer path makes (turn, run, and per-phase). It deliberately does NOT reach internal
+  // machinery: intent classification, conversation-title generation, and the provider-level
+  // fallback defaults. Forcing Ultra onto a title generation would bill the user for depth
+  // they never asked for, on a call they never see.
+  const answerPathBindings = ['turnReasoningPolicy', 'runReasoningPolicy', 'phaseReasoningPolicy'];
+  answerPathBindings.forEach(binding => {
+    const start = agentJs.indexOf(`const ${binding} = ReasoningPolicy`);
+    const selection = agentJs.slice(start, agentJs.indexOf('})', start));
+    t.ok(start > 0 && selection.includes('forcedEffort: forcedReasoningEffort'),
+      `${binding} forwards the user-picked level`);
+  });
+  t.equal((agentJs.match(/forcedEffort: forcedReasoningEffort/g) || []).length, answerPathBindings.length,
+    'only the answer path is overridden — utility and fallback selections stay automatic');
   t.end();
 });

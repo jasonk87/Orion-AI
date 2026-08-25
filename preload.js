@@ -5,6 +5,8 @@ contextBridge.exposeInMainWorld('api', {
   closeWindow: () => ipcRenderer.send('window-close'),
   minimizeWindow: () => ipcRenderer.send('window-minimize'),
   maximizeWindow: () => ipcRenderer.send('window-maximize'),
+  beginOperatorControl: (payload = {}) => ipcRenderer.invoke('orion:operator-control-begin', payload),
+  endOperatorControl: (payload = {}) => ipcRenderer.invoke('orion:operator-control-end', payload),
   
   // Workspace Actions
   selectWorkspace: () => ipcRenderer.invoke('select-workspace'),
@@ -52,7 +54,11 @@ contextBridge.exposeInMainWorld('api', {
   getPhoneCompanionDevices: () => ipcRenderer.invoke('get-phone-companion-devices'),
   revokePhoneCompanionDevice: (deviceId) => ipcRenderer.invoke('revoke-phone-companion-device', deviceId),
   revokeAllPhoneCompanionDevices: () => ipcRenderer.invoke('revoke-all-phone-companion-devices'),
-  notifyPhone: (title, body) => ipcRenderer.invoke('notify-phone', { title, body }),
+  notifyPhone: (title, body, context = {}) => ipcRenderer.invoke('notify-phone', {
+    title,
+    body,
+    conversationId: String(context && context.conversationId || '')
+  }),
   syncPhoneCompanion: () => ipcRenderer.send('orion:phone-companion-sync'),
   browserOpenUrl: (url) => ipcRenderer.invoke('browser-open-url', { url }),
   browserSearchWeb: (query) => ipcRenderer.invoke('browser-search-web', { query }),
@@ -64,9 +70,14 @@ contextBridge.exposeInMainWorld('api', {
   takeScreenshot: (workspacePath, destination, conversationId) => ipcRenderer.invoke('take-screenshot', { workspacePath, destination, conversationId }),
   showAgentBrowser: () => ipcRenderer.invoke('show-agent-browser'),
   previewApp: (workspacePath, options = {}) => ipcRenderer.invoke('preview-workspace-app', { workspacePath, command: options.command, warmupMs: options.warmupMs, destination: options.destination, processId: options.processId, timeoutMs: options.timeoutMs, conversationId: options.conversationId }),
-  captureScreen: (workspacePath, options = {}) => ipcRenderer.invoke('capture-screen', { workspacePath, destination: options.destination, delayMs: options.delayMs, conversationId: options.conversationId }),
+  captureScreen: (workspacePath, options = {}) => ipcRenderer.invoke('capture-screen', { workspacePath, destination: options.destination, delayMs: options.delayMs, conversationId: options.conversationId, displayId: options.displayId }),
+  recordInspectedScreenshot: (workspacePath, relativePath, conversationId = '') => ipcRenderer.invoke('record-inspected-screenshot', { workspacePath, path: relativePath, conversationId }),
+  computerAction: (workspacePath, action, conversationId, destination = '', displayId = '') => ipcRenderer.invoke('computer-action', { workspacePath, action, conversationId, destination, displayId }),
+  openApplication: (payload = {}) => ipcRenderer.invoke('open-application', payload),
+  clickAccessibleUi: (payload = {}) => ipcRenderer.invoke('click-accessible-ui', payload),
+  openChromeFavorite: (payload = {}) => ipcRenderer.invoke('open-chrome-favorite', payload),
   inspectScreenshot: (workspacePath, relativePath) => ipcRenderer.invoke('inspect-screenshot', { workspacePath, relativePath }),
-  readWorkspaceFileBase64: (workspacePath, relativePath) => ipcRenderer.invoke('read-workspace-file-base64', { workspacePath, relativePath }),
+  readWorkspaceFileBase64: (workspacePath, relativePath, conversationId = '') => ipcRenderer.invoke('read-workspace-file-base64', { workspacePath, relativePath, conversationId }),
   compareScreenshotToGoal: (workspacePath, relativePath, goal, observations) => ipcRenderer.invoke('compare-screenshot-to-goal', { workspacePath, relativePath, goal, observations }),
   indexWorkspace: (workspacePath) => ipcRenderer.invoke('index-workspace', workspacePath),
   searchEmbeddings: (query, limit) => ipcRenderer.invoke('search-embeddings', { query, limit }),
@@ -104,6 +115,17 @@ contextBridge.exposeInMainWorld('api', {
   cancelOrchestrationTask: (taskId, requester, reason) => ipcRenderer.invoke('orion:cancel-task', { taskId, requester, reason }),
   reconcileOrchestrationTasks: (payload) => ipcRenderer.invoke('orion:reconcile-tasks', payload || {}),
   migrateOrchestrationTasks: () => ipcRenderer.invoke('orion:migrate-tasks'),
+  acquireResourceLease: (payload) => ipcRenderer.invoke('orion:acquire-lease', payload || {}),
+  releaseResourceLease: (payload) => ipcRenderer.invoke('orion:release-lease', payload || {}),
+  releaseResourceLeasesForConversation: (conversationId) => ipcRenderer.invoke('orion:release-leases-for-conversation', conversationId),
+  heartbeatResourceLease: (payload) => ipcRenderer.invoke('orion:heartbeat-lease', payload || {}),
+  listResourceLeases: (filters) => ipcRenderer.invoke('orion:list-leases', filters || {}),
+  reconcileResourceLeases: (payload) => ipcRenderer.invoke('orion:reconcile-leases', payload || {}),
+  resolveResourceLeaseLiveness: (payload) => ipcRenderer.invoke('orion:resolve-lease-liveness', payload || {}),
+  createSchedule: (input) => ipcRenderer.invoke('orion:create-schedule', input || {}),
+  listSchedules: (filters) => ipcRenderer.invoke('orion:list-schedules', filters || {}),
+  cancelSchedule: (scheduleId) => ipcRenderer.invoke('orion:cancel-schedule', { scheduleId }),
+  cancelConversationSchedules: (conversationId) => ipcRenderer.invoke('orion:cancel-conversation-schedules', { conversationId }),
   writeConversation: (conv) => ipcRenderer.invoke('write-conversation', conv),
   writeConversationsIndex: (index) => ipcRenderer.invoke('write-conversations-index', index),
   deleteConversation: (id) => ipcRenderer.invoke('delete-conversation', id),
@@ -115,6 +137,7 @@ contextBridge.exposeInMainWorld('api', {
   getCommandStatus: (processId) => ipcRenderer.invoke('get-command-status', processId),
   readCommandOutput: (processId, maxChars) => ipcRenderer.invoke('read-command-output', { processId, maxChars }),
   killCommand: (processId) => ipcRenderer.invoke('kill-command', processId),
+  checkProcessAlive: (pid) => ipcRenderer.invoke('check-process-alive', pid),
   killCommandsForConversation: (conversationId) => ipcRenderer.invoke('kill-commands-for-conversation', conversationId),
   onCommandOutput: (processId, callback) => {
     const listener = (event, data) => callback(data);
@@ -151,5 +174,10 @@ contextBridge.exposeInMainWorld('api', {
   // Session Memory
   saveSession: (workspacePath, sessionData) => ipcRenderer.invoke('orion:save-session', { workspacePath, sessionData }),
   listSessions: (workspacePath, limit) => ipcRenderer.invoke('orion:list-sessions', { workspacePath, limit }),
-  readSession: (workspacePath, sessionId) => ipcRenderer.invoke('orion:read-session', { workspacePath, sessionId })
+  readSession: (workspacePath, sessionId) => ipcRenderer.invoke('orion:read-session', { workspacePath, sessionId }),
+
+  // Crash safety — the renderer's global error traps forward here so browser-side
+  // faults reach the same on-disk crash log as main-process ones.
+  reportRendererFault: (kind, detail) => ipcRenderer.send('orion:report-renderer-fault', { kind, detail }),
+  onMainFault: (callback) => ipcRenderer.on('orion:main-fault', (event, payload) => callback(payload))
 });

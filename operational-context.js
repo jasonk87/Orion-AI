@@ -91,6 +91,44 @@
     return normalizeStatus(value, ['critical', 'major', 'minor'], 'major');
   }
 
+  // Win conditions are addressed by whatever identifier the model remembers. Exact id and exact
+  // title already worked; an invented slug like "wc_f3_fix" for "F3 no longer quits program..."
+  // did not, and threw — costing a full round trip to re-read the titles and retry.
+  //
+  // Deliberately conservative: fuzzy candidates are only accepted when EXACTLY ONE matches, so
+  // an ambiguous guess still errors rather than silently marking the wrong condition satisfied.
+  function winConditionSlug(value) {
+    return String(value == null ? '' : value).toLowerCase().replace(/[^a-z0-9]+/g, '');
+  }
+
+  function findWinCondition(conditions, identity) {
+    const list = Array.isArray(conditions) ? conditions : [];
+    const target = String(identity == null ? '' : identity).trim();
+    if (!target) return null;
+
+    const exactId = list.find(item => item.id === target);
+    if (exactId) return exactId;
+
+    const lower = target.toLowerCase();
+    const exactTitle = list.find(item => String(item.title || '').toLowerCase() === lower);
+    if (exactTitle) return exactTitle;
+
+    const slug = winConditionSlug(target);
+    if (slug.length < 4) return null;
+
+    const slugMatches = list.filter(item =>
+      winConditionSlug(item.id) === slug || winConditionSlug(item.title) === slug);
+    if (slugMatches.length === 1) return slugMatches[0];
+
+    const contained = list.filter(item => {
+      const titleSlug = winConditionSlug(item.title);
+      const idSlug = winConditionSlug(item.id);
+      return (titleSlug && titleSlug.includes(slug))
+        || (idSlug.length >= 4 && slug.includes(idSlug));
+    });
+    return contained.length === 1 ? contained[0] : null;
+  }
+
   function normalizeNature(value) {
     return normalizeStatus(value, ['transient', 'fixable', 'terminal'], 'fixable');
   }
@@ -283,7 +321,11 @@
       }
       case 'record_adversarial_review': {
         if (!state.coverageFrontier) throw new Error('No coverage frontier exists');
-        const status = normalizeStatus(args.status, ['passed', 'failed'], '');
+        // "pass"/"fail" are what a model naturally writes, and rejecting them cost a full
+        // round trip before it retried with "passed". Accept the obvious forms.
+        const reviewSynonyms = { pass: 'passed', ok: 'passed', success: 'passed', succeeded: 'passed', fail: 'failed', failure: 'failed' };
+        const rawReviewStatus = normalizeStatus(args.status, Object.keys(reviewSynonyms).concat(['passed', 'failed']), '');
+        const status = reviewSynonyms[rawReviewStatus] || rawReviewStatus;
         if (!status) throw new Error('Adversarial review status must be passed or failed');
         state.coverageFrontier.adversarialReview = {
           status,
@@ -483,7 +525,7 @@
         if (!Array.isArray(args.evaluations) || args.evaluations.length === 0) throw new Error('evaluations array is required');
         args.evaluations.forEach(evaluation => {
           const identity = cleanText(evaluation.id || evaluation.title, 500);
-          const condition = state.winConditions.find(item => item.id === identity || item.title.toLowerCase() === identity.toLowerCase());
+          const condition = findWinCondition(state.winConditions, identity);
           if (!condition) {
             const available = state.winConditions.length
               ? state.winConditions.map(c => `"${c.title}"`).join(', ')
@@ -589,14 +631,49 @@
       'task-resolution-clarification'
     ]);
     const view = (Array.isArray(messages) ? messages : [])
+      .filter(message => !isInternalContextMessage(message))
       .filter(message => message && (message.role === 'user' || message.role === 'assistant'))
       .filter(message => !excludedSources.has(cleanText(message.source, 120)))
       .map(message => ({ role: message.role, text: cleanText(message.text, 2000), source: cleanText(message.source, 120) }))
-      .filter(message => message.text && message.text !== 'Thinking...' && !message.text.startsWith('[COMPACTED CONTEXT SUMMARY]'))
+      .filter(message => message.text && message.text !== 'Thinking...')
       .filter(message => message.role !== 'assistant' || !message.source.endsWith('-error'));
     if (view.length && view[view.length - 1].role === 'user' && view[view.length - 1].text === input) view.pop();
-    const scopeLimit = contextScope === 'recent' ? 4 : (contextScope === 'historical' ? 16 : Math.max(0, Number(limit) || MAX_CHAT_VIEW_MESSAGES));
+    const scopeLimit = contextScope === 'recent' ? MAX_CHAT_VIEW_MESSAGES : (contextScope === 'historical' ? 16 : Math.max(0, Number(limit) || MAX_CHAT_VIEW_MESSAGES));
     return view.slice(-scopeLimit);
+  }
+
+  function getCompactedConversationMemory(messages) {
+    const values = Array.isArray(messages) ? messages : [];
+    for (let index = values.length - 1; index >= 0; index -= 1) {
+      const message = values[index];
+      if (!message || typeof message !== 'object') continue;
+      const source = cleanText(message.source, 120).toLowerCase();
+      const text = cleanText(message.text || message.content, 50000);
+      const structuredSummary = source === 'context-compaction';
+      const legacySummary = !source && String(message.role || '').toLowerCase() === 'user';
+      if ((!structuredSummary && !legacySummary) || !text.startsWith('[COMPACTED CONTEXT SUMMARY]')) continue;
+      return cleanText(text.slice('[COMPACTED CONTEXT SUMMARY]'.length), 12000);
+    }
+    return '';
+  }
+
+  function isInternalContextMessage(message) {
+    if (!message || typeof message !== 'object') return false;
+    if (message.internalContext === true || message.hiddenFromTranscript === true) return true;
+
+    const source = cleanText(message.source, 120).toLowerCase();
+    if (source === 'context-compaction') return true;
+
+    // These exact machine-generated shapes predate the structured flags above. Keep the
+    // compatibility check so already-persisted conversations stop exposing implementation
+    // scaffolding after an upgrade. This is format recognition, not language classification.
+    const text = cleanText(message.text || message.content, 50000);
+    if (text.startsWith('[COMPACTED CONTEXT SUMMARY]')) return true;
+    if (text === 'Understood. I will use this compacted summary as prior context.') return true;
+    return String(message.role || '').toLowerCase() === 'system'
+      && text.startsWith('Context reached ')
+      && text.includes(' tokens; compacting for ')
+      && text.includes(' at threshold ');
   }
 
   function buildReasoningMessages(input, conversationMessages, currentInput, images = [], options = {}) {
@@ -608,6 +685,15 @@
       messages.push(
         { role: 'user', parts: [{ text: statePrompt }] },
         { role: 'model', parts: [{ text: 'Working state loaded. I will reason from it and treat chat as an input/view channel.' }] }
+      );
+    }
+    const compactedConversationMemory = contextScope === 'none'
+      ? ''
+      : getCompactedConversationMemory(conversationMessages);
+    if (compactedConversationMemory) {
+      messages.push(
+        { role: 'user', parts: [{ text: `[CONVERSATION MEMORY - compacted, non-canonical]\nThis private summary preserves the earlier part of this same conversation after context compaction. Use it for conversational continuity and unresolved references. Durable task state, files, and verification evidence remain authoritative for implementation claims.\n\n${compactedConversationMemory}` }] },
+        { role: 'model', parts: [{ text: 'Earlier conversation memory loaded. I will use it for continuity without treating it as fresh verification evidence.' }] }
       );
     }
     const chatView = buildRecentChatView(conversationMessages, currentInput, MAX_CHAT_VIEW_MESSAGES, { contextScope });
@@ -791,7 +877,7 @@
     });
   }
 
-  const api = { VERSION, createEmptyContext, normalizeContext, applyAction, formatForPrompt, buildRecentChatView, buildReasoningMessages, evaluateCompletionGate, normalizeSeverity, normalizeNature, compareBlockers };
+  const api = { VERSION, createEmptyContext, normalizeContext, applyAction, formatForPrompt, buildRecentChatView, getCompactedConversationMemory, buildReasoningMessages, evaluateCompletionGate, isInternalContextMessage, normalizeSeverity, normalizeNature, compareBlockers };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   if (globalScope) globalScope.OrionOperationalContext = api;
 })(typeof window !== 'undefined' ? window : globalThis);

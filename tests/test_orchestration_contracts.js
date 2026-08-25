@@ -577,3 +577,59 @@ test('user-reported green checks cannot become independently run or verified che
   );
   t.end();
 });
+
+// ── Completion-gate narration detection ────────────────────────────────────────
+// The completion gate injects a [SYSTEM] prompt when the model tries to finish early; the
+// model's eventual reply TO THE GATE ("Completion gate is now clear — all five coverage
+// surfaces are inspected and verified...") is machinery narration, not an answer, yet it is
+// sentence-shaped enough to pass substantive-answer checks. It overwrote the model's real
+// summary and was relayed to the user verbatim by Dispatch. This contract recognizes it.
+
+test('completion-gate narration is detected when the reply only talks about the gate', (t) => {
+  t.equal(
+    contracts.isCompletionGateNarration(
+      'Completion gate is now clear — all five coverage surfaces are inspected and verified, the win condition is satisfied, and no blockers remain. Task complete.'
+    ),
+    true,
+    'the exact relayed gate acknowledgment is narration'
+  );
+  t.equal(
+    contracts.isCompletionGateNarration('All coverage surfaces verified. No blockers remain.'),
+    true,
+    'a terse surfaces-and-blockers acknowledgment is narration'
+  );
+  t.equal(
+    contracts.isCompletionGateNarration('Completion gate cleared. Done.'),
+    true,
+    'gate clearance with a bare done is narration'
+  );
+  t.end();
+});
+
+test('real answers are never mistaken for completion-gate narration', (t) => {
+  t.equal(
+    contracts.isCompletionGateNarration(
+      'I upgraded the Codex project playwright to 1.61.1 and removed chromium-1208/1223, freeing about 1.29 GB. The completion gate is clear.'
+    ),
+    false,
+    'a substantive summary that merely mentions the gate keeps its substance'
+  );
+  t.equal(
+    contracts.isCompletionGateNarration(
+      'Python Playwright has no 1.61.1 release — it jumps to 1.62.0, which needs a new browser download, so I skipped that bump and consolidated the rest.'
+    ),
+    false,
+    'a substantive summary with no gate vocabulary is untouched'
+  );
+  t.equal(
+    contracts.isCompletionGateNarration(
+      'The build is failing on Windows because node-gyp cannot find MSVC; that blocker needs Visual Studio Build Tools installed before I can continue.'
+    ),
+    false,
+    'a real explanation that uses the word blocker is not narration'
+  );
+  t.equal(contracts.isCompletionGateNarration('Task complete.'), false,
+    'a bare completion with no gate vocabulary is out of scope for this detector');
+  t.equal(contracts.isCompletionGateNarration(''), false, 'empty text is not narration');
+  t.end();
+});

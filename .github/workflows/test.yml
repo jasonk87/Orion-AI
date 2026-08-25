@@ -1,11 +1,22 @@
 name: Test
 
 on:
+  # Runs for a PR into any base branch, including main — this part already covers "does this
+  # change break anything before it merges" regardless of branch naming.
   pull_request:
+  # Runs for direct pushes. This repo cycles through many short-lived, differently-named working
+  # branches (codex/*, fix/*, feature/*, jules-*, numeric-suffixed branches, etc.) — a hardcoded
+  # branch list here WILL go stale again, exactly like it just did (the previous two entries,
+  # codex/conversation-scoped-artifacts and feature/structural-optimizations, no longer exist as
+  # branches at all). Keep `main` and the actual current working branch listed below, but don't
+  # treat this list as durable: the real fix for "CI doesn't cover current work" is a branch
+  # protection rule on `main` requiring the `test` and `smoke` checks to pass before merging —
+  # that makes coverage independent of what any branch happens to be named. Branch protection is
+  # a GitHub repo-settings change, not something expressible in this file.
   push:
     branches:
-      - codex/conversation-scoped-artifacts
-      - feature/structural-optimizations
+      - main
+      - reliability-hardening-2026-08-03
 
 permissions:
   contents: read
@@ -21,4 +32,37 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # Correctness-only lint (no style rules). Errors fail the build; the warning ceiling is
+      # the current dead-code baseline, so existing debt does not block CI but NEW dead code or
+      # a new undefined reference does.
+      - name: Lint
+        run: npm run lint:ci
+      # agent.js and renderer.js have mixed CRLF/LF line endings. Editors that normalize them
+      # turn a 20-line change into a ~1,100-line diff and have already broken a line-ending
+      # sensitive assertion. This fails the build before that lands.
+      - name: Check line endings
+        run: npm run check:line-endings
       - run: npm test
+
+  # The unit suite loads renderer.js and agent.js through Node's module loader, which gives
+  # each its own scope and provides require/process/module. The packaged app loads them as
+  # plain <script> tags sharing one browser global scope with no Node globals. Failures that
+  # live only in that gap — duplicate top-level const across scripts, an unguarded Node
+  # global, a prompt template literal that parses but throws at load — keep the unit suite
+  # green while the shipped .exe hangs on "Agent engine is loading..." forever. This job
+  # builds the real executable and drives it over CDP so those failures block the merge.
+  smoke:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Package the app
+        run: npm run package
+      - name: Boot the packaged app and check for script faults
+        run: npm run smoke

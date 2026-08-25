@@ -74,7 +74,11 @@ function makeElectronMock(handlers = {}) {
   return {
     calls,
     mock: {
-      app: { whenReady: () => ({ then: (cb) => { cb(); } }), on: () => {} },
+      app: {
+        whenReady: () => ({ then: (cb) => { cb(); } }),
+        on: () => {},
+        getPath: () => os.tmpdir()
+      },
       BrowserWindow: class {
         constructor() {
           this.webContents = {
@@ -84,6 +88,7 @@ function makeElectronMock(handlers = {}) {
                 conversationId: 'conv1', title: 'T', conversations: [], tasks: [], messages: [],
                 latestOutput: '', preview: {}
               };
+              if (script.includes('readChatImageForPhone')) return handlers.chatImage || { success: false, error: 'Image not found' };
               if (script.includes('readWorkspaceFileForPhone')) return handlers.readFile || { success: false, error: 'File not found' };
               if (script.includes('submitPhoneCompanionPrompt')) return handlers.prompt || { success: true, queued: false };
               return { success: true };
@@ -302,6 +307,51 @@ test('/api/files/read: serves text file content with correct headers', async (t)
   t.end();
 });
 
+test('/api/chat-image serves an authenticated image attached to the selected conversation', async (t) => {
+  const imageBytes = Buffer.from('conversation-image');
+  const { main, electron } = await startServer(1240, {
+    state: { conversationId: 'conv1', title: 'T', conversations: [], tasks: [], messages: [], latestOutput: '', preview: {} },
+    chatImage: { success: true, data: imageBytes.toString('base64'), mimeType: 'image/png' }
+  });
+  const session = await pairDevice(1240);
+  await request('GET', 1240, '/api/state', null, session);
+  const imagePath = encodeURIComponent('orion-artifact://conv1/screenshots/result.png');
+  const res = await request('GET', 1240, `/api/chat-image?conversationId=conv1&path=${imagePath}`, null, session);
+  t.equal(res.statusCode, 200, 'the selected conversation may load its attached image');
+  t.equal(res.text, imageBytes.toString(), 'the endpoint returns the original image bytes');
+  t.ok(electron.calls.some(call => call.includes('readChatImageForPhone')), 'the scoped renderer image bridge was used');
+  await closeServer(main.getCompanionServer());
+  t.end();
+});
+
+test('/api/chat-image requires a conversation id and image path, but does not require the currently selected conversation', async (t) => {
+  // This route used to require conversationId to equal device.selectedConversationId (the same
+  // "stale view" guard used for state-changing actions like steer/approve-plan), which meant a
+  // screenshot attached inside a delegated Operator/Coder task - whose sourceConversationId is
+  // that specialist conversation, not the Dispatch conversation its result gets relayed into and
+  // that the phone has selected - was permanently rejected with 409, even though the backend had
+  // genuinely attached the image. See tests/test_phone_companion.js's
+  // "a screenshot relayed from a delegated Operator/Coder task..." test for the real regression
+  // this reproduces and the fix. This route's real authorization now lives entirely in
+  // readChatImageForPhone (the conversation must exist and must actually have this exact path
+  // attached to one of its messages) - a differing-but-valid conversationId is expected input,
+  // not something to reject here.
+  const { main } = await startServer(1241, {
+    state: { conversationId: 'conv1', title: 'T', conversations: [], tasks: [], messages: [], latestOutput: '', preview: {} },
+    chatImage: { success: true, data: Buffer.from('x').toString('base64'), mimeType: 'image/png' }
+  });
+  const session = await pairDevice(1241);
+  await request('GET', 1241, '/api/state', null, session);
+  const missingConversation = await request('GET', 1241, '/api/chat-image?path=image.png', null, session);
+  t.equal(missingConversation.statusCode, 400, 'a request with no conversation id at all is still rejected');
+  const missingPath = await request('GET', 1241, '/api/chat-image?conversationId=conv1', null, session);
+  t.equal(missingPath.statusCode, 400, 'a request with no image path at all is still rejected');
+  const otherConversation = await request('GET', 1241, '/api/chat-image?conversationId=conv2&path=image.png', null, session);
+  t.equal(otherConversation.statusCode, 200, 'a conversation id other than the one currently selected is not, by itself, a reason to reject');
+  await closeServer(main.getCompanionServer());
+  t.end();
+});
+
 // ── /api/prompt with file attachment ─────────────────────────────────────────
 
 test('/api/prompt: file attachment is prepended to prompt sent to renderer', async (t) => {
@@ -309,9 +359,12 @@ test('/api/prompt: file attachment is prepended to prompt sent to renderer', asy
     prompt: { success: true, queued: false }
   });
   const session = await pairDevice(1234);
+  const state = await request('GET', 1234, '/api/state', null, session);
 
   const res = await request('POST', 1234, '/api/prompt', {
     prompt: 'what does this file do?',
+    conversationId: state.json.conversationId,
+    selectionRevision: state.json.device.selectionRevision,
     fileContent: 'console.log("hello");',
     fileName: 'hello.js'
   }, session);
@@ -331,10 +384,13 @@ test('/api/prompt: oversized file attachment is truncated', async (t) => {
     prompt: { success: true, queued: false }
   });
   const session = await pairDevice(1235);
+  const state = await request('GET', 1235, '/api/state', null, session);
 
   const bigContent = 'x'.repeat(90000); // > 80000 char limit
   const res = await request('POST', 1235, '/api/prompt', {
     prompt: 'review this',
+    conversationId: state.json.conversationId,
+    selectionRevision: state.json.device.selectionRevision,
     fileContent: bigContent,
     fileName: 'big.txt'
   }, session);
@@ -351,8 +407,13 @@ test('/api/prompt: prompt without file attachment is not modified', async (t) =>
     prompt: { success: true, queued: false }
   });
   const session = await pairDevice(1236);
+  const state = await request('GET', 1236, '/api/state', null, session);
 
-  await request('POST', 1236, '/api/prompt', { prompt: 'just a plain prompt' }, session);
+  await request('POST', 1236, '/api/prompt', {
+    prompt: 'just a plain prompt',
+    conversationId: state.json.conversationId,
+    selectionRevision: state.json.device.selectionRevision
+  }, session);
   const promptCall = electron.calls.find(c => c.includes('submitPhoneCompanionPrompt'));
   t.ok(promptCall, 'submitPhoneCompanionPrompt was called');
   t.notOk(promptCall.includes('Attached file'), 'no attachment prefix when no file is sent');

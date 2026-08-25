@@ -45,6 +45,9 @@ let appConfig = {
   googleSearchEngineId: '3354e92e98ab54b31',
   googleSearchApiKey: '',
   defaultModel: 'gemini-2.5-flash-lite',
+  reasoningEffort: 'auto',
+  modelSelectionRevision: 0,
+  reasoningSelectionRevision: 0,
   compactThresholdTokens: 100000,
   autoCompact: true,
   modelContextBudgets: {
@@ -83,7 +86,10 @@ let expandedFileFolders = new Set();
 // Every cold launch begins at a clean Dispatch draft. Mode changes during the running app are
 // still preserved in memory, but an old persisted UI preference must not reopen Coder or an old
 // Dispatch transcript on the next launch.
-let appMode = 'orion'; // 'orion' | 'coder'
+let appMode = 'orion'; // 'orion' | 'coder' | 'operator'
+// Item 9 (UI polish): a plain client-side title filter per sidebar tab. Kept as one small object
+// rather than three separate variables so renderConversationList can look a mode up generically.
+let conversationSearchQueries = { orion: '', coder: '', operator: '' };
 let lastDispatchConversationId = '';
 let dispatchDraft = {
   active: true,
@@ -97,6 +103,74 @@ const RendererSupervisorOrchestration = window.OrionSupervisorOrchestration;
 const RendererSemanticIntentRouter = window.OrionSemanticIntentRouter;
 let orchestrationTasksReady = Promise.resolve();
 const orchestrationTaskCache = new Map();
+let phoneTaskRefreshPromise = null;
+let phoneTaskRefreshCompletedAt = 0;
+const phoneOperationalContextCache = new Map();
+const PHONE_TASK_REFRESH_TTL_MS = 5000;
+const PHONE_OPERATIONAL_CONTEXT_TTL_MS = 15000;
+
+function requestPhoneTaskRefresh(options = {}) {
+  if (!window.api || typeof window.api.listOrchestrationTasks !== 'function') return null;
+  const cacheIsFresh = Date.now() - phoneTaskRefreshCompletedAt < PHONE_TASK_REFRESH_TTL_MS;
+  if (phoneTaskRefreshPromise || (!options.force && cacheIsFresh)) {
+    return phoneTaskRefreshPromise;
+  }
+  phoneTaskRefreshPromise = Promise.resolve()
+    .then(() => window.api.listOrchestrationTasks({ sort: 'desc' }))
+    .then(listed => {
+      if (listed && Array.isArray(listed.tasks)) {
+        orchestrationTaskCache.clear();
+        listed.tasks.forEach(task => {
+          if (task && task.taskId) orchestrationTaskCache.set(task.taskId, task);
+        });
+      }
+      phoneTaskRefreshCompletedAt = Date.now();
+      if (window.api && typeof window.api.syncPhoneCompanion === 'function') {
+        window.api.syncPhoneCompanion();
+      }
+      return listed;
+    })
+    .catch(error => {
+      console.error('Phone companion task refresh failed', error);
+      return null;
+    })
+    .finally(() => {
+      phoneTaskRefreshPromise = null;
+    });
+  return phoneTaskRefreshPromise;
+}
+
+function requestPhoneOperationalContextRefresh(workspace) {
+  const cacheKey = String(workspace || '');
+  if (!cacheKey || !window.readOperationalContext) return null;
+  const cached = phoneOperationalContextCache.get(cacheKey);
+  if (cached && cached.promise) return cached.promise;
+  if (cached && Date.now() - cached.updatedAt < PHONE_OPERATIONAL_CONTEXT_TTL_MS) return null;
+
+  const entry = cached || { state: null, updatedAt: 0, promise: null };
+  let refreshed = false;
+  entry.promise = Promise.resolve()
+    .then(() => window.readOperationalContext(cacheKey))
+    .then(result => {
+      entry.state = result && result.state ? result.state : null;
+      entry.updatedAt = Date.now();
+      refreshed = true;
+      return result;
+    })
+    .catch(error => {
+      console.error('Phone companion operational-context refresh failed', error);
+      entry.updatedAt = Date.now();
+      return null;
+    })
+    .finally(() => {
+      entry.promise = null;
+      if (refreshed && window.api && typeof window.api.syncPhoneCompanion === 'function') {
+        window.api.syncPhoneCompanion();
+      }
+    });
+  phoneOperationalContextCache.set(cacheKey, entry);
+  return entry.promise;
+}
 
 // DOM ELEMENTS
 const el = {
@@ -119,6 +193,12 @@ const el = {
   projectList: document.getElementById('project-list'),
   conversationList: document.getElementById('conversation-list'),
   conversationListCoder: document.getElementById('conversation-list-coder'),
+  conversationListOperator: document.getElementById('conversation-list-operator'),
+  btnAddConversationOperator: document.getElementById('btn-add-conversation-operator'),
+  btnNewConversationOperator: document.getElementById('btn-new-conversation-operator'),
+  conversationSearchOrion: document.getElementById('conversation-search-orion'),
+  conversationSearchCoder: document.getElementById('conversation-search-coder'),
+  conversationSearchOperator: document.getElementById('conversation-search-operator'),
   btnSettings: document.getElementById('btn-settings'),
   btnChangeWorkspace: document.getElementById('btn-change-workspace'),
   btnSyncFiles: document.getElementById('btn-sync-files'),
@@ -133,6 +213,7 @@ const el = {
   chatInput: document.getElementById('chat-input'),
   btnSubmit: document.getElementById('btn-submit'),
   modelSelect: document.getElementById('model-select'),
+  reasoningSelect: document.getElementById('reasoning-select'),
   chatTitle: document.getElementById('chat-title'),
   // Settings modal
   settingsModal: document.getElementById('settings-modal'),
@@ -201,34 +282,86 @@ const el = {
   fileViewerContent: document.getElementById('file-viewer-content'),
   fileViewerMarkdown: document.getElementById('file-viewer-markdown'),
   fileViewerImageShell: document.getElementById('file-viewer-image-shell'),
+  fileViewerImageViewport: document.getElementById('file-viewer-image-viewport'),
   fileViewerImage: document.getElementById('file-viewer-image'),
   fileViewerImageMeta: document.getElementById('file-viewer-image-meta'),
+  fileViewerZoomLabel: document.getElementById('file-viewer-zoom-label'),
+  btnFileViewerZoomOut: document.getElementById('btn-file-viewer-zoom-out'),
+  btnFileViewerZoomReset: document.getElementById('btn-file-viewer-zoom-reset'),
+  btnFileViewerZoomIn: document.getElementById('btn-file-viewer-zoom-in'),
   btnFileViewerClose: document.getElementById('btn-file-viewer-close'),
   btnFileViewerMention: document.getElementById('btn-file-viewer-mention')
 };
 
 let viewedFilePath = '';
+let fileViewerImageZoom = 1;
+let fileViewerImageFitWidth = 0;
+let fileViewerImageFitHeight = 0;
 let agentPresenceTimer = null;
 let agentCompletionTimer = null;
 
 // INITIALIZE APP
-document.addEventListener('DOMContentLoaded', async () => {
-  setupWindowControls();
-  await loadSettings();
-  await refreshAppRuntimeInfo();
-  try { cachedUserDataPath = await window.api.getUserDataPath(); } catch (_) {}
-  setupSettingsModal();
-  setupFileViewerModal();
-  setupOperationalContextEditor();
-  setupWorkspaceHandlers();
-  setupStartActions();
-  setupEntrypointControls();
-  setupProgressiveDisclosure();
-  setupRightSidebarToggle();
-  setupChatHandlers();
-  initUpdateChecker();
-  initImageAttach();
+// Boot used to be one unguarded sequence, and `await loadSettings()` was its second
+// statement. When that threw — window.api missing because the preload bridge did not load,
+// a malformed config on disk — the rejection skipped EVERY remaining step: workspace
+// handlers, chat wiring, the update checker, image attach, every button binding. The window
+// still rendered, so it looked like a hang rather than a failure.
+//
+// Each step is now independent. A step that fails is reported through the same banner and
+// crash log as any other fault, and the rest of the UI still wires up.
+async function runInitStep(label, step) {
+  try {
+    await step();
+    return true;
+  } catch (error) {
+    const detail = (error && (error.stack || error.message)) || String(error);
+    if (typeof window.__orionReportFault === 'function') {
+      window.__orionReportFault(`init:${label}`, `Orion could not finish starting up (${label})`, detail);
+    } else {
+      console.error(`[orion:init:${label}]`, detail);
+    }
+    return false;
+  }
+}
 
+document.addEventListener('DOMContentLoaded', async () => {
+  // window.api is the renderer's only route to the main process. Without it every step
+  // below fails the same way, so say that once and plainly instead of emitting a dozen
+  // identical "Cannot read properties of undefined" traces.
+  if (!window.api && typeof window.__orionReportFault === 'function') {
+    window.__orionReportFault(
+      'preload-bridge-missing',
+      'Orion cannot reach its main process',
+      'window.api is unavailable, so settings, workspaces, and chat cannot start. This means ' +
+      'preload.js did not load. Restart Orion; your conversations on disk are unaffected.'
+    );
+  }
+
+  await runInitStep('window-controls', setupWindowControls);
+  await runInitStep('settings', loadSettings);
+  await runInitStep('runtime-info', refreshAppRuntimeInfo);
+  try { cachedUserDataPath = await window.api.getUserDataPath(); } catch (_) {}
+  await runInitStep('settings-modal', setupSettingsModal);
+  await runInitStep('file-viewer', setupFileViewerModal);
+  await runInitStep('operational-context', setupOperationalContextEditor);
+  await runInitStep('workspace-handlers', setupWorkspaceHandlers);
+  await runInitStep('start-actions', setupStartActions);
+  await runInitStep('entrypoint-controls', setupEntrypointControls);
+  await runInitStep('progressive-disclosure', setupProgressiveDisclosure);
+  await runInitStep('right-sidebar', setupRightSidebarToggle);
+  await runInitStep('chat-handlers', setupChatHandlers);
+  await runInitStep('update-checker', initUpdateChecker);
+  await runInitStep('image-attach', initImageAttach);
+
+  // The inline bindings below were the one part of boot still running unguarded. A throw here
+  // produced an unhandled rejection that killed the rest of startup silently — the same class
+  // of failure the runInitStep wrapping above was added to stop. Wrapped as one step because
+  // these are all button bindings: if the markup is intact they all succeed, and if it is not,
+  // the fault is reported once with the real cause.
+  await runInitStep('inline-bindings', () => bindInlineControls());
+});
+
+async function bindInlineControls() {
   // Bind manual task checklist add button
   const btnAddTaskManual = document.getElementById('btn-add-task-manual');
   if (btnAddTaskManual) {
@@ -298,7 +431,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   startDispatchDraft({ coldLaunch: true });
   refreshPhoneCompanionPairing();
   removeLegacyPhoneCompanionTokenBubbles();
-});
+}
 
 // --- ELECTRON WINDOW BINDINGS ---
 function setupWindowControls() {
@@ -565,6 +698,9 @@ async function loadSettings() {
   
   // Initialize dropdown with Gemini and dynamic Ollama models
   await initModelDropdown();
+  // Independent of the model dropdown: the reasoning picker must restore even when the model
+  // select is missing, otherwise a saved Ultra silently reverts to Auto.
+  restoreReasoningEffortSelection();
 }
 
 async function initModelDropdown() {
@@ -678,6 +814,104 @@ async function initModelDropdown() {
   appConfig.defaultModel = modelSelect.value;
 }
 
+// The reasoning picker next to the input box. 'auto' is the default and means the phase
+// engine keeps deciding per step; any explicit level is forced for every answer until the
+// user changes it back. Sticky on purpose — same behavior as the model select beside it.
+function restoreReasoningEffortSelection() {
+  if (!el.reasoningSelect) return;
+  const normalize = window.OrionReasoningPolicy
+    ? window.OrionReasoningPolicy.normalizeEffortOverride
+    : value => value || 'auto';
+  const saved = normalize(localStorage.getItem('ag2_reasoning_effort') || appConfig.reasoningEffort || 'auto');
+  el.reasoningSelect.value = saved;
+  if (!el.reasoningSelect.value) el.reasoningSelect.value = 'auto';
+  appConfig.reasoningEffort = el.reasoningSelect.value;
+  el.reasoningSelect.classList.toggle('reasoning-forced', el.reasoningSelect.value !== 'auto');
+}
+
+function getSelectionRevisions() {
+  return {
+    model: Math.max(0, Number(appConfig.modelSelectionRevision) || 0),
+    reasoning: Math.max(0, Number(appConfig.reasoningSelectionRevision) || 0)
+  };
+}
+
+function bumpSelectionRevision(field) {
+  const configKey = field === 'model' ? 'modelSelectionRevision' : 'reasoningSelectionRevision';
+  const next = Math.max(Date.now(), (Number(appConfig[configKey]) || 0) + 1);
+  appConfig[configKey] = next;
+  return next;
+}
+
+async function persistSelectionConfig() {
+  const result = await window.api.writeConfig(appConfig);
+  if (result === false || (result && result.success === false)) {
+    throw new Error('Orion could not persist the selection to config.');
+  }
+}
+
+window.setReasoningEffortSelection = async (value) => {
+  const normalize = window.OrionReasoningPolicy
+    ? window.OrionReasoningPolicy.normalizeEffortOverride
+    : v => v || 'auto';
+  const level = normalize(value);
+  const previousLevel = appConfig.reasoningEffort || 'auto';
+  const previousRevision = Number(appConfig.reasoningSelectionRevision) || 0;
+  const previousStored = localStorage.getItem('ag2_reasoning_effort');
+  if (level === previousLevel) {
+    return { success: true, reasoning: level, selectionRevisions: getSelectionRevisions() };
+  }
+  appConfig.reasoningEffort = level;
+  bumpSelectionRevision('reasoning');
+  if (el.reasoningSelect) {
+    el.reasoningSelect.value = level;
+    el.reasoningSelect.classList.toggle('reasoning-forced', level !== 'auto');
+  }
+  localStorage.setItem('ag2_reasoning_effort', level);
+  try {
+    await persistSelectionConfig();
+    return { success: true, reasoning: level, selectionRevisions: getSelectionRevisions() };
+  } catch (error) {
+    appConfig.reasoningEffort = previousLevel;
+    appConfig.reasoningSelectionRevision = previousRevision;
+    if (el.reasoningSelect) {
+      el.reasoningSelect.value = previousLevel;
+      el.reasoningSelect.classList.toggle('reasoning-forced', previousLevel !== 'auto');
+    }
+    if (previousStored == null) localStorage.removeItem('ag2_reasoning_effort');
+    else localStorage.setItem('ag2_reasoning_effort', previousStored);
+    return { success: false, error: error.message || String(error), reasoning: previousLevel, selectionRevisions: getSelectionRevisions() };
+  }
+};
+
+async function setModelPreferenceSelection(modelValue) {
+  if (!el.modelSelect) return { success: false, error: 'Model selector not available on desktop' };
+  const option = Array.from(el.modelSelect.options).find(item => item.value === modelValue);
+  if (!option) return { success: false, error: `Unknown model: ${modelValue}` };
+  const previousModel = appConfig.defaultModel || el.modelSelect.value;
+  const previousRevision = Number(appConfig.modelSelectionRevision) || 0;
+  const previousStored = localStorage.getItem('ag2_default_model');
+  if (modelValue === previousModel) {
+    el.modelSelect.value = modelValue;
+    return { success: true, model: modelValue, selectionRevisions: getSelectionRevisions() };
+  }
+  el.modelSelect.value = modelValue;
+  appConfig.defaultModel = modelValue;
+  bumpSelectionRevision('model');
+  localStorage.setItem('ag2_default_model', modelValue);
+  try {
+    await persistSelectionConfig();
+    return { success: true, model: modelValue, selectionRevisions: getSelectionRevisions() };
+  } catch (error) {
+    appConfig.defaultModel = previousModel;
+    appConfig.modelSelectionRevision = previousRevision;
+    el.modelSelect.value = previousModel;
+    if (previousStored == null) localStorage.removeItem('ag2_default_model');
+    else localStorage.setItem('ag2_default_model', previousStored);
+    return { success: false, error: error.message || String(error), model: previousModel, selectionRevisions: getSelectionRevisions() };
+  }
+}
+
 function normalizePhoneHttpsOrigin(value) {
   const raw = String(value || '').trim();
   if (!raw) return '';
@@ -717,7 +951,11 @@ function setupSettingsModal() {
     if (el.settingPhoneHttpsOrigin) el.settingPhoneHttpsOrigin.value = normalizedPhoneHttpsOrigin;
     appConfig.modelCallDelayMs = el.settingModelCallDelay ? Math.min(Math.max(parseInt(el.settingModelCallDelay.value) || 0, 0), 60000) : (appConfig.modelCallDelayMs || 0);
     appConfig.compactThresholdTokens = parseInt(el.settingCompactThreshold.value) || 100000;
-    appConfig.autoTest = el.settingAutoTest ? el.settingAutoTest.checked : true;
+    // Preserve the stored value when the control is absent. The settings modal no longer renders
+    // an auto-test checkbox, and falling back to `true` meant every settings save silently
+    // re-enabled auto-test — a setting agent.js still acts on in five places, that the user has
+    // no way to turn off. Missing UI must not overwrite configuration.
+    appConfig.autoTest = el.settingAutoTest ? el.settingAutoTest.checked : appConfig.autoTest;
     appConfig.planningMode = el.settingPlanningMode.checked;
     
     await window.api.writeConfig(appConfig);
@@ -869,9 +1107,21 @@ async function syncWorkspaceFiles() {
     window.api.indexWorkspace(currentWorkspace).catch(() => {});
   }
 
-  const files = await window.api.listFiles(currentWorkspace);
+  // list-files answers with an array on success but { error } on failure, so an unreadable or
+  // mid-mutation workspace used to reach buildFileTree as a non-array and throw
+  // "files.forEach is not a function" out of an unhandled promise. Surface the failure in the
+  // panel instead, and leave the last good tree data alone rather than half-clearing it.
+  const listed = await window.api.listFiles(currentWorkspace);
+  if (!Array.isArray(listed)) {
+    const reason = listed && listed.error ? String(listed.error) : 'The directory could not be read.';
+    el.fileCountBadge.textContent = '—';
+    el.fileTree.innerHTML = `<p class="empty-state">Could not list files: ${escapeHtml(reason)}</p>`;
+    loadRunArtifacts();
+    return;
+  }
+  const files = listed;
   el.fileCountBadge.textContent = files.length;
-  
+
   if (files.length === 0) {
     currentFileTreeItems = [];
     el.fileTree.innerHTML = '<p class="empty-state">No files found.</p>';
@@ -940,16 +1190,23 @@ function setAppMode(mode, persist = true) {
 
   const orionBtn = document.getElementById('btn-mode-orion');
   const coderBtn = document.getElementById('btn-mode-coder');
+  const operatorBtn = document.getElementById('btn-mode-operator');
   const orionContent = document.getElementById('sidebar-orion-content');
   const coderContent = document.getElementById('sidebar-coder-content');
+  const operatorContent = document.getElementById('sidebar-operator-content');
   if (orionBtn) orionBtn.classList.toggle('active', mode === 'orion');
   if (coderBtn) coderBtn.classList.toggle('active', mode === 'coder');
+  if (operatorBtn) operatorBtn.classList.toggle('active', mode === 'operator');
   if (orionContent) orionContent.classList.toggle('active', mode === 'orion');
   if (coderContent) coderContent.classList.toggle('active', mode === 'coder');
+  if (operatorContent) operatorContent.classList.toggle('active', mode === 'operator');
 
   // Dispatch preserves its current in-session focus, including an uncommitted draft, but never
-  // chooses an old transcript merely because the user opened the mode. Coder keeps its existing
-  // task-oriented selection behavior.
+  // chooses an old transcript merely because the user opened the mode. Coder and Operator each
+  // keep their own task-oriented selection behavior, scoped to their own mode — this used to be
+  // a blanket "anything that isn't orion is coder" check, which meant selecting an Operator
+  // conversation immediately bounced the view to a Coder one because setAppMode had never heard
+  // of a third mode. Item 10 of the Operator architecture plan.
   const activeConv = conversations.find(c => c.id === activeConversationId);
   if (mode === 'orion') {
     if (activeConv && conversationMode(activeConv) === 'orion') {
@@ -962,10 +1219,10 @@ function setAppMode(mode, persist = true) {
       if (remembered) selectConversation(remembered.id, { selectionEpoch: conversationSelectionEpoch });
       else startDispatchDraft();
     }
-  } else if (!activeConv || conversationMode(activeConv) !== 'coder') {
-    const replacement = conversations.find(c => conversationMode(c) === 'coder');
+  } else if (!activeConv || conversationMode(activeConv) !== mode) {
+    const replacement = conversations.find(c => conversationMode(c) === mode);
     if (replacement) selectConversation(replacement.id, { selectionEpoch: conversationSelectionEpoch });
-    else createNewConversation('coder');
+    else createNewConversation(mode);
   }
 
   // Adapt main workspace for mode
@@ -985,9 +1242,13 @@ function setAppMode(mode, persist = true) {
     // Update greeting time
     updateOrionGreeting();
   } else {
-    if (chatInput) chatInput.placeholder = 'Ask Orion to build, fix, or investigate…';
+    if (chatInput) {
+      chatInput.placeholder = mode === 'operator'
+        ? 'Ask Operator to click, type, or navigate…'
+        : 'Ask Orion to build, fix, or investigate…';
+    }
     if (orionSplash) orionSplash.style.display = 'none';
-    // Restore coder splash if no messages
+    // Restore the shared splash if no messages
     const conv = conversations.find(c => c.id === activeConversationId);
     const hasMessages = conv && conv.messages && conv.messages.length > 0;
     if (!hasMessages) {
@@ -1006,10 +1267,22 @@ function updateOrionGreeting() {
   nameEl.textContent = `${tod}, Jason.`;
 }
 
+// Phase 2 of the Operator architecture plan: display name per specialist role, keyed by the same
+// target.mode value task-orchestration.js already stores on every task. 'coder' and 'operator' are
+// the two real specialists; describeSupervisedTaskPresentation's roleLabel option defaults to
+// 'Coder' on its own, so an unregistered/missing role still renders exactly as before this
+// registry existed.
+const AGENT_ROLE_DISPLAY_NAMES = {
+  coder: 'Coder',
+  operator: 'Operator'
+};
+
 function supervisedTaskContext(task, isGlobalRunning = false, globalRunningId = '') {
   const taskId = String(task && task.taskId || '');
   const originConversationId = String(task && task.origin && task.origin.conversationId || '');
   const targetConversationId = String(task && task.target && task.target.conversationId || '');
+  const targetRole = String(task && task.target && task.target.mode || '').toLowerCase();
+  const roleLabel = AGENT_ROLE_DISPLAY_NAMES[targetRole] || undefined;
   const originConversation = conversations.find(conversation => conversation.id === originConversationId);
   const targetConversation = conversations.find(conversation => conversation.id === targetConversationId);
   const activeRunTaskId = window.getActiveRunTaskId ? String(window.getActiveRunTaskId() || '') : '';
@@ -1041,6 +1314,7 @@ function supervisedTaskContext(task, isGlobalRunning = false, globalRunningId = 
     targetConversation,
     originConversationId,
     targetConversationId,
+    roleLabel,
     awaitingReview,
     revisingPlan,
     planApproved: !!(targetConversation && targetConversation.planApproved),
@@ -1058,6 +1332,39 @@ function getSupervisedTaskForConversation(conversationId, activeTaskId = '') {
     activeTaskId,
     { delegatedOnly: true }
   );
+}
+
+function getOwnedSpecialistContext(dispatchConversation) {
+  const preferredTaskId = String(
+    dispatchConversation && (dispatchConversation.launchedCoderTaskId || dispatchConversation.lastOwnedTaskId)
+    || ''
+  );
+  const task = preferredTaskId
+    ? (orchestrationTaskCache.get(preferredTaskId)
+      || getSupervisedTaskForConversation(dispatchConversation && dispatchConversation.id, preferredTaskId))
+    : getSupervisedTaskForConversation(dispatchConversation && dispatchConversation.id, '');
+  const targetConversationId = String(
+    (task && task.target && task.target.conversationId)
+    || (dispatchConversation && dispatchConversation.launchedCoderConvId)
+    || ''
+  );
+  const targetConversation = targetConversationId
+    ? conversations.find(conversation => conversation.id === targetConversationId)
+    : null;
+  const role = String(
+    (task && task.target && task.target.mode)
+    || (targetConversation && conversationMode(targetConversation))
+    || (dispatchConversation && dispatchConversation.launchedTaskRole)
+    || 'coder'
+  ).toLowerCase();
+  return {
+    task,
+    taskId: String((task && task.taskId) || preferredTaskId),
+    targetConversation,
+    targetConversationId,
+    role,
+    roleLabel: AGENT_ROLE_DISPLAY_NAMES[role] || 'Specialist'
+  };
 }
 
 function getSupervisedTaskPresentation(task, isGlobalRunning = false, globalRunningId = '') {
@@ -1248,9 +1555,11 @@ async function continueDelegatedWork(coderConvId, supervisingOrionConvId) {
   } else {
     showToast('Coder is continuing the remaining work.');
     window.promptQueue = window.promptQueue.filter(item => item.taskId !== queued.task.taskId);
-    window.runAgentLoop(queued.queueItem.prompt, modelValue, coderConv, {
+    window.runAgentLoop(queued.queueItem.prompt, queued.queueItem.modelSelectValue || modelValue, coderConv, {
       source: 'queue',
-      taskId: queued.task.taskId
+      taskId: queued.task.taskId,
+      reasoningEffort: queued.queueItem.reasoningEffort,
+      executionProfile: queued.queueItem.executionProfile
     });
   }
 }
@@ -1282,6 +1591,7 @@ function setupProgressiveDisclosure() {
   // Mode switcher
   document.getElementById('btn-mode-orion')?.addEventListener('click', () => setAppMode('orion'));
   document.getElementById('btn-mode-coder')?.addEventListener('click', () => setAppMode('coder'));
+  document.getElementById('btn-mode-operator')?.addEventListener('click', () => setAppMode('operator'));
   setAppMode(appMode, false); // Initialize from stored preference
 
   // Orion prompt chips — populate input (with focus) so Jason can review/edit before sending
@@ -1807,6 +2117,76 @@ function setupFileViewerModal() {
     if (viewedFilePath) insertFileReference(viewedFilePath);
     closeFileViewer();
   });
+  if (el.btnFileViewerZoomOut) el.btnFileViewerZoomOut.addEventListener('click', () => setFileViewerImageZoom(fileViewerImageZoom / 1.25));
+  if (el.btnFileViewerZoomReset) el.btnFileViewerZoomReset.addEventListener('click', () => setFileViewerImageZoom(1));
+  if (el.btnFileViewerZoomIn) el.btnFileViewerZoomIn.addEventListener('click', () => setFileViewerImageZoom(fileViewerImageZoom * 1.25));
+  if (el.fileViewerImage) {
+    el.fileViewerImage.addEventListener('load', fitFileViewerImage);
+    el.fileViewerImage.addEventListener('dblclick', () => setFileViewerImageZoom(fileViewerImageZoom > 1 ? 1 : 2));
+  }
+  if (el.fileViewerImageViewport) {
+    el.fileViewerImageViewport.addEventListener('wheel', event => {
+      if (!event.ctrlKey) return;
+      event.preventDefault();
+      setFileViewerImageZoom(fileViewerImageZoom * (event.deltaY < 0 ? 1.15 : (1 / 1.15)));
+    }, { passive: false });
+  }
+}
+
+function fitFileViewerImage() {
+  if (!el.fileViewerImage || !el.fileViewerImageViewport || !el.fileViewerImage.naturalWidth) return;
+  const viewportWidth = Math.max(1, el.fileViewerImageViewport.clientWidth - 2);
+  const viewportHeight = Math.max(1, el.fileViewerImageViewport.clientHeight - 2);
+  const fitScale = Math.min(
+    1,
+    viewportWidth / el.fileViewerImage.naturalWidth,
+    viewportHeight / el.fileViewerImage.naturalHeight
+  );
+  fileViewerImageFitWidth = Math.max(1, Math.round(el.fileViewerImage.naturalWidth * fitScale));
+  fileViewerImageFitHeight = Math.max(1, Math.round(el.fileViewerImage.naturalHeight * fitScale));
+  setFileViewerImageZoom(1);
+}
+
+function setFileViewerImageZoom(value) {
+  fileViewerImageZoom = Math.min(8, Math.max(0.25, Number(value) || 1));
+  if (el.fileViewerImage && fileViewerImageFitWidth && fileViewerImageFitHeight) {
+    el.fileViewerImage.style.width = `${Math.round(fileViewerImageFitWidth * fileViewerImageZoom)}px`;
+    el.fileViewerImage.style.height = `${Math.round(fileViewerImageFitHeight * fileViewerImageZoom)}px`;
+    el.fileViewerImage.style.cursor = fileViewerImageZoom > 1 ? 'zoom-out' : 'zoom-in';
+  }
+  if (el.fileViewerZoomLabel) el.fileViewerZoomLabel.textContent = `${Math.round(fileViewerImageZoom * 100)}%`;
+}
+
+function openChatImageViewer(image) {
+  const source = image && (image.currentSrc || image.getAttribute('src'));
+  if (!source) {
+    showToast('That image is still loading.', 'attention');
+    return;
+  }
+  viewedFilePath = '';
+  el.fileViewerTitle.textContent = image.getAttribute('alt') || 'Chat image';
+  setFileViewerMode('image');
+  if (el.fileViewerImageMeta) el.fileViewerImageMeta.textContent = 'Use the controls, Ctrl+wheel, or double-click to zoom.';
+  if (el.fileViewerImage) el.fileViewerImage.src = source;
+  if (el.btnFileViewerMention) el.btnFileViewerMention.hidden = true;
+  el.fileViewerModal.classList.add('active');
+  if (el.fileViewerImage && el.fileViewerImage.complete) requestAnimationFrame(fitFileViewerImage);
+}
+
+function wireChatImageOpeners(container) {
+  if (!container) return;
+  container.querySelectorAll('.assistant-response-image img, .user-message-image').forEach(image => {
+    image.tabIndex = 0;
+    image.setAttribute('role', 'button');
+    image.setAttribute('aria-label', `Open ${image.getAttribute('alt') || 'chat image'} at full size`);
+    image.addEventListener('click', () => openChatImageViewer(image));
+    image.addEventListener('keydown', event => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openChatImageViewer(image);
+      }
+    });
+  });
 }
 
 async function openFileViewer(relPath) {
@@ -1866,6 +2246,7 @@ async function openImageArtifact(item) {
     return;
   }
   viewedFilePath = relPath;
+  if (el.btnFileViewerMention) el.btnFileViewerMention.hidden = false;
   el.fileViewerTitle.textContent = relPath;
   setFileViewerMode('image');
   if (el.fileViewerImageMeta) el.fileViewerImageMeta.textContent = 'Loading screenshot...';
@@ -1944,6 +2325,42 @@ function renderInlineArtifactCards(logs = []) {
   return `<div class="inline-artifacts">${cards}</div>`;
 }
 
+function renderAssistantResponseImages(images = [], conversationId = '') {
+  const safeImages = (Array.isArray(images) ? images : [])
+    .filter(image => image && (image.path || (image.data && image.mimeType)))
+    .slice(0, 4);
+  if (!safeImages.length) return '';
+  const rendered = safeImages.map(image => {
+    const alt = escapeHtml(image.alt || 'Orion screenshot');
+    const caption = image.caption ? `<figcaption>${escapeHtml(image.caption)}</figcaption>` : '';
+    if (image.data && image.mimeType) {
+      return `<figure class="assistant-response-image"><img src="data:${escapeHtml(image.mimeType)};base64,${image.data}" alt="${alt}">${caption}</figure>`;
+    }
+    return `<figure class="assistant-response-image"><img data-assistant-image-path="${escapeHtml(image.path)}" data-assistant-image-workspace="${escapeHtml(image.workspacePath || '')}" data-assistant-image-conversation="${escapeHtml(image.sourceConversationId || conversationId)}" alt="${alt}">${caption}</figure>`;
+  }).join('');
+  return `<div class="assistant-response-images">${rendered}</div>`;
+}
+
+function hydrateAssistantResponseImages(container) {
+  if (!container || !window.api || typeof window.api.readWorkspaceFileBase64 !== 'function') return;
+  container.querySelectorAll('img[data-assistant-image-path]').forEach(image => {
+    if (image.dataset.loading === 'true' || image.getAttribute('src')) return;
+    image.dataset.loading = 'true';
+    const imagePath = image.getAttribute('data-assistant-image-path') || '';
+    const workspacePath = image.getAttribute('data-assistant-image-workspace') || currentWorkspace || '';
+    const conversationId = image.getAttribute('data-assistant-image-conversation') || '';
+    window.api.readWorkspaceFileBase64(workspacePath, imagePath, conversationId).then(file => {
+      if (!file || file.success === false || !file.data || !String(file.mimeType || '').startsWith('image/')) {
+        image.closest('.assistant-response-image')?.classList.add('image-load-failed');
+        return;
+      }
+      image.src = `data:${file.mimeType};base64,${file.data}`;
+    }).catch(() => {
+      image.closest('.assistant-response-image')?.classList.add('image-load-failed');
+    });
+  });
+}
+
 function wireInlineArtifactOpeners(container) {
   if (!container) return;
   container.querySelectorAll('[data-open-artifact]').forEach(button => {
@@ -1982,6 +2399,11 @@ function setFileViewerMode(mode) {
 
 function closeFileViewer() {
   viewedFilePath = '';
+  fileViewerImageFitWidth = 0;
+  fileViewerImageFitHeight = 0;
+  setFileViewerImageZoom(1);
+  if (el.fileViewerImage) el.fileViewerImage.removeAttribute('src');
+  if (el.btnFileViewerMention) el.btnFileViewerMention.hidden = false;
   setFileViewerMode('text');
   if (el.fileViewerModal) el.fileViewerModal.classList.remove('active');
 }
@@ -2057,6 +2479,25 @@ function setupChatHandlers() {
   if (el.btnAddConversationCoder) {
     el.btnAddConversationCoder.addEventListener('click', () => createNewConversation('coder'));
   }
+  if (el.btnAddConversationOperator) {
+    el.btnAddConversationOperator.addEventListener('click', () => createNewConversation('operator'));
+  }
+  if (el.btnNewConversationOperator) {
+    el.btnNewConversationOperator.addEventListener('click', () => createNewConversation('operator'));
+  }
+
+  // Item 9 (UI polish): sidebar conversation search, one plain substring filter per mode.
+  [
+    { input: el.conversationSearchOrion, mode: 'orion' },
+    { input: el.conversationSearchCoder, mode: 'coder' },
+    { input: el.conversationSearchOperator, mode: 'operator' }
+  ].forEach(({ input, mode }) => {
+    if (!input) return;
+    input.addEventListener('input', () => {
+      conversationSearchQueries[mode] = input.value;
+      renderConversationList();
+    });
+  });
   if (el.btnNewConversationCoder && el.newConvPickerMenu) {
     const closePicker = () => { el.newConvPickerMenu.hidden = true; };
     const openPicker = () => {
@@ -2099,10 +2540,18 @@ function setupChatHandlers() {
   // Model Select changes default
   el.modelSelect.addEventListener('change', async () => {
     const val = el.modelSelect.value;
-    appConfig.defaultModel = val;
-    localStorage.setItem('ag2_default_model', val);
-    await window.api.writeConfig(appConfig);
+    const result = await setModelPreferenceSelection(val);
+    if (!result.success) showToast(result.error || 'Could not save model selection.', 'error');
   });
+
+  // Reasoning level select — sticky per-answer override beside the model select
+  if (el.reasoningSelect) {
+    el.reasoningSelect.addEventListener('change', () => {
+      window.setReasoningEffortSelection(el.reasoningSelect.value).then(result => {
+        if (!result.success) showToast(result.error || 'Could not save reasoning selection.', 'error');
+      });
+    });
+  }
 }
 
 function triggerSteer() {
@@ -2128,7 +2577,7 @@ function structuredWorkspaceForConversation(conv, explicitPath = '') {
   const workspacePath = String(explicitPath || (conv && (conv.workspace || conv.projectPath || conv.dispatchProjectPath)) || '').trim();
   if (!RendererWorkspaceResolution) {
     return {
-      role: workspacePath ? (mode === 'coder' ? 'standalone_coder' : 'active_project') : 'unresolved',
+      role: workspacePath ? ((mode === 'coder' || mode === 'operator') ? 'standalone_specialist' : 'active_project') : 'unresolved',
       path: workspacePath,
       project: { name: workspacePath.split(/[\\/]/).pop() || '', path: (conv && (conv.projectPath || conv.dispatchProjectPath)) || '' },
       source: 'legacy',
@@ -2158,6 +2607,7 @@ function structuredWorkspaceForConversation(conv, explicitPath = '') {
 
 function taskContextMessages(conv) {
   return (conv && Array.isArray(conv.messages) ? conv.messages : [])
+    .filter(isConversationMessageVisible)
     .filter(message => message && ['user', 'assistant', 'model', 'orion'].includes(String(message.role || '').toLowerCase()))
     .slice(-16)
     .map(message => ({
@@ -2187,6 +2637,81 @@ function persistTaskClarification(conv, clarification) {
   }
 }
 
+function clearCurrentTurnTaskResolutionClarifications(conv) {
+  if (!conv || !Array.isArray(conv.messages)) return 0;
+  let latestUserIndex = -1;
+  for (let index = conv.messages.length - 1; index >= 0; index--) {
+    if (String(conv.messages[index] && conv.messages[index].role || '').toLowerCase() === 'user') {
+      latestUserIndex = index;
+      break;
+    }
+  }
+  if (latestUserIndex < 0) return 0;
+  const before = conv.messages.length;
+  conv.messages = conv.messages.filter((message, index) => !(
+    index > latestUserIndex
+    && message
+    && message.source === 'task-resolution-clarification'
+  ));
+  const removed = before - conv.messages.length;
+  if (removed > 0 && typeof window.markConversationDirty === 'function') {
+    window.markConversationDirty(conv.id);
+  }
+  return removed;
+}
+
+function captureTaskExecutionProfile(options = {}, existingTask = null) {
+  const persisted = existingTask && existingTask.executionProfile && typeof existingTask.executionProfile === 'object'
+    ? existingTask.executionProfile
+    : null;
+  if (persisted && RendererTaskOrchestration) {
+    return RendererTaskOrchestration.normalizeExecutionProfile(persisted, {
+      capturedAt: existingTask.createdAt || Date.now()
+    });
+  }
+  const supplied = options.executionProfile && typeof options.executionProfile === 'object'
+    ? options.executionProfile
+    : {};
+  const selectedModel = String(
+    supplied.requestedModel
+    || options.modelSelectValue
+    || (window.getSelectedModel && window.getSelectedModel())
+    || (el.modelSelect && el.modelSelect.value)
+    || ''
+  ).trim();
+  const selectedReasoning = String(
+    supplied.requestedReasoning
+    || options.reasoningEffort
+    || appConfig.reasoningEffort
+    || 'auto'
+  ).trim().toLowerCase() || 'auto';
+  return RendererTaskOrchestration
+    ? RendererTaskOrchestration.normalizeExecutionProfile({
+        ...supplied,
+        requestedModel: selectedModel,
+        requestedReasoning: selectedReasoning,
+        capturedAt: supplied.capturedAt || Date.now()
+      })
+    : {
+        requestedModel: selectedModel,
+        requestedReasoning: selectedReasoning,
+        allowEscalation: supplied.allowEscalation !== false,
+        allowDowngrade: supplied.allowDowngrade === true,
+        capturedAt: supplied.capturedAt || Date.now()
+      };
+}
+
+function queueExecutionFields(task, options = {}) {
+  const executionProfile = captureTaskExecutionProfile(options, task);
+  return {
+    executionProfile,
+    modelSelectValue: executionProfile.requestedModel
+      || options.modelSelectValue
+      || (el.modelSelect && el.modelSelect.value),
+    reasoningEffort: executionProfile.requestedReasoning || 'auto'
+  };
+}
+
 async function enqueueOrchestrationTask(options = {}) {
   if (!RendererTaskOrchestration || !window.api || typeof window.api.createOrchestrationTask !== 'function') {
     return { success: false, error: 'Durable task orchestration is unavailable.' };
@@ -2205,6 +2730,7 @@ async function enqueueOrchestrationTask(options = {}) {
   const workspace = options.workspace && typeof options.workspace === 'object'
     ? options.workspace
     : structuredWorkspaceForConversation(originConv, options.workspacePath || '');
+  const executionProfile = captureTaskExecutionProfile(options);
   const packetResult = RendererTaskOrchestration.buildTaskPacket({
     originalUserMessage,
     resolvedObjective: options.resolvedObjective || '',
@@ -2227,9 +2753,13 @@ async function enqueueOrchestrationTask(options = {}) {
       sessionId: String(options.targetSessionId || targetConv.sessionId || targetConversationId),
       mode: conversationMode(targetConv)
     },
+    parentTaskId: String(options.parentTaskId || ''),
+    rootOriginConversationId: String(options.rootOriginConversationId || originConversationId),
     source: options.source || 'user-queue',
     images: Array.isArray(options.images) ? options.images : [],
     contextPacketIds: Array.isArray(options.contextPacketIds) ? options.contextPacketIds : [],
+    executionProfile,
+    executionSurface: options.executionSurface || (semanticIntent && semanticIntent.executionSurface) || 'none',
     semanticIntent,
     timestamp: options.createdAt || Date.now()
   });
@@ -2250,13 +2780,14 @@ async function enqueueOrchestrationTask(options = {}) {
     orchestrationTaskCache.set(task.taskId, task);
     const runtimePrompt = RendererTaskOrchestration.renderTaskPrompt(task);
     window.promptQueue = Array.isArray(window.promptQueue) ? window.promptQueue : [];
+    const executionFields = queueExecutionFields(task, options);
     queueItem = {
       id: options.queueId || createQueuedPromptId(),
       taskId: task.taskId,
       prompt: runtimePrompt,
       originalUserMessage: task.originalUserMessage,
       taskTitle: task.title,
-      modelSelectValue: options.modelSelectValue || (el.modelSelect && el.modelSelect.value),
+      ...executionFields,
       conversationId: targetConversationId,
       originConversationId,
       source: options.source || task.source,
@@ -2317,13 +2848,14 @@ async function enqueueOrchestrationTask(options = {}) {
     const retainedTask = rollbackTask && rollbackTask.status !== 'cancelled' ? rollbackTask : task;
     orchestrationTaskCache.set(retainedTask.taskId, retainedTask);
     if (!queueItem) {
+      const executionFields = queueExecutionFields(retainedTask, options);
       queueItem = {
         id: options.queueId || createQueuedPromptId(),
         taskId: retainedTask.taskId,
         prompt: retainedTask.objective || retainedTask.originalUserMessage || originalUserMessage,
         originalUserMessage: retainedTask.originalUserMessage || originalUserMessage,
         taskTitle: retainedTask.title || options.title || 'Queued task',
-        modelSelectValue: options.modelSelectValue || (el.modelSelect && el.modelSelect.value),
+        ...executionFields,
         conversationId: targetConversationId,
         originConversationId,
         source: options.source || retainedTask.source || 'user-queue',
@@ -2381,20 +2913,45 @@ async function queueDispatchWorkForCoder(options = {}) {
     ...taskContextMessages(originConv).map(message => message.text),
     semanticIntent.resolvedRequest || originalUserMessage
   ].join('\n');
-  const workspace = await bindNamedProjectForSupervisor(originConv, contextText);
   const standaloneSystemWork = semanticIntent.standaloneSystemOperation === true;
-  const standalone = standaloneSystemWork && workspace.role !== 'active_project';
+  const workspace = standaloneSystemWork
+    ? structuredWorkspaceForConversation(originConv)
+    : await bindNamedProjectForSupervisor(originConv, contextText);
+  const hasConcreteWorkspace = workspace.role === 'active_project' || workspace.role === 'standalone_specialist';
+  const standalone = standaloneSystemWork || (!hasConcreteWorkspace
+    && RendererSemanticIntentRouter
+    && RendererSemanticIntentRouter.canUseStandaloneCoderWorkspace(semanticIntent));
+  let standaloneWorkspacePath = '';
+  if (standalone) {
+    if (standaloneSystemWork) {
+      try {
+        const homeDir = await window.api.getHomeDir();
+        standaloneWorkspacePath = typeof homeDir === 'string' ? homeDir.trim() : '';
+      } catch (_) {}
+    } else {
+      const standaloneTitle = String(
+        options.title
+        || semanticIntent.taskResolution && semanticIntent.taskResolution.title
+        || semanticIntent.resolvedRequest
+        || originalUserMessage
+      ).trim();
+      standaloneWorkspacePath = getStandaloneWorkspaceForTitle(
+        standaloneTitle,
+        `handoff_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+      );
+    }
+  }
   const taskWorkspace = standalone
     ? {
-        role: 'standalone_coder',
-        path: getDispatchWorkspaceRoot(),
+        role: 'standalone_specialist',
+        path: standaloneWorkspacePath || getDispatchWorkspaceRoot(),
         project: { name: '', path: '' },
-        source: 'standalone-system-task',
+        source: standaloneSystemWork ? 'standalone-system-task' : 'standalone-coder-task',
         resolved: true
       }
     : workspace;
 
-  if (!standalone && taskWorkspace.role !== 'active_project' && taskWorkspace.role !== 'standalone_coder') {
+  if (!standalone && taskWorkspace.role !== 'active_project' && taskWorkspace.role !== 'standalone_specialist') {
     const reference = (RendererWorkspaceResolution.extractProjectReferences(contextText) || [])[0] || '';
     const clarification = reference
       ? `I could not resolve ${reference} to a specific project workspace. Which project folder should Coder use?`
@@ -2460,6 +3017,7 @@ async function queueDispatchWorkForCoder(options = {}) {
     unresolvedDecisions: packet.unresolvedDecisions,
     precedingConversationSummary: packet.precedingConversationSummary,
     semanticIntent,
+    standaloneSystemOperation: standaloneSystemWork,
     open: options.open === true
   });
   if (!promoted || promoted.success === false || !promoted.task) {
@@ -2554,7 +3112,10 @@ async function queueTaskContinuation(options = {}) {
         contextPacketIds: [
           ...(Array.isArray(existingTask.contextPacketIds) ? existingTask.contextPacketIds : []),
           ...(Array.isArray(options.contextPacketIds) ? options.contextPacketIds : [])
-        ]
+        ],
+        delegation: options.delegation && typeof options.delegation === 'object'
+          ? options.delegation
+          : existingTask.delegation
       });
       if (!updated || updated.success === false || !updated.task) {
         return {
@@ -2565,13 +3126,14 @@ async function queueTaskContinuation(options = {}) {
       existingTask = updated.task;
       orchestrationTaskCache.set(existingTask.taskId, existingTask);
     }
+    const executionFields = queueExecutionFields(existingTask, options);
     const queueItem = {
       id: createQueuedPromptId(),
       taskId: existingTask.taskId,
       prompt: continuationInput || RendererTaskOrchestration.renderTaskPrompt(existingTask),
       originalUserMessage: existingTask.originalUserMessage,
       taskTitle: existingTask.title,
-      modelSelectValue: options.modelSelectValue || (el.modelSelect && el.modelSelect.value),
+      ...executionFields,
       conversationId: targetConversationId,
       originConversationId: existingTask.origin && existingTask.origin.conversationId,
       source: options.source || 'task-continuation',
@@ -2649,13 +3211,15 @@ function startOrQueueTaskContinuation(continuation, conv, options = {}) {
     .filter(item => item && item.taskId !== taskId);
   const runPromise = window.runAgentLoop(
     continuation.queueItem.prompt,
-    options.modelSelectValue || window.getSelectedModel(),
+    continuation.queueItem.modelSelectValue || options.modelSelectValue || window.getSelectedModel(),
     conv,
     {
       source: options.source || continuation.queueItem.source || 'task-continuation',
       internalPrompt: true,
       preserveUserPrompt: !!continuation.queueItem.preserveUserPrompt,
       taskId,
+      reasoningEffort: continuation.queueItem.reasoningEffort,
+      executionProfile: continuation.queueItem.executionProfile,
       images: continuation.queueItem.images || [],
       contextPacketIds: continuation.queueItem.contextPacketIds || [],
       planRevision: continuation.queueItem.planRevision === true
@@ -2682,11 +3246,70 @@ function startOrQueueTaskContinuation(continuation, conv, options = {}) {
 }
 window.startOrQueueTaskContinuation = startOrQueueTaskContinuation;
 
+// Phase 3 (restart/recovery, item 12): populated by initializeOrchestrationTasks when a process
+// lease from an interrupted task is confirmed still alive after restart. Keyed by taskId, consumed
+// (and cleared) the first time notifySupervisorOfCoderCompletion/OfOperatorCompletion reports that
+// task, so the user is told the difference between "this task failed and left nothing behind" and
+// "this task failed, but the process it started may still be running."
+const interruptedTaskLivenessNotes = new Map();
+
+// Phase 3 (restart/recovery, item 12). The task store's own reconcileInterrupted already marks any
+// task that was ACTIVE when the app last stopped as FAILED unconditionally — safe, but dumb: it
+// cannot tell "this task's background process crashed with the app" from "this task's background
+// process is still out there running." This function is the smarter half. It takes the just-
+// reconciled tasks, asks the lease store which of them left a process lease behind (see
+// lib/resource-lease-store.js's reconcileInterrupted — desktop/browser/workspace leases are
+// released immediately there since none of those can survive a restart, but process leases are
+// flagged instead of resolved), actually checks whether each flagged PID is still alive via a raw
+// OS probe (lib/ipc-shell.js's isProcessAlive, which works even though the in-memory command-
+// session registry itself was wiped by the restart), and records a note for any task whose process
+// is confirmed still running so the eventual completion notification can say so instead of
+// silently treating the workspace as clean.
+async function reconcileResourceLeasesAfterRestart(taskReconciliation) {
+  if (!window.api || typeof window.api.reconcileResourceLeases !== 'function') return;
+  try {
+    const reconciledTasks = (taskReconciliation && Array.isArray(taskReconciliation.tasks)) ? taskReconciliation.tasks : [];
+    const interruptedTaskIds = reconciledTasks
+      .filter(task => task && task.failure && task.failure.code === 'interrupted')
+      .map(task => task.taskId)
+      .filter(Boolean);
+    const leaseReconciliation = await window.api.reconcileResourceLeases({ interruptedTaskIds });
+    const flagged = (leaseReconciliation && Array.isArray(leaseReconciliation.flaggedForLivenessCheck))
+      ? leaseReconciliation.flaggedForLivenessCheck
+      : [];
+    for (const lease of flagged) {
+      let stillAlive = false;
+      if (typeof window.api.checkProcessAlive === 'function') {
+        for (const pid of (lease.processIds || [])) {
+          try {
+            const checked = await window.api.checkProcessAlive(pid);
+            if (checked && checked.alive) { stillAlive = true; break; }
+          } catch (error) {
+            console.error('Could not check process liveness during restart recovery:', error);
+          }
+        }
+      }
+      if (typeof window.api.resolveResourceLeaseLiveness === 'function') {
+        await window.api.resolveResourceLeaseLiveness({ resourceKey: lease.resourceKey, stillAlive });
+      }
+      if (stillAlive && lease.taskId) {
+        interruptedTaskLivenessNotes.set(
+          lease.taskId,
+          'A background process this task started may still be running (confirmed alive after restart) — check before starting another one in the same workspace.'
+        );
+      }
+    }
+  } catch (error) {
+    console.error('Could not reconcile resource leases after restart:', error);
+  }
+}
+
 async function initializeOrchestrationTasks() {
   if (!window.api || typeof window.api.listOrchestrationTasks !== 'function') return;
   try {
     await window.api.migrateOrchestrationTasks?.();
-    await window.api.reconcileOrchestrationTasks?.({ reason: 'Orion restarted before the active task recorded a terminal result.' });
+    const taskReconciliation = await window.api.reconcileOrchestrationTasks?.({ reason: 'Orion restarted before the active task recorded a terminal result.' });
+    await reconcileResourceLeasesAfterRestart(taskReconciliation);
     const listed = await window.api.listOrchestrationTasks({ sort: 'desc' });
     const tasks = listed && Array.isArray(listed.tasks) ? listed.tasks : [];
     tasks.forEach(task => {
@@ -2703,6 +3326,23 @@ async function initializeOrchestrationTasks() {
         }
       }
     }
+    // Repair specialist chains that became terminal while the renderer was unavailable, including
+    // schema-v3 children that stored the exact child receipt only on their parent. Without this
+    // startup sweep, a completed child could remain stranded forever because its one live
+    // finalization callback had already been missed before Orion restarted.
+    const delegatedChildIds = new Set(tasks
+      .map(task => String(task && task.delegation && task.delegation.childTaskId || ''))
+      .filter(Boolean));
+    for (const task of tasks.filter(candidate =>
+      candidate
+      && ['completed', 'failed', 'cancelled'].includes(String(candidate.status || ''))
+      && (String(candidate.parentTaskId || '') || delegatedChildIds.has(String(candidate.taskId || '')))
+    )) {
+      const resumed = await resumeParentTaskAfterDelegatedChild(task);
+      if (!resumed || resumed.success === false) {
+        console.error('Could not reconcile a terminal delegated task during startup:', resumed && resumed.error);
+      }
+    }
     conversations.forEach(conversation =>
       scheduleTerminalDelegatedTaskReconciliation(conversation, orchestrationTaskCache)
     );
@@ -2715,6 +3355,7 @@ async function initializeOrchestrationTasks() {
       const automaticCheckpoint = String(
         task.execution && task.execution.resumePolicy || ''
       ).toLowerCase() === 'automatic';
+      const executionFields = queueExecutionFields(task);
       window.promptQueue.push({
         id: createQueuedPromptId(),
         taskId: task.taskId,
@@ -2722,6 +3363,7 @@ async function initializeOrchestrationTasks() {
           || RendererTaskOrchestration.renderTaskPrompt(task),
         originalUserMessage: task.originalUserMessage,
         taskTitle: task.title,
+        ...executionFields,
         conversationId: targetId,
         originConversationId: task.origin && task.origin.conversationId,
         source: automaticCheckpoint ? 'system' : (task.source || 'restored-queue'),
@@ -3015,12 +3657,23 @@ async function classifyCurrentConversationIntent(conv, prompt, options = {}) {
           }
         : null);
   const boundTask = activeOwnedTask || pendingOwnedTask;
+  const recentVisibleConversation = taskContextMessages(conv);
+  // Resolve an explicitly named project before asking the semantic model what the turn means.
+  // Otherwise a Dispatch conversation that was last attached to Project A can make an unambiguous
+  // request about Project B look contradictory, and the classifier will repeatedly ask the user to
+  // choose a target that the visible conversation already identified.
+  const semanticWorkspace = conv && conversationMode(conv) === 'orion'
+    ? bindNamedProjectForSupervisor(conv, [
+        ...recentVisibleConversation.map(message => message && (message.text || message.content || '')),
+        prompt
+      ].filter(Boolean).join('\n'))
+    : (conv ? structuredWorkspaceForConversation(conv) : null);
   const classification = await window.classifySemanticIntent({
     userMessage: prompt,
-    recentVisibleConversation: taskContextMessages(conv),
+    recentVisibleConversation,
     conversationId: conv && conv.id,
     mode: conv && conversationMode(conv),
-    workspace: conv ? structuredWorkspaceForConversation(conv) : null,
+    workspace: semanticWorkspace,
     pendingPlan,
     activeOwnedTask,
     pendingOwnedTask,
@@ -3079,20 +3732,7 @@ window.cancelOwnedOrchestrationTask = async function(taskId, requesterConversati
     && String(originConv.launchedCoderTaskId || '') === String(taskId)
   );
   if (originConv && cancelledLaunchedTask) {
-    originConv.lastDelegatedWork = {
-      taskId,
-      coderConversationId: targetId || '',
-      title: result.task.title,
-      projectPath: result.task.workspacePath || '',
-      status: 'cancelled',
-      subStatus: 'Cancelled',
-      startedAt: result.task.startedAt || 0,
-      completedAt: result.task.cancelledAt || Date.now(),
-      pendingCount: 0
-    };
-    originConv.launchedCoderConvId = null;
-    originConv.launchedCoderTaskId = null;
-    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(originConv.id);
+    reconcileDelegatedTaskCancellation(originConv, result.task, originConv.launchedTaskRole || 'coder');
   }
   saveConversationsToStorage();
   renderDesktopDispatchLanding();
@@ -3521,6 +4161,8 @@ function sendQueuedPromptNow(queueId, conversationId) {
   window.runAgentLoop(item.prompt, item.modelSelectValue || (el.modelSelect && el.modelSelect.value), conv, {
     source: item.source || 'queue',
     taskId: item.taskId || '',
+    reasoningEffort: item.reasoningEffort,
+    executionProfile: item.executionProfile,
     ...(queuedImages.length ? { images: queuedImages } : {})
   }).catch(error => {
     console.error('Queued prompt send-now run failed:', error);
@@ -3538,7 +4180,11 @@ function markQueuedPromptRunning(queueId, conversationId) {
 // mode from projectPath (only Coder ever had projects), so old data keeps behaving as before.
 function conversationMode(conv) {
   if (!conv) return 'orion';
-  if (conv.mode === 'orion' || conv.mode === 'coder') return conv.mode;
+  // Phase 3 of the Operator architecture plan: an explicitly-tagged operator conversation is
+  // recognized directly, the same way 'orion'/'coder' already are, rather than falling through to
+  // the projectPath-presence guess below (which predates operator and only distinguishes Coder
+  // from Dispatch).
+  if (conv.mode === 'orion' || conv.mode === 'coder' || conv.mode === 'operator') return conv.mode;
   return conv.projectPath ? 'coder' : 'orion';
 }
 
@@ -3555,7 +4201,7 @@ function compactDispatchDiscussionText(value, fallback = '') {
 function deriveDispatchDiscussionSummary(conv) {
   if (!conv) return '';
   if (conv.dispatchDiscussionSummary) return compactDispatchDiscussionText(conv.dispatchDiscussionSummary, conv.title);
-  const messages = Array.isArray(conv.messages) ? conv.messages : [];
+  const messages = Array.isArray(conv.messages) ? conv.messages.filter(isConversationMessageVisible) : [];
   const latestUser = [...messages].reverse().find(message => normalizeConversationMessageRole(message) === 'user');
   return compactDispatchDiscussionText(
     latestUser ? extractConversationMessageText(latestUser) : '',
@@ -3637,7 +4283,7 @@ function startDispatchDraft(options = {}) {
 }
 
 async function createNewConversation(mode = appMode) {
-  if (mode !== 'coder') {
+  if (mode === 'orion') {
     const focusResult = await window.beginNewFocus(activeConversationId);
     if (!focusResult || focusResult.success === false) {
       showToast('Could not cancel the pending work. The current focus was preserved.', 'error');
@@ -3646,13 +4292,17 @@ async function createNewConversation(mode = appMode) {
     startDispatchDraft();
     return null;
   }
+  // Coder and Operator both get a real standalone conversation record. Operator previously had
+  // no branch here at all, so calling this with 'operator' silently fell into the Dispatch-draft
+  // path above and produced an 'orion' conversation instead — item 10 of the Operator
+  // architecture plan.
   const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
   const title = 'New Conversation';
 
   const newConv = {
     id: newId,
     title: title,
-    mode: mode === 'coder' ? 'coder' : 'orion',
+    mode: mode === 'coder' || mode === 'operator' ? mode : 'orion',
     projectPath: '',
     workspace: '', // will slugify on first prompt
     messages: [],
@@ -3755,6 +4405,64 @@ function createStandaloneCoderConversation({ title = 'New Coder Task', workspace
   return newConv;
 }
 
+// Phase 3 piece 5 of the Operator architecture plan. Parallel to createCoderConversationForProject/
+// createStandaloneCoderConversation above rather than a shared parameterized helper: those two are
+// tiny and this keeps the 'operator' mode tag explicit at the literal call site instead of adding a
+// role parameter two functions have to thread through, for a pair this small.
+function createOperatorConversationForProject(projectPath, { title = 'New Operator Task', select = false } = {}) {
+  const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+  const newConv = {
+    id: newId,
+    title: title || 'New Operator Task',
+    mode: 'operator',
+    projectPath,
+    workspace: projectPath,
+    messages: [],
+    tasks: [],
+    testResults: null
+  };
+
+  conversations.unshift(newConv);
+  saveConversationsToStorage();
+
+  if (select) {
+    selectConversation(newId);
+    el.chatInput.focus();
+  } else {
+    renderConversationList();
+  }
+
+  return newConv;
+}
+
+function createStandaloneOperatorConversation({ title = 'New Operator Task', workspacePath = '', select = false } = {}) {
+  const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+  const resolvedWorkspace = String(workspacePath || '').trim()
+    || getStandaloneWorkspaceForTitle(title, newId);
+  const newConv = {
+    id: newId,
+    title: title || 'New Operator Task',
+    mode: 'operator',
+    projectPath: '',
+    workspace: resolvedWorkspace,
+    messages: [],
+    tasks: [],
+    testResults: null
+  };
+
+  conversations.unshift(newConv);
+  saveConversationsToStorage();
+
+  if (select) {
+    selectConversation(newId);
+    el.chatInput.focus();
+  } else {
+    renderConversationList();
+  }
+
+  return newConv;
+}
+
 function getStandaloneWorkspaceRoot() {
   const configured = (appConfig.standaloneWorkspaceRoot || '').trim();
   if (configured) return configured.replace(/[\\\/]+$/, '');
@@ -3826,14 +4534,16 @@ function getConversationRunWorkspace(conv) {
 
 function createPhoneConversation({ projectPath = '', dispatchProjectPath = '', contextSummary = '', mode = 'orion', title = 'New Phone Task' } = {}) {
   const convId = 'conv-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
+  const requestedMode = mode === 'coder' || mode === 'operator' ? mode : 'orion';
   const normalizedProjectPath = String(projectPath || '').trim();
-  const normalizedDispatchProjectPath = mode === 'orion' ? String(dispatchProjectPath || '').trim() : '';
+  const normalizedDispatchProjectPath = requestedMode === 'orion' ? String(dispatchProjectPath || '').trim() : '';
   const conv = {
     id: convId,
     title,
-    // A project conversation only ever belongs to Coder, regardless of what the phone's mode
-    // toggle happened to be set to when the request came in.
-    mode: normalizedProjectPath ? 'coder' : (mode === 'coder' ? 'coder' : 'orion'),
+    // Coder remains the default owner for a project selected from the phone's project picker.
+    // An explicit Operator request is different: Operator may be standalone or workspace-bound,
+    // so preserve that role instead of silently coercing it into Dispatch or Coder.
+    mode: requestedMode === 'operator' ? 'operator' : (normalizedProjectPath ? 'coder' : requestedMode),
     messages: [],
     createdAt: Date.now(),
     workspace: normalizedProjectPath || normalizedDispatchProjectPath || '',
@@ -3877,6 +4587,33 @@ function conversationMessageValue(conversation) {
     logCount += Array.isArray(logs) ? logs.length : 0;
   });
   return meaningfulAssistant * 100000 + logCount * 1000 + messages.length * 10;
+}
+
+// Item 9 (UI polish): the sidebar previously hardcoded every conversation's displayed age to the
+// literal string 'now', regardless of how old it actually was. conversationSortTime already
+// computes the best-available last-activity timestamp for a conversation (used for the >50
+// stub-eviction sort); this turns that same timestamp into the short relative label the list
+// actually needs.
+function formatRelativeConversationTime(timestampMs) {
+  const ts = Number(timestampMs) || 0;
+  if (!ts) return 'new';
+  const diffMs = Date.now() - ts;
+  if (diffMs < 0) return 'now'; // clock skew or a timestamp set slightly ahead - never show a negative age
+  const minute = 60 * 1000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  const week = 7 * day;
+  if (diffMs < minute) return 'now';
+  if (diffMs < hour) return `${Math.floor(diffMs / minute)}m`;
+  if (diffMs < day) return `${Math.floor(diffMs / hour)}h`;
+  if (diffMs < week) return `${Math.floor(diffMs / day)}d`;
+  if (diffMs < 5 * week) return `${Math.floor(diffMs / week)}w`;
+  // Beyond ~a month, a relative count stops being useful at a glance - a short date reads better.
+  const date = new Date(ts);
+  const sameYear = date.getFullYear() === new Date().getFullYear();
+  return sameYear
+    ? date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+    : date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
 function conversationSortTime(conversation) {
@@ -4002,8 +4739,19 @@ function scheduleTerminalDelegatedTaskReconciliation(conversation, durableTasks 
   if (String(task.target && task.target.conversationId || '') !== coderConversationId) return false;
   if (String(conversation._terminalTaskReconciliationScheduled || '') === taskId) return true;
   conversation._terminalTaskReconciliationScheduled = taskId;
+  // Route by the target conversation's own role rather than always assuming Coder - the same fix
+  // already applied to window.onOrchestrationTaskFinalized (Phase 3 piece 5) applies here too, for
+  // the separate startup-reconciliation path: a terminal Operator task discovered at startup
+  // (rather than during a live run) would otherwise still be reported as "Coder failed/completed."
+  const targetConv = conversations.find(c => c.id === coderConversationId);
+  const notifier = targetConv && conversationMode(targetConv) === 'operator'
+    ? notifySupervisorOfOperatorCompletion
+    : notifySupervisorOfCoderCompletion;
   Promise.resolve()
-    .then(() => notifySupervisorOfCoderCompletion(coderConversationId, taskId))
+    .then(async () => {
+      await notifier(coderConversationId, taskId);
+      await resumeParentTaskAfterDelegatedChild(task);
+    })
     .catch(error => console.error('Could not reconcile terminal delegated task presentation:', error))
     .finally(() => {
       if (String(conversation._terminalTaskReconciliationScheduled || '') === taskId) {
@@ -4132,7 +4880,11 @@ function migrateConversations() {
   }
 
   conversations.forEach(c => {
-    const hasExplicitMode = c.mode === 'orion' || c.mode === 'coder';
+    // Phase 3 of the Operator architecture plan: this runs on every load (unlike the one-time
+    // backfill above), so an operator-tagged conversation must count as already explicit here.
+    // Without this, the inference below would silently stomp c.mode back to 'coder'/'orion' on
+    // every single app start.
+    const hasExplicitMode = c.mode === 'orion' || c.mode === 'coder' || c.mode === 'operator';
     const matchingWorkspaceProject = (!c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace))
       ? projects.find(proj => {
         const lowerWorkspace = c.workspace.toLowerCase();
@@ -4169,7 +4921,7 @@ function migrateConversations() {
       c.projectPath = '';
       updated = true;
     }
-    if (conversationMode(c) === 'coder' && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)) {
+    if ((conversationMode(c) === 'coder' || conversationMode(c) === 'operator') && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)) {
       // Find if workspace is inside any project folder
       if (matchingWorkspaceProject) {
         c.projectPath = matchingWorkspaceProject;
@@ -4439,6 +5191,38 @@ function normalizeConversationMessageForReplay(msg) {
   };
 }
 
+function truncatePhoneTransportText(value, maxLength) {
+  const text = typeof value === 'string' ? value : (() => {
+    try { return JSON.stringify(value); } catch (_) { return String(value || ''); }
+  })();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength).trimEnd()}\n...[trimmed for phone transport]`;
+}
+
+function compactPhoneToolParams(params) {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) return {};
+  return Object.fromEntries(Object.entries(params).slice(0, 8).map(([key, value]) => [
+    key,
+    typeof value === 'string'
+      ? truncatePhoneTransportText(value, 500)
+      : truncatePhoneTransportText(value, 800)
+  ]));
+}
+
+function compactPhoneToolLogs(logs, limit = 8) {
+  return (Array.isArray(logs) ? logs : [])
+    .filter(log => log && (log.type === 'tool_call' || log.tool || (log.type === 'thought' && log.content)))
+    .slice(-limit)
+    .map(log => ({
+      type: log.type || 'tool_call',
+      content: truncatePhoneTransportText(log.content || '', 1200),
+      tool: log.tool || '',
+      status: log.status || 'running',
+      params: compactPhoneToolParams(log.params),
+      result: truncatePhoneTransportText(log.result || '', 2400)
+    }));
+}
+
 function scrubLegacyPhoneCompanionTokenMessages() {
   let updated = false;
   conversations.forEach(c => {
@@ -4684,11 +5468,13 @@ function confirmConversationDelete(title) {
 }
 
 function renderConversationList() {
-  // Dispatch (Orion) and Coder each keep their own standalone-conversation history -- a chat
-  // started in one never appears in the other's list, even though neither has a projectPath.
+  // Dispatch (Orion), Coder, and Operator each keep their own standalone-conversation history --
+  // a chat started in one never appears in another's list, even though none but Coder has a
+  // projectPath.
   const listConfigs = [
     { container: el.conversationList, mode: 'orion' },
-    { container: el.conversationListCoder, mode: 'coder' }
+    { container: el.conversationListCoder, mode: 'coder' },
+    { container: el.conversationListOperator, mode: 'operator' }
   ].filter(cfg => cfg.container);
   if (listConfigs.length === 0) return;
 
@@ -4698,31 +5484,46 @@ function renderConversationList() {
     const standaloneConversations = conversations.filter(c => {
       const convMode = conversationMode(c);
       if (convMode !== mode) return false;
-      return mode === 'orion' || !c.projectPath;
+      return mode !== 'coder' || !c.projectPath;
     });
 
-    if (standaloneConversations.length === 0) {
-      container.innerHTML = mode === 'orion'
-        ? '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No history yet</p>'
-        : '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No standalone conversations yet</p>';
+    const query = String((conversationSearchQueries && conversationSearchQueries[mode]) || '').trim().toLowerCase();
+    const visibleConversations = query
+      ? standaloneConversations.filter(c => String(c.title || '').toLowerCase().includes(query))
+      : standaloneConversations;
+
+    if (visibleConversations.length === 0) {
+      if (query) {
+        container.innerHTML = '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No conversations match your search</p>';
+      } else {
+        container.innerHTML = mode === 'orion'
+          ? '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No history yet</p>'
+          : '<p class="empty-state" style="font-size:0.75rem; font-style:italic;">No standalone conversations yet</p>';
+      }
       return;
     }
 
-    standaloneConversations.forEach(conv => {
+    visibleConversations.forEach(conv => {
       const item = document.createElement('div');
       item.className = `conversation-item ${conv.id === activeConversationId ? 'active' : ''}`;
 
-      const age = 'now';
+      const age = formatRelativeConversationTime(conversationSortTime(conv));
 
       item.innerHTML = `
         <div class="conversation-details row-details-flex">
           <span class="conversation-name">${escapeHtml(conv.title)}</span>
           <span class="conversation-time">${age}</span>
         </div>
+        <button class="rename-btn icon-btn-ghost icon-btn-spaced" title="Rename conversation">&#9998;</button>
         <button class="delete-btn icon-btn-ghost" title="Delete conversation">&times;</button>
       `;
 
       item.querySelector('.conversation-details').addEventListener('click', () => selectConversation(conv.id));
+
+      item.querySelector('.rename-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        renameConversation(conv.id);
+      });
 
       item.querySelector('.delete-btn').addEventListener('click', async (e) => {
         e.stopPropagation();
@@ -4735,6 +5536,24 @@ function renderConversationList() {
       container.appendChild(item);
     });
   });
+}
+
+// Item 9 (UI polish): manual rename. Distinct from the automatic first-message title generation
+// in the send-prompt flow -- that only fires while a conversation still has zero messages and its
+// default "New Conversation" title; this lets the user override the title at any point after.
+function renameConversation(id) {
+  const conv = conversations.find(c => c.id === id);
+  if (!conv) return;
+  const currentTitle = conv.title || 'New Conversation';
+  const newTitle = prompt('Rename conversation to:', currentTitle);
+  if (newTitle == null) return; // cancelled
+  const trimmed = newTitle.trim();
+  if (!trimmed || trimmed === currentTitle) return;
+  conv.title = trimmed.slice(0, 200);
+  conv.updatedAt = Date.now();
+  if (activeConversationId === id && el.chatTitle) el.chatTitle.textContent = conv.title;
+  renderConversationList();
+  if (typeof saveConversationsToStorage === 'function') saveConversationsToStorage();
 }
 
 async function selectConversation(id, options = {}) {
@@ -4853,7 +5672,9 @@ async function selectConversation(id, options = {}) {
     el.messagesContainer.style.display = 'flex';
     el.messagesContainer.innerHTML = '';
     
-    const replayMessages = conv.messages.map(normalizeConversationMessageForReplay);
+    const replayMessages = conv.messages
+      .filter(isConversationMessageVisible)
+      .map(normalizeConversationMessageForReplay);
     replayMessages.forEach(replayMsg => {
       const replayLogs = Array.isArray(replayMsg.logs) ? replayMsg.logs : [];
       window.clearActiveAiBubble();
@@ -4982,7 +5803,7 @@ async function submitMessage() {
   if (!conv.workspace) {
     if (conv.projectPath) {
       conv.workspace = conv.projectPath;
-    } else if (conversationMode(conv) === 'coder') {
+    } else if (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator') {
       conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id);
     }
   }
@@ -5280,7 +6101,7 @@ function renderUserMessage(text, images = [], timestamp = null) {
   const timeStr = formatMsgTime(timestamp || Date.now());
   const imgsHtml = (images && images.length)
     ? images.map(img =>
-        `<img src="data:${escapeHtml(img.mimeType)};base64,${img.data}" alt="attached image" `
+        `<img class="user-message-image" src="data:${escapeHtml(img.mimeType)};base64,${img.data}" alt="attached image" `
         `style="max-width:100%;max-height:280px;border-radius:8px;margin-top:8px;display:block;border:1px solid rgba(151,164,196,.15);">`
       ).join('')
     : '';
@@ -5292,6 +6113,7 @@ function renderUserMessage(text, images = [], timestamp = null) {
     <div class="message-body">${escapeHtml(text).replace(/\n/g, '<br>')}${imgsHtml}</div>
   `;
   sanitizeRenderedMarkdown(bubble);
+  wireChatImageOpeners(bubble);
   el.messagesContainer.appendChild(bubble);
   scrollChatToBottomIfNeeded(stickToBottom);
 }
@@ -5448,6 +6270,39 @@ function showPhoneCompanionPairingCard(payload = {}, options = {}) {
   removeLegacyPhoneCompanionTokenBubbles();
 }
 
+// Last push delivery result, recorded by agent.js after every run-end notification.
+//
+// Push failure had no visible symptom on the desktop: a phone that never subscribed and a phone
+// that got the notification looked identical from here, so "notifications don't work" could only
+// be diagnosed by reading source. notifyAllPhoneDevices already returns a precise reason
+// ("no subscribed phone devices", "web-push not available") — it was simply thrown away.
+let lastPhonePushOutcome = null;
+
+function describeLastPhonePush() {
+  if (!lastPhonePushOutcome) return '';
+  if (lastPhonePushOutcome.delivered) {
+    const count = lastPhonePushOutcome.sent || 1;
+    return ` Last push: delivered to ${count} device${count === 1 ? '' : 's'}.`;
+  }
+  const reason = String(lastPhonePushOutcome.reason || '').trim();
+  // "no subscribed phone devices" is the signature of an insecure origin: the companion page
+  // refuses to subscribe outside a secure context, so nothing ever registered.
+  const hint = /no subscribed phone devices/i.test(reason)
+    ? ' The phone has not subscribed — open the companion over its HTTPS URL and allow notifications.'
+    : '';
+  return ` Last push FAILED${reason ? `: ${reason}` : ''}.${hint}`;
+}
+
+function updatePhonePushDiagnostic(outcome) {
+  lastPhonePushOutcome = outcome || null;
+  // Re-render just the meta line; a full panel refresh would need a fresh pairing payload.
+  if (el.phoneCompanionMeta && el.phoneCompanionMeta.textContent) {
+    const base = el.phoneCompanionMeta.textContent.replace(/ Last push[^]*$/, '');
+    el.phoneCompanionMeta.textContent = `${base}${describeLastPhonePush()}`;
+  }
+}
+window.updatePhonePushDiagnostic = updatePhonePushDiagnostic;
+
 function updatePhoneCompanionPairingPanel(payload = {}) {
   const pairUrl = String(payload.pairUrl || '');
   const networkEnabled = payload.networkEnabled !== false && !!pairUrl;
@@ -5474,7 +6329,7 @@ function updatePhoneCompanionPairingPanel(payload = {}) {
         ? 'HTTPS enabled for phone notifications.'
         : secureUnavailable
           ? 'The configured HTTPS route is unavailable, so Orion is using a reachable direct route without discarding paired access.'
-          : 'Live view only; add an HTTPS phone URL in Settings for mobile notifications.'}`
+          : 'Live view only; add an HTTPS phone URL in Settings for mobile notifications.'}${describeLastPhonePush()}`
       : 'LAN companion mode is disabled by default. No localhost QR is shown for phones.';
   }
   // Tailscale panel: show/hide the Tailscale QR block inside the pairing panel
@@ -5744,6 +6599,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     ? (typeof marked !== 'undefined' ? marked.parse(bodyText) : escapeHtml(bodyText))
     : '';
   const inlineArtifactsHtml = renderInlineArtifactCards(logs);
+  const responseImagesHtml = renderAssistantResponseImages(msgMeta && msgMeta.images, targetId);
   
   let runningIndicatorHtml = '';
   let planApprovalHtml = '';
@@ -5821,9 +6677,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     }
     
     const executionMode = window.getAgentExecutionMode ? window.getAgentExecutionMode() : 'planning';
-    const statusLabel = isApproved || executionMode === 'direct' || executionMode === 'executing' || executionMode === 'answer'
-      ? `Working (Step ${stepNum})...`
-      : `Preparing implementation plan (Step ${stepNum})...`;
+    const statusLabel = buildAgentStatusLabel(executionMode, stepNum, isApproved);
       
     const subStatus = window.getAgentSubStatus ? window.getAgentSubStatus() : '';
     const displayLabel = subStatus ? `${statusLabel} — ${subStatus}` : statusLabel;
@@ -5853,6 +6707,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     ${logsHtml}
     <div class="message-body">
       ${renderedMarkdown}
+      ${responseImagesHtml}
       ${walkthroughHtml}
       ${inlineArtifactsHtml}
       ${clarificationHtml}
@@ -5861,6 +6716,8 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     </div>
   `;
   sanitizeRenderedMarkdown(bubble);
+  hydrateAssistantResponseImages(bubble);
+  wireChatImageOpeners(bubble);
 
   // Format code blocks
   if (isNew) {
@@ -6182,10 +7039,37 @@ async function runRegressionTests() {
   const result = await window.api.runCommand(getEffectiveTestCommand(), currentWorkspace, processId, appConfig.commandTimeoutMs || 120000);
   cleanListener();
   
-  const success = result.code === 0;
+  // `result.code === 0` alone collapsed four very different outcomes into "tests failed":
+  // a genuine failure, a timeout, a killed process, and a runner that never started. The agent
+  // saw `{success:false, output:"........"}` — passing pytest dots with no explanation — and
+  // could not tell "my change broke tests" from "the command never ran", so it re-ran tests
+  // through run_command instead of trusting its own tool.
+  const exitCode = result.code;
+  const neverRan = !!result.error || exitCode === null || exitCode === undefined;
+  const success = exitCode === 0 && !result.timedOut && !result.killed && !result.error;
+
+  let outcome = 'passed';
+  if (result.timedOut) outcome = 'timed_out';
+  else if (result.killed) outcome = 'killed';
+  else if (neverRan) outcome = 'did_not_run';
+  else if (!success) outcome = 'failed';
+
+  const command = getEffectiveTestCommand();
+  const diagnosis = {
+    passed: '',
+    failed: `The test command exited with code ${exitCode}. This is a real test failure — read the output above.`,
+    timed_out: `The test command did not finish within ${appConfig.commandTimeoutMs || 120000}ms and was stopped. This is NOT a test failure; the suite may just be slow, or the command may be waiting on input.`,
+    killed: 'The test process was stopped before it finished. This is NOT a test failure.',
+    did_not_run: `The test command could not be run${result.error ? ` (${result.error})` : ''}. This is NOT a test failure — check that \`${command}\` is the right command for this workspace.`
+  }[outcome];
+
   const testRunInfo = {
-    output: testOutput || result.error || `Exit code: ${result.code}`,
-    success: success,
+    output: [testOutput, diagnosis].filter(Boolean).join('\n\n') || `Exit code: ${exitCode}`,
+    success,
+    outcome,
+    ranToCompletion: !neverRan && !result.timedOut && !result.killed,
+    exitCode: exitCode === undefined ? null : exitCode,
+    command,
     timedOut: !!result.timedOut,
     timestamp: Date.now()
   };
@@ -6360,10 +7244,12 @@ async function submitClarificationAnswers({ button, bubble, targetConversationId
       return;
     }
     window.promptQueue = window.promptQueue.filter(item => item.taskId !== continuation.task.taskId);
-    window.runAgentLoop(continuation.queueItem.prompt, el.modelSelect.value, coderConv, {
+    window.runAgentLoop(continuation.queueItem.prompt, continuation.queueItem.modelSelectValue || el.modelSelect.value, coderConv, {
       source: 'clarification-answers',
       internalPrompt: true,
       taskId: continuation.task.taskId,
+      reasoningEffort: continuation.queueItem.reasoningEffort,
+      executionProfile: continuation.queueItem.executionProfile,
       images: continuation.queueItem.images || [],
       contextPacketIds: continuation.queueItem.contextPacketIds || []
     }).catch(err => console.error('Proxied clarification resume failed:', err));
@@ -6410,10 +7296,12 @@ async function submitClarificationAnswers({ button, bubble, targetConversationId
     return;
   }
   window.promptQueue = window.promptQueue.filter(item => item.taskId !== continuation.task.taskId);
-  window.runAgentLoop(continuation.queueItem.prompt, el.modelSelect.value, conv, {
+  window.runAgentLoop(continuation.queueItem.prompt, continuation.queueItem.modelSelectValue || el.modelSelect.value, conv, {
     source: 'clarification-answers',
     internalPrompt: true,
     taskId: continuation.task.taskId,
+    reasoningEffort: continuation.queueItem.reasoningEffort,
+    executionProfile: continuation.queueItem.executionProfile,
     images: continuation.queueItem.images || [],
     contextPacketIds: continuation.queueItem.contextPacketIds || []
   }).catch(err => console.error('Clarification resume failed:', err));
@@ -6443,7 +7331,7 @@ window.changeActiveWorkspace = function(folderPath, options = {}) {
     if (conv) {
       conv.workspace = folderPath;
       targetMode = conversationMode(conv);
-      const promoteProject = options.promoteProject === true || (options.promoteProject !== false && conversationMode(conv) === 'coder');
+      const promoteProject = options.promoteProject === true || (options.promoteProject !== false && (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator'));
       promoteProjectForWorkspace = promoteProject;
       if (promoteProject) {
         conv.projectPath = folderPath;
@@ -6471,25 +7359,47 @@ window.changeActiveWorkspace = function(folderPath, options = {}) {
 };
 window.promoteWorkspaceToCoder = async function(options = {}) {
   const standalone = options.standalone === true;
-  const folderPath = String(
-    options.path
-    || currentWorkspace
-    || (standalone ? getDispatchWorkspaceRoot() : '')
-  ).trim();
-  if (!folderPath) return { success: false, error: 'No workspace path to promote.' };
   const prompt = String(options.prompt || '').trim();
   const originalUserMessage = String(options.originalUserMessage || prompt).trim();
   const title = String(options.title || '').trim()
     || (prompt ? generateConversationTitle(prompt) : 'New Coder Task');
   const originConv = conversations.find(item => item.id === String(options.sourceConversationId || ''));
+  const specialistDelegation = !!String(options.parentTaskId || '');
+  const coderTaskSource = specialistDelegation ? 'specialist-coder-handoff' : 'dispatch-handoff';
+  if (originConv) clearCurrentTurnTaskResolutionClarifications(originConv);
   const semanticIntent = options.semanticIntent || (originConv && prompt
     ? await classifyCurrentConversationIntent(originConv, originalUserMessage, { model: options.modelSelectValue })
     : null);
+  const standaloneSystemOperation = standalone && (
+    options.standaloneSystemOperation === true
+    || !!(semanticIntent && semanticIntent.standaloneSystemOperation)
+  );
+  let standaloneWorkspacePath = '';
+  if (standalone) {
+    if (standaloneSystemOperation) {
+      try {
+        const homeDir = await window.api.getHomeDir();
+        standaloneWorkspacePath = typeof homeDir === 'string' ? homeDir.trim() : '';
+      } catch (_) {}
+    } else {
+      standaloneWorkspacePath = String(options.path || '').trim()
+        || getStandaloneWorkspaceForTitle(
+          title,
+          `handoff_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+        );
+    }
+  }
+  const folderPath = String(
+    (standalone ? standaloneWorkspacePath : options.path)
+    || currentWorkspace
+    || (standalone ? getDispatchWorkspaceRoot() : '')
+  ).trim();
+  if (!folderPath) return { success: false, error: 'No workspace path to promote.' };
   let preflightTask = options.taskPacket && RendererTaskOrchestration
     ? RendererTaskOrchestration.normalizeTaskRecord(options.taskPacket)
     : null;
   const handoffWorkspace = {
-    role: standalone ? 'standalone_coder' : 'active_project',
+    role: standalone ? 'standalone_specialist' : 'active_project',
     path: folderPath,
     project: {
       name: standalone ? '' : (folderPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || ''),
@@ -6499,6 +7409,7 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
     resolved: true
   };
   if (prompt && RendererTaskOrchestration && !preflightTask) {
+    const executionProfile = captureTaskExecutionProfile(options);
     const preflight = RendererTaskOrchestration.buildTaskPacket({
       originalUserMessage,
       resolvedObjective: String(options.resolvedObjective || '').trim()
@@ -6519,8 +7430,11 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
       originMessageId: String(options.sourceMessageId || ''),
       targetConversationId: 'pending-coder-conversation',
       targetMode: 'coder',
-      source: 'dispatch-handoff',
+      parentTaskId: String(options.parentTaskId || ''),
+      rootOriginConversationId: String(options.rootOriginConversationId || options.sourceConversationId || ''),
+      source: coderTaskSource,
       semanticIntent,
+      executionProfile,
       timestamp: Date.now()
     });
     if (!preflight.success || !preflight.task) {
@@ -6600,6 +7514,8 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
       originMessageId: String(options.sourceMessageId || ''),
       precedingMessages: taskContextMessages(originConv || conv),
       precedingConversationSummary: preflightTask ? preflightTask.precedingConversationSummary : '',
+      parentTaskId: String(options.parentTaskId || ''),
+      rootOriginConversationId: String(options.rootOriginConversationId || options.sourceConversationId || ''),
       workspace: handoffWorkspace,
       requirements: preflightTask
         ? [...new Set([...(preflightTask.requirements || []), ...looseFindings])]
@@ -6607,8 +7523,14 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
       constraints: preflightTask ? preflightTask.constraints : [],
       semanticIntent,
       unresolvedDecisions: preflightTask ? preflightTask.unresolvedDecisions : [],
-      source: 'dispatch-handoff',
-      modelSelectValue: window.getSelectedModel(),
+      source: coderTaskSource,
+      modelSelectValue: (preflightTask && preflightTask.executionProfile && preflightTask.executionProfile.requestedModel)
+        || window.getSelectedModel(),
+      reasoningEffort: (preflightTask && preflightTask.executionProfile && preflightTask.executionProfile.requestedReasoning)
+        || appConfig.reasoningEffort
+        || 'auto',
+      executionProfile: (preflightTask && preflightTask.executionProfile)
+        || captureTaskExecutionProfile(options),
       contextPacketIds: assignedPacketIds,
       createdAt: Date.now()
     });
@@ -6634,6 +7556,248 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
       // The durable task is already committed. A presentation/persistence warning must not turn
       // this into a false handoff failure that prompts a duplicate retry.
       handoffWarnings.push(`The task was queued, but its Coder status message could not be saved: ${error.message || error}`);
+    }
+  }
+
+  try {
+    renderProjectsList();
+    renderConversationList();
+  } catch (error) {
+    handoffWarnings.push(`The handoff was queued, but the conversation list could not refresh: ${error.message || error}`);
+  }
+  return {
+    success: true,
+    projectPath: standalone ? '' : folderPath,
+    workspacePath: folderPath,
+    standalone,
+    conversationId: conv.id,
+    title: conv.title,
+    queued: !!prompt,
+    taskId: createdTask ? createdTask.taskId : '',
+    status: createdTask ? createdTask.status : (prompt ? 'pending' : 'completed'),
+    task: createdTask,
+    queueItem: createdTask
+      ? (window.promptQueue || []).find(item => item && item.taskId === createdTask.taskId) || null
+      : null,
+    contextPacketIds: assignedPacketIds,
+    contextTransferred: assignedPacketIds.length > 0,
+    contextTransferError,
+    committedWithWarning: handoffWarnings.length > 0,
+    warning: handoffWarnings.join(' ')
+  };
+};
+
+// Phase 3 piece 5 of the Operator architecture plan. Deliberate close parallel of
+// window.promoteWorkspaceToCoder above rather than a generalized/parameterized version of it: the
+// underlying machinery this delegates to (RendererTaskOrchestration.buildTaskPacket, which already
+// takes a free targetMode string; enqueueOrchestrationTask; captureTaskExecutionProfile;
+// taskContextMessages) was already role-generic before this piece, so the only things that
+// actually differ below are the literal 'operator' mode tag, the operator conversation
+// constructors, and role-specific copy (title default, status message). Generalizing
+// promoteWorkspaceToCoder itself into a shared role-parameterized function would touch a large,
+// working, Coder-battle-tested function for a payoff this small — the "write a parallel one"
+// option from the brief, not the "reuse/generalize" one.
+window.promoteWorkspaceToOperator = async function(options = {}) {
+  const standalone = options.standalone === true;
+  const prompt = String(options.prompt || '').trim();
+  const originalUserMessage = String(options.originalUserMessage || prompt).trim();
+  const title = String(options.title || '').trim()
+    || (prompt ? generateConversationTitle(prompt) : 'New Operator Task');
+  const originConv = conversations.find(item => item.id === String(options.sourceConversationId || ''));
+  const specialistDelegation = !!String(options.parentTaskId || '');
+  const operatorTaskSource = specialistDelegation ? 'specialist-operator-handoff' : 'dispatch-operator-handoff';
+  if (originConv) clearCurrentTurnTaskResolutionClarifications(originConv);
+  const semanticIntent = options.semanticIntent || (originConv && prompt
+    ? await classifyCurrentConversationIntent(originConv, originalUserMessage, { model: options.modelSelectValue })
+    : null);
+  const standaloneSystemOperation = standalone && (
+    options.standaloneSystemOperation === true
+    || !!(semanticIntent && semanticIntent.standaloneSystemOperation)
+  );
+  let standaloneWorkspacePath = '';
+  if (standalone) {
+    if (standaloneSystemOperation) {
+      try {
+        const homeDir = await window.api.getHomeDir();
+        standaloneWorkspacePath = typeof homeDir === 'string' ? homeDir.trim() : '';
+      } catch (_) {}
+    } else {
+      standaloneWorkspacePath = String(options.path || '').trim()
+        || getStandaloneWorkspaceForTitle(
+          title,
+          `operator_handoff_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+        );
+    }
+  }
+  const folderPath = String(
+    (standalone ? standaloneWorkspacePath : options.path)
+    || currentWorkspace
+    || (standalone ? getDispatchWorkspaceRoot() : '')
+  ).trim();
+  if (!folderPath) return { success: false, error: 'No workspace path to promote.' };
+  let preflightTask = options.taskPacket && RendererTaskOrchestration
+    ? RendererTaskOrchestration.normalizeTaskRecord(options.taskPacket)
+    : null;
+  // Workspace roles stay role-neutral for every specialist. task.target.mode carries the Coder or
+  // Operator identity; there is no role-specific standalone workspace kind by design.
+  const handoffWorkspace = {
+    role: standalone ? 'standalone_specialist' : 'active_project',
+    path: folderPath,
+    project: {
+      name: standalone ? '' : (folderPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || ''),
+      path: standalone ? '' : folderPath
+    },
+    source: standalone ? 'standalone-dispatch-operator-handoff' : 'dispatch-operator-handoff',
+    resolved: true
+  };
+  if (prompt && RendererTaskOrchestration && !preflightTask) {
+    const executionProfile = captureTaskExecutionProfile(options);
+    const preflight = RendererTaskOrchestration.buildTaskPacket({
+      originalUserMessage,
+      resolvedObjective: String(options.resolvedObjective || '').trim()
+        || (semanticIntent && semanticIntent.resolvedRequest)
+        || prompt,
+      title,
+      precedingMessages: taskContextMessages(originConv),
+      precedingConversationSummary: String(options.precedingConversationSummary || ''),
+      workspace: handoffWorkspace,
+      requirements: [
+        ...(Array.isArray(options.requirements) ? options.requirements : []),
+        ...(Array.isArray(options.findings) ? options.findings : [])
+      ],
+      constraints: Array.isArray(options.constraints) ? options.constraints : [],
+      unresolvedDecisions: Array.isArray(options.unresolvedDecisions) ? options.unresolvedDecisions : [],
+      originConversationId: String(options.sourceConversationId || ''),
+      originSessionId: String(options.sourceSessionId || ''),
+      originMessageId: String(options.sourceMessageId || ''),
+      targetConversationId: 'pending-operator-conversation',
+      targetMode: 'operator',
+      parentTaskId: String(options.parentTaskId || ''),
+      rootOriginConversationId: String(options.rootOriginConversationId || options.sourceConversationId || ''),
+      source: operatorTaskSource,
+      semanticIntent,
+      executionProfile,
+      executionSurface: options.executionSurface || (semanticIntent && semanticIntent.executionSurface) || 'desktop',
+      timestamp: Date.now()
+    });
+    if (!preflight.success || !preflight.task) {
+      const clarification = preflight.clarification || 'What specific work should I hand to Operator?';
+      if (originConv) persistTaskClarification(originConv, clarification);
+      return { success: false, needsClarification: true, error: clarification };
+    }
+    preflightTask = preflight.task;
+  }
+
+  if (!standalone) addProjectPath(folderPath);
+  const conv = standalone
+    ? createStandaloneOperatorConversation({
+        title,
+        workspacePath: folderPath,
+        select: options.open === true
+      })
+    : createOperatorConversationForProject(folderPath, {
+        title,
+        select: options.open === true
+      });
+
+  const requestedPacketIds = Array.isArray(options.contextPacketIds)
+    ? [...new Set(options.contextPacketIds.map(String).filter(Boolean))].slice(-5)
+    : [];
+  let assignedPacketIds = [];
+  let contextTransferError = '';
+  let createdTask = null;
+  const handoffWarnings = [];
+  if (requestedPacketIds.length > 0 && window.api && typeof window.api.assignContextPackets === 'function') {
+    try {
+      const assignment = await window.api.assignContextPackets(folderPath, requestedPacketIds, {
+        sourceConversationId: String(options.sourceConversationId || ''),
+        targetConversationId: conv.id,
+        requestedWork: prompt,
+        findings: Array.isArray(options.findings) ? options.findings : []
+      });
+      assignedPacketIds = assignment && Array.isArray(assignment.assignedPacketIds)
+        ? assignment.assignedPacketIds
+        : [];
+      if (!assignment || assignment.success === false) contextTransferError = (assignment && assignment.error) || 'Context packet assignment failed.';
+    } catch (error) {
+      contextTransferError = error.message || String(error);
+    }
+  }
+  if (assignedPacketIds.length > 0) {
+    conv.inheritedContext = {
+      packetIds: assignedPacketIds,
+      sourceConversationId: String(options.sourceConversationId || ''),
+      workspace: folderPath,
+      assignedAt: Date.now(),
+      active: true
+    };
+  }
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+  saveConversationsToStorage();
+
+  if (prompt) {
+    const looseFindings = Array.isArray(options.findings)
+      ? options.findings.map(f => String(f || '').trim()).filter(Boolean).slice(0, 12)
+      : [];
+    const queuedPrompt = (assignedPacketIds.length === 0 && looseFindings.length > 0)
+      ? `${prompt}\n\nFindings from Dispatch's prior investigation (verify before relying on them):\n${looseFindings.map(f => `- ${f}`).join('\n')}`
+      : prompt;
+    const handoffTask = await enqueueOrchestrationTask({
+      prompt: queuedPrompt,
+      originalUserMessage: (preflightTask && preflightTask.originalUserMessage) || originalUserMessage,
+      resolvedObjective: preflightTask ? preflightTask.objective : queuedPrompt,
+      title,
+      targetConversationId: conv.id,
+      originConversationId: String(options.sourceConversationId || conv.id),
+      originSessionId: String(options.sourceSessionId || ''),
+      originMessageId: String(options.sourceMessageId || ''),
+      precedingMessages: taskContextMessages(originConv || conv),
+      precedingConversationSummary: preflightTask ? preflightTask.precedingConversationSummary : '',
+      parentTaskId: String(options.parentTaskId || ''),
+      rootOriginConversationId: String(options.rootOriginConversationId || options.sourceConversationId || ''),
+      workspace: handoffWorkspace,
+      requirements: preflightTask
+        ? [...new Set([...(preflightTask.requirements || []), ...looseFindings])]
+        : looseFindings,
+      constraints: preflightTask ? preflightTask.constraints : [],
+      semanticIntent,
+      unresolvedDecisions: preflightTask ? preflightTask.unresolvedDecisions : [],
+      source: operatorTaskSource,
+      modelSelectValue: (preflightTask && preflightTask.executionProfile && preflightTask.executionProfile.requestedModel)
+        || window.getSelectedModel(),
+      reasoningEffort: (preflightTask && preflightTask.executionProfile && preflightTask.executionProfile.requestedReasoning)
+        || appConfig.reasoningEffort
+        || 'auto',
+      executionProfile: (preflightTask && preflightTask.executionProfile)
+        || captureTaskExecutionProfile(options),
+      executionSurface: (preflightTask && preflightTask.executionSurface)
+        || options.executionSurface
+        || (semanticIntent && semanticIntent.executionSurface)
+        || 'desktop',
+      contextPacketIds: assignedPacketIds,
+      createdAt: Date.now()
+    });
+    if (!handoffTask.success) {
+      conversations = conversations.filter(item => item.id !== conv.id);
+      saveConversationsToStorage();
+      return {
+        success: false,
+        needsClarification: !!handoffTask.needsClarification,
+        error: handoffTask.clarification || handoffTask.error || 'The handoff task could not be resolved.'
+      };
+    }
+    conv.lastOrchestrationTaskId = handoffTask.task.taskId;
+    if (originConv) originConv.lastOwnedTaskId = handoffTask.task.taskId;
+    createdTask = handoffTask.task;
+    if (handoffTask.warning) handoffWarnings.push(handoffTask.warning);
+    try {
+      const originLabel = originConv && conversationMode(originConv) === 'coder' ? 'Coder' : 'Dispatch';
+      persistAssistantStatusMessage(conv.id, `Queued from ${originLabel} as ${handoffTask.task.title}. Operator will start when the current turn finishes.`, {
+        source: 'queue-status',
+        dedupeKey: `dispatch-operator-handoff-${handoffTask.task.taskId}`
+      });
+    } catch (error) {
+      handoffWarnings.push(`The task was queued, but its Operator status message could not be saved: ${error.message || error}`);
     }
   }
 
@@ -6858,6 +8022,12 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     }
   }
   const resolvedId = conv ? conv.id : '';
+  // Task transitions update this cache immediately. A durable refresh remains the backstop for
+  // changes missed while the renderer was suspended, but a warm phone snapshot must not block on
+  // reparsing the task store. Only the first empty-cache read waits; later refreshes happen behind
+  // the already-authoritative cached presentation.
+  const durableTaskRefresh = requestPhoneTaskRefresh();
+  if (orchestrationTaskCache.size === 0 && durableTaskRefresh) await durableTaskRefresh;
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
   const globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
   const globalActiveTaskId = window.getActiveRunTaskId ? String(window.getActiveRunTaskId() || '') : '';
@@ -6865,19 +8035,22 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   const queuedForResolvedConversation = Array.isArray(window.promptQueue)
     && window.promptQueue.some(q => q && q.conversationId === resolvedId);
   const normalizedPhoneMessages = conv && conv.messages
-    ? conv.messages.slice(-40).map(normalizeConversationMessageForReplay)
+    ? conv.messages.filter(isConversationMessageVisible).slice(-40).map(normalizeConversationMessageForReplay)
     : [];
   const recoveredAssistantMessage = buildMissingAssistantResponseMessage(normalizedPhoneMessages, {
     queued: queuedForResolvedConversation
   });
   const messages = normalizedPhoneMessages.map(replayMsg => {
-    const replayLogs = Array.isArray(replayMsg.logs) ? replayMsg.logs : [];
+    const replayLogs = compactPhoneToolLogs(replayMsg.logs, 8);
     const text = replayMsg.text;
     return {
       role: replayMsg.role,
       content: text,
       text,
-      logs: replayMsg.role === 'assistant' ? replayLogs : []
+      createdAt: replayMsg.createdAt || 0,
+      requestId: replayMsg.requestId || '',
+      logs: replayMsg.role === 'assistant' ? replayLogs : [],
+      images: Array.isArray(replayMsg.images) ? replayMsg.images.slice(0, 4) : []
     };
   });
   if (recoveredAssistantMessage && !isActiveTargetRunning) {
@@ -6885,39 +8058,27 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   }
   const latestOutput = messages.slice().reverse().find(msg => msg.role === 'assistant' || msg.role === 'system');
   const latestAssistant = conv && conv.messages
-    ? conv.messages.slice().reverse().map(normalizeConversationMessageForReplay).find(msg => msg.role === 'assistant')
+    ? conv.messages.filter(isConversationMessageVisible).slice().reverse().map(normalizeConversationMessageForReplay).find(msg => msg.role === 'assistant')
     : null;
   const latestText = latestAssistant ? (latestAssistant.text || '') : '';
   const changedFiles = [];
   const testResults = [];
-  const latestToolCalls = [];
+  const latestToolCalls = compactPhoneToolLogs(latestAssistant && latestAssistant.logs, 8);
   (latestAssistant && Array.isArray(latestAssistant.logs) ? latestAssistant.logs : []).forEach(log => {
     if (log.tool === 'write_file' || log.tool === 'modify_file' || log.tool === 'patch_file') {
       const params = log.params || {};
       if (params.path && !changedFiles.includes(params.path)) changedFiles.push(params.path);
     }
     if (log.tool === 'run_tests' || log.tool === 'run_command') {
-      testResults.push(log.result || '');
-    }
-    if (log.type === 'tool_call' || log.tool || log.type === 'thought') {
-      latestToolCalls.push({
-        type: log.type || 'tool_call',
-        content: log.content || '',
-        tool: log.tool || '',
-        status: log.status || 'running',
-        params: log.params || {},
-        result: log.result || ''
-      });
+      testResults.push(truncatePhoneTransportText(log.result || '', 2400));
     }
   });
   const walkthroughIndex = latestText.indexOf('\n\n## Work Walkthrough');
   const workWalkthrough = walkthroughIndex === -1 ? '' : latestText.slice(walkthroughIndex).trim();
   const conversationsSummary = conversations.map(c => {
-    const normalizedMessages = Array.isArray(c.messages)
-      ? c.messages.map(normalizeConversationMessageForReplay)
-      : [];
-    const messageCount = normalizedMessages.filter(msg =>
-      msg.role === 'user' || msg.role === 'assistant' || msg.role === 'steering'
+    const messageCount = (Array.isArray(c.messages) ? c.messages : []).filter(msg =>
+      isConversationMessageVisible(msg)
+      && ['user', 'assistant', 'steering'].includes(normalizeConversationMessageRole(msg))
     ).length;
     const taskCount = Array.isArray(c.tasks) ? c.tasks.length : 0;
     return {
@@ -6966,9 +8127,33 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   const companionWorkspaceResolution = conv
     ? structuredWorkspaceForConversation(conv, companionWorkspace)
     : { role: 'unresolved', path: '', project: { name: '', path: '' }, resolved: false };
-  const orchestrationTasks = [...orchestrationTaskCache.values()]
-    .filter(task => task && ((task.origin && task.origin.conversationId === resolvedId)
-      || (task.target && task.target.conversationId === resolvedId)))
+  const allOrchestrationTasks = [...orchestrationTaskCache.values()].filter(Boolean);
+  const conversationTaskIds = new Set(allOrchestrationTasks
+    .filter(task => (task.origin && task.origin.conversationId === resolvedId)
+      || (task.target && task.target.conversationId === resolvedId))
+    .map(task => String(task.taskId || ''))
+    .filter(Boolean));
+  // Carry the complete owned task chain to the phone. A child specialist's direct origin is its
+  // parent specialist, but its lifecycle still belongs to the Dispatch root that launched it.
+  let graphChanged = true;
+  while (graphChanged) {
+    graphChanged = false;
+    for (const task of allOrchestrationTasks) {
+      const taskId = String(task.taskId || '');
+      const parentTaskId = String(task.parentTaskId || '');
+      const childTaskId = String(task.delegation && task.delegation.childTaskId || '');
+      if (parentTaskId && conversationTaskIds.has(parentTaskId) && taskId && !conversationTaskIds.has(taskId)) {
+        conversationTaskIds.add(taskId);
+        graphChanged = true;
+      }
+      if (conversationTaskIds.has(taskId) && childTaskId && !conversationTaskIds.has(childTaskId)) {
+        conversationTaskIds.add(childTaskId);
+        graphChanged = true;
+      }
+    }
+  }
+  const orchestrationTasks = allOrchestrationTasks
+    .filter(task => conversationTaskIds.has(String(task.taskId || '')))
     .sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0))
     .slice(0, 12)
     .map(task => {
@@ -6981,6 +8166,30 @@ window.getPhoneCompanionState = async (targetConversationId) => {
         workspacePath: task.workspacePath || '',
         originConversationId: task.origin && task.origin.conversationId,
         targetConversationId: task.target && task.target.conversationId,
+        // The phone recomputes presentation from the durable task so live sub-status can update
+        // without replacing the record. Preserve the structured specialist role across this
+        // transport boundary; targetConversationId alone loses whether the target is Coder or
+        // Operator and made both the header and bottom banner fall back to "Coder planning".
+        target: {
+          conversationId: task.target && task.target.conversationId || '',
+          sessionId: task.target && task.target.sessionId || '',
+          mode: task.target && task.target.mode || 'coder'
+        },
+        parentTaskId: task.parentTaskId || '',
+        rootOriginConversationId: task.rootOriginConversationId || '',
+        delegation: task.delegation && typeof task.delegation === 'object'
+          ? { ...task.delegation }
+          : null,
+        execution: task.execution && typeof task.execution === 'object'
+          ? {
+              state: task.execution.state || '',
+              attempt: Number(task.execution.attempt) || 0,
+              reason: task.execution.reason || '',
+              reasonCode: task.execution.reasonCode || '',
+              resumePolicy: task.execution.resumePolicy || ''
+            }
+          : null,
+        executionSurface: task.executionSurface || 'none',
         updatedAt: task.updatedAt || task.createdAt || 0,
         awaitingReview: !!(presentation && presentation.awaitingReview),
         revisingPlan: !!(presentation && presentation.revisingPlan),
@@ -7005,16 +8214,22 @@ window.getPhoneCompanionState = async (targetConversationId) => {
         orchestrationTasks,
         resolvedId,
         globalActiveTaskId,
-        { delegatedOnly: !!(conv && conversationMode(conv) === 'orion') }
+        {
+          delegatedOnly: !!(conv && conversationMode(conv) === 'orion'),
+          followDescendants: true
+        }
       )
     : orchestrationTasks.find(task => task.status === 'active')
       || orchestrationTasks.find(task => task.status === 'pending')
       || null;
-  const operationalResult = companionWorkspace && window.readOperationalContext
-    ? await window.readOperationalContext(companionWorkspace)
-    : null;
-  const operationalState = operationalResult && operationalResult.state
-    ? window.OrionOperationalContext.normalizeContext(operationalResult.state)
+  // Operational context belongs in the snapshot, but it is not connection state. Reading and
+  // normalizing it took several seconds on real workspaces and made a healthy phone appear
+  // offline. Serve the last normalized value immediately and refresh it in the background. Agent
+  // reasoning continues to read the canonical context directly; this cache is presentation-only.
+  requestPhoneOperationalContextRefresh(companionWorkspace);
+  const cachedOperationalEntry = phoneOperationalContextCache.get(String(companionWorkspace || ''));
+  const operationalState = cachedOperationalEntry && cachedOperationalEntry.state
+    ? window.OrionOperationalContext.normalizeContext(cachedOperationalEntry.state)
     : window.OrionOperationalContext.createEmptyContext();
   const operationalContext = {
     revision: operationalState.revision,
@@ -7060,6 +8275,9 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     orchestrationTasks,
     activeTaskId: selectedSupervisedTask ? selectedSupervisedTask.taskId : '',
     model: window.getSelectedModel(),
+    reasoning: appConfig.reasoningEffort || 'auto',
+    intakeStatus: conv && conv.phoneIntakeStatus ? { ...conv.phoneIntakeStatus } : null,
+    selectionRevisions: getSelectionRevisions(),
     messages,
     latestOutput: latestOutput ? latestOutput.text : '',
     operationalContext,
@@ -7141,21 +8359,30 @@ window.startPhoneCompanionTask = async (options = {}) => {
     prompt = `[Attached file: ${fileName}]\n\`\`\`\n${content}\n\`\`\`\n\n${prompt}`;
   }
   if (prompt) {
-    try {
-      await window.submitPhoneCompanionPrompt({
-        prompt,
-        conversationId: conv.id,
-        requestId: options.requestId,
-        imageData: options.imageData,
-        imageMimeType: options.imageMimeType,
-        fileContent: options.fileContent,
-        fileName: options.fileName
-      });
-    } catch (error) {
-      conversations = conversations.filter(item => item.id !== conv.id);
-      throw error;
-    }
-  } else if (conversationMode(conv) === 'coder') {
+    // Creating the durable conversation is the HTTP acceptance boundary. Semantic intent,
+    // relevant-memory retrieval, and model work deliberately continue after this function
+    // returns so the phone can navigate to the real transcript immediately instead of waiting on
+    // intelligence work before it even knows which conversation owns the prompt.
+    const submission = window.submitPhoneCompanionPrompt({
+      prompt,
+      conversationId: conv.id,
+      requestId: options.requestId,
+      imageData: options.imageData,
+      imageMimeType: options.imageMimeType,
+      fileContent: options.fileContent,
+      fileName: options.fileName
+    });
+    Promise.resolve(submission).catch(error => {
+      conv.phoneIntakeStatus = null;
+      persistAssistantStatusMessage(
+        conv.id,
+        `Orion received this request but could not start it: ${error.message}`,
+        { source: 'phone-intake-error', dedupeKey: `phone-intake-error-${options.requestId || conv.id}` }
+      );
+      if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+      saveConversationsToStorage();
+    });
+  } else if (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator') {
     saveConversationsToStorage();
   } else {
     // A blank Dispatch request is only a client-side draft. Never leave an empty conversation in
@@ -7165,6 +8392,8 @@ window.startPhoneCompanionTask = async (options = {}) => {
   }
   return {
     success: true,
+    accepted: true,
+    processing: !!prompt,
     conversationId: conv.id,
     workspace: conv.workspace,
     projectPath: conv.projectPath,
@@ -7176,6 +8405,7 @@ async function submitPhoneCompanionPromptOnce(options) {
   // Can be called with either a string or an options object
   const text = typeof options === 'string' ? options.trim() : String(options.prompt || '').trim();
   let targetId = (typeof options === 'object' && options.conversationId) ? options.conversationId : activeConversationId;
+  const phoneRequestId = typeof options === 'object' ? String(options.requestId || '').trim() : '';
   // Image data from phone companion (optional)
   const phoneImageData = typeof options === 'object' && options.imageData ? options.imageData : null;
   const phoneImageMime = typeof options === 'object' && options.imageMimeType ? options.imageMimeType : 'image/jpeg';
@@ -7218,7 +8448,7 @@ async function submitPhoneCompanionPromptOnce(options) {
   if (!conv.workspace) {
     if (conv.projectPath) {
       conv.workspace = conv.projectPath;
-    } else if (conversationMode(conv) === 'coder') {
+    } else if (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator') {
       conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id);
     }
   }
@@ -7231,16 +8461,31 @@ async function submitPhoneCompanionPromptOnce(options) {
     || (conv.awaitingClarification && conv.awaitingClarification.taskId)
     || ''
   );
-  const semanticIntent = await classifyCurrentConversationIntent(conv, text, {
-    model: window.getSelectedModel(),
-    taskId: pendingReplyTaskId
-  });
+  conv.phoneIntakeStatus = {
+    requestId: phoneRequestId,
+    phase: 'preparing_context',
+    label: 'Preparing',
+    detail: 'Understanding your request and gathering relevant memory...',
+    startedAt: Date.now()
+  };
+  if (window.api && typeof window.api.syncPhoneCompanion === 'function') window.api.syncPhoneCompanion();
+  let semanticIntent;
+  try {
+    semanticIntent = await classifyCurrentConversationIntent(conv, text, {
+      model: window.getSelectedModel(),
+      taskId: pendingReplyTaskId
+    });
+  } finally {
+    conv.phoneIntakeStatus = null;
+    if (window.api && typeof window.api.syncPhoneCompanion === 'function') window.api.syncPhoneCompanion();
+  }
   if (conversationMode(conv) === 'orion' && semanticIntent.intent === 'cancel_active_task') {
     const messageId = createConversationMessageId(conv.id);
     conv.messages.push({
       id: messageId,
       role: 'user',
       source: 'phone',
+      requestId: phoneRequestId,
       text,
       createdAt: Date.now(),
       ...(phoneImages.length ? { images: phoneImages } : {})
@@ -7280,6 +8525,7 @@ async function submitPhoneCompanionPromptOnce(options) {
       id: messageId,
       role: 'user',
       source: 'phone',
+      requestId: phoneRequestId,
       text,
       createdAt: Date.now(),
       ...(phoneImages.length ? { images: phoneImages } : {})
@@ -7332,6 +8578,7 @@ async function submitPhoneCompanionPromptOnce(options) {
       id: messageId,
       role: 'user',
       source: 'phone',
+      requestId: phoneRequestId,
       text,
       createdAt: Date.now(),
       ...(phoneImages.length ? { images: phoneImages } : {})
@@ -7367,7 +8614,7 @@ async function submitPhoneCompanionPromptOnce(options) {
     if (ownsActiveSupervisedRun(conv)) {
       // Push the user message to history first
       const messageId = createConversationMessageId(conv.id);
-      conv.messages.push({ id: messageId, role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
+      conv.messages.push({ id: messageId, role: 'user', source: 'phone', requestId: phoneRequestId, text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
       saveConversationsToStorage();
       if (targetId === activeConversationId) renderUserMessage(text, phoneImages, Date.now());
       const supervisorResult = await handleSupervisorMessage(
@@ -7396,6 +8643,7 @@ async function submitPhoneCompanionPromptOnce(options) {
         id: messageId,
         role: 'user',
         source: 'phone',
+        requestId: phoneRequestId,
         text,
         createdAt: Date.now(),
         ...(phoneImages.length ? { images: phoneImages } : {})
@@ -7427,7 +8675,7 @@ async function submitPhoneCompanionPromptOnce(options) {
     }
 
     const messageId = createConversationMessageId(conv.id);
-    conv.messages.push({ id: messageId, role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
+    conv.messages.push({ id: messageId, role: 'user', source: 'phone', requestId: phoneRequestId, text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
     saveConversationsToStorage();
     if (targetId === activeConversationId) {
       renderUserMessage(text, phoneImages, Date.now());
@@ -7475,7 +8723,7 @@ async function submitPhoneCompanionPromptOnce(options) {
 
   // Directly run agent loop on the target conversation (without forcing desktop UI switch)
   if (conv.messages) {
-    conv.messages.push({ id: createConversationMessageId(conv.id), role: 'user', source: 'phone', text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
+    conv.messages.push({ id: createConversationMessageId(conv.id), role: 'user', source: 'phone', requestId: phoneRequestId, text, createdAt: Date.now(), ...(phoneImages.length ? { images: phoneImages } : {}) });
     saveConversationsToStorage();
   }
   if (targetId === activeConversationId) {
@@ -7489,9 +8737,9 @@ async function submitPhoneCompanionPromptOnce(options) {
   })
     .catch(err => {
       console.error("Phone-started agent loop failed:", err);
-      persistAssistantStatusMessage(targetId, `Orion could not start this phone request: ${err.message}`, {
-        source: 'agent-start-error',
-        dedupeKey: `phone-start-error-${targetId}-${text}`
+      persistAssistantStatusMessage(targetId, `The phone-started Orion run ended unexpectedly: ${err.message}`, {
+        source: 'agent-run-error',
+        dedupeKey: `phone-run-error-${targetId}-${text}`
       });
     });
 
@@ -7910,24 +9158,21 @@ window.getPhoneCompanionModels = () => {
       models.push({ value: opt.value, label: opt.textContent.trim(), group });
     }
   }
-  return { current, models };
+  const reasoning = window.OrionReasoningPolicy
+    ? window.OrionReasoningPolicy.normalizeEffortOverride(appConfig.reasoningEffort)
+    : (appConfig.reasoningEffort || 'auto');
+  const reasoningLevels = window.OrionReasoningPolicy
+    ? window.OrionReasoningPolicy.EFFORT_OVERRIDES.map(option => ({ ...option }))
+    : [{ value: 'auto', label: 'Auto' }];
+  return { current, models, reasoning, reasoningLevels, selectionRevisions: getSelectionRevisions() };
+};
+
+window.setPhoneCompanionReasoning = async (level) => {
+  return window.setReasoningEffortSelection(level);
 };
 
 window.setPhoneCompanionModel = async (modelValue) => {
-  if (!el.modelSelect) return { success: false, error: 'Model selector not available on desktop' };
-  let found = false;
-  for (let i = 0; i < el.modelSelect.options.length; i++) {
-    if (el.modelSelect.options[i].value === modelValue) {
-      el.modelSelect.selectedIndex = i;
-      found = true;
-      break;
-    }
-  }
-  if (!found) return { success: false, error: `Unknown model: ${modelValue}` };
-  appConfig.defaultModel = modelValue;
-  localStorage.setItem('ag2_default_model', modelValue);
-  try { await window.api.writeConfig(appConfig); } catch (_) {}
-  return { success: true, model: modelValue };
+  return setModelPreferenceSelection(modelValue);
 };
 
 window.runPhoneCompanionSkill = async ({ name, inputs } = {}) => {
@@ -8083,10 +9328,12 @@ async function approveCurrentPlanAndContinue(options = {}) {
       return { success: true, queued: true, taskId: continuation.task.taskId };
     }
     window.promptQueue = window.promptQueue.filter(item => item.taskId !== continuation.task.taskId);
-    window.runAgentLoop(continuation.queueItem.prompt, el.modelSelect.value, conv, {
+    window.runAgentLoop(continuation.queueItem.prompt, continuation.queueItem.modelSelectValue || el.modelSelect.value, conv, {
       source: 'plan-approval',
       internalPrompt: true,
       taskId: continuation.task.taskId,
+      reasoningEffort: continuation.queueItem.reasoningEffort,
+      executionProfile: continuation.queueItem.executionProfile,
       images: continuation.queueItem.images || [],
       contextPacketIds: continuation.queueItem.contextPacketIds || []
     })
@@ -8381,6 +9628,27 @@ window.readWorkspaceFileForPhone = (filePath) => {
   }
 };
 
+// Conversation images are served by reference rather than embedded into every phone-state poll.
+// The lookup is scoped to the exact conversation and only succeeds for an image actually attached
+// to one of its persisted messages, so the endpoint cannot become an arbitrary filesystem reader.
+window.readChatImageForPhone = async (payload = {}) => {
+  const conversationId = String(payload.conversationId || '');
+  const imagePath = String(payload.path || '');
+  const conv = conversations.find(conversation => conversation.id === conversationId);
+  if (!conv || !imagePath) return { success: false, error: 'Conversation image not found.' };
+  const image = (Array.isArray(conv.messages) ? conv.messages : [])
+    .flatMap(message => Array.isArray(message && message.images) ? message.images : [])
+    .find(candidate => candidate && String(candidate.path || '') === imagePath);
+  if (!image) return { success: false, error: 'Image is not attached to this conversation.' };
+  const workspacePath = String(image.workspacePath || conv.workspace || conv.projectPath || '');
+  const sourceConversationId = String(image.sourceConversationId || conversationId);
+  const result = await window.api.readWorkspaceFileBase64(workspacePath, imagePath, sourceConversationId);
+  if (!result || result.success === false || !String(result.mimeType || '').startsWith('image/')) {
+    return { success: false, error: (result && result.error) || 'Attached image is unavailable.' };
+  }
+  return result;
+};
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // DISPATCHER-AS-SUPERVISOR LAYER
 // Manages the Orion → Coder supervision relationship:
@@ -8398,6 +9666,13 @@ let _coderTaskMonitorInterval = null;
 // { orionConvId, coderConvId, lastKnownState }
 let _coderTaskMonitorMeta = null;
 let _coderTaskMonitorGeneration = 0;
+
+// Polling interval handle for the Operator task monitor (Phase 3 piece 5). Deliberately a
+// separate, simpler pair of variables/functions rather than folding Operator into the Coder
+// monitor: see the comment above startOperatorTaskMonitor for why.
+let _operatorTaskMonitorInterval = null;
+let _operatorTaskMonitorMeta = null;
+let _operatorTaskMonitorGeneration = 0;
 
 // Kept as a thin renderer adapter for older callers; the deterministic policy
 // lives in supervisor-orchestration.js and is exercised independently.
@@ -8437,6 +9712,12 @@ function buildCoderStatusSummary(coderConvId) {
   return { text: lines.join('\n'), tasks, doneTasks, pendingTasks, subStatus };
 }
 
+function isConversationMessageVisible(message) {
+  return !(window.OrionOperationalContext
+    && typeof window.OrionOperationalContext.isInternalContextMessage === 'function'
+    && window.OrionOperationalContext.isInternalContextMessage(message));
+}
+
 function bindNamedProjectForSupervisor(orionConv, prompt) {
   if (!RendererWorkspaceResolution || !orionConv) return structuredWorkspaceForConversation(orionConv);
   const coderConv = orionConv.launchedCoderConvId
@@ -8464,6 +9745,20 @@ function bindNamedProjectForSupervisor(orionConv, prompt) {
   return structuredWorkspaceForConversation(orionConv);
 }
 
+// Distinguishes small talk from a question that actually needs thinking. Greetings and
+// acknowledgements are genuinely cheap; explanation, comparison, and justification are not,
+// and answering them at the casual tier is what produced restated non-answers.
+function isSubstantiveConversationalTurn(semanticIntent, prompt) {
+  const hint = (semanticIntent && semanticIntent.reasoningPolicyHint) || {};
+  if (hint.complexity === 'medium' || hint.complexity === 'high') return true;
+  if (hint.risk === 'medium' || hint.risk === 'high') return true;
+  const text = String(prompt || '').trim();
+  if (text.length > 180) return true;
+  // "why", "how come", "compare", "versus", "instead of", "rather than", "explain",
+  // "what about" — the shapes of a question that wants reasons rather than a reply.
+  return /\b(?:why|how come|compare|comparison|versus|vs\.?|instead of|rather than|explain|walk me through|what about|trade-?offs?|pros and cons|better than|difference between)\b/i.test(text);
+}
+
 // ── Orion answers conversationally while Coder runs in the background ─────────
 async function respondOrionConversationally(orionConv, prompt, model, options = {}) {
   const config = window.getAppConfig ? window.getAppConfig() : {};
@@ -8472,24 +9767,40 @@ async function respondOrionConversationally(orionConv, prompt, model, options = 
     && options.semanticIntent.reasoningPolicyHint
     && options.semanticIntent.reasoningPolicyHint.contextNeed
     || 'none';
-  const recentLimit = contextNeed === 'none' ? 0 : (contextNeed === 'recent' ? 4 : 10);
-  // Recent conversation is candidate evidence only when the semantic route says it is needed.
-  const recentMsgs = (orionConv.messages || [])
-    .filter(message => !options.statusCheckin || !String(message && message.source || '').startsWith('supervisor-checkin'))
-    .slice(recentLimit ? -recentLimit : 0)
-    .map(m => ({
-      role: m.role === 'assistant' || m.role === 'model' ? 'assistant' : 'user',
-      content: String(m.text || m.content || '').slice(0, 500)
-    }));
-  if (recentLimit === 0) recentMsgs.length = 0;
+  const conversationalMessages = (orionConv.messages || [])
+    .filter(message => !options.statusCheckin || !String(message && message.source || '').startsWith('supervisor-checkin'));
+  const recentMsgs = RendererSupervisorOrchestration.buildConversationalGenerationMessages(
+    conversationalMessages,
+    { contextNeed }
+  );
 
   // Add coder context if a coder task is running
   let coderContext = '';
+  let liveCoderContext = false;
   const coderConvId = orionConv.launchedCoderConvId;
   if (coderConvId) {
     const summary = buildCoderStatusSummary(coderConvId);
     if (summary && summary.text) {
       coderContext = `\n\nCoder task status:\n${summary.text}`;
+      liveCoderContext = true;
+    }
+  }
+  // No live task: supply the finished run's recorded result instead. The completion notice the
+  // user sees is deliberately conversational and truncated to 500 chars in recentMsgs, so this
+  // is the only way Dispatch can answer questions like "did you test it?" about the last run.
+  if (!liveCoderContext) {
+    const finished = orionConv.lastDelegatedWork;
+    if (finished && finished.taskId) {
+      const finishedLines = [`- Task: ${finished.title || 'Coder task'}`];
+      const recordedStatus = String(finished.subStatus || finished.status || '').trim();
+      if (recordedStatus) finishedLines.push(`- Recorded status: ${recordedStatus}`);
+      if (Array.isArray(finished.changedFiles) && finished.changedFiles.length) {
+        finishedLines.push(`- Files Coder changed: ${finished.changedFiles.join(', ')}`);
+      }
+      finishedLines.push(Array.isArray(finished.verification) && finished.verification.length
+        ? `- Verification Coder recorded: ${finished.verification.join('; ')}`
+        : '- Verification Coder recorded: none was recorded for this run.');
+      coderContext = `\n\nMost recent Coder run (already finished, not running):\n${finishedLines.join('\n')}`;
     }
   }
 
@@ -8506,10 +9817,12 @@ async function respondOrionConversationally(orionConv, prompt, model, options = 
   const statusGuidance = options.statusCheckin
     ? '\n\nThe user is checking on Coder. Answer naturally in one short progress update using only the Coder task status supplied below. Summarize what is complete, what is happening now, and what remains when those facts are available. Do not print raw JSON, tool-call payloads, internal thoughts, or a mechanical field dump. Do not guess percentages or claim completion that is not recorded.'
     : '';
-  const concurrencyGuidance = coderContext
+  const concurrencyGuidance = liveCoderContext
     ? ' A separate Coder agent is working in the background; its verified status is supplied below. You can still talk freely.'
-    : ' Another response may still be finishing, but no owned Coder status is supplied. Do not claim that a Coder task exists.';
-  const systemPrompt = `You are Orion, an AI supervisor. Answer the user's current message conversationally and helpfully.${concurrencyGuidance} Be concise and direct. Never invent a remembered conversation or upgrade a reported status.${statusGuidance}${workspaceDescription ? `\n\nWorkspace state: ${workspaceDescription}` : ''}${coderContext}`;
+    : (coderContext
+      ? ' The most recent Coder run has already finished; its recorded result is supplied below. Do not say a Coder task is still running. If the user asks what was done, changed, tested, or verified, answer from that record in ordinary prose — never as a bulleted evidence dump. If no verification was recorded, say so plainly instead of implying the work was tested.'
+      : ' Another response may still be finishing, but no owned Coder status is supplied. Do not claim that a Coder task exists.');
+  const systemPrompt = `You are Orion, an AI supervisor. Answer the user's current message conversationally and helpfully.${concurrencyGuidance} Be concise and direct. Never invent a remembered conversation or upgrade a reported status. If this message is a follow-up to your previous reply, answer the NEW question — never restate your last message. When the user asks why you preferred something over specific alternatives they name, address each named alternative and give the actual basis for the ranking.${statusGuidance}${workspaceDescription ? `\n\nWorkspace state: ${workspaceDescription}` : ''}${coderContext}`;
 
   const runningConversationId = window.getRunningConversationId
     ? String(window.getRunningConversationId() || '')
@@ -8543,7 +9856,16 @@ async function respondOrionConversationally(orionConv, prompt, model, options = 
           : Promise.resolve({ success: false, evidence: [], queryTerms: [] })
       ),
       generateReply: (contractPrompt, messages) => window.quickOrionLLMCall(contractPrompt, messages, config, {
-        phase: options.statusCheckin ? 'final_response' : 'casual_conversation',
+        // Not every Dispatch turn is small talk. 'casual_conversation' resolves to low effort,
+        // which on DeepSeek disables thinking entirely — so a genuine question ("why that one
+        // over these three?") was being answered with no reasoning budget at all, and came back
+        // as a near-verbatim restatement of the previous reply. A turn the classifier rates as
+        // non-trivial gets a phase that actually affords comparison.
+        phase: options.statusCheckin
+          ? 'final_response'
+          : (isSubstantiveConversationalTurn(options.semanticIntent, prompt)
+            ? 'final_response'
+            : 'casual_conversation'),
         hint: options.semanticIntent && options.semanticIntent.reasoningPolicyHint || {}
       })
     });
@@ -8598,7 +9920,8 @@ async function respondOrionConversationally(orionConv, prompt, model, options = 
 // ── Main supervisor message handler ──────────────────────────────────────────
 // Called from submitMessage() when user types in Orion while Coder is running.
 async function handleSupervisorMessage(orionConv, prompt, model, options = {}) {
-  const coderConvId = orionConv.launchedCoderConvId;
+  const specialist = getOwnedSpecialistContext(orionConv);
+  const coderConvId = specialist.targetConversationId;
   if (!RendererSupervisorOrchestration) {
     throw new Error('Supervisor orchestration is unavailable.');
   }
@@ -8623,7 +9946,7 @@ async function handleSupervisorMessage(orionConv, prompt, model, options = {}) {
       semanticIntent: classification || semanticIntent
     });
     if (queued.success) {
-      persistAssistantStatusMessage(orionConv.id, `Queued as ${queued.task.title}. Orion will handle it after the active Coder task.`, {
+      persistAssistantStatusMessage(orionConv.id, `Queued as ${queued.task.title}. Orion will handle it after the active ${specialist.roleLabel} task.`, {
         source: 'queue-status',
         dedupeKey: `supervisor-queued-${queued.task.taskId}`
       });
@@ -8647,8 +9970,8 @@ async function handleSupervisorMessage(orionConv, prompt, model, options = {}) {
       const cancelled = await stopExpectedTaskForConversation(orionConv.id);
       const taskId = String((cancelled && cancelled.task && cancelled.task.taskId) || (cancelled && cancelled.taskId) || '');
       const replyText = cancelled && cancelled.success
-        ? `Cancelled **${(cancelled.task && cancelled.task.title) || 'Coder task'}**${taskId ? ` (${taskId})` : ''}. Its final state is cancelled.`
-        : `I could not cancel the owned Coder task: ${(cancelled && (cancelled.error || cancelled.reason)) || 'cancellation failed'}.`;
+        ? `Cancelled **${(cancelled.task && cancelled.task.title) || `${specialist.roleLabel} task`}**${taskId ? ` (${taskId})` : ''}. Its final state is cancelled.`
+        : `I could not cancel the owned ${specialist.roleLabel} task: ${(cancelled && (cancelled.error || cancelled.reason)) || 'cancellation failed'}.`;
       notifyOrionConversation(orionConv, replyText, 'supervisor-cancellation');
       return cancelled;
     },
@@ -8659,20 +9982,34 @@ async function handleSupervisorMessage(orionConv, prompt, model, options = {}) {
     },
     steerActiveTask: async ({ reason, classification }) => {
       const steeringPrompt = String(classification && classification.resolvedRequest || prompt);
+      if (!coderConvId) {
+        const replyText = 'I could not attach that update because the active specialist conversation is no longer available.';
+        notifyOrionConversation(orionConv, replyText, 'supervisor-steering-error');
+        return { success: false, steered: false, error: replyText };
+      }
       window.steeringQueue = window.steeringQueue || {};
       window.steeringQueue[coderConvId] = window.steeringQueue[coderConvId] || [];
       window.steeringQueue[coderConvId].push(steeringPrompt);
-      appendSystemMessage(
-        `Steering sent to the active Coder task: "${steeringPrompt.slice(0, 80)}${steeringPrompt.length > 80 ? '…' : ''}"`,
-        { conversationId: orionConv.id }
-      );
-      return { success: true, steered: true, coderConversationId: coderConvId };
+      const replyText = `Got it — I passed that update to ${specialist.roleLabel}, and it will use it on the active task.`;
+      notifyOrionConversation(orionConv, replyText, 'supervisor-steering', {
+        taskId: specialist.taskId,
+        targetConversationId: coderConvId,
+        targetRole: specialist.role
+      });
+      return {
+        success: true,
+        steered: true,
+        coderConversationId: coderConvId,
+        targetConversationId: coderConvId,
+        targetRole: specialist.role,
+        replyText
+      };
     },
     respondCheckin: async () => {
       const summary = buildCoderStatusSummary(coderConvId);
       const fallbackText = (summary && summary.text)
-        ? `Coder is still working. ${summary.text.replace(/\n+/g, ' ')}`
-        : 'Coder is active, but it has not recorded a detailed progress update yet.';
+        ? `${specialist.roleLabel} is still working. ${summary.text.replace(/\n+/g, ' ')}`
+        : `${specialist.roleLabel} is active, but it has not recorded a detailed progress update yet.`;
       return respondOrionConversationally(orionConv, prompt, model, {
         ...options,
         semanticIntent,
@@ -8950,27 +10287,115 @@ async function relayCoderPlanToDispatch(orionConv, coderConv, taskId) {
 function summarizeCoderCompletion(durableTask, coderConv) {
   const result = durableTask && durableTask.result && typeof durableTask.result === 'object'
     ? durableTask.result : {};
+  // A summary that answers the completion gate ("all coverage surfaces are inspected and
+  // verified, no blockers remain...") is internal machinery narration, never something to relay
+  // to the user. Agent-side selection now avoids recording it, but tasks finalized by older
+  // builds still carry it — treat it as absent and fall back to the last real answer.
+  const isGateNarration = text => !!(RendererOrchestrationContracts
+    && typeof RendererOrchestrationContracts.isCompletionGateNarration === 'function'
+    && RendererOrchestrationContracts.isCompletionGateNarration(text));
   let summary = String(result.summary || '').trim();
-  if (!summary && coderConv && Array.isArray(coderConv.messages)) {
-    const finalMessage = [...coderConv.messages].reverse().find(message =>
+  if (isGateNarration(summary)) summary = '';
+  const finalMessage = coderConv && Array.isArray(coderConv.messages)
+    ? [...coderConv.messages].reverse().find(message =>
       message
       && (message.role === 'assistant' || message.role === 'model')
       && String(message.text || '').trim()
       && String(message.text || '').trim() !== 'Thinking...'
       && !message.isPlanApprovalCard
-    );
-    summary = finalMessage ? String(finalMessage.text || '').trim() : '';
+      && !isGateNarration(message.text)
+    )
+    : null;
+  if (!summary && finalMessage) {
+    summary = String(finalMessage.text || '').trim();
   }
-  summary = summary
+  // Older task records sometimes appended a generated tool ledger under a final Work
+  // Walkthrough heading. Remove only that mechanical tail. A user-authored report may itself
+  // begin with "## Work Walkthrough" and must survive intact.
+  const stripGeneratedWalkthroughTail = text => {
+    const value = String(text || '');
+    const marker = '## Work Walkthrough';
+    let searchFrom = value.length;
+    while (searchFrom >= 0) {
+      const index = value.lastIndexOf(marker, searchFrom);
+      if (index < 0) break;
+      const tail = value.slice(index + marker.length).trimStart();
+      if (/^-\s+\*\*(?:Done|Failed|Working):\*\*/i.test(tail)) {
+        return value.slice(0, index).trim();
+      }
+      searchFrom = index - 1;
+    }
+    return value;
+  };
+  summary = stripGeneratedWalkthroughTail(summary)
     .replace(/\n{3,}/g, '\n\n')
-    .replace(/\n*## Work Walkthrough[\s\S]*$/i, '')
     .trim()
     .slice(0, 5000);
   return {
     summary,
     changedFiles: Array.isArray(result.changedFiles) ? result.changedFiles.slice(0, 20) : [],
-    verification: Array.isArray(result.verification) ? result.verification.slice(0, 12) : []
+    verification: Array.isArray(result.verification) ? result.verification.slice(0, 12) : [],
+    images: (Array.isArray(result.images) ? result.images : (finalMessage && Array.isArray(finalMessage.images) ? finalMessage.images : []))
+      .filter(image => image && image.path)
+      .slice(0, 4)
+      .map(image => ({
+        ...image,
+        sourceConversationId: image.sourceConversationId || (coderConv && coderConv.id) || ''
+      }))
   };
+}
+
+function reconcileDelegatedTaskCancellation(orionConv, durableTask, fallbackRole = 'coder') {
+  if (!orionConv || !durableTask || String(durableTask.status || '') !== 'cancelled') return false;
+  const taskId = String(durableTask.taskId || durableTask.id || '');
+  if (!taskId) return false;
+  const targetConversationId = String(durableTask.target && durableTask.target.conversationId || '');
+  const targetConv = targetConversationId ? conversations.find(conv => conv.id === targetConversationId) : null;
+  const targetMode = String(
+    durableTask.target && durableTask.target.mode
+    || targetConv && conversationMode(targetConv)
+    || orionConv.launchedTaskRole
+    || fallbackRole
+  ).toLowerCase();
+  const role = targetMode === 'operator' ? 'operator' : 'coder';
+  const roleName = role === 'operator' ? 'Operator' : 'Coder';
+  const taskTitle = String(durableTask.title || orionConv.launchedCoderTaskTitle || `${roleName} task`);
+
+  notifyOrionConversation(
+    orionConv,
+    `Cancelled **${taskTitle}**. ${roleName} will not continue this task, and it was not recorded as completed.`,
+    'supervisor-cancellation',
+    {
+      orchestrationTaskId: taskId,
+      orchestrationStatus: 'cancelled'
+    }
+  );
+  orionConv.lastDelegatedWork = {
+    taskId,
+    coderConversationId: targetConversationId,
+    title: taskTitle,
+    objective: durableTask.objective || '',
+    projectPath: durableTask.workspacePath || inferDispatchProjectPath(orionConv),
+    status: 'cancelled',
+    subStatus: 'Cancelled',
+    startedAt: durableTask.startedAt || orionConv.launchedCoderTaskStart || 0,
+    completedAt: durableTask.cancelledAt || Date.now(),
+    pendingCount: 0,
+    role
+  };
+  if (String(orionConv.launchedCoderTaskId || '') === taskId) {
+    orionConv.launchedCoderConvId = null;
+    orionConv.launchedCoderTaskId = null;
+    orionConv.launchedCoderTaskTitle = null;
+    orionConv.launchedCoderTaskStart = null;
+    orionConv.launchedTaskRole = null;
+    orionConv.awaitingDelegatedPlan = null;
+    orionConv.revisingDelegatedPlan = null;
+  }
+  orionConv.updatedAt = Date.now();
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+  if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+  return true;
 }
 
 // ── Supervisor completion notification ────────────────────────────────────────
@@ -9014,14 +10439,7 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
         && (!_coderTaskMonitorMeta.taskId || _coderTaskMonitorMeta.taskId === taskId)) {
       stopCoderTaskMonitor(_coderTaskMonitorMeta);
     }
-    orionConv.launchedCoderConvId = null;
-    orionConv.launchedCoderTaskId = null;
-    orionConv.launchedCoderTaskTitle = null;
-    orionConv.launchedCoderTaskStart = null;
-    orionConv.awaitingDelegatedPlan = null;
-    orionConv.revisingDelegatedPlan = null;
-    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
-    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    reconcileDelegatedTaskCancellation(orionConv, durableTask, 'coder');
     return;
   }
 
@@ -9060,9 +10478,9 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
     if (completion.changedFiles.length) {
       summaryText += `\n\nChanged: ${completion.changedFiles.map(file => `\`${file}\``).join(', ')}`;
     }
-    if (completion.verification.length) {
-      summaryText += `\n\nVerified:\n${completion.verification.map(item => `- ${item}`).join('\n')}`;
-    }
+    // Coder still records verification evidence on the durable task result, but the Dispatch
+    // relay does not print it — a bulleted evidence dump reads like a machine log, not a reply.
+    // It rides along in message metadata so it stays recoverable without being shown.
   } else if (pendingTasks.length > 0 && doneTasks.length === 0) {
     summaryText = `Coder stopped on **${taskTitle}** — ${pendingTasks.length} task${pendingTasks.length > 1 ? 's' : ''} still pending. It may have hit a blocker. Check the Coder conversation for details.`;
   } else if (pendingTasks.length > 0) {
@@ -9071,10 +10489,19 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
     const elapsed_str = elapsed ? ` (${elapsed}m)` : '';
     summaryText = `Coder finished **${taskTitle}**${elapsed_str}. ${doneTasks.length > 0 ? `${doneTasks.length} task${doneTasks.length > 1 ? 's' : ''} completed.` : ''} Ready for your next direction.`;
   }
+  // Phase 3 (restart/recovery, item 12): if this task was reconciled at startup and its background
+  // process was confirmed still alive, say so explicitly instead of letting a generic "failed"
+  // message imply the workspace is clean.
+  if (interruptedTaskLivenessNotes.has(taskId)) {
+    summaryText += `\n\n${interruptedTaskLivenessNotes.get(taskId)}`;
+    interruptedTaskLivenessNotes.delete(taskId);
+  }
 
   notifyOrionConversation(orionConv, summaryText, 'supervisor-completion', {
     orchestrationTaskId: taskId,
-    orchestrationStatus: durableTask && durableTask.status || ''
+    orchestrationStatus: durableTask && durableTask.status || '',
+    verificationEvidence: completion.verification,
+    images: completion.images
   });
 
   orionConv.lastDelegatedWork = {
@@ -9082,6 +10509,11 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
     coderConversationId: finishedCoderConvId,
     title: taskTitle,
     objective: durableTask && durableTask.objective || '',
+    // Cached from the durable result so Dispatch can answer "did you test it?" after the run
+    // ends, when launchedCoderConvId is already cleared and no live status is available.
+    changedFiles: completion.changedFiles,
+    verification: completion.verification,
+    images: completion.images,
     projectPath: (coderConv && coderConv.projectPath) || inferDispatchProjectPath(orionConv),
     status: durableTask ? durableTask.status : (blockedFlag || pendingTasks.length > 0 ? 'blocked' : 'completed'),
     subStatus: durableTask
@@ -9107,12 +10539,405 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
     window.markConversationDirty(orionConv.id);
     if (coderConv) window.markConversationDirty(coderConv.id);
   }
-  if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+  // The agent awaits this notifier before emitting the phone push. Commit the user-visible
+  // Dispatch result now so a notification tap can never outrun the debounced transcript save.
+  if (typeof window.flushConversationsToStorage === 'function') {
+    await window.flushConversationsToStorage(orionConv.id);
+  } else if (window.saveConversationsToStorage) {
+    window.saveConversationsToStorage();
+  }
 }
+
+// ── Operator task monitor (Phase 3 piece 5) ────────────────────────────────────
+//
+// Deliberately not a full mirror of startCoderTaskMonitor above. Most of that function's ~215
+// lines exist to service two Coder-only pause states: awaitingClarification (Coder can call
+// ask_clarifying_questions) and awaitingPlanApproval (Coder has a plan-approval workflow, relayed
+// to Dispatch via relayCoderPlanToDispatch). Operator has neither: piece 4 did not put
+// ask_clarifying_questions on OPERATOR_TOOL_ALLOWLIST, and OPERATOR_INSTRUCTION (piece 3) defines
+// no plan-approval step. Building the clarification-proxy and plan-relay machinery for pause
+// states Operator cannot enter would be dead code, not parity. What Operator's monitor still
+// needs, and has: terminal-status detection (the primary path is actually
+// window.onOrchestrationTaskFinalized below; this poll is the backstop for missed events) and a
+// quiet-stall backstop so a crashed/killed Operator run doesn't poll forever with no notification.
+window.startOperatorTaskMonitor = function(orionConvId, operatorConvId, taskId = '') {
+  stopOperatorTaskMonitor(_operatorTaskMonitorMeta);
+
+  _operatorTaskMonitorMeta = {
+    generation: ++_operatorTaskMonitorGeneration,
+    orionConvId,
+    operatorConvId,
+    taskId: String(taskId || ''),
+    startTime: Date.now(),
+    quietSince: 0,
+    inFlight: false
+  };
+
+  _operatorTaskMonitorInterval = setInterval(async () => {
+    const monitorMeta = _operatorTaskMonitorMeta;
+    if (!monitorMeta || monitorMeta.inFlight) return;
+    monitorMeta.inFlight = true;
+    try {
+      const { orionConvId, operatorConvId, taskId } = monitorMeta;
+
+      const orionConv = conversations.find(c => c.id === orionConvId);
+      const operatorConv = conversations.find(c => c.id === operatorConvId);
+      if (!orionConv || !operatorConv) {
+        stopOperatorTaskMonitor(monitorMeta);
+        return;
+      }
+      const durableTask = taskId ? orchestrationTaskCache.get(taskId) : null;
+      if (durableTask && ['cancelled', 'completed', 'failed'].includes(durableTask.status)) {
+        await notifySupervisorOfOperatorCompletion(operatorConvId, taskId);
+        if (_operatorTaskMonitorMeta === monitorMeta) stopOperatorTaskMonitor(monitorMeta);
+        return;
+      }
+
+      const isOperatorRunning = !!(window.isAgentRunning && window.isAgentRunning()
+        && window.getRunningConversationId && window.getRunningConversationId() === operatorConvId
+        && (!taskId || !window.getActiveRunTaskId || window.getActiveRunTaskId() === taskId));
+      const isQueuedForOperator = Array.isArray(window.promptQueue)
+        && window.promptQueue.some(item => item && (taskId ? item.taskId === taskId : item.conversationId === operatorConvId));
+      const isQuiet = !isOperatorRunning && !isQueuedForOperator;
+
+      if (isQuiet) {
+        if (!monitorMeta.quietSince) monitorMeta.quietSince = Date.now();
+        if (Date.now() - monitorMeta.quietSince > 60000) {
+          const stalledTitle = orionConv.launchedCoderTaskTitle || operatorConv.title || 'Operator task';
+          let canonicalTask = durableTask;
+          if (taskId && typeof window.getOrchestrationTaskStatus === 'function') {
+            const statusRead = await window.getOrchestrationTaskStatus(taskId, orionConv.id);
+            if (_operatorTaskMonitorMeta !== monitorMeta) return;
+            if (statusRead && statusRead.success && statusRead.task) canonicalTask = statusRead.task;
+          }
+          if (canonicalTask && ['completed', 'cancelled', 'failed'].includes(canonicalTask.status)) {
+            await notifySupervisorOfOperatorCompletion(operatorConvId, taskId);
+            if (_operatorTaskMonitorMeta === monitorMeta) stopOperatorTaskMonitor(monitorMeta);
+            return;
+          }
+          let stalledTask = null;
+          if (taskId && canonicalTask && canonicalTask.status === 'active'
+              && typeof window.finalizeOrchestrationTask === 'function') {
+            stalledTask = await window.finalizeOrchestrationTask(taskId, 'failed', {
+              reason: 'The Operator run went quiet without recording completion.',
+              expectedExecutionId: canonicalTask.execution && canonicalTask.execution.executionId
+            });
+            if (_operatorTaskMonitorMeta !== monitorMeta) return;
+          }
+          if (taskId && !stalledTask) {
+            monitorMeta.quietSince = Date.now();
+            return;
+          }
+          if (taskId && stalledTask.status !== 'failed') {
+            if (['completed', 'cancelled'].includes(stalledTask.status)) {
+              await notifySupervisorOfOperatorCompletion(operatorConvId, taskId);
+              if (_operatorTaskMonitorMeta !== monitorMeta) return;
+            }
+            stopOperatorTaskMonitor(monitorMeta);
+            return;
+          }
+          if (_operatorTaskMonitorMeta !== monitorMeta
+              || (taskId && String(orionConv.launchedCoderTaskId || '') !== taskId)) return;
+          notifyOrionConversation(orionConv, `Operator went quiet on **${stalledTitle}** — the run ended without recording completion (it may have crashed or stalled). The work is parked under Active work; open the Operator conversation to inspect it.`, 'supervisor-stall');
+          orionConv.lastDelegatedWork = {
+            taskId,
+            coderConversationId: operatorConvId,
+            title: stalledTitle,
+            projectPath: operatorConv.projectPath || inferDispatchProjectPath(orionConv),
+            status: taskId ? 'failed' : 'blocked',
+            subStatus: 'Went quiet without completing',
+            startedAt: orionConv.launchedCoderTaskStart || 0,
+            completedAt: Date.now(),
+            pendingCount: 0
+          };
+          orionConv.launchedCoderConvId = null;
+          orionConv.launchedCoderTaskId = null;
+          orionConv.launchedCoderTaskTitle = null;
+          orionConv.launchedCoderTaskStart = null;
+          orionConv.launchedTaskRole = null;
+          if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+          if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+          renderDesktopDispatchLanding();
+          stopOperatorTaskMonitor(monitorMeta);
+          return;
+        }
+      } else {
+        monitorMeta.quietSince = 0;
+      }
+
+      if (activeConversationId === orionConvId) {
+        syncDispatchCoderStatusCard(orionConvId, isOperatorRunning, isOperatorRunning ? operatorConvId : '');
+      }
+    } finally {
+      if (_operatorTaskMonitorMeta === monitorMeta) monitorMeta.inFlight = false;
+    }
+  }, 2000);
+};
+
+function stopOperatorTaskMonitor(expectedMeta = null) {
+  if (expectedMeta && _operatorTaskMonitorMeta !== expectedMeta) return false;
+  if (_operatorTaskMonitorInterval) {
+    clearInterval(_operatorTaskMonitorInterval);
+    _operatorTaskMonitorInterval = null;
+  }
+  _operatorTaskMonitorMeta = null;
+  return true;
+}
+window.stopOperatorTaskMonitor = stopOperatorTaskMonitor;
+
+// Parallel to notifySupervisorOfCoderCompletion, with Operator-phrased messages. Reuses
+// summarizeCoderCompletion directly (confirmed role-agnostic: it reads durableTask.result and the
+// specialist conversation's messages generically, with no "Coder"-specific text). Does not reuse
+// notifySupervisorOfCoderCompletion itself, which hardcodes "Coder" throughout its summary text.
+async function notifySupervisorOfOperatorCompletion(finishedOperatorConvId, expectedTaskId = '') {
+  if (!finishedOperatorConvId) return;
+  const normalizedExpectedTaskId = String(expectedTaskId || '');
+  const orionConv = conversations.find(c => c.launchedCoderConvId === finishedOperatorConvId
+    && (!normalizedExpectedTaskId || String(c.launchedCoderTaskId || '') === normalizedExpectedTaskId));
+  if (!orionConv) return;
+  const taskId = String(normalizedExpectedTaskId || orionConv.launchedCoderTaskId
+    || (_operatorTaskMonitorMeta && _operatorTaskMonitorMeta.operatorConvId === finishedOperatorConvId && _operatorTaskMonitorMeta.taskId)
+    || '');
+  let durableTask = null;
+  if (taskId) {
+    const read = await window.getOrchestrationTaskStatus(taskId, orionConv.id);
+    if (!read || !read.success || !read.task) return;
+    durableTask = read.task;
+  }
+  if (taskId && String(orionConv.launchedCoderTaskId || '') !== taskId) return;
+  if (durableTask && (durableTask.status === 'pending' || durableTask.status === 'active')) return;
+  const existingTerminalNotification = Array.isArray(orionConv.messages)
+    ? orionConv.messages.find(message =>
+        message
+        && message.source === 'supervisor-completion'
+        && String(message.orchestrationTaskId || '') === taskId
+      )
+    : null;
+  if (existingTerminalNotification) {
+    orionConv.launchedCoderConvId = null;
+    orionConv.launchedCoderTaskId = null;
+    orionConv.launchedCoderTaskTitle = null;
+    orionConv.launchedCoderTaskStart = null;
+    orionConv.launchedTaskRole = null;
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    return;
+  }
+  if (durableTask && durableTask.status === 'cancelled') {
+    if (_operatorTaskMonitorMeta && _operatorTaskMonitorMeta.operatorConvId === finishedOperatorConvId
+        && (!_operatorTaskMonitorMeta.taskId || _operatorTaskMonitorMeta.taskId === taskId)) {
+      stopOperatorTaskMonitor(_operatorTaskMonitorMeta);
+    }
+    reconcileDelegatedTaskCancellation(orionConv, durableTask, 'operator');
+    return;
+  }
+
+  if (_operatorTaskMonitorMeta && _operatorTaskMonitorMeta.operatorConvId === finishedOperatorConvId
+      && (!_operatorTaskMonitorMeta.taskId || _operatorTaskMonitorMeta.taskId === taskId)) {
+    stopOperatorTaskMonitor(_operatorTaskMonitorMeta);
+  }
+
+  const operatorConv = conversations.find(c => c.id === finishedOperatorConvId);
+  const taskTitle = String(
+    durableTask && durableTask.title
+    || orionConv.launchedCoderTaskTitle
+    || (operatorConv && operatorConv.title)
+    || 'Operator Task'
+  );
+  const elapsed = orionConv.launchedCoderTaskStart
+    ? Math.round((Date.now() - orionConv.launchedCoderTaskStart) / 60000)
+    : null;
+  const completion = summarizeCoderCompletion(durableTask, operatorConv);
+
+  let summaryText;
+  if (durableTask && durableTask.status === 'failed') {
+    summaryText = `Operator failed **${taskTitle}**. The task state is failed; check the Operator conversation for the recorded error before retrying.`;
+  } else if (durableTask && durableTask.status === 'completed') {
+    const elapsed_str = elapsed ? ` (${elapsed}m)` : '';
+    summaryText = `Operator completed **${taskTitle}**${elapsed_str}.`;
+    if (completion.summary) summaryText += `\n\n${completion.summary}`;
+  } else {
+    const elapsed_str = elapsed ? ` (${elapsed}m)` : '';
+    summaryText = `Operator finished **${taskTitle}**${elapsed_str}. Ready for your next direction.`;
+  }
+  // Phase 3 (restart/recovery, item 12): see the matching comment in notifySupervisorOfCoderCompletion.
+  if (interruptedTaskLivenessNotes.has(taskId)) {
+    summaryText += `\n\n${interruptedTaskLivenessNotes.get(taskId)}`;
+    interruptedTaskLivenessNotes.delete(taskId);
+  }
+
+  notifyOrionConversation(orionConv, summaryText, 'supervisor-completion', {
+    orchestrationTaskId: taskId,
+    orchestrationStatus: durableTask && durableTask.status || '',
+    verificationEvidence: completion.verification,
+    images: completion.images
+  });
+
+  orionConv.lastDelegatedWork = {
+    taskId,
+    coderConversationId: finishedOperatorConvId,
+    title: taskTitle,
+    objective: durableTask && durableTask.objective || '',
+    changedFiles: completion.changedFiles,
+    verification: completion.verification,
+    images: completion.images,
+    projectPath: (operatorConv && operatorConv.projectPath) || inferDispatchProjectPath(orionConv),
+    status: durableTask ? durableTask.status : 'completed',
+    subStatus: durableTask
+      ? (RendererTaskOrchestration ? RendererTaskOrchestration.describeTaskStatus(durableTask) : durableTask.status)
+      : 'Completed',
+    startedAt: orionConv.launchedCoderTaskStart || 0,
+    completedAt: (durableTask && (durableTask.completedAt || durableTask.failedAt || durableTask.cancelledAt)) || Date.now(),
+    pendingCount: 0
+  };
+
+  orionConv.launchedCoderConvId = null;
+  orionConv.launchedCoderTaskId = null;
+  orionConv.launchedCoderTaskTitle = null;
+  orionConv.launchedCoderTaskStart = null;
+  orionConv.launchedTaskRole = null;
+  orionConv.updatedAt = Date.now();
+  if (typeof window.markConversationDirty === 'function') {
+    window.markConversationDirty(orionConv.id);
+    if (operatorConv) window.markConversationDirty(operatorConv.id);
+  }
+  if (typeof window.flushConversationsToStorage === 'function') {
+    await window.flushConversationsToStorage(orionConv.id);
+  } else if (window.saveConversationsToStorage) {
+    window.saveConversationsToStorage();
+  }
+}
+
+async function resumeParentTaskAfterDelegatedChild(childTaskValue) {
+  const childTask = childTaskValue && typeof childTaskValue === 'object' ? childTaskValue : null;
+  if (!childTask || !window.api || typeof window.api.getOrchestrationTask !== 'function') {
+    return { success: true, action: 'none' };
+  }
+  let parentTaskId = String(childTask.parentTaskId || '');
+  if (!parentTaskId) {
+    // Schema-v3 tasks created before specialist lineage was forwarded can still be recovered from
+    // the parent's durable delegation receipt. This is intentionally exact-ID reconciliation,
+    // not a title/objective heuristic: an unrelated task can never adopt the child by accident.
+    let candidates = [...orchestrationTaskCache.values()];
+    if (window.api && typeof window.api.listOrchestrationTasks === 'function') {
+      const listed = await window.api.listOrchestrationTasks({ sort: 'desc' });
+      if (listed && listed.success && Array.isArray(listed.tasks)) {
+        candidates = listed.tasks;
+        orchestrationTaskCache.clear();
+        listed.tasks.forEach(task => {
+          if (task && task.taskId) orchestrationTaskCache.set(String(task.taskId), task);
+        });
+      }
+    }
+    const inferredParent = candidates.find(task =>
+      task
+      && task.delegation
+      && String(task.delegation.childTaskId || '') === String(childTask.taskId || '')
+    );
+    parentTaskId = String(inferredParent && inferredParent.taskId || '');
+  }
+  if (!parentTaskId) return { success: true, action: 'none' };
+  const parentRead = await window.api.getOrchestrationTask(parentTaskId);
+  const parentTask = parentRead && parentRead.success ? parentRead.task : null;
+  if (!parentTask) return { success: false, action: 'missing_parent', error: `Parent task ${parentTaskId} could not be found.` };
+  if (['completed', 'failed', 'cancelled'].includes(String(parentTask.status || ''))) {
+    return { success: true, action: 'parent_terminal', task: parentTask };
+  }
+
+  const childStatus = String(childTask.status || '');
+  const childMode = String(childTask.target && childTask.target.mode || '').toLowerCase();
+  const childRole = childMode === 'operator' ? 'Operator' : (childMode === 'coder' ? 'Coder' : 'specialist');
+  if (childStatus === 'cancelled') {
+    if (typeof window.api.cancelOrchestrationTask !== 'function') {
+      return { success: false, action: 'cancel_parent_failed', error: 'Task cancellation service is unavailable.' };
+    }
+    const cancelled = await window.api.cancelOrchestrationTask(
+      parentTaskId,
+      { conversationId: String(childTask.origin && childTask.origin.conversationId || '') },
+      `${childRole} child task ${childTask.taskId} was cancelled.`
+    );
+    if (!cancelled || cancelled.success === false || !cancelled.task) {
+      return { success: false, action: 'cancel_parent_failed', error: cancelled && cancelled.error || 'Parent cancellation failed.' };
+    }
+    orchestrationTaskCache.set(parentTaskId, cancelled.task);
+    await notifySupervisorOfCoderCompletion(
+      String(cancelled.task.target && cancelled.task.target.conversationId || ''),
+      parentTaskId
+    );
+    return { success: true, action: 'parent_cancelled', task: cancelled.task };
+  }
+
+  if (!['completed', 'failed'].includes(childStatus)) return { success: true, action: 'child_nonterminal' };
+  if (parentTask.status !== 'pending') {
+    return { success: false, action: 'parent_not_pending', error: `Parent task ${parentTaskId} is ${parentTask.status}.` };
+  }
+  if (parentTask.continuation
+      && String(parentTask.continuation.source || '') === 'delegated-child-result'
+      && String(parentTask.continuation.messageId || '') === String(childTask.taskId || '')) {
+    return { success: true, action: 'already_resumed', task: parentTask };
+  }
+
+  const childSummary = String(
+    childTask.result && childTask.result.summary
+    || childTask.failure && childTask.failure.message
+    || `${childRole} task ended with state ${childStatus}.`
+  ).trim();
+  const continuationPrompt = childStatus === 'completed'
+    ? [
+        `The delegated ${childRole} task ${childTask.taskId} completed.`,
+        `Result: ${childSummary}`,
+        'Use this evidence to finish the original parent task now. Report the actual playtest/result to the user; do not create another handoff for the same completed child.'
+      ].join('\n\n')
+    : [
+        `The delegated ${childRole} task ${childTask.taskId} failed.`,
+        `Recorded failure: ${childSummary}`,
+        'Resume the original parent task, diagnose this concrete failure, and either recover with a justified next action or report the verified blocker. Do not claim the parent completed.'
+      ].join('\n\n');
+  const continuation = await queueTaskContinuation({
+    targetConversationId: String(parentTask.target && parentTask.target.conversationId || ''),
+    taskId: parentTaskId,
+    requireExistingTask: true,
+    prompt: continuationPrompt,
+    source: 'delegated-child-result',
+    originMessageId: String(childTask.taskId || ''),
+    images: childTask.result && Array.isArray(childTask.result.images) ? childTask.result.images : [],
+    delegation: {
+      ...(parentTask.delegation && typeof parentTask.delegation === 'object' ? parentTask.delegation : {}),
+      childTaskId: String(childTask.taskId || ''),
+      childRole: childRole.toLowerCase(),
+      status: childStatus,
+      resolvedAt: Date.now()
+    }
+  });
+  if (!continuation || continuation.success === false) {
+    return { success: false, action: 'resume_parent_failed', error: continuation && continuation.error || 'Parent continuation could not be queued.' };
+  }
+  return { success: true, action: 'parent_resumed', task: continuation.task };
+}
+window.resumeParentTaskAfterDelegatedChild = resumeParentTaskAfterDelegatedChild;
 
 window.onOrchestrationTaskFinalized = async function(taskId, targetConversationId, status) {
   if (!taskId || !targetConversationId || !['completed', 'failed', 'cancelled'].includes(String(status || ''))) return;
-  await notifySupervisorOfCoderCompletion(targetConversationId, taskId);
+  // Route by the target conversation's own role rather than always assuming Coder. Before this
+  // fix, an Operator task's completion would still call notifySupervisorOfCoderCompletion (which
+  // matches on the reused launchedCoderConvId field, so it would "work" but mislabel every message
+  // as "Coder failed/completed..." for a run that was never Coder).
+  const targetConv = conversations.find(c => c.id === targetConversationId);
+  if (targetConv && conversationMode(targetConv) === 'operator') {
+    await notifySupervisorOfOperatorCompletion(targetConversationId, taskId);
+  } else {
+    await notifySupervisorOfCoderCompletion(targetConversationId, taskId);
+  }
+  if (window.api && typeof window.api.getOrchestrationTask === 'function') {
+    const finalizedRead = await window.api.getOrchestrationTask(taskId);
+    const finalizedTask = finalizedRead && finalizedRead.success ? finalizedRead.task : null;
+    if (finalizedTask) {
+      const resumed = await resumeParentTaskAfterDelegatedChild(finalizedTask);
+      if (!resumed || resumed.success === false) {
+        console.error('Could not reconcile the delegated child task with its parent:', resumed && resumed.error);
+      }
+    }
+  }
 };
 
 // Appends a message to an Orion conversation, rendering it if active.
@@ -9278,11 +11103,49 @@ function syncDispatchCoderStatusCard(
     card.dataset.taskId = String(task.taskId || '');
     card.dataset.taskStatus = presentation.status;
     card.dataset.taskPhase = presentation.phase;
+    card.dataset.agentRole = String(task.target && task.target.mode || 'coder').toLowerCase();
+    card.setAttribute('aria-label', card.dataset.agentRole === 'operator'
+      ? `Operator screen control: ${task.title || 'desktop task'}`
+      : `Coder task: ${task.title || 'task'}`);
   }
   return true;
 }
 
 function hideCoderStatusCard() {
   const card = document.getElementById('coder-task-status-card');
-  if (card) card.classList.remove('visible');
+  if (card) {
+    card.classList.remove('visible');
+    delete card.dataset.agentRole;
+  }
 }
+
+// The label shown on the live progress pill.
+//
+// 'analyzing' is the pre-classification window — the run has started but the request has not
+// been read yet. It used to fall through to "Preparing implementation plan", which was a guess
+// made before Orion knew what was asked, so a plain "how are you doing?" displayed a
+// plan-preparation banner for the whole classification round trip.
+function buildAgentStatusLabel(executionMode, stepNum, isApproved) {
+  if (executionMode === 'analyzing') return 'Reading your request...';
+  const working = isApproved
+    || executionMode === 'direct'
+    || executionMode === 'executing'
+    || executionMode === 'answer';
+  return working ? `Working (Step ${stepNum})...` : `Preparing implementation plan (Step ${stepNum})...`;
+}
+window.buildAgentStatusLabel = buildAgentStatusLabel;
+
+// The "Working (Step N)..." / "Preparing implementation plan (Step N)..." pill is baked into an
+// assistant bubble's innerHTML by renderAiMessage, so it only disappears if that bubble is
+// re-rendered after the run ends. It never was: runAgentLoop does its FINAL render while
+// isAgentRunning() is still true and only clears the flag afterwards, in its finally block. The
+// result was a finished answer sitting under a live-looking progress pill while the header
+// already read "Ready" — two contradictory states, until the next reload.
+//
+// Called from runAgentLoop's finally once the run flags are down. Guarded so a still-running
+// (or immediately re-queued) run keeps its indicator.
+function clearAgentRunningIndicators() {
+  if (window.isAgentRunning && window.isAgentRunning()) return;
+  document.querySelectorAll('.agent-running-indicator').forEach(node => node.remove());
+}
+window.clearAgentRunningIndicators = clearAgentRunningIndicators;

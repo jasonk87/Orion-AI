@@ -1,3 +1,5 @@
+process.env.NODE_ENV = 'test';
+
 const test = require('tape');
 const http = require('http');
 const vm = require('vm');
@@ -26,7 +28,7 @@ function request(method, port, path, body, session) {
       res.on('end', () => {
         let json = null;
         try { json = JSON.parse(text); } catch (e) {}
-        resolve({ statusCode: res.statusCode, text, json });
+        resolve({ statusCode: res.statusCode, headers: res.headers, text, json });
       });
     });
     req.on('error', reject);
@@ -79,21 +81,28 @@ function makeElectronMock(handlers = {}) {
             executeJavaScript: async (script) => {
               calls.push(script);
               if (script.includes('approvePhoneCompanionPairing')) return handlers.pairingApproval || { approved: true };
-              if (script.includes('getPhoneCompanionState')) return handlers.state || {
-                conversationId: 'conv1',
-                title: 'Task One',
-                conversations: [{ id: 'conv1', title: 'Task One', active: true }],
-                tasks: [{ title: 'Build', status: 'in-progress' }],
-                messages: [],
-                latestOutput: 'latest',
-                preview: {
-                  latestAssistantOutput: 'latest',
-                  workWalkthrough: 'Done: test',
-                  changedFiles: ['app.js'],
-                  testResults: ['npm test passed'],
-                  appLaunchUrl: 'http://localhost:3000'
-                }
-              };
+              if (script.includes('getPhoneCompanionState')) {
+                // stateProvider lets a test control timing/sequencing per call (e.g. to hold the
+                // Nth call open until a concurrent triggerCompanionSync() has had a chance to fire,
+                // reproducing races between a state change landing and an SSE connection assembling
+                // its snapshot). Falls through to the static handlers.state used by most tests.
+                if (typeof handlers.stateProvider === 'function') return handlers.stateProvider();
+                return handlers.state || {
+                  conversationId: 'conv1',
+                  title: 'Task One',
+                  conversations: [{ id: 'conv1', title: 'Task One', active: true }],
+                  tasks: [{ title: 'Build', status: 'in-progress' }],
+                  messages: [],
+                  latestOutput: 'latest',
+                  preview: {
+                    latestAssistantOutput: 'latest',
+                    workWalkthrough: 'Done: test',
+                    changedFiles: ['app.js'],
+                    testResults: ['npm test passed'],
+                    appLaunchUrl: 'http://localhost:3000'
+                  }
+                };
+              }
               if (script.includes('switchPhoneCompanionConversation')) return { success: true, conversationId: 'conv2' };
               if (script.includes('startPhoneCompanionTask')) return { success: true, conversationId: 'new' };
               if (script.includes('beginNewFocus')) return handlers.newFocus || { cancelled: ['task-pending'], count: 1 };
@@ -107,6 +116,11 @@ function makeElectronMock(handlers = {}) {
               if (script.includes('resumePhoneCompanionTask')) return { success: true, queued: true };
               if (script.includes('discoverPhoneCompanionSkills')) return handlers.skills || { skills: [{ name: 'demo-skill', description: 'demo' }], count: 1 };
               if (script.includes('runPhoneCompanionSkill')) return handlers.skillRun || { success: true, outputs: { ok: true } };
+              if (script.includes('readChatImageForPhone')) return handlers.chatImage || {
+                success: true,
+                data: Buffer.from('phone-image').toString('base64'),
+                mimeType: 'image/png'
+              };
               return { success: true };
             },
             send: () => {}
@@ -249,6 +263,70 @@ function requestFirstSseFrame(port, path, session) {
   });
 }
 
+// Opens an SSE connection and keeps collecting parsed `data:` frames for as long as the caller
+// holds it open (unlike requestFirstSseFrame, which destroys the socket after the first one).
+// Used to observe a *sequence* of pushes on a single connection -- e.g. an initial snapshot
+// followed by a later update that arrives while the connection is still open.
+function openSseConnection(port, path, session) {
+  const frames = [];
+  let notify = null;
+  const req = http.request({
+    method: 'GET',
+    hostname: '127.0.0.1',
+    port,
+    path,
+    headers: session ? { Authorization: `Bearer ${session.secret}`, 'X-Orion-Device-Id': session.deviceId } : {}
+  });
+  const responsePromise = new Promise((resolve, reject) => {
+    req.on('response', (res) => {
+      let buffer = '';
+      res.on('data', chunk => {
+        buffer += chunk.toString();
+        let sepIndex;
+        while ((sepIndex = buffer.indexOf('\n\n')) !== -1) {
+          const rawEvent = buffer.slice(0, sepIndex);
+          buffer = buffer.slice(sepIndex + 2);
+          const dataLines = rawEvent.split('\n').filter(line => line.startsWith('data:'));
+          if (dataLines.length) {
+            try {
+              frames.push(JSON.parse(dataLines.map(line => line.slice(5).trim()).join('\n')));
+              if (notify) notify();
+            } catch (e) {}
+          }
+        }
+      });
+      resolve(res);
+    });
+    req.on('error', (err) => {
+      if (!/ECONNRESET|aborted/i.test(err.message)) reject(err);
+    });
+  });
+  req.end();
+  return {
+    frames,
+    responsePromise,
+    waitForFrameCount(count, timeoutMs = 2000) {
+      return new Promise((resolve, reject) => {
+        if (frames.length >= count) { resolve(frames); return; }
+        const timer = setTimeout(() => {
+          notify = null;
+          reject(new Error(`Timed out waiting for ${count} SSE frame(s); got ${frames.length}`));
+        }, timeoutMs);
+        notify = () => {
+          if (frames.length >= count) {
+            clearTimeout(timer);
+            notify = null;
+            resolve(frames);
+          }
+        };
+      });
+    },
+    close() {
+      req.destroy();
+    }
+  };
+}
+
 test('Phone Companion generated inline script is valid JavaScript', (t) => {
   const html = companionHtml('DESKTOP-TEST');
   const inlineScripts = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)];
@@ -271,6 +349,8 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
   t.notOk(root.text.includes('pair-code-123456'), 'clean phone shell does not embed the current setup code');
   t.ok(root.text.includes('<title>Orion</title>'), 'root shell serves the Orion mobile UI');
   t.notOk(root.text.includes('data-drawer-destination="history"'), 'root shell does not expose History as a top-level mode');
+  t.ok(root.text.includes('data-drawer-destination="operator"'), 'root shell exposes Operator in the app drawer');
+  t.ok(root.text.includes('id="mode-toggle-operator"'), 'root shell includes Operator in the specialist mode control');
   t.ok(root.text.includes('function enterDispatch'), 'root shell enters Dispatch through the chat-first route');
   t.ok(root.text.includes("companionFetch('/api/new-focus'"), 'phone New Focus asks the desktop to cancel pending owned work');
   t.ok(root.text.includes('permanentCredentialFailureCodes'), 'phone distinguishes durable auth revocation from transient transport failures');
@@ -543,6 +623,40 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
     'the phone selection is persisted independently of desktop activity'
   );
 
+  const promptCallsBeforeStaleSubmit = electron.calls.filter(call => call.includes('submitPhoneCompanionPrompt')).length;
+  const stalePrompt = await request('POST', 1133, '/api/prompt', {
+    prompt: 'this belongs to the old transcript',
+    conversationId: 'conv1',
+    selectionRevision: switchRes.json.selectionRevision
+  }, session);
+  t.equal(stalePrompt.statusCode, 409, 'a prompt submitted from a stale visible conversation is rejected');
+  t.equal(
+    electron.calls.filter(call => call.includes('submitPhoneCompanionPrompt')).length,
+    promptCallsBeforeStaleSubmit,
+    'a stale prompt never reaches the renderer or another conversation'
+  );
+
+  const staleRevisionPrompt = await request('POST', 1133, '/api/prompt', {
+    prompt: 'same conversation, obsolete view',
+    conversationId: 'conv2',
+    selectionRevision: Math.max(0, switchRes.json.selectionRevision - 1)
+  }, session);
+  t.equal(staleRevisionPrompt.statusCode, 409, 'an obsolete revision of the same conversation is rejected');
+
+  const unboundPrompt = await request('POST', 1133, '/api/prompt', { prompt: 'unbound turn' }, session);
+  t.equal(unboundPrompt.statusCode, 409, 'an existing-conversation prompt must identify its visible transcript');
+
+  const currentPrompt = await request('POST', 1133, '/api/prompt', {
+    prompt: 'this belongs here',
+    conversationId: 'conv2',
+    selectionRevision: switchRes.json.selectionRevision
+  }, session);
+  t.equal(currentPrompt.statusCode, 200, 'a prompt bound to the visible conversation succeeds');
+  t.ok(
+    electron.calls.some(call => call.includes('submitPhoneCompanionPrompt') && call.includes('conv2') && call.includes('this belongs here')),
+    'the renderer receives the exact visible conversation identity'
+  );
+
   const newTask = await request('POST', 1133, '/api/conversations/new', { prompt: 'new task', projectPath: 'C:\\Projects\\OrionTarget' }, session);
   t.equal(newTask.statusCode, 200, 'new task endpoint succeeds');
 
@@ -554,10 +668,33 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
   }, session);
   t.equal(dispatchStart.statusCode, 200, 'first Dispatch message creates its conversation through one request');
 
-  const prompt = await request('POST', 1133, '/api/prompt', { prompt: 'hello', projectPath: 'C:\\Projects\\OrionTarget' }, session);
+  const operatorStart = await request('POST', 1133, '/api/conversations/new', {
+    prompt: 'open the browser and inspect the page',
+    mode: 'operator'
+  }, session);
+  t.equal(operatorStart.statusCode, 200, 'new Operator task endpoint succeeds');
+
+  const prompt = await request('POST', 1133, '/api/prompt', {
+    prompt: 'hello',
+    conversationId: operatorStart.json.conversationId,
+    selectionRevision: operatorStart.json.selectionRevision,
+    projectPath: 'C:\\Projects\\OrionTarget'
+  }, session);
   t.equal(prompt.statusCode, 200, 'prompt submission succeeds');
 
-  const steer = await request('POST', 1133, '/api/steer', { prompt: 'focus here' }, session);
+  const operatorPrompt = await request('POST', 1133, '/api/prompt', {
+    prompt: 'inspect the desktop',
+    conversationId: operatorStart.json.conversationId,
+    selectionRevision: operatorStart.json.selectionRevision,
+    mode: 'operator'
+  }, session);
+  t.equal(operatorPrompt.statusCode, 200, 'Operator prompt submission succeeds');
+
+  const steer = await request('POST', 1133, '/api/steer', {
+    prompt: 'focus here',
+    conversationId: operatorStart.json.conversationId,
+    selectionRevision: operatorStart.json.selectionRevision
+  }, session);
   t.equal(steer.statusCode, 200, 'steering endpoint succeeds');
 
   const approve = await request('POST', 1133, '/api/approve-plan', {}, session);
@@ -589,6 +726,14 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
   t.ok(!electron.calls.some(call => call.includes('switchPhoneCompanionConversation')), 'desktop bridge no longer switches global active conversation task');
   t.ok(electron.calls.some(call => call.includes('C:\\\\Projects\\\\OrionTarget')), 'new task endpoint forwards selected project path');
   t.ok(electron.calls.some(call => call.includes('C:\\\\Projects\\\\Chronicle') && call.includes('Last discussed expedition progression.')), 'Dispatch creation forwards project association and compact re-entry context');
+  t.ok(
+    electron.calls.some(call => call.includes('startPhoneCompanionTask') && call.includes('"mode":"operator"')),
+    'Operator creation preserves its role across the real phone-to-renderer bridge'
+  );
+  t.ok(
+    electron.calls.some(call => call.includes('submitPhoneCompanionPrompt') && call.includes('"mode":"operator"')),
+    'existing phone prompts preserve Operator mode across the server bridge'
+  );
   t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt') && call.includes('C:\\\\Projects\\\\OrionTarget')), 'prompt endpoint forwards selected project path');
   t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt')), 'desktop bridge submitted prompt');
   t.ok(electron.calls.some(call => call.includes('approvePhoneCompanionPlan')), 'desktop bridge approved plan');
@@ -691,6 +836,30 @@ test('Phone Companion surfaces and accepts answers to clarifying questions', asy
   await closeServer(main.getCompanionServer());
 });
 
+test('Phone Companion preserves clarification drafts across live transcript rerenders', t => {
+  const html = companionHtml();
+  const renderStart = html.indexOf('function renderConversationMessages(state)');
+  const renderEnd = html.indexOf('function renderToolCallRows', renderStart);
+  const renderFlow = html.slice(renderStart, renderEnd);
+  const submitStart = html.indexOf('async function submitClarificationFromTranscript');
+  const submitEnd = html.indexOf("messagesEl.addEventListener('click'", submitStart);
+  const submitFlow = html.slice(submitStart, submitEnd);
+
+  t.ok(html.includes('const clarificationDrafts = new Map()'),
+    'answer drafts live outside the poll-replaced transcript DOM');
+  t.ok(renderFlow.includes('captureClarificationDraft(')
+    && renderFlow.includes('restoreClarificationDraft('),
+    'every transcript rebuild captures and restores selected answers');
+  t.ok(html.includes("messagesEl.addEventListener('input'"),
+    'typed Other answers are persisted as the user enters them');
+  t.ok(submitFlow.includes("block.classList.add('unanswered')")
+    && submitFlow.includes("firstUnanswered.scrollIntoView({ behavior: 'smooth', block: 'center' })"),
+    'an incomplete form identifies and reveals the first unanswered question');
+  t.ok(submitFlow.includes('clarificationDrafts.delete(draftKey)'),
+    'a successfully submitted draft is discarded instead of leaking into later questions');
+  t.end();
+});
+
 test('Phone Companion exposes the skill system to paired phones', async (t) => {
   const { main, electron } = await startMainWithConfig(1144, {}, {
     skills: { skills: [{ name: 'demo-skill', description: 'demo' }], count: 1 },
@@ -736,6 +905,176 @@ test('Phone Companion pushes state over SSE instead of only polling', async (t) 
   } finally {
     await closeServer(main.getCompanionServer());
   }
+});
+
+test('Phone Companion does not drop a state update that lands while an SSE connection is (re)establishing', async (t) => {
+  // Regression test for a state-sync gap: a phone reconnecting (e.g. coming back from
+  // backgrounded/inactive) registers its SSE connection AFTER assembling its first snapshot.
+  // If a message finishes processing (persistConversations -> triggerCompanionSync) in that
+  // window, the sync had nowhere to land -- the connection wasn't registered in
+  // activeSseTriggers yet -- and the phone showed nothing new until an unrelated later event or a
+  // full app reopen. The message itself sent and was processed correctly; only the push that was
+  // supposed to tell the UI about it was silently lost.
+  let resolveFirstSnapshot = null;
+  let stateCalls = 0;
+  const stateV1 = {
+    conversationId: 'conv1', title: 'Before reply', conversations: [], tasks: [], messages: [],
+    latestOutput: 'v1', preview: {}
+  };
+  const stateV2 = {
+    conversationId: 'conv1', title: 'After reply', conversations: [], tasks: [], messages: [],
+    latestOutput: 'v2', preview: {}
+  };
+  const { main } = await startMainWithConfig(1199, {}, {
+    stateProvider: () => {
+      stateCalls += 1;
+      // Hold the connection's first snapshot open until the test explicitly resolves it, so a
+      // triggerCompanionSync() can be fired while this connection is still assembling that
+      // snapshot -- mirroring a message finishing right as the phone's SSE stream reconnects.
+      if (stateCalls === 1) {
+        return new Promise(resolve => { resolveFirstSnapshot = () => resolve(stateV1); });
+      }
+      return stateV2;
+    }
+  });
+  let live = null;
+  try {
+    const pair = await request('POST', 1199, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
+    const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+
+    live = openSseConnection(1199, '/api/events', session);
+    await live.responsePromise;
+
+    // Wait for the server to have entered its first getPhoneCompanionState() call (proving the
+    // snapshot is genuinely in flight) before simulating the race.
+    await new Promise(resolve => {
+      (function check() { stateCalls >= 1 ? resolve() : setImmediate(check); })();
+    });
+    t.equal(stateCalls, 1, 'the connection began assembling its initial snapshot');
+    t.ok(typeof resolveFirstSnapshot === 'function', 'the first snapshot call is genuinely pending, not already resolved');
+
+    // A message finishes processing concurrently with this connection's setup.
+    main.triggerCompanionSync();
+    // Now let the held-open initial snapshot resolve.
+    resolveFirstSnapshot();
+
+    const frames = await live.waitForFrameCount(2, 2000);
+    t.equal(frames.length, 2, 'the connection receives both its initial snapshot and the update that raced its setup');
+    t.equal(frames[0].title, 'Before reply', 'first frame is the state as of connection time');
+    t.equal(frames[1].title, 'After reply', 'second frame reflects the concurrent update -- it was not silently dropped');
+  } finally {
+    // Always tear down the still-open SSE socket before closing the server -- server.close()
+    // waits for existing keep-alive connections to end on their own, and this connection's
+    // 20s ping keeps it alive indefinitely. Skipping this step (e.g. on an assertion failure
+    // above) would hang the whole test run instead of just failing this one test.
+    if (live) live.close();
+    await closeServer(main.getCompanionServer());
+  }
+});
+
+test('Phone Companion replaces suspended mobile connections immediately on foreground', t => {
+  const html = companionHtml();
+  const ipcServerSource = fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8');
+  const mainSource = fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8');
+
+  t.ok(html.includes('id="status-pill">Connecting</div>')
+      && !html.includes('id="status-pill">Offline</div>'),
+    'cold load describes an in-progress connection instead of falsely declaring Offline');
+  t.ok(html.includes('let sseConnected = false;')
+      && html.includes("connTextEl.textContent = machineName + ' · Connecting';"),
+    'stream startup distinguishes an attempted connection from a confirmed live transport');
+
+  t.ok(html.includes("if (document.hidden) suspendBackgroundConnection();"),
+    'backgrounding proactively retires the stream instead of leaving a ghost active connection');
+  t.ok(html.includes("startEventStream({ force: true });"),
+    'foreground recovery always replaces the pre-suspension stream');
+  t.ok(html.includes("window.addEventListener('pageshow', recoverForegroundConnection)"),
+    'PWA restoration and back-forward cache restoration recover immediately');
+  t.ok(html.includes("window.addEventListener('online', recoverForegroundConnection)"),
+    'a network handoff recovers immediately without waiting for the poll interval');
+  t.ok(html.includes("window.addEventListener('focus', recoverForegroundConnection)"),
+    'returning focus also recovers browsers with unreliable visibility events');
+  t.ok(html.includes("if (!sseConnected && !stateFetchController) loadState();")
+      && html.includes("if (!sseConnected && lastSseMessageAt < recoveryStartedAt && !stateFetchController) loadState({ force: true });"),
+    'transport and full-state fallbacks are staged instead of racing the replacement stream');
+  t.ok(html.includes("requestTimeout = setTimeout(() => requestController.abort(), 7000)"),
+    'a stalled state request cannot block foreground recovery indefinitely');
+  t.ok(html.includes("lastSseActivityAt = Date.now();"),
+    'SSE keepalive bytes count as live activity and suppress redundant status polling');
+  t.ok(ipcServerSource.includes('if (pushInFlight)') && ipcServerSource.includes('pushAgain = true'),
+    'server state pushes are coalesced while a renderer snapshot is in flight');
+  t.ok(mainSource.includes('backgroundThrottling: false'),
+    'the canonical desktop state bridge remains responsive while the desktop window is minimized');
+  t.end();
+});
+
+test('phone state transports only the activity the mobile UI can display', t => {
+  const start = rendererSource.indexOf('function truncatePhoneTransportText(');
+  const end = rendererSource.indexOf('function scrubLegacyPhoneCompanionTokenMessages', start);
+  t.ok(start > 0 && end > start, 'phone transport compaction helpers are independently testable');
+  const source = rendererSource.slice(start, end);
+  const compactPhoneToolLogs = new Function(
+    `${source}; return compactPhoneToolLogs;`
+  )();
+  const logs = Array.from({ length: 20 }, (_, index) => ({
+    type: 'tool_call',
+    tool: `tool-${index}`,
+    status: 'completed',
+    params: { path: `file-${index}.js`, content: 'p'.repeat(4000) },
+    result: 'r'.repeat(12000)
+  }));
+  const compact = compactPhoneToolLogs(logs, 8);
+
+  t.equal(compact.length, 8, 'transport matches the eight operations the phone renderer shows');
+  t.equal(compact[0].tool, 'tool-12', 'the newest visible operations are preserved');
+  t.ok(compact.every(log => log.result.length < 2500), 'large invisible tool results are bounded before network transfer');
+  t.ok(compact.every(log => log.params.content.length < 900), 'large tool parameters are bounded before network transfer');
+  t.ok(rendererSource.includes('const text = replayMsg.text;')
+      && rendererSource.includes('logs: replayMsg.role === \'assistant\' ? replayLogs : []'),
+    'assistant answer text remains intact while only execution logs are compacted');
+  t.end();
+});
+
+test('phone renders an outgoing message before waiting for Orion to answer', t => {
+  const html = companionHtml();
+  const submitStart = html.indexOf('async function handlePromptSubmit()');
+  const submitEnd = html.indexOf("document.getElementById('send').addEventListener", submitStart);
+  const flow = html.slice(submitStart, submitEnd);
+  const optimisticIndex = flow.indexOf('appendOptimisticPhoneMessage(text, optimisticImages, promptPayload.requestId)');
+  const existingConversationPost = flow.indexOf("companionFetch('/api/prompt'");
+  const newConversationPost = flow.indexOf("companionFetch('/api/conversations/new'");
+
+  t.ok(optimisticIndex > 0, 'the phone creates its local user bubble in the real submit path');
+  t.ok(optimisticIndex < existingConversationPost, 'an existing-conversation bubble renders before its POST can wait on classification or an answer');
+  t.ok(optimisticIndex < newConversationPost, 'a first-message bubble also renders before conversation creation waits');
+  t.ok(flow.indexOf("promptEl.value = '';", optimisticIndex) < existingConversationPost,
+    'the composer clears immediately rather than looking unsent while Orion works');
+  t.ok(html.includes('Received · preparing context…'),
+    'a server-accepted prompt stays visibly staged while semantic and memory work continues');
+  t.ok(flow.includes('promptEl.value = text;') && flow.includes("promptEl.dispatchEvent(new Event('input'))"),
+    'a failed send restores the user text instead of silently discarding it');
+  t.ok(flow.includes('conversationId: currentConversationId'),
+    'every existing-conversation prompt names the transcript visible on the phone');
+  t.ok(flow.includes('selectionRevision: acceptedConversationSelectionRevision'),
+    'every existing-conversation prompt carries the accepted view revision');
+  t.ok(html.includes('optimisticPhoneSend') && html.includes('canonicalMessageArrived'),
+    'intermediate state snapshots preserve the local bubble until its canonical message arrives');
+  t.ok(rendererSource.includes("requestId: replayMsg.requestId || ''"),
+    'the canonical phone state echoes the idempotency receipt used to reconcile the local bubble');
+  t.ok(rendererSource.includes("requestId: phoneRequestId"),
+    'the persisted user message carries that exact receipt through the real renderer route');
+  const newTaskStart = rendererSource.indexOf('window.startPhoneCompanionTask = async');
+  const newTaskEnd = rendererSource.indexOf('async function submitPhoneCompanionPromptOnce', newTaskStart);
+  const newTaskFlow = rendererSource.slice(newTaskStart, newTaskEnd);
+  t.ok(newTaskFlow.includes('const submission = window.submitPhoneCompanionPrompt')
+      && !newTaskFlow.includes('await window.submitPhoneCompanionPrompt'),
+    'new conversation creation acknowledges before semantic classification and memory retrieval finish');
+  t.ok(newTaskFlow.includes('accepted: true') && newTaskFlow.includes('processing: !!prompt'),
+    'the immediate acceptance response tells the phone that processing continues');
+  t.ok(rendererSource.includes("phase: 'preparing_context'")
+      && rendererSource.includes('gathering relevant memory'),
+    'the renderer publishes the real context-preparation phase without bypassing it');
+  t.end();
 });
 
 test('Phone Companion delete requires explicit UI confirmation flag', async (t) => {
@@ -867,7 +1206,11 @@ test('Phone Companion v2 notify IPC reports desktop and phone delivery', async (
   const notifyHandler = electron.ipcHandlers['notify-phone'];
   t.ok(notifyHandler, 'notify-phone IPC handler is registered');
 
-  const result = await notifyHandler(null, { title: 'Orion AI', body: 'Task complete' });
+  const result = await notifyHandler(null, {
+    title: 'Orion AI',
+    body: 'Task complete',
+    conversationId: 'dispatch-reminder-conversation'
+  });
   t.equal(result.success, true, 'notification handler reports overall success');
   t.equal(result.desktop.success, true, 'desktop notification succeeds');
   t.equal(result.phone.sent, 1, 'phone push sends to the subscribed device');
@@ -877,7 +1220,170 @@ test('Phone Companion v2 notify IPC reports desktop and phone delivery', async (
   const pushSend = webPushCalls.find(call => call.type === 'sendNotification');
   t.ok(pushSend, 'web-push sendNotification is called');
   t.deepEqual(pushSend.subscription, pushSubscription, 'web-push receives the stored subscription');
-  t.deepEqual(JSON.parse(pushSend.payload), { title: 'Orion AI', body: 'Task complete' }, 'web-push payload carries title and body');
+  t.deepEqual(JSON.parse(pushSend.payload), {
+    title: 'Orion AI',
+    body: 'Task complete',
+    conversationId: 'dispatch-reminder-conversation'
+  }, 'web-push payload carries the visible conversation deep-link target');
+
+  const serviceWorker = await request('GET', 1146, '/sw.js');
+  t.equal(serviceWorker.statusCode, 200, 'the companion service worker is available');
+  t.ok(serviceWorker.text.includes("data: {\n      conversationId"), 'the notification stores its conversation target');
+  t.ok(serviceWorker.text.includes("type: 'orion-notification-open'"), 'an already-open companion receives the exact conversation target');
+  t.ok(serviceWorker.text.includes("/?conversation="), 'a closed companion opens on a conversation deep link');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('paired phone authenticates VAPID setup, persists its subscription, and receives push', async (t) => {
+  const session = { deviceId: 'dev1', secret: 'sec1' };
+  const pushSubscription = {
+    endpoint: 'https://push.example.test/live-subscription',
+    keys: { p256dh: 'phone-p256dh', auth: 'phone-auth' }
+  };
+  const { main, electron, webPushCalls } = await startMainWithConfig(1156, {
+    phoneCompanionDevices: [
+      { id: session.deviceId, name: 'Phone', secret: session.secret, approved: true, revoked: false }
+    ]
+  });
+
+  const unauthenticatedKey = await request('GET', 1156, '/api/vapid-public-key');
+  t.equal(unauthenticatedKey.statusCode, 401, 'the protected VAPID endpoint rejects a bare fetch');
+
+  const authenticatedKey = await request('GET', 1156, '/api/vapid-public-key', null, session);
+  t.equal(authenticatedKey.statusCode, 200, 'the paired-device request can retrieve the VAPID key');
+  t.equal(authenticatedKey.json.enabled, true, 'push is advertised as enabled');
+  t.equal(authenticatedKey.json.publicKey, 'test-public-key', 'the browser receives the configured application key');
+
+  const saved = await request('POST', 1156, '/api/push-subscribe', { subscription: pushSubscription }, session);
+  t.equal(saved.statusCode, 200, 'the authenticated subscription is persisted');
+  t.equal(saved.json.success, true, 'the server confirms subscription persistence');
+
+  const notifyHandler = electron.ipcHandlers['notify-phone'];
+  const delivered = await notifyHandler(null, { title: 'Orion AI', body: 'Verified live chain' });
+  t.equal(delivered.phone.sent, 1, 'the newly persisted subscription receives the next push');
+  const pushSend = webPushCalls.find(call => call.type === 'sendNotification');
+  t.deepEqual(pushSend.subscription, pushSubscription, 'delivery uses the subscription saved by the phone endpoint');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('expired push subscription renews without pairing and replays the missed completion', async (t) => {
+  const session = { deviceId: 'dev-expired', secret: 'sec-expired' };
+  const staleSubscription = {
+    endpoint: 'https://fcm.googleapis.com/expired-subscription',
+    keys: { p256dh: 'stale-p256dh', auth: 'stale-auth' }
+  };
+  const freshSubscription = {
+    endpoint: 'https://fcm.googleapis.com/fresh-subscription',
+    keys: { p256dh: 'fresh-p256dh', auth: 'fresh-auth' }
+  };
+  const pushCalls = [];
+  const expiredError = new Error('Received unexpected response code');
+  expiredError.statusCode = 410;
+  expiredError.body = 'push subscription has unsubscribed or expired.';
+  const webPush = {
+    generateVAPIDKeys: () => ({ publicKey: 'test-public-key', privateKey: 'test-private-key' }),
+    setVapidDetails: () => {},
+    sendNotification: async (subscription, payload) => {
+      pushCalls.push({ subscription, payload });
+      if (subscription.endpoint === staleSubscription.endpoint) throw expiredError;
+    },
+    '@global': true,
+    '@noCallThru': true
+  };
+  const { main, electron, fsMock } = await startMainWithConfig(1157, {
+    phoneCompanionDevices: [{
+      id: session.deviceId,
+      name: 'Phone',
+      secret: session.secret,
+      approved: true,
+      revoked: false,
+      pushSubscription: staleSubscription,
+      pushSubscriptionSavedAt: '2026-08-10T00:00:00.000Z'
+    }]
+  }, { webPush });
+
+  const notifyHandler = electron.ipcHandlers['notify-phone'];
+  const missed = await notifyHandler(null, {
+    title: 'Orion AI',
+    body: 'Coder completed the task.',
+    conversationId: 'dispatch-origin'
+  });
+  t.equal(missed.phone.sent, 0, 'the expired endpoint is not reported as delivered');
+  t.equal(missed.phone.failed, 1, 'the failed device is counted');
+  t.match(missed.phone.reason, /expired/i, 'the provider failure is preserved instead of discarded');
+
+  const invalidated = fsMock._config().phoneCompanionDevices.find(device => device.id === session.deviceId);
+  t.notOk(invalidated.pushSubscription, 'the expired endpoint is removed');
+  t.equal(invalidated.pushSubscriptionNeedsRefresh, true, 'the paired phone is marked for silent renewal');
+  t.equal(invalidated.pendingPushNotification.context.conversationId, 'dispatch-origin', 'the missed deep-link notification is retained for replay');
+
+  const state = await request('GET', 1157, '/api/state', null, session);
+  t.equal(state.statusCode, 200, 'the existing paired session remains valid');
+  t.equal(state.json.device.pushSubscriptionNeedsRefresh, true, 'the phone learns that only its push subscription needs renewal');
+
+  const staleSync = await request('POST', 1157, '/api/push-subscribe', { subscription: staleSubscription }, session);
+  t.equal(staleSync.statusCode, 409, 'blindly re-saving the known-dead endpoint is rejected');
+  t.equal(staleSync.json.code, 'PUSH_SUBSCRIPTION_REFRESH_REQUIRED', 'the response requests subscription renewal, not re-pairing');
+
+  const renewed = await request('POST', 1157, '/api/push-subscribe', {
+    subscription: freshSubscription,
+    refreshed: true
+  }, session);
+  t.equal(renewed.statusCode, 200, 'a fresh subscription is accepted using the existing device session');
+  t.equal(renewed.json.replayedNotification, true, 'the missed completion is replayed after renewal');
+  t.equal(pushCalls.length, 2, 'one failed delivery and one successful replay occur');
+  t.deepEqual(JSON.parse(pushCalls[1].payload), {
+    title: 'Orion AI',
+    body: 'Coder completed the task.',
+    conversationId: 'dispatch-origin'
+  }, 'the replay preserves the original completion and conversation target');
+
+  const recovered = fsMock._config().phoneCompanionDevices.find(device => device.id === session.deviceId);
+  t.deepEqual(recovered.pushSubscription, freshSubscription, 'the fresh endpoint replaces the expired endpoint');
+  t.equal(recovered.pushSubscriptionNeedsRefresh, false, 'the refresh marker clears after renewal');
+  t.notOk(recovered.pendingPushNotification, 'the replay receipt clears after successful delivery');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('legacy paired push state gets one silent subscription refresh', async (t) => {
+  const session = { deviceId: 'dev-legacy-push', secret: 'sec-legacy-push' };
+  const legacySubscription = {
+    endpoint: 'https://fcm.googleapis.com/legacy-subscription',
+    keys: { p256dh: 'legacy-p256dh', auth: 'legacy-auth' }
+  };
+  const refreshedSubscription = {
+    endpoint: 'https://fcm.googleapis.com/refreshed-subscription',
+    keys: { p256dh: 'refreshed-p256dh', auth: 'refreshed-auth' }
+  };
+  const { main } = await startMainWithConfig(1158, {
+    phoneCompanionDevices: [{
+      id: session.deviceId,
+      name: 'Existing paired phone',
+      secret: session.secret,
+      approved: true,
+      revoked: false,
+      pushSubscription: legacySubscription
+    }]
+  });
+
+  const state = await request('GET', 1158, '/api/state', null, session);
+  t.equal(state.statusCode, 200, 'the durable device session is still authenticated');
+  t.equal(state.json.device.pushSubscriptionNeedsRefresh, true, 'a legacy endpoint is selected for one silent refresh');
+  t.ok(state.json.device.pushSubscriptionRefreshToken, 'the phone receives a stable refresh trigger');
+
+  const blindSync = await request('POST', 1158, '/api/push-subscribe', { subscription: legacySubscription }, session);
+  t.equal(blindSync.statusCode, 409, 'the stale endpoint cannot be re-saved as though it were renewed');
+
+  const refreshed = await request('POST', 1158, '/api/push-subscribe', {
+    subscription: refreshedSubscription,
+    refreshed: true
+  }, session);
+  t.equal(refreshed.statusCode, 200, 'the same pairing accepts the replacement endpoint');
+  const recoveredState = await request('GET', 1158, '/api/state', null, session);
+  t.equal(recoveredState.json.device.pushSubscriptionNeedsRefresh, false, 'one successful renewal clears the migration trigger');
 
   await closeServer(main.getCompanionServer());
 });
@@ -910,7 +1416,7 @@ test('phone Dispatch cancellation and supervisor failures preserve truthful outc
   const submitStart = rendererSource.indexOf('async function submitPhoneCompanionPromptOnce');
   const submitEnd = rendererSource.indexOf('\nwindow.steerPhoneCompanionTask', submitStart);
   const submitPath = rendererSource.slice(submitStart, submitEnd);
-  const classifyIndex = submitPath.indexOf('const semanticIntent = await classifyCurrentConversationIntent');
+  const classifyIndex = submitPath.indexOf('semanticIntent = await classifyCurrentConversationIntent');
   const cancelIndex = submitPath.indexOf('await cancelOwnedTaskRequestedInPrompt(');
   const clarificationIndex = submitPath.indexOf('if (conv.awaitingClarification && pendingReplyTaskId)');
   const busyIndex = submitPath.indexOf('if (isGlobalRunning)');
@@ -959,13 +1465,65 @@ test('new phone Coder conversations submit their initial prompt exactly once', t
   t.end();
 });
 
+test('phone Operator mode remains Operator across navigation, creation, and specialist controls', t => {
+  const html = companionHtml();
+  t.ok(html.includes('data-drawer-destination="operator"'), 'Operator is reachable from the phone drawer');
+  t.ok(html.includes('id="mode-toggle-operator"'), 'Operator has a phone mode control');
+  t.ok(
+    html.includes("return mode === 'coder' || mode === 'operator' ? mode : 'orion';"),
+    'phone navigation normalizes the complete three-role mode enum'
+  );
+  t.ok(
+    html.includes("const targetMode = normalizeCompanionMode(target.mode || 'orion');")
+      && html.includes('companionMode = targetMode;'),
+    'opening an Operator conversation does not bounce it into Dispatch'
+  );
+  t.ok(
+    html.includes('activeConversationMode = targetMode;')
+      && html.includes('updateSpecialistTabVisibility(activeConversationMode);'),
+    'opening a specialist conversation binds its role chrome before the asynchronous state switch'
+  );
+  const switchStart = html.indexOf('async function switchTask(taskId)');
+  const switchEnd = html.indexOf('window.switchTask = switchTask;', switchStart);
+  const switchFlow = html.slice(switchStart, switchEnd);
+  t.ok(
+    switchFlow.indexOf('await loadState({ minSerial: serial, force: true });')
+      < switchFlow.lastIndexOf('updateSpecialistTabVisibility(activeConversationMode);'),
+    'the confirmed switch reasserts specialist navigation from accepted state'
+  );
+  const modeHomeStart = html.indexOf('function openModeHome(mode)');
+  const modeHomeEnd = html.indexOf('function startDispatchDraft', modeHomeStart);
+  const modeHomeFlow = html.slice(modeHomeStart, modeHomeEnd);
+  t.ok(
+    modeHomeFlow.includes("activeConversationMode = 'orion';")
+      && modeHomeFlow.includes("updateSpecialistTabVisibility('orion');"),
+    'returning from a specialist binds Dispatch chrome before async conversation recovery'
+  );
+  t.ok(
+    html.includes("const isSpecialist = mode === 'coder' || mode === 'operator';"),
+    'Operator receives the same task status and logs navigation as Coder'
+  );
+  t.ok(
+    rendererSource.includes("mode: requestedMode === 'operator' ? 'operator' : (normalizedProjectPath ? 'coder' : requestedMode)"),
+    'the renderer persists an explicitly requested Operator conversation as Operator'
+  );
+  t.ok(
+    rendererSource.includes("conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator'"),
+    'standalone Operator conversations receive a durable standalone workspace'
+  );
+  t.end();
+});
+
 test('phone Dispatch status derives queued, active, and review presentation from the durable task', t => {
   const html = companionHtml();
   const stateRenderStart = html.indexOf('const supervisedTask = activeConversationMode');
   const stateRenderEnd = html.indexOf('// Needs-attention cards', stateRenderStart);
   const stateRender = html.slice(stateRenderStart, stateRenderEnd);
   t.ok(stateRender.includes('selectSupervisedTask('), 'phone selects the supervised task from orchestrationTasks');
-  t.ok(stateRender.includes('{ delegatedOnly: true }'), 'phone presents only cross-conversation Coder tasks as supervised work');
+  t.ok(
+    stateRender.includes('delegatedOnly: true') && stateRender.includes('followDescendants: true'),
+    'phone presents only cross-conversation specialist work and follows its durable descendants'
+  );
   t.ok(stateRender.includes('state.activeTaskId'), 'phone preserves taskId as the presentation identity');
   t.ok(stateRender.includes('describeSupervisedTaskPresentation'), 'phone uses the shared lifecycle presentation contract');
   t.ok(stateRender.includes('supervisedPresentation.agentState'), 'header state follows the durable task presentation');
@@ -976,5 +1534,199 @@ test('phone Dispatch status derives queued, active, and review presentation from
     stateRender.includes('supervisedPresentation.isOngoing'),
     'queued and active tasks remain visible even when globalRunning briefly becomes false'
   );
+  t.end();
+});
+
+// ── Phone model + reasoning pickers at the composer ────────────────────────────
+// Both selections must be reachable at the input box on the phone, not buried in the Status
+// tab, and must proxy the desktop's state so the two surfaces never disagree.
+
+test('phone composer carries model and reasoning pickers next to the input', t => {
+  const html = companionHtml();
+  const composerStart = html.indexOf('<div class="composer-model-bar">');
+  t.ok(composerStart > 0, 'a picker bar exists in the composer area');
+  const formStart = html.indexOf('<form id="prompt-form">');
+  t.ok(composerStart < formStart, 'the pickers sit directly above the prompt form');
+  const bar = html.slice(composerStart, formStart);
+  t.ok(bar.includes('id="composer-model-select"'), 'the model picker is at the composer');
+  t.ok(bar.includes('id="composer-reasoning-select"'), 'the reasoning picker is at the composer');
+  t.ok(html.includes('.composer-model-bar select.reasoning-forced'),
+    'a forced reasoning level gets distinct styling so the cost is visible');
+  t.end();
+});
+
+test('phone pickers proxy the desktop selection through /api/model', t => {
+  const html = companionHtml();
+  const start = html.indexOf('async function loadPhoneModelList');
+  const end = html.indexOf('// ── Clarifying-questions chat card', start);
+  const flow = html.slice(start, end);
+
+  t.ok(flow.includes('fillModelOptions(composerModelSelect'), 'the composer model list is populated');
+  t.ok(flow.includes('data.reasoningLevels'), 'reasoning levels come from the desktop, not hardcoded twice');
+  t.ok(flow.includes("postModelSelection({ reasoning }"), 'a reasoning change posts to the shared endpoint');
+  t.ok(flow.includes("postModelSelection({ model }"), 'a model change posts to the shared endpoint');
+  t.ok(flow.includes('await loadPhoneModelList(); // revert to the desktop\'s actual state'),
+    'a rejected change reverts to the desktop truth instead of lying');
+  t.ok(flow.includes('wirePhoneModelSelect(phoneModelSelect, composerModelSelect)')
+    && flow.includes('wirePhoneModelSelect(composerModelSelect, phoneModelSelect)'),
+    'the Status-tab and composer model selects stay mirrored');
+  t.end();
+});
+
+test('paired phone can change the desktop reasoning level through the real model endpoint', async t => {
+  const port = 1157;
+  const { main, electron } = await startMainWithConfig(port);
+  try {
+    const pair = await request('POST', port, '/api/pair', {
+      pairingCode: 'pair-code-123456',
+      deviceName: 'Pixel'
+    });
+    const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+    const response = await request('POST', port, '/api/model', { reasoning: 'high' }, session);
+
+    t.equal(response.statusCode, 200, 'the authenticated reasoning update succeeds');
+    t.equal(response.json && response.json.success, true, 'the endpoint reports success');
+    t.ok(
+      electron.calls.some(script => script.includes('setPhoneCompanionReasoning') && script.includes('"high"')),
+      'the endpoint invokes the allowlisted desktop reasoning bridge with the selected level'
+    );
+  } finally {
+    await closeServer(main.getCompanionServer());
+  }
+  t.end();
+});
+
+test('a reasoning level picked on the desktop reaches the phone through status sync', t => {
+  const html = companionHtml();
+  // Guarded, not unconditional: an unguarded reflect let a poll issued before the user's own
+  // POST landed carry the desktop's stale value back down and revert their selection.
+  t.ok(/if \(state\.reasoning && !syncSuppressed\('reasoning', state\.reasoning, state\.selectionRevisions\)\)/.test(html),
+    'status polling reflects a desktop-side reasoning change, unless the phone has an unechoed local pick');
+  t.ok(html.includes('composerModelSelect].forEach(select =>'),
+    'status polling syncs both model selects');
+  t.ok(/if \(state\.model && !syncSuppressed\('model', state\.model, state\.selectionRevisions\)\)/.test(html),
+    'and the model sync carries the same guard');
+  t.ok(html.includes('shouldRejectSelectionRevision(acceptedSelectionRevision[field], revision)'),
+    'an older poll remains rejected even after a newer POST has been acknowledged');
+  t.ok(html.includes('acknowledgeSelectionResponse(body.model ? \'model\' : \'reasoning\', data)'),
+    'the successful POST advances the phone-side accepted revision before forced refresh');
+  t.end();
+});
+
+test('a pre-save revision-zero poll cannot overwrite an acknowledged phone selection', t => {
+  const html = companionHtml();
+  const start = html.indexOf('function shouldRejectSelectionRevision(');
+  const end = html.indexOf('\n  }', start);
+  t.ok(start > 0 && end > start, 'the generated phone client contains the revision-ordering guard');
+  const source = html.slice(start, end + 4);
+  const shouldReject = new Function(`${source}; return shouldRejectSelectionRevision;`)();
+
+  t.equal(shouldReject(0, 0), false, 'an unversioned initial state remains compatible');
+  t.equal(shouldReject(100, 0), true, 'revision zero is stale after a saved selection is acknowledged');
+  t.equal(shouldReject(100, 99), true, 'any older positive revision is also stale');
+  t.equal(shouldReject(100, 100), false, 'the acknowledged revision may be rendered');
+  t.equal(shouldReject(100, 101), false, 'a genuinely newer desktop change may win');
+  t.end();
+});
+
+test('assistant screenshot references render directly in phone chat through the authenticated image endpoint', t => {
+  const html = companionHtml();
+  t.ok(html.includes('data-chat-image-path'), 'conversation-scoped image references get an inline image element');
+  t.ok(html.includes("companionFetch('/api/chat-image?conversationId='"), 'image bytes use the paired companion fetch path');
+  t.ok(html.includes('URL.createObjectURL(await response.blob())'), 'the fetched image is displayed without persisting base64 in state');
+  t.ok(html.includes('releaseChatImageObjectUrls()'), 'object URLs are released when the transcript rerenders');
+  t.ok(html.includes('attempt < 2'), 'transient image fetch failures receive bounded retries');
+  t.ok(html.includes('Image unavailable — tap to retry'), 'a persistent failure stays visible and user-retryable');
+  t.notOk(html.includes("figure.style.display = 'none'"), 'a failed first fetch cannot silently erase the attachment');
+  t.end();
+});
+
+test('paired phone retrieves a conversation-scoped Coder screenshot through the real image route', async t => {
+  const port = 1156;
+  const bytes = Buffer.from('real-phone-image-bytes');
+  const { main } = await startMainWithConfig(port, {}, {
+    state: {
+      conversationId: 'dispatch-image',
+      title: 'Desktop inspection',
+      conversations: [{ id: 'dispatch-image', title: 'Desktop inspection', active: true }],
+      messages: []
+    },
+    chatImage: {
+      success: true,
+      data: bytes.toString('base64'),
+      mimeType: 'image/png'
+    }
+  });
+  try {
+    const pair = await request('POST', port, '/api/pair', {
+      pairingCode: 'pair-code-123456',
+      deviceName: 'Pixel'
+    });
+    const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+    await request('GET', port, '/api/state', null, session);
+    const image = await request(
+      'GET',
+      port,
+      '/api/chat-image?conversationId=dispatch-image&path=' + encodeURIComponent('orion-artifact://coder/codex.png'),
+      null,
+      session
+    );
+    t.equal(image.statusCode, 200, 'the authenticated image route serves the attachment');
+    t.equal(image.headers['content-type'], 'image/png', 'the original image MIME type is preserved');
+    t.equal(Buffer.from(image.text, 'binary').toString(), bytes.toString(), 'the relayed screenshot bytes are intact');
+  } finally {
+    await closeServer(main.getCompanionServer());
+  }
+  t.end();
+});
+
+test('a screenshot relayed from a delegated Operator/Coder task loads even though its conversation differs from the one currently selected on the phone', async t => {
+  const port = 1157;
+  const bytes = Buffer.from('delegated-task-image-bytes');
+  // Reproduces a real dogfood bug: Dispatch delegates executable work (e.g. "navigate to Yahoo
+  // News and take a screenshot") to a specialist Operator/Coder conversation. attach_image records
+  // that image's sourceConversationId as the SPECIALIST conversation - the one the tool actually
+  // ran in - not the Dispatch conversation the result gets relayed into and that the phone has
+  // selected. The phone renders the image using that original sourceConversationId (see
+  // data-chat-image-conversation in companion-html.js), so /api/chat-image legitimately receives a
+  // conversationId that differs from device.selectedConversationId for every such relayed image.
+  // The backend logged attach_image as done/succeeded, but the phone showed "Image unavailable -
+  // tap to retry" because resolveCompanionActionConversation rejected the mismatched conversationId
+  // with a 409 - a check meant to guard state-changing actions (steer/approve-plan) against a
+  // stale view, wrongly applied to a passive, already-attached image read.
+  const { main } = await startMainWithConfig(port, {}, {
+    state: {
+      conversationId: 'dispatch-conv',
+      title: 'Dispatch',
+      conversations: [{ id: 'dispatch-conv', title: 'Dispatch', active: true }],
+      messages: []
+    },
+    chatImage: {
+      success: true,
+      data: bytes.toString('base64'),
+      mimeType: 'image/png'
+    }
+  });
+  try {
+    const pair = await request('POST', port, '/api/pair', {
+      pairingCode: 'pair-code-123456',
+      deviceName: 'Pixel'
+    });
+    const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+    // Selects 'dispatch-conv' as this device's current conversation.
+    await request('GET', port, '/api/state', null, session);
+    const image = await request(
+      'GET',
+      port,
+      '/api/chat-image?conversationId=operator-conv-xyz&path=' + encodeURIComponent('orion-artifact://operator-conv-xyz/yahoo-news.png'),
+      null,
+      session
+    );
+    t.equal(image.statusCode, 200, 'a relayed image loads even when its own conversationId differs from the currently selected conversation');
+    t.equal(image.headers['content-type'], 'image/png', 'the original image MIME type is preserved');
+    t.equal(Buffer.from(image.text, 'binary').toString(), bytes.toString(), 'the relayed screenshot bytes are intact');
+  } finally {
+    await closeServer(main.getCompanionServer());
+  }
   t.end();
 });

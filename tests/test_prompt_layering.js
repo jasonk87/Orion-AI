@@ -1,0 +1,323 @@
+'use strict';
+
+// Phase 1 of the Operator architecture plan: SYSTEM_INSTRUCTION (Coder) and DISPATCHER_INSTRUCTION
+// (Dispatch) used to be two fully independent hand-written prompts that had already drifted — both
+// carried a "verify your claims before committing to them" rule, written twice with different
+// wording. orion-operating-contract.js now holds the genuinely-shared fragments (verification
+// discipline, and the db_query / "tools are schemas" tool descriptions both prompts described
+// separately) as single canonical strings that each prompt interpolates.
+//
+// These tests exist to catch exactly the failure mode the refactor was meant to prevent: a shared
+// fragment silently re-diverging (someone edits the copy inside one prompt instead of the shared
+// constant), a fragment getting duplicated twice inside the same prompt, or content quietly lost
+// during the extraction. They assert on the assembled runtime prompt text (what
+// getSystemInstruction() actually returns), not on source layout, so they keep meaning whatever
+// the internal structure looks like later.
+
+const test = require('tape');
+
+global.window = {};
+global.fetch = async () => ({ ok: false });
+
+const contract = require('../orion-operating-contract');
+const agent = require('../agent');
+
+function countOccurrences(haystack, needle) {
+  if (!needle) return 0;
+  let count = 0;
+  let index = 0;
+  while (true) {
+    index = haystack.indexOf(needle, index);
+    if (index === -1) break;
+    count++;
+    index += needle.length;
+  }
+  return count;
+}
+
+function coderPrompt() {
+  agent.__setActiveConversationModeForTest('coder');
+  return agent.getSystemInstruction(false, '', '');
+}
+
+function dispatchPrompt() {
+  agent.__setActiveConversationModeForTest('orion');
+  agent.setOrionConversationHasHistory({ messages: [] });
+  return agent.getSystemInstruction(false, '', '');
+}
+
+function operatorPrompt() {
+  agent.__setActiveConversationModeForTest('operator');
+  return agent.getSystemInstruction(false, '', '');
+}
+
+test('orion-operating-contract exports the shared fragments as non-empty strings', (t) => {
+  t.equal(typeof contract.VERIFICATION_DISCIPLINE, 'string');
+  t.ok(contract.VERIFICATION_DISCIPLINE.length > 0, 'verification discipline fragment is not empty');
+  t.equal(typeof contract.TOOL_SCHEMA_NOTE, 'string');
+  t.ok(contract.TOOL_SCHEMA_NOTE.length > 0, 'tool schema note fragment is not empty');
+  t.equal(typeof contract.DB_QUERY_CORE, 'string');
+  t.ok(contract.DB_QUERY_CORE.length > 0, 'db_query core fragment is not empty');
+  t.end();
+});
+
+test('agent.js loads the same shared contract object, not a copy', (t) => {
+  // window.OrionOperatingContract is how the renderer wires this up (see index.html's script
+  // order); in Node/tests agent.js falls through to require('./orion-operating-contract')
+  // directly. Either path must land on the exact same fragment text used in the assertions below.
+  const agentJs = require('fs').readFileSync(require('path').join(__dirname, '..', 'agent.js'), 'utf8');
+  t.ok(agentJs.includes("require('./orion-operating-contract')"),
+    'agent.js sources the shared contract from the dedicated module rather than a local copy');
+  t.end();
+});
+
+test('the verification-discipline rule is truly shared between Coder and Dispatch, not re-diverged', (t) => {
+  const coder = coderPrompt();
+  const dispatch = dispatchPrompt();
+
+  t.ok(coder.includes(contract.VERIFICATION_DISCIPLINE), 'Coder prompt contains the exact shared fragment');
+  t.ok(dispatch.includes(contract.VERIFICATION_DISCIPLINE), 'Dispatch prompt contains the exact shared fragment');
+
+  // Guards the specific drift Jason found: the same rule hand-copied with different wording.
+  // Any future edit that copies the block instead of editing the shared constant reintroduces a
+  // second, differently-worded copy, which this equality check would catch.
+  t.equal(countOccurrences(coder, contract.VERIFICATION_DISCIPLINE), 1,
+    'the fragment appears exactly once in the Coder prompt (no accidental double-inclusion)');
+  t.equal(countOccurrences(dispatch, contract.VERIFICATION_DISCIPLINE), 1,
+    'the fragment appears exactly once in the Dispatch prompt (no accidental double-inclusion)');
+
+  // Each prompt still keeps its own header in its own house style — the shared part is the body.
+  t.ok(coder.includes('18A. DIAGNOSTIC RIGOR:'), 'Coder keeps its numbered-rule header style');
+  t.ok(dispatch.includes('BEFORE YOU COMMIT TO A CLAIM OR DIAGNOSIS'), 'Dispatch keeps its own header style');
+
+  // Coder-specific elaboration (get_symbol_index/get_file_symbols) must survive the extraction —
+  // it was never part of the shared fragment, so it must still appear right after it in Coder only.
+  t.ok(coder.includes('get_symbol_index/get_file_symbols'), 'Coder keeps its tool-specific tracing detail');
+  t.notOk(dispatch.includes('get_symbol_index/get_file_symbols'),
+    'that Coder-specific detail was not accidentally added to Dispatch');
+  t.end();
+});
+
+test('the tool-schema note is shared between Coder and Dispatch', (t) => {
+  const coder = coderPrompt();
+  const dispatch = dispatchPrompt();
+  t.ok(coder.includes(contract.TOOL_SCHEMA_NOTE), 'Coder TOOL USE section uses the shared opening line');
+  t.ok(dispatch.includes(contract.TOOL_SCHEMA_NOTE), 'Dispatch TOOL USE section uses the shared opening line');
+  t.equal(countOccurrences(coder, contract.TOOL_SCHEMA_NOTE), 1, 'appears exactly once in Coder');
+  t.equal(countOccurrences(dispatch, contract.TOOL_SCHEMA_NOTE), 1, 'appears exactly once in Dispatch');
+  t.end();
+});
+
+test('the db_query tool description core is shared between Coder and Dispatch', (t) => {
+  const coder = coderPrompt();
+  const dispatch = dispatchPrompt();
+  t.ok(coder.includes(contract.DB_QUERY_CORE), 'Coder db_query section uses the shared core');
+  t.ok(dispatch.includes(contract.DB_QUERY_CORE), 'Dispatch db_query section uses the shared core');
+  t.equal(countOccurrences(coder, contract.DB_QUERY_CORE), 1, 'appears exactly once in Coder');
+  t.equal(countOccurrences(dispatch, contract.DB_QUERY_CORE), 1, 'appears exactly once in Dispatch');
+
+  // Each side keeps its own addendum that was NOT promoted to the shared fragment.
+  t.ok(coder.includes('Output is returned as raw CLI JSON/CSV text'), 'Coder keeps its own output-format note');
+  t.ok(dispatch.includes('rather than routing to Coder just to run a SELECT'),
+    'Dispatch keeps its own routing note');
+  t.notOk(coder.includes('routing to Coder just to run a SELECT'),
+    "Dispatch's routing note was not accidentally added to Coder");
+  t.notOk(dispatch.includes('Output is returned as raw CLI JSON/CSV text'),
+    "Coder's output-format note was not accidentally added to Dispatch");
+  t.end();
+});
+
+test('specialist-only content was not lost or cross-contaminated by the extraction', (t) => {
+  const coder = coderPrompt();
+  const dispatch = dispatchPrompt();
+
+  // A representative sample of content that is genuinely specialist-specific and was deliberately
+  // left untouched — if any of these vanish, something was lost in the refactor rather than merged.
+  const coderOnly = [
+    'TESTING AND REGRESSION DISCIPLINE',
+    'PREVIEW_APP RULES',
+    'FILE EDIT DISCIPLINE',
+    'DESIGN QUALITY',
+    'FOLLOW-UP TIMERS',
+    'ADAPT INSTEAD OF QUITTING',
+    'MEMORY REASONING CONTRACT',
+    'MEMORY EXAMPLES',
+    'SKILL REGISTRY GUIDANCE',
+    'PERSISTENT TERMINAL'
+  ];
+  const dispatchOnly = [
+    'WHO YOU\'RE TALKING TO',
+    'Context ownership',
+    'HOW YOU COMMUNICATE',
+    'HOW YOU THINK',
+    'Permission boundary rule',
+    'ENVIRONMENT INSPECTION'
+  ];
+
+  for (const phrase of coderOnly) {
+    t.ok(coder.includes(phrase), `Coder prompt still has "${phrase}"`);
+    t.notOk(dispatch.includes(phrase), `Dispatch prompt did not gain "${phrase}"`);
+  }
+  for (const phrase of dispatchOnly) {
+    t.ok(dispatch.includes(phrase), `Dispatch prompt still has "${phrase}"`);
+    t.notOk(coder.includes(phrase), `Coder prompt did not gain "${phrase}"`);
+  }
+  t.end();
+});
+
+test('assembled prompts are not suspiciously short after extraction', (t) => {
+  // A coarse content-loss tripwire: both prompts are long, structured documents. A refactor bug
+  // that accidentally deletes a whole section would show up here even if the more specific
+  // assertions above happened to miss it.
+  const coder = coderPrompt();
+  const dispatch = dispatchPrompt();
+  t.ok(coder.length > 6000, `Coder prompt is still substantial (${coder.length} chars)`);
+  t.ok(dispatch.length > 2000, `Dispatch prompt is still substantial (${dispatch.length} chars)`);
+  t.end();
+});
+
+test('Dispatch is instructed to use schedule_followup and watch_condition, not just told it exists', (t) => {
+  // Dispatch gained both tools when the allowlist fix landed (schedule_followup / watch_condition),
+  // but DISPATCHER_INSTRUCTION never actually told it when to use them — a real gap noticed during
+  // the Phase 1 prompt-layering review. This guards the fix: a dedicated SCHEDULING section that
+  // names both tools and tells Dispatch when each applies.
+  const dispatch = dispatchPrompt();
+  t.ok(dispatch.includes('SCHEDULING (schedule_followup / watch_condition):'), 'Dispatch prompt has a dedicated scheduling section');
+  t.ok(dispatch.includes('schedule_followup'), 'schedule_followup is named');
+  t.ok(dispatch.includes('watch_condition'), 'watch_condition is named');
+  t.ok(/every morning|check back|remind me/i.test(dispatch), 'gives Dispatch a concrete durable-request example, not just an abstract rule');
+  t.ok(/tell me when/i.test(dispatch), 'gives Dispatch a concrete "notify me when" example for watch_condition');
+
+  // This is Dispatch-specific behavior (Dispatch's own routing/ownership rules), not a shared
+  // operating rule — it must not leak into Coder's prompt, which already has its own differently
+  // worded FOLLOW-UP TIMERS rule for its own execution context.
+  const coder = coderPrompt();
+  t.notOk(coder.includes('SCHEDULING (schedule_followup / watch_condition):'),
+    "Dispatch's scheduling section was not accidentally added to Coder");
+  t.ok(coder.includes('FOLLOW-UP TIMERS'), 'Coder keeps its own, separate follow-up rule');
+  t.end();
+});
+
+test('Phase 3: DOM_BEFORE_PIXEL_CONTROL and ADAPT_INSTEAD_OF_QUITTING are exported as non-empty strings', (t) => {
+  t.equal(typeof contract.DOM_BEFORE_PIXEL_CONTROL, 'string');
+  t.ok(contract.DOM_BEFORE_PIXEL_CONTROL.length > 0, 'DOM-before-pixel fragment is not empty');
+  t.equal(typeof contract.ADAPT_INSTEAD_OF_QUITTING, 'string');
+  t.ok(contract.ADAPT_INSTEAD_OF_QUITTING.length > 0, 'adapt-instead-of-quitting fragment is not empty');
+  t.end();
+});
+
+test('Phase 3: ADAPT INSTEAD OF QUITTING is now sourced from the shared fragment, still Coder-only', (t) => {
+  // Promoted from Coder's old inline "7A." text ahead of Operator's prompt existing, so the rule
+  // is written once instead of being hand-copied into OPERATOR_INSTRUCTION with different wording
+  // — the exact drift Phase 1 was built to prevent, this time caught before it could happen.
+  const coder = coderPrompt();
+  t.ok(coder.includes(contract.ADAPT_INSTEAD_OF_QUITTING), 'Coder prompt contains the exact shared fragment');
+  t.equal(countOccurrences(coder, contract.ADAPT_INSTEAD_OF_QUITTING), 1,
+    'the fragment appears exactly once (no accidental double-inclusion)');
+  t.ok(coder.includes('7A. ADAPT INSTEAD OF QUITTING:'), 'Coder keeps its own numbered-rule header');
+
+  // Not promoted into Dispatch: Dispatch cannot take the corrective multi-step action this rule
+  // describes, so adding it would be a new behavior claim, not a preserved one.
+  const dispatch = dispatchPrompt();
+  t.notOk(dispatch.includes(contract.ADAPT_INSTEAD_OF_QUITTING),
+    'the fragment was not added to Dispatch, which has no matching capability');
+  t.end();
+});
+
+test('Phase 3: DOM-before-pixel-control is shared inside Coder\'s computer-use rule', (t) => {
+  // This rule used to be a single buried clause in "14A. COMPUTER USE" ("do not use GUI automation
+  // to bypass Orion's dedicated browser... tools"). Promoted to the shared contract because it
+  // applies wherever a DOM tool and computer_action are both available — true for Coder today and
+  // for Operator once Operator's prompt exists (see the later Phase 3 assertions below).
+  const coder = coderPrompt();
+  t.ok(coder.includes(contract.DOM_BEFORE_PIXEL_CONTROL), 'Coder prompt contains the exact shared fragment');
+  t.equal(countOccurrences(coder, contract.DOM_BEFORE_PIXEL_CONTROL), 1,
+    'the fragment appears exactly once (no accidental double-inclusion)');
+  t.ok(coder.includes('14A. COMPUTER USE:'), 'Coder keeps its own numbered-rule header');
+  t.ok(coder.includes('Never type secrets or interact with UAC/security/credential dialogs'),
+    "Coder's own computer-use safety clause survives, reworded around the new shared opening sentence");
+
+  const dispatch = dispatchPrompt();
+  t.notOk(dispatch.includes(contract.DOM_BEFORE_PIXEL_CONTROL),
+    'the fragment was not added to Dispatch, which has no computer_action to prefer DOM tools over');
+  t.end();
+});
+
+// ── Phase 3 piece 3: OPERATOR_INSTRUCTION ───────────────────────────────────────────────────────
+// getSystemInstruction() now has a real three-way branch (Dispatch / Coder / Operator). These tests
+// exercise the same assembled-prompt-text level as everything above, per this file's own stated
+// convention, so they keep meaning regardless of later internal restructuring.
+
+test('Phase 3 piece 3: getSystemInstruction serves OPERATOR_INSTRUCTION for activeConversationMode "operator"', (t) => {
+  const operator = operatorPrompt();
+  t.ok(operator.includes("operating the user's desktop and browser directly on Jason's behalf"),
+    'Operator gets its own identity opening, not a fallback to Coder\'s prompt');
+  t.notOk(operator.includes('You are Orion AI, the ultimate pair programmer agent'),
+    'Operator prompt is not silently Coder\'s prompt (the pre-Phase-3 collapse this whole audit exists to prevent)');
+  agent.__setActiveConversationModeForTest('orion');
+  t.end();
+});
+
+test('Phase 3 piece 3: Operator shares VERIFICATION_DISCIPLINE, TOOL_SCHEMA_NOTE, DOM_BEFORE_PIXEL_CONTROL, and ADAPT_INSTEAD_OF_QUITTING with the other specialists', (t) => {
+  const operator = operatorPrompt();
+  for (const fragment of [contract.VERIFICATION_DISCIPLINE, contract.TOOL_SCHEMA_NOTE, contract.DOM_BEFORE_PIXEL_CONTROL, contract.ADAPT_INSTEAD_OF_QUITTING]) {
+    t.ok(operator.includes(fragment), 'Operator prompt contains the exact shared fragment');
+    t.equal(countOccurrences(operator, fragment), 1, 'the fragment appears exactly once (no accidental double-inclusion or hand-copy)');
+  }
+  t.ok(operator.includes('TOOL PREFERENCE — DOM BEFORE PIXELS:'), 'Operator has its own header for the shared DOM-before-pixel rule');
+  t.ok(operator.includes('ADAPT INSTEAD OF QUITTING:'), 'Operator has its own header for the shared adapt rule');
+  agent.__setActiveConversationModeForTest('orion');
+  t.end();
+});
+
+test('Phase 3 piece 3: Operator prompt covers state freshness, evidence-before-completion, and the real-world side-effects permission boundary', (t) => {
+  const operator = operatorPrompt();
+  t.ok(operator.includes('STATE FRESHNESS'), 'has a dedicated state-freshness section');
+  t.ok(operator.includes('capture_screen') && operator.includes('inspect_screenshot_with_model'),
+    'state-freshness guidance names the actual gated tools, not just an abstract rule');
+  t.ok(/does not need re-inspection/i.test(operator),
+    'explicitly covers when a fresh look is NOT required, not just when it is');
+
+  t.ok(operator.includes('EVIDENCE BEFORE COMPLETION'), 'has a dedicated evidence-before-completion section');
+  t.ok(/observed the result|actually observed/i.test(operator), 'completion is tied to observation, not intent');
+
+  t.ok(operator.includes('REAL-WORLD SIDE EFFECTS') || operator.includes('PERMISSION BOUNDARY'),
+    'has a dedicated permission-boundary section');
+  t.ok(/purchase/i.test(operator) && /send/i.test(operator) && /delet/i.test(operator) && /submit/i.test(operator),
+    'permission boundary names purchases, sends, deletions, and submissions explicitly, not just an abstract "irreversible" label');
+  t.ok(/explicitly/i.test(operator), 'permission boundary requires explicit authorization, not inferred intent');
+  agent.__setActiveConversationModeForTest('orion');
+  t.end();
+});
+
+test('Phase 3 piece 3: Operator prompt excludes Coder-specific testing, file-edit, and mission/subplan content', (t) => {
+  const operator = operatorPrompt();
+  const coderOnlyExcludedFromOperator = [
+    'TESTING AND REGRESSION DISCIPLINE',
+    'FILE EDIT DISCIPLINE',
+    'PREVIEW_APP RULES',
+    'DESIGN QUALITY',
+    'update_mission_context',
+    'start_subplan',
+    'coverage_frontier',
+    'MEMORY REASONING CONTRACT',
+    'SCRATCHPAD CHAIN-OF-THOUGHT'
+  ];
+  for (const phrase of coderOnlyExcludedFromOperator) {
+    t.notOk(operator.includes(phrase), `Operator prompt does not include Coder-specific "${phrase}"`);
+  }
+  // And the reverse: Operator's own content must not have leaked into Coder or Dispatch.
+  const coder = coderPrompt();
+  const dispatch = dispatchPrompt();
+  t.notOk(coder.includes('REAL-WORLD SIDE EFFECTS'), "Operator's permission-boundary section was not added to Coder");
+  t.notOk(dispatch.includes('REAL-WORLD SIDE EFFECTS'), "Operator's permission-boundary section was not added to Dispatch");
+  agent.__setActiveConversationModeForTest('orion');
+  t.end();
+});
+
+test('Phase 3 piece 3: Operator prompt is not suspiciously short', (t) => {
+  const operator = operatorPrompt();
+  t.ok(operator.length > 2500, `Operator prompt is substantial (${operator.length} chars)`);
+  agent.__setActiveConversationModeForTest('orion');
+  t.end();
+});

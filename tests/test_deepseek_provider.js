@@ -67,6 +67,68 @@ test('convertGeminiToDeepSeekMessages preserves hidden reasoning_content without
   t.end();
 });
 
+test('lightweight conversational replies project visible DeepSeek content instead of private reasoning', t => {
+  const response = {
+    candidates: [{
+      content: {
+        parts: [
+          {
+            text: 'The user is asking why I routed this task. Let me reason through the possible explanations.',
+            thought: true,
+            _deepseekReasoningContent: true
+          },
+          { text: 'I routed it incorrectly. Interactive playtesting belongs to Operator.' }
+        ]
+      }
+    }]
+  };
+  t.equal(
+    agent.extractVisibleModelText(response),
+    'I routed it incorrectly. Interactive playtesting belongs to Operator.',
+    'the supervisor path selects the visible answer even when reasoning is the first provider part'
+  );
+  t.equal(
+    agent.extractVisibleModelText({
+      candidates: [{ content: { parts: [{ text: 'private draft only', thought: true, _deepseekReasoningContent: true }] } }]
+    }),
+    '',
+    'reasoning-only output fails closed instead of becoming the chat answer'
+  );
+  t.end();
+});
+
+test('the real lightweight Dispatch call returns DeepSeek visible content, not reasoning_content', async t => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      choices: [{
+        message: {
+          reasoning_content: 'The user is asking why the task was routed this way. I should reconstruct the old decision.',
+          content: 'That was routed incorrectly. An interactive playtest belongs to Operator.'
+        }
+      }]
+    })
+  });
+
+  try {
+    const reply = await global.window.quickOrionLLMCall(
+      'Answer conversationally.',
+      [{ role: 'user', content: 'Why did you route that to Coder?' }],
+      { modelName: 'deepseek-v4-flash', deepseekApiKey: 'test-key' }
+    );
+    t.equal(
+      reply,
+      'That was routed incorrectly. An interactive playtest belongs to Operator.',
+      'the integrated supervisor call returns the provider-visible answer'
+    );
+    t.notOk(reply.includes('The user is asking'), 'private provider reasoning never becomes chat content');
+  } finally {
+    global.fetch = originalFetch;
+  }
+  t.end();
+});
+
 test('convertGeminiToDeepSeekMessages adds reasoning continuity for tool-call turns that lost it', (t) => {
   const messages = [
     {
@@ -162,6 +224,50 @@ test('DeepSeek context fitting collapses a giant recent read result without muta
   t.ok(/narrower read_file range/.test(response.note), 'DeepSeek is told how to recover exact relevant source');
   t.equal(messages[2].parts[0].functionResponse.response.content.length, giant.length, 'canonical history is not mutated by the per-call safety copy');
   t.ok(fitted.estimatedTokens <= fitted.maxInputTokens, 'the fitted request is below the configured safety ceiling');
+  t.end();
+});
+
+test('DeepSeek emergency fitting bounds a giant recent command result while retaining verification evidence', (t) => {
+  const stdout = `first match\n${'x'.repeat(50000)}\nlast match`;
+  const messages = [
+    { role: 'user', parts: [{ text: 'inspect the diagnostic result' }] },
+    { role: 'model', parts: [{ functionCall: { name: 'run_command', args: { command: 'Select-String huge.json needle' } } }] },
+    {
+      role: 'tool',
+      parts: [{
+        functionResponse: {
+          name: 'run_command',
+          response: { exitCode: 0, stdout, stderr: '', timedOut: false, killed: false }
+        }
+      }]
+    }
+  ];
+  const fitted = agent.fitDeepSeekMessagesToContextWindow(
+    messages,
+    'deepseek-v4-flash',
+    'system',
+    [],
+    { maxInputTokens: 4000 }
+  );
+  const response = fitted.messages[2].parts[0].functionResponse.response;
+
+  t.equal(fitted.collapsedToolResults, 1, 'recent execution output is eligible only for emergency request fitting');
+  t.equal(response.exitCode, 0, 'the command exit status survives emergency fitting');
+  t.equal(response.timedOut, false, 'timeout evidence survives emergency fitting');
+  t.match(response.stdoutPreview, /first match/, 'the start of command evidence is retained');
+  t.match(response.stdoutPreview, /last match/, 'the end of command evidence is retained');
+  t.match(response.note, /rerun a narrower command/i, 'the model receives a safe exact-evidence recovery path');
+  t.equal(messages[2].parts[0].functionResponse.response.stdout.length, stdout.length, 'canonical live history is not mutated');
+  t.ok(fitted.estimatedTokens <= fitted.maxInputTokens, 'the provider request is brought below the safety ceiling');
+  t.end();
+});
+
+test('live command streaming is bounded before it enters agent history', (t) => {
+  const first = agent.appendBoundedCommandOutput('', 'a'.repeat(agent.AGENT_COMMAND_OUTPUT_MAX_CHARS - 10));
+  const second = agent.appendBoundedCommandOutput(first.output, `${'b'.repeat(1000)}TAIL`);
+  t.equal(second.output.length, agent.AGENT_COMMAND_OUTPUT_MAX_CHARS, 'the renderer-side live buffer cannot grow past its cap');
+  t.equal(second.truncated, true, 'the caller can disclose that output was truncated');
+  t.match(second.output, /TAIL$/, 'the newest diagnostic output is retained');
   t.end();
 });
 
@@ -281,5 +387,81 @@ test('the reactive per-file escalation and proactive deep-task upgrade both use 
   t.ok(matches.length >= 2, 'getNextModelForHighDemand is used at both escalation call sites (proactive + reactive)');
   t.notOk(agentSource.includes("activeRunModelName.startsWith('gemini-') ? getNextGeminiModelForHighDemand(activeRunModelName) : null"),
     'the reactive escalation no longer gates on a hardcoded gemini-only check');
+  t.end();
+});
+
+// Regression: DeepSeek rejects the ENTIRE request with
+//   HTTP 400 "Invalid assistant message: content or tool_calls must be set"
+// if any assistant message carries neither. This killed a live task mid-run.
+//
+// The cause was a coupling that was easy to miss: content used to be derived as
+//   joinedText || (reasoningContent ? "" : null)
+// so reasoningContent was silently doing double duty as "does this turn have any substance".
+// When prior-turn reasoning stopped being replayed (to stop each request growing larger than
+// the last), older text-free turns collapsed to content:null with no tool_calls.
+//
+// This asserts the provider's invariant directly, across every history shape, so the two
+// concerns can never be coupled again.
+test('every assistant message sent to DeepSeek satisfies content-or-tool_calls', (t) => {
+  const reasoningPart = { text: 'internal chain of thought', thought: true, _deepseekReasoningContent: true };
+  const callPart = { functionCall: { name: 'grep_search', args: { pattern: 'x' } } };
+
+  const histories = {
+    'text only': [{ role: 'model', parts: [{ text: 'Here is the answer.' }] }],
+    'reasoning only, no text, no tools': [{ role: 'model', parts: [reasoningPart] }],
+    'tool call with no text': [{ role: 'model', parts: [callPart] }],
+    'reasoning plus tool call': [{ role: 'model', parts: [reasoningPart, callPart] }],
+    'completely empty parts': [{ role: 'model', parts: [] }],
+    'missing parts entirely': [{ role: 'model' }],
+    'older reasoning-only turn followed by a newer turn': [
+      { role: 'model', parts: [reasoningPart] },
+      { role: 'user', parts: [{ text: 'and then?' }] },
+      { role: 'model', parts: [{ text: 'final' }, reasoningPart] }
+    ],
+    'several stacked reasoning-only turns': [
+      { role: 'model', parts: [reasoningPart] },
+      { role: 'model', parts: [reasoningPart] },
+      { role: 'model', parts: [reasoningPart] }
+    ]
+  };
+
+  for (const [label, history] of Object.entries(histories)) {
+    const converted = agent.convertGeminiToDeepSeekMessages(history);
+    const assistants = converted.filter(m => m.role === 'assistant');
+    t.ok(assistants.length > 0, `${label}: produces at least one assistant message`);
+    for (const msg of assistants) {
+      const hasContent = typeof msg.content === 'string';
+      const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+      t.ok(hasContent || hasToolCalls,
+        `${label}: assistant message has content or tool_calls (content=${JSON.stringify(msg.content)}, tools=${hasToolCalls})`);
+      // content:null is legal when tool_calls carry the turn — it is only fatal when the
+      // message has neither, which is the case the guard above covers.
+      if (!hasToolCalls) {
+        t.notEqual(msg.content, null, `${label}: a tool-less assistant message never sends null content`);
+      }
+    }
+  }
+  t.end();
+});
+
+test('only the newest turn replays full reasoning, but tool-call turns keep the field', (t) => {
+  const reasoningPart = { text: 'a very long chain of thought', thought: true, _deepseekReasoningContent: true };
+  const callPart = { functionCall: { name: 'read_file', args: { path: 'a.js' } } };
+  const history = [
+    { role: 'model', parts: [reasoningPart, callPart] },
+    { role: 'tool', parts: [{ functionResponse: { name: 'read_file', response: { ok: true } } }] },
+    { role: 'model', parts: [reasoningPart, { text: 'done' }] }
+  ];
+
+  const assistants = agent.convertGeminiToDeepSeekMessages(history).filter(m => m.role === 'assistant');
+  t.equal(assistants.length, 2, 'both assistant turns are present');
+
+  // The older tool-call turn must still carry the field — DeepSeek requires it on tool-call
+  // turns — but not the full earlier transcript, which is what was inflating every request.
+  t.ok(assistants[0].reasoning_content, 'the older tool-call turn keeps a reasoning_content field');
+  t.notEqual(assistants[0].reasoning_content, 'a very long chain of thought',
+    'the older turn does not replay its full chain of thought');
+  t.equal(assistants[1].reasoning_content, 'a very long chain of thought',
+    'the newest turn replays its reasoning verbatim');
   t.end();
 });

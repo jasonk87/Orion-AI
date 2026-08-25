@@ -89,6 +89,102 @@ test('context-dependent request detection consumes structured semantic intent on
   t.end();
 });
 
+test('task execution profile preserves the selected model and reasoning across normalization', t => {
+  const result = buildTaskPacket({
+    taskId: 'task-profile',
+    originalUserMessage: 'Fix the issue.',
+    objective: 'Fix and verify the issue.',
+    workspace: baseTask().workspace,
+    origin: baseTask().origin,
+    target: baseTask().target,
+    executionProfile: {
+      requestedModel: 'deepseek-v4-flash',
+      requestedReasoning: 'max',
+      allowEscalation: true,
+      allowDowngrade: false,
+      capturedAt: 1000
+    },
+    timestamp: 1000
+  });
+  t.equal(result.success, true, 'the task packet is created');
+  t.deepEqual(result.task.executionProfile, {
+    requestedModel: 'deepseek-v4-flash',
+    requestedReasoning: 'max',
+    allowEscalation: true,
+    allowDowngrade: false,
+    capturedAt: 1000
+  }, 'the dispatch selection is part of the durable task contract');
+  const restored = normalizeTaskRecord(JSON.parse(JSON.stringify(result.task)));
+  t.deepEqual(restored.executionProfile, result.task.executionProfile, 'restart normalization preserves the execution profile exactly');
+  t.match(renderTaskPrompt(restored), /Requested model: deepseek-v4-flash/, 'Coder receives the requested model in the self-contained packet');
+  t.match(renderTaskPrompt(restored), /Requested reasoning: max/, 'Coder receives the requested reasoning in the self-contained packet');
+
+  const legacy = normalizeTaskRecord(baseTask({ executionProfile: undefined, modelSelectValue: 'gemini-2.5-flash' }));
+  t.equal(legacy.executionProfile.requestedModel, 'gemini-2.5-flash', 'legacy queued model data migrates forward');
+  t.equal(legacy.executionProfile.requestedReasoning, 'auto', 'legacy tasks safely default to dynamic reasoning');
+  t.end();
+});
+
+test('specialist child tasks preserve parent lineage without surrendering root Dispatch control', t => {
+  const child = normalizeTaskRecord(baseTask({
+    taskId: 'task_operator_child',
+    title: 'Playtest This is Life',
+    objective: 'Interactively playtest This is Life and report visible evidence.',
+    originalUserMessage: 'Can we have Operator playtest our This is Life project?',
+    precedingConversationSummary: 'Parent task task_coder_parent: prepare and supervise the interactive playtest.',
+    parentTaskId: 'task_coder_parent',
+    rootOriginConversationId: 'dispatch-root',
+    origin: { conversationId: 'coder-parent', sessionId: 'coder-parent', messageId: '' },
+    target: { conversationId: 'operator-child', sessionId: 'operator-child', messageId: '', mode: 'operator' },
+    executionSurface: 'desktop'
+  }));
+  t.equal(child.parentTaskId, 'task_coder_parent', 'the durable child points to the task it must return to');
+  t.equal(child.rootOriginConversationId, 'dispatch-root', 'the root Dispatch owner survives specialist-to-specialist delegation');
+  t.equal(canRequesterControlTask(child, { conversationId: 'dispatch-root' }), true, 'the original Dispatch conversation can still cancel its descendant');
+  t.equal(canRequesterControlTask(child, { conversationId: 'unrelated' }), false, 'unrelated conversations gain no child-task authority');
+  const prompt = renderTaskPrompt(child);
+  t.match(prompt, /Parent task: task_coder_parent/, 'Operator sees compact lineage instead of needing a nested rendered parent packet');
+  t.match(prompt, /Root owner conversation: dispatch-root/, 'the self-contained prompt identifies the durable root owner');
+  t.end();
+});
+
+test('a parent waiting on Operator is presented as delegated work, not completed or generically queued', t => {
+  const presentation = describeSupervisedTaskPresentation(normalizeTaskRecord(baseTask({
+    status: 'pending',
+    execution: {
+      attempt: 1,
+      executionId: 'task_base:run:1',
+      state: 'pending',
+      reasonCode: 'awaiting_delegated_task',
+      resumePolicy: 'manual'
+    },
+    delegation: { childTaskId: 'task_operator_child', childRole: 'operator', status: 'active' }
+  })), { roleLabel: 'Coder', roleMode: 'coder' });
+  t.equal(presentation.phase, 'delegated', 'the durable wait has its own lifecycle phase');
+  t.equal(presentation.label, 'Operator active', 'Dispatch shows who is actually doing the visible work');
+  t.equal(presentation.isOngoing, true, 'the parent remains ongoing while its child runs');
+  t.end();
+});
+
+test('legacy model API errors recorded as completed migrate to failed', t => {
+  const migrated = normalizeTaskRecord(baseTask({
+    schemaVersion: 2,
+    status: 'completed',
+    result: {
+      summary: 'Error contacting Model API: Orion blocked an oversized DeepSeek request locally.'
+    }
+  }));
+  t.equal(migrated.status, 'failed', 'the false terminal success is repaired');
+  t.equal(migrated.failure.code, 'legacy_model_api_failure', 'the migration reason remains structured');
+
+  const ordinary = normalizeTaskRecord(baseTask({
+    status: 'completed',
+    result: { summary: 'Documented the text Error contacting Model API: in a troubleshooting guide.' }
+  }));
+  t.equal(ordinary.status, 'completed', 'ordinary prose mentioning the phrase is not reclassified');
+  t.end();
+});
+
 test('task continuation detection requires a structured active-owned-task target', t => {
   t.equal(isContinuationRequest({
     intent: 'context_followup',
@@ -604,6 +700,66 @@ test('Dispatch task presentation follows one durable task from queued through pl
   t.end();
 });
 
+test('Phase 2: task presentation and continuation selection are role-generic, not hardcoded to Coder', t => {
+  // These guard the Phase 2 generalization: selectOwnedContinuationTask and
+  // describeSupervisedTaskPresentation used to have 'coder' baked in as a literal. Both now take an
+  // optional role/roleLabel that defaults to 'coder'/'Coder' — the tests above already lock in that
+  // default (unchanged) behavior. These tests prove the parameter is real: supplying a different
+  // role/roleLabel actually changes the result, rather than the option being silently ignored.
+  const coderTask = normalizeTaskRecord(baseTask({
+    taskId: 'task_role_coder',
+    origin: { conversationId: 'dispatch-1', sessionId: 'dispatch-1', messageId: 'message-1' },
+    target: { conversationId: 'coder-1', sessionId: 'coder-1', mode: 'coder' }
+  }));
+  const operatorTask = normalizeTaskRecord(baseTask({
+    taskId: 'task_role_operator',
+    executionSurface: 'desktop',
+    origin: { conversationId: 'dispatch-1', sessionId: 'dispatch-1', messageId: 'message-2' },
+    target: { conversationId: 'operator-1', sessionId: 'operator-1', mode: 'operator' }
+  }));
+  t.equal(operatorTask.executionSurface, 'desktop', 'the durable task preserves its Operator execution surface across persistence');
+
+  // selectOwnedContinuationTask: without a role option, only the coder-mode task is a candidate
+  // (unchanged default — this is exactly what every pre-Phase-2 caller still gets). With
+  // role: 'operator', only the operator-mode task is a candidate. Neither role leaks into the
+  // other's result, and both tasks being present and pending simultaneously proves the filter is
+  // doing real work, not just returning "the only task there is."
+  const defaultRole = selectOwnedContinuationTask([coderTask, operatorTask], 'dispatch-1', []);
+  t.equal(defaultRole.action, 'resume_pending', 'the one pending coder-mode task resumes by default');
+  t.equal(defaultRole.task.taskId, 'task_role_coder', 'default role selects only the coder task');
+
+  const explicitCoder = selectOwnedContinuationTask([coderTask, operatorTask], 'dispatch-1', [], { role: 'coder' });
+  t.equal(explicitCoder.task.taskId, 'task_role_coder', 'role: "coder" is equivalent to the default');
+
+  const operatorRole = selectOwnedContinuationTask([coderTask, operatorTask], 'dispatch-1', [], { role: 'operator' });
+  t.equal(operatorRole.action, 'resume_pending', 'the one pending operator-mode task resumes when asked for that role');
+  t.equal(operatorRole.task.taskId, 'task_role_operator', 'role: "operator" selects only the operator task, not the coder one');
+
+  const noSuchRole = selectOwnedContinuationTask([coderTask, operatorTask], 'dispatch-1', [], { role: 'reviewer' });
+  t.equal(noSuchRole.action, 'unknown_specialist', 'an unregistered role fails closed rather than falling back to any specialist');
+
+  // describeSupervisedTaskPresentation: roleLabel defaults to 'Coder' (already covered by the
+  // exact-string assertions above), and an explicit roleLabel substitutes cleanly everywhere the
+  // literal 'Coder' used to be hardcoded, without corrupting the phase/badge machinery around it.
+  const operatorPresentation = describeSupervisedTaskPresentation(operatorTask, { roleLabel: 'Operator' });
+  t.equal(operatorPresentation.label, 'Operator queued', 'a supplied roleLabel replaces the hardcoded "Coder" in the label');
+  t.equal(operatorPresentation.agentState, 'Operator queued', 'and in the agent-state string');
+  t.equal(operatorPresentation.detail, 'Waiting for Operator to claim this task.', 'and in the detail sentence');
+  t.equal(operatorPresentation.phase, 'queued', 'the underlying phase/badge logic is unaffected by the role label');
+  t.equal(operatorPresentation.badgeClass, 'warning', 'and the badge class is unaffected too');
+
+  const activeOperator = transitionTask(operatorTask, TASK_STATES.ACTIVE, { timestamp: 1200 });
+  const observing = describeSupervisedTaskPresentation(activeOperator, {
+    roleLabel: 'Operator',
+    roleMode: 'operator',
+    subStatus: 'Operator is inspecting what is visible...'
+  });
+  t.equal(observing.label, 'Operator observing', 'active screen inspection is not mislabeled as planning');
+  t.equal(observing.phase, 'observing-screen', 'the UI receives an explicit screen-observation phase');
+  t.equal(observing.badgeClass, 'operator', 'Operator takeover has a distinct presentation class');
+  t.end();
+});
+
 test('live phone conversation state outranks a previous terminal Coder task', t => {
   for (const terminal of [
     { agentState: 'Complete', detail: 'Coder recorded this task as completed.', isOngoing: false },
@@ -659,6 +815,46 @@ test('Dispatch supervision excludes same-conversation Orion queue records', t =>
     selectSupervisedTask([directDispatchTask, delegatedCoderTask], 'dispatch-1', '', { delegatedOnly: true }).taskId,
     delegatedCoderTask.taskId,
     'real cross-conversation Coder work remains visible in Dispatch'
+  );
+  t.end();
+});
+
+test('Dispatch supervision follows durable specialist descendants instead of freezing on the root task', t => {
+  const root = normalizeTaskRecord(baseTask({
+    taskId: 'task_dispatch_root',
+    title: 'Push Orion changes',
+    origin: { conversationId: 'dispatch-1', sessionId: 'dispatch-1', messageId: 'm-root' },
+    target: { conversationId: 'coder-parent', sessionId: 'coder-parent', mode: 'coder' },
+    source: 'dispatch-handoff',
+    delegation: { childTaskId: 'task_coder_child', childRole: 'coder', status: 'pending' }
+  }));
+  const child = transitionTask(normalizeTaskRecord(baseTask({
+    taskId: 'task_coder_child',
+    title: 'Push verified changes',
+    parentTaskId: root.taskId,
+    rootOriginConversationId: 'dispatch-1',
+    origin: { conversationId: 'coder-parent', sessionId: 'coder-parent', messageId: 'm-child' },
+    target: { conversationId: 'coder-child', sessionId: 'coder-child', mode: 'coder' },
+    source: 'specialist-coder-handoff'
+  })), TASK_STATES.ACTIVE, { timestamp: 2200 });
+
+  t.equal(
+    selectSupervisedTask([root, child], 'dispatch-1', '', {
+      delegatedOnly: true,
+      followDescendants: true
+    }).taskId,
+    child.taskId,
+    'the owning Dispatch view follows the active descendant even though its direct origin is Coder'
+  );
+
+  const legacyChild = { ...child, parentTaskId: '' };
+  t.equal(
+    selectSupervisedTask([root, legacyChild], 'dispatch-1', '', {
+      delegatedOnly: true,
+      followDescendants: true
+    }).taskId,
+    legacyChild.taskId,
+    'an older child with missing lineage is still followed through the parent delegation receipt'
   );
   t.end();
 });

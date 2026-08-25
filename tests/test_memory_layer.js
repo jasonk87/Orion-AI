@@ -136,6 +136,44 @@ test('Pinned global facts remain eligible after normal age filtering', async (t)
   t.end();
 });
 
+test('Global factual retrieval cannot be crowded out by preferences', async (t) => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-home-'));
+  const origHome = process.env.HOME;
+  const origUserProfile = process.env.USERPROFILE;
+  process.env.HOME = tmpHome;
+  process.env.USERPROFILE = tmpHome;
+
+  try {
+    const addedAt = new Date().toISOString();
+    mm.writeGlobalMemory({
+      user: {
+        preferences: Array.from({ length: 20 }, (_, index) => ({
+          text: `Preference ${index}: conversational style choice`,
+          source: 'explicit-preference',
+          addedAt
+        }))
+      },
+      facts: [{
+        text: 'Jason lives in south-central Kentucky (Glasgow/Bowling Green area).',
+        category: 'personal',
+        addedAt
+      }]
+    });
+    const ranked = await mm.rankGlobalFactsByQuery('user home or current location', null, 10, 'orion');
+    t.deepEqual(
+      ranked.map(item => item.text),
+      ['Jason lives in south-central Kentucky (Glasgow/Bowling Green area).'],
+      'the durable location remains factual evidence even when many preferences exist'
+    );
+    t.ok(ranked.every(item => item.type === 'fact'), 'the factual evidence channel never returns preferences');
+  } finally {
+    process.env.HOME = origHome;
+    process.env.USERPROFILE = origUserProfile;
+    cleanup(tmpHome);
+  }
+  t.end();
+});
+
 // ── Project Memory ────────────────────────────────────────────────────────────
 
 test('Project memory - readProjectMemory returns defaults for missing workspace', (t) => {

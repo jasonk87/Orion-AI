@@ -462,7 +462,65 @@ test('conversation can be compacted without losing mission state', (t) => {
   const joined = JSON.stringify(messages);
   t.ok(joined.includes('Build a deep colony simulation.'), 'mission state is still present');
   t.ok(joined.includes('Working economy'), 'win conditions are still present');
-  t.notOk(joined.includes('Old task summary that is not canonical'), 'compacted chat summary is not task source of truth');
+  t.ok(joined.includes('Old task summary that is not canonical'), 'compacted conversation memory remains available');
+  t.ok(joined.includes('compacted, non-canonical'), 'the summary is explicitly separated from authoritative task state');
+  t.notOk(joined.includes('Understood. I will use this compacted summary as prior context.'), 'synthetic compaction acknowledgement is not replayed as conversation');
+  t.end();
+});
+
+test('compaction scaffolding is recognized as internal while ordinary messages remain visible', (t) => {
+  const legacySummary = { role: 'user', text: '[COMPACTED CONTEXT SUMMARY]\nOld internal summary.' };
+  const legacyAck = { role: 'assistant', text: 'Understood. I will use this compacted summary as prior context.' };
+  const legacyStatus = { role: 'system', text: 'Context reached 125000 tokens; compacting for model-x at threshold 100000.' };
+  const structured = { role: 'user', source: 'context-compaction', internalContext: true, text: 'Stored summary.' };
+  const ordinary = { role: 'assistant', text: 'Hey Jason, I am here.' };
+
+  t.equal(operational.isInternalContextMessage(legacySummary), true, 'legacy summary is hidden after upgrade');
+  t.equal(operational.isInternalContextMessage(legacyAck), true, 'legacy acknowledgement is hidden after upgrade');
+  t.equal(operational.isInternalContextMessage(legacyStatus), true, 'legacy visible compaction status is hidden after upgrade');
+  t.equal(operational.isInternalContextMessage(structured), true, 'new structured compaction record is internal');
+  t.equal(operational.isInternalContextMessage(ordinary), false, 'ordinary assistant text stays visible');
+
+  const view = operational.buildRecentChatView([
+    legacySummary,
+    legacyAck,
+    legacyStatus,
+    { role: 'user', text: "What's up?" },
+    ordinary
+  ], 'Anything new?');
+  t.deepEqual(view.map(message => message.text), ["What's up?", 'Hey Jason, I am here.'], 'recent chat contains only the real conversation');
+  t.end();
+});
+
+test('recent conversation scope retains several exchanges and private compaction memory', (t) => {
+  const conversation = [
+    {
+      role: 'user',
+      source: 'context-compaction',
+      internalContext: true,
+      hiddenFromTranscript: true,
+      text: '[COMPACTED CONTEXT SUMMARY]\nJason said he was preparing for another day of storm work.'
+    },
+    { role: 'assistant', source: 'context-compaction', internalContext: true, text: 'Understood. I will use this compacted summary as prior context.' },
+    { role: 'user', text: "What's up?" },
+    { role: 'assistant', text: 'Not much. How is your morning going?' },
+    { role: 'user', text: 'Just getting ready for another day of work.' },
+    { role: 'assistant', text: 'Got it. Hope the day goes smoothly.' },
+    { role: 'user', text: 'As I just said, I am getting ready.' }
+  ];
+  const messages = operational.buildReasoningMessages(
+    operational.createEmptyContext(T0),
+    conversation,
+    'As I just said, I am getting ready.',
+    [],
+    { contextScope: 'recent' }
+  );
+  const joined = JSON.stringify(messages);
+
+  t.ok(joined.includes('preparing for another day of storm work'), 'private compacted memory reaches reasoning');
+  t.ok(joined.includes('Just getting ready for another day of work.'), 'the immediately preceding user statement is retained');
+  t.ok(joined.includes('Hope the day goes smoothly.'), 'the preceding assistant response is retained');
+  t.equal((joined.match(/As I just said, I am getting ready\./g) || []).length, 1, 'the current input is not duplicated inside the recent view');
   t.end();
 });
 
