@@ -819,6 +819,46 @@ test('Dispatch supervision excludes same-conversation Orion queue records', t =>
   t.end();
 });
 
+test('Dispatch supervision follows durable specialist descendants instead of freezing on the root task', t => {
+  const root = normalizeTaskRecord(baseTask({
+    taskId: 'task_dispatch_root',
+    title: 'Push Orion changes',
+    origin: { conversationId: 'dispatch-1', sessionId: 'dispatch-1', messageId: 'm-root' },
+    target: { conversationId: 'coder-parent', sessionId: 'coder-parent', mode: 'coder' },
+    source: 'dispatch-handoff',
+    delegation: { childTaskId: 'task_coder_child', childRole: 'coder', status: 'pending' }
+  }));
+  const child = transitionTask(normalizeTaskRecord(baseTask({
+    taskId: 'task_coder_child',
+    title: 'Push verified changes',
+    parentTaskId: root.taskId,
+    rootOriginConversationId: 'dispatch-1',
+    origin: { conversationId: 'coder-parent', sessionId: 'coder-parent', messageId: 'm-child' },
+    target: { conversationId: 'coder-child', sessionId: 'coder-child', mode: 'coder' },
+    source: 'specialist-coder-handoff'
+  })), TASK_STATES.ACTIVE, { timestamp: 2200 });
+
+  t.equal(
+    selectSupervisedTask([root, child], 'dispatch-1', '', {
+      delegatedOnly: true,
+      followDescendants: true
+    }).taskId,
+    child.taskId,
+    'the owning Dispatch view follows the active descendant even though its direct origin is Coder'
+  );
+
+  const legacyChild = { ...child, parentTaskId: '' };
+  t.equal(
+    selectSupervisedTask([root, legacyChild], 'dispatch-1', '', {
+      delegatedOnly: true,
+      followDescendants: true
+    }).taskId,
+    legacyChild.taskId,
+    'an older child with missing lineage is still followed through the parent delegation receipt'
+  );
+  t.end();
+});
+
 test('newer continuation tasks supersede exact pending predecessors without title guessing', t => {
   const predecessor = normalizeTaskRecord(baseTask({
     taskId: 'task_polish_original',

@@ -5309,11 +5309,19 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         forcedYieldFailure,
         lastTextResponse
       });
-      if (notification) {
+      // A delegated child is not the user-visible terminal result. Its completion first resumes
+      // the durable parent; only the root task may notify after Dispatch has received and flushed
+      // the final report. Otherwise a tap races into an intermediate specialist transcript.
+      const delegatedChildCompletion = !!(
+        finalizedTaskRecord
+        && String(finalizedTaskRecord.parentTaskId || '')
+      );
+      if (notification && !delegatedChildCompletion) {
         const taskOriginConversationId = String(
-          finalizedTaskRecord
-          && finalizedTaskRecord.origin
-          && finalizedTaskRecord.origin.conversationId
+          finalizedTaskRecord && (
+            finalizedTaskRecord.rootOriginConversationId
+            || (finalizedTaskRecord.origin && finalizedTaskRecord.origin.conversationId)
+          )
           || ''
         );
         // The delivery result is inspected rather than discarded. It carries the reason a push
@@ -6521,11 +6529,25 @@ async function executeTool(name, args, workspace, config, conversation, executio
       ).trim();
       if (!requestedPath && !isolatedStandaloneHandoff) throw new Error("Missing workspace path to hand off to Coder");
       const prompt = String(args.prompt || '').trim();
+      const parentTask = executionContext.claimedTaskRecord && typeof executionContext.claimedTaskRecord === 'object'
+        ? executionContext.claimedTaskRecord
+        : null;
+      const parentTaskId = String(executionContext.runTaskId || '').trim();
       const originalUserMessage = String(
-        args.originalUserMessage
+        (parentTask && parentTask.originalUserMessage)
+        || args.originalUserMessage
         || [...(conversation.messages || [])].reverse().find(message => message && message.role === 'user')?.text
         || prompt
       ).trim();
+      const parentContextSummary = parentTaskId && parentTask
+        ? [
+            `Parent task ${parentTask.taskId}: ${parentTask.objective || parentTask.title || originalUserMessage}`,
+            parentTask.precedingConversationSummary
+              ? `Original context: ${String(parentTask.precedingConversationSummary).slice(0, 1800)}`
+              : '',
+            prompt ? `Delegated Coder objective: ${prompt}` : ''
+          ].filter(Boolean).join('\n')
+        : '';
       const resolution = isolatedStandaloneHandoff
         ? { success: true, path: '', fuzzyResolved: false, resolvedFrom: '', matchedName: 'Standalone' }
         : await resolveWorkspacePathForChange(requestedPath);
@@ -6573,6 +6595,13 @@ async function executeTool(name, args, workspace, config, conversation, executio
         sourceConversationId: conversation.id,
         sourceSessionId: conversation.sessionId || conversation.id,
         sourceMessageId: (conversation.messages || []).slice().reverse().find(message => message.role === 'user')?.id || '',
+        parentTaskId,
+        rootOriginConversationId: String(
+          parentTask && (parentTask.rootOriginConversationId
+            || (parentTask.origin && parentTask.origin.conversationId))
+          || conversation.id
+        ),
+        precedingConversationSummary: parentContextSummary,
         contextPacketIds,
         findings: Array.isArray(args.findings) ? args.findings : [],
         semanticIntent: executionContext.authorizedDispatchHandoffIntent || undefined

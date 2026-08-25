@@ -1295,6 +1295,98 @@ test('Coder delegation to Operator keeps the same parent task pending until chil
   t.end();
 });
 
+test('a task-bound handoff to Coder preserves parent and root Dispatch ownership', async t => {
+  const originalFetch = global.fetch;
+  const workspace = 'C:\\Users\\Owner\\Desktop\\Projects\\OrionAI';
+  const parentTaskId = 'task-coder-parent-push';
+  const childTaskId = 'task-coder-child-push';
+  const coderHandoffs = [];
+  const parentUpdates = [];
+  const finalized = [];
+  installHarness([[{
+    functionCall: {
+      name: 'handoff_to_coder',
+      args: {
+        path: workspace,
+        prompt: 'Push the verified Orion changes and report the exact commit.',
+        title: 'Push verified Orion changes'
+      }
+    }
+  }]], {
+    workspace,
+    projects: [workspace],
+    api: {
+      updateOrchestrationTask: async (taskId, patch) => {
+        parentUpdates.push({ taskId, patch });
+        return { success: true };
+      }
+    },
+    window: {
+      claimOrchestrationTask: async taskId => ({
+        success: true,
+        task: {
+          schemaVersion: 4,
+          taskId,
+          title: 'Publish Orion reliability fixes',
+          objective: 'Verify and publish the current Orion reliability fixes.',
+          originalUserMessage: 'Can you push all Orion changes to GitHub?',
+          precedingConversationSummary: 'The user approved publishing all verified Orion changes.',
+          workspacePath: workspace,
+          rootOriginConversationId: 'dispatch-push-origin',
+          origin: { conversationId: 'dispatch-push-origin' },
+          target: { conversationId: 'coder-push-parent', mode: 'coder' },
+          status: 'active',
+          execution: { executionId: 'exec-coder-parent-push' }
+        },
+        prompt: 'Verify and publish the current Orion reliability fixes.'
+      }),
+      promoteWorkspaceToCoder: async payload => {
+        coderHandoffs.push(payload);
+        return {
+          success: true,
+          conversationId: 'coder-push-child',
+          taskId: childTaskId,
+          title: payload.title,
+          status: 'pending',
+          task: {
+            taskId: childTaskId,
+            parentTaskId: payload.parentTaskId,
+            rootOriginConversationId: payload.rootOriginConversationId,
+            target: { conversationId: 'coder-push-child', mode: 'coder' }
+          }
+        };
+      },
+      startCoderTaskMonitor: () => {},
+      finalizeOrchestrationTask: async (taskId, status, details) => {
+        finalized.push({ taskId, status, details });
+        return { taskId, status, delegation: { childTaskId } };
+      },
+      onOrchestrationTaskFinalized: async () => {}
+    }
+  });
+  const conv = conversation('coder-push-parent', { mode: 'coder', workspace });
+  try {
+    await global.window.runAgentLoop(
+      'Verify and publish the current Orion reliability fixes.',
+      'gemini-1',
+      conv,
+      { taskId: parentTaskId, internalPrompt: true }
+    );
+
+    t.equal(coderHandoffs.length, 1, 'the parent creates exactly one Coder child');
+    t.equal(coderHandoffs[0].parentTaskId, parentTaskId, 'the new Coder task names its exact parent');
+    t.equal(coderHandoffs[0].rootOriginConversationId, 'dispatch-push-origin', 'the root Dispatch owner survives the handoff');
+    t.equal(coderHandoffs[0].originalUserMessage, 'Can you push all Orion changes to GitHub?', 'original user intent survives as provenance');
+    t.match(coderHandoffs[0].precedingConversationSummary, /Parent task task-coder-parent-push/i, 'the child receives a bounded parent summary');
+    t.equal(parentUpdates[0].patch.delegation.childTaskId, childTaskId, 'the parent records the exact child receipt');
+    t.equal(finalized[0].status, 'pending', 'delegation parks rather than completes the parent');
+    t.equal(finalized[0].details.reasonCode, 'awaiting_delegated_task', 'the pending reason remains structured');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
 test('a direct executable request preflights once to Operator and preserves durable handoff provenance', async t => {
   const originalFetch = global.fetch;
   const workspace = 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE';
@@ -3380,6 +3472,58 @@ test('a delegated specialist completion notification opens the owning Dispatch c
       dispatchConversationId,
       'the notification opens the Dispatch conversation that owns the task'
     );
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('a delegated child completion resumes its parent without sending an intermediate push', async t => {
+  const originalFetch = global.fetch;
+  const notifications = [];
+  const finalizedCallbacks = [];
+  const specialist = conversation('nested-notification-coder', { mode: 'coder' });
+  installHarness([[{ text: 'The child operation completed successfully.' }]], {
+    api: {
+      notifyPhone: async (title, body, context) => {
+        notifications.push({ title, body, context });
+        return { success: true, phone: { success: true, sent: 1 } };
+      }
+    },
+    window: {
+      claimOrchestrationTask: async taskId => ({
+        success: true,
+        task: {
+          taskId,
+          parentTaskId: 'task-visible-parent',
+          rootOriginConversationId: 'dispatch-visible-owner',
+          status: 'active',
+          execution: { executionId: 'nested-child-execution' },
+          origin: { conversationId: 'coder-parent' },
+          target: { conversationId: specialist.id, mode: 'coder' }
+        },
+        prompt: 'Complete the delegated child operation.'
+      }),
+      finalizeOrchestrationTask: async (taskId, status) => ({
+        taskId,
+        parentTaskId: 'task-visible-parent',
+        rootOriginConversationId: 'dispatch-visible-owner',
+        status,
+        origin: { conversationId: 'coder-parent' },
+        target: { conversationId: specialist.id, mode: 'coder' }
+      }),
+      onOrchestrationTaskFinalized: async (...args) => finalizedCallbacks.push(args)
+    }
+  });
+  try {
+    await global.window.runAgentLoop(
+      'Complete the delegated child operation.',
+      'gemini-1',
+      specialist,
+      { taskId: 'task-nested-child' }
+    );
+    t.equal(finalizedCallbacks.length, 1, 'the renderer receives the child finalization for parent reconciliation');
+    t.equal(notifications.length, 0, 'the child cannot race the final Dispatch result with an intermediate notification');
   } finally {
     restoreGlobals(originalFetch);
   }

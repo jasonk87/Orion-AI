@@ -221,23 +221,6 @@ test('phone task transport preserves Operator role for the header and screen-con
     messages: [],
     tasks: []
   };
-  const { win, expose } = loadRenderer({
-    t,
-    globals: {
-      OrionOperationalContext: operational,
-      OrionWorkspaceResolution: workspaceResolution,
-      OrionTaskOrchestration: taskOrchestration,
-      OrionSemanticIntentRouter: semanticIntentRouter,
-      OrionReasoningPolicy: reasoningPolicy
-    },
-    set: {
-      conversations: [dispatchConversation, operatorConversation],
-      activeConversationId: dispatchConversation.id,
-      appMode: 'orion',
-      currentWorkspace: 'C:\\Projects'
-    },
-    expose: ['orchestrationTaskCache']
-  });
   const operatorTask = taskOrchestration.transitionTask(
     taskOrchestration.normalizeTaskRecord({
       schemaVersion: taskOrchestration.SCHEMA_VERSION,
@@ -265,7 +248,25 @@ test('phone task transport preserves Operator role for the header and screen-con
     taskOrchestration.TASK_STATES.ACTIVE,
     { timestamp: 1100 }
   );
-  expose.orchestrationTaskCache.set(operatorTask.taskId, operatorTask);
+  const { win } = loadRenderer({
+    t,
+    api: {
+      listOrchestrationTasks: async () => ({ success: true, tasks: [operatorTask] })
+    },
+    globals: {
+      OrionOperationalContext: operational,
+      OrionWorkspaceResolution: workspaceResolution,
+      OrionTaskOrchestration: taskOrchestration,
+      OrionSemanticIntentRouter: semanticIntentRouter,
+      OrionReasoningPolicy: reasoningPolicy
+    },
+    set: {
+      conversations: [dispatchConversation, operatorConversation],
+      activeConversationId: dispatchConversation.id,
+      appMode: 'orion',
+      currentWorkspace: 'C:\\Projects'
+    }
+  });
 
   const phoneState = await win.getPhoneCompanionState(dispatchConversation.id);
   const transportedTask = phoneState.orchestrationTasks.find(task => task.taskId === operatorTask.taskId);
@@ -280,6 +281,249 @@ test('phone task transport preserves Operator role for the header and screen-con
   });
   t.equal(phoneRecomputed.label, 'Operator active', 'the phone header recomputation no longer falls back to Coder planning');
   t.notOk(/Coder/.test(phoneRecomputed.label), 'the bottom banner cannot describe this Operator task as Coder work');
+  t.end();
+});
+
+test('phone state refreshes durable task descendants and selects the work actually running', async t => {
+  const dispatch = {
+    id: 'dispatch-nested-owner',
+    title: 'Push Orion changes',
+    mode: 'orion',
+    workspace: 'C:\\Projects',
+    messages: [{ role: 'user', text: 'Push all Orion changes.' }],
+    tasks: []
+  };
+  const root = taskOrchestration.normalizeTaskRecord({
+    schemaVersion: taskOrchestration.SCHEMA_VERSION,
+    taskId: 'task-phone-root',
+    title: 'Push Orion changes',
+    objective: 'Publish all verified Orion changes.',
+    originalUserMessage: 'Push all Orion changes.',
+    workspacePath: 'C:\\Projects\\OrionAI',
+    origin: { conversationId: dispatch.id, sessionId: dispatch.id, messageId: 'm-root' },
+    target: { conversationId: 'coder-parent', sessionId: 'coder-parent', mode: 'coder' },
+    source: 'dispatch-handoff',
+    status: 'pending',
+    delegation: { childTaskId: 'task-phone-child', childRole: 'coder', status: 'active' },
+    createdAt: 1000,
+    updatedAt: 1200
+  });
+  const child = taskOrchestration.transitionTask(taskOrchestration.normalizeTaskRecord({
+    schemaVersion: taskOrchestration.SCHEMA_VERSION,
+    taskId: 'task-phone-child',
+    title: 'Publish verified branch',
+    objective: 'Push the verified branch and report the commit.',
+    originalUserMessage: 'Push all Orion changes.',
+    workspacePath: 'C:\\Projects\\OrionAI',
+    parentTaskId: root.taskId,
+    rootOriginConversationId: dispatch.id,
+    origin: { conversationId: 'coder-parent', sessionId: 'coder-parent', messageId: 'm-child' },
+    target: { conversationId: 'coder-child', sessionId: 'coder-child', mode: 'coder' },
+    source: 'specialist-coder-handoff',
+    status: 'pending',
+    createdAt: 1300,
+    updatedAt: 1300
+  }), taskOrchestration.TASK_STATES.ACTIVE, { timestamp: 1400 });
+  const { win } = loadRenderer({
+    t,
+    api: {
+      listOrchestrationTasks: async () => ({ success: true, tasks: [root, child] })
+    },
+    globals: {
+      OrionOperationalContext: operational,
+      OrionWorkspaceResolution: workspaceResolution,
+      OrionTaskOrchestration: taskOrchestration,
+      OrionSemanticIntentRouter: semanticIntentRouter,
+      OrionReasoningPolicy: reasoningPolicy
+    },
+    set: {
+      conversations: [dispatch],
+      activeConversationId: dispatch.id,
+      appMode: 'orion',
+      currentWorkspace: 'C:\\Projects'
+    }
+  });
+
+  const phoneState = await win.getPhoneCompanionState(dispatch.id);
+  t.equal(
+    phoneState.orchestrationTasks.map(task => task.taskId).sort().join(','),
+    [child.taskId, root.taskId].sort().join(','),
+    'the phone receives the whole durable lineage rather than only direct Dispatch records'
+  );
+  t.equal(phoneState.activeTaskId, child.taskId, 'the active descendant drives the phone lifecycle status');
+  const transportedChild = phoneState.orchestrationTasks.find(task => task.taskId === child.taskId);
+  t.equal(transportedChild.parentTaskId, root.taskId, 'child lineage survives the renderer transport boundary');
+  t.equal(transportedChild.rootOriginConversationId, dispatch.id, 'root notification ownership survives transport');
+  t.equal(transportedChild.execution.state, 'active', 'structured execution state survives transport');
+  t.end();
+});
+
+test('Coder completion is appended and flushed in Dispatch before notification deep-link delivery', async t => {
+  const taskId = 'task-flushed-dispatch-result';
+  const dispatch = {
+    id: 'dispatch-result-owner',
+    title: 'Push Orion changes',
+    mode: 'orion',
+    workspace: 'C:\\Projects\\OrionAI',
+    launchedCoderConvId: 'coder-result-worker',
+    launchedCoderTaskId: taskId,
+    launchedCoderTaskTitle: 'Push Orion changes',
+    launchedCoderTaskStart: Date.now() - 60000,
+    messages: [{ role: 'user', text: 'Push all Orion changes.' }],
+    tasks: []
+  };
+  const coder = {
+    id: 'coder-result-worker',
+    title: 'Push Orion changes',
+    mode: 'coder',
+    workspace: 'C:\\Projects\\OrionAI',
+    messages: [{ role: 'assistant', text: 'Pushed commit abc123 and verified origin is synchronized.' }],
+    tasks: []
+  };
+  const completedTask = taskOrchestration.normalizeTaskRecord({
+    schemaVersion: taskOrchestration.SCHEMA_VERSION,
+    taskId,
+    title: 'Push Orion changes',
+    objective: 'Push all verified Orion changes.',
+    originalUserMessage: 'Push all Orion changes.',
+    workspacePath: 'C:\\Projects\\OrionAI',
+    origin: { conversationId: dispatch.id, sessionId: dispatch.id, messageId: 'm-push' },
+    target: { conversationId: coder.id, sessionId: coder.id, mode: 'coder' },
+    source: 'dispatch-handoff',
+    status: 'completed',
+    result: { summary: 'Pushed commit abc123 and verified origin is synchronized.' },
+    createdAt: 1000,
+    updatedAt: 2000,
+    completedAt: 2000
+  });
+  const flushed = [];
+  const { win, read } = loadRenderer({
+    t,
+    api: {
+      getOrchestrationTask: async requestedTaskId => ({
+        success: requestedTaskId === taskId,
+        task: requestedTaskId === taskId ? completedTask : null
+      })
+    },
+    globals: {
+      OrionOperationalContext: operational,
+      OrionWorkspaceResolution: workspaceResolution,
+      OrionTaskOrchestration: taskOrchestration,
+      OrionSemanticIntentRouter: semanticIntentRouter,
+      OrionReasoningPolicy: reasoningPolicy
+    },
+    set: {
+      conversations: [dispatch, coder],
+      activeConversationId: dispatch.id,
+      appMode: 'orion',
+      currentWorkspace: 'C:\\Projects\\OrionAI'
+    }
+  });
+  win.flushConversationsToStorage = async conversationId => {
+    const storedDispatch = read('conversations').find(conversation => conversation.id === dispatch.id);
+    flushed.push({
+      conversationId,
+      hasCompletion: storedDispatch.messages.some(message =>
+        message.source === 'supervisor-completion'
+        && message.orchestrationTaskId === taskId
+      )
+    });
+    return { success: true };
+  };
+
+  await win.notifySupervisorOfCoderCompletion(coder.id, taskId);
+  const storedDispatch = read('conversations').find(conversation => conversation.id === dispatch.id);
+  const completion = storedDispatch.messages.find(message =>
+    message.source === 'supervisor-completion'
+    && message.orchestrationTaskId === taskId
+  );
+  t.ok(completion, 'the substantive Coder result is appended to the owning Dispatch transcript');
+  t.match(completion && completion.text || '', /abc123/, 'the report itself is preserved in chat, not only in the push body');
+  t.deepEqual(flushed, [{ conversationId: dispatch.id, hasCompletion: true }], 'the transcript is flushed only after the completion message exists');
+  t.equal(storedDispatch.launchedCoderTaskId, null, 'the completed handoff is cleared only after delivery state is recorded');
+  t.end();
+});
+
+test('startup recovers legacy delegated children from the exact durable delegation receipt', async t => {
+  const parentConversation = {
+    id: 'coder-legacy-parent',
+    title: 'Push Orion changes',
+    mode: 'coder',
+    workspace: 'C:\\Projects\\OrionAI',
+    messages: [],
+    tasks: []
+  };
+  const parent = taskOrchestration.normalizeTaskRecord({
+    schemaVersion: taskOrchestration.SCHEMA_VERSION,
+    taskId: 'task-legacy-parent',
+    title: 'Push Orion changes',
+    objective: 'Publish verified Orion changes.',
+    originalUserMessage: 'Push all Orion changes.',
+    workspacePath: 'C:\\Projects\\OrionAI',
+    rootOriginConversationId: 'dispatch-legacy-owner',
+    origin: { conversationId: 'dispatch-legacy-owner', sessionId: 'dispatch-legacy-owner', messageId: 'm-root' },
+    target: { conversationId: parentConversation.id, sessionId: parentConversation.id, mode: 'coder' },
+    source: 'dispatch-handoff',
+    status: 'pending',
+    execution: {
+      state: 'pending',
+      attempt: 1,
+      reason: 'Waiting for delegated Coder task.',
+      reasonCode: 'awaiting_delegated_task',
+      resumePolicy: 'user'
+    },
+    delegation: { childTaskId: 'task-legacy-child', childRole: 'coder', status: 'active' },
+    createdAt: 1000,
+    updatedAt: 1100
+  });
+  const child = taskOrchestration.normalizeTaskRecord({
+    schemaVersion: taskOrchestration.SCHEMA_VERSION,
+    taskId: 'task-legacy-child',
+    title: 'Push verified branch',
+    objective: 'Push the verified branch.',
+    originalUserMessage: 'Push all Orion changes.',
+    workspacePath: 'C:\\Projects\\OrionAI',
+    parentTaskId: '',
+    rootOriginConversationId: '',
+    origin: { conversationId: parentConversation.id, sessionId: parentConversation.id, messageId: 'm-child' },
+    target: { conversationId: 'coder-legacy-child', sessionId: 'coder-legacy-child', mode: 'coder' },
+    source: 'specialist-coder-handoff',
+    status: 'completed',
+    result: { summary: 'Pushed commit abc123.' },
+    createdAt: 1200,
+    updatedAt: 1300,
+    completedAt: 1300
+  });
+  let persistedContinuation = null;
+  const { win } = loadRenderer({
+    t,
+    api: {
+      listOrchestrationTasks: async () => ({ success: true, tasks: [parent, child] }),
+      getOrchestrationTask: async taskId => ({ success: taskId === parent.taskId, task: taskId === parent.taskId ? parent : null }),
+      updateOrchestrationTask: async (taskId, patch) => {
+        persistedContinuation = { taskId, patch };
+        return { success: true, task: { ...parent, ...patch } };
+      }
+    },
+    globals: {
+      OrionOperationalContext: operational,
+      OrionWorkspaceResolution: workspaceResolution,
+      OrionTaskOrchestration: taskOrchestration,
+      OrionSemanticIntentRouter: semanticIntentRouter,
+      OrionReasoningPolicy: reasoningPolicy
+    },
+    set: {
+      conversations: [parentConversation],
+      activeConversationId: parentConversation.id,
+      appMode: 'coder',
+      currentWorkspace: 'C:\\Projects\\OrionAI'
+    }
+  });
+
+  await win.initializeOrchestrationTasks();
+  t.equal(persistedContinuation.taskId, parent.taskId, 'only the parent named by the exact child receipt is resumed');
+  t.equal(persistedContinuation.patch.continuation.messageId, child.taskId, 'the child ID becomes the idempotent continuation receipt');
+  t.match(win.promptQueue[0].prompt, /Pushed commit abc123/, 'the child result becomes durable parent continuation evidence');
   t.end();
 });
 

@@ -1022,8 +1022,8 @@
     const viewingConversationId = compactInline(viewingConversationIdValue);
     const activeTaskId = compactInline(activeTaskIdValue);
     const delegatedOnly = options.delegatedOnly === true;
-    const tasks = filterSupersededTasks(tasksValue)
-      .filter(task => {
+    const allTasks = filterSupersededTasks(tasksValue);
+    const tasks = allTasks.filter(task => {
         if (!viewingConversationId) return false;
         const originConversationId = taskConversationId(task, 'origin');
         const targetConversationId = taskConversationId(task, 'target');
@@ -1040,14 +1040,36 @@
     const byNewest = (a, b) => Number(b.updatedAt || b.createdAt || 0)
       - Number(a.updatedAt || a.createdAt || 0)
       || compactInline(a.taskId).localeCompare(compactInline(b.taskId));
-    const exactActive = activeTaskId
+    let selected = activeTaskId
       ? tasks.find(task => compactInline(task.taskId) === activeTaskId)
       : null;
-    if (exactActive) return exactActive;
-    return tasks.filter(task => task.status === TASK_STATES.ACTIVE).sort(byNewest)[0]
+    selected = selected
+      || tasks.filter(task => task.status === TASK_STATES.ACTIVE).sort(byNewest)[0]
       || tasks.filter(task => task.status === TASK_STATES.PENDING).sort(byNewest)[0]
       || tasks.sort(byNewest)[0]
       || null;
+    if (!selected || options.followDescendants !== true) return selected;
+
+    // The visible Dispatch conversation owns the root task, while Coder/Operator descendants are
+    // owned by their immediate specialist conversations. Follow the durable lineage instead of
+    // requiring every descendant to pretend Dispatch is its direct origin. This keeps the phone
+    // on the task that is actually executing through arbitrarily deep specialist handoffs.
+    const visited = new Set();
+    while (selected && !visited.has(selected.taskId)) {
+      visited.add(selected.taskId);
+      const delegatedChildId = compactInline(selected.delegation && selected.delegation.childTaskId);
+      const children = allTasks.filter(task =>
+        compactInline(task.parentTaskId) === compactInline(selected.taskId)
+        || (delegatedChildId && compactInline(task.taskId) === delegatedChildId)
+      );
+      if (!children.length) break;
+      const child = children.filter(task => task.status === TASK_STATES.ACTIVE).sort(byNewest)[0]
+        || children.filter(task => task.status === TASK_STATES.PENDING).sort(byNewest)[0]
+        || children.sort(byNewest)[0];
+      if (!child) break;
+      selected = child;
+    }
+    return selected;
   }
 
   function pendingTaskNeedsRuntimeQueue(taskValue) {
@@ -1129,14 +1151,15 @@
       agentState = `${roleLabel} revising`;
       badgeClass = 'success';
     } else if (status === TASK_STATES.PENDING && reasonCode === 'awaiting_delegated_task') {
-      const childRole = compactInline(taskValue.delegation && taskValue.delegation.childRole).toLowerCase() === 'operator'
-        ? 'Operator'
-        : 'specialist';
+      const childRoleMode = compactInline(taskValue.delegation && taskValue.delegation.childRole).toLowerCase();
+      const childRoleRecord = SpecialistRegistry && SpecialistRegistry.get(childRoleMode);
+      const childRole = childRoleRecord && childRoleRecord.label
+        || (childRoleMode === 'operator' ? 'Operator' : (childRoleMode === 'coder' ? 'Coder' : 'Specialist'));
       phase = 'delegated';
       label = `${childRole} active`;
       detail = detail || `${roleLabel} is waiting for ${childRole} to return the delegated result.`;
       agentState = `${childRole} active`;
-      badgeClass = childRole === 'Operator' ? 'operator' : 'success';
+      badgeClass = childRoleMode === 'operator' ? 'operator' : 'success';
     } else if (status === TASK_STATES.PENDING && resumePolicy === 'automatic') {
       phase = 'continuing';
       label = `${roleLabel} continuing`;

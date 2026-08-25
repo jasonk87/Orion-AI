@@ -3258,6 +3258,23 @@ async function initializeOrchestrationTasks() {
         }
       }
     }
+    // Repair specialist chains that became terminal while the renderer was unavailable, including
+    // schema-v3 children that stored the exact child receipt only on their parent. Without this
+    // startup sweep, a completed child could remain stranded forever because its one live
+    // finalization callback had already been missed before Orion restarted.
+    const delegatedChildIds = new Set(tasks
+      .map(task => String(task && task.delegation && task.delegation.childTaskId || ''))
+      .filter(Boolean));
+    for (const task of tasks.filter(candidate =>
+      candidate
+      && ['completed', 'failed', 'cancelled'].includes(String(candidate.status || ''))
+      && (String(candidate.parentTaskId || '') || delegatedChildIds.has(String(candidate.taskId || '')))
+    )) {
+      const resumed = await resumeParentTaskAfterDelegatedChild(task);
+      if (!resumed || resumed.success === false) {
+        console.error('Could not reconcile a terminal delegated task during startup:', resumed && resumed.error);
+      }
+    }
     conversations.forEach(conversation =>
       scheduleTerminalDelegatedTaskReconciliation(conversation, orchestrationTaskCache)
     );
@@ -4665,7 +4682,7 @@ function scheduleTerminalDelegatedTaskReconciliation(conversation, durableTasks 
   Promise.resolve()
     .then(async () => {
       await notifier(coderConversationId, taskId);
-      if (task.parentTaskId) await resumeParentTaskAfterDelegatedChild(task);
+      await resumeParentTaskAfterDelegatedChild(task);
     })
     .catch(error => console.error('Could not reconcile terminal delegated task presentation:', error))
     .finally(() => {
@@ -7279,6 +7296,8 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
   const title = String(options.title || '').trim()
     || (prompt ? generateConversationTitle(prompt) : 'New Coder Task');
   const originConv = conversations.find(item => item.id === String(options.sourceConversationId || ''));
+  const specialistDelegation = !!String(options.parentTaskId || '');
+  const coderTaskSource = specialistDelegation ? 'specialist-coder-handoff' : 'dispatch-handoff';
   if (originConv) clearCurrentTurnTaskResolutionClarifications(originConv);
   const semanticIntent = options.semanticIntent || (originConv && prompt
     ? await classifyCurrentConversationIntent(originConv, originalUserMessage, { model: options.modelSelectValue })
@@ -7343,7 +7362,9 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
       originMessageId: String(options.sourceMessageId || ''),
       targetConversationId: 'pending-coder-conversation',
       targetMode: 'coder',
-      source: 'dispatch-handoff',
+      parentTaskId: String(options.parentTaskId || ''),
+      rootOriginConversationId: String(options.rootOriginConversationId || options.sourceConversationId || ''),
+      source: coderTaskSource,
       semanticIntent,
       executionProfile,
       timestamp: Date.now()
@@ -7425,6 +7446,8 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
       originMessageId: String(options.sourceMessageId || ''),
       precedingMessages: taskContextMessages(originConv || conv),
       precedingConversationSummary: preflightTask ? preflightTask.precedingConversationSummary : '',
+      parentTaskId: String(options.parentTaskId || ''),
+      rootOriginConversationId: String(options.rootOriginConversationId || options.sourceConversationId || ''),
       workspace: handoffWorkspace,
       requirements: preflightTask
         ? [...new Set([...(preflightTask.requirements || []), ...looseFindings])]
@@ -7432,7 +7455,7 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
       constraints: preflightTask ? preflightTask.constraints : [],
       semanticIntent,
       unresolvedDecisions: preflightTask ? preflightTask.unresolvedDecisions : [],
-      source: 'dispatch-handoff',
+      source: coderTaskSource,
       modelSelectValue: (preflightTask && preflightTask.executionProfile && preflightTask.executionProfile.requestedModel)
         || window.getSelectedModel(),
       reasoningEffort: (preflightTask && preflightTask.executionProfile && preflightTask.executionProfile.requestedReasoning)
@@ -7931,6 +7954,22 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     }
   }
   const resolvedId = conv ? conv.id : '';
+  // Phone presentation must not rely on a renderer cache that may have missed a transition while
+  // the app was minimized or while one specialist created another. Refresh the durable snapshot at
+  // the state boundary; a transient read failure keeps the last-known cache rather than erasing it.
+  if (window.api && typeof window.api.listOrchestrationTasks === 'function') {
+    try {
+      const listed = await window.api.listOrchestrationTasks({ sort: 'desc' });
+      if (listed && Array.isArray(listed.tasks)) {
+        orchestrationTaskCache.clear();
+        listed.tasks.forEach(task => {
+          if (task && task.taskId) orchestrationTaskCache.set(task.taskId, task);
+        });
+      }
+    } catch (error) {
+      console.error('Phone companion task refresh failed', error);
+    }
+  }
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
   const globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
   const globalActiveTaskId = window.getActiveRunTaskId ? String(window.getActiveRunTaskId() || '') : '';
@@ -8030,9 +8069,33 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   const companionWorkspaceResolution = conv
     ? structuredWorkspaceForConversation(conv, companionWorkspace)
     : { role: 'unresolved', path: '', project: { name: '', path: '' }, resolved: false };
-  const orchestrationTasks = [...orchestrationTaskCache.values()]
-    .filter(task => task && ((task.origin && task.origin.conversationId === resolvedId)
-      || (task.target && task.target.conversationId === resolvedId)))
+  const allOrchestrationTasks = [...orchestrationTaskCache.values()].filter(Boolean);
+  const conversationTaskIds = new Set(allOrchestrationTasks
+    .filter(task => (task.origin && task.origin.conversationId === resolvedId)
+      || (task.target && task.target.conversationId === resolvedId))
+    .map(task => String(task.taskId || ''))
+    .filter(Boolean));
+  // Carry the complete owned task chain to the phone. A child specialist's direct origin is its
+  // parent specialist, but its lifecycle still belongs to the Dispatch root that launched it.
+  let graphChanged = true;
+  while (graphChanged) {
+    graphChanged = false;
+    for (const task of allOrchestrationTasks) {
+      const taskId = String(task.taskId || '');
+      const parentTaskId = String(task.parentTaskId || '');
+      const childTaskId = String(task.delegation && task.delegation.childTaskId || '');
+      if (parentTaskId && conversationTaskIds.has(parentTaskId) && taskId && !conversationTaskIds.has(taskId)) {
+        conversationTaskIds.add(taskId);
+        graphChanged = true;
+      }
+      if (conversationTaskIds.has(taskId) && childTaskId && !conversationTaskIds.has(childTaskId)) {
+        conversationTaskIds.add(childTaskId);
+        graphChanged = true;
+      }
+    }
+  }
+  const orchestrationTasks = allOrchestrationTasks
+    .filter(task => conversationTaskIds.has(String(task.taskId || '')))
     .sort((a, b) => Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0))
     .slice(0, 12)
     .map(task => {
@@ -8054,6 +8117,20 @@ window.getPhoneCompanionState = async (targetConversationId) => {
           sessionId: task.target && task.target.sessionId || '',
           mode: task.target && task.target.mode || 'coder'
         },
+        parentTaskId: task.parentTaskId || '',
+        rootOriginConversationId: task.rootOriginConversationId || '',
+        delegation: task.delegation && typeof task.delegation === 'object'
+          ? { ...task.delegation }
+          : null,
+        execution: task.execution && typeof task.execution === 'object'
+          ? {
+              state: task.execution.state || '',
+              attempt: Number(task.execution.attempt) || 0,
+              reason: task.execution.reason || '',
+              reasonCode: task.execution.reasonCode || '',
+              resumePolicy: task.execution.resumePolicy || ''
+            }
+          : null,
         executionSurface: task.executionSurface || 'none',
         updatedAt: task.updatedAt || task.createdAt || 0,
         awaitingReview: !!(presentation && presentation.awaitingReview),
@@ -8079,7 +8156,10 @@ window.getPhoneCompanionState = async (targetConversationId) => {
         orchestrationTasks,
         resolvedId,
         globalActiveTaskId,
-        { delegatedOnly: !!(conv && conversationMode(conv) === 'orion') }
+        {
+          delegatedOnly: !!(conv && conversationMode(conv) === 'orion'),
+          followDescendants: true
+        }
       )
     : orchestrationTasks.find(task => task.status === 'active')
       || orchestrationTasks.find(task => task.status === 'pending')
@@ -10372,7 +10452,13 @@ async function notifySupervisorOfCoderCompletion(finishedCoderConvId, expectedTa
     window.markConversationDirty(orionConv.id);
     if (coderConv) window.markConversationDirty(coderConv.id);
   }
-  if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+  // The agent awaits this notifier before emitting the phone push. Commit the user-visible
+  // Dispatch result now so a notification tap can never outrun the debounced transcript save.
+  if (typeof window.flushConversationsToStorage === 'function') {
+    await window.flushConversationsToStorage(orionConv.id);
+  } else if (window.saveConversationsToStorage) {
+    window.saveConversationsToStorage();
+  }
 }
 
 // ── Operator task monitor (Phase 3 piece 5) ────────────────────────────────────
@@ -10628,15 +10714,42 @@ async function notifySupervisorOfOperatorCompletion(finishedOperatorConvId, expe
     window.markConversationDirty(orionConv.id);
     if (operatorConv) window.markConversationDirty(operatorConv.id);
   }
-  if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+  if (typeof window.flushConversationsToStorage === 'function') {
+    await window.flushConversationsToStorage(orionConv.id);
+  } else if (window.saveConversationsToStorage) {
+    window.saveConversationsToStorage();
+  }
 }
 
 async function resumeParentTaskAfterDelegatedChild(childTaskValue) {
   const childTask = childTaskValue && typeof childTaskValue === 'object' ? childTaskValue : null;
-  const parentTaskId = String(childTask && childTask.parentTaskId || '');
-  if (!childTask || !parentTaskId || !window.api || typeof window.api.getOrchestrationTask !== 'function') {
+  if (!childTask || !window.api || typeof window.api.getOrchestrationTask !== 'function') {
     return { success: true, action: 'none' };
   }
+  let parentTaskId = String(childTask.parentTaskId || '');
+  if (!parentTaskId) {
+    // Schema-v3 tasks created before specialist lineage was forwarded can still be recovered from
+    // the parent's durable delegation receipt. This is intentionally exact-ID reconciliation,
+    // not a title/objective heuristic: an unrelated task can never adopt the child by accident.
+    let candidates = [...orchestrationTaskCache.values()];
+    if (window.api && typeof window.api.listOrchestrationTasks === 'function') {
+      const listed = await window.api.listOrchestrationTasks({ sort: 'desc' });
+      if (listed && listed.success && Array.isArray(listed.tasks)) {
+        candidates = listed.tasks;
+        orchestrationTaskCache.clear();
+        listed.tasks.forEach(task => {
+          if (task && task.taskId) orchestrationTaskCache.set(String(task.taskId), task);
+        });
+      }
+    }
+    const inferredParent = candidates.find(task =>
+      task
+      && task.delegation
+      && String(task.delegation.childTaskId || '') === String(childTask.taskId || '')
+    );
+    parentTaskId = String(inferredParent && inferredParent.taskId || '');
+  }
+  if (!parentTaskId) return { success: true, action: 'none' };
   const parentRead = await window.api.getOrchestrationTask(parentTaskId);
   const parentTask = parentRead && parentRead.success ? parentRead.task : null;
   if (!parentTask) return { success: false, action: 'missing_parent', error: `Parent task ${parentTaskId} could not be found.` };
@@ -10645,9 +10758,8 @@ async function resumeParentTaskAfterDelegatedChild(childTaskValue) {
   }
 
   const childStatus = String(childTask.status || '');
-  const childRole = String(childTask.target && childTask.target.mode || '').toLowerCase() === 'operator'
-    ? 'Operator'
-    : 'specialist';
+  const childMode = String(childTask.target && childTask.target.mode || '').toLowerCase();
+  const childRole = childMode === 'operator' ? 'Operator' : (childMode === 'coder' ? 'Coder' : 'specialist');
   if (childStatus === 'cancelled') {
     if (typeof window.api.cancelOrchestrationTask !== 'function') {
       return { success: false, action: 'cancel_parent_failed', error: 'Task cancellation service is unavailable.' };
@@ -10732,7 +10844,7 @@ window.onOrchestrationTaskFinalized = async function(taskId, targetConversationI
   if (window.api && typeof window.api.getOrchestrationTask === 'function') {
     const finalizedRead = await window.api.getOrchestrationTask(taskId);
     const finalizedTask = finalizedRead && finalizedRead.success ? finalizedRead.task : null;
-    if (finalizedTask && finalizedTask.parentTaskId) {
+    if (finalizedTask) {
       const resumed = await resumeParentTaskAfterDelegatedChild(finalizedTask);
       if (!resumed || resumed.success === false) {
         console.error('Could not reconcile the delegated child task with its parent:', resumed && resumed.error);

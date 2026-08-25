@@ -1045,7 +1045,11 @@ test('Dispatch uses Projects fallback while Coder standalone conversations get i
   t.ok(rendererJs.includes('function addProjectPath'), 'project registration is centralized instead of mixed into every workspace change');
   t.ok(rendererJs.includes('if (promoteProjectForWorkspace) addProjectPath(folderPath)'), 'Dispatch workspace changes do not add folders to the Coder project list unless explicitly promoted');
   t.ok(rendererJs.includes('window.promoteWorkspaceToCoder'), 'renderer exposes an explicit Dispatch-to-Coder promotion path');
-  t.ok(rendererJs.includes("source: 'dispatch-handoff'"), 'Dispatch handoffs queue Coder prompts with a distinct source');
+  t.ok(
+    rendererJs.includes("const coderTaskSource = specialistDelegation ? 'specialist-coder-handoff' : 'dispatch-handoff'")
+      && rendererJs.includes('source: coderTaskSource'),
+    'Dispatch and specialist handoffs queue Coder prompts with distinct durable sources'
+  );
   t.ok(rendererJs.includes('assignContextPackets') && rendererJs.includes('conv.inheritedContext'), 'Dispatch assigns validated packet IDs to the new Coder conversation');
   t.ok(agentJs.includes("'handoff_to_coder'"), 'Dispatch allowlist includes the explicit Coder handoff tool');
   t.ok(agentJs.includes('change_workspace alone must not add folders to Coder'), 'handoff tool declaration teaches the model that workspace inspection is not project promotion');

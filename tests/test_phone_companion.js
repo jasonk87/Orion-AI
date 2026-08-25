@@ -1497,7 +1497,10 @@ test('phone Dispatch status derives queued, active, and review presentation from
   const stateRenderEnd = html.indexOf('// Needs-attention cards', stateRenderStart);
   const stateRender = html.slice(stateRenderStart, stateRenderEnd);
   t.ok(stateRender.includes('selectSupervisedTask('), 'phone selects the supervised task from orchestrationTasks');
-  t.ok(stateRender.includes('{ delegatedOnly: true }'), 'phone presents only cross-conversation Coder tasks as supervised work');
+  t.ok(
+    stateRender.includes('delegatedOnly: true') && stateRender.includes('followDescendants: true'),
+    'phone presents only cross-conversation specialist work and follows its durable descendants'
+  );
   t.ok(stateRender.includes('state.activeTaskId'), 'phone preserves taskId as the presentation identity');
   t.ok(stateRender.includes('describeSupervisedTaskPresentation'), 'phone uses the shared lifecycle presentation contract');
   t.ok(stateRender.includes('supervisedPresentation.agentState'), 'header state follows the durable task presentation');
