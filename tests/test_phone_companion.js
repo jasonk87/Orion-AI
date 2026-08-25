@@ -972,6 +972,130 @@ test('Phone Companion does not drop a state update that lands while an SSE conne
   }
 });
 
+test('Phone Companion coalesces concurrent HTTP and SSE state snapshots', async (t) => {
+  let resolveSnapshot = null;
+  let stateCalls = 0;
+  const state = {
+    conversationId: 'conv1', title: 'Shared snapshot', conversations: [], tasks: [], messages: [],
+    latestOutput: 'ready', preview: {}
+  };
+  const { main } = await startMainWithConfig(1201, {}, {
+    stateProvider: () => {
+      stateCalls += 1;
+      return new Promise(resolve => { resolveSnapshot = () => resolve(state); });
+    }
+  });
+  let live = null;
+  try {
+    const pair = await request('POST', 1201, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
+    const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+    live = openSseConnection(1201, '/api/events', session);
+    await live.responsePromise;
+    await new Promise(resolve => {
+      (function check() { stateCalls === 1 ? resolve() : setImmediate(check); })();
+    });
+
+    const httpState = request('GET', 1201, '/api/state', null, session);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    t.equal(stateCalls, 1, 'HTTP joins the renderer snapshot already being assembled for SSE');
+
+    resolveSnapshot();
+    const [httpResponse, frames] = await Promise.all([httpState, live.waitForFrameCount(1)]);
+    t.equal(httpResponse.statusCode, 200, 'the joined HTTP request receives the shared snapshot');
+    t.equal(httpResponse.json.title, 'Shared snapshot', 'HTTP and SSE use the same canonical state');
+    t.equal(frames[0].title, 'Shared snapshot', 'SSE receives the canonical shared state');
+    t.equal(stateCalls, 1, 'one renderer call serves both transports');
+  } finally {
+    if (live) live.close();
+    await closeServer(main.getCompanionServer());
+  }
+});
+
+test('Phone Companion unregisters an abandoned SSE stream before its first snapshot resolves', async (t) => {
+  let resolveSnapshot = null;
+  let stateCalls = 0;
+  const { main } = await startMainWithConfig(1202, {}, {
+    stateProvider: () => {
+      stateCalls += 1;
+      return new Promise(resolve => {
+        resolveSnapshot = () => resolve({
+          conversationId: 'conv1', title: 'Delayed', conversations: [], tasks: [], messages: [],
+          latestOutput: '', preview: {}
+        });
+      });
+    }
+  });
+  let live = null;
+  try {
+    const pair = await request('POST', 1202, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
+    const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+    live = openSseConnection(1202, '/api/events', session);
+    await live.responsePromise;
+    await new Promise(resolve => {
+      (function check() { stateCalls === 1 ? resolve() : setImmediate(check); })();
+    });
+
+    live.close();
+    await new Promise(resolve => setTimeout(resolve, 40));
+    main.triggerCompanionSync();
+    await new Promise(resolve => setTimeout(resolve, 30));
+    t.equal(stateCalls, 1, 'a disconnected stream is removed before later sync triggers run');
+    resolveSnapshot();
+    await new Promise(resolve => setImmediate(resolve));
+  } finally {
+    if (live) live.close();
+    await closeServer(main.getCompanionServer());
+  }
+});
+
+test('Phone Companion serves cached state promptly while one background refresh is running', async (t) => {
+  let stateCalls = 0;
+  let resolveRefresh = null;
+  const stateV1 = {
+    conversationId: 'conv1', title: 'Cached state', conversations: [], tasks: [], messages: [],
+    latestOutput: 'v1', preview: {}
+  };
+  const stateV2 = { ...stateV1, title: 'Fresh state', latestOutput: 'v2' };
+  const { main } = await startMainWithConfig(12903, {}, {
+    stateProvider: () => {
+      stateCalls += 1;
+      if (stateCalls === 1) return stateV1;
+      return new Promise(resolve => { resolveRefresh = () => resolve(stateV2); });
+    }
+  });
+  let live = null;
+  try {
+    const pair = await request('POST', 12903, '/api/pair', { pairingCode: 'pair-code-123456', deviceName: 'iPhone' });
+    const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+    const initial = await request('GET', 12903, '/api/state', null, session);
+    t.equal(initial.json.title, 'Cached state', 'the first renderer snapshot seeds the response cache');
+
+    live = openSseConnection(12903, '/api/events', session);
+    await live.responsePromise;
+    await live.waitForFrameCount(1);
+    main.triggerCompanionSync();
+    await new Promise(resolve => {
+      (function check() { stateCalls === 2 ? resolve() : setImmediate(check); })();
+    });
+
+    const startedAt = Date.now();
+    const cached = await request('GET', 12903, '/api/state', null, session);
+    const elapsed = Date.now() - startedAt;
+    t.equal(cached.json.title, 'Cached state', 'a stale-but-usable snapshot keeps the phone responsive');
+    t.ok(elapsed < 250, `cached response returns promptly (${elapsed}ms)`);
+    t.equal(stateCalls, 2, 'the HTTP fallback joins the one canonical background refresh');
+
+    resolveRefresh();
+    await live.waitForFrameCount(2);
+    const refreshed = await request('GET', 12903, '/api/state', null, session);
+    t.equal(refreshed.json.title, 'Fresh state', 'the completed refresh replaces the cached snapshot');
+    t.equal(stateCalls, 2, 'reading the fresh cache does not call the renderer again');
+  } finally {
+    if (live) live.close();
+    await closeServer(main.getCompanionServer());
+  }
+});
+
 test('Phone Companion replaces suspended mobile connections immediately on foreground', t => {
   const html = companionHtml();
   const ipcServerSource = fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8');
@@ -995,8 +1119,14 @@ test('Phone Companion replaces suspended mobile connections immediately on foreg
   t.ok(html.includes("window.addEventListener('focus', recoverForegroundConnection)"),
     'returning focus also recovers browsers with unreliable visibility events');
   t.ok(html.includes("if (lastStatePayloadAt < recoveryStartedAt && !stateFetchController) loadState({ force: true });")
-      && html.includes("if (lastStatePayloadAt < recoveryStartedAt) {"),
+      && html.includes("if (lastStatePayloadAt === 0 && lastStatePayloadAt < recoveryStartedAt) {"),
     'foreground recovery waits for a real state payload rather than trusting the stream handshake');
+  t.ok(html.includes('const FOREGROUND_RECOVERY_DEDUPE_MS = 1500;')
+      && html.includes('now - lastForegroundRecoveryAt < FOREGROUND_RECOVERY_DEDUPE_MS')
+      && html.includes('recoveryGeneration !== foregroundRecoveryGeneration'),
+    'duplicate focus/visibility/pageshow events share one bounded foreground recovery attempt');
+  t.ok(html.includes('lastStatePayloadAt === 0'),
+    'a reconnect preserves the last usable conversation instead of covering it with a full-screen banner');
   t.ok(html.includes("requestTimeout = setTimeout(() => requestController.abort(), 7000)"),
     'a stalled state request cannot block foreground recovery indefinitely');
   t.ok(html.includes("lastSseActivityAt = Date.now();")
@@ -1010,6 +1140,9 @@ test('Phone Companion replaces suspended mobile connections immediately on foreg
     'a connected stream without an initial state payload receives a bounded HTTP fallback');
   t.ok(ipcServerSource.includes('if (pushInFlight)') && ipcServerSource.includes('pushAgain = true'),
     'server state pushes are coalesced while a renderer snapshot is in flight');
+  t.ok(ipcServerSource.includes("getCompanionStateSnapshot(device.selectedConversationId, { allowStale: true })")
+      && ipcServerSource.includes("res.once('close', cleanup)"),
+    'HTTP fallbacks reuse cached snapshots and abandoned streams unregister before renderer work completes');
   t.ok(mainSource.includes('backgroundThrottling: false'),
     'the canonical desktop state bridge remains responsive while the desktop window is minimized');
   t.end();
