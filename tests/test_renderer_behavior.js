@@ -204,6 +204,65 @@ test('desktop replay hides internal compaction scaffolding from old and new conv
 
 // ── Orphaned turns ─────────────────────────────────────────────────────────────
 
+test('a new phone conversation is acknowledged before semantic and memory work finishes', async t => {
+  const loaded = loadRenderer({
+    t,
+    set: { conversations: [], activeConversationId: '', appMode: 'orion' }
+  });
+  let finishSubmission;
+  const pendingSubmission = new Promise(resolve => { finishSubmission = resolve; });
+  loaded.win.submitPhoneCompanionPrompt = () => pendingSubmission;
+
+  const accepted = await loaded.win.startPhoneCompanionTask({
+    prompt: 'What is the weather today?',
+    mode: 'orion',
+    requestId: 'phone-fast-ack'
+  });
+
+  t.ok(accepted.success && accepted.accepted, 'conversation creation is accepted immediately');
+  t.ok(accepted.processing, 'the response explicitly says intelligence work is continuing');
+  t.ok(accepted.conversationId, 'the phone receives the canonical conversation identity');
+  t.equal(loaded.read('conversations').length, 1, 'the accepted conversation already exists in renderer state');
+
+  finishSubmission({ success: true, conversationId: accepted.conversationId });
+  await pendingSubmission;
+  t.end();
+});
+
+test('phone snapshots do not wait for presentation-only operational context refresh', async t => {
+  const conversation = {
+    id: 'phone-fast-state',
+    title: 'Fast state',
+    mode: 'orion',
+    workspace: 'C:\\Projects',
+    messages: [],
+    tasks: [],
+    phoneIntakeStatus: {
+      phase: 'preparing_context',
+      label: 'Preparing',
+      detail: 'Gathering relevant memory...'
+    }
+  };
+  const loaded = loadRenderer({
+    t,
+    globals: { OrionOperationalContext: operational },
+    set: { conversations: [conversation], activeConversationId: conversation.id, appMode: 'orion' }
+  });
+  let finishContextRead;
+  loaded.win.readOperationalContext = () => new Promise(resolve => { finishContextRead = resolve; });
+
+  const state = await Promise.race([
+    loaded.win.getPhoneCompanionState(conversation.id),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('phone state waited on operational context')), 100))
+  ]);
+  t.equal(state.intakeStatus.phase, 'preparing_context', 'the live preparation phase reaches the phone snapshot');
+  t.equal(state.operationalContext.revision, 0, 'an empty presentation cache is safe while the canonical read continues');
+
+  finishContextRead({ success: true, state: operational.createEmptyContext() });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  t.end();
+});
+
 test('phone task transport preserves Operator role for the header and screen-control banner', async t => {
   const dispatchConversation = {
     id: 'dispatch-operator-owner',

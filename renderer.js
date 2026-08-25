@@ -103,6 +103,74 @@ const RendererSupervisorOrchestration = window.OrionSupervisorOrchestration;
 const RendererSemanticIntentRouter = window.OrionSemanticIntentRouter;
 let orchestrationTasksReady = Promise.resolve();
 const orchestrationTaskCache = new Map();
+let phoneTaskRefreshPromise = null;
+let phoneTaskRefreshCompletedAt = 0;
+const phoneOperationalContextCache = new Map();
+const PHONE_TASK_REFRESH_TTL_MS = 5000;
+const PHONE_OPERATIONAL_CONTEXT_TTL_MS = 15000;
+
+function requestPhoneTaskRefresh(options = {}) {
+  if (!window.api || typeof window.api.listOrchestrationTasks !== 'function') return null;
+  const cacheIsFresh = Date.now() - phoneTaskRefreshCompletedAt < PHONE_TASK_REFRESH_TTL_MS;
+  if (phoneTaskRefreshPromise || (!options.force && cacheIsFresh)) {
+    return phoneTaskRefreshPromise;
+  }
+  phoneTaskRefreshPromise = Promise.resolve()
+    .then(() => window.api.listOrchestrationTasks({ sort: 'desc' }))
+    .then(listed => {
+      if (listed && Array.isArray(listed.tasks)) {
+        orchestrationTaskCache.clear();
+        listed.tasks.forEach(task => {
+          if (task && task.taskId) orchestrationTaskCache.set(task.taskId, task);
+        });
+      }
+      phoneTaskRefreshCompletedAt = Date.now();
+      if (window.api && typeof window.api.syncPhoneCompanion === 'function') {
+        window.api.syncPhoneCompanion();
+      }
+      return listed;
+    })
+    .catch(error => {
+      console.error('Phone companion task refresh failed', error);
+      return null;
+    })
+    .finally(() => {
+      phoneTaskRefreshPromise = null;
+    });
+  return phoneTaskRefreshPromise;
+}
+
+function requestPhoneOperationalContextRefresh(workspace) {
+  const cacheKey = String(workspace || '');
+  if (!cacheKey || !window.readOperationalContext) return null;
+  const cached = phoneOperationalContextCache.get(cacheKey);
+  if (cached && cached.promise) return cached.promise;
+  if (cached && Date.now() - cached.updatedAt < PHONE_OPERATIONAL_CONTEXT_TTL_MS) return null;
+
+  const entry = cached || { state: null, updatedAt: 0, promise: null };
+  let refreshed = false;
+  entry.promise = Promise.resolve()
+    .then(() => window.readOperationalContext(cacheKey))
+    .then(result => {
+      entry.state = result && result.state ? result.state : null;
+      entry.updatedAt = Date.now();
+      refreshed = true;
+      return result;
+    })
+    .catch(error => {
+      console.error('Phone companion operational-context refresh failed', error);
+      entry.updatedAt = Date.now();
+      return null;
+    })
+    .finally(() => {
+      entry.promise = null;
+      if (refreshed && window.api && typeof window.api.syncPhoneCompanion === 'function') {
+        window.api.syncPhoneCompanion();
+      }
+    });
+  phoneOperationalContextCache.set(cacheKey, entry);
+  return entry.promise;
+}
 
 // DOM ELEMENTS
 const el = {
@@ -7954,22 +8022,12 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     }
   }
   const resolvedId = conv ? conv.id : '';
-  // Phone presentation must not rely on a renderer cache that may have missed a transition while
-  // the app was minimized or while one specialist created another. Refresh the durable snapshot at
-  // the state boundary; a transient read failure keeps the last-known cache rather than erasing it.
-  if (window.api && typeof window.api.listOrchestrationTasks === 'function') {
-    try {
-      const listed = await window.api.listOrchestrationTasks({ sort: 'desc' });
-      if (listed && Array.isArray(listed.tasks)) {
-        orchestrationTaskCache.clear();
-        listed.tasks.forEach(task => {
-          if (task && task.taskId) orchestrationTaskCache.set(task.taskId, task);
-        });
-      }
-    } catch (error) {
-      console.error('Phone companion task refresh failed', error);
-    }
-  }
+  // Task transitions update this cache immediately. A durable refresh remains the backstop for
+  // changes missed while the renderer was suspended, but a warm phone snapshot must not block on
+  // reparsing the task store. Only the first empty-cache read waits; later refreshes happen behind
+  // the already-authoritative cached presentation.
+  const durableTaskRefresh = requestPhoneTaskRefresh();
+  if (orchestrationTaskCache.size === 0 && durableTaskRefresh) await durableTaskRefresh;
   const isGlobalRunning = window.isAgentRunning ? window.isAgentRunning() : false;
   const globalRunningId = window.getRunningConversationId ? window.getRunningConversationId() : null;
   const globalActiveTaskId = window.getActiveRunTaskId ? String(window.getActiveRunTaskId() || '') : '';
@@ -8164,11 +8222,14 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     : orchestrationTasks.find(task => task.status === 'active')
       || orchestrationTasks.find(task => task.status === 'pending')
       || null;
-  const operationalResult = companionWorkspace && window.readOperationalContext
-    ? await window.readOperationalContext(companionWorkspace)
-    : null;
-  const operationalState = operationalResult && operationalResult.state
-    ? window.OrionOperationalContext.normalizeContext(operationalResult.state)
+  // Operational context belongs in the snapshot, but it is not connection state. Reading and
+  // normalizing it took several seconds on real workspaces and made a healthy phone appear
+  // offline. Serve the last normalized value immediately and refresh it in the background. Agent
+  // reasoning continues to read the canonical context directly; this cache is presentation-only.
+  requestPhoneOperationalContextRefresh(companionWorkspace);
+  const cachedOperationalEntry = phoneOperationalContextCache.get(String(companionWorkspace || ''));
+  const operationalState = cachedOperationalEntry && cachedOperationalEntry.state
+    ? window.OrionOperationalContext.normalizeContext(cachedOperationalEntry.state)
     : window.OrionOperationalContext.createEmptyContext();
   const operationalContext = {
     revision: operationalState.revision,
@@ -8215,6 +8276,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
     activeTaskId: selectedSupervisedTask ? selectedSupervisedTask.taskId : '',
     model: window.getSelectedModel(),
     reasoning: appConfig.reasoningEffort || 'auto',
+    intakeStatus: conv && conv.phoneIntakeStatus ? { ...conv.phoneIntakeStatus } : null,
     selectionRevisions: getSelectionRevisions(),
     messages,
     latestOutput: latestOutput ? latestOutput.text : '',
@@ -8297,20 +8359,29 @@ window.startPhoneCompanionTask = async (options = {}) => {
     prompt = `[Attached file: ${fileName}]\n\`\`\`\n${content}\n\`\`\`\n\n${prompt}`;
   }
   if (prompt) {
-    try {
-      await window.submitPhoneCompanionPrompt({
-        prompt,
-        conversationId: conv.id,
-        requestId: options.requestId,
-        imageData: options.imageData,
-        imageMimeType: options.imageMimeType,
-        fileContent: options.fileContent,
-        fileName: options.fileName
-      });
-    } catch (error) {
-      conversations = conversations.filter(item => item.id !== conv.id);
-      throw error;
-    }
+    // Creating the durable conversation is the HTTP acceptance boundary. Semantic intent,
+    // relevant-memory retrieval, and model work deliberately continue after this function
+    // returns so the phone can navigate to the real transcript immediately instead of waiting on
+    // intelligence work before it even knows which conversation owns the prompt.
+    const submission = window.submitPhoneCompanionPrompt({
+      prompt,
+      conversationId: conv.id,
+      requestId: options.requestId,
+      imageData: options.imageData,
+      imageMimeType: options.imageMimeType,
+      fileContent: options.fileContent,
+      fileName: options.fileName
+    });
+    Promise.resolve(submission).catch(error => {
+      conv.phoneIntakeStatus = null;
+      persistAssistantStatusMessage(
+        conv.id,
+        `Orion received this request but could not start it: ${error.message}`,
+        { source: 'phone-intake-error', dedupeKey: `phone-intake-error-${options.requestId || conv.id}` }
+      );
+      if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+      saveConversationsToStorage();
+    });
   } else if (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator') {
     saveConversationsToStorage();
   } else {
@@ -8321,6 +8392,8 @@ window.startPhoneCompanionTask = async (options = {}) => {
   }
   return {
     success: true,
+    accepted: true,
+    processing: !!prompt,
     conversationId: conv.id,
     workspace: conv.workspace,
     projectPath: conv.projectPath,
@@ -8388,10 +8461,24 @@ async function submitPhoneCompanionPromptOnce(options) {
     || (conv.awaitingClarification && conv.awaitingClarification.taskId)
     || ''
   );
-  const semanticIntent = await classifyCurrentConversationIntent(conv, text, {
-    model: window.getSelectedModel(),
-    taskId: pendingReplyTaskId
-  });
+  conv.phoneIntakeStatus = {
+    requestId: phoneRequestId,
+    phase: 'preparing_context',
+    label: 'Preparing',
+    detail: 'Understanding your request and gathering relevant memory...',
+    startedAt: Date.now()
+  };
+  if (window.api && typeof window.api.syncPhoneCompanion === 'function') window.api.syncPhoneCompanion();
+  let semanticIntent;
+  try {
+    semanticIntent = await classifyCurrentConversationIntent(conv, text, {
+      model: window.getSelectedModel(),
+      taskId: pendingReplyTaskId
+    });
+  } finally {
+    conv.phoneIntakeStatus = null;
+    if (window.api && typeof window.api.syncPhoneCompanion === 'function') window.api.syncPhoneCompanion();
+  }
   if (conversationMode(conv) === 'orion' && semanticIntent.intent === 'cancel_active_task') {
     const messageId = createConversationMessageId(conv.id);
     conv.messages.push({

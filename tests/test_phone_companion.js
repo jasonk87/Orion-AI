@@ -977,6 +977,13 @@ test('Phone Companion replaces suspended mobile connections immediately on foreg
   const ipcServerSource = fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8');
   const mainSource = fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8');
 
+  t.ok(html.includes('id="status-pill">Connecting</div>')
+      && !html.includes('id="status-pill">Offline</div>'),
+    'cold load describes an in-progress connection instead of falsely declaring Offline');
+  t.ok(html.includes('let sseConnected = false;')
+      && html.includes("connTextEl.textContent = machineName + ' · Connecting';"),
+    'stream startup distinguishes an attempted connection from a confirmed live transport');
+
   t.ok(html.includes("if (document.hidden) suspendBackgroundConnection();"),
     'backgrounding proactively retires the stream instead of leaving a ghost active connection');
   t.ok(html.includes("startEventStream({ force: true });"),
@@ -987,8 +994,9 @@ test('Phone Companion replaces suspended mobile connections immediately on foreg
     'a network handoff recovers immediately without waiting for the poll interval');
   t.ok(html.includes("window.addEventListener('focus', recoverForegroundConnection)"),
     'returning focus also recovers browsers with unreliable visibility events');
-  t.ok(html.includes("if (!sseStateReceived || lastSseMessageAt < recoveryStartedAt) loadState({ force: true });"),
-    'a bounded fallback state request runs when the replacement stream has not delivered state');
+  t.ok(html.includes("if (!sseConnected && !stateFetchController) loadState();")
+      && html.includes("if (!sseConnected && lastSseMessageAt < recoveryStartedAt && !stateFetchController) loadState({ force: true });"),
+    'transport and full-state fallbacks are staged instead of racing the replacement stream');
   t.ok(html.includes("requestTimeout = setTimeout(() => requestController.abort(), 7000)"),
     'a stalled state request cannot block foreground recovery indefinitely');
   t.ok(html.includes("lastSseActivityAt = Date.now();"),
@@ -1041,6 +1049,10 @@ test('phone renders an outgoing message before waiting for Orion to answer', t =
   t.ok(optimisticIndex < newConversationPost, 'a first-message bubble also renders before conversation creation waits');
   t.ok(flow.indexOf("promptEl.value = '';", optimisticIndex) < existingConversationPost,
     'the composer clears immediately rather than looking unsent while Orion works');
+  t.ok(html.includes('Received · preparing context…'),
+    'a server-accepted prompt stays visibly staged while semantic and memory work continues');
+  t.ok(flow.includes('promptEl.value = text;') && flow.includes("promptEl.dispatchEvent(new Event('input'))"),
+    'a failed send restores the user text instead of silently discarding it');
   t.ok(flow.includes('conversationId: currentConversationId'),
     'every existing-conversation prompt names the transcript visible on the phone');
   t.ok(flow.includes('selectionRevision: acceptedConversationSelectionRevision'),
@@ -1051,6 +1063,17 @@ test('phone renders an outgoing message before waiting for Orion to answer', t =
     'the canonical phone state echoes the idempotency receipt used to reconcile the local bubble');
   t.ok(rendererSource.includes("requestId: phoneRequestId"),
     'the persisted user message carries that exact receipt through the real renderer route');
+  const newTaskStart = rendererSource.indexOf('window.startPhoneCompanionTask = async');
+  const newTaskEnd = rendererSource.indexOf('async function submitPhoneCompanionPromptOnce', newTaskStart);
+  const newTaskFlow = rendererSource.slice(newTaskStart, newTaskEnd);
+  t.ok(newTaskFlow.includes('const submission = window.submitPhoneCompanionPrompt')
+      && !newTaskFlow.includes('await window.submitPhoneCompanionPrompt'),
+    'new conversation creation acknowledges before semantic classification and memory retrieval finish');
+  t.ok(newTaskFlow.includes('accepted: true') && newTaskFlow.includes('processing: !!prompt'),
+    'the immediate acceptance response tells the phone that processing continues');
+  t.ok(rendererSource.includes("phase: 'preparing_context'")
+      && rendererSource.includes('gathering relevant memory'),
+    'the renderer publishes the real context-preparation phase without bypassing it');
   t.end();
 });
 
@@ -1393,7 +1416,7 @@ test('phone Dispatch cancellation and supervisor failures preserve truthful outc
   const submitStart = rendererSource.indexOf('async function submitPhoneCompanionPromptOnce');
   const submitEnd = rendererSource.indexOf('\nwindow.steerPhoneCompanionTask', submitStart);
   const submitPath = rendererSource.slice(submitStart, submitEnd);
-  const classifyIndex = submitPath.indexOf('const semanticIntent = await classifyCurrentConversationIntent');
+  const classifyIndex = submitPath.indexOf('semanticIntent = await classifyCurrentConversationIntent');
   const cancelIndex = submitPath.indexOf('await cancelOwnedTaskRequestedInPrompt(');
   const clarificationIndex = submitPath.indexOf('if (conv.awaitingClarification && pendingReplyTaskId)');
   const busyIndex = submitPath.indexOf('if (isGlobalRunning)');
