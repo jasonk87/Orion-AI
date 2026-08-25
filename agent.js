@@ -7623,6 +7623,20 @@ async function executeTool(name, args, workspace, config, conversation, executio
       const imagePath = OperatorExecutionPolicy
         ? OperatorExecutionPolicy.resolveSnapshotReference(args.path, executionContext.lastDesktopSnapshot)
         : args.path;
+      // Real state tracking against re-judging a stale frame. A screenshot that has already had one
+      // completed inspect_screenshot_with_model call cannot be inspected again - even for a
+      // different goal (e.g. "confirm gameplay is running" then "did movement happen?") - without a
+      // fresh capture_screen producing a new file first. Two inspections of the identical image are
+      // comparing a picture to itself, not detecting a real change. Tracked by resolved file
+      // identity (capture_screen writes a uniquely timestamped path every call), not by parsing or
+      // pattern-matching the goal text, so this can't be defeated by rephrasing the goal and can't
+      // false-positive on two genuinely different screenshots.
+      const normalizedImagePath = String(imagePath || '').trim().replace(/\\/g, '/').toLowerCase();
+      const inspectedScreenshotPaths = executionContext.inspectedScreenshotPaths
+        || (executionContext.inspectedScreenshotPaths = new Set());
+      if (normalizedImagePath && inspectedScreenshotPaths.has(normalizedImagePath)) {
+        throw new Error('This exact screenshot has already been inspected with inspect_screenshot_with_model. Call capture_screen again to get a fresh image before judging whether anything changed - re-inspecting the same image cannot detect a change, even to answer a different question.');
+      }
       const activeModelName = config.activeRunModelName || config.modelName || 'gemini-2.5-flash-lite';
       if (String(activeModelName || '').startsWith('gemini-') && !config.geminiApiKey) throw new Error('Gemini API key is required for Gemini multimodal screenshot inspection.');
       const file = await window.api.readWorkspaceFileBase64(workspace, imagePath, conversation && conversation.id ? conversation.id : '');
@@ -7636,6 +7650,9 @@ async function executeTool(name, args, workspace, config, conversation, executio
         modelName: activeModelName,
         apiKey: config.geminiApiKey
       });
+      // Only a genuinely completed inspection (the call above did not throw) counts as "already
+      // judged" - a failed inspection leaves the frame unjudged and must remain eligible to retry.
+      if (normalizedImagePath) inspectedScreenshotPaths.add(normalizedImagePath);
       if (executionContext.lastDesktopSnapshot
           && String(executionContext.lastDesktopSnapshot.path || '') === String(imagePath)) {
         executionContext.lastDesktopSnapshot.inspectedAt = Date.now();
