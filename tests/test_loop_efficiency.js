@@ -530,3 +530,47 @@ test('personal facts are retrieved during casual conversation, not just task wor
   }
   t.end();
 });
+
+// Regression: knowledgeBrief was caught blocking the first answer by 248 seconds and got a hard
+// 5s ceiling for it. memoryBlock (this call) and scopedNotes (readScopedNotes, below) were never
+// given the same protection and were separately observed in production stalling a run's startup
+// phase by 20-30s each with no bound on how much worse a slow/hung backend call could make it.
+test('refreshOrionMemoryBlock does not block on a hung memory-ranking call', async (t) => {
+  global.window = global.window || {};
+  global.window.api = {
+    readGlobalMemory: async () => ({ user: { name: 'Jason', preferences: [] }, facts: [] }),
+    // Never resolves — simulates a stalled embedding call with no network-level timeout of its own.
+    rankMemoryFacts: () => new Promise(() => {})
+  };
+  try {
+    const startedAt = Date.now();
+    await agent.refreshOrionMemoryBlock(
+      { someKey: true },
+      'how is the weather here today?',
+      'orion',
+      { contextScope: 'recent' },
+      { needed: true, query: 'user home location', confidence: 0.98 }
+    );
+    const elapsedMs = Date.now() - startedAt;
+    t.ok(elapsedMs < 5500, `resolves near the 5s ceiling instead of hanging on the ranking call (took ${elapsedMs}ms)`);
+  } finally {
+    delete global.window.api;
+  }
+  t.end();
+});
+
+test('readScopedNotes does not block on a hung workspace file read', async (t) => {
+  global.window = global.window || {};
+  // Never resolves — simulates a slow/busy workspace read (e.g. a large or remote-mounted file).
+  global.window.api = { readFile: () => new Promise(() => {}) };
+  try {
+    const startedAt = Date.now();
+    const result = await agent.readScopedNotes('C:\\Projects\\Widget', { projectPath: 'C:\\Projects\\Widget' });
+    const elapsedMs = Date.now() - startedAt;
+    t.ok(elapsedMs < 5500, `resolves near the 5s ceiling instead of hanging on the file read (took ${elapsedMs}ms)`);
+    t.equal(result.content, '', 'falls back to empty notes rather than surfacing the stall to the run');
+  } finally {
+    delete global.window.api;
+  }
+  t.end();
+});

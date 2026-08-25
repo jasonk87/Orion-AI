@@ -347,7 +347,14 @@ async function refreshOrionMemoryBlock(config, queryText, mode, reasoningPolicy 
     const retrievalQuery = semanticMemoryQuery || String(queryText || '').trim();
     if (retrievalQuery && config && window.api.rankMemoryFacts) {
       try {
-        const result = await window.api.rankMemoryFacts(retrievalQuery, config, 10, modeTag);
+        // Same 5s ceiling as getKnowledgeBrief/readScopedNotes: this is an embedding call over
+        // the network, has no timeout of its own, and was observed stalling the run's startup
+        // phase by 20-24s (measured via the memoryBlock startup-phase timer) when the call was
+        // slow. Facts are a ranking nicety, not required for the run to proceed.
+        const result = await Promise.race([
+          window.api.rankMemoryFacts(retrievalQuery, config, 10, modeTag),
+          new Promise(resolve => setTimeout(() => resolve(null), 5000))
+        ]);
         if (result && result.success && Array.isArray(result.results)) ranked = result.results;
       } catch (_) { /* fall through to the recency-based fallback below */ }
     }
@@ -8098,8 +8105,17 @@ async function readScopedNotes(workspace, conversation) {
   if (!workspace) {
     return { ...metadata, content: '' };
   }
-  
-  const content = await window.api.readFile(workspace, metadata.path);
+
+  // Durable notes are a warm-start optimization, not load-bearing - the same 5s ceiling
+  // getKnowledgeBrief was given after it was caught blocking the first answer by minutes.
+  // This IPC read has no such bound of its own and was separately observed stalling the run's
+  // startup phase by 20-30s (measured via the scopedNotes startup-phase timer) on a slow or
+  // busy workspace read. Waiting minutes to save seconds is backwards; if the read is slow,
+  // run without the notes.
+  const content = await Promise.race([
+    window.api.readFile(workspace, metadata.path),
+    new Promise(resolve => setTimeout(() => resolve(null), 5000))
+  ]);
   return {
     ...metadata,
     content: typeof content === 'string' ? content : ''
@@ -14654,6 +14670,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
   module.exports.getSystemInstruction = getSystemInstruction;
   module.exports.setOrionConversationHasHistory = setOrionConversationHasHistory;
   module.exports.refreshOrionMemoryBlock = refreshOrionMemoryBlock;
+  module.exports.readScopedNotes = readScopedNotes;
   module.exports.buildRunArtifactPayload = buildRunArtifactPayload;
   module.exports.__setActiveConversationModeForTest = (mode) => { activeConversationMode = mode; };
   module.exports.__setAgentExecutionModeForTest = (mode) => { agentExecutionMode = mode; };

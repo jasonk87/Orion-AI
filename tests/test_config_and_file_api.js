@@ -324,15 +324,30 @@ test('/api/chat-image serves an authenticated image attached to the selected con
   t.end();
 });
 
-test('/api/chat-image rejects a stale or unrelated conversation id', async (t) => {
+test('/api/chat-image requires a conversation id and image path, but does not require the currently selected conversation', async (t) => {
+  // This route used to require conversationId to equal device.selectedConversationId (the same
+  // "stale view" guard used for state-changing actions like steer/approve-plan), which meant a
+  // screenshot attached inside a delegated Operator/Coder task - whose sourceConversationId is
+  // that specialist conversation, not the Dispatch conversation its result gets relayed into and
+  // that the phone has selected - was permanently rejected with 409, even though the backend had
+  // genuinely attached the image. See tests/test_phone_companion.js's
+  // "a screenshot relayed from a delegated Operator/Coder task..." test for the real regression
+  // this reproduces and the fix. This route's real authorization now lives entirely in
+  // readChatImageForPhone (the conversation must exist and must actually have this exact path
+  // attached to one of its messages) - a differing-but-valid conversationId is expected input,
+  // not something to reject here.
   const { main } = await startServer(1241, {
     state: { conversationId: 'conv1', title: 'T', conversations: [], tasks: [], messages: [], latestOutput: '', preview: {} },
     chatImage: { success: true, data: Buffer.from('x').toString('base64'), mimeType: 'image/png' }
   });
   const session = await pairDevice(1241);
   await request('GET', 1241, '/api/state', null, session);
-  const res = await request('GET', 1241, '/api/chat-image?conversationId=conv2&path=image.png', null, session);
-  t.equal(res.statusCode, 409, 'a paired phone cannot fetch another conversation through a stale view');
+  const missingConversation = await request('GET', 1241, '/api/chat-image?path=image.png', null, session);
+  t.equal(missingConversation.statusCode, 400, 'a request with no conversation id at all is still rejected');
+  const missingPath = await request('GET', 1241, '/api/chat-image?conversationId=conv1', null, session);
+  t.equal(missingPath.statusCode, 400, 'a request with no image path at all is still rejected');
+  const otherConversation = await request('GET', 1241, '/api/chat-image?conversationId=conv2&path=image.png', null, session);
+  t.equal(otherConversation.statusCode, 200, 'a conversation id other than the one currently selected is not, by itself, a reason to reject');
   await closeServer(main.getCompanionServer());
   t.end();
 });

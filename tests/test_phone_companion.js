@@ -836,6 +836,30 @@ test('Phone Companion surfaces and accepts answers to clarifying questions', asy
   await closeServer(main.getCompanionServer());
 });
 
+test('Phone Companion preserves clarification drafts across live transcript rerenders', t => {
+  const html = companionHtml();
+  const renderStart = html.indexOf('function renderConversationMessages(state)');
+  const renderEnd = html.indexOf('function renderToolCallRows', renderStart);
+  const renderFlow = html.slice(renderStart, renderEnd);
+  const submitStart = html.indexOf('async function submitClarificationFromTranscript');
+  const submitEnd = html.indexOf("messagesEl.addEventListener('click'", submitStart);
+  const submitFlow = html.slice(submitStart, submitEnd);
+
+  t.ok(html.includes('const clarificationDrafts = new Map()'),
+    'answer drafts live outside the poll-replaced transcript DOM');
+  t.ok(renderFlow.includes('captureClarificationDraft(')
+    && renderFlow.includes('restoreClarificationDraft('),
+    'every transcript rebuild captures and restores selected answers');
+  t.ok(html.includes("messagesEl.addEventListener('input'"),
+    'typed Other answers are persisted as the user enters them');
+  t.ok(submitFlow.includes("block.classList.add('unanswered')")
+    && submitFlow.includes("firstUnanswered.scrollIntoView({ behavior: 'smooth', block: 'center' })"),
+    'an incomplete form identifies and reveals the first unanswered question');
+  t.ok(submitFlow.includes('clarificationDrafts.delete(draftKey)'),
+    'a successfully submitted draft is discarded instead of leaking into later questions');
+  t.end();
+});
+
 test('Phone Companion exposes the skill system to paired phones', async (t) => {
   const { main, electron } = await startMainWithConfig(1144, {}, {
     skills: { skills: [{ name: 'demo-skill', description: 'demo' }], count: 1 },
@@ -1427,8 +1451,30 @@ test('phone Operator mode remains Operator across navigation, creation, and spec
     'phone navigation normalizes the complete three-role mode enum'
   );
   t.ok(
-    html.includes("companionMode = normalizeCompanionMode(target.mode || 'orion');"),
+    html.includes("const targetMode = normalizeCompanionMode(target.mode || 'orion');")
+      && html.includes('companionMode = targetMode;'),
     'opening an Operator conversation does not bounce it into Dispatch'
+  );
+  t.ok(
+    html.includes('activeConversationMode = targetMode;')
+      && html.includes('updateSpecialistTabVisibility(activeConversationMode);'),
+    'opening a specialist conversation binds its role chrome before the asynchronous state switch'
+  );
+  const switchStart = html.indexOf('async function switchTask(taskId)');
+  const switchEnd = html.indexOf('window.switchTask = switchTask;', switchStart);
+  const switchFlow = html.slice(switchStart, switchEnd);
+  t.ok(
+    switchFlow.indexOf('await loadState({ minSerial: serial, force: true });')
+      < switchFlow.lastIndexOf('updateSpecialistTabVisibility(activeConversationMode);'),
+    'the confirmed switch reasserts specialist navigation from accepted state'
+  );
+  const modeHomeStart = html.indexOf('function openModeHome(mode)');
+  const modeHomeEnd = html.indexOf('function startDispatchDraft', modeHomeStart);
+  const modeHomeFlow = html.slice(modeHomeStart, modeHomeEnd);
+  t.ok(
+    modeHomeFlow.includes("activeConversationMode = 'orion';")
+      && modeHomeFlow.includes("updateSpecialistTabVisibility('orion');"),
+    'returning from a specialist binds Dispatch chrome before async conversation recovery'
   );
   t.ok(
     html.includes("const isSpecialist = mode === 'coder' || mode === 'operator';"),
@@ -1600,6 +1646,57 @@ test('paired phone retrieves a conversation-scoped Coder screenshot through the 
       session
     );
     t.equal(image.statusCode, 200, 'the authenticated image route serves the attachment');
+    t.equal(image.headers['content-type'], 'image/png', 'the original image MIME type is preserved');
+    t.equal(Buffer.from(image.text, 'binary').toString(), bytes.toString(), 'the relayed screenshot bytes are intact');
+  } finally {
+    await closeServer(main.getCompanionServer());
+  }
+  t.end();
+});
+
+test('a screenshot relayed from a delegated Operator/Coder task loads even though its conversation differs from the one currently selected on the phone', async t => {
+  const port = 1157;
+  const bytes = Buffer.from('delegated-task-image-bytes');
+  // Reproduces a real dogfood bug: Dispatch delegates executable work (e.g. "navigate to Yahoo
+  // News and take a screenshot") to a specialist Operator/Coder conversation. attach_image records
+  // that image's sourceConversationId as the SPECIALIST conversation - the one the tool actually
+  // ran in - not the Dispatch conversation the result gets relayed into and that the phone has
+  // selected. The phone renders the image using that original sourceConversationId (see
+  // data-chat-image-conversation in companion-html.js), so /api/chat-image legitimately receives a
+  // conversationId that differs from device.selectedConversationId for every such relayed image.
+  // The backend logged attach_image as done/succeeded, but the phone showed "Image unavailable -
+  // tap to retry" because resolveCompanionActionConversation rejected the mismatched conversationId
+  // with a 409 - a check meant to guard state-changing actions (steer/approve-plan) against a
+  // stale view, wrongly applied to a passive, already-attached image read.
+  const { main } = await startMainWithConfig(port, {}, {
+    state: {
+      conversationId: 'dispatch-conv',
+      title: 'Dispatch',
+      conversations: [{ id: 'dispatch-conv', title: 'Dispatch', active: true }],
+      messages: []
+    },
+    chatImage: {
+      success: true,
+      data: bytes.toString('base64'),
+      mimeType: 'image/png'
+    }
+  });
+  try {
+    const pair = await request('POST', port, '/api/pair', {
+      pairingCode: 'pair-code-123456',
+      deviceName: 'Pixel'
+    });
+    const session = { deviceId: pair.json.device.id, secret: pair.json.sessionSecret };
+    // Selects 'dispatch-conv' as this device's current conversation.
+    await request('GET', port, '/api/state', null, session);
+    const image = await request(
+      'GET',
+      port,
+      '/api/chat-image?conversationId=operator-conv-xyz&path=' + encodeURIComponent('orion-artifact://operator-conv-xyz/yahoo-news.png'),
+      null,
+      session
+    );
+    t.equal(image.statusCode, 200, 'a relayed image loads even when its own conversationId differs from the currently selected conversation');
     t.equal(image.headers['content-type'], 'image/png', 'the original image MIME type is preserved');
     t.equal(Buffer.from(image.text, 'binary').toString(), bytes.toString(), 'the relayed screenshot bytes are intact');
   } finally {

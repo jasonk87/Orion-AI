@@ -149,6 +149,21 @@ async function main() {
   const args = parseArgs(process.argv);
   const appPath = resolveAppPath(args.app);
   const failures = [];
+  // The phone shell is served dynamically from the packaged application directory. A partial
+  // or externally damaged package can still boot its already-loaded desktop window while these
+  // late-read assets are missing, leaving the phone stuck at Offline. Assert the load-bearing
+  // companion resources before launch so the packaged smoke test covers both clients.
+  const packagedAppRoot = process.platform === 'darwin'
+    ? path.join(path.dirname(appPath), '..', 'Resources', 'app')
+    : path.join(path.dirname(appPath), 'resources', 'app');
+  for (const relativePath of [
+    'task-orchestration.js',
+    path.join('node_modules', 'marked', 'marked.min.js')
+  ]) {
+    if (!fs.existsSync(path.join(packagedAppRoot, relativePath))) {
+      failures.push(`Packaged phone companion asset is missing: ${relativePath}`);
+    }
+  }
 
   // Orion holds a single-instance lock keyed on its user-data directory. Without an isolated
   // one, launching here while a real Orion is open makes this process quit instantly with

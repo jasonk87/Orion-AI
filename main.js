@@ -170,6 +170,57 @@ function installRendererCrashRecovery() {
   });
 }
 
+// ── Tailscale serve route (retry + user-visible surfacing) ─────────────────────
+// ensureTailscaleServeRoute() itself stays best-effort and side-effect-light (it is unit tested
+// directly in tests/test_phone_notifications.js). This wraps it with a couple of retries and
+// turns a persistent failure into something the user can actually see and act on, but only when
+// they opted into a Tailscale origin in the first place — an unset origin is a normal, silent
+// no-op for the majority of installs that never asked for this.
+const TAILSCALE_SERVE_RETRY_DELAYS_MS = [5000, 15000];
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function ensureTailscaleServeRouteWithRetry(options = {}) {
+  const retryDelaysMs = Array.isArray(options.retryDelaysMs) ? options.retryDelaysMs : TAILSCALE_SERVE_RETRY_DELAYS_MS;
+  const companionPort = require('./lib/config').readAppConfig().phoneCompanionPort || 45678;
+  const hasOptedIntoTailscale = !!String(require('./lib/config').readAppConfig().phoneCompanionHttpsOrigin || '').trim();
+
+  const attempt = () => ipcServer.ensureTailscaleServeRoute(companionPort)
+    .catch(error => ({ applied: false, reason: (error && error.message) || String(error) }));
+
+  let result = await attempt();
+  for (const delay of retryDelaysMs) {
+    if (result.applied || result.alreadyRouted || !hasOptedIntoTailscale) break;
+    await sleep(delay);
+    result = await attempt();
+  }
+
+  if (result.applied) {
+    console.log(`Tailscale serve route ready: ${result.origin} -> ${result.target}`);
+    return result;
+  }
+  if (result.alreadyRouted) {
+    console.log('Tailscale serve route already present.');
+    return result;
+  }
+  if (!hasOptedIntoTailscale) {
+    // Expected for most installs: no configured origin means the user never asked for this.
+    return result;
+  }
+
+  // The user configured a tailnet origin for phone push/remote pairing, retries did not help,
+  // and this was previously silent beyond crash.log.
+  recordSwallowedFault('tailscale-serve', result.reason || 'route not applied');
+  console.error('Tailscale serve route could not be established after retrying:', result.reason);
+  notifyFault(
+    'Orion phone companion: Tailscale route unavailable',
+    `${result.reason || 'Unknown error'} — phone push notifications and off-network pairing may not work until this is resolved.`
+  );
+  return result;
+}
+
 // ── Window creation ────────────────────────────────────────────────────────────
 
 function createWindow() {
@@ -403,29 +454,44 @@ if (!isTestRuntime && !gotTheLock) {
     installRendererCrashRecovery();
     createWindow();
     if (!isTestRuntime) {
-      try {
-        await ipcServer.startPhoneCompanionServer();
-      } catch (error) {
-        console.error('Phone companion startup failed:', error);
-        if (Notification && Notification.isSupported && Notification.isSupported()) {
-          new Notification({ title: 'Orion phone companion unavailable', body: error.message }).show();
+      // Not awaited beyond the initial fast attempt inside the helper: on a failed bind this can
+      // retry for up to ~12s before falling back to a quiet background retry loop, and that must
+      // not delay window activation or the Tailscale route setup below (same reasoning as the
+      // Tailscale call itself not being awaited).
+      ipcServer.startPhoneCompanionServerWithRetry({
+        onFailure: (error) => {
+          const detail = error && error.message ? String(error.message) : 'unknown error';
+          recordSwallowedFault('phone-companion-startup', detail, {});
+          console.error('Phone companion startup failed, will keep retrying in the background:', detail);
+          if (Notification && Notification.isSupported && Notification.isSupported()) {
+            new Notification({
+              title: 'Orion phone companion unavailable',
+              body: `${detail} — Orion will keep trying to recover automatically.`
+            }).show();
+          }
+        },
+        onRecovered: () => {
+          console.log('Phone companion server recovered after a delayed retry.');
+          if (Notification && Notification.isSupported && Notification.isSupported()) {
+            new Notification({
+              title: 'Orion phone companion is back',
+              body: 'The phone companion server recovered and is reachable again.'
+            }).show();
+          }
         }
-      }
+      }).catch(error => recordSwallowedFault('phone-companion-startup', error, {}));
       // Re-assert the Tailscale HTTPS route to the companion port. Phone push cannot subscribe
       // without a secure context, and that route is the only thing providing one. Doing it on
       // every launch means it follows the app instead of living in a .bat the user must
       // remember to run, and it always targets the port the companion actually bound.
       //
       // Deliberately not awaited: it shells out to the Tailscale CLI, and a slow or missing
-      // CLI must not delay the window. Failures are recorded, never fatal.
-      const companionPort = require('./lib/config').readAppConfig().phoneCompanionPort || 45678;
-      ipcServer.ensureTailscaleServeRoute(companionPort)
-        .then(result => {
-          if (result.applied) console.log(`Tailscale serve route ready: ${result.origin} -> ${result.target}`);
-          else if (result.alreadyRouted) console.log('Tailscale serve route already present.');
-          else recordSwallowedFault('tailscale-serve', result.reason || 'route not applied');
-        })
-        .catch(error => recordSwallowedFault('tailscale-serve', error));
+      // CLI must not delay the window. Failures are recorded, and now retried a couple of times
+      // (cert provisioning / tailscaled startup can be transient) before being surfaced — but
+      // only when the user actually opted into a Tailscale origin. Before this, a real failure
+      // (cert provisioning stuck, tailscaled down, etc.) only ever reached crash.log: nothing
+      // told the user their phone push/off-network pairing had silently degraded to LAN-only.
+      ensureTailscaleServeRouteWithRetry().catch(error => recordSwallowedFault('tailscale-serve', error));
     }
 
     app.on('activate', () => {
@@ -526,6 +592,8 @@ if (process.env.NODE_ENV === 'test') {
     isDestructiveCommand,
     activeProcesses: shared.activeProcesses,
     commandSessions: shared.commandSessions,
-    ensureCompanionToken: ipcServer.ensureCompanionToken
+    ensureCompanionToken: ipcServer.ensureCompanionToken,
+    ensureTailscaleServeRouteWithRetry,
+    TAILSCALE_SERVE_RETRY_DELAYS_MS
   };
 }

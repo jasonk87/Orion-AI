@@ -82,6 +82,35 @@ test('conversation screenshot references cannot cross conversation boundaries', 
   t.end();
 });
 
+test('a bare screenshot destination resolves against the conversation artifact directory without the returned orion-artifact:// path', t => {
+  const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'orion-chat-image-scope-'));
+  const fileTools = proxyquire('../lib/ipc-file-tools', {
+    electron: { app: { getPath: () => userData } }
+  });
+  // Reproduces a real dogfood bug: take_screenshot/capture_screen write into the conversation's
+  // artifact directory under whatever bare `destination` string the model supplied (see
+  // writeScreenshotBuffer in lib/ipc-shell.js), then return the resolved orion-artifact:// URI as
+  // their result `path`. Models were observed reusing their own `destination` argument (e.g.
+  // "yahoo-news.png") for the follow-up inspect_screenshot_with_model/attach_image call instead of
+  // that returned path, which previously guaranteed a "File does not exist" error and a mandatory
+  // retry on every single screenshot-then-inspect-or-attach flow. The bare destination must resolve
+  // on the first try whenever it matches a real artifact already written for that conversation.
+  fileTools.writeConversationArtifactBuffer('conv_1787622552304_2qj6t', 'yahoo-news.png', Buffer.from('png'));
+  const file = fileTools.readWorkspaceFileBase64('', 'yahoo-news.png', 'conv_1787622552304_2qj6t');
+  t.equal(file.mimeType, 'image/png', 'the bare destination the model passed to take_screenshot resolves without needing the resolved artifact path');
+  // A bare destination for a DIFFERENT conversation's artifact must still be rejected - the fix
+  // must not weaken the cross-conversation boundary the test above establishes.
+  t.throws(
+    () => {
+      const otherConvFile = fileTools.readWorkspaceFileBase64('', 'yahoo-news.png', 'conv_other');
+      if (!otherConvFile || otherConvFile.mimeType !== 'image/png') throw new Error('not found');
+    },
+    'a bare destination cannot accidentally resolve into a different conversation\'s artifact directory'
+  );
+  fs.rmSync(userData, { recursive: true, force: true });
+  t.end();
+});
+
 test('computer action IPC hides Orion, performs one action, captures the result, and restores Orion', async t => {
   let handler = null;
   const calls = [];
