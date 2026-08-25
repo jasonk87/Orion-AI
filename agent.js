@@ -201,7 +201,7 @@ SCREEN-FIRST EXECUTION:
 
 STATE FRESHNESS — WHEN A FRESH LOOK IS ACTUALLY REQUIRED:
 - Native computer_action is gated in code, not just by convention: every call requires a capture_screen from this run followed by inspect_screenshot_with_model on that exact capture, and a successful action immediately invalidates the inspection — so the next computer_action needs its own fresh capture-and-inspect pair. Do not attempt to act twice off one inspection; the tool will refuse it.
-- Browser-worker tools (open_url, click_element, fill_input, wait_for_page) do not require that vision round-trip, but the page itself can still change under you — a navigation, a form submission, or an async update can invalidate what you last read. Re-read the page (wait_for_page, take_screenshot, or re-issuing the read that told you what was there) before acting on state you have not observed since the last thing that could plausibly have changed it.
+- Browser-worker tools (open_url, click_element, fill_input, wait_for_page) do not require that vision round-trip, but the page itself can still change under you — a navigation, a form submission, or an async update can invalidate what you last read. Re-read the page (wait_for_page, take_screenshot, or re-issuing the read that told you what was there) before acting on state you have not observed since the last thing that could plausibly have changed it. Use close_browser to close Orion's managed browser; do not substitute about:blank or OS-level clicks for that operation.
 - A screen or page you have not touched, and nothing else could plausibly have changed, does not need re-inspection out of caution alone. Re-inspect when something you did — or something asynchronous — could have changed it, not on a fixed schedule.
 
 EVIDENCE BEFORE COMPLETION:
@@ -807,6 +807,11 @@ const ASSET_BROWSER_VISUAL_TOOL_DECLARATIONS = [
     name: 'navigate_back',
     description: 'Navigates the browser worker back one page.',
     parameters: { type: 'OBJECT', properties: {} }
+  },
+  {
+    name: 'close_browser',
+    description: 'Closes Orion\'s managed browser worker. Optionally verifies that the current URL or title contains the expected text before closing, so the wrong managed page is never closed.',
+    parameters: { type: 'OBJECT', properties: { expectedUrlContains: { type: 'STRING', description: 'Optional expected URL or title fragment, such as yahoo.com.' } } }
   },
   {
     name: 'download_from_page',
@@ -4321,9 +4326,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         const resultError = getToolFailureSignal(result);
         if (resultError) {
           const baseFailure = classifyAgentFailure({ toolName, args, result, errorText: resultError });
-          const failureKey = (toolName === 'run_command' || toolName === 'start_command')
-            ? buildRepeatedFailureKey(toolName, args, baseFailure.category)
-            : `${toolName}:${stableStringify(args)}:${String(resultError).slice(0, 240)}`;
+          const failureKey = buildRepeatedFailureKey(toolName, args, baseFailure.category);
           const failureCount = (repeatedToolFailures.get(failureKey) || 0) + 1;
           repeatedToolFailures.set(failureKey, failureCount);
           const failure = classifyAgentFailure({ toolName, args, result, errorText: resultError, failureCount });
@@ -5938,7 +5941,7 @@ function appendBoundedCommandOutput(currentValue, chunkValue, maxChars = AGENT_C
 const DESKTOP_LEASE_TOOLS = new Set(['computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite']);
 const BROWSER_LEASE_TOOLS = new Set([
   'open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back',
-  'download_from_page', 'wait_for_page', 'take_screenshot'
+  'close_browser', 'download_from_page', 'wait_for_page', 'take_screenshot'
 ]);
 
 async function acquireToolResourceLease(name, conversation, executionContext) {
@@ -6009,7 +6012,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
 
   const browserControlTools = new Set([
     'open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back',
-    'download_from_page', 'wait_for_page', 'take_screenshot'
+    'close_browser', 'download_from_page', 'wait_for_page', 'take_screenshot'
   ]);
   const desktopControlTools = new Set([
     'preview_app', 'capture_screen', 'open_application', 'click_ui_element', 'open_chrome_favorite', 'computer_action'
@@ -7360,6 +7363,14 @@ async function executeTool(name, args, workspace, config, conversation, executio
       return result;
     }
 
+    case 'close_browser': {
+      const result = await window.api.browserClose(args.expectedUrlContains || '');
+      if (!result.success) throw new Error(result.error || 'Managed browser close failed');
+      executionContext.lastBrowserSnapshot = null;
+      lastBrowserPageSignature = '';
+      return result;
+    }
+
     case 'download_from_page': {
       const result = await window.api.browserDownloadFromPage(workspace, args.selector || '', args.url || '', args.destination || '');
       if (!result.success) throw new Error(result.error || 'Page download failed');
@@ -7376,6 +7387,10 @@ async function executeTool(name, args, workspace, config, conversation, executio
     case 'take_screenshot': {
       const result = await window.api.takeScreenshot(workspace, args.destination || '', conversation.id);
       if (!result.success) throw new Error(result.error || 'Screenshot failed');
+      executionContext.lastBrowserSnapshot = {
+        path: result.path,
+        capturedAt: Date.now()
+      };
       return result;
     }
 
@@ -7609,9 +7624,12 @@ async function executeTool(name, args, workspace, config, conversation, executio
 
     case 'attach_image': {
       if (!args.path) throw new Error("Missing 'path' parameter");
-      const imagePath = OperatorExecutionPolicy
+      const desktopResolvedPath = OperatorExecutionPolicy
         ? OperatorExecutionPolicy.resolveSnapshotReference(args.path, executionContext.lastDesktopSnapshot)
         : args.path;
+      const imagePath = OperatorExecutionPolicy
+        ? OperatorExecutionPolicy.resolveSnapshotReference(desktopResolvedPath, executionContext.lastBrowserSnapshot)
+        : desktopResolvedPath;
       const file = await window.api.readWorkspaceFileBase64(workspace, imagePath, conversation && conversation.id ? conversation.id : '');
       if (!file || file.success === false) throw new Error((file && file.error) || 'Image could not be read');
       if (!String(file.mimeType || '').startsWith('image/')) throw new Error(`attach_image requires an image, got ${file.mimeType || 'unknown type'}`);
@@ -8467,7 +8485,7 @@ async function recordToolOutcomeInWorkingState(workspace, toolName, args, result
 function buildDiscoveryFromToolOutcome(toolName, args = {}, result = {}, outcome = {}) {
   if (!result || result.error || result.success === false) return null;
   const assetTools = new Set(['download_file', 'inspect_archive', 'extract_archive', 'inspect_binary_asset', 'list_asset_metadata']);
-  const browserTools = new Set(['open_url', 'search_web', 'click_element', 'download_from_page']);
+  const browserTools = new Set(['open_url', 'search_web', 'click_element', 'close_browser', 'download_from_page']);
   const visualTools = new Set(['take_screenshot', 'preview_app', 'capture_screen', 'computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite', 'attach_image', 'inspect_screenshot', 'compare_screenshot_to_goal', 'inspect_screenshot_with_model']);
   if (assetTools.has(toolName)) {
     const source = result.url || args.url || '';
@@ -8991,20 +9009,20 @@ If STRATEGY.md finds mission-critical ambiguity, ask the user before planning. I
 const PLANNING_BLOCKED_TOOLS = Object.freeze([
   'modify_file', 'patch_file', 'delete_created_file', 'start_command', 'run_tests', 'run_linter',
   'sync_workspace_env', 'launch_workspace_app', 'preview_app', 'git_push', 'download_file',
-  'download_from_page', 'extract_archive', 'take_screenshot', 'computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite'
+  'download_from_page', 'extract_archive', 'take_screenshot', 'close_browser', 'computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite'
 ]);
 
 const PLAN_REVISION_BLOCKED_TOOLS = Object.freeze([
   'delete_created_file', 'start_command', 'run_tests', 'run_linter', 'sync_workspace_env',
   'launch_workspace_app', 'preview_app', 'git_push', 'download_file', 'download_from_page',
-  'extract_archive', 'computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite'
+  'extract_archive', 'close_browser', 'computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite'
 ]);
 
 const REVIEW_ONLY_BLOCKED_TOOLS = Object.freeze([
   'modify_file', 'patch_file', 'delete_created_file', 'sync_workspace_env',
   'set_workspace_entrypoint', 'start_command', 'launch_workspace_app', 'preview_app', 'git_push',
   'download_file', 'download_from_page', 'extract_archive', 'set_task_checklist',
-  'computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite',
+  'close_browser', 'computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite',
   'update_mission_context', 'start_subplan', 'update_subplan_context', 'complete_subplan',
   'evaluate_win_conditions', 'record_blocker', 'resolve_blocker'
 ]);
@@ -9192,6 +9210,7 @@ function summarizeToolStart(toolName, args = {}) {
   if (toolName === 'click_element') return { toolName, kind: 'browser', status: 'running', label: `Clicked page element${args.selector ? ` \`${args.selector}\`` : ''}` };
   if (toolName === 'fill_input') return { toolName, kind: 'browser', status: 'running', label: `Filled input \`${args.selector || 'input'}\`` };
   if (toolName === 'navigate_back') return { toolName, kind: 'browser', status: 'running', label: 'Navigated browser back' };
+  if (toolName === 'close_browser') return { toolName, kind: 'browser', status: 'running', label: 'Closed managed browser' };
   if (toolName === 'download_from_page') return { toolName, kind: 'asset', status: 'running', label: 'Downloaded asset from current page' };
   if (toolName === 'wait_for_page') return { toolName, kind: 'browser', status: 'running', label: 'Waited for page' };
   if (toolName === 'take_screenshot') return { toolName, kind: 'visual', status: 'running', label: 'Captured browser screenshot' };
@@ -9347,7 +9366,7 @@ function updateWalkthroughItem(item, toolName, args, result, error) {
       item.height = result.height || item.height || 0;
       item.size = result.size || item.size || 0;
     }
-  } else if (result && result.title && (toolName === 'open_url' || toolName === 'search_web' || toolName === 'click_element' || toolName === 'fill_input' || toolName === 'navigate_back' || toolName === 'wait_for_page')) {
+  } else if (result && result.title && (toolName === 'open_url' || toolName === 'search_web' || toolName === 'click_element' || toolName === 'fill_input' || toolName === 'navigate_back' || toolName === 'close_browser' || toolName === 'wait_for_page')) {
     item.detail = `Page: ${result.title}`;
   }
 }
@@ -11565,6 +11584,10 @@ async function sleepWithModelApiStatus(ms, label, onWarning) {
 // Normalize away superficial command text and key on the failure category instead so these collapse
 // into one growing counter.
 function buildRepeatedFailureKey(toolName, args, category) {
+  if (toolName === 'capture_screen') {
+    const displayId = String((args && args.displayId) || 'primary');
+    return `${toolName}:${displayId}:${category}`;
+  }
   if (toolName === 'run_command' || toolName === 'start_command') {
     const normalizedCommand = String((args && args.command) || '')
       .toLowerCase()
@@ -12279,7 +12302,7 @@ const DISPATCH_TOOL_ALLOWLIST = new Set([
   'handoff_to_coder',
   'handoff_to_operator',
   'get_coder_task_status', 'cancel_coder_task',
-  'open_url', 'click_element', 'fill_input', 'take_screenshot', 'navigate_back', 'attach_image',
+  'open_url', 'click_element', 'fill_input', 'take_screenshot', 'navigate_back', 'close_browser', 'attach_image',
   'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model',
   'grep_search', 'search_embeddings', 'semantic_search',
   'get_symbol_index', 'fetch_page', 'git_diff', 'git_rollback', 'edit_config', 'get_file_symbols', 'find_references',
@@ -12315,7 +12338,7 @@ const DISPATCH_TOOL_ALLOWLIST = new Set([
 // assume it can do. Flagged here as a judgment call rather than a silent addition.
 const OPERATOR_TOOL_ALLOWLIST = new Set([
   'computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite',
-  'open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back', 'download_from_page', 'wait_for_page', 'take_screenshot',
+  'open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back', 'close_browser', 'download_from_page', 'wait_for_page', 'take_screenshot',
   'run_command', 'start_command', 'get_command_status', 'read_command_output', 'kill_command', 'terminal_exec',
   'capture_screen', 'inspect_screenshot', 'compare_screenshot_to_goal', 'inspect_screenshot_with_model', 'attach_image',
   'schedule_followup', 'watch_condition',

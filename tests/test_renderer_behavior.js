@@ -1190,6 +1190,62 @@ test('phone image relay honors the attached Coder artifact provenance', async t 
   t.end();
 });
 
+test('phone image lookup hydrates a stubbed specialist source conversation after reload', async t => {
+  const artifactPath = 'orion-artifact://operator-1/yahoo-homepage.png';
+  const calls = [];
+  const loaded = loadRenderer({
+    t,
+    api: {
+      readConversation: async id => {
+        calls.push(['readConversation', id]);
+        return {
+          success: true,
+          conversation: {
+            id,
+            mode: 'operator',
+            workspace: 'C:\\workspace',
+            messages: [{
+              role: 'assistant',
+              text: 'Yahoo is open.',
+              images: [{
+                path: artifactPath,
+                workspacePath: 'C:\\workspace',
+                sourceConversationId: id,
+                mimeType: 'image/png'
+              }]
+            }]
+          }
+        };
+      },
+      readWorkspaceFileBase64: async (...args) => {
+        calls.push(['readWorkspaceFileBase64', ...args]);
+        return { success: true, data: 'aW1hZ2U=', mimeType: 'image/png' };
+      }
+    },
+    set: {
+      conversations: [{
+        id: 'operator-1',
+        mode: 'operator',
+        workspace: 'C:\\workspace',
+        isStub: true,
+        hasMessages: true,
+        messages: []
+      }]
+    }
+  });
+
+  const result = await loaded.win.readChatImageForPhone({
+    conversationId: 'operator-1',
+    path: artifactPath
+  });
+
+  t.equal(result.success, true, 'the specialist image survives renderer reload and stub eviction');
+  t.deepEqual(calls[0], ['readConversation', 'operator-1'], 'the source specialist is hydrated before searching attachments');
+  t.deepEqual(calls[1], ['readWorkspaceFileBase64', 'C:\\workspace', artifactPath, 'operator-1'],
+    'the hydrated image is read through its owning specialist provenance');
+  t.end();
+});
+
 // ── Per-message model + reasoning pickers ──────────────────────────────────────
 // The reasoning selector sits beside the model select under the input box. It is sticky, it
 // persists to both localStorage and appConfig (which is what agent.js reads), and a forced

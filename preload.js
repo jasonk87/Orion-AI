@@ -65,6 +65,7 @@ contextBridge.exposeInMainWorld('api', {
   browserClickElement: (selector, text) => ipcRenderer.invoke('browser-click-element', { selector, text }),
   browserFillInput: (selector, value) => ipcRenderer.invoke('browser-fill-input', { selector, value }),
   browserNavigateBack: () => ipcRenderer.invoke('browser-navigate-back'),
+  browserClose: (expectedUrlContains = '') => ipcRenderer.invoke('browser-close', { expectedUrlContains }),
   browserDownloadFromPage: (workspacePath, selector, url, destination) => ipcRenderer.invoke('browser-download-from-page', { workspacePath, selector, url, destination }),
   browserWaitForPage: (timeoutMs) => ipcRenderer.invoke('browser-wait-for-page', { timeoutMs }),
   takeScreenshot: (workspacePath, destination, conversationId) => ipcRenderer.invoke('take-screenshot', { workspacePath, destination, conversationId }),

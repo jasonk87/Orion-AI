@@ -523,6 +523,7 @@ if (process.env.NODE_ENV === 'test') {
     commandLooksPowerShellSpecific: ipcShell.commandLooksPowerShellSpecific,
     hasUnquotedSemicolon: ipcShell.hasUnquotedSemicolon,
     pickBestClickCandidate: ipcShell.pickBestClickCandidate,
+    closeBrowserWorkerInstance: ipcShell.closeBrowserWorkerInstance,
     getCommandShellSpec: ipcShell.getCommandShellSpec,
     previewWorkspaceApp: ipcShell.previewWorkspaceApp,
     normalizeComputerAction: ipcComputerUse.normalizeComputerAction,

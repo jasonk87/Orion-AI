@@ -53,6 +53,7 @@ test('agent exposes general asset, browser, and visual tools without hardcoded w
     'click_element',
     'fill_input',
     'navigate_back',
+    'close_browser',
     'download_from_page',
     'wait_for_page',
     'take_screenshot',

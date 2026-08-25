@@ -11,6 +11,26 @@ global.fetch = async () => ({ ok: true, json: async () => ({}) });
 const agent = require('../agent.js');
 const { classifyAgentFailure, buildFailureRecoveryGuidance, getCompactionThreshold } = agent;
 
+test('capture-screen retries collapse delay and destination variations into one failure', t => {
+  const first = agent.buildRepeatedFailureKey('capture_screen', {
+    delayMs: 0,
+    destination: 'first.png'
+  }, 'environment_failure');
+  const retry = agent.buildRepeatedFailureKey('capture_screen', {
+    delayMs: 15000,
+    destination: 'eighth.png'
+  }, 'environment_failure');
+  const otherDisplay = agent.buildRepeatedFailureKey('capture_screen', {
+    displayId: 'monitor-2',
+    delayMs: 15000,
+    destination: 'eighth.png'
+  }, 'environment_failure');
+
+  t.equal(first, retry, 'cosmetic retry arguments cannot evade the repeated-failure guard');
+  t.notEqual(first, otherDisplay, 'a genuinely different display remains a distinct attempt');
+  t.end();
+});
+
 // ── classifyAgentFailure ──────────────────────────────────────────────────────
 
 test('classifyAgentFailure: repeated failures (count >= 3) override other categories', (t) => {

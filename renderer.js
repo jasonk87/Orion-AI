@@ -9636,6 +9636,16 @@ window.readChatImageForPhone = async (payload = {}) => {
   const imagePath = String(payload.path || '');
   const conv = conversations.find(conversation => conversation.id === conversationId);
   if (!conv || !imagePath) return { success: false, error: 'Conversation image not found.' };
+  if (conv.isStub && conv.hasMessages && window.api && typeof window.api.readConversation === 'function') {
+    try {
+      const loaded = await window.api.readConversation(conv.id);
+      if (loaded && loaded.success && loaded.conversation) {
+        hydrateConversationRecord(conv, loaded.conversation);
+      }
+    } catch (err) {
+      console.error('Phone image source hydration failed', err);
+    }
+  }
   const image = (Array.isArray(conv.messages) ? conv.messages : [])
     .flatMap(message => Array.isArray(message && message.images) ? message.images : [])
     .find(candidate => candidate && String(candidate.path || '') === imagePath);

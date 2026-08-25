@@ -86,13 +86,10 @@ test('Gemini request serialization sends the provider-safe declaration payload',
     const declarations = requestBody.tools[0].functionDeclarations;
     const editConfig = declarations.find(tool => tool.name === 'edit_config');
     t.equal(containsKey(requestBody.tools, 'additionalProperties'), false, 'serialized Gemini tools contain no unsupported arbitrary-object keyword');
-    // Phase 3 piece 5 inserted a new handoff_to_operator declaration earlier in the master tool
-    // array (alongside handoff_to_coder), which shifted every later Dispatch-mode declaration
-    // index by one — edit_config moved from 24 to 25. The regression this test guards (a live
-    // HTTP 400 caused by an unsanitized schema at edit_config's position) is about the tool
-    // reaching Gemini with a provider-safe schema, not about a specific literal index, so the
-    // fix is updating the pinned index rather than the surrounding assertions.
-    t.equal(declarations[25].name, 'edit_config', 'regression reaches the same declaration index as the live HTTP 400');
+    // The regression was an unsafe edit_config schema, not its incidental position in an
+    // expanding tool array. New capabilities may be inserted before it without weakening the
+    // provider-safety contract this test is meant to enforce.
+    t.ok(editConfig, 'the formerly rejected edit_config declaration still reaches Gemini regardless of tool-array growth');
     t.equal(containsKey(editConfig.parameters, 'additionalProperties'), false, 'the formerly rejected edit_config schema is provider-safe');
     t.equal(editConfig.parameters.properties.updates.type, 'STRING', 'serialized request preserves map usability through JSON encoding');
     t.match(editConfig.parameters.properties.updates.description, /decoded before the tool runs/i, 'serialized request explains executor normalization');

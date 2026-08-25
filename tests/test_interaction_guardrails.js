@@ -1207,7 +1207,7 @@ test('Operator receives a narrower, desktop/browser-execution tool surface, not 
   t.notOk(coderTools.includes('open_application'), 'Coder does not receive the Operator-only app opener');
   t.notOk(coderTools.includes('click_ui_element'), 'Coder does not receive Operator-only accessibility control');
   t.notOk(coderTools.includes('open_chrome_favorite'), 'Coder does not receive Operator-only Chrome profile control');
-  for (const browserTool of ['open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back', 'download_from_page', 'wait_for_page', 'take_screenshot']) {
+  for (const browserTool of ['open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back', 'close_browser', 'download_from_page', 'wait_for_page', 'take_screenshot']) {
     t.ok(operatorTools.includes(browserTool), `Operator has the full browser-worker tool: ${browserTool}`);
   }
   for (const processTool of ['run_command', 'start_command', 'get_command_status', 'read_command_output', 'kill_command', 'terminal_exec']) {

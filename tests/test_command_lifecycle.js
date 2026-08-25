@@ -24,6 +24,30 @@ const main = proxyquire('../main.js', {
 
 global.mainWindow = { webContents: { send: () => {} } };
 
+test('managed browser close verifies the expected page and destroys only the matching worker', t => {
+  let destroyed = false;
+  const win = {
+    isDestroyed: () => destroyed,
+    getTitle: () => 'Yahoo | Mail, Weather, Search, Politics, News',
+    webContents: { getURL: () => 'https://www.yahoo.com/' },
+    destroy: () => { destroyed = true; }
+  };
+
+  const mismatch = main.closeBrowserWorkerInstance(win, 'example.com');
+  t.equal(mismatch.success, false, 'a mismatched expected page is refused');
+  t.equal(destroyed, false, 'the wrong managed page remains open');
+
+  const closed = main.closeBrowserWorkerInstance(win, 'yahoo.com');
+  t.equal(closed.success, true, 'the matching managed page closes');
+  t.equal(closed.closed, true, 'the result records a real close');
+  t.equal(closed.url, 'https://www.yahoo.com/', 'the closed URL is preserved as evidence');
+  t.equal(destroyed, true, 'the managed worker is destroyed deterministically');
+
+  const alreadyClosed = main.closeBrowserWorkerInstance(win, 'yahoo.com');
+  t.equal(alreadyClosed.alreadyClosed, true, 'closing an already-closed worker is idempotent');
+  t.end();
+});
+
 // These tests deliberately launch detached, long-running processes to verify Orion's lifecycle
 // controls. Windows can keep a killed child/conhost handle alive briefly on slower CI runners,
 // even after every Tape assertion has finished. Clean up synchronously so the test file cannot

@@ -233,6 +233,62 @@ test('attach_image records a safe reference with owning-conversation provenance'
   t.end();
 });
 
+test('attach_image preserves the canonical browser artifact path when the model reuses its destination', async t => {
+  const oldApi = global.window.api;
+  let readArgs = null;
+  global.window.api = {
+    readWorkspaceFileBase64: async (...args) => {
+      readArgs = args;
+      return { success: true, mimeType: 'image/png', data: Buffer.from('png').toString('base64') };
+    }
+  };
+  const canonical = 'orion-artifact://conv_browser/yahoo-homepage.png';
+  const executionContext = {
+    attachedResponseImages: [],
+    lastBrowserSnapshot: { path: canonical, capturedAt: Date.now() }
+  };
+
+  const result = await agent.executeTool(
+    'attach_image',
+    { path: 'yahoo-homepage.png', alt: 'Yahoo home page' },
+    'C:\\workspace',
+    {},
+    { id: 'conv_browser', mode: 'operator' },
+    executionContext
+  );
+  global.window.api = oldApi;
+
+  t.equal(result.attached, canonical, 'the response stores the canonical artifact URI');
+  t.equal(readArgs[1], canonical, 'the file read validates the canonical artifact URI');
+  t.equal(executionContext.attachedResponseImages[0].path, canonical, 'relay and reload retain the canonical image reference');
+  t.end();
+});
+
+test('close_browser uses the managed browser API instead of desktop input', async t => {
+  const oldApi = global.window.api;
+  let expected = null;
+  global.window.api = {
+    browserClose: async value => {
+      expected = value;
+      return { success: true, closed: true, url: 'https://www.yahoo.com/' };
+    }
+  };
+
+  const result = await agent.executeTool(
+    'close_browser',
+    { expectedUrlContains: 'yahoo.com' },
+    'C:\\workspace',
+    {},
+    { id: 'conv_browser', mode: 'operator' },
+    { lastBrowserSnapshot: { path: 'orion-artifact://conv_browser/yahoo.png' } }
+  );
+  global.window.api = oldApi;
+
+  t.equal(result.closed, true, 'the managed browser reports a real close');
+  t.equal(expected, 'yahoo.com', 'the expected page guard reaches the browser owner');
+  t.end();
+});
+
 test('agent refuses blind desktop input and resets inspection after every action', async t => {
   const oldApi = global.window.api;
   let sentAction = null;
@@ -271,7 +327,7 @@ test('agent refuses blind desktop input and resets inspection after every action
   t.end();
 });
 
-test('tool contracts expose computer use only to Coder and image attachment to both modes', t => {
+test('tool contracts expose computer use only to Coder and managed browser close to authorized modes', t => {
   agent.__setActiveConversationModeForTest('coder');
   const coderTools = agent.buildAgentToolDeclarations().map(tool => tool.name);
   agent.__setActiveConversationModeForTest('orion');
@@ -281,6 +337,9 @@ test('tool contracts expose computer use only to Coder and image attachment to b
   t.notOk(dispatchTools.includes('computer_action'), 'Dispatch cannot operate the native desktop');
   t.ok(coderTools.includes('attach_image'), 'Coder can attach a captured result to chat');
   t.ok(dispatchTools.includes('attach_image'), 'Dispatch can attach a browser screenshot or existing safe image');
+  t.ok(coderTools.includes('close_browser'), 'Coder can close Orion\'s managed browser');
+  t.ok(dispatchTools.includes('close_browser'), 'Dispatch can close Orion\'s managed browser without desktop control');
+  t.ok(agent.PLANNING_BLOCKED_TOOLS.includes('close_browser'), 'planning blocks managed browser mutation');
   t.ok(agent.PLANNING_BLOCKED_TOOLS.includes('computer_action'), 'planning blocks native input');
   t.ok(agent.PLAN_REVISION_BLOCKED_TOOLS.includes('computer_action'), 'plan revision blocks native input');
   t.ok(agent.REVIEW_ONLY_BLOCKED_TOOLS.includes('computer_action'), 'review-only work blocks native input');
