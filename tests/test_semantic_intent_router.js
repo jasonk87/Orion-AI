@@ -456,6 +456,38 @@ test('specialist selection distinguishes desktop operation from code and artifac
   t.end();
 });
 
+test('reminder payload actions remain Dispatch-owned scheduling instead of Operator work', async t => {
+  const reminder = await router.classify(baseContext('Remind me at 2 PM to start OpenAI.'), {
+    structureApi,
+    classify: async () => classification('new_task', {
+      requiresExecution: true,
+      resolvedRequest: 'Set a one-time reminder for 2:00 PM to start OpenAI.',
+      executionScope: 'mutating',
+      executionTarget: 'dispatch',
+      executionSurface: 'none',
+      orchestrationAction: 'schedule_followup',
+      scheduledRequest: {
+        prompt: 'Remind Jason that it is time to start OpenAI. Do not launch it unless he asks after receiving the reminder.',
+        purpose: 'start-openai-reminder',
+        atTime: '14:00',
+        recurring: false
+      },
+      // The future payload mentions a local app. Even if a provider redundantly marks that
+      // evidence domain, the immediate requested action is still scheduling, not operating it.
+      inspectionTarget: 'local_system',
+      standaloneSystemOperation: true
+    })
+  });
+
+  t.equal(reminder.executionTarget, 'dispatch', 'Dispatch owns the immediate scheduling operation');
+  t.equal(reminder.orchestrationAction, 'schedule_followup', 'the durable scheduling primitive is explicit');
+  t.equal(reminder.scheduledRequest.atTime, '14:00', 'the local wall-clock time remains structured');
+  t.equal(reminder.scheduledRequest.recurring, false, 'a plain reminder is not upgraded to a daily recurrence');
+  t.match(reminder.scheduledRequest.prompt, /do not launch/i, 'the future action remains reminder payload, not present authority');
+  t.equal(router.canUseStandaloneSpecialistWorkspace(reminder), false, 'a reminder never creates a standalone specialist workspace');
+  t.end();
+});
+
 test('contextual steering and retry preserve the specialist on the durable task', async t => {
   const activeOperatorTask = {
     taskId: 'task-operator-1',

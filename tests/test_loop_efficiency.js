@@ -424,12 +424,19 @@ test('casual conversation never reaches for the cross-project fact store', (t) =
   t.end();
 });
 
-test('an ongoing thread suppresses the greeting the prompt keeps inviting', (t) => {
+test('the first reply and every ongoing reply must address the actual message', (t) => {
   agent.__setActiveConversationModeForTest('orion');
   try {
     agent.setOrionConversationHasHistory({ messages: [{ role: 'user', text: 'hi' }] });
     const firstTurn = agent.getSystemInstruction(false, 'Name: Jason', 'deepseek-v4');
-    t.notOk(/CONVERSATION IN PROGRESS/.test(firstTurn), 'the opening turn may greet normally');
+    t.notOk(/CONVERSATION IN PROGRESS/.test(firstTurn), 'the opening turn is not mislabeled as an ongoing thread');
+    t.ok(firstTurn.includes('FIRST REPLY:'), 'the opening turn receives an explicit response contract');
+    t.ok(firstTurn.includes("Respond to the substance of Jason's exact message immediately"),
+      'the first reply must engage with the supplied message');
+    t.ok(firstTurn.includes('a greeting alone is never an answer'),
+      'a greeting cannot substitute for first-turn acknowledgment');
+    t.ok(firstTurn.includes('If his message is a statement rather than a question'),
+      'the contract covers conversational statements as well as questions');
 
     for (const priorRole of ['assistant', 'model', 'ai', 'orion']) {
       agent.setOrionConversationHasHistory({

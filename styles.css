@@ -899,11 +899,17 @@ body[data-mode="orion"] #chat-workspace { border-left: none; }
   color: var(--text-muted);
 }
 
+/* Markdown-rendering cleanup: a research write-up's natural shape for comparing multiple sources
+   or options is a table, and a narrow chat column can be as tight as the phone bubble this same
+   fix was made for — display:block + overflow-x:auto keeps a wide table from breaking the layout
+   instead of just clipping or forcing the whole bubble to scroll sideways. */
 .message-body table {
   width: 100%;
   border-collapse: collapse;
   margin: 14px 0;
   font-size: 0.82rem;
+  display: block;
+  overflow-x: auto;
 }
 
 .message-body th,
@@ -917,6 +923,11 @@ body[data-mode="orion"] #chat-workspace { border-left: none; }
 .message-body th {
   color: var(--text-primary);
   background-color: rgba(255, 255, 255, 0.04);
+  font-weight: 700;
+}
+
+.message-body tbody tr:nth-child(even) td {
+  background-color: rgba(255, 255, 255, 0.02);
 }
 
 .message-body hr {

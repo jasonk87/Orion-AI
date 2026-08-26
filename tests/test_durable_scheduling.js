@@ -125,6 +125,7 @@ test('a schedule preserves its user-facing delivery conversation across restarts
       conversationId: 'operator-worker',
       deliveryConversationId: 'dispatch-origin',
       sourceTaskId: 'task-reminder',
+      deliveryOnly: true,
       purpose: 'weather-update',
       prompt: 'Give the user a weather update.',
       delayMs: MINUTE
@@ -133,6 +134,23 @@ test('a schedule preserves its user-facing delivery conversation across restarts
     t.equal(restored.conversationId, 'operator-worker', 'execution remains bound to the worker conversation');
     t.equal(restored.deliveryConversationId, 'dispatch-origin', 'delivery remains bound to the visible conversation');
     t.equal(restored.sourceTaskId, 'task-reminder', 'the originating task provenance is durable');
+    t.equal(restored.deliveryOnly, true, 'delivery-only authority survives restart without becoming executable work');
+  } finally { h.cleanup(); }
+  t.end();
+});
+
+test('legacy schedules default to executable follow-up behavior', async t => {
+  const clock = { now: BASE };
+  const h = makeStore(clock);
+  try {
+    await h.store.create({
+      conversationId: 'legacy-conversation',
+      purpose: 'legacy-followup',
+      prompt: 'Inspect the current job state.',
+      delayMs: MINUTE
+    });
+    const [restored] = await h.reopen().list({ status: 'pending' });
+    t.equal(restored.deliveryOnly, false, 'missing deliveryOnly never silently removes existing execution behavior');
   } finally { h.cleanup(); }
   t.end();
 });
@@ -340,7 +358,9 @@ test('the integrated schedule path carries delivery provenance into execution', 
   t.ok(scheduleBody.includes('resolveScheduledDeliveryConversation'), 'schedule creation resolves the originating visible conversation from task provenance');
   t.ok(scheduleBody.includes('deliveryConversationId: delivery.conversationId'), 'the visible destination is persisted with the schedule');
   t.ok(scheduleIpc.includes('deliveryConversationId: schedule.deliveryConversationId'), 'main-process dispatch preserves the destination');
+  t.ok(scheduleIpc.includes('deliveryOnly: schedule.deliveryOnly === true'), 'main-process dispatch preserves delivery-only authority');
   t.ok(runBody.includes('scheduleDeliveryConversationId'), 'the fired run receives the destination before model execution');
+  t.ok(runBody.includes('buildScheduledDeliveryIntent(prompt)'), 'delivery-only fires cannot be reinterpreted as specialist tasks');
   t.end();
 });
 

@@ -350,7 +350,9 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
   t.ok(root.text.includes('<title>Orion</title>'), 'root shell serves the Orion mobile UI');
   t.notOk(root.text.includes('data-drawer-destination="history"'), 'root shell does not expose History as a top-level mode');
   t.ok(root.text.includes('data-drawer-destination="operator"'), 'root shell exposes Operator in the app drawer');
+  t.ok(root.text.includes('data-drawer-destination="researcher"'), 'root shell exposes Researcher in the app drawer');
   t.ok(root.text.includes('id="mode-toggle-operator"'), 'root shell includes Operator in the specialist mode control');
+  t.ok(root.text.includes('id="mode-toggle-researcher"'), 'root shell includes Researcher in the specialist mode control');
   t.ok(root.text.includes('function enterDispatch'), 'root shell enters Dispatch through the chat-first route');
   t.ok(root.text.includes("companionFetch('/api/new-focus'"), 'phone New Focus asks the desktop to cancel pending owned work');
   t.ok(root.text.includes('permanentCredentialFailureCodes'), 'phone distinguishes durable auth revocation from transient transport failures');
@@ -674,10 +676,24 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
   }, session);
   t.equal(operatorStart.statusCode, 200, 'new Operator task endpoint succeeds');
 
+  const researcherStart = await request('POST', 1133, '/api/conversations/new', {
+    prompt: 'compare the primary sources',
+    mode: 'researcher'
+  }, session);
+  t.equal(researcherStart.statusCode, 200, 'new Researcher task endpoint succeeds');
+
+  const researcherPrompt = await request('POST', 1133, '/api/prompt', {
+    prompt: 'also check the publication dates',
+    conversationId: researcherStart.json.conversationId,
+    selectionRevision: researcherStart.json.selectionRevision,
+    mode: 'researcher'
+  }, session);
+  t.equal(researcherPrompt.statusCode, 200, 'Researcher prompt submission succeeds');
+
   const prompt = await request('POST', 1133, '/api/prompt', {
     prompt: 'hello',
     conversationId: operatorStart.json.conversationId,
-    selectionRevision: operatorStart.json.selectionRevision,
+    selectionRevision: researcherStart.json.selectionRevision,
     projectPath: 'C:\\Projects\\OrionTarget'
   }, session);
   t.equal(prompt.statusCode, 200, 'prompt submission succeeds');
@@ -685,7 +701,7 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
   const operatorPrompt = await request('POST', 1133, '/api/prompt', {
     prompt: 'inspect the desktop',
     conversationId: operatorStart.json.conversationId,
-    selectionRevision: operatorStart.json.selectionRevision,
+    selectionRevision: researcherStart.json.selectionRevision,
     mode: 'operator'
   }, session);
   t.equal(operatorPrompt.statusCode, 200, 'Operator prompt submission succeeds');
@@ -693,7 +709,7 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
   const steer = await request('POST', 1133, '/api/steer', {
     prompt: 'focus here',
     conversationId: operatorStart.json.conversationId,
-    selectionRevision: operatorStart.json.selectionRevision
+    selectionRevision: researcherStart.json.selectionRevision
   }, session);
   t.equal(steer.statusCode, 200, 'steering endpoint succeeds');
 
@@ -731,8 +747,16 @@ test('Phone Companion v2 task controls and preview endpoints reach desktop bridg
     'Operator creation preserves its role across the real phone-to-renderer bridge'
   );
   t.ok(
+    electron.calls.some(call => call.includes('startPhoneCompanionTask') && call.includes('"mode":"researcher"')),
+    'Researcher creation preserves its role across the real phone-to-renderer bridge'
+  );
+  t.ok(
     electron.calls.some(call => call.includes('submitPhoneCompanionPrompt') && call.includes('"mode":"operator"')),
     'existing phone prompts preserve Operator mode across the server bridge'
+  );
+  t.ok(
+    electron.calls.some(call => call.includes('submitPhoneCompanionPrompt') && call.includes('"mode":"researcher"')),
+    'existing phone prompts preserve Researcher mode across the server bridge'
   );
   t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt') && call.includes('C:\\\\Projects\\\\OrionTarget')), 'prompt endpoint forwards selected project path');
   t.ok(electron.calls.some(call => call.includes('submitPhoneCompanionPrompt')), 'desktop bridge submitted prompt');
@@ -1605,13 +1629,15 @@ test('new phone Coder conversations submit their initial prompt exactly once', t
   t.end();
 });
 
-test('phone Operator mode remains Operator across navigation, creation, and specialist controls', t => {
+test('phone registered specialist modes remain bound across navigation, creation, and specialist controls', t => {
   const html = companionHtml();
   t.ok(html.includes('data-drawer-destination="operator"'), 'Operator is reachable from the phone drawer');
   t.ok(html.includes('id="mode-toggle-operator"'), 'Operator has a phone mode control');
+  t.ok(html.includes('data-drawer-destination="researcher"'), 'Researcher is reachable from the phone drawer');
+  t.ok(html.includes('id="mode-toggle-researcher"'), 'Researcher has a phone mode control');
   t.ok(
-    html.includes("return mode === 'coder' || mode === 'operator' ? mode : 'orion';"),
-    'phone navigation normalizes the complete three-role mode enum'
+    html.includes("companionSpecialistByRole.has(normalized) ? normalized : 'orion'"),
+    'phone navigation accepts every role supplied by the shared specialist registry'
   );
   t.ok(
     html.includes("const targetMode = normalizeCompanionMode(target.mode || 'orion');")
@@ -1640,17 +1666,28 @@ test('phone Operator mode remains Operator across navigation, creation, and spec
     'returning from a specialist binds Dispatch chrome before async conversation recovery'
   );
   t.ok(
-    html.includes("const isSpecialist = mode === 'coder' || mode === 'operator';"),
-    'Operator receives the same task status and logs navigation as Coder'
+    html.includes('const isSpecialist = isCompanionSpecialistMode(mode);'),
+    'every registered specialist receives the same task status and logs navigation'
   );
   t.ok(
-    rendererSource.includes("mode: requestedMode === 'operator' ? 'operator' : (normalizedProjectPath ? 'coder' : requestedMode)"),
-    'the renderer persists an explicitly requested Operator conversation as Operator'
+    rendererSource.includes("mode: requestedMode !== 'orion' ? requestedMode : (normalizedProjectPath ? 'coder' : 'orion')"),
+    'the renderer persists every explicitly requested registered specialist conversation'
   );
   t.ok(
     rendererSource.includes("conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator'"),
     'standalone Operator conversations receive a durable standalone workspace'
   );
+  t.end();
+});
+
+test('phone Researcher has a standalone new-chat and history surface without a project picker', t => {
+  const html = companionHtml();
+  t.ok(html.includes('id="mode-toggle-researcher"'), 'Researcher is selectable on phone');
+  t.ok(html.includes("newChatScreenEl.classList.toggle('researcher-mode', isResearcherStart)"), 'new-chat chrome tracks Researcher explicitly');
+  t.ok(html.includes('#screen-new-chat.researcher-mode .coder-workspace-picker { display: none; }'), 'Researcher does not inherit Coder project selection');
+  t.ok(html.includes('Tell Researcher what to investigate, compare, or synthesize.'), 'Researcher receives role-appropriate start copy');
+  t.ok(html.includes("'Ask Researcher to investigate...'"), 'Researcher receives a role-appropriate composer prompt');
+  t.ok(html.includes("homeSpecialist.label + (homeSpecialist.canControlDesktop ? ' Sessions' : ' Chats')"), 'Researcher history uses registered-role presentation instead of falling through to Dispatch');
   t.end();
 });
 

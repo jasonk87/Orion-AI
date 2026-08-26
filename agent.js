@@ -6,6 +6,7 @@
 const OrionOperatingContract = window.OrionOperatingContract || (typeof require === 'function' ? require('./orion-operating-contract') : null);
 const OperatorExecutionPolicy = window.OrionOperatorExecutionPolicy || (typeof require === 'function' ? require('./operator-execution-policy') : null);
 const OrionSpecialistRegistry = window.OrionSpecialistRegistry || (typeof require === 'function' ? require('./specialist-registry') : null);
+const SchedulePolicy = typeof require === 'function' ? require('./lib/schedule-policy') : null;
 
 // System Instruction for the Pair Programmer
 const SYSTEM_INSTRUCTION = `You are Orion AI, the ultimate pair programmer agent running locally on the user's workspace.
@@ -129,12 +130,14 @@ WHO YOU'RE TALKING TO:
 Jason. Solo developer. Casual, direct — he wants the answer, not the explanation. He'll give you context as it comes up. Don't ask for everything upfront.
 
 HOW YOU WORK:
-Handle directly: conversation, strategy, planning, research, reading and discussing code or docs, answering questions, web searches, and browser screenshots. You can look at files and search the web to back up what you say, but you cannot write, edit, run commands, capture the native desktop, or operate the desktop yourself — you are read-only by design. You may attach a browser screenshot or existing safe image to your response when Jason asks to see it.
+Handle directly: conversation, strategy, planning, a quick web search or two, reading and discussing code or docs, answering questions, and browser screenshots. You can look at files and search the web to back up what you say, but you cannot write, edit, run commands, capture the native desktop, or operate the desktop yourself — you are read-only by design. You may attach a browser screenshot or existing safe image to your response when Jason asks to see it.
 Route to the coder: anything requiring file changes, writing or debugging code, running tests, building or fixing features, running local commands tied to a codebase, or producing local files/artifacts for Jason. Before routing, make sure you understand the task well enough to hand it off clearly — ask Jason to clarify if you don't. When you route something, tell him. Don't go quiet. Report back with a clean summary when it's done.
 
 Route to the operator: anything requiring hands-on desktop or browser execution that isn't code work — clicking through an application UI, filling in a web form, driving a multi-step browser workflow, launching or monitoring a local process/app, or capturing and inspecting the desktop/screen to verify something happened. Same rule as Coder: understand the task first, tell Jason when you route it, report back when it's done. If a request is genuinely both (e.g. "build this feature, then click through it to confirm it works"), route the code portion to Coder first and hand the verification portion to Operator once Coder reports back — don't try to make one specialist do the other's job.
 
-Permission boundary rule: when Jason asks for an executable or mutating operation that Dispatch cannot perform, you MUST call handoff_to_coder or handoff_to_operator, whichever fits the work. Never refuse the task or tell Jason to perform it manually merely because Dispatch is read-only. If the target is genuinely ambiguous, use inspect_environment for read-only identification or tell the specialist to identify it safely as part of the handoff.
+Route to the researcher: real multi-step investigation that needs finding and cross-checking multiple sources rather than a quick inline answer — the line is depth, not topic. A single search-and-answer stays with you; "find and compare X, cross-check the details, write it up" goes to Researcher. Also route technical write-ups/explainers (optionally with code snippets or examples) that are meant as a deliverable, not just a chat answer. Same rule as Coder/Operator: understand the question first, tell Jason when you route it, report back with Researcher's findings when it's done.
+
+Permission boundary rule: when Jason asks for an executable or mutating operation that Dispatch cannot perform, or for research deeper than a quick inline answer, you MUST call handoff_to_coder, handoff_to_operator, or handoff_to_researcher, whichever fits the work. Never refuse the task or tell Jason to perform it manually merely because Dispatch is read-only. If the target is genuinely ambiguous, use inspect_environment for read-only identification or tell the specialist to identify it safely as part of the handoff.
 
 Context ownership: for an obvious build/fix/edit/test request, route early from the known workspace and task description. Do not deeply inspect source merely to decide that Coder should do the work. Handle a focused read-only question directly when it needs at most one or two source files. Route broader project reviews to Coder as read-only inspections so one agent owns the source survey, persists version-bound file notes/project knowledge, and reports back through Dispatch. If a focused discussion later becomes implementation, use handoff_to_coder; Orion will transfer exact validated context packets so Coder can start from that evidence instead of rediscovering the project.
 
@@ -145,7 +148,7 @@ BEFORE YOU COMMIT TO A CLAIM OR DIAGNOSIS (silent self-check, then answer):
 ${OrionOperatingContract.VERIFICATION_DISCIPLINE}
 
 HOW YOU COMMUNICATE:
-Casual and direct. Short when simple, fuller when it isn't. Greet Jason by name when starting fresh. If you don't know something about his projects or context, ask — don't assume or pretend.
+Casual and direct. Short when simple, fuller when it isn't. From the very first reply, acknowledge or answer the exact message Jason sent. A greeting is optional, but it must never replace the response or become the whole response. If you don't know something about his projects or context, ask — don't assume or pretend.
 
 MEMORY:
 At the start of a conversation, call recall_memory with scope="global" to orient yourself. When you learn something new — a project, a preference, a decision — use remember_fact or remember_preference immediately. When past context is relevant, surface it naturally.
@@ -153,7 +156,7 @@ At the start of a conversation, call recall_memory with scope="global" to orient
 {{user_memory}}
 
 TOOL USE:
-${OrionOperatingContract.TOOL_SCHEMA_NOTE} In Dispatch, use read/search/memory/workspace/handoff tools when available. You may capture and attach the browser worker, but you still cannot edit files, run commands, capture or control the native desktop, or produce other local artifacts yourself. Send code, project, and artifact work to Coder; send native desktop, application, process, and screen-control work to Operator.
+${OrionOperatingContract.TOOL_SCHEMA_NOTE} In Dispatch, use read/search/memory/workspace/handoff tools when available. You may capture and attach the browser worker, but you still cannot edit files, run commands, capture or control the native desktop, or produce other local artifacts yourself. Send code, project, and artifact work to Coder; send native desktop, application, process, and screen-control work to Operator; send real multi-step investigation and cross-sourced research to Researcher.
 
 DATABASE QUERIES (db_query):
 ${OrionOperatingContract.DB_QUERY_CORE}
@@ -165,6 +168,8 @@ ENVIRONMENT INSPECTION (inspect_environment):
 
 SCHEDULING (schedule_followup / watch_condition):
 - Use "schedule_followup" for durable one-off or recurring requests — "every morning at 8, give me X," "check back with me in an hour," "remind me before the meeting." Schedules survive restarts and machine sleep. Never just promise to follow up later without actually scheduling one — you have no way to act on that promise otherwise.
+- Scheduling is Dispatch-owned orchestration. Do not hand a reminder to Coder or Operator merely because its future reminder text mentions an app, command, project, or action. "Remind me at 2 to start OpenAI" means schedule the reminder here; it does not mean launch OpenAI now.
+- Plain reminders are one-shot. When using atTime for a one-time reminder, set runOnce=true. Use a recurring calendar schedule only when Jason explicitly asks for repetition (for example every day or weekdays).
 - Use "watch_condition" for "tell me when Y happens" instead of scheduling repeated follow-ups to check the same thing — it polls quietly in the background and only wakes this conversation when the condition actually changes.
 - Schedule only one active follow-up or watch per purpose; when one fires, actually report the outcome to Jason rather than letting it fire silently.`;
 
@@ -238,6 +243,64 @@ WHAT YOU DO NOT DO:
 - You do not read, write, or edit source code, and you do not carry Coder's testing/regression discipline, file-edit discipline, or mission/subplan/win-condition/coverage-frontier tracking — that apparatus exists for multi-step software work, not discrete desktop/browser actions. If a task turns out to actually require writing or changing code, say so plainly rather than trying to force it through desktop automation.`;
 
 
+// ── Researcher System Instruction ─────────────────────────────────────────────
+// Third specialist role, added alongside the handoff-generalization work. Built on the shared
+// contract layer (orion-operating-contract.js) the same way SYSTEM_INSTRUCTION/DISPATCHER_
+// INSTRUCTION/OPERATOR_INSTRUCTION are, not hand-derived from scratch — verification discipline and
+// adapt-instead-of-quitting genuinely apply here unchanged. DOM-before-pixel does not apply:
+// Researcher has no computer_action to prefer against in the first place (see
+// RESEARCHER_TOOL_ALLOWLIST in agent.js), so that fragment is deliberately not interpolated.
+// Deliberately excludes: Coder's testing/regression/file-edit discipline and mission/subplan/win-
+// condition tooling (no source tree, nothing to build or test), and Operator's screen-state/
+// evidence-before-completion apparatus (no desktop/browser actions to verify against a screen) —
+// same reasoning OPERATOR_INSTRUCTION documents for why it excludes Coder's apparatus.
+const RESEARCHER_INSTRUCTION = `You are Orion AI, investigating and synthesizing research on Jason's behalf.
+Your goal is real multi-step investigation, not a quick inline guess: find and cross-check multiple sources, then report a clear, well-organized answer — optionally including code snippets or technical examples when the research is about a technical topic. Judge your own completion by whether you actually verified your key claims against sources you fetched, not by whether an answer merely sounds plausible.
+
+VOICE AND IDENTITY:
+- Own being Orion. Speak in first person as Jason's local collaborator doing the legwork of an investigation, not as a generic model reciting "I am an AI" disclaimers.
+- You are the specialist Dispatch hands multi-step research to, the same way it hands code work to Coder and desktop/browser work to Operator. Coder and Operator can also hand work to you mid-task — e.g. Coder checking a library's current API before writing against it, or Operator looking up expected UI behavior before judging a screenshot — so you may be started by any of them, not only Dispatch. Report back plainly what you found and how confident you are in it.
+
+INVESTIGATION LOOP:
+- Start from "google_search" and "fetch_web_page" for the actual source content — the same tools Dispatch already uses for exactly this kind of work. Use the read-only browser-worker tools (open_url, search_web, click_element, fill_input, navigate_back, take_screenshot, close_browser) for sources a search API cannot reach directly.
+- Multi-step means multi-step: for anything beyond a trivial single-fact lookup, gather from more than one source before writing the answer. A single page is a start, not a finding.
+- CROSS-CHECKING DISCIPLINE — do not trust a single page: when a claim is load-bearing (it changes the answer, a recommendation, or a technical conclusion), verify it against a second independent source before presenting it as fact. If two sources disagree, say so explicitly rather than silently picking one. If you could not find a second source for a load-bearing claim, say that plainly instead of presenting single-source information with unwarranted confidence.
+${OrionOperatingContract.VERIFICATION_DISCIPLINE}
+- Use "update_scratchpad" to track sources, partial findings, and open questions across a long investigation so earlier discoveries do not fall out of context as the investigation continues.
+
+SOURCE-CITATION DISCIPLINE:
+- Cite only URLs and sources you actually fetched with fetch_web_page or actually visited with the browser worker in this run. Never state or imply a source exists, or invent a plausible-looking URL, without having verified it is reachable and says what you are citing it for.
+- End substantive research output with a "Sources" section listing what you actually consulted. Keep it separate from the body so findings and provenance do not blur together.
+
+ADAPT INSTEAD OF QUITTING: ${OrionOperatingContract.ADAPT_INSTEAD_OF_QUITTING}
+
+WHEN THE RESEARCH POINTS SOMEWHERE ELSE:
+- If the investigation turns up something that clearly requires writing or changing code, hand it to Coder with "handoff_to_coder" rather than describing code changes you cannot make yourself.
+- If it turns up something that needs on-screen/desktop or browser verification you cannot do read-only, hand it to Operator with "handoff_to_operator".
+- Only do this when the research genuinely points that direction — do not hand off merely because a task is difficult; that is what continuing the investigation is for.
+
+TASK COMPLETION:
+- Use "set_task_checklist" the way Coder and Operator do: mark a step 'in-progress' when you start it, 'completed' only once you have real source-backed evidence for it, not on intent alone.
+
+FOLLOW-UP TIMERS:
+- If you say you will check back or continue after a delay, you MUST call "schedule_followup" — do not merely say you will wait. Use "watch_condition" for "tell me when X happens" instead of polling manually. Both are durable and survive restarts; a run may fire late after the machine slept, so re-observe current state when it does rather than assuming no time passed.
+
+TOOL USE:
+- ${OrionOperatingContract.TOOL_SCHEMA_NOTE}
+- If a needed capability is not present in the supplied schemas, adapt with the available tools or explain the blocker; do not invent undeclared tool names.
+
+MEMORY:
+- Call recall_memory when you need durable context this run did not already establish. When you learn a durable fact, decision, or preference relevant to future runs, save it with remember_fact, remember_decision, or remember_preference immediately rather than waiting until the end.
+
+RESPONSE FORMAT:
+- Structure findings for scanning, not a wall of prose: clear headers for distinct sub-questions, an actual Markdown table when comparing multiple options or sources side by side, bold for the actual verdict/conclusion so it is not lost in sourcing detail, and a separate "Sources" section at the end rather than links scattered through the body.
+- Lead with the answer or verdict, then the supporting detail. Jason can already see your tools running — do not narrate the search process itself, report what it found.
+- When Jason asks to see a screenshot you captured while researching, call attach_image with the relevant screenshot so it appears directly in chat.
+
+WHAT YOU DO NOT DO:
+- You do not read, write, or edit source code, and you do not carry Coder's testing/regression discipline or Operator's desktop/browser execution and evidence-before-completion apparatus — those exist for work this role does not do. If a task turns out to actually require writing code or acting on the desktop, hand it to the specialist who owns that instead of trying to force it through research tools.`;
+
+
 // Returns the right system instruction for the current mode.
 // Pass cachedMemory (string) to inject into the dispatcher instruction.
 function getSystemInstruction(disableTools = false, cachedMemory = '', modelName = '') {
@@ -257,13 +320,13 @@ function getSystemInstruction(disableTools = false, cachedMemory = '', modelName
     // ten messages deep. They are reference material, not an invitation to re-introduce yourself.
     const continuityDirective = orionConversationHasHistory
       ? '\n\nCONVERSATION IN PROGRESS: this thread already has replies from you. Do not open with a greeting, the time of day, or Jason\'s name — answer what he just said, the way you would mid-conversation. Do not restate points you already made in this thread; if you already acknowledged something, move forward instead of repeating it.'
-      : '';
+      : '\n\nFIRST REPLY: Respond to the substance of Jason\'s exact message immediately. You may include a brief natural greeting, but a greeting alone is never an answer. If his message is a statement rather than a question, acknowledge what he actually said and engage with it instead of asking a generic "What\'s up?".';
     base = DISPATCHER_INSTRUCTION.replace('{{user_memory}}', memBlock) + timeContext + continuityDirective + orionSessionContinuityContext;
   } else {
     // Specialist roles are explicit. An unknown future role must never silently inherit Coder's
     // authority, prompt, or tools merely because it is not Operator.
     const specialist = OrionSpecialistRegistry.requireRole(activeConversationMode);
-    const prompts = { coder: SYSTEM_INSTRUCTION, operator: OPERATOR_INSTRUCTION };
+    const prompts = { coder: SYSTEM_INSTRUCTION, operator: OPERATOR_INSTRUCTION, researcher: RESEARCHER_INSTRUCTION };
     base = prompts[specialist.promptKey];
     if (!base) throw new Error(`No system prompt is registered for Orion specialist role "${specialist.role}".`);
     if (modelName && (modelName.startsWith('deepseek') || modelName.includes('pro') || modelName.includes('claude-3-7'))) {
@@ -2839,11 +2902,18 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const canExecuteThisTask = () => isPlanRevision
       ? false
       : (!config.planningMode || conversation.planApproved || planningBypassedForTask);
+    const dispatchOrchestrationCall = runMode === 'orion'
+      && conversation.mode === 'orion'
+      && !runTaskId
+      && !isInternalPrompt
+      ? buildDispatchOrchestrationCall(semanticIntent)
+      : null;
     const dispatchPreflightAuthorized = runMode === 'orion'
       && conversation.mode === 'orion'
       && !runTaskId
       && !isInternalPrompt
       && semanticIntent.requiresExecution === true
+      && semanticIntent.executionTarget !== 'dispatch'
       && !(DispatchInspectionPolicy && DispatchInspectionPolicy.isSourceInspectionIntent(semanticIntent))
       && ['new_task', 'context_followup', 'steer_active_task'].includes(semanticIntent.intent);
     let dispatchInspectionDelegationPending = !!(DispatchInspectionPolicy
@@ -3057,6 +3127,22 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           currentAgentLogs.push({
             type: 'thought',
             content: 'Semantic intent was unresolved, so Orion asked for clarification without exposing execution tools.'
+          });
+        } else if (dispatchOrchestrationCall && loopCount === 1) {
+          response = {
+            candidates: [{
+              finishReason: 'STOP',
+              content: {
+                parts: [
+                  { text: 'I’m setting that directly as a durable reminder.' },
+                  { functionCall: dispatchOrchestrationCall }
+                ]
+              }
+            }]
+          };
+          currentAgentLogs.push({
+            type: 'thought',
+            content: 'Dispatch orchestration preflight scheduled the reminder directly without creating a specialist task.'
           });
         } else if (((shouldPreflightDispatchHandoff && loopCount === 1)
               || (dispatchInspectionDelegationPending && canDelegateCurrentInspectionWorkspace()))
@@ -3305,6 +3391,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         const isExecutableHandoffIntent = intent => !!(
           intent
           && intent.requiresExecution === true
+          && intent.executionTarget !== 'dispatch'
           && !(DispatchInspectionPolicy && DispatchInspectionPolicy.isSourceInspectionIntent(intent))
           && ['new_task', 'context_followup', 'steer_active_task'].includes(intent.intent)
         );
@@ -3466,6 +3553,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       const classifiedExecutionNeedsRealHandoff = !!(
         runMode === 'orion'
         && effectiveDispatchHandoffIntent.requiresExecution === true
+        && effectiveDispatchHandoffIntent.executionTarget !== 'dispatch'
         && !(DispatchInspectionPolicy && DispatchInspectionPolicy.isSourceInspectionIntent(effectiveDispatchHandoffIntent))
         && ['new_task', 'context_followup', 'steer_active_task'].includes(effectiveDispatchHandoffIntent.intent)
       );
@@ -5974,6 +6062,194 @@ async function acquireToolResourceLease(name, conversation, executionContext) {
   }
 }
 
+// Shared implementation behind handoff_to_coder / handoff_to_operator / handoff_to_researcher.
+// Handoff-generalization: these three tools used to be (two of them still literally are, until
+// this change) ~140-line hand-copies of each other differing only in the target role name and a
+// couple of role-specific fields (Operator's executionSurface). This is now the single
+// implementation, parameterized by targetRole; each case block in executeTool's switch below is a
+// thin dispatch into it. This is also the one place the delegation-chain depth/loop guard is
+// enforced (see TaskOrchestration.evaluateDelegationHandoff), so every caller — Dispatch or a
+// specialist delegating mid-task — goes through the identical check rather than each handoff tool
+// needing its own copy of that logic too.
+async function executeSpecialistHandoff(targetRole, args, workspace, conversation, executionContext, resolvedHomeDirValue) {
+  const role = OrionSpecialistRegistry.normalizeRole(targetRole);
+  const definition = OrionSpecialistRegistry.requireRole(role);
+  const roleLabel = definition.label;
+
+  const standaloneHandoff = args.standalone === true;
+  const authorizedHandoffIntent = executionContext.authorizedDispatchHandoffIntent || {};
+  const standaloneSystemHandoff = standaloneHandoff
+    && authorizedHandoffIntent.standaloneSystemOperation === true;
+  const isolatedStandaloneHandoff = standaloneHandoff && !standaloneSystemHandoff;
+  const requestedPath = String(
+    standaloneSystemHandoff
+      ? resolvedHomeDirValue
+      : (isolatedStandaloneHandoff ? '' : (args.path || workspace || conversation.workspace || ''))
+  ).trim();
+  if (!requestedPath && !isolatedStandaloneHandoff) throw new Error(`Missing workspace path to hand off to ${roleLabel}`);
+  const prompt = String(args.prompt || '').trim();
+  const parentTask = executionContext.claimedTaskRecord && typeof executionContext.claimedTaskRecord === 'object'
+    ? executionContext.claimedTaskRecord
+    : null;
+  const parentTaskId = String(executionContext.runTaskId || '').trim();
+
+  // ── Delegation-chain depth/loop guard (real, code-enforced — not the old prose-only
+  // "don't create another handoff for the same completed child" instruction) ─────────────────
+  // The current chain is whatever lineage the CALLING task itself already carries (empty for a
+  // fresh Dispatch-initiated handoff, since Dispatch has no claimed task record of its own).
+  // evaluateDelegationHandoff hard-stops both a role reappearing in its own chain (the
+  // coder -> operator -> coder loop shape) and a chain that would exceed the registered
+  // specialist-role count, and throws a clear error instead of silently letting the handoff
+  // proceed.
+  const currentDelegationChain = Array.isArray(parentTask && parentTask.delegationChain)
+    ? parentTask.delegationChain
+    : [];
+  const delegationGuard = TaskOrchestration
+    ? TaskOrchestration.evaluateDelegationHandoff(currentDelegationChain, role)
+    : { allowed: true, nextChain: [...currentDelegationChain, role] };
+  if (!delegationGuard.allowed) {
+    const blockedError = new Error(delegationGuard.reason);
+    blockedError.code = 'DELEGATION_CHAIN_BLOCKED';
+    throw blockedError;
+  }
+  const delegationChain = delegationGuard.nextChain;
+
+  const originalUserMessage = String(
+    (parentTask && parentTask.originalUserMessage)
+    || args.originalUserMessage
+    || [...(conversation.messages || [])].reverse().find(message => message && message.role === 'user')?.text
+    || prompt
+  ).trim();
+  const parentContextSummary = parentTaskId && parentTask
+    ? [
+        `Parent task ${parentTask.taskId}: ${parentTask.objective || parentTask.title || originalUserMessage}`,
+        parentTask.precedingConversationSummary
+          ? `Original context: ${String(parentTask.precedingConversationSummary).slice(0, 1800)}`
+          : '',
+        prompt ? `Delegated ${roleLabel} objective: ${prompt}` : ''
+      ].filter(Boolean).join('\n')
+    : '';
+  const resolution = isolatedStandaloneHandoff
+    ? { success: true, path: '', fuzzyResolved: false, resolvedFrom: '', matchedName: 'Standalone' }
+    : await resolveWorkspacePathForChange(requestedPath);
+  if (!resolution.success) {
+    throw new Error(`${roleLabel} handoff path "${resolution.path}" is invalid or does not exist: ${resolution.error}`);
+  }
+  const handoffImpl = AGENT_HANDOFF_IMPLEMENTATIONS[role];
+  const promoteFnName = `promoteWorkspaceTo${roleLabel}`;
+  if (!handoffImpl || typeof window[promoteFnName] !== 'function') {
+    throw new Error(`${roleLabel} handoff is not available in this Orion build.`);
+  }
+  let handoffWorkspace = isolatedStandaloneHandoff
+    ? { kind: WorkspaceResolution ? WorkspaceResolution.KINDS.STANDALONE_SPECIALIST : 'standalone_specialist', path: 'pending-standalone-workspace' }
+    : WorkspaceResolution ? WorkspaceResolution.classifyWorkspace({
+    mode: role,
+    workspacePath: resolution.path,
+    dispatchProjectPath: conversation.dispatchProjectPath,
+    searchRoot: getDispatchWorkspaceRoot(),
+    knownProjects: getKnownWorkspaceCandidates(conversation)
+  }) : { kind: 'active_project', path: resolution.path };
+  if (WorkspaceResolution && handoffWorkspace.kind === WorkspaceResolution.KINDS.UNRESOLVED
+      && !WorkspaceResolution.samePath(resolution.path, getDispatchWorkspaceRoot())) {
+    handoffWorkspace = WorkspaceResolution.bindResolvedProject(handoffWorkspace, {
+      path: resolution.path,
+      name: resolution.matchedName || getLocalPathBaseName(resolution.path),
+      source: args.path ? 'explicit_verified_handoff_path' : 'resolved_conversation_workspace'
+    });
+  }
+  const handoffPermission = WorkspaceResolution ? WorkspaceResolution.canHandoffWorkspace(handoffWorkspace) : { allowed: true };
+  if (!handoffPermission.allowed && !standaloneHandoff) {
+    throw new Error(handoffPermission.reason || `Resolve a concrete project workspace before handing work to ${roleLabel}.`);
+  }
+  const contextPacketIds = resolution.path
+    ? getHandoffContextPacketIds(conversation, resolution.path)
+    : [];
+  const result = await handoffImpl.promote({
+    path: resolution.path,
+    prompt,
+    originalUserMessage,
+    standalone: standaloneHandoff,
+    standaloneSystemOperation: standaloneSystemHandoff,
+    title: args.title || '',
+    open: args.open === true,
+    sourceConversationId: conversation.id,
+    sourceSessionId: conversation.sessionId || conversation.id,
+    sourceMessageId: (conversation.messages || []).slice().reverse().find(message => message.role === 'user')?.id || '',
+    parentTaskId,
+    rootOriginConversationId: String(
+      parentTask && (parentTask.rootOriginConversationId
+        || (parentTask.origin && parentTask.origin.conversationId))
+      || conversation.id
+    ),
+    precedingConversationSummary: parentContextSummary,
+    delegationChain,
+    // Operator-only field. Harmless to omit for coder/researcher promote() implementations since
+    // they simply won't read it; kept role-conditional rather than always-present so a
+    // non-Operator target's task packet doesn't carry a meaningless executionSurface value.
+    ...(role === 'operator' ? {
+      executionSurface: String(
+        args.executionSurface
+        || (executionContext.authorizedDispatchHandoffIntent && executionContext.authorizedDispatchHandoffIntent.executionSurface)
+        || executionContext.operatorExecutionSurface
+        || 'desktop'
+      )
+    } : {}),
+    contextPacketIds,
+    findings: Array.isArray(args.findings) ? args.findings : [],
+    semanticIntent: executionContext.authorizedDispatchHandoffIntent || undefined
+  });
+  if (!result || result.success === false) {
+    throw new Error((result && result.error) || `${roleLabel} handoff failed.`);
+  }
+
+  // ── Supervisor: track the launched specialist conversation ─────────────────────────────────
+  // launchedCoder* field names stay unchanged regardless of target role — companion-html.js and
+  // other readers depend on them by name. launchedTaskRole is the role-aware field newer code
+  // should read instead of assuming the launchedCoder* names imply the role.
+  conversation.launchedCoderConvId = result.conversationId;
+  conversation.launchedCoderTaskId = result.taskId || '';
+  conversation.lastOwnedTaskId = result.taskId || conversation.lastOwnedTaskId || '';
+  conversation.launchedCoderTaskTitle = result.title || `${roleLabel} Task`;
+  conversation.launchedCoderTaskStart = Date.now();
+  conversation.launchedTaskRole = role;
+  const committedHandoffWarnings = result.warning ? [String(result.warning)] : [];
+  try {
+    if (typeof window.markConversationDirty === 'function') {
+      window.markConversationDirty(conversation.id);
+    }
+    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+  } catch (error) {
+    // promoteWorkspaceTo<Role> already returned a durable task ID. Treating a local
+    // conversation-save failure as a failed tool call would invite the model to hand off the
+    // same work again and create a duplicate.
+    committedHandoffWarnings.push(`The task was queued, but Dispatch could not save its supervisor pointer: ${error.message || error}`);
+  }
+  // Kick off the supervisor monitor in the renderer
+  const monitorFnName = `start${roleLabel}TaskMonitor`;
+  if (typeof handoffImpl.startMonitor === 'function' && typeof window[monitorFnName] === 'function') {
+    try {
+      handoffImpl.startMonitor(conversation.id, result.conversationId, result.taskId || '');
+    } catch (error) {
+      committedHandoffWarnings.push(`The task was queued, but its live supervisor monitor did not start: ${error.message || error}`);
+    }
+  }
+
+  return {
+    ...result,
+    success: true,
+    message: prompt
+      ? `${standaloneHandoff ? `Opened a standalone ${roleLabel} task in` : 'Promoted'} ${result.workspacePath || resolution.path} and queued task ${result.taskId || '(pending ID)'} with state ${result.status || 'pending'}.${result.contextTransferred ? ` Transferred ${result.contextPacketIds.length} validated context packet(s).` : ''}`
+      : `Promoted ${resolution.path} to ${roleLabel} as a project.`,
+    originalUserMessage,
+    standalone: standaloneHandoff,
+    fuzzyResolved: !!resolution.fuzzyResolved,
+    resolvedFrom: resolution.resolvedFrom,
+    matchedName: resolution.matchedName || getLocalPathBaseName(resolution.path),
+    committedWithWarning: committedHandoffWarnings.length > 0,
+    warning: committedHandoffWarnings.join(' ')
+  };
+}
+
 async function executeTool(name, args, workspace, config, conversation, executionContext = {}) {
   console.log(`Executing tool ${name} with args:`, args);
 
@@ -6520,296 +6796,25 @@ async function executeTool(name, args, workspace, config, conversation, executio
     }
 
     case 'handoff_to_coder': {
-      const standaloneHandoff = args.standalone === true;
-      const authorizedHandoffIntent = executionContext.authorizedDispatchHandoffIntent || {};
-      const standaloneSystemHandoff = standaloneHandoff
-        && authorizedHandoffIntent.standaloneSystemOperation === true;
-      const isolatedStandaloneHandoff = standaloneHandoff && !standaloneSystemHandoff;
-      const requestedPath = String(
-        standaloneSystemHandoff
-          ? resolvedHomeDir
-          : (isolatedStandaloneHandoff ? '' : (args.path || workspace || conversation.workspace || ''))
-      ).trim();
-      if (!requestedPath && !isolatedStandaloneHandoff) throw new Error("Missing workspace path to hand off to Coder");
-      const prompt = String(args.prompt || '').trim();
-      const parentTask = executionContext.claimedTaskRecord && typeof executionContext.claimedTaskRecord === 'object'
-        ? executionContext.claimedTaskRecord
-        : null;
-      const parentTaskId = String(executionContext.runTaskId || '').trim();
-      const originalUserMessage = String(
-        (parentTask && parentTask.originalUserMessage)
-        || args.originalUserMessage
-        || [...(conversation.messages || [])].reverse().find(message => message && message.role === 'user')?.text
-        || prompt
-      ).trim();
-      const parentContextSummary = parentTaskId && parentTask
-        ? [
-            `Parent task ${parentTask.taskId}: ${parentTask.objective || parentTask.title || originalUserMessage}`,
-            parentTask.precedingConversationSummary
-              ? `Original context: ${String(parentTask.precedingConversationSummary).slice(0, 1800)}`
-              : '',
-            prompt ? `Delegated Coder objective: ${prompt}` : ''
-          ].filter(Boolean).join('\n')
-        : '';
-      const resolution = isolatedStandaloneHandoff
-        ? { success: true, path: '', fuzzyResolved: false, resolvedFrom: '', matchedName: 'Standalone' }
-        : await resolveWorkspacePathForChange(requestedPath);
-      if (!resolution.success) {
-        throw new Error(`Coder handoff path "${resolution.path}" is invalid or does not exist: ${resolution.error}`);
-      }
-      // Phase 2: this tool always hands off to role 'coder' today — see AGENT_HANDOFF_IMPLEMENTATIONS.
-      const handoffRole = 'coder';
-      const handoffImpl = AGENT_HANDOFF_IMPLEMENTATIONS[handoffRole];
-      if (!handoffImpl || typeof window.promoteWorkspaceToCoder !== 'function') {
-        throw new Error('Coder handoff is not available in this Orion build.');
-      }
-      let handoffWorkspace = isolatedStandaloneHandoff
-        ? { kind: WorkspaceResolution ? WorkspaceResolution.KINDS.STANDALONE_SPECIALIST : 'standalone_specialist', path: 'pending-standalone-workspace' }
-        : WorkspaceResolution ? WorkspaceResolution.classifyWorkspace({
-        mode: 'orion',
-        workspacePath: resolution.path,
-        dispatchProjectPath: conversation.dispatchProjectPath,
-        searchRoot: getDispatchWorkspaceRoot(),
-        knownProjects: getKnownWorkspaceCandidates(conversation)
-      }) : { kind: 'active_project', path: resolution.path };
-      if (WorkspaceResolution && handoffWorkspace.kind === WorkspaceResolution.KINDS.UNRESOLVED
-          && !WorkspaceResolution.samePath(resolution.path, getDispatchWorkspaceRoot())) {
-        handoffWorkspace = WorkspaceResolution.bindResolvedProject(handoffWorkspace, {
-          path: resolution.path,
-          name: resolution.matchedName || getLocalPathBaseName(resolution.path),
-          source: args.path ? 'explicit_verified_handoff_path' : 'resolved_conversation_workspace'
-        });
-      }
-      const handoffPermission = WorkspaceResolution ? WorkspaceResolution.canHandoffWorkspace(handoffWorkspace) : { allowed: true };
-      if (!handoffPermission.allowed && !standaloneHandoff) {
-        throw new Error(handoffPermission.reason || 'Resolve a concrete project workspace before handing work to Coder.');
-      }
-      const contextPacketIds = resolution.path
-        ? getHandoffContextPacketIds(conversation, resolution.path)
-        : [];
-      const result = await handoffImpl.promote({
-        path: resolution.path,
-        prompt,
-        originalUserMessage,
-        standalone: standaloneHandoff,
-        standaloneSystemOperation: standaloneSystemHandoff,
-        title: args.title || '',
-        open: args.open === true,
-        sourceConversationId: conversation.id,
-        sourceSessionId: conversation.sessionId || conversation.id,
-        sourceMessageId: (conversation.messages || []).slice().reverse().find(message => message.role === 'user')?.id || '',
-        parentTaskId,
-        rootOriginConversationId: String(
-          parentTask && (parentTask.rootOriginConversationId
-            || (parentTask.origin && parentTask.origin.conversationId))
-          || conversation.id
-        ),
-        precedingConversationSummary: parentContextSummary,
-        contextPacketIds,
-        findings: Array.isArray(args.findings) ? args.findings : [],
-        semanticIntent: executionContext.authorizedDispatchHandoffIntent || undefined
-      });
-      if (!result || result.success === false) {
-        throw new Error((result && result.error) || 'Coder handoff failed.');
-      }
-
-      // ── Supervisor: track the launched Coder conversation ──────────────────
-      // launchedCoder* field names are unchanged (companion-html.js and other readers depend on
-      // them by name) — launchedTaskRole is new and purely additive, so future role-aware code can
-      // check it instead of assuming the field names imply the role.
-      conversation.launchedCoderConvId = result.conversationId;
-      conversation.launchedCoderTaskId = result.taskId || '';
-      conversation.lastOwnedTaskId = result.taskId || conversation.lastOwnedTaskId || '';
-      conversation.launchedCoderTaskTitle = result.title || 'Coder Task';
-      conversation.launchedCoderTaskStart = Date.now();
-      conversation.launchedTaskRole = handoffRole;
-      const committedHandoffWarnings = result.warning ? [String(result.warning)] : [];
-      try {
-        if (typeof window.markConversationDirty === 'function') {
-          window.markConversationDirty(conversation.id);
-        }
-        if (window.saveConversationsToStorage) window.saveConversationsToStorage();
-      } catch (error) {
-        // promoteWorkspaceToCoder already returned a durable task ID. Treating a local
-        // conversation-save failure as a failed tool call would invite the model to hand off the
-        // same work again and create a duplicate.
-        committedHandoffWarnings.push(`The task was queued, but Dispatch could not save its supervisor pointer: ${error.message || error}`);
-      }
-      // Kick off the supervisor monitor in the renderer
-      if (typeof handoffImpl.startMonitor === 'function' && typeof window.startCoderTaskMonitor === 'function') {
-        try {
-          handoffImpl.startMonitor(conversation.id, result.conversationId, result.taskId || '');
-        } catch (error) {
-          committedHandoffWarnings.push(`The task was queued, but its live supervisor monitor did not start: ${error.message || error}`);
-        }
-      }
-      // ───────────────────────────────────────────────────────────────────────
-
-      return {
-        ...result,
-        success: true,
-        message: prompt
-          ? `${standaloneHandoff ? 'Opened a standalone Coder task in' : 'Promoted'} ${result.workspacePath || resolution.path} and queued task ${result.taskId || '(pending ID)'} with state ${result.status || 'pending'}.${result.contextTransferred ? ` Transferred ${result.contextPacketIds.length} validated context packet(s).` : ''}`
-          : `Promoted ${resolution.path} to Coder as a project.`,
-        originalUserMessage,
-        standalone: standaloneHandoff,
-        fuzzyResolved: !!resolution.fuzzyResolved,
-        resolvedFrom: resolution.resolvedFrom,
-        matchedName: resolution.matchedName || getLocalPathBaseName(resolution.path),
-        committedWithWarning: committedHandoffWarnings.length > 0,
-        warning: committedHandoffWarnings.join(' ')
-      };
+      return await executeSpecialistHandoff('coder', args, workspace, conversation, executionContext, resolvedHomeDir);
     }
 
     case 'handoff_to_operator': {
-      // Phase 3 piece 5: a sibling tool to handoff_to_coder, not a generalization of it. Dispatch
-      // chooses explicitly between the two based on what the work is (code/build/test/install work
-      // goes to Coder; desktop/browser execution work goes to Operator) — see DISPATCHER_INSTRUCTION.
-      // Everything below mirrors handoff_to_coder's structure (workspace resolution, standalone/
-      // system-operation handling, context packet transfer, supervisor tracking) because that
-      // structure is role-agnostic; only the target role, target functions, and user-facing text
-      // differ.
-      const standaloneHandoff = args.standalone === true;
-      const authorizedHandoffIntent = executionContext.authorizedDispatchHandoffIntent || {};
-      const standaloneSystemHandoff = standaloneHandoff
-        && authorizedHandoffIntent.standaloneSystemOperation === true;
-      const isolatedStandaloneHandoff = standaloneHandoff && !standaloneSystemHandoff;
-      const requestedPath = String(
-        standaloneSystemHandoff
-          ? resolvedHomeDir
-          : (isolatedStandaloneHandoff ? '' : (args.path || workspace || conversation.workspace || ''))
-      ).trim();
-      if (!requestedPath && !isolatedStandaloneHandoff) throw new Error("Missing workspace path to hand off to Operator");
-      const prompt = String(args.prompt || '').trim();
-      const parentTask = executionContext.claimedTaskRecord && typeof executionContext.claimedTaskRecord === 'object'
-        ? executionContext.claimedTaskRecord
-        : null;
-      const parentTaskId = String(executionContext.runTaskId || '').trim();
-      const originalUserMessage = String(
-        (parentTask && parentTask.originalUserMessage)
-        || args.originalUserMessage
-        || [...(conversation.messages || [])].reverse().find(message => message && message.role === 'user')?.text
-        || prompt
-      ).trim();
-      const parentContextSummary = parentTaskId && parentTask
-        ? [
-            `Parent task ${parentTask.taskId}: ${parentTask.objective || parentTask.title || originalUserMessage}`,
-            parentTask.precedingConversationSummary
-              ? `Original context: ${String(parentTask.precedingConversationSummary).slice(0, 1800)}`
-              : '',
-            prompt ? `Delegated Operator objective: ${prompt}` : ''
-          ].filter(Boolean).join('\n')
-        : '';
-      const resolution = isolatedStandaloneHandoff
-        ? { success: true, path: '', fuzzyResolved: false, resolvedFrom: '', matchedName: 'Standalone' }
-        : await resolveWorkspacePathForChange(requestedPath);
-      if (!resolution.success) {
-        throw new Error(`Operator handoff path "${resolution.path}" is invalid or does not exist: ${resolution.error}`);
-      }
-      const handoffRole = 'operator';
-      const handoffImpl = AGENT_HANDOFF_IMPLEMENTATIONS[handoffRole];
-      if (!handoffImpl || typeof window.promoteWorkspaceToOperator !== 'function') {
-        throw new Error('Operator handoff is not available in this Orion build.');
-      }
-      let handoffWorkspace = isolatedStandaloneHandoff
-        ? { kind: WorkspaceResolution ? WorkspaceResolution.KINDS.STANDALONE_SPECIALIST : 'standalone_specialist', path: 'pending-standalone-workspace' }
-        : WorkspaceResolution ? WorkspaceResolution.classifyWorkspace({
-        mode: 'operator',
-        workspacePath: resolution.path,
-        dispatchProjectPath: conversation.dispatchProjectPath,
-        searchRoot: getDispatchWorkspaceRoot(),
-        knownProjects: getKnownWorkspaceCandidates(conversation)
-      }) : { kind: 'active_project', path: resolution.path };
-      if (WorkspaceResolution && handoffWorkspace.kind === WorkspaceResolution.KINDS.UNRESOLVED
-          && !WorkspaceResolution.samePath(resolution.path, getDispatchWorkspaceRoot())) {
-        handoffWorkspace = WorkspaceResolution.bindResolvedProject(handoffWorkspace, {
-          path: resolution.path,
-          name: resolution.matchedName || getLocalPathBaseName(resolution.path),
-          source: args.path ? 'explicit_verified_handoff_path' : 'resolved_conversation_workspace'
-        });
-      }
-      const handoffPermission = WorkspaceResolution ? WorkspaceResolution.canHandoffWorkspace(handoffWorkspace) : { allowed: true };
-      if (!handoffPermission.allowed && !standaloneHandoff) {
-        throw new Error(handoffPermission.reason || 'Resolve a concrete project workspace before handing work to Operator.');
-      }
-      const contextPacketIds = resolution.path
-        ? getHandoffContextPacketIds(conversation, resolution.path)
-        : [];
-      const result = await handoffImpl.promote({
-        path: resolution.path,
-        prompt,
-        originalUserMessage,
-        standalone: standaloneHandoff,
-        standaloneSystemOperation: standaloneSystemHandoff,
-        title: args.title || '',
-        open: args.open === true,
-        sourceConversationId: conversation.id,
-        sourceSessionId: conversation.sessionId || conversation.id,
-        sourceMessageId: (conversation.messages || []).slice().reverse().find(message => message.role === 'user')?.id || '',
-        parentTaskId,
-        rootOriginConversationId: String(
-          parentTask && (parentTask.rootOriginConversationId
-            || (parentTask.origin && parentTask.origin.conversationId))
-          || conversation.id
-        ),
-        precedingConversationSummary: parentContextSummary,
-        executionSurface: String(
-          args.executionSurface
-          || (executionContext.authorizedDispatchHandoffIntent && executionContext.authorizedDispatchHandoffIntent.executionSurface)
-          || executionContext.operatorExecutionSurface
-          || 'desktop'
-        ),
-        contextPacketIds,
-        findings: Array.isArray(args.findings) ? args.findings : [],
-        semanticIntent: executionContext.authorizedDispatchHandoffIntent || undefined
-      });
-      if (!result || result.success === false) {
-        throw new Error((result && result.error) || 'Operator handoff failed.');
-      }
+      // Dispatch (or a delegating specialist) chooses explicitly between the registered specialist
+      // roles based on what the work is: code/build/test/install work goes to Coder, desktop/
+      // browser execution work goes to Operator, investigation/research work goes to Researcher —
+      // see DISPATCHER_INSTRUCTION / OPERATOR_INSTRUCTION / RESEARCHER_INSTRUCTION. All three tools
+      // share executeSpecialistHandoff's implementation; only the target role differs here.
+      return await executeSpecialistHandoff('operator', args, workspace, conversation, executionContext, resolvedHomeDir);
+    }
 
-      // ── Supervisor: track the launched Operator conversation ───────────────
-      // Reuses the launchedCoder* field names by design (see the identical comment on
-      // handoff_to_coder above) — launchedTaskRole distinguishes this as an Operator task for
-      // role-aware readers like window.onOrchestrationTaskFinalized's routing check.
-      conversation.launchedCoderConvId = result.conversationId;
-      conversation.launchedCoderTaskId = result.taskId || '';
-      conversation.lastOwnedTaskId = result.taskId || conversation.lastOwnedTaskId || '';
-      conversation.launchedCoderTaskTitle = result.title || 'Operator Task';
-      conversation.launchedCoderTaskStart = Date.now();
-      conversation.launchedTaskRole = handoffRole;
-      const committedHandoffWarnings = result.warning ? [String(result.warning)] : [];
-      try {
-        if (typeof window.markConversationDirty === 'function') {
-          window.markConversationDirty(conversation.id);
-        }
-        if (window.saveConversationsToStorage) window.saveConversationsToStorage();
-      } catch (error) {
-        committedHandoffWarnings.push(`The task was queued, but Dispatch could not save its supervisor pointer: ${error.message || error}`);
-      }
-      // Kick off the supervisor monitor in the renderer
-      if (typeof handoffImpl.startMonitor === 'function' && typeof window.startOperatorTaskMonitor === 'function') {
-        try {
-          handoffImpl.startMonitor(conversation.id, result.conversationId, result.taskId || '');
-        } catch (error) {
-          committedHandoffWarnings.push(`The task was queued, but its live supervisor monitor did not start: ${error.message || error}`);
-        }
-      }
-      // ───────────────────────────────────────────────────────────────────────
-
-      return {
-        ...result,
-        success: true,
-        message: prompt
-          ? `${standaloneHandoff ? 'Opened a standalone Operator task in' : 'Promoted'} ${result.workspacePath || resolution.path} and queued task ${result.taskId || '(pending ID)'} with state ${result.status || 'pending'}.${result.contextTransferred ? ` Transferred ${result.contextPacketIds.length} validated context packet(s).` : ''}`
-          : `Promoted ${resolution.path} to Operator as a project.`,
-        originalUserMessage,
-        standalone: standaloneHandoff,
-        fuzzyResolved: !!resolution.fuzzyResolved,
-        resolvedFrom: resolution.resolvedFrom,
-        matchedName: resolution.matchedName || getLocalPathBaseName(resolution.path),
-        committedWithWarning: committedHandoffWarnings.length > 0,
-        warning: committedHandoffWarnings.join(' ')
-      };
+    case 'handoff_to_researcher': {
+      // Third specialist handoff tool, added alongside the handoff-generalization work. Callable
+      // by Dispatch directly (upfront research requests) and, per the now-symmetric per-role
+      // allowlists, by Coder/Operator mid-task — e.g. Coder checking a library's current API before
+      // writing against it, or Operator looking up expected UI behavior before judging a
+      // screenshot. Goes through the exact same delegation-chain guard as the other two.
+      return await executeSpecialistHandoff('researcher', args, workspace, conversation, executionContext, resolvedHomeDir);
     }
 
     case 'get_coder_task_status': {
@@ -8586,7 +8591,7 @@ function persistCompactedConversation(conversation, summary) {
 // reload, a crash, or an app restart — silently, with nothing recorded. The tool surface the
 // model sees is unchanged; only the backing moved.
 async function scheduleAgentFollowup(args = {}) {
-  const delaySeconds = Math.min(Math.max(Number(args.delaySeconds || 60), 1), 86400);
+  let delaySeconds = Math.min(Math.max(Number(args.delaySeconds || 60), 1), 86400);
   const intervalSeconds = Math.max(0, Number(args.repeatEverySeconds || 0));
   const prompt = args.prompt || 'Continue the previous task. Check any long-running command or training progress, inspect output, fix issues if needed, and keep working until the task is complete.';
   const targetConversationId = runningConversationId || ((typeof activeConversationId !== 'undefined') ? activeConversationId : null);
@@ -8601,10 +8606,25 @@ async function scheduleAgentFollowup(args = {}) {
     return { success: false, error: 'Durable scheduling is unavailable in this build.' };
   }
 
-  // A clock time ("09:00") makes this a calendar schedule instead of an interval one.
-  const calendar = args.atTime
+  // A clock time ("09:00") normally makes this a recurring calendar schedule. A plain reminder
+  // at a wall-clock time is different: it needs calendar math to find the next local occurrence,
+  // but it must remain a one-shot in the durable store. Keeping that distinction here prevents
+  // the model from calculating time deltas, consulting IP/time APIs, or accidentally turning
+  // "remind me at 2" into a daily recurrence.
+  const requestedCalendar = args.atTime
     ? { atTime: String(args.atTime), onDays: args.onDays }
     : null;
+  const runOnceAtTime = !!(requestedCalendar && args.runOnce === true);
+  let oneShotDueAt = 0;
+  if (runOnceAtTime) {
+    const normalized = SchedulePolicy && SchedulePolicy.normalizeCalendar(requestedCalendar);
+    oneShotDueAt = normalized && SchedulePolicy.nextCalendarOccurrence(normalized, Date.now());
+    if (!oneShotDueAt) {
+      return { success: false, error: `Could not read "${args.atTime}" as a time. Use 24-hour HH:MM, for example 09:00 or 17:30.` };
+    }
+    delaySeconds = Math.max(1, Math.ceil((oneShotDueAt - Date.now()) / 1000));
+  }
+  const calendar = runOnceAtTime ? null : requestedCalendar;
 
   const created = await window.api.createSchedule({
     conversationId: targetConversationId,
@@ -8615,6 +8635,7 @@ async function scheduleAgentFollowup(args = {}) {
     title: `Scheduled follow-up: ${purpose}`,
     modelSelectValue,
     source: 'followup',
+    deliveryOnly: args.deliveryOnly === true,
     delayMs: delaySeconds * 1000,
     intervalMs: intervalSeconds * 1000,
     calendar
@@ -8628,6 +8649,17 @@ async function scheduleAgentFollowup(args = {}) {
 
   const repeats = intervalSeconds > 0;
   const nextRun = new Date(created.schedule.dueAt);
+  if (runOnceAtTime) {
+    return {
+      success: true,
+      scheduleId: created.schedule.scheduleId,
+      runOnce: true,
+      nextRunAt: created.schedule.dueAt,
+      replacedExisting: (created.supersededScheduleIds || []).length > 0,
+      durable: true,
+      message: `Scheduled once for ${nextRun.toLocaleString()}. This survives restarts.`
+    };
+  }
   if (created.schedule.calendar) {
     const cal = created.schedule.calendar;
     const days = cal.days ? cal.days.length : 7;
@@ -8740,7 +8772,8 @@ window.runDurableSchedule = async function(payload = {}) {
   if (window.isAgentRunning && window.isAgentRunning()) {
     return { deferred: true, reason: 'agent_busy' };
   }
-  if (typeof window.enqueueOrchestrationTask !== 'function') {
+  const deliveryOnly = payload.deliveryOnly === true;
+  if (!deliveryOnly && typeof window.enqueueOrchestrationTask !== 'function') {
     return { deferred: true, reason: 'orchestration_not_ready' };
   }
 
@@ -8751,18 +8784,21 @@ window.runDurableSchedule = async function(payload = {}) {
   const prompt = payload.conditionBriefing
     ? `${payload.conditionBriefing}\n\n${basePrompt}`
     : basePrompt;
-  const queued = await window.enqueueOrchestrationTask({
-    prompt,
-    resolvedObjective: prompt,
-    title: payload.title || `Scheduled follow-up: ${payload.purpose || ''}`,
-    modelSelectValue: payload.modelSelectValue,
-    targetConversationId: conversationId,
-    originConversationId: conversationId,
-    source: 'followup',
-    alreadyRendered: true
-  });
-  if (!queued || !queued.success) return { deferred: true, reason: 'enqueue_failed' };
-  window.promptQueue = (window.promptQueue || []).filter(item => item && item.taskId !== queued.task.taskId);
+  let queued = null;
+  if (!deliveryOnly) {
+    queued = await window.enqueueOrchestrationTask({
+      prompt,
+      resolvedObjective: prompt,
+      title: payload.title || `Scheduled follow-up: ${payload.purpose || ''}`,
+      modelSelectValue: payload.modelSelectValue,
+      targetConversationId: conversationId,
+      originConversationId: conversationId,
+      source: 'followup',
+      alreadyRendered: true
+    });
+    if (!queued || !queued.success) return { deferred: true, reason: 'enqueue_failed' };
+    window.promptQueue = (window.promptQueue || []).filter(item => item && item.taskId !== queued.task.taskId);
+  }
 
   if (window.appendSystemMessage) {
     // A late run must say so. Reporting a nine-hour-late wake-up as if it were punctual would
@@ -8778,13 +8814,43 @@ window.runDurableSchedule = async function(payload = {}) {
     {
       source: 'followup',
       internalPrompt: true,
-      taskId: queued.task.taskId,
+      ...(deliveryOnly
+        ? { semanticIntent: buildScheduledDeliveryIntent(prompt) }
+        : { taskId: queued.task.taskId }),
       scheduleId: String(payload.scheduleId || ''),
       scheduleDeliveryConversationId: String(payload.deliveryConversationId || conversationId)
     }
   );
   return { deferred: false, ran: true };
 };
+
+function buildScheduledDeliveryIntent(prompt) {
+  return {
+    intent: 'context_followup',
+    requiresExecution: false,
+    target: 'current_conversation',
+    resolvedRequest: String(prompt || ''),
+    contextDependent: true,
+    confidence: 1,
+    needsClarification: false,
+    clarificationQuestion: '',
+    reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'recent' },
+    memoryIntent: 'none',
+    memoryContext: { needed: false, query: '', confidence: 0 },
+    taskResolution: { title: '', requirements: [], constraints: [], unresolvedDecisions: [] },
+    executionScope: 'none',
+    executionTarget: 'none',
+    executionSurface: 'none',
+    orchestrationAction: 'none',
+    scheduledRequest: {
+      prompt: '', purpose: '', delaySeconds: 0, repeatEverySeconds: 0,
+      atTime: '', onDays: '', recurring: false, deliveryOnly: false
+    },
+    inspectionTarget: 'none',
+    inspectionBreadth: 'none',
+    standaloneSystemOperation: false
+  };
+}
 
 async function resolveScheduledDeliveryConversation(executionConversationId) {
   const fallback = { conversationId: String(executionConversationId || ''), taskId: '' };
@@ -10316,22 +10382,67 @@ function buildForcedDispatchHandoffPrompt(userPrompt) {
   return `Execute this request from Dispatch in the local environment: "${originalRequest.replace(/"/g, "'").slice(0, 2000)}"\n\nIdentify the intended local target if needed, perform the operation safely using the existing launch/configuration method, and verify the result. Do not return the task to the user merely because Dispatch itself is read-only.`;
 }
 
-const DISPATCH_HANDOFF_TOOL_NAMES = new Set(['handoff_to_coder', 'handoff_to_operator']);
+function isDispatchOwnedOrchestrationIntent(semanticIntent = {}) {
+  return semanticIntent.requiresExecution === true
+    && semanticIntent.executionTarget === 'dispatch'
+    && semanticIntent.orchestrationAction === 'schedule_followup'
+    && ['new_task', 'context_followup'].includes(semanticIntent.intent);
+}
+
+function buildDispatchOrchestrationCall(semanticIntent = {}) {
+  if (!isDispatchOwnedOrchestrationIntent(semanticIntent)) return null;
+  const request = semanticIntent.scheduledRequest && typeof semanticIntent.scheduledRequest === 'object'
+    ? semanticIntent.scheduledRequest
+    : {};
+  const prompt = String(request.prompt || '').trim();
+  const atTime = String(request.atTime || '').trim();
+  const delaySeconds = Math.max(0, Number(request.delaySeconds) || 0);
+  if (!prompt || (!atTime && !delaySeconds)) return null;
+  const recurring = request.recurring === true;
+  const args = {
+    prompt,
+    deliveryOnly: request.deliveryOnly === true,
+    purpose: String(request.purpose || semanticIntent.taskResolution && semanticIntent.taskResolution.title || 'user-reminder').trim()
+      .slice(0, 200)
+  };
+  if (atTime) {
+    args.atTime = atTime;
+    args.runOnce = !recurring;
+    if (recurring && request.onDays) args.onDays = String(request.onDays);
+  } else {
+    args.delaySeconds = delaySeconds;
+    if (recurring && Number(request.repeatEverySeconds) > 0) {
+      args.repeatEverySeconds = Number(request.repeatEverySeconds);
+    }
+  }
+  return { name: 'schedule_followup', args };
+}
+
+// Generalized role<->handoff-tool lookup (handoff-generalization piece). These names ("DISPATCH_
+// HANDOFF_TOOL_NAMES", "isDispatchHandoffTool") predate Coder/Operator being able to call handoff
+// tools themselves and are kept as-is rather than renamed, since every call site across this file
+// already refers to them — but the sets and functions below are now derived from
+// specialist-registry.js instead of a hardcoded two-role ternary, so they are genuinely
+// role-general: any caller (Dispatch or a specialist mid-task) checks membership the same way, and
+// a fourth specialist role would only require a new entry in specialist-registry.js, not a change
+// here.
+const DISPATCH_HANDOFF_TOOL_NAMES = new Set(OrionSpecialistRegistry.allHandoffToolNames());
 
 function isDispatchHandoffTool(name) {
   return DISPATCH_HANDOFF_TOOL_NAMES.has(String(name || '').trim());
 }
 
 function handoffRoleForTool(name) {
-  return String(name || '').trim() === 'handoff_to_operator' ? 'operator' : 'coder';
+  return OrionSpecialistRegistry.roleForHandoffTool(name) || 'coder';
 }
 
 function handoffToolForRole(role) {
-  return String(role || '').toLowerCase() === 'operator' ? 'handoff_to_operator' : 'handoff_to_coder';
+  return OrionSpecialistRegistry.handoffToolNameForRole(role) || 'handoff_to_coder';
 }
 
 function handoffRoleLabel(role) {
-  return String(role || '').toLowerCase() === 'operator' ? 'Operator' : 'Coder';
+  const definition = OrionSpecialistRegistry.get(role);
+  return definition ? definition.label : 'Coder';
 }
 
 function resolveDispatchHandoffRole(semanticIntent = {}, { delegatedInspection = false } = {}) {
@@ -12272,11 +12383,12 @@ function convertGeminiToOllamaMessages(geminiMessages) {
   return ollamaMessages;
 }
 
-// Registry of handoff implementations by specialist role. Dispatch chooses between Coder and
-// Operator from the shared semantic intent, while each executor retains its role-specific durable
-// promotion and monitor path. The functions are thin lookups evaluated at
-// call time (not captured at module load), so they still see whatever window.promoteWorkspaceToCoder
-// resolves to at the moment a handoff actually runs — the same timing tests already rely on.
+// Registry of handoff implementations by specialist role. The caller (Dispatch, or a specialist
+// delegating mid-task — see executeSpecialistHandoff) picks a target role from the shared semantic
+// intent or an explicit tool call, while each executor retains its role-specific durable promotion
+// and monitor path. The functions are thin lookups evaluated at call time (not captured at module
+// load), so they still see whatever window.promoteWorkspaceToCoder resolves to at the moment a
+// handoff actually runs — the same timing tests already rely on.
 const AGENT_HANDOFF_IMPLEMENTATIONS = {
   coder: {
     displayName: 'Coder',
@@ -12287,6 +12399,11 @@ const AGENT_HANDOFF_IMPLEMENTATIONS = {
     displayName: 'Operator',
     promote: (payload) => window.promoteWorkspaceToOperator(payload),
     startMonitor: (dispatchConvId, targetConvId, taskId) => window.startOperatorTaskMonitor(dispatchConvId, targetConvId, taskId)
+  },
+  researcher: {
+    displayName: 'Researcher',
+    promote: (payload) => window.promoteWorkspaceToResearcher(payload),
+    startMonitor: (dispatchConvId, targetConvId, taskId) => window.startResearcherTaskMonitor(dispatchConvId, targetConvId, taskId)
   }
 };
 
@@ -12295,12 +12412,16 @@ const AGENT_HANDOFF_IMPLEMENTATIONS = {
 // write, edit, run, or execute anything itself. This whitelist is enforced
 // below regardless of what the system prompt text claims, so the restriction can't be talked
 // around by a model that decides to route differently.
+// Handoff tools are generated from specialist-registry.js rather than hand-listed: Dispatch is not
+// itself a specialist role, so handoffToolNamesFor('orion') returns every registered specialist's
+// handoff tool (today: handoff_to_coder, handoff_to_operator, handoff_to_researcher) with no
+// exclusion. A new specialist role added to the registry becomes callable from Dispatch
+// automatically, without this allowlist needing a matching edit.
 const DISPATCH_TOOL_ALLOWLIST = new Set([
   'recall_memory', 'remember_fact', 'remember_preference',
   'google_search', 'fetch_web_page', 'fetch_api_docs', 'search_api_docs',
   'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context', 'list_files', 'get_workspace_info', 'change_workspace',
-  'handoff_to_coder',
-  'handoff_to_operator',
+  ...OrionSpecialistRegistry.handoffToolNamesFor('orion'),
   'get_coder_task_status', 'cancel_coder_task',
   'open_url', 'click_element', 'fill_input', 'take_screenshot', 'navigate_back', 'close_browser', 'attach_image',
   'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model',
@@ -12336,6 +12457,14 @@ const DISPATCH_TOOL_ALLOWLIST = new Set([
 // "workspace" category explicitly: without them Operator has no way to learn or set the workspace
 // it is bound to, which both piece 2's change_workspace fix and OPERATOR_INSTRUCTION's identity
 // assume it can do. Flagged here as a judgment call rather than a silent addition.
+//
+// Handoff-generalization: Operator previously had no handoff tools at all, making the old
+// Coder->Operator playtest pattern strictly one-directional (an accident of Coder's tool list being
+// built as an exclusion set — see the coder branch of getAvailableToolsForMode below — not a
+// deliberate design). Operator now gets a handoff tool to every OTHER registered specialist
+// (handoffToolNamesFor('operator') excludes 'handoff_to_operator' itself — no self-handoff), plus
+// the task-status/cancel tools every other handoff-capable role already has, so it can act on
+// what it delegates the same way Dispatch and Coder can.
 const OPERATOR_TOOL_ALLOWLIST = new Set([
   'computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite',
   'open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back', 'close_browser', 'download_from_page', 'wait_for_page', 'take_screenshot',
@@ -12345,7 +12474,41 @@ const OPERATOR_TOOL_ALLOWLIST = new Set([
   'recall_memory', 'remember_fact', 'remember_decision', 'remember_preference',
   'read_notes', 'update_notes', 'read_project_memory', 'append_project_memory', 'remember_file_notes', 'save_session_summary',
   'get_workspace_info', 'change_workspace',
-  'set_task_checklist'
+  'set_task_checklist',
+  ...OrionSpecialistRegistry.handoffToolNamesFor('operator'),
+  'get_coder_task_status', 'cancel_coder_task'
+]);
+
+// Third specialist tool allowlist (Researcher). Researcher investigates and synthesizes; it never
+// edits the workspace or controls the desktop (specialist-registry.js: canEditWorkspace: false,
+// canControlDesktop: false), so this list deliberately excludes patch_file/write_file/run_command/
+// computer_action the same way OPERATOR_TOOL_ALLOWLIST excludes read_file/patch_file. Every tool
+// here already exists and is already used by another role — Dispatch's own web/read/memory tools,
+// Coder/Operator's memory and task-status tools, and the browser-worker read-only snapshot tools
+// Dispatch already uses to look at pages. No new tool was invented for Researcher.
+const RESEARCHER_TOOL_ALLOWLIST = new Set([
+  // Web research core — identical to what Dispatch already uses for exactly this kind of work.
+  'google_search', 'fetch_web_page', 'fetch_api_docs', 'search_api_docs',
+  // Read-only browser-worker snapshot tools (same set Dispatch has) for sources a search API can't
+  // reach directly.
+  'open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back', 'close_browser', 'take_screenshot',
+  // Read-only workspace/context inspection, for research that needs to ground itself against an
+  // existing project rather than only the open web.
+  'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context', 'list_files',
+  'get_workspace_info', 'change_workspace', 'grep_search', 'search_embeddings', 'semantic_search',
+  'get_symbol_index', 'get_file_symbols', 'find_references',
+  'read_notes', 'read_project_memory', 'remember_file_notes',
+  'db_query', 'inspect_environment',
+  // Synthesis / running notes across a multi-step investigation, and durable memory once findings
+  // are worth keeping past this task.
+  'update_scratchpad', 'recall_memory', 'remember_fact', 'remember_preference', 'remember_decision', 'save_session_summary',
+  'schedule_followup', 'watch_condition',
+  'set_task_checklist',
+  // Handoff to every OTHER registered specialist (excludes handoff_to_researcher — no
+  // self-handoff), so research that turns up something requiring code changes or on-screen
+  // verification can route there directly instead of only ever reporting back.
+  ...OrionSpecialistRegistry.handoffToolNamesFor('researcher'),
+  'get_coder_task_status', 'cancel_coder_task'
 ]);
 
 // Single source of truth for the agent's tool declarations, consumed by every provider
@@ -12482,6 +12645,26 @@ function buildAgentToolDeclarations() {
                 },
                 title: { type: "STRING", description: "Optional title for the new Operator conversation." },
                 open: { type: "BOOLEAN", description: "Whether to switch the UI to the new Operator conversation immediately. Defaults to false." }
+              }
+            }
+          },
+          {
+            name: "handoff_to_researcher",
+            description: "Queues investigation work for Researcher in either a resolved project or an isolated standalone Researcher workspace: multi-step web research that needs cross-checking multiple sources rather than a quick inline answer, technical write-ups or explainers (optionally including code snippets/examples), or looking something up before code or desktop/browser work proceeds. Use this instead of handoff_to_coder/handoff_to_operator when the work is investigation and synthesis, not writing code or driving the desktop/browser. Callable directly by Dispatch for an upfront research request, and by Coder or Operator mid-task when something they're doing turns up a question worth researching before continuing. REQUIRED: when the user asks for real multi-step research outside Dispatch's read-only quick-answer capacity, call this tool; never refuse or tell the user to perform it manually merely because Dispatch cannot run a multi-step investigation itself. IMPORTANT — context transfer: exact-source context packets are generated ONLY by inspect_code_context calls. If your investigation used grep_search/read_file instead, no packets exist, so you MUST pass your key conclusions in `findings` — otherwise Researcher starts blind and rediscovers everything. This is the explicit promotion path; change_workspace alone must not add folders to Researcher.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                path: { type: "STRING", description: "Optional absolute folder path to promote. Defaults to the current Dispatch workspace." },
+                prompt: { type: "STRING", description: "Optional exact research question or objective for Researcher to start with." },
+                originalUserMessage: { type: "STRING", description: "Exact latest user utterance retained separately when prompt is expanded. Orion injects this provenance; do not paraphrase it." },
+                standalone: { type: "BOOLEAN", description: "True when the research is not bound to an existing project. Orion creates an isolated Researcher workspace. Never use standalone to bypass resolution for research that depends on project files or existing project context." },
+                findings: {
+                  type: "ARRAY",
+                  items: { type: "STRING" },
+                  description: "Concise findings or decisions already established by the caller (file paths, key line references, conclusions, or the exact question that still needs answering). REQUIRED in practice when you explored with grep_search/read_file, since only inspect_code_context produces transferable context packets. Do not paste source code here; exact source is transferred through context packets."
+                },
+                title: { type: "STRING", description: "Optional title for the new Researcher conversation." },
+                open: { type: "BOOLEAN", description: "Whether to switch the UI to the new Researcher conversation immediately. Defaults to false." }
               }
             }
           },
@@ -12900,6 +13083,8 @@ function buildAgentToolDeclarations() {
                 purpose: { type: "STRING", description: "Optional stable dedupe key, e.g. training-progress or test-check. Re-scheduling the same purpose in the same conversation replaces the earlier schedule instead of stacking a second one." },
                 repeatEverySeconds: { type: "NUMBER", description: "Optional. When set (minimum 30), the schedule repeats on this interval instead of running once. Missed runs while Orion was closed or asleep collapse into a single catch-up run." },
                 atTime: { type: "STRING", description: "Optional clock time in 24-hour HH:MM local time, e.g. '09:00' or '17:30'. Use this for calendar schedules like 'every morning at 9' — it stays correct across daylight saving, which repeatEverySeconds does not. Supply this INSTEAD of delaySeconds/repeatEverySeconds." },
+                runOnce: { type: "BOOLEAN", description: "Set true with atTime for a one-time reminder at the next occurrence of that local clock time. Leave false/omit only for an explicitly recurring calendar schedule." },
+                deliveryOnly: { type: "BOOLEAN", description: "True when firing should only surface the stored message in this conversation. False when firing must perform fresh work before responding." },
                 onDays: { type: "STRING", description: "Optional day filter for atTime: 'weekdays', 'weekends', 'daily', or a comma list like 'mon,wed,fri'. Defaults to every day." }
               },
               required: ["prompt"]
@@ -13307,8 +13492,23 @@ function buildAgentToolDeclarations() {
   if (activeConversationMode === 'operator') {
     return gatedTools.filter(tool => OPERATOR_TOOL_ALLOWLIST.has(tool.name));
   }
+  if (activeConversationMode === 'researcher') {
+    return gatedTools.filter(tool => RESEARCHER_TOOL_ALLOWLIST.has(tool.name));
+  }
   if (activeConversationMode === 'coder') {
-    return gatedTools.filter(tool => !['open_application', 'click_ui_element', 'open_chrome_favorite'].includes(tool.name));
+    // Coder's tool list has always been built as an exclusion set (everything except these three
+    // Operator-native GUI tools) rather than a named inclusion list like Dispatch/Operator/
+    // Researcher get — that is deliberate; Coder legitimately needs almost every tool in allTools.
+    // Handoff-generalization piece: that exclusion-set shape used to mean Coder got
+    // handoff_to_coder (a self-handoff nothing guarded against) purely by omission, alongside the
+    // handoff_to_operator access that made the original Coder->Operator playtest pattern possible.
+    // Self-handoff is now excluded deliberately rather than left as an accident; handoff to every
+    // OTHER specialist (operator, researcher) remains available the same way it always was.
+    const excludedTools = [
+      'open_application', 'click_ui_element', 'open_chrome_favorite',
+      OrionSpecialistRegistry.handoffToolNameForRole('coder')
+    ];
+    return gatedTools.filter(tool => !excludedTools.includes(tool.name));
   }
   return gatedTools;
 }
@@ -14561,6 +14761,9 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     shouldHaveUsedToolsButDidNot,
     classifySemanticIntent,
     buildForcedDispatchHandoffPrompt,
+    isDispatchOwnedOrchestrationIntent,
+    buildDispatchOrchestrationCall,
+    buildScheduledDeliveryIntent,
     resolveDispatchHandoffTitle,
     isDispatchHandoffTool,
     handoffRoleForTool,

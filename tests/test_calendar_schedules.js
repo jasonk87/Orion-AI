@@ -226,6 +226,7 @@ test('schedule_followup exposes calendar scheduling and no longer forces delaySe
   const decl = agentJs.slice(declStart, declStart + 2500);
   t.ok(/atTime:\s*\{/.test(decl), 'a clock time can be given');
   t.ok(/onDays:\s*\{/.test(decl), 'along with a day filter');
+  t.ok(/deliveryOnly:\s*\{/.test(decl), 'stored-message delivery is distinguished from fresh scheduled work');
   t.ok(/daylight saving/i.test(decl),
     'and the description tells the model why atTime beats repeatEverySeconds for daily jobs');
   t.ok(/required: \["prompt"\]/.test(decl),

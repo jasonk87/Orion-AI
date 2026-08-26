@@ -4,6 +4,7 @@ const test = require('tape');
 global.window = {};
 const agent = require('../agent.js');
 const runAgentLoop = global.window.runAgentLoop;
+const runDurableSchedule = global.window.runDurableSchedule;
 const stopAgentExecution = global.window.stopAgentExecution;
 const isAgentRunning = global.window.isAgentRunning;
 const getRunningConversationId = global.window.getRunningConversationId;
@@ -56,6 +57,7 @@ function installHarness(modelTurns, options = {}) {
   }
   Object.assign(global.window, {
     runAgentLoop,
+    runDurableSchedule,
     stopAgentExecution,
     isAgentRunning,
     getRunningConversationId,
@@ -209,6 +211,45 @@ test('Dispatch accepts the first concise casual answer without a planning-gate r
     t.equal(harness.modelTurns, 1, 'the answer is accepted on the first model turn');
     t.equal(finalAssistant.text, firstAnswer, 'the original natural answer is preserved exactly');
     t.notOk(/nothing to plan or build/i.test(finalAssistant.text), 'planning-gate language never replaces the answer');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('Dispatch first reply receives the exact statement and a no-greeting-only response contract', async t => {
+  const originalFetch = global.fetch;
+  let sawExactStatement = false;
+  let sawFirstReplyContract = false;
+  const harness = installHarness([
+    body => {
+      const serialized = JSON.stringify(body);
+      sawExactStatement = serialized.includes('You have received some more updates');
+      sawFirstReplyContract = serialized.includes('FIRST REPLY:')
+        && serialized.includes("Respond to the substance of Jason's exact message immediately")
+        && serialized.includes('a greeting alone is never an answer');
+      return [{ text: 'I have — and the new Researcher role is one of the latest additions.' }];
+    }
+  ], {
+    semanticClassification: semanticClassification({
+      intent: 'conversation',
+      requiresExecution: false,
+      target: 'none',
+      resolvedRequest: 'Acknowledge and discuss the additional Orion updates.',
+      executionScope: 'none',
+      inspectionTarget: 'none',
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'none' }
+    })
+  });
+  const conv = conversation('dispatch-first-statement-acknowledgment');
+  try {
+    await global.window.runAgentLoop('You have received some more updates', 'gemini-1', conv);
+    const finalAssistant = [...conv.messages].reverse().find(message => message.role === 'assistant');
+    t.equal(harness.modelTurns, 1, 'the first response is produced in one answer turn without a corrective gate');
+    t.ok(sawExactStatement, 'the exact first statement reaches the answer model');
+    t.ok(sawFirstReplyContract, 'the answer model is told that a greeting alone is not a response');
+    t.equal(finalAssistant.text, 'I have — and the new Researcher role is one of the latest additions.',
+      'the substantive first response remains canonical');
   } finally {
     restoreGlobals(originalFetch);
   }
@@ -709,6 +750,105 @@ test('semantic adjudication corrects a model-selected Coder handoff to Operator'
     t.equal(operatorHandoffs[0].semanticIntent.executionTarget, 'operator', 'the durable task carries the adjudicated specialist');
     const finalAssistant = [...conv.messages].reverse().find(message => message.role === 'assistant');
     t.match(finalAssistant.text, /Operator has task .* queued/i, 'the committed result names the corrected specialist');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('Dispatch schedules a one-time app reminder directly without creating a specialist task', async t => {
+  const originalFetch = global.fetch;
+  const createdSchedules = [];
+  const coderHandoffs = [];
+  const operatorHandoffs = [];
+  const forbiddenCalls = [];
+  const future = new Date(Date.now() + (2 * 60 * 60 * 1000));
+  const atTime = `${String(future.getHours()).padStart(2, '0')}:${String(future.getMinutes()).padStart(2, '0')}`;
+  installHarness([
+    [{ text: `Done. I set a one-time reminder for ${atTime}.` }]
+  ], {
+    semanticClassification: semanticClassification({
+      intent: 'new_task',
+      requiresExecution: true,
+      target: 'current_conversation',
+      resolvedRequest: `Set a one-time reminder for ${atTime} to start OpenAI.`,
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'none' },
+      executionScope: 'mutating',
+      executionTarget: 'dispatch',
+      orchestrationAction: 'schedule_followup',
+      scheduledRequest: {
+        prompt: 'Remind Jason that it is time to start OpenAI. This is a reminder only; do not launch or operate OpenAI unless Jason asks after receiving it.',
+        purpose: 'start-openai-reminder',
+        delaySeconds: 0,
+        repeatEverySeconds: 0,
+        atTime,
+        onDays: '',
+        recurring: false,
+        deliveryOnly: true
+      },
+      inspectionTarget: 'local_system',
+      standaloneSystemOperation: true,
+      taskResolution: { title: 'Reminder to start OpenAI', requirements: [], constraints: [], unresolvedDecisions: [] }
+    }),
+    api: {
+      createSchedule: async input => {
+        createdSchedules.push(input);
+        return {
+          success: true,
+          schedule: {
+            scheduleId: 'sched-direct-reminder',
+            dueAt: Date.now() + input.delayMs,
+            calendar: input.calendar || null
+          },
+          supersededScheduleIds: []
+        };
+      }
+    },
+    window: {
+      promoteWorkspaceToCoder: async payload => { coderHandoffs.push(payload); return { success: true }; },
+      promoteWorkspaceToOperator: async payload => { operatorHandoffs.push(payload); return { success: true }; },
+      captureScreen: async (...args) => { forbiddenCalls.push(['captureScreen', ...args]); return { success: false }; },
+      runCommand: async (...args) => { forbiddenCalls.push(['runCommand', ...args]); return { success: false }; }
+    }
+  });
+  const conv = conversation('dispatch-direct-reminder', {
+    messages: [{ role: 'user', text: `Remind me at ${atTime} to start OpenAI.` }]
+  });
+
+  try {
+    await global.window.runAgentLoop(`Remind me at ${atTime} to start OpenAI.`, 'gemini-1', conv, {
+      semanticIntent: semanticClassification({
+        intent: 'new_task',
+        requiresExecution: true,
+        target: 'current_conversation',
+        resolvedRequest: `Set a one-time reminder for ${atTime} to start OpenAI.`,
+        executionScope: 'mutating',
+        executionTarget: 'dispatch',
+        orchestrationAction: 'schedule_followup',
+        scheduledRequest: {
+          prompt: 'Remind Jason that it is time to start OpenAI. This is a reminder only; do not launch or operate OpenAI unless Jason asks after receiving it.',
+          purpose: 'start-openai-reminder',
+          atTime,
+          recurring: false,
+          deliveryOnly: true
+        },
+        inspectionTarget: 'local_system',
+        standaloneSystemOperation: true
+      })
+    });
+    t.equal(createdSchedules.length, 1, 'exactly one durable schedule is created');
+    t.equal(coderHandoffs.length, 0, 'Coder is not involved');
+    t.equal(operatorHandoffs.length, 0, 'Operator is not involved');
+    t.equal(forbiddenCalls.length, 0, 'no screen or shell probing is attempted');
+    t.equal(createdSchedules[0].conversationId, conv.id, 'the reminder remains owned by the visible Dispatch conversation');
+    t.equal(createdSchedules[0].deliveryOnly, true, 'the future event is persisted as conversation delivery, not specialist execution');
+    t.equal(createdSchedules[0].calendar, null, 'the clock-time reminder is persisted as a one-shot, not a daily calendar recurrence');
+    t.ok(createdSchedules[0].delayMs > 0 && createdSchedules[0].delayMs <= 24 * 60 * 60 * 1000,
+      'local calendar math produces the next occurrence without a network time lookup');
+    t.match(createdSchedules[0].prompt, /reminder only; do not launch/i,
+      'the future app action is payload, not unattended execution authority');
+    const finalAssistant = [...conv.messages].reverse().find(message => message.role === 'assistant');
+    t.match(finalAssistant && finalAssistant.text, /one-time reminder/i, 'the user receives a normal scheduling confirmation');
   } finally {
     restoreGlobals(originalFetch);
   }
@@ -3421,6 +3561,43 @@ test('a scheduled worker result is flushed into its visible conversation before 
     t.ok(flushedConversationIds.includes(visible.id), 'the visible transcript is flushed before the run finishes');
     t.equal(notifications.length, 1, 'the scheduled result emits one terminal notification');
     t.equal(notifications[0].context.conversationId, visible.id, 'the push deep-links to the visible conversation');
+  } finally {
+    delete global.conversations;
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('a delivery-only reminder fires in Dispatch without creating specialist work', async t => {
+  const originalFetch = global.fetch;
+  const queuedTasks = [];
+  const visible = conversation('scheduled-reminder-dispatch', { mode: 'orion' });
+  global.conversations = [visible];
+  installHarness([[{ text: 'It is 2:00 PM — time to start OpenAI.' }]], {
+    window: {
+      enqueueOrchestrationTask: async input => {
+        queuedTasks.push(input);
+        return { success: false, error: 'must not enqueue' };
+      }
+    }
+  });
+  try {
+    const result = await global.window.runDurableSchedule({
+      scheduleId: 'schedule-reminder-1',
+      conversationId: visible.id,
+      deliveryConversationId: visible.id,
+      prompt: 'Tell Jason it is 2:00 PM and time to start OpenAI. Do not launch the application.',
+      purpose: 'start-openai-reminder',
+      title: 'Reminder to start OpenAI',
+      modelSelectValue: 'gemini-1',
+      deliveryOnly: true
+    });
+    t.equal(result && result.ran, true, 'the reminder runs through the normal conversation loop');
+    t.equal(queuedTasks.length, 0, 'it does not create Coder or Operator work when it fires');
+    const answer = visible.messages.find(message =>
+      message.role === 'assistant' && /time to start OpenAI/i.test(message.text || '')
+    );
+    t.ok(answer, 'the reminder is saved as a real assistant response in the owning conversation');
   } finally {
     delete global.conversations;
     restoreGlobals(originalFetch);

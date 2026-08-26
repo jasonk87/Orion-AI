@@ -196,9 +196,13 @@ const el = {
   conversationListOperator: document.getElementById('conversation-list-operator'),
   btnAddConversationOperator: document.getElementById('btn-add-conversation-operator'),
   btnNewConversationOperator: document.getElementById('btn-new-conversation-operator'),
+  conversationListResearcher: document.getElementById('conversation-list-researcher'),
+  btnAddConversationResearcher: document.getElementById('btn-add-conversation-researcher'),
+  btnNewConversationResearcher: document.getElementById('btn-new-conversation-researcher'),
   conversationSearchOrion: document.getElementById('conversation-search-orion'),
   conversationSearchCoder: document.getElementById('conversation-search-coder'),
   conversationSearchOperator: document.getElementById('conversation-search-operator'),
+  conversationSearchResearcher: document.getElementById('conversation-search-researcher'),
   btnSettings: document.getElementById('btn-settings'),
   btnChangeWorkspace: document.getElementById('btn-change-workspace'),
   btnSyncFiles: document.getElementById('btn-sync-files'),
@@ -1191,15 +1195,19 @@ function setAppMode(mode, persist = true) {
   const orionBtn = document.getElementById('btn-mode-orion');
   const coderBtn = document.getElementById('btn-mode-coder');
   const operatorBtn = document.getElementById('btn-mode-operator');
+  const researcherBtn = document.getElementById('btn-mode-researcher');
   const orionContent = document.getElementById('sidebar-orion-content');
   const coderContent = document.getElementById('sidebar-coder-content');
   const operatorContent = document.getElementById('sidebar-operator-content');
+  const researcherContent = document.getElementById('sidebar-researcher-content');
   if (orionBtn) orionBtn.classList.toggle('active', mode === 'orion');
   if (coderBtn) coderBtn.classList.toggle('active', mode === 'coder');
   if (operatorBtn) operatorBtn.classList.toggle('active', mode === 'operator');
+  if (researcherBtn) researcherBtn.classList.toggle('active', mode === 'researcher');
   if (orionContent) orionContent.classList.toggle('active', mode === 'orion');
   if (coderContent) coderContent.classList.toggle('active', mode === 'coder');
   if (operatorContent) operatorContent.classList.toggle('active', mode === 'operator');
+  if (researcherContent) researcherContent.classList.toggle('active', mode === 'researcher');
 
   // Dispatch preserves its current in-session focus, including an uncommitted draft, but never
   // chooses an old transcript merely because the user opened the mode. Coder and Operator each
@@ -1245,7 +1253,9 @@ function setAppMode(mode, persist = true) {
     if (chatInput) {
       chatInput.placeholder = mode === 'operator'
         ? 'Ask Operator to click, type, or navigate…'
-        : 'Ask Orion to build, fix, or investigate…';
+        : mode === 'researcher'
+          ? 'Ask Researcher to look something up…'
+          : 'Ask Orion to build, fix, or investigate…';
     }
     if (orionSplash) orionSplash.style.display = 'none';
     // Restore the shared splash if no messages
@@ -1267,15 +1277,19 @@ function updateOrionGreeting() {
   nameEl.textContent = `${tod}, Jason.`;
 }
 
-// Phase 2 of the Operator architecture plan: display name per specialist role, keyed by the same
-// target.mode value task-orchestration.js already stores on every task. 'coder' and 'operator' are
-// the two real specialists; describeSupervisedTaskPresentation's roleLabel option defaults to
+// Phase 2 of the Operator architecture plan (extended for the Researcher role/handoff-
+// generalization build): display name per specialist role, keyed by the same target.mode value
+// task-orchestration.js already stores on every task. Built from OrionSpecialistRegistry rather
+// than a hand-maintained per-role literal, so a new specialist role added to specialist-registry.js
+// shows up here automatically. describeSupervisedTaskPresentation's roleLabel option defaults to
 // 'Coder' on its own, so an unregistered/missing role still renders exactly as before this
 // registry existed.
-const AGENT_ROLE_DISPLAY_NAMES = {
-  coder: 'Coder',
-  operator: 'Operator'
-};
+const AGENT_ROLE_DISPLAY_NAMES = window.OrionSpecialistRegistry
+  ? window.OrionSpecialistRegistry.list().reduce((map, definition) => {
+      map[definition.role] = definition.label;
+      return map;
+    }, {})
+  : { coder: 'Coder', operator: 'Operator', researcher: 'Researcher' };
 
 function supervisedTaskContext(task, isGlobalRunning = false, globalRunningId = '') {
   const taskId = String(task && task.taskId || '');
@@ -1592,6 +1606,7 @@ function setupProgressiveDisclosure() {
   document.getElementById('btn-mode-orion')?.addEventListener('click', () => setAppMode('orion'));
   document.getElementById('btn-mode-coder')?.addEventListener('click', () => setAppMode('coder'));
   document.getElementById('btn-mode-operator')?.addEventListener('click', () => setAppMode('operator'));
+  document.getElementById('btn-mode-researcher')?.addEventListener('click', () => setAppMode('researcher'));
   setAppMode(appMode, false); // Initialize from stored preference
 
   // Orion prompt chips — populate input (with focus) so Jason can review/edit before sending
@@ -2485,12 +2500,19 @@ function setupChatHandlers() {
   if (el.btnNewConversationOperator) {
     el.btnNewConversationOperator.addEventListener('click', () => createNewConversation('operator'));
   }
+  if (el.btnAddConversationResearcher) {
+    el.btnAddConversationResearcher.addEventListener('click', () => createNewConversation('researcher'));
+  }
+  if (el.btnNewConversationResearcher) {
+    el.btnNewConversationResearcher.addEventListener('click', () => createNewConversation('researcher'));
+  }
 
   // Item 9 (UI polish): sidebar conversation search, one plain substring filter per mode.
   [
     { input: el.conversationSearchOrion, mode: 'orion' },
     { input: el.conversationSearchCoder, mode: 'coder' },
-    { input: el.conversationSearchOperator, mode: 'operator' }
+    { input: el.conversationSearchOperator, mode: 'operator' },
+    { input: el.conversationSearchResearcher, mode: 'researcher' }
   ].forEach(({ input, mode }) => {
     if (!input) return;
     input.addEventListener('input', () => {
@@ -2577,7 +2599,7 @@ function structuredWorkspaceForConversation(conv, explicitPath = '') {
   const workspacePath = String(explicitPath || (conv && (conv.workspace || conv.projectPath || conv.dispatchProjectPath)) || '').trim();
   if (!RendererWorkspaceResolution) {
     return {
-      role: workspacePath ? ((mode === 'coder' || mode === 'operator') ? 'standalone_specialist' : 'active_project') : 'unresolved',
+      role: workspacePath ? ((mode === 'coder' || mode === 'operator' || mode === 'researcher') ? 'standalone_specialist' : 'active_project') : 'unresolved',
       path: workspacePath,
       project: { name: workspacePath.split(/[\\/]/).pop() || '', path: (conv && (conv.projectPath || conv.dispatchProjectPath)) || '' },
       source: 'legacy',
@@ -2755,6 +2777,13 @@ async function enqueueOrchestrationTask(options = {}) {
     },
     parentTaskId: String(options.parentTaskId || ''),
     rootOriginConversationId: String(options.rootOriginConversationId || originConversationId),
+    // Delegation-chain depth/loop guard (handoff-generalization piece): this is the single choke
+    // point where every specialist handoff's task packet is actually persisted (promoteWorkspaceTo*
+    // builds a "preflight" packet earlier only to derive title/objective/clarification — the
+    // canonical stored task comes from this buildTaskPacket call), so delegationChain has to be
+    // forwarded here or it silently never reaches the persisted task regardless of what the
+    // promoteWorkspaceTo* caller passed in.
+    delegationChain: Array.isArray(options.delegationChain) ? options.delegationChain : [],
     source: options.source || 'user-queue',
     images: Array.isArray(options.images) ? options.images : [],
     contextPacketIds: Array.isArray(options.contextPacketIds) ? options.contextPacketIds : [],
@@ -4184,7 +4213,11 @@ function conversationMode(conv) {
   // recognized directly, the same way 'orion'/'coder' already are, rather than falling through to
   // the projectPath-presence guess below (which predates operator and only distinguishes Coder
   // from Dispatch).
-  if (conv.mode === 'orion' || conv.mode === 'coder' || conv.mode === 'operator') return conv.mode;
+  // Researcher tab build: an explicitly-tagged Researcher conversation is recognized directly too,
+  // the same fix already applied for Operator above -- without this, a Researcher conversation
+  // (created from its own tab, or promoted via handoff) falls through to the projectPath-presence
+  // guess below and gets silently misclassified as 'orion'.
+  if (conv.mode === 'orion' || conv.mode === 'coder' || conv.mode === 'operator' || conv.mode === 'researcher') return conv.mode;
   return conv.projectPath ? 'coder' : 'orion';
 }
 
@@ -4292,17 +4325,18 @@ async function createNewConversation(mode = appMode) {
     startDispatchDraft();
     return null;
   }
-  // Coder and Operator both get a real standalone conversation record. Operator previously had
-  // no branch here at all, so calling this with 'operator' silently fell into the Dispatch-draft
-  // path above and produced an 'orion' conversation instead — item 10 of the Operator
-  // architecture plan.
+  // Coder, Operator, and Researcher all get a real standalone conversation record. Operator
+  // previously had no branch here at all, so calling this with 'operator' silently fell into the
+  // Dispatch-draft path above and produced an 'orion' conversation instead — item 10 of the
+  // Operator architecture plan. Researcher's own tab (built later, same pattern) needed the same
+  // fix so its "New Conversation" button does not silently produce an 'orion' conversation either.
   const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
   const title = 'New Conversation';
 
   const newConv = {
     id: newId,
     title: title,
-    mode: mode === 'coder' || mode === 'operator' ? mode : 'orion',
+    mode: mode === 'coder' || mode === 'operator' || mode === 'researcher' ? mode : 'orion',
     projectPath: '',
     workspace: '', // will slugify on first prompt
     messages: [],
@@ -4463,6 +4497,64 @@ function createStandaloneOperatorConversation({ title = 'New Operator Task', wor
   return newConv;
 }
 
+// Third specialist role (Researcher, handoff-generalization build). Parallel to
+// createCoderConversationForProject/createOperatorConversationForProject above, following the same
+// established convention (an explicit role tag at the literal call site rather than a shared
+// parameterized helper) rather than introducing a new pattern now that there are three of these.
+function createResearcherConversationForProject(projectPath, { title = 'New Researcher Task', select = false } = {}) {
+  const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+  const newConv = {
+    id: newId,
+    title: title || 'New Researcher Task',
+    mode: 'researcher',
+    projectPath,
+    workspace: projectPath,
+    messages: [],
+    tasks: [],
+    testResults: null
+  };
+
+  conversations.unshift(newConv);
+  saveConversationsToStorage();
+
+  if (select) {
+    selectConversation(newId);
+    el.chatInput.focus();
+  } else {
+    renderConversationList();
+  }
+
+  return newConv;
+}
+
+function createStandaloneResearcherConversation({ title = 'New Researcher Task', workspacePath = '', select = false } = {}) {
+  const newId = 'conv_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+  const resolvedWorkspace = String(workspacePath || '').trim()
+    || getStandaloneWorkspaceForTitle(title, newId);
+  const newConv = {
+    id: newId,
+    title: title || 'New Researcher Task',
+    mode: 'researcher',
+    projectPath: '',
+    workspace: resolvedWorkspace,
+    messages: [],
+    tasks: [],
+    testResults: null
+  };
+
+  conversations.unshift(newConv);
+  saveConversationsToStorage();
+
+  if (select) {
+    selectConversation(newId);
+    el.chatInput.focus();
+  } else {
+    renderConversationList();
+  }
+
+  return newConv;
+}
+
 function getStandaloneWorkspaceRoot() {
   const configured = (appConfig.standaloneWorkspaceRoot || '').trim();
   if (configured) return configured.replace(/[\\\/]+$/, '');
@@ -4534,16 +4626,22 @@ function getConversationRunWorkspace(conv) {
 
 function createPhoneConversation({ projectPath = '', dispatchProjectPath = '', contextSummary = '', mode = 'orion', title = 'New Phone Task' } = {}) {
   const convId = 'conv-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
-  const requestedMode = mode === 'coder' || mode === 'operator' ? mode : 'orion';
+  const requestedRole = String(mode || '').trim().toLowerCase();
+  const registeredSpecialistMode = !!(
+    window.OrionSpecialistRegistry
+    && typeof window.OrionSpecialistRegistry.has === 'function'
+    && window.OrionSpecialistRegistry.has(requestedRole)
+  );
+  const requestedMode = requestedRole === 'orion' || registeredSpecialistMode ? requestedRole : 'orion';
   const normalizedProjectPath = String(projectPath || '').trim();
   const normalizedDispatchProjectPath = requestedMode === 'orion' ? String(dispatchProjectPath || '').trim() : '';
   const conv = {
     id: convId,
     title,
-    // Coder remains the default owner for a project selected from the phone's project picker.
-    // An explicit Operator request is different: Operator may be standalone or workspace-bound,
-    // so preserve that role instead of silently coercing it into Dispatch or Coder.
-    mode: requestedMode === 'operator' ? 'operator' : (normalizedProjectPath ? 'coder' : requestedMode),
+    // Coder remains the default owner for a project selected from its phone project picker. An
+    // explicit registered specialist may be standalone or workspace-bound, so preserve that role
+    // instead of silently coercing it into Dispatch or Coder.
+    mode: requestedMode !== 'orion' ? requestedMode : (normalizedProjectPath ? 'coder' : 'orion'),
     messages: [],
     createdAt: Date.now(),
     workspace: normalizedProjectPath || normalizedDispatchProjectPath || '',
@@ -4740,13 +4838,17 @@ function scheduleTerminalDelegatedTaskReconciliation(conversation, durableTasks 
   if (String(conversation._terminalTaskReconciliationScheduled || '') === taskId) return true;
   conversation._terminalTaskReconciliationScheduled = taskId;
   // Route by the target conversation's own role rather than always assuming Coder - the same fix
-  // already applied to window.onOrchestrationTaskFinalized (Phase 3 piece 5) applies here too, for
-  // the separate startup-reconciliation path: a terminal Operator task discovered at startup
-  // (rather than during a live run) would otherwise still be reported as "Coder failed/completed."
+  // already applied to window.onOrchestrationTaskFinalized (Phase 3 piece 5, extended for
+  // Researcher) applies here too, for the separate startup-reconciliation path: a terminal
+  // Operator or Researcher task discovered at startup (rather than during a live run) would
+  // otherwise still be reported as "Coder failed/completed."
   const targetConv = conversations.find(c => c.id === coderConversationId);
-  const notifier = targetConv && conversationMode(targetConv) === 'operator'
+  const targetConvMode = targetConv ? conversationMode(targetConv) : '';
+  const notifier = targetConvMode === 'operator'
     ? notifySupervisorOfOperatorCompletion
-    : notifySupervisorOfCoderCompletion;
+    : targetConvMode === 'researcher'
+      ? notifySupervisorOfResearcherCompletion
+      : notifySupervisorOfCoderCompletion;
   Promise.resolve()
     .then(async () => {
       await notifier(coderConversationId, taskId);
@@ -4870,8 +4972,14 @@ function migrateConversations() {
   // Dispatch. Runs exactly once so it never touches genuinely new Dispatch conversations created
   // after this point.
   if (!localStorage.getItem('orionCoderModeBackfillDone')) {
+    // Bug found while building the Researcher tab: this one-time legacy backfill predates
+    // Operator and Researcher both, and only ever excluded 'orion'/'coder' from being stomped to
+    // 'coder'. In practice this flag is already set on any existing install, so it never re-runs
+    // there - but on a genuinely fresh install (or cleared localStorage), the very first
+    // migrateConversations() call would silently rewrite a brand-new operator- or
+    // researcher-tagged conversation to 'coder' before the explicit-mode check below ever runs.
     conversations.forEach(c => {
-      if (!c.projectPath && c.mode !== 'orion' && c.mode !== 'coder') {
+      if (!c.projectPath && c.mode !== 'orion' && c.mode !== 'coder' && c.mode !== 'operator' && c.mode !== 'researcher') {
         c.mode = 'coder';
       }
     });
@@ -4880,11 +4988,11 @@ function migrateConversations() {
   }
 
   conversations.forEach(c => {
-    // Phase 3 of the Operator architecture plan: this runs on every load (unlike the one-time
-    // backfill above), so an operator-tagged conversation must count as already explicit here.
-    // Without this, the inference below would silently stomp c.mode back to 'coder'/'orion' on
-    // every single app start.
-    const hasExplicitMode = c.mode === 'orion' || c.mode === 'coder' || c.mode === 'operator';
+    // Phase 3 of the Operator architecture plan (extended for the Researcher tab): this runs on
+    // every load (unlike the one-time backfill above), so an operator- or researcher-tagged
+    // conversation must count as already explicit here. Without this, the inference below would
+    // silently stomp c.mode back to 'coder'/'orion' on every single app start.
+    const hasExplicitMode = c.mode === 'orion' || c.mode === 'coder' || c.mode === 'operator' || c.mode === 'researcher';
     const matchingWorkspaceProject = (!c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace))
       ? projects.find(proj => {
         const lowerWorkspace = c.workspace.toLowerCase();
@@ -4921,7 +5029,7 @@ function migrateConversations() {
       c.projectPath = '';
       updated = true;
     }
-    if ((conversationMode(c) === 'coder' || conversationMode(c) === 'operator') && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)) {
+    if ((conversationMode(c) === 'coder' || conversationMode(c) === 'operator' || conversationMode(c) === 'researcher') && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)) {
       // Find if workspace is inside any project folder
       if (matchingWorkspaceProject) {
         c.projectPath = matchingWorkspaceProject;
@@ -5468,13 +5576,14 @@ function confirmConversationDelete(title) {
 }
 
 function renderConversationList() {
-  // Dispatch (Orion), Coder, and Operator each keep their own standalone-conversation history --
-  // a chat started in one never appears in another's list, even though none but Coder has a
-  // projectPath.
+  // Dispatch (Orion), Coder, Operator, and Researcher each keep their own standalone-conversation
+  // history -- a chat started in one never appears in another's list, even though none but Coder
+  // has a projectPath.
   const listConfigs = [
     { container: el.conversationList, mode: 'orion' },
     { container: el.conversationListCoder, mode: 'coder' },
-    { container: el.conversationListOperator, mode: 'operator' }
+    { container: el.conversationListOperator, mode: 'operator' },
+    { container: el.conversationListResearcher, mode: 'researcher' }
   ].filter(cfg => cfg.container);
   if (listConfigs.length === 0) return;
 
@@ -5803,7 +5912,7 @@ async function submitMessage() {
   if (!conv.workspace) {
     if (conv.projectPath) {
       conv.workspace = conv.projectPath;
-    } else if (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator') {
+    } else if (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator' || conversationMode(conv) === 'researcher') {
       conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id);
     }
   }
@@ -7331,7 +7440,7 @@ window.changeActiveWorkspace = function(folderPath, options = {}) {
     if (conv) {
       conv.workspace = folderPath;
       targetMode = conversationMode(conv);
-      const promoteProject = options.promoteProject === true || (options.promoteProject !== false && (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator'));
+      const promoteProject = options.promoteProject === true || (options.promoteProject !== false && (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator' || conversationMode(conv) === 'researcher'));
       promoteProjectForWorkspace = promoteProject;
       if (promoteProject) {
         conv.projectPath = folderPath;
@@ -7516,6 +7625,7 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
       precedingConversationSummary: preflightTask ? preflightTask.precedingConversationSummary : '',
       parentTaskId: String(options.parentTaskId || ''),
       rootOriginConversationId: String(options.rootOriginConversationId || options.sourceConversationId || ''),
+      delegationChain: Array.isArray(options.delegationChain) ? options.delegationChain : [],
       workspace: handoffWorkspace,
       requirements: preflightTask
         ? [...new Set([...(preflightTask.requirements || []), ...looseFindings])]
@@ -7755,6 +7865,7 @@ window.promoteWorkspaceToOperator = async function(options = {}) {
       precedingConversationSummary: preflightTask ? preflightTask.precedingConversationSummary : '',
       parentTaskId: String(options.parentTaskId || ''),
       rootOriginConversationId: String(options.rootOriginConversationId || options.sourceConversationId || ''),
+      delegationChain: Array.isArray(options.delegationChain) ? options.delegationChain : [],
       workspace: handoffWorkspace,
       requirements: preflightTask
         ? [...new Set([...(preflightTask.requirements || []), ...looseFindings])]
@@ -7828,6 +7939,243 @@ window.promoteWorkspaceToOperator = async function(options = {}) {
     warning: handoffWarnings.join(' ')
   };
 };
+
+// Third specialist promotion path (Researcher, handoff-generalization build). Mirrors
+// promoteWorkspaceToOperator's structure exactly (workspace resolution, standalone/system-operation
+// handling, context packet transfer, task enqueue, supervisor tracking) since that structure is
+// role-agnostic — only the target role, target functions, default titles, and the absence of
+// Operator's executionSurface field differ. Callable by Dispatch directly (handoff_to_researcher
+// from Dispatch) and by Coder/Operator mid-task via the same tool, now that handoff tools are
+// symmetric across specialist roles (see OPERATOR_TOOL_ALLOWLIST / Coder's tool filter / a future
+// RESEARCHER_TOOL_ALLOWLIST in agent.js).
+window.promoteWorkspaceToResearcher = async function(options = {}) {
+  const standalone = options.standalone === true;
+  const prompt = String(options.prompt || '').trim();
+  const originalUserMessage = String(options.originalUserMessage || prompt).trim();
+  const title = String(options.title || '').trim()
+    || (prompt ? generateConversationTitle(prompt) : 'New Researcher Task');
+  const originConv = conversations.find(item => item.id === String(options.sourceConversationId || ''));
+  const specialistDelegation = !!String(options.parentTaskId || '');
+  const researcherTaskSource = specialistDelegation ? 'specialist-researcher-handoff' : 'dispatch-researcher-handoff';
+  if (originConv) clearCurrentTurnTaskResolutionClarifications(originConv);
+  const semanticIntent = options.semanticIntent || (originConv && prompt
+    ? await classifyCurrentConversationIntent(originConv, originalUserMessage, { model: options.modelSelectValue })
+    : null);
+  const standaloneSystemOperation = standalone && (
+    options.standaloneSystemOperation === true
+    || !!(semanticIntent && semanticIntent.standaloneSystemOperation)
+  );
+  let standaloneWorkspacePath = '';
+  if (standalone) {
+    if (standaloneSystemOperation) {
+      try {
+        const homeDir = await window.api.getHomeDir();
+        standaloneWorkspacePath = typeof homeDir === 'string' ? homeDir.trim() : '';
+      } catch (_) {}
+    } else {
+      standaloneWorkspacePath = String(options.path || '').trim()
+        || getStandaloneWorkspaceForTitle(
+          title,
+          `researcher_handoff_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+        );
+    }
+  }
+  const folderPath = String(
+    (standalone ? standaloneWorkspacePath : options.path)
+    || currentWorkspace
+    || (standalone ? getDispatchWorkspaceRoot() : '')
+  ).trim();
+  if (!folderPath) return { success: false, error: 'No workspace path to promote.' };
+  let preflightTask = options.taskPacket && RendererTaskOrchestration
+    ? RendererTaskOrchestration.normalizeTaskRecord(options.taskPacket)
+    : null;
+  const handoffWorkspace = {
+    role: standalone ? 'standalone_specialist' : 'active_project',
+    path: folderPath,
+    project: {
+      name: standalone ? '' : (folderPath.replace(/[\\\/]+$/, '').split(/[\\\/]/).pop() || ''),
+      path: standalone ? '' : folderPath
+    },
+    source: standalone ? 'standalone-dispatch-researcher-handoff' : 'dispatch-researcher-handoff',
+    resolved: true
+  };
+  if (prompt && RendererTaskOrchestration && !preflightTask) {
+    const executionProfile = captureTaskExecutionProfile(options);
+    const preflight = RendererTaskOrchestration.buildTaskPacket({
+      originalUserMessage,
+      resolvedObjective: String(options.resolvedObjective || '').trim()
+        || (semanticIntent && semanticIntent.resolvedRequest)
+        || prompt,
+      title,
+      precedingMessages: taskContextMessages(originConv),
+      precedingConversationSummary: String(options.precedingConversationSummary || ''),
+      workspace: handoffWorkspace,
+      requirements: [
+        ...(Array.isArray(options.requirements) ? options.requirements : []),
+        ...(Array.isArray(options.findings) ? options.findings : [])
+      ],
+      constraints: Array.isArray(options.constraints) ? options.constraints : [],
+      unresolvedDecisions: Array.isArray(options.unresolvedDecisions) ? options.unresolvedDecisions : [],
+      originConversationId: String(options.sourceConversationId || ''),
+      originSessionId: String(options.sourceSessionId || ''),
+      originMessageId: String(options.sourceMessageId || ''),
+      targetConversationId: 'pending-researcher-conversation',
+      targetMode: 'researcher',
+      parentTaskId: String(options.parentTaskId || ''),
+      rootOriginConversationId: String(options.rootOriginConversationId || options.sourceConversationId || ''),
+      delegationChain: Array.isArray(options.delegationChain) ? options.delegationChain : [],
+      source: researcherTaskSource,
+      semanticIntent,
+      executionProfile,
+      timestamp: Date.now()
+    });
+    if (!preflight.success || !preflight.task) {
+      const clarification = preflight.clarification || 'What specific research should I hand to Researcher?';
+      if (originConv) persistTaskClarification(originConv, clarification);
+      return { success: false, needsClarification: true, error: clarification };
+    }
+    preflightTask = preflight.task;
+  }
+
+  if (!standalone) addProjectPath(folderPath);
+  const conv = standalone
+    ? createStandaloneResearcherConversation({
+        title,
+        workspacePath: folderPath,
+        select: options.open === true
+      })
+    : createResearcherConversationForProject(folderPath, {
+        title,
+        select: options.open === true
+      });
+
+  const requestedPacketIds = Array.isArray(options.contextPacketIds)
+    ? [...new Set(options.contextPacketIds.map(String).filter(Boolean))].slice(-5)
+    : [];
+  let assignedPacketIds = [];
+  let contextTransferError = '';
+  let createdTask = null;
+  const handoffWarnings = [];
+  if (requestedPacketIds.length > 0 && window.api && typeof window.api.assignContextPackets === 'function') {
+    try {
+      const assignment = await window.api.assignContextPackets(folderPath, requestedPacketIds, {
+        sourceConversationId: String(options.sourceConversationId || ''),
+        targetConversationId: conv.id,
+        requestedWork: prompt,
+        findings: Array.isArray(options.findings) ? options.findings : []
+      });
+      assignedPacketIds = assignment && Array.isArray(assignment.assignedPacketIds)
+        ? assignment.assignedPacketIds
+        : [];
+      if (!assignment || assignment.success === false) contextTransferError = (assignment && assignment.error) || 'Context packet assignment failed.';
+    } catch (error) {
+      contextTransferError = error.message || String(error);
+    }
+  }
+  if (assignedPacketIds.length > 0) {
+    conv.inheritedContext = {
+      packetIds: assignedPacketIds,
+      sourceConversationId: String(options.sourceConversationId || ''),
+      workspace: folderPath,
+      assignedAt: Date.now(),
+      active: true
+    };
+  }
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
+  saveConversationsToStorage();
+
+  if (prompt) {
+    const looseFindings = Array.isArray(options.findings)
+      ? options.findings.map(f => String(f || '').trim()).filter(Boolean).slice(0, 12)
+      : [];
+    const queuedPrompt = (assignedPacketIds.length === 0 && looseFindings.length > 0)
+      ? `${prompt}\n\nFindings from the caller's prior investigation (verify before relying on them):\n${looseFindings.map(f => `- ${f}`).join('\n')}`
+      : prompt;
+    const handoffTask = await enqueueOrchestrationTask({
+      prompt: queuedPrompt,
+      originalUserMessage: (preflightTask && preflightTask.originalUserMessage) || originalUserMessage,
+      resolvedObjective: preflightTask ? preflightTask.objective : queuedPrompt,
+      title,
+      targetConversationId: conv.id,
+      originConversationId: String(options.sourceConversationId || conv.id),
+      originSessionId: String(options.sourceSessionId || ''),
+      originMessageId: String(options.sourceMessageId || ''),
+      precedingMessages: taskContextMessages(originConv || conv),
+      precedingConversationSummary: preflightTask ? preflightTask.precedingConversationSummary : '',
+      parentTaskId: String(options.parentTaskId || ''),
+      rootOriginConversationId: String(options.rootOriginConversationId || options.sourceConversationId || ''),
+      delegationChain: Array.isArray(options.delegationChain) ? options.delegationChain : [],
+      workspace: handoffWorkspace,
+      requirements: preflightTask
+        ? [...new Set([...(preflightTask.requirements || []), ...looseFindings])]
+        : looseFindings,
+      constraints: preflightTask ? preflightTask.constraints : [],
+      semanticIntent,
+      unresolvedDecisions: preflightTask ? preflightTask.unresolvedDecisions : [],
+      source: researcherTaskSource,
+      modelSelectValue: (preflightTask && preflightTask.executionProfile && preflightTask.executionProfile.requestedModel)
+        || window.getSelectedModel(),
+      reasoningEffort: (preflightTask && preflightTask.executionProfile && preflightTask.executionProfile.requestedReasoning)
+        || appConfig.reasoningEffort
+        || 'auto',
+      executionProfile: (preflightTask && preflightTask.executionProfile)
+        || captureTaskExecutionProfile(options),
+      contextPacketIds: assignedPacketIds,
+      createdAt: Date.now()
+    });
+    if (!handoffTask.success) {
+      conversations = conversations.filter(item => item.id !== conv.id);
+      saveConversationsToStorage();
+      return {
+        success: false,
+        needsClarification: !!handoffTask.needsClarification,
+        error: handoffTask.clarification || handoffTask.error || 'The handoff task could not be resolved.'
+      };
+    }
+    conv.lastOrchestrationTaskId = handoffTask.task.taskId;
+    if (originConv) originConv.lastOwnedTaskId = handoffTask.task.taskId;
+    createdTask = handoffTask.task;
+    if (handoffTask.warning) handoffWarnings.push(handoffTask.warning);
+    try {
+      const originRole = originConv ? conversationMode(originConv) : '';
+      const originLabel = AGENT_ROLE_DISPLAY_NAMES[originRole] || 'Dispatch';
+      persistAssistantStatusMessage(conv.id, `Queued from ${originLabel} as ${handoffTask.task.title}. Researcher will start when the current turn finishes.`, {
+        source: 'queue-status',
+        dedupeKey: `dispatch-researcher-handoff-${handoffTask.task.taskId}`
+      });
+    } catch (error) {
+      handoffWarnings.push(`The task was queued, but its Researcher status message could not be saved: ${error.message || error}`);
+    }
+  }
+
+  try {
+    renderProjectsList();
+    renderConversationList();
+  } catch (error) {
+    handoffWarnings.push(`The handoff was queued, but the conversation list could not refresh: ${error.message || error}`);
+  }
+  return {
+    success: true,
+    projectPath: standalone ? '' : folderPath,
+    workspacePath: folderPath,
+    standalone,
+    conversationId: conv.id,
+    title: conv.title,
+    queued: !!prompt,
+    taskId: createdTask ? createdTask.taskId : '',
+    status: createdTask ? createdTask.status : (prompt ? 'pending' : 'completed'),
+    task: createdTask,
+    queueItem: createdTask
+      ? (window.promptQueue || []).find(item => item && item.taskId === createdTask.taskId) || null
+      : null,
+    contextPacketIds: assignedPacketIds,
+    contextTransferred: assignedPacketIds.length > 0,
+    contextTransferError,
+    committedWithWarning: handoffWarnings.length > 0,
+    warning: handoffWarnings.join(' ')
+  };
+};
+
 window.getSelectedModel = () => el.modelSelect ? el.modelSelect.value : appConfig.defaultModel;
 window.getKnownProjects = () => projects.slice();
 window.getRecentProjectCandidates = () => conversations
@@ -8382,7 +8730,7 @@ window.startPhoneCompanionTask = async (options = {}) => {
       if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
       saveConversationsToStorage();
     });
-  } else if (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator') {
+  } else if (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator' || conversationMode(conv) === 'researcher') {
     saveConversationsToStorage();
   } else {
     // A blank Dispatch request is only a client-side draft. Never leave an empty conversation in
@@ -8448,7 +8796,7 @@ async function submitPhoneCompanionPromptOnce(options) {
   if (!conv.workspace) {
     if (conv.projectPath) {
       conv.workspace = conv.projectPath;
-    } else if (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator') {
+    } else if (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator' || conversationMode(conv) === 'researcher') {
       conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id);
     }
   }
@@ -9684,6 +10032,12 @@ let _operatorTaskMonitorInterval = null;
 let _operatorTaskMonitorMeta = null;
 let _operatorTaskMonitorGeneration = 0;
 
+// Third specialist task monitor (Researcher, handoff-generalization build). Same separate-pair
+// convention as Operator's above, not shared with Coder or Operator's monitor state.
+let _researcherTaskMonitorInterval = null;
+let _researcherTaskMonitorMeta = null;
+let _researcherTaskMonitorGeneration = 0;
+
 // Kept as a thin renderer adapter for older callers; the deterministic policy
 // lives in supervisor-orchestration.js and is exercised independently.
 function classifySupervisorIntent(text) {
@@ -10367,8 +10721,8 @@ function reconcileDelegatedTaskCancellation(orionConv, durableTask, fallbackRole
     || orionConv.launchedTaskRole
     || fallbackRole
   ).toLowerCase();
-  const role = targetMode === 'operator' ? 'operator' : 'coder';
-  const roleName = role === 'operator' ? 'Operator' : 'Coder';
+  const role = AGENT_ROLE_DISPLAY_NAMES[targetMode] ? targetMode : 'coder';
+  const roleName = AGENT_ROLE_DISPLAY_NAMES[role] || 'Coder';
   const taskTitle = String(durableTask.title || orionConv.launchedCoderTaskTitle || `${roleName} task`);
 
   notifyOrionConversation(
@@ -10818,6 +11172,255 @@ async function notifySupervisorOfOperatorCompletion(finishedOperatorConvId, expe
   }
 }
 
+// Third specialist task monitor (Researcher, handoff-generalization build). Mirrors
+// startOperatorTaskMonitor/notifySupervisorOfOperatorCompletion exactly — same separate-pair
+// convention as Coder/Operator, not a shared generalized monitor, matching this codebase's existing
+// precedent of one monitor+notify pair per specialist role rather than one parameterized
+// implementation. summarizeCoderCompletion is reused as-is (confirmed role-agnostic — see the
+// comment on notifySupervisorOfOperatorCompletion above).
+window.startResearcherTaskMonitor = function(orionConvId, researcherConvId, taskId = '') {
+  stopResearcherTaskMonitor(_researcherTaskMonitorMeta);
+
+  _researcherTaskMonitorMeta = {
+    generation: ++_researcherTaskMonitorGeneration,
+    orionConvId,
+    researcherConvId,
+    taskId: String(taskId || ''),
+    startTime: Date.now(),
+    quietSince: 0,
+    inFlight: false
+  };
+
+  _researcherTaskMonitorInterval = setInterval(async () => {
+    const monitorMeta = _researcherTaskMonitorMeta;
+    if (!monitorMeta || monitorMeta.inFlight) return;
+    monitorMeta.inFlight = true;
+    try {
+      const { orionConvId, researcherConvId, taskId } = monitorMeta;
+
+      const orionConv = conversations.find(c => c.id === orionConvId);
+      const researcherConv = conversations.find(c => c.id === researcherConvId);
+      if (!orionConv || !researcherConv) {
+        stopResearcherTaskMonitor(monitorMeta);
+        return;
+      }
+      const durableTask = taskId ? orchestrationTaskCache.get(taskId) : null;
+      if (durableTask && ['cancelled', 'completed', 'failed'].includes(durableTask.status)) {
+        await notifySupervisorOfResearcherCompletion(researcherConvId, taskId);
+        if (_researcherTaskMonitorMeta === monitorMeta) stopResearcherTaskMonitor(monitorMeta);
+        return;
+      }
+
+      const isResearcherRunning = !!(window.isAgentRunning && window.isAgentRunning()
+        && window.getRunningConversationId && window.getRunningConversationId() === researcherConvId
+        && (!taskId || !window.getActiveRunTaskId || window.getActiveRunTaskId() === taskId));
+      const isQueuedForResearcher = Array.isArray(window.promptQueue)
+        && window.promptQueue.some(item => item && (taskId ? item.taskId === taskId : item.conversationId === researcherConvId));
+      const isQuiet = !isResearcherRunning && !isQueuedForResearcher;
+
+      if (isQuiet) {
+        if (!monitorMeta.quietSince) monitorMeta.quietSince = Date.now();
+        if (Date.now() - monitorMeta.quietSince > 60000) {
+          const stalledTitle = orionConv.launchedCoderTaskTitle || researcherConv.title || 'Researcher task';
+          let canonicalTask = durableTask;
+          if (taskId && typeof window.getOrchestrationTaskStatus === 'function') {
+            const statusRead = await window.getOrchestrationTaskStatus(taskId, orionConv.id);
+            if (_researcherTaskMonitorMeta !== monitorMeta) return;
+            if (statusRead && statusRead.success && statusRead.task) canonicalTask = statusRead.task;
+          }
+          if (canonicalTask && ['completed', 'cancelled', 'failed'].includes(canonicalTask.status)) {
+            await notifySupervisorOfResearcherCompletion(researcherConvId, taskId);
+            if (_researcherTaskMonitorMeta === monitorMeta) stopResearcherTaskMonitor(monitorMeta);
+            return;
+          }
+          let stalledTask = null;
+          if (taskId && canonicalTask && canonicalTask.status === 'active'
+              && typeof window.finalizeOrchestrationTask === 'function') {
+            stalledTask = await window.finalizeOrchestrationTask(taskId, 'failed', {
+              reason: 'The Researcher run went quiet without recording completion.',
+              expectedExecutionId: canonicalTask.execution && canonicalTask.execution.executionId
+            });
+            if (_researcherTaskMonitorMeta !== monitorMeta) return;
+          }
+          if (taskId && !stalledTask) {
+            monitorMeta.quietSince = Date.now();
+            return;
+          }
+          if (taskId && stalledTask.status !== 'failed') {
+            if (['completed', 'cancelled'].includes(stalledTask.status)) {
+              await notifySupervisorOfResearcherCompletion(researcherConvId, taskId);
+              if (_researcherTaskMonitorMeta !== monitorMeta) return;
+            }
+            stopResearcherTaskMonitor(monitorMeta);
+            return;
+          }
+          if (_researcherTaskMonitorMeta !== monitorMeta
+              || (taskId && String(orionConv.launchedCoderTaskId || '') !== taskId)) return;
+          notifyOrionConversation(orionConv, `Researcher went quiet on **${stalledTitle}** — the run ended without recording completion (it may have crashed or stalled). The work is parked under Active work; open the Researcher conversation to inspect it.`, 'supervisor-stall');
+          orionConv.lastDelegatedWork = {
+            taskId,
+            coderConversationId: researcherConvId,
+            title: stalledTitle,
+            projectPath: researcherConv.projectPath || inferDispatchProjectPath(orionConv),
+            status: taskId ? 'failed' : 'blocked',
+            subStatus: 'Went quiet without completing',
+            startedAt: orionConv.launchedCoderTaskStart || 0,
+            completedAt: Date.now(),
+            pendingCount: 0
+          };
+          orionConv.launchedCoderConvId = null;
+          orionConv.launchedCoderTaskId = null;
+          orionConv.launchedCoderTaskTitle = null;
+          orionConv.launchedCoderTaskStart = null;
+          orionConv.launchedTaskRole = null;
+          if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+          if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+          renderDesktopDispatchLanding();
+          stopResearcherTaskMonitor(monitorMeta);
+          return;
+        }
+      } else {
+        monitorMeta.quietSince = 0;
+      }
+
+      if (activeConversationId === orionConvId) {
+        syncDispatchCoderStatusCard(orionConvId, isResearcherRunning, isResearcherRunning ? researcherConvId : '');
+      }
+    } finally {
+      if (_researcherTaskMonitorMeta === monitorMeta) monitorMeta.inFlight = false;
+    }
+  }, 2000);
+};
+
+function stopResearcherTaskMonitor(expectedMeta = null) {
+  if (expectedMeta && _researcherTaskMonitorMeta !== expectedMeta) return false;
+  if (_researcherTaskMonitorInterval) {
+    clearInterval(_researcherTaskMonitorInterval);
+    _researcherTaskMonitorInterval = null;
+  }
+  _researcherTaskMonitorMeta = null;
+  return true;
+}
+window.stopResearcherTaskMonitor = stopResearcherTaskMonitor;
+
+async function notifySupervisorOfResearcherCompletion(finishedResearcherConvId, expectedTaskId = '') {
+  if (!finishedResearcherConvId) return;
+  const normalizedExpectedTaskId = String(expectedTaskId || '');
+  const orionConv = conversations.find(c => c.launchedCoderConvId === finishedResearcherConvId
+    && (!normalizedExpectedTaskId || String(c.launchedCoderTaskId || '') === normalizedExpectedTaskId));
+  if (!orionConv) return;
+  const taskId = String(normalizedExpectedTaskId || orionConv.launchedCoderTaskId
+    || (_researcherTaskMonitorMeta && _researcherTaskMonitorMeta.researcherConvId === finishedResearcherConvId && _researcherTaskMonitorMeta.taskId)
+    || '');
+  let durableTask = null;
+  if (taskId) {
+    const read = await window.getOrchestrationTaskStatus(taskId, orionConv.id);
+    if (!read || !read.success || !read.task) return;
+    durableTask = read.task;
+  }
+  if (taskId && String(orionConv.launchedCoderTaskId || '') !== taskId) return;
+  if (durableTask && (durableTask.status === 'pending' || durableTask.status === 'active')) return;
+  const existingTerminalNotification = Array.isArray(orionConv.messages)
+    ? orionConv.messages.find(message =>
+        message
+        && message.source === 'supervisor-completion'
+        && String(message.orchestrationTaskId || '') === taskId
+      )
+    : null;
+  if (existingTerminalNotification) {
+    orionConv.launchedCoderConvId = null;
+    orionConv.launchedCoderTaskId = null;
+    orionConv.launchedCoderTaskTitle = null;
+    orionConv.launchedCoderTaskStart = null;
+    orionConv.launchedTaskRole = null;
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(orionConv.id);
+    if (window.saveConversationsToStorage) window.saveConversationsToStorage();
+    return;
+  }
+  if (durableTask && durableTask.status === 'cancelled') {
+    if (_researcherTaskMonitorMeta && _researcherTaskMonitorMeta.researcherConvId === finishedResearcherConvId
+        && (!_researcherTaskMonitorMeta.taskId || _researcherTaskMonitorMeta.taskId === taskId)) {
+      stopResearcherTaskMonitor(_researcherTaskMonitorMeta);
+    }
+    reconcileDelegatedTaskCancellation(orionConv, durableTask, 'researcher');
+    return;
+  }
+
+  if (_researcherTaskMonitorMeta && _researcherTaskMonitorMeta.researcherConvId === finishedResearcherConvId
+      && (!_researcherTaskMonitorMeta.taskId || _researcherTaskMonitorMeta.taskId === taskId)) {
+    stopResearcherTaskMonitor(_researcherTaskMonitorMeta);
+  }
+
+  const researcherConv = conversations.find(c => c.id === finishedResearcherConvId);
+  const taskTitle = String(
+    durableTask && durableTask.title
+    || orionConv.launchedCoderTaskTitle
+    || (researcherConv && researcherConv.title)
+    || 'Researcher Task'
+  );
+  const elapsed = orionConv.launchedCoderTaskStart
+    ? Math.round((Date.now() - orionConv.launchedCoderTaskStart) / 60000)
+    : null;
+  const completion = summarizeCoderCompletion(durableTask, researcherConv);
+
+  let summaryText;
+  if (durableTask && durableTask.status === 'failed') {
+    summaryText = `Researcher failed **${taskTitle}**. The task state is failed; check the Researcher conversation for the recorded error before retrying.`;
+  } else if (durableTask && durableTask.status === 'completed') {
+    const elapsed_str = elapsed ? ` (${elapsed}m)` : '';
+    summaryText = `Researcher completed **${taskTitle}**${elapsed_str}.`;
+    if (completion.summary) summaryText += `\n\n${completion.summary}`;
+  } else {
+    const elapsed_str = elapsed ? ` (${elapsed}m)` : '';
+    summaryText = `Researcher finished **${taskTitle}**${elapsed_str}. Ready for your next direction.`;
+  }
+  if (interruptedTaskLivenessNotes.has(taskId)) {
+    summaryText += `\n\n${interruptedTaskLivenessNotes.get(taskId)}`;
+    interruptedTaskLivenessNotes.delete(taskId);
+  }
+
+  notifyOrionConversation(orionConv, summaryText, 'supervisor-completion', {
+    orchestrationTaskId: taskId,
+    orchestrationStatus: durableTask && durableTask.status || '',
+    verificationEvidence: completion.verification,
+    images: completion.images
+  });
+
+  orionConv.lastDelegatedWork = {
+    taskId,
+    coderConversationId: finishedResearcherConvId,
+    title: taskTitle,
+    objective: durableTask && durableTask.objective || '',
+    changedFiles: completion.changedFiles,
+    verification: completion.verification,
+    images: completion.images,
+    projectPath: (researcherConv && researcherConv.projectPath) || inferDispatchProjectPath(orionConv),
+    status: durableTask ? durableTask.status : 'completed',
+    subStatus: durableTask
+      ? (RendererTaskOrchestration ? RendererTaskOrchestration.describeTaskStatus(durableTask) : durableTask.status)
+      : 'Completed',
+    startedAt: orionConv.launchedCoderTaskStart || 0,
+    completedAt: (durableTask && (durableTask.completedAt || durableTask.failedAt || durableTask.cancelledAt)) || Date.now(),
+    pendingCount: 0
+  };
+
+  orionConv.launchedCoderConvId = null;
+  orionConv.launchedCoderTaskId = null;
+  orionConv.launchedCoderTaskTitle = null;
+  orionConv.launchedCoderTaskStart = null;
+  orionConv.launchedTaskRole = null;
+  orionConv.updatedAt = Date.now();
+  if (typeof window.markConversationDirty === 'function') {
+    window.markConversationDirty(orionConv.id);
+    if (researcherConv) window.markConversationDirty(researcherConv.id);
+  }
+  if (typeof window.flushConversationsToStorage === 'function') {
+    await window.flushConversationsToStorage(orionConv.id);
+  } else if (window.saveConversationsToStorage) {
+    window.saveConversationsToStorage();
+  }
+}
+
 async function resumeParentTaskAfterDelegatedChild(childTaskValue) {
   const childTask = childTaskValue && typeof childTaskValue === 'object' ? childTaskValue : null;
   if (!childTask || !window.api || typeof window.api.getOrchestrationTask !== 'function') {
@@ -10856,7 +11459,7 @@ async function resumeParentTaskAfterDelegatedChild(childTaskValue) {
 
   const childStatus = String(childTask.status || '');
   const childMode = String(childTask.target && childTask.target.mode || '').toLowerCase();
-  const childRole = childMode === 'operator' ? 'Operator' : (childMode === 'coder' ? 'Coder' : 'specialist');
+  const childRole = AGENT_ROLE_DISPLAY_NAMES[childMode] || 'specialist';
   if (childStatus === 'cancelled') {
     if (typeof window.api.cancelOrchestrationTask !== 'function') {
       return { success: false, action: 'cancel_parent_failed', error: 'Task cancellation service is unavailable.' };
@@ -10933,8 +11536,11 @@ window.onOrchestrationTaskFinalized = async function(taskId, targetConversationI
   // matches on the reused launchedCoderConvId field, so it would "work" but mislabel every message
   // as "Coder failed/completed..." for a run that was never Coder).
   const targetConv = conversations.find(c => c.id === targetConversationId);
-  if (targetConv && conversationMode(targetConv) === 'operator') {
+  const targetRole = targetConv ? conversationMode(targetConv) : '';
+  if (targetRole === 'operator') {
     await notifySupervisorOfOperatorCompletion(targetConversationId, taskId);
+  } else if (targetRole === 'researcher') {
+    await notifySupervisorOfResearcherCompletion(targetConversationId, taskId);
   } else {
     await notifySupervisorOfCoderCompletion(targetConversationId, taskId);
   }
@@ -11116,7 +11722,9 @@ function syncDispatchCoderStatusCard(
     card.dataset.agentRole = String(task.target && task.target.mode || 'coder').toLowerCase();
     card.setAttribute('aria-label', card.dataset.agentRole === 'operator'
       ? `Operator screen control: ${task.title || 'desktop task'}`
-      : `Coder task: ${task.title || 'task'}`);
+      : card.dataset.agentRole === 'researcher'
+        ? `Researcher task: ${task.title || 'research task'}`
+        : `Coder task: ${task.title || 'task'}`);
   }
   return true;
 }

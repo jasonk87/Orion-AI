@@ -28,8 +28,9 @@
     'stored_memory_lookup',
     'memory_write'
   ]);
-  const EXECUTION_TARGETS = Object.freeze(['none', 'coder', 'operator']);
+  const EXECUTION_TARGETS = Object.freeze(['none', 'dispatch', 'coder', 'operator']);
   const EXECUTION_SURFACES = Object.freeze(['none', 'desktop', 'browser', 'process']);
+  const ORCHESTRATION_ACTIONS = Object.freeze(['none', 'schedule_followup']);
   const INSPECTION_BREADTHS = Object.freeze(['none', 'single_file', 'focused', 'broad']);
   const RUNTIME_SCAFFOLD_SOURCES = new Set([
     'agent-start-blocked',
@@ -202,7 +203,11 @@
       '- memoryContext only requests read-only retrieval. It never authorizes an action or changes memoryIntent. Leave it disabled when no particular durable fact or preference would materially improve the answer.',
       '- Set reasoningPolicyHint.contextNeed to historical for conversation_recall or a stored_memory_lookup that genuinely needs history. A memory_policy explanation does not need historical conversation retrieval.',
       '- requiresExecution describes whether satisfying the resolved request requires tools or state mutation. It does not authorize execution.',
-      '- executionTarget selects the specialist for executable work. Use operator for hands-on native desktop/browser/application/process/screenshot work. Use coder for source code, project files, builds, tests, installs, commands tied to a codebase, or creating local artifacts.',
+      '- executionTarget selects who owns the immediate requested operation. Use dispatch for durable orchestration that Dispatch can perform itself, currently reminders and scheduled follow-ups. Use operator for hands-on native desktop/browser/application/process/screenshot work. Use coder for source code, project files, builds, tests, installs, commands tied to a codebase, or creating local artifacts.',
+      '- Classify the action the user is requesting NOW, not an action mentioned inside a reminder payload. "Remind me at 2 to start OpenAI" asks Dispatch to schedule a reminder; it does not ask Operator to start OpenAI now. Set executionTarget=dispatch, orchestrationAction=schedule_followup, and put the future reminder wording in scheduledRequest.prompt.',
+      '- A plain reminder is one-shot. Set scheduledRequest.recurring=true only when the user explicitly requests repetition such as every day, weekdays, or every hour. Never infer recurrence merely because atTime is present.',
+      '- scheduledRequest.deliveryOnly is true when the future event should only surface the requested reminder/message. It is false when the future event must perform fresh work such as checking weather, inspecting a build, or operating an app. Mentioning a future action inside reminder text does not authorize that action.',
+      '- For a one-shot clock-time request, return atTime in local 24-hour HH:MM form and recurring=false. Do not look up the time, timezone, IP address, or location; the durable scheduler resolves it against the desktop clock.',
       '- executionSurface describes Operator work without relying on keyword rules: desktop for visible native application/screen interaction or screenshots, browser for live page interaction, process for process lifecycle/monitoring that does not require visual control, and none for Coder or non-executable work.',
       '- Honor an explicit, appropriate request for Operator or Coder. For mixed work, choose the specialist that owns the immediate next operation; code-first changes go to Coder before later UI verification by Operator.',
       '- Preserve the target specialist of an active or pending owned task when the turn steers or continues that same task. Never create a second specialist task merely because the wording is contextual.',
@@ -240,8 +245,19 @@
           unresolvedDecisions: []
         },
         executionScope: 'none | read_only | mutating',
-        executionTarget: 'none | coder | operator',
+        executionTarget: 'none | dispatch | coder | operator',
         executionSurface: 'none | desktop | browser | process',
+        orchestrationAction: 'none | schedule_followup',
+        scheduledRequest: {
+          prompt: '',
+          purpose: '',
+          delaySeconds: 0,
+          repeatEverySeconds: 0,
+          atTime: '',
+          onDays: '',
+          recurring: false,
+          deliveryOnly: false
+        },
         inspectionTarget: 'none | local_system | workspace | project',
         inspectionBreadth: 'none | single_file | focused | broad',
         standaloneSystemOperation: false
@@ -280,6 +296,8 @@
         executionScope: 'none',
         executionTarget: 'none',
         executionSurface: 'none',
+        orchestrationAction: 'none',
+        scheduledRequest: { prompt: '', purpose: '', delaySeconds: 0, repeatEverySeconds: 0, atTime: '', onDays: '', recurring: false, deliveryOnly: false },
         inspectionTarget: 'none',
         inspectionBreadth: 'none',
         standaloneSystemOperation: false,
@@ -305,6 +323,8 @@
       executionScope: 'none',
       executionTarget: 'none',
       executionSurface: 'none',
+      orchestrationAction: 'none',
+      scheduledRequest: { prompt: '', purpose: '', delaySeconds: 0, repeatEverySeconds: 0, atTime: '', onDays: '', recurring: false, deliveryOnly: false },
       inspectionTarget: 'none',
       inspectionBreadth: 'none',
       standaloneSystemOperation: false,
@@ -391,6 +411,27 @@
     const executionSurface = executionTarget === 'operator' && EXECUTION_SURFACES.includes(parsed.executionSurface)
       ? parsed.executionSurface
       : 'none';
+    const requestedOrchestrationAction = ORCHESTRATION_ACTIONS.includes(parsed.orchestrationAction)
+      ? parsed.orchestrationAction
+      : 'none';
+    const orchestrationAction = executionTarget === 'dispatch'
+      ? requestedOrchestrationAction
+      : 'none';
+    const requestedSchedule = parsed.scheduledRequest && typeof parsed.scheduledRequest === 'object'
+      ? parsed.scheduledRequest
+      : {};
+    const scheduledRequest = orchestrationAction === 'schedule_followup'
+      ? {
+          prompt: string(requestedSchedule.prompt, 4000),
+          purpose: string(requestedSchedule.purpose, 200),
+          delaySeconds: Math.max(0, Number(requestedSchedule.delaySeconds) || 0),
+          repeatEverySeconds: Math.max(0, Number(requestedSchedule.repeatEverySeconds) || 0),
+          atTime: string(requestedSchedule.atTime, 20),
+          onDays: string(requestedSchedule.onDays, 100),
+          recurring: requestedSchedule.recurring === true,
+          deliveryOnly: requestedSchedule.deliveryOnly === true
+        }
+      : { prompt: '', purpose: '', delaySeconds: 0, repeatEverySeconds: 0, atTime: '', onDays: '', recurring: false, deliveryOnly: false };
     return {
       intent: normalizedIntent,
       requiresExecution: parsed.requiresExecution === true,
@@ -422,6 +463,8 @@
         : (parsed.requiresExecution === true ? 'mutating' : 'none'),
       executionTarget,
       executionSurface,
+      orchestrationAction,
+      scheduledRequest,
       inspectionTarget,
       inspectionBreadth: INSPECTION_BREADTHS.includes(parsed.inspectionBreadth)
         ? parsed.inspectionBreadth
@@ -450,13 +493,17 @@
     const recentTargetMode = taskTargetMode(input.recentOwnedTask);
     if (recentTargetMode && intent === 'context_followup') return recentTargetMode;
 
+    const explicitTarget = string(classification.executionTarget, 40).toLowerCase();
+    const executionSurface = string(classification.executionSurface, 40).toLowerCase();
+    if (explicitTarget === 'dispatch'
+        && ORCHESTRATION_ACTIONS.includes(string(classification.orchestrationAction, 80).toLowerCase())
+        && string(classification.orchestrationAction, 80).toLowerCase() !== 'none') {
+      return 'dispatch';
+    }
     const inspectionTarget = string(classification.inspectionTarget, 80).toLowerCase();
     if (classification.standaloneSystemOperation === true || inspectionTarget === 'local_system') {
       return 'operator';
     }
-
-    const explicitTarget = string(classification.executionTarget, 40).toLowerCase();
-    const executionSurface = string(classification.executionSurface, 40).toLowerCase();
     // A project can be the thing shown on screen without turning the immediate work into source
     // work. Playtesting a game, clicking through a desktop build, or visually checking a browser
     // app still belongs to Operator even though the evidence is associated with a project. The old
@@ -522,6 +569,7 @@
     if (!classification || typeof classification !== 'object') return false;
     return classification.requiresExecution === true
       && ['new_task', 'context_followup'].includes(classification.intent)
+      && classification.executionTarget !== 'dispatch'
       && !requiresProjectWorkspace(classification);
   }
 
@@ -533,6 +581,7 @@
     TARGETS,
     EXECUTION_TARGETS,
     EXECUTION_SURFACES,
+    ORCHESTRATION_ACTIONS,
     INSPECTION_BREADTHS,
     MEMORY_INTENTS,
     isRuntimeScaffoldingMessage,

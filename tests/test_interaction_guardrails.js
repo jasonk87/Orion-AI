@@ -1037,7 +1037,7 @@ test('Dispatch uses Projects fallback while Coder standalone conversations get i
   // Phase 3 of the Operator architecture plan: operator conversations get this same auto-bind
   // treatment as Coder now (both do real workspace-bound artifact work), so the condition gained
   // an explicit operator clause alongside coder.
-  t.ok(rendererJs.includes("(conversationMode(c) === 'coder' || conversationMode(c) === 'operator') && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)"), 'migration never promotes generated standalone workspaces or Dispatch conversations into projects, and now treats operator the same as coder');
+  t.ok(rendererJs.includes("(conversationMode(c) === 'coder' || conversationMode(c) === 'operator' || conversationMode(c) === 'researcher') && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)"), 'migration never promotes generated standalone workspaces or Dispatch conversations into projects, and now treats operator and researcher the same as coder');
   // Phase 3 of the Operator architecture plan: Operator does real workspace-bound artifact work
   // like Coder, so change_workspace promotes both into project scope now, not Coder alone. Dispatch
   // still takes the separate known-projects branch below, unaffected by this change.
@@ -1152,8 +1152,13 @@ test('token-saving prompt cleanup keeps tool schemas authoritative', (t) => {
   const coderTools = namesForMode('coder');
   t.ok(dispatchTools.length > 0 && dispatchTools.length < coderTools.length,
     'Dispatch receives a strictly narrower tool surface than Coder');
-  t.ok(dispatchTools.every(name => coderTools.includes(name)),
-    'Dispatch is offered only tools that exist in the full surface');
+  // Handoff-generalization: Coder's own tool surface now deliberately excludes handoff_to_coder
+  // (no self-handoff — see the coder branch of buildAgentToolDeclarations), so Coder is no longer
+  // a strict superset of every other role's tools the way it was when there were only two
+  // specialists. Dispatch still needs handoff_to_coder to promote work to Coder in the first
+  // place, so that one tool is an explicit, deliberate exception here, not a leak.
+  t.ok(dispatchTools.every(name => coderTools.includes(name) || name === 'handoff_to_coder'),
+    'Dispatch is offered only tools that exist in the full surface, plus the one handoff tool Coder deliberately excludes for itself');
   t.notOk(dispatchTools.includes('patch_file'), 'Dispatch is not offered direct file editing');
   t.ok(dispatchTools.includes('handoff_to_coder'), 'Dispatch keeps the handoff tool it exists to use');
   t.ok(agentJs.includes("'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model'"), 'Dispatch can inspect existing project artwork through read-only visual tools');
@@ -1183,9 +1188,14 @@ test('Operator receives a narrower, desktop/browser-execution tool surface, not 
 
   t.ok(operatorTools.length > 0 && operatorTools.length < coderTools.length,
     'Operator receives a strictly narrower tool surface than Coder');
-  const operatorOnlyTools = new Set(['open_application', 'click_ui_element', 'open_chrome_favorite']);
+  // Handoff-generalization: Operator now deliberately has handoff_to_coder and handoff_to_researcher
+  // (symmetric per-role handoff access — see OPERATOR_TOOL_ALLOWLIST), and handoff_to_coder is one
+  // of the tools Coder's own surface deliberately excludes for itself (no self-handoff), so it is
+  // not present in coderTools either. That is expected, not a leak: it is listed explicitly here
+  // alongside the pre-existing bounded GUI-only exceptions.
+  const operatorOnlyTools = new Set(['open_application', 'click_ui_element', 'open_chrome_favorite', 'handoff_to_coder']);
   t.ok(operatorTools.every(name => coderTools.includes(name) || operatorOnlyTools.has(name)),
-    'Operator tools come from the shared surface except for bounded role-specific desktop controls');
+    'Operator tools come from the shared surface except for bounded role-specific desktop controls and its own deliberate handoff access');
 
   // Not code/mission/skill tools, per the brief.
   t.notOk(operatorTools.includes('patch_file'), 'Operator cannot edit source files');
@@ -1245,12 +1255,19 @@ test('Dispatch can hand work to Operator through its own dedicated tool, distinc
     'AGENT_HANDOFF_IMPLEMENTATIONS registers a real Operator monitor implementation');
 
   // Field reuse: Operator handoffs are tracked through the same launchedCoder* field names as
-  // Coder (by design - see the comment on both handoff cases), distinguished by launchedTaskRole.
-  t.ok(agentJs.includes("conversation.launchedTaskRole = handoffRole") , 'the Operator handoff case records its role the same way the Coder handoff case does');
+  // Coder, distinguished by launchedTaskRole. Handoff-generalization moved this line into the
+  // single shared executeSpecialistHandoff implementation (agent.js) that all three handoff tools
+  // now dispatch into, rather than each handoff case setting it separately with its own
+  // role-specific variable name — so this now pins the shared function's line plus proof that both
+  // the Coder and Operator case blocks actually route into it instead of keeping their own copies.
+  t.ok(agentJs.includes("conversation.launchedTaskRole = role;"), 'the shared specialist-handoff implementation records the target role');
+  t.ok(agentJs.includes("async function executeSpecialistHandoff("), 'handoff_to_coder/handoff_to_operator/handoff_to_researcher share one implementation instead of three hand-copies');
+  t.ok(agentJs.includes("return await executeSpecialistHandoff('coder',"), "the Coder handoff case dispatches into the shared implementation");
+  t.ok(agentJs.includes("return await executeSpecialistHandoff('operator',"), "the Operator handoff case dispatches into the shared implementation");
 
   // Routing prose: Dispatch's own prompt actually tells it when to prefer Operator over Coder.
   t.ok(agentJs.includes('Route to the operator'), 'DISPATCHER_INSTRUCTION explains when to route to Operator instead of Coder');
-  t.ok(agentJs.includes('MUST call handoff_to_coder or handoff_to_operator'), 'the permission-boundary invariant now names both specialists');
+  t.ok(agentJs.includes('MUST call handoff_to_coder, handoff_to_operator, or handoff_to_researcher'), 'the permission-boundary invariant now names all three specialists');
 
   // Renderer: the promotion + monitor + notification trio actually exist, not just referenced.
   t.ok(rendererJs.includes('window.promoteWorkspaceToOperator = async function'), 'renderer implements the Operator promotion entry point');
@@ -1260,9 +1277,14 @@ test('Dispatch can hand work to Operator through its own dedicated tool, distinc
   t.ok(rendererJs.includes('function createOperatorConversationForProject'), 'renderer implements an Operator-specific project conversation constructor');
   t.ok(rendererJs.includes('function createStandaloneOperatorConversation'), 'renderer implements an Operator-specific standalone conversation constructor');
 
-  // The finalization hook is role-aware instead of always assuming Coder.
-  t.ok(rendererJs.includes("conversationMode(targetConv) === 'operator'") && rendererJs.includes('notifySupervisorOfOperatorCompletion(targetConversationId, taskId)'),
+  // The finalization hook is role-aware instead of always assuming Coder. Refactored from an
+  // inline conversationMode(targetConv) === 'operator' ternary into a targetRole variable once a
+  // third branch (researcher) was added, since a two-way ternary doesn't extend cleanly to three
+  // outcomes -- same targetRole/conversationMode(targetConv) computation, same routing behavior.
+  t.ok(rendererJs.includes("const targetRole = targetConv ? conversationMode(targetConv) : ''") && rendererJs.includes("if (targetRole === 'operator')") && rendererJs.includes('notifySupervisorOfOperatorCompletion(targetConversationId, taskId)'),
     'window.onOrchestrationTaskFinalized routes Operator task completions to the Operator notifier, not the Coder one');
+  t.ok(rendererJs.includes("else if (targetRole === 'researcher')") && rendererJs.includes('notifySupervisorOfResearcherCompletion(targetConversationId, taskId)'),
+    'window.onOrchestrationTaskFinalized routes Researcher task completions to the Researcher notifier too, not the Coder one');
 
   // Display name registry (piece 6).
   t.ok(rendererJs.includes("operator: 'Operator'"), 'AGENT_ROLE_DISPLAY_NAMES includes a display name for the operator role');

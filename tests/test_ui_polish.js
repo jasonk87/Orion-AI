@@ -8,6 +8,7 @@ const main = fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8').replace
 const renderer = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8').replace(/\r\n/g, '\n');
 const preload = fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8').replace(/\r\n/g, '\n');
 const companionHtml = fs.readFileSync(path.join(__dirname, '../lib/companion-html.js'), 'utf8').replace(/\r\n/g, '\n');
+const renderedCompanionHtml = require('../lib/companion-html')('DESKTOP-TEST').replace(/\r\n/g, '\n');
 const taskOrchestration = fs.readFileSync(path.join(__dirname, '../task-orchestration.js'), 'utf8').replace(/\r\n/g, '\n');
 const ipcUiJs = fs.readFileSync(path.join(__dirname, '../lib/ipc-ui.js'), 'utf8').replace(/\r\n/g, '\n');
 
@@ -48,8 +49,8 @@ test('phone companion finishes with the same dark theme and complete mission hie
   t.ok(companionHtml.includes('#task-list-card { grid-area: mission; }'), 'Task List has an explicit mobile layout area');
   t.ok(companionHtml.includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
   t.ok(companionHtml.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
-  t.ok(companionHtml.includes('state-freshness-v31'), 'phone shell exposes the current UI build version');
-  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v28"), 'phone service worker cache is bumped for the current UI build');
+  t.ok(companionHtml.includes('state-freshness-v32'), 'phone shell exposes the current UI build version');
+  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v30"), 'phone service worker cache is bumped for the current UI build');
   t.ok(companionHtml.includes('window.isSecureContext'), 'phone explains when browser push is blocked by an insecure context');
   t.ok(companionHtml.includes('Phone push needs HTTPS or localhost'), 'phone tells the user that HTTPS is required for push notifications');
   t.ok(companionHtml.includes("companionFetch('/api/push-subscribe'"), 'phone stores push subscriptions through the authenticated fetch path');
@@ -130,12 +131,13 @@ test('phone companion uses a global drawer and specialist operations surfaces', 
   t.ok(companionHtml.includes('id="app-drawer-overlay"'), 'phone has a global app drawer');
   t.ok(companionHtml.includes('data-drawer-destination="orion"'), 'drawer exposes Dispatch as a top-level destination');
   t.notOk(companionHtml.includes('data-drawer-destination="history"'), 'History is not a top-level destination');
-  t.ok(companionHtml.includes('data-drawer-destination="coder"'), 'drawer exposes Coder as a top-level destination');
-  t.ok(companionHtml.includes('data-drawer-destination="operator"'), 'drawer exposes Operator as a top-level destination');
+  t.ok(renderedCompanionHtml.includes('data-drawer-destination="coder"'), 'drawer exposes Coder as a top-level destination');
+  t.ok(renderedCompanionHtml.includes('data-drawer-destination="operator"'), 'drawer exposes Operator as a top-level destination');
+  t.ok(renderedCompanionHtml.includes('data-drawer-destination="researcher"'), 'drawer exposes Researcher as a top-level destination');
   t.ok(companionHtml.includes('data-drawer-destination="settings"'), 'drawer exposes Settings as an app-level destination');
   t.ok(companionHtml.includes('id="screen-settings"'), 'phone has a dedicated Settings screen');
   t.ok(companionHtml.includes('Check local Orion files'), 'update controls live in Settings copy');
-  t.ok(companionHtml.includes("const isSpecialist = mode === 'coder' || mode === 'operator';"), 'Coder and Operator share specialist operations tabs');
+  t.ok(companionHtml.includes('const isSpecialist = isCompanionSpecialistMode(mode);'), 'all registered specialists share operations tabs');
   t.ok(companionHtml.includes("bottomNav.classList.toggle('hidden', !isSpecialist)"), 'specialist operations tabs are hidden in Dispatch');
   t.ok(companionHtml.includes('id="task-list-card"'), 'Status shows the task-list card');
   t.ok(companionHtml.includes('function renderPhoneTaskList'), 'Status renders the actual conversation checklist');
@@ -266,8 +268,8 @@ test('Dispatch opens as a focused front door without project-driven clutter', (t
   t.ok(renderer.includes("window.markConversationDirty(orionConv.id)"), 'delegated-work completion receipts persist with their Dispatch transcript');
   t.ok(companionHtml.includes("if (resetRequested) {\n      localStorage.removeItem(sessionKey);"), 'ordinary phone UI updates preserve the paired device session');
   t.ok(companionHtml.includes('coder-workspace-picker'), 'phone keeps the Coder workspace picker');
-  t.ok(companionHtml.includes('#screen-new-chat.dispatch-mode .coder-workspace-picker,') && companionHtml.includes('#screen-new-chat.operator-mode .coder-workspace-picker { display: none; }'), 'Dispatch and standalone Operator hide the Coder workspace picker on new chat');
-  t.ok(companionHtml.includes("newChatPromptEl.placeholder = isDispatchStart") && companionHtml.includes("isOperatorStart ? 'Ask Operator to open, click, type, or navigate...' : 'What should we build?'"), 'new chat placeholder is mode-aware across Dispatch, Coder, and Operator');
+  t.ok(companionHtml.includes('#screen-new-chat.dispatch-mode .coder-workspace-picker,') && companionHtml.includes('#screen-new-chat.researcher-mode .coder-workspace-picker { display: none; }'), 'Dispatch and standalone non-Coder specialists hide the Coder workspace picker on new chat');
+  t.ok(companionHtml.includes("newChatPromptEl.placeholder = isDispatchStart") && companionHtml.includes("'Ask Researcher to investigate...'"), 'new chat placeholder is mode-aware across Dispatch and all registered specialists');
   t.end();
 });
 
@@ -443,7 +445,9 @@ test('agent presence communicates meaningful execution phases', (t) => {
     'phone uses the shared verification state language');
   t.ok(styles.includes('data-agent-role="operator"') && styles.includes('SCREEN CONTROL'), 'desktop exposes a distinct compact screen-control banner');
   t.ok(companionHtml.includes('operator-control') && companionHtml.includes('Screen control ·'), 'phone identifies active Operator takeover instead of generic activity');
-  t.ok(companionHtml.includes("roleLabel: supervisedTask.target && supervisedTask.target.mode === 'operator' ? 'Operator' : 'Coder'"), 'phone derives the specialist label from the durable task role');
+  t.ok(companionHtml.includes('const roleDefinition = companionSpecialistDefinition(roleMode);')
+      && companionHtml.includes("return roleDefinition ? roleDefinition.label : 'Specialist';"),
+    'phone derives specialist labels from the shared registry, including Researcher');
   t.end();
 });
 

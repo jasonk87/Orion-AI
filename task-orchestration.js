@@ -14,6 +14,66 @@
     return mode === 'orion' || !!(SpecialistRegistry && SpecialistRegistry.has(mode));
   }
 
+  // Generalized so a new specialist role only needs to be added to specialist-registry.js, not
+  // hand-copied into this message too. 'Dispatch' is prepended since it is a valid task target
+  // ('orion') but is not itself a specialist-registry entry.
+  function describeRegisteredTaskTargets() {
+    const specialistLabels = SpecialistRegistry && typeof SpecialistRegistry.list === 'function'
+      ? SpecialistRegistry.list().map(definition => definition.label)
+      : [];
+    return ['Dispatch', ...specialistLabels];
+  }
+
+  // "Dispatch, Coder, Operator, or Researcher" instead of a bare comma join — reads as a real
+  // English list regardless of how many specialist roles are registered.
+  function joinAsEnglishList(items) {
+    const values = (items || []).filter(Boolean);
+    if (values.length <= 1) return values.join('');
+    if (values.length === 2) return `${values[0]} or ${values[1]}`;
+    return `${values.slice(0, -1).join(', ')}, or ${values[values.length - 1]}`;
+  }
+
+  // ── Delegation chain guard (handoff-generalization piece) ──────────────────────────────────
+  // Real, code-enforced replacement for the old "please don't create another handoff for the same
+  // completed child" prose-only instruction. A task's delegationChain is the ordered list of
+  // specialist roles that have already handled this lineage, from the original Dispatch handoff
+  // down to (and including) the task currently deciding whether to delegate further. Every
+  // specialist role can now hand off to every other role (see specialist-registry.js
+  // handoffToolNamesFor), which means an unchecked chain could bounce forever
+  // (coder -> operator -> coder -> operator -> ...) once more than one role can initiate a
+  // handoff. This guard makes that structurally impossible rather than relying on the model
+  // reading and honoring an instruction.
+  const MAX_DELEGATION_DEPTH = 3; // one hop per registered specialist role today (coder/operator/researcher)
+
+  function evaluateDelegationHandoff(currentChainValue, targetRoleValue) {
+    const chain = uniqueStrings(Array.isArray(currentChainValue) ? currentChainValue : [])
+      .map(role => String(role || '').trim().toLowerCase())
+      .filter(Boolean);
+    const targetRole = String(targetRoleValue || '').trim().toLowerCase();
+    if (!targetRole) {
+      return { allowed: false, reason: 'No target specialist role was specified for this handoff.', chain, nextChain: chain };
+    }
+    if (chain.includes(targetRole)) {
+      const attempted = [...chain, targetRole].join(' → ');
+      return {
+        allowed: false,
+        reason: `Handoff blocked: ${attempted} would hand this task back to "${targetRole}", which already appears earlier in this same delegation chain. Blocked to prevent an infinite handoff loop.`,
+        chain,
+        nextChain: chain
+      };
+    }
+    const nextChain = [...chain, targetRole];
+    if (nextChain.length > MAX_DELEGATION_DEPTH) {
+      return {
+        allowed: false,
+        reason: `Handoff blocked: this would extend the delegation chain to ${nextChain.length} hops (${nextChain.join(' → ')}), past the maximum of ${MAX_DELEGATION_DEPTH}.`,
+        chain,
+        nextChain: chain
+      };
+    }
+    return { allowed: true, reason: '', chain, nextChain };
+  }
+
   const SCHEMA_VERSION = 5;
   const TASK_STATES = Object.freeze({
     PENDING: 'pending',
@@ -497,7 +557,7 @@
       return {
         success: false,
         needsClarification: true,
-        clarification: `Orion does not have a registered task role named "${target.mode}". Choose Dispatch, Coder, or Operator before this task is queued.`,
+        clarification: `Orion does not have a registered task role named "${target.mode}". Choose ${joinAsEnglishList(describeRegisteredTaskTargets())} before this task is queued.`,
         task: null
       };
     }
@@ -525,6 +585,11 @@
       || origin.conversationId
       || ''
     );
+    // Ordered specialist-role lineage for this task, already vetted by evaluateDelegationHandoff
+    // before this packet was built (see agent.js's shared handoff execution path). Stored verbatim
+    // (sanitized) rather than recomputed here so buildTaskPacket stays a pure "shape the input"
+    // function and the one guard decision lives in one place.
+    const delegationChain = uniqueStrings(input.delegationChain || []).map(role => String(role).trim().toLowerCase()).filter(Boolean);
     const executionProfile = normalizeExecutionProfile(input.executionProfile, {
       modelSelectValue: input.modelSelectValue,
       reasoningEffort: input.reasoningEffort,
@@ -558,6 +623,7 @@
       target,
       parentTaskId,
       rootOriginConversationId,
+      delegationChain,
       supersedesTaskId,
       source: compactInline(input.source || 'user'),
       status: TASK_STATES.PENDING,
@@ -676,6 +742,7 @@
         || origin.conversationId
         || ''
       ),
+      delegationChain: uniqueStrings(record.delegationChain || []).map(role => String(role).trim().toLowerCase()).filter(Boolean),
       supersedesTaskId: compactInline(
         record.supersedesTaskId
         || record.predecessorTaskId
@@ -1328,6 +1395,11 @@
     isContextDependentRequest,
     isContinuationRequest,
     deriveTaskTitle: titleFromObjective,
+    isRegisteredTaskTarget,
+    describeRegisteredTaskTargets,
+    joinAsEnglishList,
+    MAX_DELEGATION_DEPTH,
+    evaluateDelegationHandoff,
     buildTaskPacket,
     normalizeTaskRecord,
     transitionTask,

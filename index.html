@@ -50,6 +50,10 @@
           <span class="mode-nav-icon">&#9881;</span>
           <span class="mode-nav-label">Operator</span>
         </button>
+        <button id="btn-mode-researcher" class="mode-nav-item" title="Researcher — Web Research &amp; Synthesis">
+          <span class="mode-nav-icon">&#128269;</span>
+          <span class="mode-nav-label">Researcher</span>
+        </button>
       </div>
 
       <!-- ORION MODE CONTENT -->
@@ -139,6 +143,30 @@
           </div>
           <input type="text" class="conversation-search-input" id="conversation-search-operator" placeholder="Search conversations…" aria-label="Search conversations">
           <div class="conversation-list" id="conversation-list-operator">
+            <!-- Dynamic conversation list (mirrors #conversation-list) -->
+          </div>
+        </div>
+      </div>
+
+      <!-- RESEARCHER MODE CONTENT -->
+      <!-- Same flat, non-project structure as Operator: Researcher's standaloneWorkspaceRole is
+           'standalone_specialist' (specialist-registry.js), the same as Operator's, so there is no
+           "Projects" concept to browse here either. -->
+      <div id="sidebar-researcher-content" class="sidebar-mode-content">
+        <div class="sidebar-top">
+          <button id="btn-new-conversation-researcher" class="btn-primary">
+            <span class="plus-icon">+</span> New Conversation
+          </button>
+        </div>
+        <div class="sidebar-section">
+          <div class="section-header">
+            <span>Conversations</span>
+            <div class="section-actions">
+              <button id="btn-add-conversation-researcher" title="New Conversation">+</button>
+            </div>
+          </div>
+          <input type="text" class="conversation-search-input" id="conversation-search-researcher" placeholder="Search conversations…" aria-label="Search conversations">
+          <div class="conversation-list" id="conversation-list-researcher">
             <!-- Dynamic conversation list (mirrors #conversation-list) -->
           </div>
         </div>
