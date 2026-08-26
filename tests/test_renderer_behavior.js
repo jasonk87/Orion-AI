@@ -202,6 +202,61 @@ test('desktop replay hides internal compaction scaffolding from old and new conv
   t.end();
 });
 
+// Regression: only the conversation open on desktop is fully hydrated in memory; every other
+// conversation sits as a lazy stub (isStub: true, messages: [] even when real history exists) to
+// keep the renderer's memory footprint bounded across restarts. The phone's home screen used to
+// derive its per-conversation activity purely from a live messageCount, so it read as 0 - and the
+// phone showed "No messages yet" - for a conversation with a real transcript that simply was not
+// the one open on desktop right now. desktop's on-disk conversation index has always carried a
+// durable hasMessages boolean for exactly this case; this proves getPhoneCompanionState forwards
+// it instead of only trusting the live (and, for a stub, always empty) message array.
+test('phone conversation summaries do not report real history as empty for un-hydrated stubs', async (t) => {
+  const activeConversation = {
+    id: 'active-conv',
+    title: 'Active chat',
+    mode: 'orion',
+    workspace: '',
+    messages: [
+      { role: 'user', text: 'hello' },
+      { role: 'assistant', text: 'hi there' }
+    ],
+    tasks: [],
+    isStub: false
+  };
+  const stubConversation = {
+    id: 'stub-conv',
+    title: 'Remind me at 2 to start OpenAI',
+    mode: 'orion',
+    workspace: '',
+    // Real history exists, but nothing has hydrated this conversation's transcript this session -
+    // exactly the shape the renderer produces for every conversation other than the active one.
+    messages: [],
+    tasks: [],
+    isStub: true,
+    hasMessages: true
+  };
+  const { win } = loadRenderer({
+    t,
+    globals: { OrionOperationalContext: operational },
+    set: {
+      conversations: [activeConversation, stubConversation],
+      activeConversationId: activeConversation.id,
+      appMode: 'orion'
+    }
+  });
+
+  const phoneState = await win.getPhoneCompanionState(activeConversation.id);
+  const stubSummary = phoneState.conversations.find(c => c.id === stubConversation.id);
+  t.ok(stubSummary, 'the stub conversation is still listed on the phone home screen');
+  t.equal(stubSummary.messageCount, 0, 'a live count is honestly 0 for an un-hydrated stub');
+  t.equal(stubSummary.hasMessages, true, 'but the durable hasMessages flag survives the transport, so the phone is never told this is empty');
+
+  const activeSummary = phoneState.conversations.find(c => c.id === activeConversation.id);
+  t.equal(activeSummary.messageCount, 2, 'a hydrated conversation still reports its real live count');
+  t.equal(activeSummary.hasMessages, true, 'and is also flagged as having messages');
+  t.end();
+});
+
 // ── Orphaned turns ─────────────────────────────────────────────────────────────
 
 test('a new phone conversation is acknowledged before semantic and memory work finishes', async t => {

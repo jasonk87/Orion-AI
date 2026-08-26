@@ -8440,6 +8440,16 @@ window.getPhoneCompanionState = async (targetConversationId) => {
       && ['user', 'assistant', 'steering'].includes(normalizeConversationMessageRole(msg))
     ).length;
     const taskCount = Array.isArray(c.tasks) ? c.tasks.length : 0;
+    // Most conversations in memory are lazy-loaded stubs (isStub: true, messages: []) to keep
+    // the renderer's footprint bounded — only the conversation currently open on desktop is fully
+    // hydrated. messageCount is real for a hydrated conversation but is always 0 for a stub, even
+    // one with a long real history, because its .messages array was never loaded. Without this
+    // flag the phone's home screen reported "No messages yet" for every conversation that wasn't
+    // the one open on desktop at that moment — a false claim, not an actual empty conversation.
+    // hasMessages is a durable boolean carried in the on-disk conversation index across restarts
+    // (see loadConversationsFromStorage / the index writer above) specifically so a stub can still
+    // truthfully say "this has history" even without the full transcript loaded.
+    const hasMessages = messageCount > 0 || !!c.hasMessages;
     return {
       id: c.id,
       title: c.title || 'New Conversation',
@@ -8457,6 +8467,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
       awaitingClarification: !!c.awaitingClarification,
       taskCount,
       messageCount,
+      hasMessages,
       activityCount: messageCount + taskCount,
       updatedAt: c.updatedAt || c.createdAt || 0
     };

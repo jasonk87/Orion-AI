@@ -1898,6 +1898,40 @@ test('a pre-save revision-zero poll cannot overwrite an acknowledged phone selec
   t.end();
 });
 
+// Regression: most conversations in the desktop renderer's memory are lazy-loaded stubs (only the
+// conversation currently open on desktop is fully hydrated with a real .messages array). The
+// phone's home screen used to derive its activity label purely from messageCount/taskCount, which
+// read as 0 for every stub conversation regardless of real history, so it told the truth only for
+// whichever single conversation happened to be open on desktop and lied ("No messages yet") about
+// every other one - including conversations with real prior message history. desktop's own conversation
+// index has always carried a durable hasMessages boolean across restarts for exactly this case;
+// this test locks in that the phone label consults it instead of only trusting a live count.
+test('conversation activity label does not lie about history desktop has not hydrated yet', t => {
+  const html = companionHtml();
+  const start = html.indexOf('function conversationActivityLabel(');
+  const end = html.indexOf('\n  }', start);
+  t.ok(start > 0 && end > start, 'the generated phone client contains the activity label helper');
+  const source = html.slice(start, end + 4);
+  const conversationActivityLabel = new Function(`${source}; return conversationActivityLabel;`)();
+
+  t.equal(
+    conversationActivityLabel({ messageCount: 3, taskCount: 0, hasMessages: true }),
+    '3 messages',
+    'a hydrated conversation with a real count still shows the exact count'
+  );
+  t.equal(
+    conversationActivityLabel({ messageCount: 0, taskCount: 0, hasMessages: false }),
+    'No messages yet',
+    'a genuinely empty conversation still says so'
+  );
+  t.equal(
+    conversationActivityLabel({ messageCount: 0, taskCount: 0, hasMessages: true }),
+    'Previous messages',
+    'an un-hydrated stub with real prior history never claims to have no messages'
+  );
+  t.end();
+});
+
 test('assistant screenshot references render directly in phone chat through the authenticated image endpoint', t => {
   const html = companionHtml();
   t.ok(html.includes('data-chat-image-path'), 'conversation-scoped image references get an inline image element');
