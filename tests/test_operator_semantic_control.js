@@ -148,7 +148,13 @@ test('accessible control and Chrome favorite IPC actions capture their resulting
   t.end();
 });
 
-test('Operator alone receives semantic desktop controls and they require observed screen state', async t => {
+// Previously this asserted that a named favorite was REJECTED until a screenshot had been
+// inspected. That gate made vision rediscover a target the caller had already named: the observed
+// cost was a rejected call, a model turn spent on the failure, a capture of an irrelevant desktop,
+// a vision call to confirm the page was not already open, and only then the same favorite call.
+// The semantic target is the grounding, so the action now runs first. What must NOT regress is the
+// Operator-only exposure and the post-action evidence requirement, both asserted below.
+test('Operator alone receives semantic desktop controls, and a named favorite opens without a pre-action screenshot', async t => {
   agent.__setActiveConversationModeForTest('operator');
   const operatorTools = agent.buildAgentToolDeclarations().map(tool => tool.name);
   agent.__setActiveConversationModeForTest('coder');
@@ -163,19 +169,24 @@ test('Operator alone receives semantic desktop controls and they require observe
   global.window.api = {
     openChromeFavorite: async () => {
       favoriteCalls += 1;
-      return { success: true };
+      return { success: true, path: 'after.png', width: 100, height: 100, favorite: { name: 'DeepSeek Platform' } };
     }
   };
-  const blocked = await agent.executeTool('open_chrome_favorite', { name: 'DeepSeek Platform' }, '', {}, {
-    id: 'operator-1', mode: 'operator'
-  }, {
-    lastDesktopSnapshot: { path: 'before.png', width: 100, height: 100, capturedAt: Date.now(), inspectedAt: 0 },
+  // No prior capture at all - the run has never looked at the screen.
+  const executionContext = {
     operatorExecutionSurface: 'browser',
     operatorPolicyState: policy.createState('browser')
-  });
-  t.equal(blocked.success, false);
-  t.match(String(blocked.error || ''), /capture and inspect the screen/i);
-  t.equal(favoriteCalls, 0, 'favorite lookup never opens a page before observation');
+  };
+  const opened = await agent.executeTool('open_chrome_favorite', { name: 'DeepSeek Platform' }, '', {}, {
+    id: 'operator-1', mode: 'operator'
+  }, executionContext);
+  t.equal(opened.success, true, 'the named favorite opens on the first call');
+  t.equal(favoriteCalls, 1, 'exactly one favorite call - no rejected round trip before it');
+  t.equal(opened.effect, 'favorite_opened', 'the tool reports the verified effect');
+  t.equal(executionContext.lastDesktopSnapshot.path, 'after.png',
+    'the resulting page becomes the current screen');
+  t.equal(executionContext.lastDesktopSnapshot.inspectedAt, 0,
+    'and it is recorded UNINSPECTED, so the page still has to be looked at before it is described');
   global.window.api = oldApi;
   agent.__setActiveConversationModeForTest('orion');
   t.end();

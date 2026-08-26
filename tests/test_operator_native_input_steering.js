@@ -74,7 +74,12 @@ test('OPERATOR_INSTRUCTION explicitly steers native input away from run_command/
   const instructionSlice = agentJs.slice(instructionStart, instructionStart + 6000);
   t.match(instructionSlice, /Use computer_action for visible clicks, typing, hotkeys/i, 'the prompt tells Operator to use computer_action for real input');
   t.match(instructionSlice, /Never use run_command, terminal_exec, PowerShell automation, WScript\.Shell, or SendKeys/i, 'the prompt explicitly names and forbids the exact failure mode from the playtest');
-  t.match(instructionSlice, /open_application after the first inspection to activate its existing window even if it is merely covered, minimized, or in the background/i, 'the prompt tells Operator open_application covers an existing-but-unfocused window, not only a missing one');
+  // The invariant is that open_application covers an existing-but-unfocused window, not only a
+  // missing one. It used to be phrased "after the first inspection", which is no longer true and
+  // was never what this guard was about: a named application is grounded by its name, and the
+  // launcher's own existing-window check is what prevents the duplicate launch.
+  t.match(instructionSlice, /open_application to activate an application's existing window even if it is merely covered, minimized, or in the background/i, 'the prompt tells Operator open_application covers an existing-but-unfocused window, not only a missing one');
+  t.match(instructionSlice, /launches a new instance only when none exists/i, 'and that a duplicate launch is prevented by the tool itself');
   t.end();
 });
 

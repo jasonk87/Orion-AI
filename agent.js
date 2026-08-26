@@ -196,17 +196,22 @@ VOICE AND IDENTITY:
 TOOL PREFERENCE — DOM BEFORE PIXELS:
 ${OrionOperatingContract.DOM_BEFORE_PIXEL_CONTROL}
 
-SCREEN-FIRST EXECUTION:
-- For visible desktop or browser work, inspect the current screen or page before probing processes, package metadata, installation folders, or window handles. If the requested state is already visible, stop investigating and report it.
-- When the user names a native application, use open_application after the first inspection to activate its existing window even if it is merely covered, minimized, or in the background; it launches a new instance only when none exists. Never guess an application's taskbar coordinates from a screenshot.
+GROUNDING — USE THE CHEAPEST TRUSTWORTHY SOURCE:
+- Match the grounding to the action. A named target needs no screenshot to find it; only a target you cannot name does.
+- SEMANTIC FIRST. When you already know WHAT you want — an application by name, a Chrome favorite by name, a labeled accessible control — call that tool immediately. Do NOT capture and inspect the screen first just to confirm the obvious; the name you were given IS the grounding, and each of these tools resolves it deterministically or refuses rather than guessing.
+- Use open_application to activate an application's existing window even if it is merely covered, minimized, or in the background; it launches a new instance only when none exists, and it tells you which it did (effect: activated_existing or opened_new). That check is why it needs no screenshot first. Never guess an application's taskbar coordinates from a screenshot.
 - Use open_chrome_favorite for a Chrome favorite/bookmark named by the user. It resolves the saved item from Chrome's profile and opens the exact URL; never click a guessed taskbar icon, Favorites-menu row, or bookmark-bar coordinate for this job.
-- Use click_ui_element for a labeled native control exposed through Windows accessibility. Prefer its app name + visible label over model-guessed pixels. Use computer_action coordinates only for canvas/game/image targets that have no stable accessible label.
-- When the requested app is a project-local command rather than an installed Start-menu app, inspect the screen once and then use start_command to launch it directly. A launch is an action, not process archaeology; do not open a terminal window and type the same command through computer_action.
+- Use click_ui_element for a labeled native control exposed through Windows accessibility. Prefer its app name + visible label over model-guessed pixels; it refuses an ambiguous match instead of picking one for you.
+- Escalate to vision only when semantic resolution actually fails. If a name comes back not-found or ambiguous, THEN capture and inspect the screen, and pick a target that exists or narrow it with an application name, folder, control type, or occurrence. Repeating the identical failed name is refused in code.
+- Use computer_action coordinates only for canvas, game, or image targets that have no accessible label. That is the one action class with no semantic target, so it carries the strictest visual contract.
+- For visible desktop or browser work, inspect the current screen or page before probing processes, package metadata, installation folders, or window handles. If the requested state is already visible, stop investigating and report it.
+- When the requested app is a project-local command rather than an installed Start-menu app, use start_command to launch it directly. A launch is an action, not process archaeology; do not open a terminal window and type the same command through computer_action.
 - Use computer_action for visible clicks, typing, hotkeys, and game controls. Never use run_command, terminal_exec, PowerShell automation, WScript.Shell, or SendKeys as a substitute for screen input; those calls cannot ground the action in the screen you inspected.
 - Raw shell diagnostics are a bounded fallback for a concrete blocker, not the normal way to operate a screen. Code enforces a small diagnostic budget so repeated system probes cannot replace visible action.
 
 STATE FRESHNESS — WHEN A FRESH LOOK IS ACTUALLY REQUIRED:
 - Native computer_action is gated in code, not just by convention: every call requires a capture_screen from this run followed by inspect_screenshot_with_model on that exact capture, and a successful action immediately invalidates the inspection — so the next computer_action needs its own fresh capture-and-inspect pair. Do not attempt to act twice off one inspection; the tool will refuse it.
+- ACTION SUCCESS IS NOT MISSION SUCCESS. Skipping the screenshot BEFORE a semantic action never lets you skip the one AFTER it. open_chrome_favorite reporting success proves a URL was opened, not what the page says; open_application reporting success proves a window is frontmost, not what it contains. Every semantic action captures the resulting screen and marks it uninspected — inspect that capture before answering any question about what is now on it.
 - Browser-worker tools (open_url, click_element, fill_input, wait_for_page) do not require that vision round-trip, but the page itself can still change under you — a navigation, a form submission, or an async update can invalidate what you last read. Re-read the page (wait_for_page, take_screenshot, or re-issuing the read that told you what was there) before acting on state you have not observed since the last thing that could plausibly have changed it. Use close_browser to close Orion's managed browser; do not substitute about:blank or OS-level clicks for that operation.
 - A screen or page you have not touched, and nothing else could plausibly have changed, does not need re-inspection out of caution alone. Re-inspect when something you did — or something asynchronous — could have changed it, not on a fixed schedule.
 
@@ -6052,6 +6057,47 @@ function appendBoundedCommandOutput(currentValue, chunkValue, maxChars = AGENT_C
 // releases, silently stomping each other's desktop/browser state). This gate runs once, before the
 // big tool-dispatch switch below, rather than being duplicated into each individual case.
 const DESKTOP_LEASE_TOOLS = new Set(['computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite']);
+
+// A semantic action (open_application / open_chrome_favorite / click_ui_element) no longer needs an
+// inspected screen BEFORE it runs — it names its own target and the implementation resolves that
+// target deterministically. It still owns the screen AFTER it runs: every one of them captures the
+// resulting desktop, and that capture is recorded as UNINSPECTED so nothing downstream can treat a
+// pre-action image as proof of the post-action state. `previous` may be null, which is the whole
+// point: the first action of a run no longer has to be a screenshot.
+function applySemanticActionSnapshot(executionContext, result, previous) {
+  if (!result || !result.path || !result.width || !result.height) return;
+  const prior = previous && typeof previous === 'object' ? previous : null;
+  executionContext.lastDesktopSnapshot = {
+    path: result.path,
+    width: Number(result.width) || (prior ? prior.width : 0),
+    height: Number(result.height) || (prior ? prior.height : 0),
+    capturedAt: Date.now(),
+    // Deliberately 0: the action changed the screen, so the next state-dependent step needs its
+    // own inspection of THIS image. computer_action's contract is unchanged by that.
+    inspectedAt: 0,
+    displayId: result.displayId != null ? String(result.displayId) : (prior ? prior.displayId || '' : ''),
+    availableDisplays: (prior && prior.availableDisplays) || []
+  };
+}
+
+// Semantic tools throw on failure so the model sees a real error, but the policy still needs to
+// learn that this exact target could not be resolved — that is what escalates the next attempt
+// from "name it" to "look at the screen" instead of letting the model retry the same name forever.
+function recordSemanticActionOutcome(operatorPolicyState, name, result, args) {
+  if (!OperatorExecutionPolicy || !operatorPolicyState) return;
+  OperatorExecutionPolicy.recordToolResult(operatorPolicyState, name, result, args);
+}
+
+// Attaches the normalized, verified effect of a semantic action so the model is told what happened
+// rather than having to infer it from a screenshot.
+function withSemanticEffect(name, result) {
+  if (!OperatorExecutionPolicy || typeof OperatorExecutionPolicy.describeSemanticEffect !== 'function') return result;
+  const described = OperatorExecutionPolicy.describeSemanticEffect(name, result);
+  if (!described || !result || typeof result !== 'object') return result;
+  if (described.effect && !result.effect) result.effect = described.effect;
+  if (described.grounding && !result.grounding) result.grounding = described.grounding;
+  return result;
+}
 const BROWSER_LEASE_TOOLS = new Set([
   'open_url', 'search_web', 'click_element', 'fill_input', 'navigate_back',
   'close_browser', 'download_from_page', 'wait_for_page', 'take_screenshot'
@@ -7504,34 +7550,25 @@ async function executeTool(name, args, workspace, config, conversation, executio
         throw new Error('open_application is Operator-only. Route native application work to Operator.');
       }
       if (!args.appName) throw new Error("Missing 'appName' parameter");
+      // No pre-action screenshot: the launcher itself checks for an existing window first and
+      // ACTIVATES it instead of launching a duplicate, which is the only thing the old
+      // capture-and-inspect requirement was buying. It reports which of the two it did.
       const snapshot = executionContext.lastDesktopSnapshot;
-      if (!snapshot || !snapshot.inspectedAt || snapshot.inspectedAt < snapshot.capturedAt) {
-        throw new Error('Open application requires a fresh captured and inspected screen so Orion does not launch a duplicate of an app that is already visible.');
-      }
       const result = await window.api.openApplication({
         appName: String(args.appName),
         settleMs: args.settleMs,
         workspacePath: workspace,
         destination: args.destination || '',
         conversationId: conversation.id,
-        displayId: snapshot.displayId || ''
+        displayId: (snapshot && snapshot.displayId) || ''
       });
-      if (!result || !result.success) throw new Error((result && result.error) || 'Application could not be opened');
-      if (result.path && result.width && result.height) {
-        executionContext.lastDesktopSnapshot = {
-          path: result.path,
-          width: Number(result.width) || snapshot.width,
-          height: Number(result.height) || snapshot.height,
-          capturedAt: Date.now(),
-          inspectedAt: 0,
-          displayId: result.displayId != null ? String(result.displayId) : (snapshot.displayId || ''),
-          availableDisplays: snapshot.availableDisplays || []
-        };
+      if (!result || !result.success) {
+        recordSemanticActionOutcome(operatorPolicyState, name, result, args);
+        throw new Error((result && result.error) || 'Application could not be opened');
       }
-      if (OperatorExecutionPolicy && operatorPolicyState) {
-        OperatorExecutionPolicy.recordToolResult(operatorPolicyState, name, result);
-      }
-      return result;
+      applySemanticActionSnapshot(executionContext, result, snapshot);
+      recordSemanticActionOutcome(operatorPolicyState, name, result, args);
+      return withSemanticEffect(name, result);
     }
 
     case 'click_ui_element': {
@@ -7539,10 +7576,10 @@ async function executeTool(name, args, workspace, config, conversation, executio
         throw new Error('click_ui_element is Operator-only. Route native application work to Operator.');
       }
       if (!args.targetText) throw new Error("Missing 'targetText' parameter");
+      // No pre-action screenshot: the target is resolved through the Windows accessibility tree by
+      // name/automation id, and the resolver REFUSES an ambiguous or offscreen match rather than
+      // guessing. That refusal is stronger evidence than a screenshot, and costs no vision call.
       const snapshot = executionContext.lastDesktopSnapshot;
-      if (!snapshot || !snapshot.inspectedAt || snapshot.inspectedAt < snapshot.capturedAt) {
-        throw new Error('Accessible UI control requires a fresh captured and inspected screen.');
-      }
       const result = await window.api.clickAccessibleUi({
         targetText: String(args.targetText),
         appName: args.appName ? String(args.appName) : '',
@@ -7553,24 +7590,18 @@ async function executeTool(name, args, workspace, config, conversation, executio
         workspacePath: workspace,
         destination: args.destination || '',
         conversationId: conversation.id,
-        displayId: snapshot.displayId || ''
+        displayId: (snapshot && snapshot.displayId) || ''
       });
-      if (!result || !result.success) throw new Error((result && result.error) || 'Accessible UI control could not be activated');
-      if (result.path && result.width && result.height) {
-        executionContext.lastDesktopSnapshot = {
-          path: result.path,
-          width: Number(result.width) || snapshot.width,
-          height: Number(result.height) || snapshot.height,
-          capturedAt: Date.now(),
-          inspectedAt: 0,
-          displayId: result.displayId != null ? String(result.displayId) : (snapshot.displayId || ''),
-          availableDisplays: snapshot.availableDisplays || []
-        };
+      if (!result || !result.success) {
+        recordSemanticActionOutcome(operatorPolicyState, name, result, args);
+        const detail = result && result.ambiguous && Array.isArray(result.matches) && result.matches.length
+          ? `${result.error} Matches: ${result.matches.map(item => `${item.Name || item.name || ''}${item.ControlType || item.controlType ? ` [${item.ControlType || item.controlType}]` : ''}`.trim()).filter(Boolean).join('; ')}`
+          : ((result && result.error) || 'Accessible UI control could not be activated');
+        throw new Error(detail);
       }
-      if (OperatorExecutionPolicy && operatorPolicyState) {
-        OperatorExecutionPolicy.recordToolResult(operatorPolicyState, name, result);
-      }
-      return result;
+      applySemanticActionSnapshot(executionContext, result, snapshot);
+      recordSemanticActionOutcome(operatorPolicyState, name, result, args);
+      return withSemanticEffect(name, result);
     }
 
     case 'open_chrome_favorite': {
@@ -7578,10 +7609,10 @@ async function executeTool(name, args, workspace, config, conversation, executio
         throw new Error('open_chrome_favorite is Operator-only. Route browser favorite work to Operator.');
       }
       if (!args.name) throw new Error("Missing 'name' parameter");
+      // No pre-action screenshot: the caller already supplied the semantic target, and the
+      // bookmark resolver refuses an unmatched or ambiguous name instead of guessing a URL. The
+      // desktop that happened to be visible beforehand tells Orion nothing about the favorite.
       const snapshot = executionContext.lastDesktopSnapshot;
-      if (!snapshot || !snapshot.inspectedAt || snapshot.inspectedAt < snapshot.capturedAt) {
-        throw new Error('Opening a Chrome favorite requires a fresh captured and inspected screen.');
-      }
       const result = await window.api.openChromeFavorite({
         name: String(args.name),
         folder: args.folder ? String(args.folder) : '',
@@ -7589,29 +7620,18 @@ async function executeTool(name, args, workspace, config, conversation, executio
         workspacePath: workspace,
         destination: args.destination || '',
         conversationId: conversation.id,
-        displayId: snapshot.displayId || ''
+        displayId: (snapshot && snapshot.displayId) || ''
       });
       if (!result || !result.success) {
+        recordSemanticActionOutcome(operatorPolicyState, name, result, args);
         const detail = result && result.ambiguous && Array.isArray(result.matches)
           ? `${result.error} Matches: ${result.matches.map(item => `${item.name}${item.folder ? ` (${item.folder})` : ''}`).join('; ')}`
           : ((result && result.error) || 'Chrome favorite could not be opened');
         throw new Error(detail);
       }
-      if (result.path && result.width && result.height) {
-        executionContext.lastDesktopSnapshot = {
-          path: result.path,
-          width: Number(result.width) || snapshot.width,
-          height: Number(result.height) || snapshot.height,
-          capturedAt: Date.now(),
-          inspectedAt: 0,
-          displayId: result.displayId != null ? String(result.displayId) : (snapshot.displayId || ''),
-          availableDisplays: snapshot.availableDisplays || []
-        };
-      }
-      if (OperatorExecutionPolicy && operatorPolicyState) {
-        OperatorExecutionPolicy.recordToolResult(operatorPolicyState, name, result);
-      }
-      return result;
+      applySemanticActionSnapshot(executionContext, result, snapshot);
+      recordSemanticActionOutcome(operatorPolicyState, name, result, args);
+      return withSemanticEffect(name, result);
     }
 
     case 'computer_action': {

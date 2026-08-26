@@ -176,7 +176,13 @@ test('open_application treats the requested app name as data rather than a wildc
   t.end();
 });
 
-test('open_application is exposed only to Operator and requires inspected screen evidence', async t => {
+// This used to assert that open_application was REJECTED without an inspected screenshot, on the
+// theory that vision was needed to avoid launching a duplicate of an already-open app. It is not:
+// the launcher enumerates existing windows itself and ACTIVATES a match instead of launching, and
+// says which it did. The screenshot was buying nothing the implementation did not already
+// guarantee, so it is gone - but the duplicate-launch guarantee it was standing in for is asserted
+// directly here instead, which is a stronger test than the one it replaces.
+test('open_application is Operator-only, runs without a pre-action screenshot, and reports which effect it had', async t => {
   agent.__setActiveConversationModeForTest('operator');
   const operatorTools = agent.buildAgentToolDeclarations().map(tool => tool.name);
   agent.__setActiveConversationModeForTest('coder');
@@ -186,27 +192,33 @@ test('open_application is exposed only to Operator and requires inspected screen
 
   const oldApi = global.window.api;
   let openCalls = 0;
+  let method = 'activated';
   global.window.api = {
     openApplication: async () => {
       openCalls += 1;
-      return { success: true, path: 'after.png', width: 100, height: 80 };
+      return { success: true, method, path: 'after.png', width: 100, height: 80 };
     }
   };
+  // No prior capture and no prior inspection: the run has never looked at the screen.
   const executionContext = {
-    lastDesktopSnapshot: { path: 'before.png', width: 100, height: 80, capturedAt: Date.now(), inspectedAt: 0 },
     operatorExecutionSurface: 'desktop',
     operatorPolicyState: policy.createState('desktop')
   };
-  policy.recordToolResult(executionContext.operatorPolicyState, 'capture_screen', { success: true, path: 'before.png' });
-  policy.recordToolResult(executionContext.operatorPolicyState, 'inspect_screenshot_with_model', { success: true, status: 'not_satisfied' });
-  let error = null;
-  try {
-    await agent.executeTool('open_application', { appName: 'Codex' }, '', {}, { id: 'operator-1', mode: 'operator' }, executionContext);
-  } catch (caught) {
-    error = caught;
-  }
-  t.match(String(error && error.message || ''), /captured and inspected screen/, 'blind duplicate launch is rejected');
-  t.equal(openCalls, 0, 'the IPC action did not run');
+  const activated = await agent.executeTool(
+    'open_application', { appName: 'Codex' }, '', {}, { id: 'operator-1', mode: 'operator' }, executionContext
+  );
+  t.equal(openCalls, 1, 'the named application opens on the first call, with no rejected round trip');
+  t.equal(activated.effect, 'activated_existing',
+    'an already-open app is reported as activated - the duplicate launch the old gate guarded against cannot happen');
+  t.equal(executionContext.lastDesktopSnapshot.path, 'after.png', 'the resulting screen replaces the old one');
+  t.equal(executionContext.lastDesktopSnapshot.inspectedAt, 0,
+    'and is uninspected, so nothing may describe it without looking');
+
+  method = 'launched';
+  const launched = await agent.executeTool(
+    'open_application', { appName: 'Calculator' }, '', {}, { id: 'operator-1', mode: 'operator' }, executionContext
+  );
+  t.equal(launched.effect, 'opened_new', 'a genuinely absent app is reported as a new launch');
   global.window.api = oldApi;
   agent.__setActiveConversationModeForTest('orion');
   t.end();

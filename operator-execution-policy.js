@@ -14,9 +14,35 @@
     'inspect_screenshot_with_model',
     'compare_screenshot_to_goal'
   ]);
-  const SCREEN_ACTION_TOOLS = new Set(['computer_action', 'open_application', 'click_ui_element', 'open_chrome_favorite']);
+  // Operator's actions are not one class, and grouping them made vision mandatory for work that
+  // already carried its own target. Use the cheapest trustworthy grounding for the action class:
+  //
+  //   SEMANTIC_OPEN_ACTIONS  — the caller names the app or favorite. The implementation resolves
+  //                            it deterministically: an already-open app is ACTIVATED rather than
+  //                            duplicated, and an unmatched or ambiguous name is refused rather
+  //                            than guessed. A screenshot cannot add to that.
+  //   SEMANTIC_UI_ACTIONS    — the caller names a control that Windows accessibility resolves by
+  //                            name/automation id. The tool itself refuses ambiguous matches, so
+  //                            its own refusal is better evidence than a pre-emptive screenshot.
+  //   RAW_VISUAL_ACTIONS     — coordinate control with no semantic target. Vision is the ONLY
+  //                            grounding available, so the strict capture/inspect contract in
+  //                            executeTool stays exactly as it was.
+  const SEMANTIC_OPEN_ACTIONS = new Set(['open_application', 'open_chrome_favorite']);
+  const SEMANTIC_UI_ACTIONS = new Set(['click_ui_element']);
+  const RAW_VISUAL_ACTIONS = new Set(['computer_action']);
+  const SEMANTIC_ACTION_TOOLS = new Set([...SEMANTIC_OPEN_ACTIONS, ...SEMANTIC_UI_ACTIONS]);
+  // The union stays the visual-epoch set: every one of these mutates what is on screen, so all of
+  // them must still invalidate prior visual authority even when they no longer require it first.
+  const SCREEN_ACTION_TOOLS = new Set([...SEMANTIC_ACTION_TOOLS, ...RAW_VISUAL_ACTIONS]);
+  // Which argument carries the caller's explicit semantic target, per tool.
+  const SEMANTIC_TARGET_ARGS = Object.freeze({
+    open_application: 'appName',
+    open_chrome_favorite: 'name',
+    click_ui_element: 'targetText'
+  });
   const PROCESS_ACTION_TOOLS = new Set(['start_command', 'kill_command']);
   const MAX_UNPRODUCTIVE_DIAGNOSTICS = 3;
+  const MAX_TRACKED_UNRESOLVED_TARGETS = 12;
 
   function normalizeSurface(value) {
     const surface = String(value || '').trim().toLowerCase();
@@ -38,7 +64,97 @@
       visualActionEpoch: 0,
       latestCaptureEpoch: 0,
       screenActionAttempts: 0,
-      screenActions: 0
+      screenActions: 0,
+      // Semantic targets the implementation itself could not resolve (ambiguous, or no match).
+      // This is the structural signal that semantic grounding was INSUFFICIENT for that target,
+      // which is the one case where escalating to vision is genuinely worth its cost.
+      unresolvedSemanticTargets: [],
+      semanticActionFailures: 0
+    };
+  }
+
+  function semanticActionTarget(toolName, args = {}) {
+    const key = SEMANTIC_TARGET_ARGS[toolName];
+    if (!key) return '';
+    const source = args && typeof args === 'object' ? args : {};
+    return String(source[key] == null ? '' : source[key]).trim();
+  }
+
+  function unresolvedTargetKey(toolName, target) {
+    return `${toolName}:${String(target || '').trim().toLowerCase()}`;
+  }
+
+  function hasUnresolvedSemanticTarget(stateValue, toolName, target) {
+    const tracked = stateValue && Array.isArray(stateValue.unresolvedSemanticTargets)
+      ? stateValue.unresolvedSemanticTargets
+      : [];
+    return tracked.includes(unresolvedTargetKey(toolName, target));
+  }
+
+  function normalizeMatches(value) {
+    if (Array.isArray(value)) return value;
+    return value == null || value === '' ? [] : [value];
+  }
+
+  // Normalizes what a semantic tool ACTUALLY verified into a stable structured shape, so the model
+  // is told the effect instead of having to infer it from a screenshot. Every field here is read
+  // from something the implementation genuinely determined — nothing is asserted on its behalf.
+  function describeSemanticEffect(toolName, result) {
+    if (!SEMANTIC_ACTION_TOOLS.has(toolName)) return null;
+    // A missing result is a failed call, not a silent success. isSuccessful({}) is true by design
+    // for the diagnostic paths that share it, so absence is rejected here rather than there.
+    if (!result || typeof result !== 'object') {
+      return { effect: '', reasonCode: 'semantic_action_failed', grounding: 'semantic' };
+    }
+    const value = result;
+    const declaredReason = String(value.reasonCode || '').trim();
+    if (!isSuccessful(value)) {
+      if (declaredReason) return { effect: '', reasonCode: declaredReason, grounding: 'semantic' };
+      if (value.ambiguous === true) {
+        return {
+          effect: '',
+          reasonCode: toolName === 'open_chrome_favorite' ? 'favorite_ambiguous'
+            : (toolName === 'click_ui_element' ? 'control_ambiguous' : 'application_ambiguous'),
+          grounding: 'semantic'
+        };
+      }
+      if (value.notFound === true) {
+        return {
+          effect: '',
+          reasonCode: toolName === 'open_chrome_favorite' ? 'favorite_not_found'
+            : (toolName === 'click_ui_element' ? 'control_not_found' : 'application_not_found'),
+          grounding: 'semantic'
+        };
+      }
+      if (toolName === 'open_application') {
+        // The launcher reports its candidate list: none means nothing matched, several means the
+        // name was not specific enough. Both are resolution failures, not action failures.
+        return {
+          effect: '',
+          reasonCode: normalizeMatches(value.matches).length > 0 ? 'application_ambiguous' : 'application_not_found',
+          grounding: 'semantic'
+        };
+      }
+      return { effect: '', reasonCode: 'semantic_action_failed', grounding: 'semantic' };
+    }
+    if (toolName === 'open_application') {
+      const method = String(value.method || '').trim().toLowerCase();
+      // 'activated' means a matching window already existed and was raised — the exact duplicate
+      // launch a pre-action screenshot used to be required to prevent.
+      if (method === 'activated') return { effect: 'activated_existing', reasonCode: '', grounding: 'semantic' };
+      if (method === 'launched') return { effect: 'opened_new', reasonCode: '', grounding: 'semantic' };
+      return { effect: 'application_opened', reasonCode: '', grounding: 'semantic' };
+    }
+    if (toolName === 'open_chrome_favorite') {
+      return { effect: 'favorite_opened', reasonCode: '', grounding: 'semantic' };
+    }
+    // click_ui_element resolved one enabled, on-screen accessible element and invoked it.
+    return {
+      effect: 'control_activated',
+      reasonCode: '',
+      grounding: String(value.method || '').trim().toLowerCase() === 'bounded-click'
+        ? 'accessibility_bounds'
+        : 'accessibility'
     };
   }
 
@@ -75,8 +191,34 @@
     };
   }
 
+  function recordSemanticTargetOutcome(state, toolName, result, args) {
+    if (!SEMANTIC_ACTION_TOOLS.has(toolName)) return;
+    const target = semanticActionTarget(toolName, args);
+    if (!target) return;
+    if (!Array.isArray(state.unresolvedSemanticTargets)) state.unresolvedSemanticTargets = [];
+    const key = unresolvedTargetKey(toolName, target);
+    const effect = describeSemanticEffect(toolName, result);
+    const unresolved = !!(effect && effect.reasonCode && effect.reasonCode !== 'semantic_action_failed');
+    if (unresolved) {
+      // The tool proved that naming this target is not enough to act on it. Until the screen is
+      // looked at again, repeating the identical call cannot produce a different answer.
+      if (!state.unresolvedSemanticTargets.includes(key)) state.unresolvedSemanticTargets.push(key);
+      if (state.unresolvedSemanticTargets.length > MAX_TRACKED_UNRESOLVED_TARGETS) {
+        state.unresolvedSemanticTargets.shift();
+      }
+      state.semanticActionFailures = (Number(state.semanticActionFailures) || 0) + 1;
+      return;
+    }
+    // Only a real success clears the escalation. A failure with no recognizable resolution reason
+    // (a crashed helper, a missing result) must leave any existing escalation standing.
+    if (!result || typeof result !== 'object' || !isSuccessful(result)) return;
+    state.unresolvedSemanticTargets = state.unresolvedSemanticTargets.filter(item => item !== key);
+    state.semanticActionFailures = 0;
+  }
+
   function recordToolResult(stateValue, toolName, result, args = {}) {
     const state = stateValue || createState();
+    recordSemanticTargetOutcome(state, toolName, result, args);
     if (RAW_DIAGNOSTIC_TOOLS.has(toolName)) {
       state.diagnosticCalls += 1;
       const requestKey = `${toolName}:${boundedFingerprint(args)}`;
@@ -105,7 +247,12 @@
     if (toolName === 'inspect_screenshot' || toolName === 'compare_screenshot_to_goal') {
       state.inspected = true;
     }
-    if (SCREEN_OBSERVATION_TOOLS.has(toolName)) state.unproductiveDiagnosticStreak = 0;
+    if (SCREEN_OBSERVATION_TOOLS.has(toolName)) {
+      state.unproductiveDiagnosticStreak = 0;
+      // Looking at the screen is exactly the escalation an unresolved semantic target called for.
+      // Once it has happened, the model can name a better target, so the block is released.
+      if (state.inspected) state.unresolvedSemanticTargets = [];
+    }
     if (SCREEN_ACTION_TOOLS.has(toolName)) {
       state.visualActionEpoch = (Number(state.visualActionEpoch) || 0) + 1;
       state.screenActions += 1;
@@ -205,12 +352,26 @@
       };
     }
 
-    if (SCREEN_ACTION_TOOLS.has(toolName) && toolName !== 'computer_action' && VISUAL_SURFACES.has(surface) && !state.inspected) {
-      return {
-        allowed: false,
-        code: 'operator_open_requires_observation',
-        reason: 'Capture and inspect the screen before activating an application or labeled desktop control. The current visible state may already satisfy the request.'
-      };
+    // Semantic actions are allowed to run FIRST. They carry an explicit target, and their
+    // implementations resolve it deterministically rather than guessing — so making vision
+    // rediscover a target the caller already named is pure latency. What is still gated is the
+    // case where semantic grounding is genuinely absent or has already been disproved.
+    if (SEMANTIC_ACTION_TOOLS.has(toolName) && VISUAL_SURFACES.has(surface)) {
+      const target = semanticActionTarget(toolName, args);
+      if (!target) {
+        return {
+          allowed: false,
+          code: 'operator_semantic_target_required',
+          reason: 'This action needs an explicit target to be semantic. Name the application, Chrome favorite, or accessible control — or capture and inspect the screen first if you do not yet know which one you need.'
+        };
+      }
+      if (!state.inspected && hasUnresolvedSemanticTarget(state, toolName, target)) {
+        return {
+          allowed: false,
+          code: 'operator_semantic_target_unresolved',
+          reason: `"${target}" could not be resolved by name on the last attempt, so repeating the identical call cannot succeed. Capture and inspect the screen to choose a target that exists, or narrow it with an application name, folder, control type, or occurrence.`
+        };
+      }
     }
     return { allowed: true };
   }
@@ -252,9 +413,16 @@
     RAW_DIAGNOSTIC_TOOLS,
     SCREEN_OBSERVATION_TOOLS,
     SCREEN_ACTION_TOOLS,
+    SEMANTIC_OPEN_ACTIONS,
+    SEMANTIC_UI_ACTIONS,
+    SEMANTIC_ACTION_TOOLS,
+    RAW_VISUAL_ACTIONS,
     PROCESS_ACTION_TOOLS,
     normalizeSurface,
     createState,
+    semanticActionTarget,
+    hasUnresolvedSemanticTarget,
+    describeSemanticEffect,
     recordToolResult,
     recordToolAttempt,
     gateTool,
