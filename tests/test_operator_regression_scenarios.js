@@ -260,7 +260,13 @@ test('a completed Operator child resumes the same pending Coder parent instead o
 // reintroducing the Coder-only assumption Phase 2 spent significant effort removing.
 
 test('window.runDurableSchedule never branches on conversation.mode - a fired schedule reaches whatever role the conversation actually is', t => {
-  const fnSource = agentJs.slice(agentJs.indexOf('window.runDurableSchedule = async function'), agentJs.indexOf('window.runDurableSchedule = async function') + 2600);
+  // Bounded by the next top-level declaration rather than a fixed character count, so the whole
+  // function is always covered. A magic-number window silently stops covering the tail of the
+  // function as soon as it grows, which is how this guard first went blind to its own subject.
+  const fnStart = agentJs.indexOf('window.runDurableSchedule = async function');
+  const fnEnd = agentJs.indexOf('function buildScheduledDeliveryIntent', fnStart);
+  t.ok(fnStart >= 0 && fnEnd > fnStart, 'the whole function body is located');
+  const fnSource = agentJs.slice(fnStart, fnEnd);
   t.ok(fnSource.includes('conversations.find(c => c.id === conversationId)'), 'resolves the target conversation purely by id');
   t.notOk(/targetConv\.mode\s*===|targetConv\.mode\s*!==/.test(fnSource), 'does not gate execution on the target conversation\'s mode');
   t.ok(fnSource.includes('window.runAgentLoop('), 'hands off to the single shared run entry point regardless of role');

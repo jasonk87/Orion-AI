@@ -656,6 +656,48 @@ test('automatic action-boundary checkpoints persist their restart policy and con
   t.end();
 });
 
+test('scheduled checkpoints preserve evidence and present as waiting rather than complete', t => {
+  const active = transitionTask(normalizeTaskRecord(baseTask()), TASK_STATES.ACTIVE, {
+    timestamp: 1100,
+    executionId: 'exec-scheduled-checkpoint'
+  });
+  const pending = transitionTask(active, TASK_STATES.PENDING, {
+    timestamp: 1200,
+    expectedExecutionId: 'exec-scheduled-checkpoint',
+    reason: 'Tests are still running.',
+    summary: 'Tests are still running and green so far.',
+    reasonCode: 'scheduled_followup',
+    resumePolicy: 'scheduled',
+    notificationKind: 'checkpoint',
+    result: { summary: 'Tests are still running and green so far.', verification: ['process is active'] },
+    schedule: {
+      scheduleId: 'schedule-test-check',
+      sourceTaskId: active.taskId,
+      dueAt: 1700000120000,
+      purpose: 'test completion check'
+    },
+    continuation: {
+      input: 'Check the test process, then commit and push if it passes.',
+      source: 'scheduled-followup',
+      kind: 'scheduled',
+      messageId: 'schedule-test-check',
+      createdAt: 1200
+    }
+  });
+  t.equal(pending.status, TASK_STATES.PENDING, 'the checkpoint remains nonterminal');
+  t.equal(pending.execution.reasonCode, 'scheduled_followup', 'the durable reason is structured');
+  t.equal(pending.execution.resumePolicy, 'scheduled', 'resumption belongs to the schedule clock');
+  t.equal(pending.checkpoint.schedule.scheduleId, 'schedule-test-check', 'the owning schedule is retained');
+  t.equal(pending.checkpoint.result.verification[0], 'process is active', 'checkpoint evidence is retained');
+  t.equal(pending.continuation.kind, 'scheduled', 'the continuation type survives persistence');
+  t.equal(pendingTaskNeedsRuntimeQueue(pending), false, 'startup does not race the future schedule by auto-queueing it');
+  const presentation = describeSupervisedTaskPresentation(pending, { roleLabel: 'Coder' });
+  t.equal(presentation.phase, 'scheduled-followup', 'the UI receives a scheduled waiting phase');
+  t.equal(presentation.label, 'Coder waiting', 'the UI never presents pending scheduled work as complete');
+  t.match(presentation.detail, /scheduled follow-up/i, 'the waiting reason is visible');
+  t.end();
+});
+
 test('Dispatch task presentation follows one durable task from queued through planning and review', t => {
   const pending = normalizeTaskRecord(baseTask({
     taskId: 'task_dispatch_phone_lifecycle',
@@ -1294,5 +1336,165 @@ test('IPC task lifecycle preserves ownership and reports claim races', async t =
   });
   t.equal(cancelled.success, true, 'owning Dispatch can cancel through IPC');
   t.equal(cancelled.task.status, TASK_STATES.CANCELLED, 'IPC returns the explicit terminal cancellation state');
+  t.end();
+});
+
+// ── Scheduled-continuation lifecycle ──────────────────────────────────────────
+// A specialist execution pass ending is not the mission ending. These cover the durable half of
+// that invariant: a checkpoint that names its owning schedule must survive persistence, must
+// present as waiting rather than queued or complete, and must still be able to reach completion
+// once the scheduled continuation actually finishes the remaining work.
+
+function scheduledCheckpoint(overrides = {}) {
+  const active = transitionTask(normalizeTaskRecord(baseTask(overrides.task || {})), TASK_STATES.ACTIVE, {
+    timestamp: 2100,
+    executionId: 'exec-scheduled-1'
+  });
+  return transitionTask(active, TASK_STATES.PENDING, {
+    timestamp: 2200,
+    expectedExecutionId: 'exec-scheduled-1',
+    reason: 'The regression suite is still running.',
+    summary: 'Suite is running and green so far.',
+    reasonCode: 'scheduled_followup',
+    resumePolicy: 'scheduled',
+    notificationKind: 'checkpoint',
+    result: { summary: 'Suite is running and green so far.', verification: ['npm test still active'] },
+    schedule: {
+      scheduleId: 'schedule-suite-check',
+      sourceTaskId: 'task_base',
+      dueAt: 1700000120000,
+      purpose: 'test-progress'
+    },
+    continuation: {
+      input: 'Check the suite, then commit and push if it passed.',
+      source: 'scheduled-followup',
+      kind: 'scheduled',
+      messageId: 'schedule-suite-check',
+      createdAt: 2200
+    },
+    ...overrides.details
+  });
+}
+
+test('a checkpointed pending task never reads as queued, idle, or complete', t => {
+  const checkpointed = scheduledCheckpoint();
+  const status = describeTaskStatus(checkpointed);
+  t.match(status, /waiting for a scheduled follow-up/i, 'the status names what it is waiting on');
+  t.doesNotMatch(status, /complete/i, 'a pending task is never described as complete');
+  t.doesNotMatch(status, /queued/i,
+    'a task that already ran a pass is not described as if it had not started');
+
+  const queued = normalizeTaskRecord(baseTask());
+  t.equal(describeTaskStatus(queued), 'Queued — waiting to start.',
+    'a task that truly has not started still reads as queued');
+  t.equal(describeTaskStatus(TASK_STATES.COMPLETED), 'Completed.',
+    'the bare-status form is unchanged for callers that pass a string');
+  t.end();
+});
+
+test('each pending reason gets its own honest description', t => {
+  const withReason = (reasonCode, resumePolicy) => describeTaskStatus(scheduledCheckpoint({
+    details: { reasonCode, resumePolicy, schedule: null, notificationKind: 'checkpoint' }
+  }));
+  t.match(withReason('automatic_action_boundary', 'automatic'), /continuing automatically/i,
+    'an automatic checkpoint says it is continuing on its own');
+  t.match(withReason('awaiting_delegated_task', 'manual'), /delegated/i,
+    'delegated work says what it is waiting for');
+  t.match(withReason('awaiting_plan_approval', 'user'), /plan approval/i,
+    'plan approval is named');
+  t.match(withReason('awaiting_clarification', 'user'), /your answer/i,
+    'clarification asks the user, not the clock');
+  t.match(withReason('pending_work', 'manual'), /checkpointed/i,
+    'an unlabelled continuation still reads as mid-flight rather than queued');
+  ['automatic_action_boundary', 'awaiting_delegated_task', 'awaiting_plan_approval', 'awaiting_clarification', 'pending_work']
+    .forEach(reasonCode => {
+      t.doesNotMatch(withReason(reasonCode, 'manual'), /complete/i,
+        reasonCode + ' is never reported as completion');
+    });
+  t.end();
+});
+
+test('scheduled waiting presents identically for every specialist role, not just Coder', t => {
+  ['coder', 'operator', 'researcher'].forEach(mode => {
+    const roleLabel = mode.charAt(0).toUpperCase() + mode.slice(1);
+    const checkpointed = scheduledCheckpoint({
+      task: { target: { conversationId: mode + '-1', sessionId: '', messageId: '', mode } }
+    });
+    const presentation = describeSupervisedTaskPresentation(checkpointed, { roleLabel });
+    t.equal(presentation.phase, 'scheduled-followup', mode + ' waiting is the scheduled phase');
+    t.equal(presentation.label, roleLabel + ' waiting', mode + ' is presented by its own role name');
+    t.equal(presentation.agentState, 'Waiting', mode + ' does not present as Ready while work is outstanding');
+    t.doesNotMatch(presentation.label, /complete/i, mode + ' pending work is never labelled complete');
+    t.doesNotMatch(presentation.agentState, /^Ready$/, mode + ' does not present as idle');
+  });
+  t.end();
+});
+
+test('the phone shows waiting, not Ready, while a scheduled continuation is outstanding', t => {
+  const checkpointed = scheduledCheckpoint();
+  const supervisedPresentation = describeSupervisedTaskPresentation(checkpointed, { roleLabel: 'Coder' });
+  const phone = resolvePhoneConversationPresentation({
+    conversationRunning: false,
+    awaitingPlanApproval: false,
+    supervisedPresentation,
+    subStatus: '',
+    workspace: 'C:\\Projects\\Orion'
+  });
+  t.equal(phone.agentState, 'Waiting', 'the phone reports waiting rather than Ready');
+  t.doesNotMatch(phone.agentState, /complete/i, 'the phone never reports completion for pending work');
+  t.match(phone.detail, /scheduled follow-up/i, 'the phone explains what it is waiting on');
+  t.equal(phone.useSupervisedTaskCard, true,
+    'the phone keeps showing the task card instead of falling back to an idle conversation view');
+  t.end();
+});
+
+test('a resumed scheduled task runs pending -> active -> completed and drops its checkpoint reason', t => {
+  const checkpointed = scheduledCheckpoint();
+  t.equal(checkpointed.status, TASK_STATES.PENDING, 'the pass ended nonterminal');
+
+  // The clock fires and the SAME task is claimed, exactly as the schedule bridge does.
+  const resumed = transitionTask(checkpointed, TASK_STATES.ACTIVE, {
+    timestamp: 2300,
+    executionId: 'exec-scheduled-2',
+    consumeContinuation: true
+  });
+  t.equal(resumed.taskId, checkpointed.taskId, 'the original mission identity is preserved');
+  t.equal(resumed.status, TASK_STATES.ACTIVE, 'the schedule reactivates the same task');
+  t.equal(resumed.execution.attempt, 2, 'the resumed pass is the second attempt on one task');
+  t.equal(resumed.continuation, null, 'the continuation instruction is consumed by the claim');
+  t.equal(resumed.checkpoint.schedule.scheduleId, 'schedule-suite-check',
+    'the checkpoint history is preserved across the resume');
+
+  const completed = transitionTask(resumed, TASK_STATES.COMPLETED, {
+    timestamp: 2400,
+    expectedExecutionId: 'exec-scheduled-2',
+    summary: 'Suite passed; committed and pushed.',
+    result: { summary: 'Suite passed; committed and pushed.', verification: ['npm test: 0 failures'] }
+  });
+  t.equal(completed.status, TASK_STATES.COMPLETED, 'the remaining work reaches real completion');
+  t.equal(describeTaskStatus(completed), 'Completed.', 'and only now is it described as complete');
+  t.equal(completed.checkpointHistory.length, 1, 'the intermediate checkpoint remains as evidence');
+  const presentation = describeSupervisedTaskPresentation(completed, { roleLabel: 'Coder' });
+  t.notEqual(presentation.phase, 'scheduled-followup', 'the completed task no longer presents as waiting');
+  t.end();
+});
+
+test('a scheduled checkpoint survives the persistence round-trip that a restart replays', t => {
+  // normalizeTaskRecord is what every store read passes through. If it dropped the checkpoint,
+  // a restart would forget which schedule is holding the task open and could never cancel it.
+  const checkpointed = scheduledCheckpoint();
+  const replayed = normalizeTaskRecord(JSON.parse(JSON.stringify(checkpointed)));
+  t.equal(replayed.status, TASK_STATES.PENDING, 'the task is still nonterminal after a restart');
+  t.equal(replayed.execution.reasonCode, 'scheduled_followup', 'the structured reason survives persistence');
+  t.equal(replayed.execution.resumePolicy, 'scheduled', 'the resume policy survives persistence');
+  t.equal(replayed.checkpoint.schedule.scheduleId, 'schedule-suite-check',
+    'the owning schedule identity survives, so cancellation can still find it');
+  t.equal(replayed.checkpoint.schedule.sourceTaskId, 'task_base', 'the schedule still points back at this task');
+  t.equal(replayed.continuation.input, 'Check the suite, then commit and push if it passed.',
+    'the continuation instruction survives so the resumed pass knows what to finish');
+  t.equal(pendingTaskNeedsRuntimeQueue(replayed), false,
+    'startup does not race the clock by auto-queueing work the schedule already owns');
+  t.match(describeTaskStatus(replayed), /waiting for a scheduled follow-up/i,
+    'and it still presents as waiting after the restart');
   t.end();
 });

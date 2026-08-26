@@ -74,7 +74,7 @@
     return { allowed: true, reason: '', chain, nextChain };
   }
 
-  const SCHEMA_VERSION = 5;
+  const SCHEMA_VERSION = 6;
   const TASK_STATES = Object.freeze({
     PENDING: 'pending',
     ACTIVE: 'active',
@@ -845,7 +845,7 @@
     }
     if (nextState === TASK_STATES.PENDING && currentState === TASK_STATES.ACTIVE) {
       next.pendingAt = now;
-      const resumePolicy = ['automatic', 'user', 'manual'].includes(compactInline(details.resumePolicy).toLowerCase())
+      const resumePolicy = ['automatic', 'scheduled', 'user', 'manual'].includes(compactInline(details.resumePolicy).toLowerCase())
         ? compactInline(details.resumePolicy).toLowerCase()
         : 'manual';
       next.execution = {
@@ -862,10 +862,41 @@
           next.continuation = {
             input: continuationInput,
             source: compactInline(details.continuation.source || 'task-continuation'),
+            kind: compactInline(details.continuation.kind || ''),
             messageId: compactInline(details.continuation.messageId || ''),
             createdAt: Number(details.continuation.createdAt || now)
           };
         }
+      }
+      if (details.notificationKind === 'checkpoint') {
+        const scheduleValue = details.schedule && typeof details.schedule === 'object'
+          ? details.schedule
+          : null;
+        const checkpoint = {
+          checkpointId: compactInline(details.checkpointId)
+            || `${task.taskId}:checkpoint:${Math.max(1, Number(currentExecution.attempt) || 1)}:${now}`,
+          attempt: Math.max(1, Number(currentExecution.attempt) || 1),
+          summary: compactWhitespace(details.summary || ''),
+          result: details.result && typeof details.result === 'object' ? details.result : null,
+          reason: compactWhitespace(details.reason || details.pendingReason || ''),
+          reasonCode: compactInline(details.reasonCode || ''),
+          resumePolicy,
+          schedule: scheduleValue
+            ? {
+                scheduleId: compactInline(scheduleValue.scheduleId || ''),
+                sourceTaskId: compactInline(scheduleValue.sourceTaskId || task.taskId),
+                dueAt: Number(scheduleValue.dueAt || scheduleValue.nextRunAt) || 0,
+                nextRunAt: Number(scheduleValue.nextRunAt || scheduleValue.dueAt) || 0,
+                purpose: compactWhitespace(scheduleValue.purpose || '')
+              }
+            : null,
+          checkpointedAt: now
+        };
+        next.checkpoint = checkpoint;
+        next.checkpointHistory = [
+          ...(Array.isArray(task.checkpointHistory) ? task.checkpointHistory : []),
+          checkpoint
+        ].slice(-20);
       }
     }
     if (nextState === TASK_STATES.COMPLETED) {
@@ -1012,6 +1043,34 @@
     return sections.join('\n').trim();
   }
 
+  // A pending task is not one shape. "Queued — waiting to start" is only true before the first
+  // execution pass; once a pass has checkpointed, pending means the mission is mid-flight and
+  // waiting on something specific. Reporting all of them as "queued" reads as idle, which is the
+  // same class of error as reporting them as complete.
+  function describePendingReason(task) {
+    const execution = task && task.execution && typeof task.execution === 'object' ? task.execution : {};
+    const attempt = Math.max(0, Number(execution.attempt) || 0);
+    if (attempt === 0) return 'Queued — waiting to start.';
+    const reasonCode = compactInline(execution.reasonCode || '').toLowerCase();
+    const scheduledAt = Number(
+      task && task.checkpoint && task.checkpoint.schedule
+      && (task.checkpoint.schedule.nextRunAt || task.checkpoint.schedule.dueAt)
+    ) || 0;
+    if (reasonCode === 'scheduled_followup'
+        || compactInline(execution.resumePolicy).toLowerCase() === 'scheduled') {
+      return scheduledAt
+        ? `Waiting for a scheduled follow-up at ${new Date(scheduledAt).toLocaleString()}.`
+        : 'Waiting for a scheduled follow-up.';
+    }
+    if (reasonCode === 'automatic_action_boundary') return 'Checkpointed — continuing automatically.';
+    if (reasonCode === 'awaiting_delegated_task') return 'Waiting for a delegated task.';
+    if (reasonCode === 'awaiting_plan_approval') return 'Waiting for plan approval.';
+    if (reasonCode === 'awaiting_clarification' || reasonCode === 'awaiting_input') {
+      return 'Waiting for your answer.';
+    }
+    return 'Checkpointed — waiting to continue.';
+  }
+
   function describeTaskStatus(taskOrStatus) {
     const task = taskOrStatus && typeof taskOrStatus === 'object' ? normalizeTaskRecord(taskOrStatus) : null;
     let status = task ? task.status : TASK_STATES.FAILED;
@@ -1020,7 +1079,7 @@
     }
     const reason = task && status === TASK_STATES.CANCELLED && task.cancellation ? compactInline(task.cancellation.reason) : '';
     const failure = task && status === TASK_STATES.FAILED && task.failure ? compactInline(task.failure.message) : '';
-    if (status === TASK_STATES.PENDING) return 'Queued — waiting to start.';
+    if (status === TASK_STATES.PENDING) return task ? describePendingReason(task) : 'Queued — waiting to start.';
     if (status === TASK_STATES.ACTIVE) return 'Running.';
     if (status === TASK_STATES.COMPLETED) return 'Completed.';
     if (status === TASK_STATES.CANCELLED) return reason ? `Cancelled — ${reason}` : 'Cancelled.';
@@ -1227,6 +1286,31 @@
       detail = detail || `${roleLabel} is waiting for ${childRole} to return the delegated result.`;
       agentState = `${childRole} active`;
       badgeClass = childRoleMode === 'operator' ? 'operator' : 'success';
+    } else if (status === TASK_STATES.PENDING && (reasonCode === 'scheduled_followup' || resumePolicy === 'scheduled')) {
+      const scheduledAt = Number(
+        taskValue.checkpoint
+        && taskValue.checkpoint.schedule
+        && (taskValue.checkpoint.schedule.nextRunAt || taskValue.checkpoint.schedule.dueAt)
+      ) || 0;
+      phase = 'scheduled-followup';
+      label = `${roleLabel} waiting`;
+      detail = detail || (scheduledAt
+        ? `Waiting for the scheduled follow-up at ${new Date(scheduledAt).toLocaleString()}.`
+        : 'Waiting for the scheduled follow-up.');
+      agentState = 'Waiting';
+      badgeClass = 'warning';
+    } else if (status === TASK_STATES.PENDING && reasonCode === 'awaiting_plan_approval') {
+      phase = 'review';
+      label = 'Review';
+      detail = detail || `${roleLabel}'s implementation plan is ready for approval.`;
+      agentState = 'Review';
+      badgeClass = 'warning';
+    } else if (status === TASK_STATES.PENDING && ['awaiting_clarification', 'awaiting_input'].includes(reasonCode)) {
+      phase = 'awaiting-input';
+      label = 'Input needed';
+      detail = detail || `${roleLabel} is waiting for your answer.`;
+      agentState = 'Input needed';
+      badgeClass = 'warning';
     } else if (status === TASK_STATES.PENDING && resumePolicy === 'automatic') {
       phase = 'continuing';
       label = `${roleLabel} continuing`;

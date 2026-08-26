@@ -3568,6 +3568,77 @@ test('a scheduled worker result is flushed into its visible conversation before 
   t.end();
 });
 
+test('a task-owned schedule resumes the same durable task instead of creating a new mission', async t => {
+  const specialist = conversation('scheduled-source-coder', { mode: 'coder' });
+  global.conversations = [specialist];
+  const enqueued = [];
+  const runs = [];
+  installHarness([], {
+    api: {
+      getOrchestrationTask: async taskId => ({
+        success: true,
+        task: {
+          taskId,
+          status: 'pending',
+          target: { conversationId: specialist.id, mode: 'coder' }
+        }
+      })
+    },
+    window: {
+      enqueueOrchestrationTask: async input => {
+        enqueued.push(input);
+        return { success: false, error: 'must not enqueue' };
+      }
+    }
+  });
+  global.window.runAgentLoop = async (prompt, model, conv, options) => {
+    runs.push({ prompt, model, conv, options });
+  };
+  const result = await global.window.runDurableSchedule({
+    scheduleId: 'schedule-source-task',
+    sourceTaskId: 'task-source-123',
+    conversationId: specialist.id,
+    deliveryConversationId: 'dispatch-owner',
+    prompt: 'Check the running tests, then commit and push if they pass.',
+    purpose: 'test-progress',
+    modelSelectValue: 'gemini-1'
+  });
+  t.equal(result.ran, true, 'the scheduled continuation runs');
+  t.equal(result.taskId, 'task-source-123', 'the same source task identity is returned');
+  t.equal(enqueued.length, 0, 'no unrelated task is created');
+  t.equal(runs.length, 1, 'one continuation pass starts');
+  t.equal(runs[0].options.taskId, 'task-source-123', 'the agent loop claims the original task');
+  t.equal(runs[0].options.scheduleId, 'schedule-source-task', 'the schedule remains correlated');
+  delete global.conversations;
+  t.end();
+});
+
+test('a fired task schedule cannot resurrect a cancelled task', async t => {
+  const specialist = conversation('cancelled-source-coder', { mode: 'coder' });
+  global.conversations = [specialist];
+  let runCount = 0;
+  installHarness([], {
+    api: {
+      getOrchestrationTask: async taskId => ({
+        success: true,
+        task: { taskId, status: 'cancelled', target: { conversationId: specialist.id, mode: 'coder' } }
+      })
+    }
+  });
+  global.window.runAgentLoop = async () => { runCount++; };
+  const result = await global.window.runDurableSchedule({
+    scheduleId: 'schedule-cancelled-task',
+    sourceTaskId: 'task-cancelled',
+    conversationId: specialist.id,
+    prompt: 'Resume cancelled work.'
+  });
+  t.equal(result.skipped, true, 'the stale trigger is consumed without execution');
+  t.equal(result.reason, 'source_task_cancelled', 'the canonical terminal state explains the skip');
+  t.equal(runCount, 0, 'cancelled work never restarts');
+  delete global.conversations;
+  t.end();
+});
+
 test('a delivery-only reminder fires in Dispatch without creating specialist work', async t => {
   const originalFetch = global.fetch;
   const queuedTasks = [];
@@ -3705,4 +3776,235 @@ test('a delegated child completion resumes its parent without sending an interme
     restoreGlobals(originalFetch);
   }
   t.end();
+});
+
+// ── Scheduled continuations keep the durable mission alive ────────────────────
+// The bug these cover: a specialist could start a long-running process, schedule a follow-up to
+// check it, and end the execution pass. The finalizer did not consult the durable schedule store,
+// so the pass fell through to "no continuation remains" and persisted the task as COMPLETED --
+// which Dispatch then correctly relayed as "Coder completed ...", contradicting the specialist's
+// own checkpoint. A specialist run ending is not the mission ending.
+
+function scheduleStoreStub(schedules) {
+  const listed = [];
+  const cancelled = [];
+  return {
+    listed,
+    cancelled,
+    api: {
+      listSchedules: async (filters = {}) => {
+        listed.push(filters);
+        const sourceTaskId = String(filters.sourceTaskId || '');
+        return {
+          success: true,
+          schedules: schedules
+            .filter(item => !sourceTaskId || item.sourceTaskId === sourceTaskId)
+            .map(item => ({ ...item }))
+        };
+      },
+      cancelTaskSchedules: async sourceTaskId => {
+        cancelled.push(sourceTaskId);
+        return { success: true, cancelled: 1, scheduleIds: schedules.map(item => item.scheduleId) };
+      }
+    }
+  };
+}
+
+function ownedSchedule(sourceTaskId, overrides = {}) {
+  return {
+    scheduleId: 'schedule-suite-check',
+    sourceTaskId,
+    conversationId: 'ignored-by-the-finalizer',
+    dueAt: 1700000120000,
+    purpose: 'test-progress',
+    prompt: 'Check the regression suite, then commit and push if it passed.',
+    status: 'pending',
+    ...overrides
+  };
+}
+
+// One pass that does real work and then stops talking, which is exactly the shape that used to
+// be misread as completion.
+const PROGRESS_THEN_STOP = [
+  [{ text: 'Starting the regression suite now.' }, { functionCall: { name: 'read_file', args: { path: 'status.txt' } } }],
+  [{ text: '## Work Walkthrough\n\n**Result:** The regression suite is running and green so far.' }]
+];
+
+async function runTrackedPass(t, options = {}) {
+  const finalized = [];
+  const checkpointed = [];
+  const terminalRelays = [];
+  const runFinalizations = [];
+  const store = scheduleStoreStub(options.schedules || []);
+  installHarness(PROGRESS_THEN_STOP, {
+    workspace: 'C:\\Users\\Owner',
+    api: {
+      readFile: async () => 'suite: running',
+      ...store.api
+    },
+    window: {
+      claimOrchestrationTask: async taskId => ({
+        success: true,
+        task: { taskId, status: 'active', execution: { executionId: options.executionId || 'exec-scheduled-pass' } },
+        prompt: 'Run the regression suite and push once it passes.'
+      }),
+      finalizeOrchestrationTask: async (taskId, status, details) => {
+        finalized.push({ taskId, status, details });
+        return { taskId, status };
+      },
+      onOrchestrationTaskFinalized: async (taskId, conversationId, status) => {
+        terminalRelays.push({ taskId, conversationId, status });
+      },
+      onOrchestrationTaskCheckpointed: async (taskId, conversationId, details) => {
+        checkpointed.push({ taskId, conversationId, details });
+      },
+      onAgentRunFinalized: async (conversationId, status, details) => {
+        runFinalizations.push({ conversationId, status, details });
+      }
+    }
+  });
+  const conv = conversation(options.conversationId || 'coder-scheduled-pass', {
+    mode: options.mode || 'coder',
+    workspace: 'C:\\Users\\Owner'
+  });
+  await global.window.runAgentLoop(
+    'Run the regression suite and push once it passes.',
+    'gemini-1',
+    conv,
+    { taskId: options.taskId || 'task-scheduled-pass', ...(options.runOptions || {}) }
+  );
+  return { finalized, checkpointed, terminalRelays, runFinalizations, store, conv };
+}
+
+test('a pass that scheduled a task-owned follow-up persists as pending, never completed', async t => {
+  const originalFetch = global.fetch;
+  try {
+    const taskId = 'task-scheduled-pass';
+    const run = await runTrackedPass(t, { schedules: [ownedSchedule(taskId)] });
+
+    t.equal(run.finalized.length, 1, 'the execution pass records exactly one durable transition');
+    t.equal(run.finalized[0].taskId, taskId, 'the original mission identity is preserved');
+    t.equal(run.finalized[0].status, 'pending',
+      'an outstanding task-owned schedule keeps the durable task nonterminal');
+    t.notEqual(run.finalized[0].status, 'completed',
+      'the pass ending is not treated as the mission ending');
+
+    const details = run.finalized[0].details;
+    t.equal(details.reasonCode, 'scheduled_followup', 'the pending reason is structured, not prose');
+    t.equal(details.resumePolicy, 'scheduled', 'the clock owns resumption');
+    t.equal(details.notificationKind, 'checkpoint', 'the pass publishes a checkpoint, not a terminal result');
+    t.equal(details.pendingWork, true, 'the schedule counts as durable pending work');
+    t.equal(details.schedule.scheduleId, 'schedule-suite-check',
+      'the schedule keeping the task alive is recorded by identity');
+    t.equal(details.schedule.sourceTaskId, taskId, 'the schedule is bound to this task');
+    t.equal(details.schedule.dueAt, 1700000120000, 'the due time is retained for presentation and cancellation');
+    t.equal(details.continuation.kind, 'scheduled', 'the continuation is typed as scheduled');
+    t.equal(details.continuation.messageId, 'schedule-suite-check',
+      'the continuation names the schedule that will deliver it');
+    t.match(details.continuation.input, /commit and push/i,
+      'the resumed pass will receive the remaining work, not a blank restart');
+
+    // The store is consulted by task identity, not by conversation or by parsing the transcript.
+    t.ok(run.store.listed.length >= 1, 'the durable schedule store is actually consulted');
+    t.equal(run.store.listed[0].sourceTaskId, taskId, 'schedules are looked up by owning task');
+    t.deepEqual(run.store.listed[0].status, ['pending', 'firing'],
+      'only live schedules can hold a task open');
+    t.end();
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+});
+
+test('a pending scheduled pass reports a checkpoint to Dispatch and never a terminal completion', async t => {
+  const originalFetch = global.fetch;
+  try {
+    const taskId = 'task-scheduled-pass';
+    const run = await runTrackedPass(t, { schedules: [ownedSchedule(taskId)] });
+
+    t.equal(run.terminalRelays.length, 0,
+      'the terminal relay stays terminal-only, so Dispatch cannot say the specialist completed');
+    t.equal(run.checkpointed.length, 1, 'the separate checkpoint relay fires exactly once');
+    t.equal(run.checkpointed[0].taskId, taskId, 'the checkpoint names the same durable task');
+    t.equal(run.checkpointed[0].details.disposition.reasonCode, 'scheduled_followup',
+      'the checkpoint carries the structured reason');
+    t.equal(run.checkpointed[0].details.disposition.schedule.scheduleId, 'schedule-suite-check',
+      'the checkpoint carries the owning schedule');
+    t.ok(run.checkpointed[0].details.result, 'the checkpoint carries the pass evidence');
+
+    t.equal(run.store.cancelled.length, 0,
+      'a live continuation is not cancelled while the task is still pending');
+
+    t.equal(run.runFinalizations.length, 1, 'the UI receives one end-of-pass update');
+    t.equal(run.runFinalizations[0].status, 'pending', 'the UI is told the task is still pending');
+    t.equal(run.runFinalizations[0].details.reasonCode, 'scheduled_followup',
+      'the UI receives the same reason the durable task recorded');
+    t.equal(run.runFinalizations[0].details.resumePolicy, 'scheduled',
+      'desktop and phone presentation read the same resume policy as the task store');
+    t.equal(run.runFinalizations[0].details.schedule.scheduleId, 'schedule-suite-check',
+      'the UI can show when the next check happens');
+    t.end();
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+});
+
+test('the scheduled-continuation lifecycle is generic across specialist roles', async t => {
+  const originalFetch = global.fetch;
+  try {
+    for (const mode of ['coder', 'operator', 'researcher']) {
+      const taskId = 'task-scheduled-' + mode;
+      const run = await runTrackedPass(t, {
+        mode,
+        taskId,
+        conversationId: mode + '-scheduled-pass',
+        executionId: 'exec-scheduled-' + mode,
+        schedules: [ownedSchedule(taskId)]
+      });
+      t.equal(run.finalized[0].status, 'pending', mode + ' keeps its durable task nonterminal');
+      t.equal(run.finalized[0].details.reasonCode, 'scheduled_followup',
+        mode + ' records the same structured reason');
+      t.equal(run.terminalRelays.length, 0, mode + ' does not emit a terminal completion');
+      t.equal(run.checkpointed.length, 1, mode + ' emits a checkpoint instead');
+    }
+    t.end();
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+});
+
+test('with no task-owned schedule outstanding the same pass completes and releases the task', async t => {
+  const originalFetch = global.fetch;
+  try {
+    const run = await runTrackedPass(t, { schedules: [] });
+    t.equal(run.finalized[0].status, 'completed',
+      'a finished pass with nothing outstanding still reaches real completion');
+    t.equal(run.finalized[0].details.notificationKind, 'terminal', 'and publishes a terminal result');
+    t.equal(run.checkpointed.length, 0, 'no checkpoint is emitted for a finished mission');
+    t.equal(run.terminalRelays.length, 1, 'Dispatch receives exactly one terminal completion');
+    t.equal(run.terminalRelays[0].status, 'completed', 'and it reports the canonical durable state');
+    t.deepEqual(run.store.cancelled, ['task-scheduled-pass'],
+      'terminal work cancels any task-owned continuation so it cannot wake the task again');
+    t.end();
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+});
+
+test('the schedule that woke a pass cannot hold that same pass open forever', async t => {
+  const originalFetch = global.fetch;
+  try {
+    const taskId = 'task-scheduled-pass';
+    // The firing schedule is still live in the store while the run it woke is executing. If it
+    // counted as an outstanding continuation, a scheduled resume could never complete its task.
+    const run = await runTrackedPass(t, {
+      schedules: [ownedSchedule(taskId, { scheduleId: 'schedule-that-woke-us', status: 'firing' })],
+      runOptions: { scheduleId: 'schedule-that-woke-us' }
+    });
+    t.equal(run.finalized[0].status, 'completed',
+      'the resumed pass finishes the mission instead of rescheduling itself indefinitely');
+    t.equal(run.terminalRelays.length, 1, 'Dispatch receives the one true completion');
+    t.end();
+  } finally {
+    restoreGlobals(originalFetch);
+  }
 });

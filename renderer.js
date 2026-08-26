@@ -3748,6 +3748,12 @@ window.cancelOwnedOrchestrationTask = async function(taskId, requesterConversati
   const result = await window.api.cancelOrchestrationTask(taskId, { conversationId: requesterConversationId }, reason);
   if (!result || result.success === false || !result.task) return result || { success: false, error: 'Cancellation failed.' };
   orchestrationTaskCache.set(result.task.taskId, result.task);
+  if (window.api && typeof window.api.cancelTaskSchedules === 'function') {
+    const scheduleCancellation = await window.api.cancelTaskSchedules(taskId);
+    if (scheduleCancellation && scheduleCancellation.success === false) {
+      console.error('Could not cancel task-owned continuation schedules:', scheduleCancellation.error);
+    }
+  }
   window.promptQueue = (Array.isArray(window.promptQueue) ? window.promptQueue : []).filter(item => item && item.taskId !== taskId);
   const targetId = result.task.target && result.task.target.conversationId;
   const originId = result.task.origin && result.task.origin.conversationId;
@@ -8339,7 +8345,12 @@ window.onAgentRunFinalized = async function(conversationId, status, details = {}
     renderAgentPresence('attention', 'Failed', 'Open the transcript for the recorded error');
     showToast('The task failed.', 'error');
   } else if (canonicalStatus === 'pending') {
-    if (details.automaticContinuation) {
+    if (details.reasonCode === 'scheduled_followup' || details.resumePolicy === 'scheduled') {
+      const nextAt = details.schedule && Number(details.schedule.nextRunAt || details.schedule.dueAt);
+      renderAgentPresence('verifying', 'Waiting', nextAt
+        ? `Next scheduled follow-up: ${new Date(nextAt).toLocaleString()}`
+        : 'Waiting for the scheduled follow-up');
+    } else if (details.automaticContinuation) {
       renderAgentPresence('working', 'Continuing', 'Orion checkpointed this pass and is continuing the same task');
     } else if (conv && conv.awaitingPlanApproval && !conv.planApproved) {
       revealAgentPanel('A plan is ready for review.');
@@ -11556,11 +11567,74 @@ window.onOrchestrationTaskFinalized = async function(taskId, targetConversationI
   }
 };
 
+window.onOrchestrationTaskCheckpointed = async function(taskId, targetConversationId, details = {}) {
+  if (!taskId || !targetConversationId || !window.api || typeof window.api.getOrchestrationTask !== 'function') return;
+  const taskRead = await window.api.getOrchestrationTask(taskId);
+  const task = taskRead && taskRead.success ? taskRead.task : null;
+  if (!task || task.status !== 'pending') return;
+  orchestrationTaskCache.set(task.taskId, task);
+
+  const targetConv = conversations.find(conversation => conversation.id === targetConversationId);
+  const roleMode = String(
+    targetConv && conversationMode(targetConv)
+    || task.target && task.target.mode
+    || ''
+  ).toLowerCase();
+  const roleName = AGENT_ROLE_DISPLAY_NAMES[roleMode] || 'Specialist';
+  const originConversationId = String(
+    task.rootOriginConversationId
+    || task.origin && task.origin.conversationId
+    || ''
+  );
+  const originConv = conversations.find(conversation => conversation.id === originConversationId);
+  if (!originConv) return;
+
+  const checkpoint = task.checkpoint && typeof task.checkpoint === 'object'
+    ? task.checkpoint
+    : {};
+  const schedule = checkpoint.schedule && typeof checkpoint.schedule === 'object'
+    ? checkpoint.schedule
+    : (details.disposition && details.disposition.schedule || null);
+  const summary = String(checkpoint.summary || details.summary || '').trim();
+  const reasonCode = String(
+    checkpoint.reasonCode
+    || task.execution && task.execution.reasonCode
+    || ''
+  );
+  const nextLine = schedule && Number(schedule.nextRunAt || schedule.dueAt)
+    ? `Next check is scheduled for ${new Date(Number(schedule.nextRunAt || schedule.dueAt)).toLocaleString()}.`
+    : (reasonCode === 'automatic_action_boundary'
+      ? 'The same task is continuing automatically.'
+      : 'It is waiting for its next continuation.');
+  const text = `${roleName} checkpoint — **${task.title || 'Task'}**\n\n`
+    + `${summary || checkpoint.reason || 'Meaningful progress was recorded for this execution pass.'}\n\n`
+    + `The task remains pending. ${nextLine}`;
+  notifyOrionConversation(originConv, text, 'supervisor-checkpoint', {
+    orchestrationTaskId: taskId,
+    orchestrationEventId: String(checkpoint.checkpointId || `${taskId}:${task.updatedAt || Date.now()}`),
+    specialistRole: roleMode,
+    checkpointReasonCode: reasonCode
+  });
+  if (typeof window.markConversationDirty === 'function') window.markConversationDirty(originConv.id);
+  if (typeof window.flushConversationsToStorage === 'function') {
+    await window.flushConversationsToStorage(originConv.id);
+  }
+  syncDispatchCoderStatusCard(originConv.id, false, '');
+};
+
 // Appends a message to an Orion conversation, rendering it if active.
 function notifyOrionConversation(orionConv, text, source, metadata = {}) {
   if (!orionConv || !text) return;
   if (!Array.isArray(orionConv.messages)) orionConv.messages = [];
-  if (metadata.orchestrationTaskId
+  if (metadata.orchestrationEventId
+      && orionConv.messages.some(message =>
+        message
+        && message.source === source
+        && String(message.orchestrationEventId || '') === String(metadata.orchestrationEventId)
+      )) {
+    return;
+  }
+  if (!metadata.orchestrationEventId && metadata.orchestrationTaskId
       && orionConv.messages.some(message =>
         message
         && message.source === source

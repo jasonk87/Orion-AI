@@ -127,6 +127,7 @@ contextBridge.exposeInMainWorld('api', {
   listSchedules: (filters) => ipcRenderer.invoke('orion:list-schedules', filters || {}),
   cancelSchedule: (scheduleId) => ipcRenderer.invoke('orion:cancel-schedule', { scheduleId }),
   cancelConversationSchedules: (conversationId) => ipcRenderer.invoke('orion:cancel-conversation-schedules', { conversationId }),
+  cancelTaskSchedules: (sourceTaskId) => ipcRenderer.invoke('orion:cancel-task-schedules', { sourceTaskId }),
   writeConversation: (conv) => ipcRenderer.invoke('write-conversation', conv),
   writeConversationsIndex: (index) => ipcRenderer.invoke('write-conversations-index', index),
   deleteConversation: (id) => ipcRenderer.invoke('delete-conversation', id),

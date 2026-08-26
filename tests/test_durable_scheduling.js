@@ -28,6 +28,66 @@ function makeStore(clockRef) {
   };
 }
 
+test('task-owned schedules can be queried and cancelled without touching reminders', async t => {
+  const clock = { now: BASE };
+  const fixture = makeStore(clock);
+  try {
+    const owned = await fixture.store.create({
+      conversationId: 'coder-conversation',
+      sourceTaskId: 'task-123',
+      prompt: 'Check the test process and continue the mission.',
+      purpose: 'test-progress',
+      delayMs: MINUTE
+    });
+    const reminder = await fixture.store.create({
+      conversationId: 'dispatch-conversation',
+      prompt: 'Remind Jason to call someone.',
+      purpose: 'plain-reminder',
+      deliveryOnly: true,
+      delayMs: MINUTE
+    });
+    const restarted = fixture.reopen();
+    const taskSchedules = await restarted.list({ sourceTaskId: 'task-123', status: ['pending', 'firing'] });
+    t.equal(taskSchedules.length, 1, 'the task continuation survives restart and remains queryable');
+    t.equal(taskSchedules[0].scheduleId, owned.schedule.scheduleId, 'the exact continuation is found');
+    const cancelled = await restarted.cancelForSourceTask('task-123');
+    t.equal(cancelled.cancelled, 1, 'task cancellation cancels its continuation');
+    t.deepEqual(cancelled.scheduleIds, [owned.schedule.scheduleId], 'the cancellation receipt is explicit');
+    const all = await restarted.list();
+    t.equal(all.find(item => item.scheduleId === owned.schedule.scheduleId).status, 'cancelled',
+      'the task-owned continuation cannot wake later');
+    t.equal(all.find(item => item.scheduleId === reminder.schedule.scheduleId).status, 'pending',
+      'a plain Dispatch reminder remains independent');
+  } finally {
+    fixture.cleanup();
+  }
+  t.end();
+});
+
+test('cancellation remains authoritative when a task schedule was already claimed', async t => {
+  const clock = { now: BASE };
+  const fixture = makeStore(clock);
+  try {
+    const created = await fixture.store.create({
+      conversationId: 'coder-conversation',
+      sourceTaskId: 'task-race',
+      prompt: 'Resume work.',
+      purpose: 'race-check',
+      delayMs: MINUTE
+    });
+    clock.now += MINUTE;
+    const claimed = await fixture.store.claimDue(clock.now);
+    t.equal(claimed.length, 1, 'the schedule enters firing');
+    await fixture.store.cancelForSourceTask('task-race');
+    await fixture.store.settle(created.schedule.scheduleId, {});
+    const [record] = await fixture.store.list({ sourceTaskId: 'task-race' });
+    t.equal(record.status, 'cancelled', 'a late settle cannot resurrect or complete cancelled work');
+  } finally {
+    fixture.cleanup();
+  }
+  t.end();
+});
+
 // ── Fire-time policy ──────────────────────────────────────────────────────────
 
 test('a one-shot that came due while the machine slept still runs, and is marked late', t => {
@@ -376,5 +436,99 @@ test('startup sweeps overdue schedules promptly instead of waiting out the first
   const recoveryIndex = body.indexOf('releaseInterruptedFiring()');
   const primingIndex = body.indexOf('priming');
   t.ok(recoveryIndex < primingIndex, 'stranded schedules are released before the first sweep claims anything');
+  t.end();
+});
+
+// A cancelled task must stay cancelled across the one recovery path that deliberately revives
+// schedules. releaseInterruptedFiring exists because a process that dies mid-fire would otherwise
+// strand a schedule in 'firing' forever -- but it must not be able to walk a cancelled
+// continuation back into the live set and restart work the user stopped.
+test('restart recovery cannot revive a continuation that was cancelled mid-fire', async t => {
+  const clock = { now: BASE };
+  const fixture = makeStore(clock);
+  try {
+    const created = await fixture.store.create({
+      conversationId: 'coder-conversation',
+      sourceTaskId: 'task-stopped',
+      prompt: 'Resume the stopped mission.',
+      purpose: 'test-progress',
+      delayMs: MINUTE
+    });
+    clock.now += MINUTE;
+    t.equal((await fixture.store.claimDue(clock.now)).length, 1, 'the continuation was claimed and is firing');
+
+    // The user stops the task while its continuation is mid-fire, then Orion dies.
+    await fixture.store.cancelForSourceTask('task-stopped');
+
+    const restarted = fixture.reopen();
+    await restarted.releaseInterruptedFiring();
+    const [record] = await restarted.list({ sourceTaskId: 'task-stopped' });
+    t.equal(record.status, 'cancelled', 'startup recovery leaves the cancelled continuation cancelled');
+
+    clock.now += HOUR;
+    const claimedAfterRestart = await restarted.claimDue(clock.now);
+    t.equal(claimedAfterRestart.length, 0, 'and it can never come due again, however long the app runs');
+    t.equal(
+      (await restarted.list({ sourceTaskId: 'task-stopped', status: ['pending', 'firing'] })).length,
+      0,
+      'no live continuation remains that could resurrect the cancelled task'
+    );
+    t.equal(created.schedule.sourceTaskId, 'task-stopped', 'the continuation was task-owned throughout');
+  } finally {
+    fixture.cleanup();
+  }
+  t.end();
+});
+
+test('an interrupted continuation for a task that is still live is recovered normally', async t => {
+  const clock = { now: BASE };
+  const fixture = makeStore(clock);
+  try {
+    await fixture.store.create({
+      conversationId: 'coder-conversation',
+      sourceTaskId: 'task-live',
+      prompt: 'Check the suite and finish the mission.',
+      purpose: 'test-progress',
+      delayMs: MINUTE
+    });
+    clock.now += MINUTE;
+    await fixture.store.claimDue(clock.now);
+
+    const restarted = fixture.reopen();
+    await restarted.releaseInterruptedFiring();
+    const [record] = await restarted.list({ sourceTaskId: 'task-live' });
+    t.equal(record.status, 'pending', 'a crash mid-fire returns the continuation to the live set');
+    t.equal(record.fireCount, 0, 'the fire that never happened is not counted against it');
+    t.equal((await restarted.claimDue(clock.now)).length, 1,
+      'so the pending mission actually resumes instead of being stranded');
+  } finally {
+    fixture.cleanup();
+  }
+  t.end();
+});
+
+test('task-scoped cancellation is inert without a task, so reminders are never swept up', async t => {
+  const clock = { now: BASE };
+  const fixture = makeStore(clock);
+  try {
+    const reminder = await fixture.store.create({
+      conversationId: 'dispatch-conversation',
+      prompt: 'Remind Jason to call someone at 2 PM.',
+      purpose: 'plain-reminder',
+      deliveryOnly: true,
+      delayMs: MINUTE
+    });
+    t.equal(reminder.schedule.sourceTaskId, '', 'a plain reminder has no owning task');
+    t.deepEqual(await fixture.store.cancelForSourceTask(''), { cancelled: 0, scheduleIds: [] },
+      'cancelling "no task" cancels nothing rather than everything');
+    t.deepEqual(await fixture.store.cancelForSourceTask('task-that-never-existed'), { cancelled: 0, scheduleIds: [] },
+      'cancelling an unrelated task leaves the store alone');
+    const [record] = await fixture.store.list({ conversationId: 'dispatch-conversation' });
+    t.equal(record.status, 'pending', 'the ordinary reminder is still going to fire');
+    t.equal((await fixture.store.list({ sourceTaskId: '' })).length, 1,
+      'an empty task filter is not treated as a match-nothing filter for listing either');
+  } finally {
+    fixture.cleanup();
+  }
   t.end();
 });

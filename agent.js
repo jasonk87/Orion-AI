@@ -7,6 +7,7 @@ const OrionOperatingContract = window.OrionOperatingContract || (typeof require 
 const OperatorExecutionPolicy = window.OrionOperatorExecutionPolicy || (typeof require === 'function' ? require('./operator-execution-policy') : null);
 const OrionSpecialistRegistry = window.OrionSpecialistRegistry || (typeof require === 'function' ? require('./specialist-registry') : null);
 const SchedulePolicy = typeof require === 'function' ? require('./lib/schedule-policy') : null;
+const RunExitDisposition = window.OrionRunExitDisposition || (typeof require === 'function' ? require('./run-exit-disposition') : null);
 
 // System Instruction for the Pair Programmer
 const SYSTEM_INSTRUCTION = `You are Orion AI, the ultimate pair programmer agent running locally on the user's workspace.
@@ -5226,70 +5227,76 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       || conversation.awaitingPlanApproval
       || conversation.awaitingClarification
     );
+    const scheduledFollowup = runTaskId
+      ? await findTaskContinuationSchedule(runTaskId, options.scheduleId)
+      : null;
+    const awaitingDelegatedChild = !!(delegatedChildTask && delegatedChildTask.taskId);
+    const runExitDisposition = RunExitDisposition.resolveRunExitDisposition({
+      cancelled: userRequestedStop,
+      planDenied: currentTaskDeniedByPlanDecision,
+      criticalError: criticalRunError,
+      delegatedChildTaskId: awaitingDelegatedChild ? delegatedChildTask.taskId : '',
+      scheduledFollowup,
+      automaticContinuation: autoContinueExecution,
+      awaitingPlanApproval: conversation.awaitingPlanApproval,
+      awaitingClarification: conversation.awaitingClarification,
+      repeatedToolFailure: !!forcedYieldFailure,
+      actionBoundary: ranOutOfLoopBudget,
+      awaitingUser: forceYield,
+      pendingWork: hasPendingWork || durableBoundaryWork
+    });
+    const runResult = {
+      summary: userFacingResultSummary.slice(0, 5000),
+      changedFiles: [...new Set(
+        (workWalkthrough || [])
+          .filter(item => isFileMutationItem(item) && item.path)
+          .map(item => String(item.path))
+      )].slice(0, 40),
+      verification: (workWalkthrough || [])
+        .filter(item => item && (
+          item.toolName === 'run_tests'
+          || ['open_url', 'capture_screen', 'inspect_screenshot_with_model'].includes(item.toolName)
+          || (item.toolName === 'run_command' && isRealVerificationCommand(item.command || item.args?.command || ''))
+        ))
+        .filter(item => item.status !== 'error')
+        .map(item => String(item.label || item.detail || item.toolName).replace(/\s+/g, ' ').trim())
+        .filter(Boolean)
+        .slice(-20),
+      images: attachedResponseImages.map(image => ({ ...image }))
+    };
 
     if (runTaskId && typeof window.finalizeOrchestrationTask === 'function') {
-      const awaitingDelegatedChild = !!(delegatedChildTask && delegatedChildTask.taskId);
-      const desiredTaskState = (userRequestedStop || currentTaskDeniedByPlanDecision)
-        ? 'cancelled'
-        : (criticalRunError
-          ? 'failed'
-          : ((awaitingDelegatedChild || autoContinueExecution || forceYield || ranOutOfLoopBudget || hasPendingWork || conversation.awaitingPlanApproval || conversation.awaitingClarification)
-            ? 'pending'
-            : 'completed'));
-      const finalizedTask = await window.finalizeOrchestrationTask(runTaskId, desiredTaskState, {
-        reason: currentTaskDeniedByPlanDecision
-          ? 'The user denied the pending implementation plan.'
-          : (userRequestedStop
-            ? 'Cancelled by user.'
-            : (criticalRunError
-              ? String(criticalRunError.message || criticalRunError)
-              : (awaitingDelegatedChild
-                ? `Waiting for delegated ${handoffRoleLabel(delegatedChildTask.target && delegatedChildTask.target.mode)} task ${delegatedChildTask.taskId}.`
-                : (autoContinueExecution
-                ? 'Execution pass checkpointed after verified progress; the same task will continue automatically.'
-                : (forcedYieldFailure
-                  ? `Paused after ${forcedYieldFailure.failureCount || 3} repeated ${forcedYieldFailure.toolName || 'tool'} failures.`
-                  : ''))))),
+      const finalizedTask = await window.finalizeOrchestrationTask(runTaskId, runExitDisposition.state, {
+        reason: describeRunExitReason(runExitDisposition, {
+          criticalRunError,
+          delegatedChildTask,
+          scheduledFollowup,
+          forcedYieldFailure
+        }),
         summary: userFacingResultSummary.replace(/\s+/g, ' ').slice(0, 1000),
-        result: {
-          summary: userFacingResultSummary.slice(0, 5000),
-          changedFiles: [...new Set(
-            (workWalkthrough || [])
-              .filter(item => isFileMutationItem(item) && item.path)
-              .map(item => String(item.path))
-          )].slice(0, 40),
-          verification: (workWalkthrough || [])
-            .filter(item => item && (
-              item.toolName === 'run_tests'
-              || ['open_url', 'capture_screen', 'inspect_screenshot_with_model'].includes(item.toolName)
-              || (item.toolName === 'run_command' && isRealVerificationCommand(item.command || item.args?.command || ''))
-            ))
-            .filter(item => item.status !== 'error')
-            .map(item => String(item.label || item.detail || item.toolName).replace(/\s+/g, ' ').trim())
-            .filter(Boolean)
-            .slice(-20),
-          images: attachedResponseImages.map(image => ({ ...image }))
-        },
+        result: runResult,
         conversationId: conversation.id,
-        pendingWork: !!(awaitingDelegatedChild || hasPendingWork || durableBoundaryWork),
+        pendingWork: runExitDisposition.pendingWork,
         awaitingUser: awaitingUserAtExit,
-        resumePolicy: autoContinueExecution ? 'automatic' : (awaitingUserAtExit ? 'user' : 'manual'),
-        reasonCode: awaitingDelegatedChild
-          ? 'awaiting_delegated_task'
-          : (autoContinueExecution
-          ? 'automatic_action_boundary'
-          : (conversation.awaitingPlanApproval
-              ? 'awaiting_plan_approval'
-              : (conversation.awaitingClarification
-                  ? 'awaiting_clarification'
-                  : (forcedYieldFailure ? 'repeated_tool_failure' : (ranOutOfLoopBudget ? 'action_boundary' : 'pending_work'))))),
-        continuation: automaticContinuationPrompt
+        resumePolicy: runExitDisposition.resumePolicy,
+        reasonCode: runExitDisposition.reasonCode,
+        notificationKind: runExitDisposition.notificationKind,
+        schedule: runExitDisposition.schedule,
+        continuation: scheduledFollowup
+          ? {
+              input: String(scheduledFollowup.prompt || `Continue ${scheduledFollowup.purpose || 'the remaining task work'} and verify the result.`),
+              source: 'scheduled-followup',
+              kind: 'scheduled',
+              messageId: scheduledFollowup.scheduleId,
+              createdAt: Date.now()
+            }
+          : (automaticContinuationPrompt
           ? {
               input: automaticContinuationPrompt,
               source: 'automatic-action-boundary',
               createdAt: Date.now()
             }
-          : undefined,
+          : undefined),
         expectedExecutionId: runTaskExecutionId
       });
       finalizedTaskRecord = finalizedTask && typeof finalizedTask === 'object' ? finalizedTask : null;
@@ -5305,23 +5312,38 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         finalizedTaskState = 'unknown';
       }
       durableTaskStateCommitted = ['pending', 'completed', 'cancelled', 'failed'].includes(finalizedTaskState);
-      if (typeof window.onOrchestrationTaskFinalized === 'function') {
+      if (['completed', 'failed', 'cancelled'].includes(finalizedTaskState)
+          && window.api
+          && typeof window.api.cancelTaskSchedules === 'function') {
+        try {
+          await window.api.cancelTaskSchedules(runTaskId);
+        } catch (error) {
+          console.error('Could not cancel terminal task continuation schedules:', error);
+        }
+      }
+      if (['completed', 'failed', 'cancelled'].includes(finalizedTaskState)
+          && typeof window.onOrchestrationTaskFinalized === 'function') {
         try {
           await window.onOrchestrationTaskFinalized(runTaskId, conversation.id, finalizedTaskState);
         } catch (error) {
           console.error('Could not publish the finalized orchestration task state:', error);
         }
+      } else if (finalizedTaskState === 'pending'
+          && runExitDisposition.notificationKind === 'checkpoint'
+          && typeof window.onOrchestrationTaskCheckpointed === 'function') {
+        try {
+          await window.onOrchestrationTaskCheckpointed(runTaskId, conversation.id, {
+            disposition: runExitDisposition,
+            summary: userFacingResultSummary,
+            result: runResult
+          });
+        } catch (error) {
+          console.error('Could not publish the orchestration checkpoint:', error);
+        }
       }
     }
     if (!finalizedTaskState) {
-      finalizedTaskState = (userRequestedStop || currentTaskDeniedByPlanDecision)
-        ? 'cancelled'
-        : (criticalRunError
-          ? 'failed'
-          : (((delegatedChildTask && delegatedChildTask.taskId) || autoContinueExecution || forceYield || ranOutOfLoopBudget || hasPendingWork
-              || conversation.awaitingPlanApproval || conversation.awaitingClarification)
-            ? 'pending'
-            : 'completed'));
+      finalizedTaskState = runExitDisposition.state;
     }
     if (autoContinueExecution
         && finalizedTaskState === 'pending'
@@ -5376,9 +5398,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       try {
         await window.onAgentRunFinalized(conversation.id, finalizedTaskState, {
           taskId: runTaskId,
-          pendingWork: !!(hasPendingWork || autoContinueExecution),
+          pendingWork: runExitDisposition.pendingWork,
           awaitingUser: !!(forceYield || conversation.awaitingPlanApproval || conversation.awaitingClarification),
-          automaticContinuation: !!(autoContinueExecution && automaticContinuationQueued)
+          automaticContinuation: !!(autoContinueExecution && automaticContinuationQueued),
+          reasonCode: runExitDisposition.reasonCode,
+          resumePolicy: runExitDisposition.resumePolicy,
+          schedule: runExitDisposition.schedule
         });
       } catch (error) {
         console.error('Could not publish the finalized agent-run state:', error);
@@ -8765,6 +8790,7 @@ async function cancelFollowupsForConversation(conversationId) {
 // conversation is already running, so a schedule can never overlap its own previous run.
 window.runDurableSchedule = async function(payload = {}) {
   const conversationId = String(payload.conversationId || '');
+  const sourceTaskId = String(payload.sourceTaskId || '');
   if (!conversationId) return { deferred: false, error: 'missing conversation' };
   if (typeof conversations === 'undefined') return { deferred: true, reason: 'renderer_not_ready' };
   const targetConv = conversations.find(c => c.id === conversationId);
@@ -8773,7 +8799,7 @@ window.runDurableSchedule = async function(payload = {}) {
     return { deferred: true, reason: 'agent_busy' };
   }
   const deliveryOnly = payload.deliveryOnly === true;
-  if (!deliveryOnly && typeof window.enqueueOrchestrationTask !== 'function') {
+  if (!deliveryOnly && !sourceTaskId && typeof window.enqueueOrchestrationTask !== 'function') {
     return { deferred: true, reason: 'orchestration_not_ready' };
   }
 
@@ -8785,7 +8811,28 @@ window.runDurableSchedule = async function(payload = {}) {
     ? `${payload.conditionBriefing}\n\n${basePrompt}`
     : basePrompt;
   let queued = null;
-  if (!deliveryOnly) {
+  let resumedTask = null;
+  if (!deliveryOnly && sourceTaskId) {
+    if (!window.api || typeof window.api.getOrchestrationTask !== 'function') {
+      return { deferred: true, reason: 'orchestration_not_ready' };
+    }
+    const taskRead = await window.api.getOrchestrationTask(sourceTaskId);
+    resumedTask = taskRead && taskRead.success ? taskRead.task : null;
+    if (!resumedTask) return { deferred: false, skipped: true, reason: 'source_task_missing' };
+    if (['completed', 'failed', 'cancelled'].includes(String(resumedTask.status || ''))) {
+      return { deferred: false, skipped: true, reason: `source_task_${resumedTask.status}` };
+    }
+    if (String(resumedTask.status || '') === 'active') {
+      return { deferred: true, reason: 'source_task_active' };
+    }
+    if (String(resumedTask.status || '') !== 'pending') {
+      return { deferred: true, reason: 'source_task_not_pending' };
+    }
+    const taskConversationId = String(resumedTask.target && resumedTask.target.conversationId || '');
+    if (taskConversationId !== conversationId) {
+      return { deferred: false, skipped: true, reason: 'source_task_target_mismatch' };
+    }
+  } else if (!deliveryOnly) {
     queued = await window.enqueueOrchestrationTask({
       prompt,
       resolvedObjective: prompt,
@@ -8816,12 +8863,12 @@ window.runDurableSchedule = async function(payload = {}) {
       internalPrompt: true,
       ...(deliveryOnly
         ? { semanticIntent: buildScheduledDeliveryIntent(prompt) }
-        : { taskId: queued.task.taskId }),
+        : { taskId: resumedTask ? sourceTaskId : queued.task.taskId }),
       scheduleId: String(payload.scheduleId || ''),
       scheduleDeliveryConversationId: String(payload.deliveryConversationId || conversationId)
     }
   );
-  return { deferred: false, ran: true };
+  return { deferred: false, ran: true, taskId: resumedTask ? sourceTaskId : (queued && queued.task.taskId || '') };
 };
 
 function buildScheduledDeliveryIntent(prompt) {
@@ -8850,6 +8897,51 @@ function buildScheduledDeliveryIntent(prompt) {
     inspectionBreadth: 'none',
     standaloneSystemOperation: false
   };
+}
+
+// The human-readable half of the run exit disposition. It is derived FROM the resolved reason
+// code rather than re-deriving the outcome from the raw signals, so the prose a person reads can
+// never disagree with the structured state the task store recorded — the two used to rank a
+// schedule and an automatic continuation differently, which is exactly how a pending task ends up
+// described as if it were finishing.
+function describeRunExitReason(disposition, context = {}) {
+  const { criticalRunError, delegatedChildTask, scheduledFollowup, forcedYieldFailure } = context;
+  switch (disposition && disposition.reasonCode) {
+    case 'plan_denied':
+      return 'The user denied the pending implementation plan.';
+    case 'cancelled_by_user':
+      return 'Cancelled by user.';
+    case 'execution_failed':
+      return String(criticalRunError && (criticalRunError.message || criticalRunError) || 'The execution pass failed.');
+    case 'awaiting_delegated_task':
+      return `Waiting for delegated ${handoffRoleLabel(delegatedChildTask && delegatedChildTask.target && delegatedChildTask.target.mode)} task ${delegatedChildTask && delegatedChildTask.taskId}.`;
+    case 'scheduled_followup':
+      return `Execution pass checkpointed; the same task resumes on scheduled follow-up ${(scheduledFollowup && scheduledFollowup.scheduleId) || ''}.`.replace(/\s+\.$/, '.');
+    case 'automatic_action_boundary':
+      return 'Execution pass checkpointed after verified progress; the same task will continue automatically.';
+    case 'repeated_tool_failure':
+      return `Paused after ${(forcedYieldFailure && forcedYieldFailure.failureCount) || 3} repeated ${(forcedYieldFailure && forcedYieldFailure.toolName) || 'tool'} failures.`;
+    default:
+      return '';
+  }
+}
+
+async function findTaskContinuationSchedule(taskId, currentScheduleId = '') {
+  if (!taskId || !window.api || typeof window.api.listSchedules !== 'function') return null;
+  try {
+    const result = await window.api.listSchedules({
+      sourceTaskId: String(taskId),
+      status: ['pending', 'firing']
+    });
+    if (!result || result.success === false || !Array.isArray(result.schedules)) return null;
+    const excludedId = String(currentScheduleId || '');
+    return result.schedules
+      .filter(schedule => schedule && String(schedule.scheduleId || '') !== excludedId)
+      .sort((left, right) => Number(left.dueAt || 0) - Number(right.dueAt || 0))[0] || null;
+  } catch (error) {
+    console.error('Could not inspect durable task continuation schedules:', error);
+    return null;
+  }
 }
 
 async function resolveScheduledDeliveryConversation(executionConversationId) {
