@@ -49,7 +49,7 @@ test('phone companion finishes with the same dark theme and complete mission hie
   t.ok(companionHtml.includes('#task-list-card { grid-area: mission; }'), 'Task List has an explicit mobile layout area');
   t.ok(companionHtml.includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
   t.ok(companionHtml.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
-  t.ok(companionHtml.includes('conversation-activity-fallback-v35'), 'phone shell exposes the current UI build version');
+  t.ok(companionHtml.includes('conversation-preview-and-durable-counts-v36'), 'phone shell exposes the current UI build version');
   t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v32"), 'phone service worker cache is bumped for the current UI build');
   t.ok(companionHtml.includes('window.isSecureContext'), 'phone explains when browser push is blocked by an insecure context');
   t.ok(companionHtml.includes('Phone push needs HTTPS or localhost'), 'phone tells the user that HTTPS is required for push notifications');
@@ -101,6 +101,19 @@ test('phone companion renders approvals and tool calls as first-class mobile UI'
   t.notOk(phoneStateSource.includes('isEmptyThinkingPlaceholder'), 'phone state does not drop saved assistant placeholders before mobile rendering');
   t.ok(companionHtml.includes('function conversationActivityLabel'), 'phone labels conversations by real message/task activity');
   t.notOk(companionHtml.includes("c.taskCount + ' items'"), 'phone no longer shows checklist count as generic items');
+  // Regression: the home screen's main recent-chats list only ever called conversationActivityLabel,
+  // so an un-hydrated stub conversation showed a generic count/fallback label even though a real,
+  // durable last-message preview (discussionSummary) was already being computed and sent for it -
+  // it just was not being read here. The Dispatch discussion browser already preferred
+  // discussionSummary over the generic label; the main list now follows the same precedent.
+  t.ok(companionHtml.includes("metaParts.push(c.discussionSummary || conversationActivityLabel(c));"),
+    'the main recent-chats list prefers a real last-message preview over the generic activity label');
+  t.ok(companionHtml.includes("escapeHtml(projectName) + ' - ' + escapeHtml(c.discussionSummary || conversationActivityLabel(c))"),
+    'the Needs Approval cards prefer the same real preview');
+  t.ok(companionHtml.includes("metaParts.push(c.discussionSummary || conversationActivityLabel(c));\n      if (c.workspace && c.workspace !== c.projectPath)"),
+    'the project thread list prefers the same real preview');
+  t.ok(companionHtml.includes("timeText + ' &middot; ' + escapeHtml(c.discussionSummary || conversationActivityLabel(c))"),
+    'the recent tasks list prefers the same real preview');
   t.ok(companionHtml.includes("history.replaceState(null, '', location.pathname || '/')"), 'phone cleans one-time pairing links after trust is saved');
   t.notOk(companionHtml.includes('const pairingCode ='), 'clean phone shell never embeds a reusable setup code');
   t.notOk(companionHtml.includes('urlPairingCode !== pairingCode'), 'an expired setup link cannot silently substitute a new pairing code');

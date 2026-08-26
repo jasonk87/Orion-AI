@@ -5391,6 +5391,17 @@ async function executeSaveConversationsToStorage() {
   
   // 1. Build the lightweight index
   const index = conversations.map(c => {
+    // A stub's own .messages/.tasks are always empty ([]), so a live count from them is only ever
+    // meaningful for the conversation(s) actually hydrated right now. Carrying forward the last
+    // durable count (like hasMessages already does, below) means every conversation that has been
+    // active at least once since this field shipped keeps reporting its real numbers to the phone
+    // even while it sits as a stub in every other session - not just "this conversation has
+    // history" but the real count of it.
+    const liveMessageCount = (Array.isArray(c.messages) ? c.messages : []).filter(msg =>
+      isConversationMessageVisible(msg)
+      && ['user', 'assistant', 'steering'].includes(normalizeConversationMessageRole(msg))
+    ).length;
+    const liveTaskCount = Array.isArray(c.tasks) ? c.tasks.length : 0;
     return {
       id: c.id,
       title: c.title,
@@ -5416,7 +5427,9 @@ async function executeSaveConversationsToStorage() {
       updatedAt: c.updatedAt || Date.now(),
       createdAt: c.createdAt || Date.now(),
       isStub: true, // index always represents stubs
-      hasMessages: c.isStub ? !!c.hasMessages : (Array.isArray(c.messages) && c.messages.length > 0)
+      hasMessages: c.isStub ? !!c.hasMessages : (Array.isArray(c.messages) && c.messages.length > 0),
+      messageCount: liveMessageCount > 0 ? liveMessageCount : Math.max(0, Number(c.messageCount) || 0),
+      taskCount: liveTaskCount > 0 ? liveTaskCount : Math.max(0, Number(c.taskCount) || 0)
     };
   });
 
@@ -8435,20 +8448,24 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   const walkthroughIndex = latestText.indexOf('\n\n## Work Walkthrough');
   const workWalkthrough = walkthroughIndex === -1 ? '' : latestText.slice(walkthroughIndex).trim();
   const conversationsSummary = conversations.map(c => {
-    const messageCount = (Array.isArray(c.messages) ? c.messages : []).filter(msg =>
+    const liveMessageCount = (Array.isArray(c.messages) ? c.messages : []).filter(msg =>
       isConversationMessageVisible(msg)
       && ['user', 'assistant', 'steering'].includes(normalizeConversationMessageRole(msg))
     ).length;
-    const taskCount = Array.isArray(c.tasks) ? c.tasks.length : 0;
+    const liveTaskCount = Array.isArray(c.tasks) ? c.tasks.length : 0;
     // Most conversations in memory are lazy-loaded stubs (isStub: true, messages: []) to keep
     // the renderer's footprint bounded — only the conversation currently open on desktop is fully
-    // hydrated. messageCount is real for a hydrated conversation but is always 0 for a stub, even
-    // one with a long real history, because its .messages array was never loaded. Without this
-    // flag the phone's home screen reported "No messages yet" for every conversation that wasn't
-    // the one open on desktop at that moment — a false claim, not an actual empty conversation.
-    // hasMessages is a durable boolean carried in the on-disk conversation index across restarts
-    // (see loadConversationsFromStorage / the index writer above) specifically so a stub can still
-    // truthfully say "this has history" even without the full transcript loaded.
+    // hydrated. A live count is real for a hydrated conversation but is always 0 for a stub, even
+    // one with a long real history, because its .messages array was never loaded. Without a durable
+    // fallback the phone's home screen reported "No messages yet" for every conversation that
+    // wasn't the one open on desktop at that moment — a false claim, not an actual empty
+    // conversation. c.messageCount/c.taskCount are durable counts carried in the on-disk
+    // conversation index across restarts (see the index writer above) specifically so a stub can
+    // still report its real numbers, not just "this has history", without the full transcript
+    // loaded. They only exist once this conversation has been saved at least once since this field
+    // was added; until then this still falls back to 0, same as before.
+    const messageCount = liveMessageCount > 0 ? liveMessageCount : Math.max(0, Number(c.messageCount) || 0);
+    const taskCount = liveTaskCount > 0 ? liveTaskCount : Math.max(0, Number(c.taskCount) || 0);
     const hasMessages = messageCount > 0 || !!c.hasMessages;
     return {
       id: c.id,

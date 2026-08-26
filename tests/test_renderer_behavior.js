@@ -257,6 +257,113 @@ test('phone conversation summaries do not report real history as empty for un-hy
   t.end();
 });
 
+// Follow-up regression: hasMessages alone told the phone a stub had SOME history, but Jason
+// still saw a generic "Previous messages" fallback for every un-hydrated conversation instead of
+// its real count, because nothing carried a real number across the stub boundary. The on-disk
+// conversation index already persists other fields (hasMessages, dispatchDiscussionSummary) across
+// restarts precisely because a stub's own .messages is always empty; messageCount/taskCount follow
+// the same durable-carry-forward pattern instead of a live (and therefore always-zero) count.
+test('phone conversation summaries report a durable real count for a stub, not just hasMessages', async (t) => {
+  const stubWithDurableCount = {
+    id: 'stub-with-count',
+    title: 'Remind me at 2 to start OpenAI',
+    mode: 'orion',
+    workspace: '',
+    messages: [],
+    tasks: [],
+    isStub: true,
+    hasMessages: true,
+    // Exactly what a previous session's index write would have carried forward for this
+    // conversation the last time it was actually open and hydrated.
+    messageCount: 6,
+    taskCount: 1
+  };
+  const activeConversation = {
+    id: 'active-conv-2',
+    title: 'Active chat',
+    mode: 'orion',
+    workspace: '',
+    messages: [{ role: 'user', text: 'hi' }],
+    tasks: [],
+    isStub: false
+  };
+  const { win } = loadRenderer({
+    t,
+    globals: { OrionOperationalContext: operational },
+    set: {
+      conversations: [activeConversation, stubWithDurableCount],
+      activeConversationId: activeConversation.id,
+      appMode: 'orion'
+    }
+  });
+
+  const phoneState = await win.getPhoneCompanionState(activeConversation.id);
+  const stubSummary = phoneState.conversations.find(c => c.id === stubWithDurableCount.id);
+  t.equal(stubSummary.messageCount, 6, 'the phone gets the real durable count, not a generic fallback');
+  t.equal(stubSummary.taskCount, 1, 'the durable task count survives the same way');
+  t.end();
+});
+
+// The write side of the same contract: whenever a real, hydrated conversation is actually saved,
+// its lightweight index entry must carry the real count forward for the NEXT time it is a stub -
+// otherwise there is nothing durable for the read side (above) to fall back to in the first place.
+test('saving a hydrated conversation persists its real message and task count into the disk index', async (t) => {
+  const hydratedConversation = {
+    id: 'conv-to-save',
+    title: 'Remind me at 2 to start OpenAI',
+    mode: 'orion',
+    workspace: '',
+    messages: [
+      { role: 'user', text: 'remind me at 2 to start OpenAI' },
+      { role: 'assistant', text: 'Done, I will remind you at 2.' },
+      { role: 'user', text: 'thanks' }
+    ],
+    tasks: [{ id: 'task_1' }],
+    isStub: false
+  };
+  const staleStub = {
+    id: 'stale-stub',
+    title: 'Old chat',
+    mode: 'orion',
+    workspace: '',
+    messages: [],
+    tasks: [],
+    isStub: true,
+    hasMessages: true,
+    messageCount: 9,
+    taskCount: 0
+  };
+  let capturedIndex = null;
+  const { win } = loadRenderer({
+    t,
+    globals: { OrionOperationalContext: operational },
+    api: {
+      writeConversationsIndex: async (payload) => {
+        capturedIndex = payload.index;
+        return { success: true };
+      }
+    },
+    set: {
+      conversations: [hydratedConversation, staleStub],
+      activeConversationId: hydratedConversation.id,
+      diskConversationIndexLoaded: true,
+      appMode: 'orion'
+    }
+  });
+
+  await win.flushConversationsToStorage(hydratedConversation.id);
+  t.ok(Array.isArray(capturedIndex), 'the real index writer ran and was captured');
+
+  const savedHydrated = capturedIndex.find(c => c.id === hydratedConversation.id);
+  t.equal(savedHydrated.messageCount, 3, 'the real live message count is written to disk');
+  t.equal(savedHydrated.taskCount, 1, 'the real live task count is written to disk');
+
+  const savedStub = capturedIndex.find(c => c.id === staleStub.id);
+  t.equal(savedStub.messageCount, 9, 'a stub with no live messages keeps its previously durable count instead of being zeroed out');
+  t.equal(savedStub.taskCount, 0, 'same for a durable task count of zero');
+  t.end();
+});
+
 // ── Orphaned turns ─────────────────────────────────────────────────────────────
 
 test('a new phone conversation is acknowledged before semantic and memory work finishes', async t => {
