@@ -8383,7 +8383,24 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   const requestedConv = requestedId ? conversations.find(c => c.id === requestedId) : null;
   const activeConv = activeConversationId ? conversations.find(c => c.id === activeConversationId) : null;
   const conv = requestedConv || activeConv || conversations[0] || null;
-  if (conv && conv.isStub && conv.hasMessages && window.api && typeof window.api.readConversation === 'function') {
+  // Real bug from a live phone report: tapping an existing conversation with genuine on-disk
+  // history opened to a completely empty chat, not even the original first message. Root cause:
+  // this used to gate hydration on `conv.hasMessages`, a durable flag that is only ever computed
+  // when a conversation is fully hydrated (see hydrateConversationRecord below) or freshly written
+  // to the index after that field existed. A stub conversation whose hasMessages was never
+  // computed - anything indexed before this flag shipped, or any stub that has simply never been
+  // reopened on desktop since - carries hasMessages as false/undefined forever, because the index
+  // writer (saveConversationsToStorage) only ever carries a stub's existing hasMessages forward, it
+  // never independently checks the real conv-<id>.json for that stub. That made this hydration gate
+  // permanently unreachable for exactly the conversations that most need it: real history sitting
+  // untouched on disk. The conversation being explicitly requested by ID here (targetConversationId,
+  // set when the phone opens it) is authority enough on its own - a stub genuinely has no messages
+  // loaded, so there is always something worth trying to read, and reading a conversation with no
+  // real file on disk is a harmless no-op (read-conversation returns { success:false, missing:true }
+  // and this simply leaves the empty stub in place). Once hydration succeeds,
+  // hydrateConversationRecord sets isStub=false, so this only ever costs one extra disk read per
+  // conversation per session, not a read on every poll.
+  if (conv && conv.isStub && window.api && typeof window.api.readConversation === 'function') {
     try {
       const result = await window.api.readConversation(conv.id);
       if (result && result.success && result.conversation) {

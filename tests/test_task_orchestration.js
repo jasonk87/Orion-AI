@@ -742,6 +742,35 @@ test('Dispatch task presentation follows one durable task from queued through pl
   t.end();
 });
 
+// Real bug: a task that is genuinely still just queued (never actually failed) briefly showed a
+// "Failed" status badge right after a handoff. Root cause: describeSupervisedTaskPresentation used
+// to read the status through normalizeTransitionStatus, which is a STRICT validator meant for
+// approving/rejecting an actual state transition and deliberately throws on anything it does not
+// recognize — not a display helper. A task record that has not yet round-tripped through the
+// store's own normalization (e.g. a manually-built fallback object, or simply `status` being
+// missing/blank for a moment) threw here, and the catch defaulted straight to 'failed'. Presentation
+// must never assume the worst just because a status string is momentarily missing or unrecognized —
+// it should stay non-committal (pending), the same forgiving behavior normalizeStatus already gives
+// every other status read in this file.
+test('a task presentation never defaults an unrecognized or missing status to Failed', t => {
+  const missingStatus = { ...baseTask(), status: undefined };
+  delete missingStatus.status;
+  const missing = describeSupervisedTaskPresentation(missingStatus, { roleLabel: 'Researcher' });
+  t.notEqual(missing.label, 'Failed', 'a task with no status yet is never presented as failed');
+  t.equal(missing.status, TASK_STATES.PENDING, 'a missing status reads as pending, not failed');
+  t.equal(missing.label, 'Researcher queued', 'it presents as an ordinary queued task');
+
+  const weirdStatus = describeSupervisedTaskPresentation(baseTask({ status: 'some-future-status' }), { roleLabel: 'Researcher' });
+  t.notEqual(weirdStatus.label, 'Failed', 'an unrecognized status string is never presented as failed either');
+  t.equal(weirdStatus.status, TASK_STATES.PENDING, 'an unrecognized status still reads as pending, matching normalizeStatus elsewhere');
+
+  // A task that genuinely did fail must still present as Failed — this is not a blanket suppression.
+  const genuinelyFailed = describeSupervisedTaskPresentation(baseTask({ status: 'failed' }), { roleLabel: 'Researcher' });
+  t.equal(genuinelyFailed.label, 'Failed', 'a task recorded as actually failed still presents as Failed');
+  t.equal(genuinelyFailed.badgeClass, 'danger', 'the failed badge styling is unchanged for a real failure');
+  t.end();
+});
+
 test('Phase 2: task presentation and continuation selection are role-generic, not hardcoded to Coder', t => {
   // These guard the Phase 2 generalization: selectOwnedContinuationTask and
   // describeSupervisedTaskPresentation used to have 'coder' baked in as a literal. Both now take an

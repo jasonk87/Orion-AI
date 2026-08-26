@@ -1527,6 +1527,127 @@ test('a task-bound handoff to Coder preserves parent and root Dispatch ownership
   t.end();
 });
 
+// Real bug report: right after a real handoff, the task status badge briefly showed FAILED
+// instead of reflecting delegation. Investigation found two independent bugs, of which this test
+// covers one: agent.js's parent-task delegation bookkeeping (persisting the child relationship and
+// leaving the parent pending until the child's result returns) required `runMode !== 'orion'` — so
+// it only ever ran when a SPECIALIST delegates onward mid-task (the Coder->Operator case covered by
+// the test directly above, where the specialist's own durable task is the parent). Dispatch's own
+// conversation mode is 'orion'. For a fresh Dispatch chat turn this bug is latent (Dispatch has no
+// durable task of its own to mismanage in that case), but whenever Dispatch DOES already own a
+// durable task and hands off from within it — resuming after a clarification answer, a scheduled
+// continuation, or any other reentry into an existing Dispatch task — that parent task finalized
+// straight to 'completed' the instant the child was merely queued, before the child had done any
+// work, instead of staying 'pending: awaiting_delegated_task' like the Coder->Operator case does.
+// This is the same test shape as 'a task-bound handoff to Coder preserves parent and root Dispatch
+// ownership' above, with the one variable that actually matters here changed: mode: 'orion'.
+test('a Dispatch-initiated handoff from an existing durable Dispatch task keeps that task pending until child evidence returns, exactly like a specialist-initiated one', async t => {
+  const originalFetch = global.fetch;
+  const workspace = 'C:\\Users\\Owner\\Desktop\\Projects\\OrionAI';
+  const parentTaskId = 'task-dispatch-parent-research';
+  const childTaskId = 'task-researcher-child-research';
+  const researcherHandoffs = [];
+  const parentUpdates = [];
+  const finalized = [];
+  installHarness([[{
+    functionCall: {
+      name: 'handoff_to_researcher',
+      args: {
+        path: workspace,
+        prompt: 'Find the latest updates for Crimson Desert and report verified findings with sources.',
+        title: 'Research Crimson Desert updates'
+      }
+    }
+  }]], {
+    workspace,
+    projects: [workspace],
+    api: {
+      updateOrchestrationTask: async (taskId, patch) => {
+        parentUpdates.push({ taskId, patch });
+        return { success: true };
+      }
+    },
+    window: {
+      claimOrchestrationTask: async taskId => ({
+        success: true,
+        task: {
+          schemaVersion: 4,
+          taskId,
+          title: 'Research Crimson Desert updates',
+          objective: 'Find and report the latest verified updates for Crimson Desert.',
+          originalUserMessage: 'What are the latest updates for Crimson Desert?',
+          precedingConversationSummary: 'The user asked Dispatch for the latest Crimson Desert updates.',
+          workspacePath: workspace,
+          rootOriginConversationId: 'dispatch-research-origin',
+          origin: { conversationId: 'dispatch-research-origin' },
+          target: { conversationId: 'dispatch-research-origin', mode: 'orion' },
+          status: 'active',
+          execution: { executionId: 'exec-dispatch-parent-research' }
+        },
+        prompt: 'Find and report the latest verified updates for Crimson Desert.'
+      }),
+      promoteWorkspaceToResearcher: async payload => {
+        researcherHandoffs.push(payload);
+        return {
+          success: true,
+          conversationId: 'researcher-research-worker',
+          taskId: childTaskId,
+          title: payload.title,
+          status: 'pending',
+          workspacePath: payload.path,
+          task: {
+            taskId: childTaskId,
+            title: payload.title,
+            parentTaskId: payload.parentTaskId,
+            rootOriginConversationId: payload.rootOriginConversationId,
+            target: { conversationId: 'researcher-research-worker', mode: 'researcher' }
+          }
+        };
+      },
+      startResearcherTaskMonitor: () => {},
+      finalizeOrchestrationTask: async (taskId, status, details) => {
+        finalized.push({ taskId, status, details });
+        return { taskId, status, delegation: { childTaskId } };
+      },
+      onOrchestrationTaskFinalized: async () => {}
+    }
+  });
+  const conv = conversation('dispatch-research-origin', { mode: 'orion', workspace });
+  try {
+    await global.window.runAgentLoop(
+      'What are the latest updates for Crimson Desert?',
+      'gemini-1',
+      conv,
+      {
+        taskId: parentTaskId,
+        internalPrompt: true,
+        semanticIntent: semanticClassification({
+          intent: 'new_task',
+          requiresExecution: true,
+          target: 'current_conversation',
+          resolvedRequest: 'Find the latest updates for Crimson Desert and report verified findings with sources.',
+          reasoningPolicyHint: { complexity: 'medium', risk: 'low', contextNeed: 'none' },
+          executionScope: 'read_only',
+          executionTarget: 'researcher'
+        })
+      }
+    );
+
+    t.equal(researcherHandoffs.length, 1, 'Dispatch creates exactly one Researcher child task');
+    t.equal(researcherHandoffs[0].parentTaskId, parentTaskId, 'the child is linked to the durable Dispatch parent');
+    t.equal(parentUpdates.length, 1, 'the parent records one durable child relationship, matching the Coder->Operator case');
+    t.equal(parentUpdates[0].patch.delegation.childTaskId, childTaskId, 'the relationship points at the exact Researcher child');
+    t.equal(finalized.length, 1, 'the Dispatch parent is finalized once');
+    t.equal(finalized[0].status, 'pending', 'queueing Researcher is not treated as Dispatch parent completion - the exact reported bug');
+    t.notEqual(finalized[0].status, 'completed', 'this must never silently become completed the instant the child is merely queued');
+    t.equal(finalized[0].details.reasonCode, 'awaiting_delegated_task', 'the parent records why it is pending, same as a specialist-initiated handoff');
+    t.match(finalized[0].details.reason, /Waiting for delegated Researcher task/i, 'the pending reason names the actual specialist');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
 test('a direct executable request preflights once to Operator and preserves durable handoff provenance', async t => {
   const originalFetch = global.fetch;
   const workspace = 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE';

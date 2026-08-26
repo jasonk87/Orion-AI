@@ -257,6 +257,73 @@ test('phone conversation summaries do not report real history as empty for un-hy
   t.end();
 });
 
+// Real bug from a live phone report: tapping an existing conversation with genuine on-disk history
+// opened to a completely empty chat - not even the original first message. Root cause: opening a
+// conversation used to gate hydration on the SAME durable hasMessages flag the test above covers,
+// but hasMessages is only ever computed once a conversation has been fully hydrated (or re-indexed
+// after that flag existed) - a stub whose hasMessages was never computed (anything indexed before
+// the flag shipped, or any stub simply never reopened on desktop since) carries hasMessages as
+// false/undefined forever, because the index writer only ever forwards a stub's EXISTING
+// hasMessages, it never independently checks the stub's own conv-<id>.json. That made hydration
+// permanently unreachable for exactly the conversations that most need it. This proves the phone
+// explicitly opening a conversation by ID is authority enough on its own to attempt hydration,
+// regardless of what a possibly-never-computed hasMessages flag claims.
+test('opening a stub conversation by ID loads its real on-disk history even when hasMessages was never computed', async (t) => {
+  const calls = [];
+  const staleStub = {
+    id: 'stale-stub-conv',
+    title: 'Ok you know have even more updates...',
+    mode: 'orion',
+    workspace: '',
+    messages: [],
+    tasks: [],
+    isStub: true
+    // hasMessages intentionally omitted: this is the exact shape of a conversation indexed before
+    // the flag existed, or one that has simply never been reopened on desktop since it shipped.
+  };
+  const { win, read } = loadRenderer({
+    t,
+    globals: { OrionOperationalContext: operational },
+    api: {
+      readConversation: async id => {
+        calls.push(id);
+        return {
+          success: true,
+          conversation: {
+            id,
+            title: staleStub.title,
+            mode: 'orion',
+            workspace: '',
+            messages: [
+              { role: 'user', text: 'Ok you know have even more updates for the project, right?' },
+              { role: 'assistant', text: 'Yes - here is what changed since we last talked.' }
+            ],
+            tasks: []
+          }
+        };
+      }
+    },
+    set: {
+      conversations: [staleStub],
+      activeConversationId: staleStub.id,
+      appMode: 'orion'
+    }
+  });
+
+  const phoneState = await win.getPhoneCompanionState(staleStub.id);
+  t.deepEqual(calls, [staleStub.id], 'the phone opening this exact conversation triggers a real disk read for it');
+  t.ok(Array.isArray(phoneState.messages) && phoneState.messages.length > 0,
+    'the phone receives real messages instead of an empty transcript');
+  const transcript = JSON.stringify(phoneState.messages);
+  t.match(transcript, /even more updates for the project/, 'the original first message that started the conversation is present');
+  t.match(transcript, /here is what changed/, 'the real assistant reply is present too');
+
+  const hydrated = read('conversations').find(c => c.id === staleStub.id);
+  t.equal(hydrated.isStub, false, 'the conversation is no longer a stub after this hydration');
+  t.equal(hydrated.hasMessages, true, 'hasMessages is now correctly computed instead of staying stuck at unknown/false');
+  t.end();
+});
+
 // Follow-up regression: hasMessages alone told the phone a stub had SOME history, but Jason
 // still saw a generic "Previous messages" fallback for every un-hydrated conversation instead of
 // its real count, because nothing carried a real number across the stub boundary. The on-disk

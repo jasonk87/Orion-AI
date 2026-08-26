@@ -4306,7 +4306,31 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             // Queueing a child specialist is not completion of the active parent task. Persist the
             // relationship and leave this task pending until the child's terminal result is fed
             // back into the same parent task ID.
-            if (runTaskId && runMode !== 'orion' && result.taskId) {
+            //
+            // Bug found from a real report: right after a successful handoff, the status badge
+            // briefly (or persistently) showed FAILED instead of "delegated"/"active" for the
+            // specialist. Root cause: this block only ever ran when `runMode !== 'orion'` - i.e.
+            // only when a SPECIALIST delegates onward to another specialist mid-task (Coder ->
+            // Operator, the case both existing regression tests below cover). Dispatch's own
+            // conversation mode is 'orion', so a real Dispatch-initiated handoff (the overwhelming
+            // majority of handoffs - Dispatch handing straight to Coder/Operator/Researcher) never
+            // took this branch: delegatedChildTask stayed null, so
+            // resolveRunExitDisposition({ delegatedChildTaskId: '' , ... }) fell through past its
+            // 'awaiting_delegated_task' branch straight to terminal('completed', 'mission_complete')
+            // - Dispatch's own durable task incorrectly finalized as already "completed" the instant
+            // the child was merely queued, before the child had done any work. Two real consequences
+            // of that: (1) the parent's status/reasonCode never became the
+            // ('pending','awaiting_delegated_task') pair the UI (task-orchestration.js's
+            // describeSupervisedTaskPresentation) specifically renders as "<Role> active" - so the
+            // UI fell back to less-specific status handling instead of that dedicated path; (2)
+            // resumeParentTaskAfterDelegatedChild (renderer.js) requires parentTask.status ===
+            // 'pending' to relay the specialist's finished result back into Dispatch's conversation
+            // - with the parent already wrongly 'completed', that relay silently no-ops
+            // (action: 'parent_terminal'), so Dispatch never got told the specialist was done. This
+            // check should never have been mode-conditional: a handoff commits the same way whether
+            // Dispatch itself or a delegating specialist made it, so the "wait for the child" bridge
+            // must fire for both.
+            if (runTaskId && result.taskId) {
               delegatedChildTask = result.task && typeof result.task === 'object'
                 ? result.task
                 : {
@@ -10565,7 +10589,18 @@ function resolveDispatchHandoffRole(semanticIntent = {}, { delegatedInspection =
   if (delegatedInspection) return 'coder';
   if (SemanticIntentRouter && typeof SemanticIntentRouter.resolveExecutionTarget === 'function') {
     const resolved = SemanticIntentRouter.resolveExecutionTarget(semanticIntent);
-    if (resolved === 'operator' || resolved === 'coder') return resolved;
+    // Bug found from a real misroute: "what are the latest updates for Crimson Desert" (pure
+    // multi-source research, textbook Researcher work) was forced to Coder, which then failed.
+    // SemanticIntentRouter.resolveExecutionTarget is registry-driven and already correctly
+    // returns 'researcher' for this shape of request (see specialist-registry.js's
+    // capabilitySummary and semantic-intent-router.js's capability-based resolution) - but this
+    // function only ever accepted its two oldest possible answers, 'operator' or 'coder', and
+    // silently discarded any other registered role, falling through to the coder/operator default
+    // below. Checking registry membership instead of a two-value literal list means a properly
+    // registered specialist's routing decision is honored regardless of how many specialists
+    // exist, the same way handoffToolForRole/handoffRoleLabel already look the role up instead of
+    // hand-checking names.
+    if (OrionSpecialistRegistry.has(resolved)) return resolved;
   }
   return semanticIntent.standaloneSystemOperation === true
     || semanticIntent.inspectionTarget === 'local_system'

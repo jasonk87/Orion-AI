@@ -1221,12 +1221,19 @@
         isOngoing: false
       };
     }
-    let status;
-    try {
-      status = normalizeTransitionStatus(taskValue.status);
-    } catch (_) {
-      status = TASK_STATES.FAILED;
-    }
+    // Real bug: this used to read the status through normalizeTransitionStatus, which is a
+    // STRICT validator meant for approving/rejecting an actual state transition (it deliberately
+    // throws on anything it doesn't recognize) - not a display helper. A task object built before
+    // it round-trips through the store's own normalization (e.g. the manually-constructed
+    // fallback child-task record agent.js builds immediately after a handoff commits, before the
+    // canonical persisted record is what's actually shown) can legitimately have no `status`
+    // field yet. That threw here, and the catch defaulted straight to TASK_STATES.FAILED - so a
+    // task that was merely still being wired up got presented as "Failed" the instant it was
+    // queued, before it had done any work, let alone failed at any. Presentation should never
+    // assume the worst just because a status string is momentarily missing or unrecognized; use
+    // the lenient normalizeStatus (already used when persisting/reading real task records
+    // elsewhere in this file), which defaults an unrecognized value to PENDING instead of FAILED.
+    const status = normalizeStatus(taskValue.status);
     const awaitingReview = context.awaitingReview === true || taskValue.awaitingReview === true;
     const revisingPlan = context.revisingPlan === true || taskValue.revisingPlan === true;
     const planApproved = context.planApproved === true || taskValue.planApproved === true;

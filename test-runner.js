@@ -63,7 +63,18 @@ const TEST_FILE_TIMEOUT_OVERRIDES_MS = {
   'test_operator_ui_surface.js': 110000,
   // Same renderer.js-under-JSDOM load cost as the Operator/Coder UI-surface files above.
   // Verified correct — 41/41 pass.
-  'test_researcher_ui_surface.js': 110000
+  'test_researcher_ui_surface.js': 110000,
+  // Found while re-verifying the full suite for the Dispatch routing fix: this file missed the
+  // default 30s budget (exit 124) even though nothing in it or its dependencies was touched this
+  // session. Timed directly in isolation at ~69s real wall time, 36/36 passing — genuinely this
+  // slow (real durable-task/schedule-store setup and teardown per test), not a hang. Same category
+  // as the other overrides above; it just hadn't been hit by a full-suite run with this file
+  // included until now.
+  'test_specialist_checkpoint_relay.js': 100000,
+  // Loads jsdom and generates the full ~6000-line companion-html.js output to extract and execute
+  // its real markdown-rendering functions - the same jsdom fixed-load cost documented above, timed
+  // at ~70s real wall time in isolation, 21/21 passing. Not a hang.
+  'test_markdown_table_cards.js': 100000
 };
 
 function runTestFile(file) {
