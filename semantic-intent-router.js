@@ -28,7 +28,56 @@
     'stored_memory_lookup',
     'memory_write'
   ]);
-  const EXECUTION_TARGETS = Object.freeze(['none', 'dispatch', 'coder', 'operator']);
+  // Specialist execution targets come from the specialist registry, never from a list maintained
+  // here. A hard-coded ['none','dispatch','coder','operator'] is what let the router and the
+  // registry disagree about reality: Researcher was a fully registered specialist with its own
+  // prompt, tools and handoff support, yet the classifier was never offered it as an execution
+  // target, a Researcher-owned task could not even be preserved across a follow-up turn, and
+  // anything carrying project evidence fell through to Coder. Registering a specialist now
+  // teaches the router about it in one place.
+  //
+  // Resolved lazily rather than at module init: in the packaged renderer these are plain
+  // <script> tags, so the registry may not have evaluated yet when this module body runs.
+  let cachedRegistry = null;
+  function registry() {
+    if (cachedRegistry) return cachedRegistry;
+    const found = (typeof globalScope !== 'undefined' && globalScope && globalScope.OrionSpecialistRegistry)
+      || (typeof require === 'function' ? require('./specialist-registry') : null);
+    if (found && typeof found.list === 'function') cachedRegistry = found;
+    return cachedRegistry;
+  }
+
+  function specialistRoles() {
+    const found = registry();
+    return found ? found.list().map(definition => definition.role) : [];
+  }
+
+  function specialist(role) {
+    const found = registry();
+    return found ? found.get(role) : null;
+  }
+
+  function executionTargets() {
+    return ['none', 'dispatch', ...specialistRoles()];
+  }
+
+  // One guidance line per registered specialist, built from the registry's own capability summary
+  // so the classifier reasons about capabilities rather than being handed example phrasings.
+  function specialistCapabilityGuidance() {
+    const found = registry();
+    if (!found) return [];
+    return found.list().map(definition => {
+      const capabilities = Array.isArray(definition.capabilitySummary) && definition.capabilitySummary.length
+        ? definition.capabilitySummary.join('; ')
+        : 'no declared capabilities';
+      return `    - ${definition.role} (${definition.label}): ${capabilities}.`;
+    });
+  }
+
+  function executionTargetSchemaValue() {
+    return executionTargets().join(' | ');
+  }
+
   const EXECUTION_SURFACES = Object.freeze(['none', 'desktop', 'browser', 'process']);
   const ORCHESTRATION_ACTIONS = Object.freeze(['none', 'schedule_followup']);
   const INSPECTION_BREADTHS = Object.freeze(['none', 'single_file', 'focused', 'broad']);
@@ -203,7 +252,9 @@
       '- memoryContext only requests read-only retrieval. It never authorizes an action or changes memoryIntent. Leave it disabled when no particular durable fact or preference would materially improve the answer.',
       '- Set reasoningPolicyHint.contextNeed to historical for conversation_recall or a stored_memory_lookup that genuinely needs history. A memory_policy explanation does not need historical conversation retrieval.',
       '- requiresExecution describes whether satisfying the resolved request requires tools or state mutation. It does not authorize execution.',
-      '- executionTarget selects who owns the immediate requested operation. Use dispatch for durable orchestration that Dispatch can perform itself, currently reminders and scheduled follow-ups. Use operator for hands-on native desktop/browser/application/process/screenshot work. Use coder for source code, project files, builds, tests, installs, commands tied to a codebase, or creating local artifacts.',
+      '- executionTarget selects who owns the immediate requested operation. Use dispatch for durable orchestration Dispatch performs itself, currently reminders and scheduled follow-ups. Otherwise choose the specialist whose capabilities match the SHAPE of the work:',
+      ...specialistCapabilityGuidance(),
+      '- Choose the specialist by what the work IS, not by where its evidence happens to live. The same repository history can belong to either specialist: reading recent changes to explain a pattern, trajectory, or what a series of changes collectively means is read-only investigation and synthesis; locating the change that broke something and correcting it is diagnosis and mutation. A question that requires gathering several artifacts, comparing them, and explaining what they add up to is investigation even when every artifact is a source file or a commit.',
       '- Classify the action the user is requesting NOW, not an action mentioned inside a reminder payload. "Remind me at 2 to start OpenAI" asks Dispatch to schedule a reminder; it does not ask Operator to start OpenAI now. Set executionTarget=dispatch, orchestrationAction=schedule_followup, and put the future reminder wording in scheduledRequest.prompt.',
       '- A plain reminder is one-shot. Set scheduledRequest.recurring=true only when the user explicitly requests repetition such as every day, weekdays, or every hour. Never infer recurrence merely because atTime is present.',
       '- scheduledRequest.deliveryOnly is true when the future event should only surface the requested reminder/message. It is false when the future event must perform fresh work such as checking weather, inspecting a build, or operating an app. Mentioning a future action inside reminder text does not authorize that action.',
@@ -245,7 +296,7 @@
           unresolvedDecisions: []
         },
         executionScope: 'none | read_only | mutating',
-        executionTarget: 'none | dispatch | coder | operator',
+        executionTarget: executionTargetSchemaValue(),
         executionSurface: 'none | desktop | browser | process',
         orchestrationAction: 'none | schedule_followup',
         scheduledRequest: {
@@ -408,7 +459,14 @@
       inspectionTarget,
       standaloneSystemOperation
     }, input);
-    const executionSurface = executionTarget === 'operator' && EXECUTION_SURFACES.includes(parsed.executionSurface)
+    // A surface is preserved when the resolved specialist can actually work on it, per the
+    // registry. Gating this on 'operator' discarded Researcher's legitimate read-only browser
+    // surface and made every non-Operator classification look surface-less.
+    const resolvedSpecialist = specialist(executionTarget);
+    const executionSurface = resolvedSpecialist
+      && EXECUTION_SURFACES.includes(parsed.executionSurface)
+      && Array.isArray(resolvedSpecialist.executionSurfaces)
+      && resolvedSpecialist.executionSurfaces.includes(parsed.executionSurface)
       ? parsed.executionSurface
       : 'none';
     const requestedOrchestrationAction = ORCHESTRATION_ACTIONS.includes(parsed.orchestrationAction)
@@ -473,9 +531,12 @@
     };
   }
 
+  // Ownership of an existing durable task is not a routing preference — it is a fact. Filtering it
+  // through a hard-coded target list meant a Researcher-owned task returned '' here and the next
+  // turn silently re-resolved to Coder, losing the task binding entirely.
   function taskTargetMode(task) {
     const targetMode = string(task && task.targetMode, 40).toLowerCase();
-    return EXECUTION_TARGETS.includes(targetMode) && targetMode !== 'none' ? targetMode : '';
+    return executionTargets().includes(targetMode) && targetMode !== 'none' ? targetMode : '';
   }
 
   // Specialist selection is semantic, but the target of an already-owned durable task is not.
@@ -501,26 +562,69 @@
       return 'dispatch';
     }
     const inspectionTarget = string(classification.inspectionTarget, 80).toLowerCase();
-    if (classification.standaloneSystemOperation === true || inspectionTarget === 'local_system') {
-      return 'operator';
-    }
-    // A project can be the thing shown on screen without turning the immediate work into source
-    // work. Playtesting a game, clicking through a desktop build, or visually checking a browser
-    // app still belongs to Operator even though the evidence is associated with a project. The old
-    // ordering returned Coder as soon as inspectionTarget was "project", silently discarding the
-    // classifier's correctly structured Operator + desktop/browser decision.
-    if (explicitTarget === 'operator'
-        && ['desktop', 'browser', 'process'].includes(executionSurface)) {
-      return 'operator';
-    }
-    if (inspectionTarget === 'workspace' || inspectionTarget === 'project') return 'coder';
+    const executionScope = string(classification.executionScope, 40).toLowerCase();
 
-    if (EXECUTION_TARGETS.includes(explicitTarget) && explicitTarget !== 'none') {
+    // Capability requirements the requested work implies. These are properties of the WORK, read
+    // from structured classifier fields — never from the wording of the request.
+    const needsLocalSystem = classification.standaloneSystemOperation === true || inspectionTarget === 'local_system';
+    const needsDesktopControl = executionSurface === 'desktop';
+    const needsWorkspaceMutation = executionScope === 'mutating'
+      && ['workspace', 'project'].includes(inspectionTarget);
+
+    // Can this registered specialist actually perform work with those requirements? Answered from
+    // the registry's own capability flags, so a new specialist is judged by what it can do rather
+    // than by being named in a list here.
+    function capableOf(role) {
+      const definition = specialist(role);
+      if (!definition) return false;
+      if (needsLocalSystem && definition.canInspectLocalSystem !== true) return false;
+      if (needsDesktopControl && definition.canControlDesktop !== true) return false;
+      if (needsWorkspaceMutation && definition.canEditWorkspace !== true) return false;
+      if (executionSurface && executionSurface !== 'none'
+          && Array.isArray(definition.executionSurfaces)
+          && !definition.executionSurfaces.includes(executionSurface)) {
+        return false;
+      }
+      return true;
+    }
+
+    // The classifier's explicit specialist choice is honored whenever that specialist can do the
+    // work. This is the ordering fix: evidence LOCATION no longer overrides work SHAPE. Reading a
+    // repository's history to explain a trajectory is Researcher work that happens to involve a
+    // codebase; finding the commit that broke a function and fixing it is Coder work over the very
+    // same evidence. The old chain returned Coder for both the moment inspectionTarget was project.
+    if (specialist(explicitTarget) && capableOf(explicitTarget)) return explicitTarget;
+
+    // The explicit choice was absent or incapable. Fall back on the capability the work needs,
+    // preferring a registered specialist that can actually satisfy it.
+    if (needsLocalSystem) {
+      const localCapable = specialistRoles().find(role => {
+        const definition = specialist(role);
+        return definition && definition.canInspectLocalSystem === true;
+      });
+      if (localCapable) return localCapable;
+    }
+    if (needsDesktopControl) {
+      const desktopCapable = specialistRoles().find(role => {
+        const definition = specialist(role);
+        return definition && definition.canControlDesktop === true;
+      });
+      if (desktopCapable) return desktopCapable;
+    }
+    if (needsWorkspaceMutation || inspectionTarget === 'workspace' || inspectionTarget === 'project') {
+      const editCapable = specialistRoles().find(role => {
+        const definition = specialist(role);
+        return definition && definition.canEditWorkspace === true;
+      });
+      if (editCapable) return editCapable;
+    }
+
+    if (executionTargets().includes(explicitTarget) && explicitTarget !== 'none') {
       return explicitTarget;
     }
 
-    // Executable work without a local-system evidence target is file/artifact work by default.
-    // This keeps older persisted classifications compatible without inventing language rules.
+    // Executable work with no evidence target and no usable classification is file/artifact work
+    // by default. This keeps older persisted classifications compatible without language rules.
     return 'coder';
   }
 
@@ -579,7 +683,6 @@
   const api = {
     INTENTS,
     TARGETS,
-    EXECUTION_TARGETS,
     EXECUTION_SURFACES,
     ORCHESTRATION_ACTIONS,
     INSPECTION_BREADTHS,
@@ -596,6 +699,13 @@
     canUseStandaloneSpecialistWorkspace,
     canUseStandaloneCoderWorkspace
   };
+  // Registry-derived, so callers reading api.EXECUTION_TARGETS always see the roles that actually
+  // exist rather than a snapshot taken before the registry finished loading.
+  Object.defineProperty(api, 'EXECUTION_TARGETS', {
+    enumerable: true,
+    get() { return Object.freeze(executionTargets()); }
+  });
+  api.specialistCapabilityGuidance = specialistCapabilityGuidance;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   if (globalScope) globalScope.OrionSemanticIntentRouter = api;
 })(typeof window !== 'undefined' ? window : globalThis);

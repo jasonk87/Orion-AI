@@ -1041,7 +1041,12 @@ test('Dispatch uses Projects fallback while Coder standalone conversations get i
   // Phase 3 of the Operator architecture plan: Operator does real workspace-bound artifact work
   // like Coder, so change_workspace promotes both into project scope now, not Coder alone. Dispatch
   // still takes the separate known-projects branch below, unaffected by this change.
-  t.ok(agentJs.includes("if (conversation.mode === 'coder' || conversation.mode === 'operator')") && agentJs.includes('conversation.projectPath = targetPath'), 'change_workspace promotes Coder and Operator conversations into project scope');
+  //
+  // The condition is now asked of the specialist registry rather than naming roles, because the
+  // hand-maintained pair is precisely how Researcher fell through this branch after being
+  // registered as a first-class specialist. Pinning the literal role names here would re-create
+  // the same trap for the next specialist, so the invariant is asserted instead.
+  t.ok(agentJs.includes('OrionSpecialistRegistry.has(conversation.mode)') && agentJs.includes('conversation.projectPath = targetPath'), 'change_workspace promotes every registered specialist conversation into project scope');
   t.ok(rendererJs.includes('function addProjectPath'), 'project registration is centralized instead of mixed into every workspace change');
   t.ok(rendererJs.includes('if (promoteProjectForWorkspace) addProjectPath(folderPath)'), 'Dispatch workspace changes do not add folders to the Coder project list unless explicitly promoted');
   t.ok(rendererJs.includes('window.promoteWorkspaceToCoder'), 'renderer exposes an explicit Dispatch-to-Coder promotion path');

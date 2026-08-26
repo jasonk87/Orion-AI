@@ -18,7 +18,18 @@
       standaloneWorkspaceRole: 'standalone_specialist',
       executionSurfaces: Object.freeze(['none', 'browser', 'process']),
       canEditWorkspace: true,
-      canControlDesktop: false
+      canControlDesktop: false,
+      canInspectLocalSystem: false,
+      // The work SHAPE this role owns, in the router's own vocabulary. The semantic classifier is
+      // given these rather than a hand-maintained per-role paragraph, so adding a specialist to
+      // this registry teaches the router about it automatically. Capability, not keywords: the
+      // location of the evidence never decides the specialist, the kind of work does.
+      capabilitySummary: Object.freeze([
+        'source mutation and implementation',
+        'builds, tests, installs, and commands bound to a codebase',
+        'code debugging and regression diagnosis',
+        'creating or editing local project artifacts'
+      ])
     }),
     operator: Object.freeze({
       role: 'operator',
@@ -28,7 +39,14 @@
       standaloneWorkspaceRole: 'standalone_specialist',
       executionSurfaces: Object.freeze(['none', 'desktop', 'browser', 'process']),
       canEditWorkspace: false,
-      canControlDesktop: true
+      canControlDesktop: true,
+      canInspectLocalSystem: true,
+      capabilitySummary: Object.freeze([
+        'native desktop and application interaction',
+        'live browser interaction driven through the screen',
+        'process lifecycle and local machine state',
+        'screen evidence and visual verification'
+      ])
     }),
     // Third specialist role (handoff-generalization + Researcher build). Researcher investigates —
     // web search/fetch, source cross-checking, synthesis — and reports back through the same
@@ -44,7 +62,15 @@
       standaloneWorkspaceRole: 'standalone_specialist',
       executionSurfaces: Object.freeze(['none', 'browser']),
       canEditWorkspace: false,
-      canControlDesktop: false
+      canControlDesktop: false,
+      canInspectLocalSystem: false,
+      capabilitySummary: Object.freeze([
+        'read-only investigation that changes nothing',
+        'gathering and cross-checking multiple sources',
+        'historical and project evidence, including change history',
+        'comparison, synthesis, and explaining a trajectory or pattern',
+        'provenance - saying where each finding came from'
+      ])
     })
   });
 

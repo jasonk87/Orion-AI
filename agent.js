@@ -6837,10 +6837,14 @@ async function executeTool(name, args, workspace, config, conversation, executio
       }
       const targetPath = resolution.path;
       conversation.workspace = targetPath;
-      // Operator binds a concrete project path exactly like Coder (previously this was an
+      // Every registered specialist binds a concrete project path (previously this was an
       // if/else-if with no catch-all: an operator-mode conversation matched neither branch and
-      // silently kept both projectPath and dispatchProjectPath unset).
-      if (conversation.mode === 'coder' || conversation.mode === 'operator') {
+      // silently kept both projectPath and dispatchProjectPath unset). Asking the registry rather
+      // than naming roles is what stops that from recurring: Researcher was registered as a
+      // first-class specialist and then silently fell through this same gap because it was not in
+      // the hand-maintained pair.
+      const specialistConversation = !!(OrionSpecialistRegistry && OrionSpecialistRegistry.has(conversation.mode));
+      if (specialistConversation) {
         conversation.projectPath = targetPath;
       } else if (conversation.mode === 'orion' && window.getKnownProjects) {
         const normalizedTarget = String(targetPath).replace(/[\\/]+/g, '\\').replace(/\\+$/, '').toLowerCase();
@@ -6852,7 +6856,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
       if (typeof window.changeActiveWorkspace === 'function') {
         window.changeActiveWorkspace(targetPath, {
           conversationId: conversation.id,
-          promoteProject: conversation.mode === 'coder' || conversation.mode === 'operator'
+          promoteProject: specialistConversation
         });
       }
       return {

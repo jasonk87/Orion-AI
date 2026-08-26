@@ -154,3 +154,37 @@ test('source-level sanity: runtime and workspace routing use the specialist regi
     'the shared workspace classifier recognizes specialists through the registry');
   t.end();
 });
+
+// Researcher was registered as a first-class specialist but change_workspace still asked a
+// hand-maintained coder/operator pair, so a Researcher conversation matched neither that branch nor
+// the Dispatch branch and silently kept projectPath unset - the exact defect the Operator case
+// above was written to fix, recreated for the next role added. The condition now asks the
+// specialist registry, so this generalizes to every registered specialist rather than to a list.
+test('change_workspace binds projectPath for every registered specialist, including Researcher', async (t) => {
+  const registry = require('../specialist-registry');
+  const oldApi = global.window.api;
+  global.window.api = { listFiles: async () => ([]) };
+  try {
+    const bound = {};
+    for (const definition of registry.list()) {
+      const conversation = { id: 'conv_' + definition.role + '_change', mode: definition.role, workspace: '' };
+      await agent.executeTool('change_workspace', { path: 'C:\Ops\Shared' }, 'C:\old', {}, conversation, {});
+      bound[definition.role] = conversation.projectPath;
+      t.equal(conversation.projectPath, 'C:\Ops\Shared',
+        definition.role + ' binds projectPath on change_workspace');
+    }
+    t.ok(Object.prototype.hasOwnProperty.call(bound, 'researcher'),
+      'Researcher is actually covered by the registry-driven condition');
+    const distinct = new Set(Object.values(bound));
+    t.equal(distinct.size, 1, 'every specialist ends up with identical binding behavior');
+
+    // Dispatch is not a specialist and keeps its separate known-projects branch.
+    const dispatch = { id: 'conv_dispatch_change', mode: 'orion', workspace: '' };
+    await agent.executeTool('change_workspace', { path: 'C:\Ops\Shared' }, 'C:\old', {}, dispatch, {});
+    t.notEqual(dispatch.projectPath, 'C:\Ops\Shared',
+      'Dispatch does not bind projectPath through the specialist branch');
+  } finally {
+    global.window.api = oldApi;
+  }
+  t.end();
+});
