@@ -11,7 +11,7 @@ const { findExistingTailscaleHttpsOrigin } = require('../lib/ipc-server');
 
 const rendererSource = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8').replace(/\r\n/g, '\n');
 
-function request(method, port, path, body, session) {
+function request(method, port, path, body, session, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const payload = body ? JSON.stringify(body) : '';
     const req = http.request({
@@ -21,7 +21,8 @@ function request(method, port, path, body, session) {
       path,
       headers: {
         ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {}),
-        ...(session ? { Authorization: `Bearer ${session.secret}`, 'X-Orion-Device-Id': session.deviceId } : {})
+        ...(session ? { Authorization: `Bearer ${session.secret}`, 'X-Orion-Device-Id': session.deviceId } : {}),
+        ...extraHeaders
       }
     }, (res) => {
       let text = '';
@@ -381,6 +382,9 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
   t.ok(root.text.includes('confirmedCredentialFailures < 2'), 'phone confirms a permanent credential failure before erasing saved access');
   t.ok(root.text.includes('Connection interrupted. Retrying saved phone access...'), 'generic auth interruptions retain the durable device credential');
   t.ok(root.text.includes('This browser has no saved Orion phone access.'), 'clean URLs do not silently reuse a short-lived setup code');
+  t.ok(root.text.includes("fetch('/api/session/recover'"), 'a clean secure shortcut first attempts private-tailnet session recovery');
+  t.ok(root.text.includes("connTextEl.textContent = 'Pairing required'"), 'a genuinely unpaired shortcut presents an actionable state instead of reconnecting forever');
+  t.notOk(root.text.includes('scheduleEventStreamReconnect(eventStreamGeneration, 800)'), 'missing credentials do not start an impossible authenticated-stream retry loop');
   t.ok(root.text.includes('await cancelPendingTasksForNewFocus();'), 'phone waits for cancellation before opening a fresh Dispatch draft');
   t.ok(root.text.includes('id="dispatch-browser-overlay"'), 'root shell keeps saved discussions in an in-Dispatch browser');
   t.notOk(root.text.includes('<span>Pick up a project</span>'), 'root shell keeps project rows off the Dispatch landing');
@@ -565,6 +569,66 @@ test('Phone Companion durable session remains valid after the short-lived pairin
   });
   t.equal(state.statusCode, 200, 'device credential is independent of pairing-link expiry');
   t.equal(state.json.success, true, 'expired setup link does not expire the paired phone');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion securely recovers a pre-upgrade session through Tailscale Serve identity', async (t) => {
+  const pairedAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const device = {
+    id: 'existing-pixel',
+    name: 'Pixel',
+    secret: 'existing-secret',
+    approved: true,
+    revoked: false,
+    pairedAt,
+    lastSeenAt: pairedAt,
+    userAgent: 'Pixel Chrome 151'
+  };
+  const { main, fsMock } = await startMainWithConfig(1167, {
+    phoneCompanionDevices: [device]
+  });
+
+  const recovered = await request('POST', 1167, '/api/session/recover', {}, null, {
+    'User-Agent': device.userAgent,
+    'Tailscale-User-Login': 'owner@example.test'
+  });
+  t.equal(recovered.statusCode, 200, 'a loopback Tailscale Serve request can recover saved access');
+  t.equal(recovered.json.device.id, device.id, 'recovery retains the durable device identity');
+  t.equal(recovered.json.sessionSecret, device.secret, 'recovery restores the existing credential rather than creating a new device');
+  t.equal(fsMock._config().phoneCompanionDevices.length, 1, 'recovery does not create duplicate phone records');
+  t.equal(fsMock._config().phoneCompanionDevices[0].tailscaleUserLogin, 'owner@example.test', 'the verified tailnet identity is bound for browser-version-independent recovery');
+
+  const changedBrowser = await request('POST', 1167, '/api/session/recover', {}, null, {
+    'User-Agent': 'Pixel Chrome 152',
+    'Tailscale-User-Login': 'owner@example.test'
+  });
+  t.equal(changedBrowser.statusCode, 200, 'the verified identity survives a later browser user-agent update');
+  t.equal(changedBrowser.json.device.id, device.id, 'browser updates recover the same durable phone');
+
+  await closeServer(main.getCompanionServer());
+});
+
+test('Phone Companion recovery fails closed without verified private-tailnet identity', async (t) => {
+  const { main } = await startMainWithConfig(1168, {
+    phoneCompanionDevices: [{
+      id: 'existing-pixel',
+      name: 'Pixel',
+      secret: 'existing-secret',
+      approved: true,
+      revoked: false,
+      pairedAt: new Date().toISOString(),
+      lastSeenAt: new Date().toISOString(),
+      userAgent: 'Pixel Chrome 151'
+    }]
+  });
+
+  const rejected = await request('POST', 1168, '/api/session/recover', {}, null, {
+    'User-Agent': 'Pixel Chrome 151'
+  });
+  t.equal(rejected.statusCode, 403, 'ordinary callers cannot recover a session from user-agent data alone');
+  t.equal(rejected.json.code, 'COMPANION_TRUSTED_ORIGIN_REQUIRED', 'the rejection names the trusted-origin requirement');
+  t.notOk(rejected.json.sessionSecret, 'rejected recovery never exposes a credential');
 
   await closeServer(main.getCompanionServer());
 });

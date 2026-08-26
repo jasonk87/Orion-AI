@@ -364,9 +364,10 @@ test('every authenticated companion API call carries credentials', (t) => {
   const fs = require('fs');
   const companionSource = fs.readFileSync(path.join(__dirname, '..', 'lib', 'companion-html.js'), 'utf8');
 
-  // Bare fetch('/api/...') is only legitimate BEFORE credentials exist — i.e. pairing itself.
-  const PRE_AUTH_ENDPOINTS = ['/api/pair'];
-  const bareApiFetches = [...companionSource.matchAll(/(?<!companion)fetch\(\s*['"](\/api\/[a-z0-9-]+)/gi)]
+  // Bare fetch('/api/...') is only legitimate before credentials exist: initial pairing or
+  // trusted-tailnet recovery of an already-approved device.
+  const PRE_AUTH_ENDPOINTS = ['/api/pair', '/api/session/recover'];
+  const bareApiFetches = [...companionSource.matchAll(/(?<!companion)fetch\(\s*['"](\/api\/[a-z0-9/-]+)/gi)]
     .map(match => match[1])
     .filter(endpoint => !PRE_AUTH_ENDPOINTS.includes(endpoint));
 
