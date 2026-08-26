@@ -7,6 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const proxyquire = require('proxyquire').noPreserveCache();
 const companionHtml = require('../lib/companion-html');
+const { findExistingTailscaleHttpsOrigin } = require('../lib/ipc-server');
 
 const rendererSource = fs.readFileSync(path.join(__dirname, '../renderer.js'), 'utf8').replace(/\r\n/g, '\n');
 
@@ -36,6 +37,27 @@ function request(method, port, path, body, session) {
     req.end();
   });
 }
+
+test('Phone Companion reuses an existing stable Tailscale HTTPS origin for its installed shortcut', t => {
+  const status = {
+    Web: {
+      'desktop-owner.example.ts.net:443': {
+        Handlers: { '/': { Proxy: 'http://127.0.0.1:45678' } }
+      },
+      'other.example.ts.net:443': {
+        Handlers: { '/': { Proxy: 'http://127.0.0.1:9999' } }
+      }
+    }
+  };
+  t.equal(
+    findExistingTailscaleHttpsOrigin(status, 45678),
+    'https://desktop-owner.example.ts.net',
+    'pairing and the saved app use the existing secure origin for this exact companion port'
+  );
+  t.equal(findExistingTailscaleHttpsOrigin(status, 45679), '',
+    'an unrelated Tailscale route is never adopted');
+  t.end();
+});
 
 function makeFsMock(config) {
   let temp = '';
@@ -558,7 +580,8 @@ test('Phone Companion rejects an expired setup code while preserving durable dev
     deviceName: 'New phone'
   });
   t.equal(expiredPair.statusCode, 401, 'expired setup code cannot create another device session');
-  t.equal(expiredPair.json.error, 'Invalid pairing code', 'expired setup link receives a clear rejection');
+  t.equal(expiredPair.json.code, 'COMPANION_PAIRING_CODE_INVALID', 'expired setup link receives a machine-readable rejection');
+  t.equal(expiredPair.json.needsPairingLink, true, 'expired setup link tells the phone to request one fresh link');
 
   await closeServer(main.getCompanionServer());
 });
@@ -1151,6 +1174,11 @@ test('Phone Companion replaces suspended mobile connections immediately on foreg
     'duplicate focus/visibility/pageshow events share one bounded foreground recovery attempt');
   t.ok(html.includes('lastStatePayloadAt === 0'),
     'a reconnect preserves the last usable conversation instead of covering it with a full-screen banner');
+  t.ok(html.includes("data.code === 'COMPANION_PAIRING_CODE_INVALID'")
+      && html.includes('This pairing link expired. Open the current pairing link from Orion once'),
+    'an expired pairing link becomes an explicit recoverable state instead of retrying until rate-limited');
+  t.notOk(html.includes('clearInterval(statePollInterval)'),
+    'no pairing or authentication branch can permanently stop state recovery');
   t.ok(html.includes("requestTimeout = setTimeout(() => requestController.abort(), 7000)"),
     'a stalled state request cannot block foreground recovery indefinitely');
   t.ok(html.includes("lastSseActivityAt = Date.now();")

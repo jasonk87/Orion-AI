@@ -49,8 +49,8 @@ test('phone companion finishes with the same dark theme and complete mission hie
   t.ok(companionHtml.includes('#task-list-card { grid-area: mission; }'), 'Task List has an explicit mobile layout area');
   t.ok(companionHtml.includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
   t.ok(companionHtml.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
-  t.ok(companionHtml.includes('state-freshness-v32'), 'phone shell exposes the current UI build version');
-  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v30"), 'phone service worker cache is bumped for the current UI build');
+  t.ok(companionHtml.includes('phone-session-recovery-v33'), 'phone shell exposes the current UI build version');
+  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v31"), 'phone service worker cache is bumped for the current UI build');
   t.ok(companionHtml.includes('window.isSecureContext'), 'phone explains when browser push is blocked by an insecure context');
   t.ok(companionHtml.includes('Phone push needs HTTPS or localhost'), 'phone tells the user that HTTPS is required for push notifications');
   t.ok(companionHtml.includes("companionFetch('/api/push-subscribe'"), 'phone stores push subscriptions through the authenticated fetch path');
@@ -267,6 +267,8 @@ test('Dispatch opens as a focused front door without project-driven clutter', (t
   t.ok(renderer.includes('dispatchProjectPath'), 'Dispatch persists a project association separate from Coder task identity');
   t.ok(renderer.includes("window.markConversationDirty(orionConv.id)"), 'delegated-work completion receipts persist with their Dispatch transcript');
   t.ok(companionHtml.includes("if (resetRequested) {\n      localStorage.removeItem(sessionKey);"), 'ordinary phone UI updates preserve the paired device session');
+  t.ok(companionHtml.includes("const urlPairingCode = params.get('pair') || '';\n      if (!urlPairingCode)"), 'pairing lock is released through finally even when the current origin has no saved credential or link');
+  t.notOk(companionHtml.includes('clearInterval(statePollInterval)'), 'pairing and credential recovery never permanently disable the fallback state poll');
   t.ok(companionHtml.includes('coder-workspace-picker'), 'phone keeps the Coder workspace picker');
   t.ok(companionHtml.includes('#screen-new-chat.dispatch-mode .coder-workspace-picker,') && companionHtml.includes('#screen-new-chat.researcher-mode .coder-workspace-picker { display: none; }'), 'Dispatch and standalone non-Coder specialists hide the Coder workspace picker on new chat');
   t.ok(companionHtml.includes("newChatPromptEl.placeholder = isDispatchStart") && companionHtml.includes("'Ask Researcher to investigate...'"), 'new chat placeholder is mode-aware across Dispatch and all registered specialists');
