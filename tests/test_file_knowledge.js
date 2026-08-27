@@ -116,7 +116,7 @@ test('agent wiring: read recording, notes tool, and run-start brief are connecte
   t.end();
 });
 
-test('file-note IPC preflight rejects internal state immediately without waking the index worker', (t) => {
+test('file-note IPC preflight rejects internal state immediately', (t) => {
   t.deepEqual(
     fk.validateIndexablePath('.orion/context/operational-context.json'),
     {
@@ -126,7 +126,92 @@ test('file-note IPC preflight rejects internal state immediately without waking 
     },
     'internal operational state is rejected deterministically'
   );
-  t.equal(fk.validateIndexablePath('engine/save.py'), null, 'ordinary project source reaches the worker');
-  t.equal(fk.FILE_KNOWLEDGE_TIMEOUT_MS, 20000, 'file-note operations have a bounded interactive deadline');
+  t.equal(fk.validateIndexablePath('engine/save.py'), null, 'ordinary project source reaches the targeted ledger');
+  t.equal(
+    fk.knowledgePath('C:\\workspace'),
+    path.join('C:\\workspace', '.orion', 'file-knowledge.json'),
+    'durable notes are stored separately from the disposable workspace index cache'
+  );
+  t.end();
+});
+
+test('cold file-note writes inspect one file without reconciling the workspace index', (t) => {
+  const root = makeWorkspace();
+  const { WorkspaceIndexService } = require('../lib/workspace-index-service');
+  for (let i = 0; i < 300; i++) {
+    const dir = path.join(root, `large-${Math.floor(i / 30)}`);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `file-${i}.js`), `module.exports = ${i};`);
+  }
+  const service = new WorkspaceIndexService(root, { watch: false, deferInitialReconcile: true });
+  try {
+    const result = service.saveFileDigest('app.js', 'Cold-worker targeted note.');
+    t.equal(result.scope, 'single_file', 'the operation reports its bounded scope');
+    t.equal(service.initialReconcilePending, true, 'global initial reconciliation remains deferred');
+    t.equal(service.records.size, 0, 'no repository records were built as a side effect');
+    t.equal(service.getTelemetry().fullReconciliationDurationMs, 0, 'no full reconcile was performed');
+    t.ok(fs.existsSync(fk.knowledgePath(root)), 'the small durable ledger was persisted');
+    t.notOk(
+      fs.existsSync(path.join(root, '.orion', 'workspace-intelligence-cache.json')),
+      'the global cache was not serialized for a file note'
+    );
+  } finally {
+    service.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+test('file-note IPC uses its own atomic queue rather than the workspace-index worker', async t => {
+  const root = makeWorkspace();
+  const handlers = new Map();
+  const ipcMain = { handle: (name, handler) => handlers.set(name, handler) };
+  fk.registerHandlers(ipcMain);
+  try {
+    const source = fs.readFileSync(path.join(__dirname, '../lib/file-knowledge.js'), 'utf8');
+    t.notOk(source.includes("require('./workspace-index-client')"), 'the note path has no global worker dependency');
+    const save = handlers.get('orion:save-file-digest');
+    const record = handlers.get('orion:record-file-read');
+    const results = await Promise.all([
+      save(null, { workspacePath: root, relativePath: 'app.js', digest: 'Entry point.' }),
+      record(null, { workspacePath: root, relativePath: 'util.js' })
+    ]);
+    t.ok(results.every(result => result.success), 'concurrent note operations complete through the dedicated queue');
+    const ledger = fk.readLedger(root);
+    t.equal(ledger.files['app.js'].digest, 'Entry point.', 'digest survives the queued write');
+    t.ok(ledger.files['util.js'].hash, 'concurrent read stamp survives without a lost update');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+test('legacy shared-cache knowledge migrates on the first targeted mutation', (t) => {
+  const root = makeWorkspace();
+  const cachePath = path.join(root, '.orion', 'workspace-intelligence-cache.json');
+  fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+  const identity = fk.currentFileIdentity(root, 'app.js');
+  fs.writeFileSync(cachePath, JSON.stringify({
+    schemaVersion: 1,
+    persistedAt: new Date().toISOString(),
+    fileKnowledge: {
+      'app.js': { ...identity, lastReadAt: 10, digest: 'Legacy note.', digestedAt: 10 }
+    },
+    files: {}
+  }));
+  try {
+    t.deepEqual(
+      fk.buildKnowledgeBrief(root).knownCurrent,
+      [{ path: 'app.js', digest: 'Legacy note.' }],
+      'existing embedded notes remain readable before migration'
+    );
+    fk.recordFileRead(root, 'util.js');
+    const migrated = fk.readLedger(root);
+    t.equal(migrated.files['app.js'].digest, 'Legacy note.', 'legacy note is retained');
+    t.ok(migrated.files['util.js'].hash, 'new knowledge is added');
+    t.ok(fs.existsSync(fk.knowledgePath(root)), 'migration creates the dedicated ledger');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
   t.end();
 });
