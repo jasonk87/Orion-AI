@@ -45,7 +45,7 @@
     const lines = [
       request || 'Inspect the selected project and report the requested findings.',
       '',
-      'This is a delegated read-only project inspection. Do not modify application source merely because Coder owns the inspection.',
+      'This is a delegated read-only project inspection. Do not modify application source merely because you own the inspection.',
       'Reuse transferred context and existing version-bound file knowledge before reading more source.',
       'As you materially inspect files, save concise version-bound notes with remember_file_notes. Persist only durable project-level architecture, constraints, or gotchas with project memory tools.',
       'Return a grounded report to Dispatch with the files/surfaces inspected, concrete findings, uncertainties, and any recommended next action.'

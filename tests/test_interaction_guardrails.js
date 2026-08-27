@@ -1174,7 +1174,15 @@ test('token-saving prompt cleanup keeps tool schemas authoritative', (t) => {
   t.ok(agentJs.includes('${workWalkthroughOverride}${knownProjectsBlock}`') && agentJs.includes('const knownProjectsBlock = knownProjectsFacts'), 'known project paths are folded into the full system-facts exchange');
   t.notOk(agentJs.includes('buildToolUseContractPrompt()'), 'the redundant per-turn tool contract is no longer injected');
   t.ok(agentJs.includes('const TOOL_RESULT_TRIM_THRESHOLD_CHARS = 1500') && agentJs.includes('const TOOL_RESULT_TRIM_KEEP_RECENT_MESSAGES = 3'), 'older read-only tool payloads are compacted aggressively');
-  t.ok(agentJs.includes('msgs.slice(-10)') && agentJs.includes("substring(0, 300)"), 'background memory extraction uses a bounded transcript');
+  // The bound is still real, it is just no longer "the last 10 messages, once, ever". Automatic
+  // memory now works from a watermark so a long conversation can contribute more than once, with
+  // an explicit per-pass cap instead of a hardcoded slice. Both halves of the bound are asserted:
+  // how many messages one pass may consider, and how much of each message it may send.
+  t.ok(agentJs.includes('ORION_MEMORY_MAX_MESSAGES_PER_PASS') && agentJs.includes('pending.slice(-ORION_MEMORY_MAX_MESSAGES_PER_PASS)'),
+    'background memory extraction bounds how many messages a single pass considers');
+  t.ok(agentJs.includes('substring(0, 300)'), 'and bounds how much of each message it sends');
+  t.notOk(agentJs.includes('msgs.slice(-10)'),
+    'the old fixed last-10-messages-once window is gone, so later material is still eligible');
   t.end();
 });
 

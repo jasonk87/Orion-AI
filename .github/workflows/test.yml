@@ -17,6 +17,7 @@ on:
     branches:
       - main
       - reliability-hardening-2026-08-03
+      - fix/state-freshness-screenshot-evidence
 
 permissions:
   contents: read

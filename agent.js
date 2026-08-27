@@ -150,7 +150,7 @@ Route to the researcher: real multi-step investigation that needs finding and cr
 
 Permission boundary rule: when Jason asks for an executable or mutating operation that Dispatch cannot perform, or for research deeper than a quick inline answer, you MUST call handoff_to_coder, handoff_to_operator, or handoff_to_researcher, whichever fits the work. Never refuse the task or tell Jason to perform it manually merely because Dispatch is read-only. If the target is genuinely ambiguous, use inspect_environment for read-only identification or tell the specialist to identify it safely as part of the handoff.
 
-Context ownership: for an obvious build/fix/edit/test request, route early from the known workspace and task description. Do not deeply inspect source merely to decide that Coder should do the work. Handle a focused read-only question directly when it needs at most one or two source files. Route broader project reviews to Coder as read-only inspections so one agent owns the source survey, persists version-bound file notes/project knowledge, and reports back through Dispatch. If a focused discussion later becomes implementation, use handoff_to_coder; Orion will transfer exact validated context packets so Coder can start from that evidence instead of rediscovering the project.
+Context ownership: for an obvious build/fix/edit/test request, route early from the known workspace and task description. Do not deeply inspect source merely to decide that Coder should do the work. Handle a focused read-only question directly when it needs at most one or two source files. Delegate broader project reviews as read-only inspections so one specialist owns the source survey, persists version-bound file notes/project knowledge, and reports back through Dispatch — choose that specialist by the shape of the work, not by the fact that it is an inspection: a survey whose point is gathering, comparing and synthesizing evidence is Researcher's, while one that is really diagnosis ahead of a change is Coder's. If a focused discussion later becomes implementation, use handoff_to_coder; Orion will transfer exact validated context packets so Coder can start from that evidence instead of rediscovering the project.
 
 HOW YOU THINK:
 Don't snap-route. Ask yourself first: can I handle this directly? Do I have enough context to give the coder a clear task? Is this a coding problem or a planning conversation first? Think it through, then act.
@@ -545,27 +545,48 @@ async function maybeSaveExplicitPreference(text, config, mode) {
 }
 
 // Tracks conversations already auto-summarized to avoid duplicate writes
-const orionAutoSummarizedIds = new Set();
+// How much of each conversation automatic memory has already SUCCESSFULLY processed, and which
+// conversations have an extraction in flight right now.
+//
+// This replaced a plain Set of "conversations already summarized", which had three defects that
+// together made automatic memory far less reliable than the explicit remember_fact path:
+//   - it was marked BEFORE the model call, so one transient provider/JSON error permanently
+//     suppressed memory for that conversation for the rest of the process;
+//   - it never allowed a second pass, so a long conversation that went idle, resumed, and then
+//     covered five important things recorded nothing from the second half;
+//   - it only ever looked at the last ten messages of that single pass.
+// A watermark advances only after a successful extraction, so failure retries and later material
+// is still eligible.
+const orionMemoryWatermarks = new Map();
+const orionMemoryExtractionInFlight = new Set();
+// Bounds one extraction prompt. Everything past the watermark is eligible, but a very long idle
+// gap should not send an unbounded transcript to the utility model.
+const ORION_MEMORY_MAX_MESSAGES_PER_PASS = 40;
 
 async function autoSaveOrionMemory(conversation, config, workspacePath, mode) {
   if (!config) return;
   const convId = conversation.id;
-  if (orionAutoSummarizedIds.has(convId)) return;
+  if (orionMemoryExtractionInFlight.has(convId)) return; // guard double-fire, NOT a permanent mark
   const msgs = (conversation.messages || []).filter(m => m.role === 'user' || m.role === 'assistant');
-  const userMsgCount = msgs.filter(m => m.role === 'user').length;
-  if (userMsgCount < 2) return; // too short — nothing worth summarizing
+  const watermark = Math.max(0, Number(orionMemoryWatermarks.get(convId)) || 0);
+  const pending = msgs.slice(watermark);
+  const userMsgCount = pending.filter(m => m.role === 'user').length;
+  if (userMsgCount < 2) return; // too little new material — nothing worth summarizing yet
 
-  orionAutoSummarizedIds.add(convId); // mark before async to avoid double-fire
+  orionMemoryExtractionInFlight.add(convId);
 
-  // Build a condensed transcript
-  const transcript = msgs.slice(-10).map(m =>
+  // Everything since the last SUCCESSFUL pass, bounded so a long idle gap cannot send an
+  // unbounded transcript.
+  const considered = pending.slice(-ORION_MEMORY_MAX_MESSAGES_PER_PASS);
+  const transcript = considered.map(m =>
     `${m.role === 'user' ? 'Jason' : 'Orion'}: ${(m.text || '').substring(0, 300)}`
   ).join('\n');
 
   const analyzePrompt = `You are reviewing a conversation between Jason and Orion (his AI assistant).
 Extract facts/preferences worth remembering in future sessions, and a short session summary for a session log.
-Return JSON: {"items": [{"type": "fact"|"preference", "text": "..."}], "session": {"summary": "...", "decisions": ["..."], "discoveries": ["..."], "tasksCompleted": ["..."], "openItems": ["..."]}}
+Return JSON: {"items": [{"type": "fact"|"preference", "scope": "global"|"project", "text": "..."}], "session": {"summary": "...", "decisions": ["..."], "discoveries": ["..."], "tasksCompleted": ["..."], "openItems": ["..."]}}
 "items" are durable facts/preferences Jason expressed clearly or decided. Keep each under 120 characters. Do not include trivial details, greetings, or task steps. Return [] if none.
+"scope" is REQUIRED on every item and is a judgment about the item itself, never about which project happens to be open: "global" if it holds regardless of which project is open (identity, habits, cross-project preferences), "project" if it is specific to the active project's code or design. If you cannot tell, omit the item rather than guessing — a mis-scoped memory is worse than a missing one.
 "session.summary" is a concise 1-2 sentence description of what this session covered — return "" if the conversation had no durable content worth logging.
 "session.decisions"/"discoveries"/"tasksCompleted"/"openItems" are short bullet strings (under 150 characters each) — omit or leave empty where nothing applies.
 
@@ -573,56 +594,52 @@ Conversation:
 ${transcript}`;
 
   try {
-    let rawJson = '';
-    const extractionModel = config.modelName;
-    if (config.geminiApiKey) {
-      const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${extractionModel}:generateContent?key=${config.geminiApiKey}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: analyzePrompt }] }],
-          generationConfig: { maxOutputTokens: 512, temperature: 0.2, responseMimeType: 'application/json' }
-        })
-      });
-      const data = await resp.json();
-      rawJson = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '{"items":[]}';
-    } else if (config.anthropicApiKey) {
-      const resp = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-key': config.anthropicApiKey, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({ model: extractionModel, max_tokens: 512, messages: [{ role: 'user', content: analyzePrompt }] })
-      });
-      const data = await resp.json();
-      rawJson = data?.content?.[0]?.text?.trim() || '{"items":[]}';
-    } else if (config.deepseekApiKey) {
-      const resp = await fetch('https://api.deepseek.com/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.deepseekApiKey}` },
-        body: JSON.stringify({
-          model: extractionModel,
-          messages: [{ role: 'user', content: analyzePrompt }],
-          max_tokens: 512,
-          temperature: 0.2,
-          response_format: { type: 'json_object' }
-        })
-      });
-      const data = await resp.json();
-      rawJson = data?.choices?.[0]?.message?.content?.trim() || '{"items":[]}';
-    }
+    // Provider-neutral. This used to hand-roll its own three-branch router keyed on WHICH API KEY
+    // EXISTS - `if (geminiApiKey) ... else if (anthropicApiKey) ...` - while passing
+    // config.modelName as the model. With a Gemini key present and Claude or DeepSeek selected,
+    // it posted a foreign model name to the Gemini endpoint, got nothing back, and silently
+    // extracted zero memories. callUtilityModel routes by the model itself, and
+    // resolveUtilityModelName picks the cheap tier belonging to that provider.
+    const extractionModel = resolveUtilityModelName(config.modelName);
+    const rawJson = await callUtilityModel(analyzePrompt, extractionModel, config, true, {
+      phase: 'memory_extraction'
+    });
+    if (!rawJson) throw new Error(`Memory extraction returned no response from ${extractionModel}.`);
+
     const parsed = JSON.parse(rawJson);
     const items = Array.isArray(parsed?.items) ? parsed.items : [];
+    // Scope is enforced here exactly as it is on the explicit remember_fact path. This used to
+    // send EVERY automatically extracted item to global memory, which quietly defeated the scope
+    // guarantee the tool path enforces: a project-specific detail learned while one workspace was
+    // open became a permanent global fact. An item whose scope the model could not judge is
+    // dropped, because a mis-scoped memory is worse than a missing one.
+    let stored = 0;
     for (const item of items) {
-      if (!item.text || item.text.length < 5) continue;
-      if (item.type === 'preference') {
-        await window.api.appendGlobalPreference(item.text, config, 'auto-summary', mode);
+      if (!item || !item.text || String(item.text).length < 5) continue;
+      const scope = String(item.scope || '').trim().toLowerCase();
+      if (scope !== 'global' && scope !== 'project') continue;
+      if (scope === 'project' && !workspacePath) continue; // nothing to scope it to
+      const isPreference = item.type === 'preference';
+      let result;
+      if (scope === 'global') {
+        result = isPreference
+          ? await window.api.appendGlobalPreference(item.text, config, 'auto-summary', mode)
+          : await window.api.appendGlobalFact(item.text, 'auto-summary', config);
       } else {
-        await window.api.appendGlobalFact(item.text, 'auto-summary', config);
+        // Project preferences have no dedicated store; they persist as project facts so they stay
+        // bound to the workspace they were learned in rather than leaking to every project.
+        result = await window.api.appendProjectFact(workspacePath, item.text, 'auto-summary', config);
       }
+      if (result && result.success !== false) stored += 1;
     }
-    if (items.length > 0) {
-      console.log(`[Orion] Auto-saved ${items.length} memory item(s) from session.`);
+    if (stored > 0) {
+      console.log(`[Orion] Auto-saved ${stored} of ${items.length} extracted memory item(s) from session.`);
       // Refresh the in-memory block so the next run in this session starts with the new facts
       await refreshOrionMemoryBlock(config, null, mode).catch(() => {});
+    } else if (items.length > 0) {
+      // Extraction worked but nothing survived scoping. Worth seeing: it usually means the model
+      // is omitting scope, which would previously have been globalized without anyone noticing.
+      console.warn(`[Orion] Extracted ${items.length} memory item(s) but stored none - all lacked a usable scope.`);
     }
 
     const session = parsed && parsed.session;
@@ -638,7 +655,18 @@ ${transcript}`;
         openItems: Array.isArray(session.openItems) ? session.openItems : []
       });
     }
-  } catch (e) { /* silent — memory auto-save is best-effort */ }
+    // Only now, after a successful extraction AND persistence pass, does the watermark move.
+    // Advancing it on failure is what made a single transient provider error permanently suppress
+    // memory for this conversation.
+    orionMemoryWatermarks.set(convId, watermark + considered.length);
+  } catch (error) {
+    // Best-effort, but never invisible. This path silently swallowed every failure, which is why a
+    // misrouted provider call could disable automatic memory indefinitely with no symptom. The
+    // watermark is deliberately NOT advanced here, so the next idle period retries this material.
+    console.error('[Orion] Automatic memory extraction failed; it will retry on the next idle period:', error && error.message ? error.message : error);
+  } finally {
+    orionMemoryExtractionInFlight.delete(convId);
+  }
 }
 
 // ── Inactivity-triggered memory auto-save ──────────────────────────────────────
@@ -10709,7 +10737,12 @@ function handoffRoleLabel(role) {
 }
 
 function resolveDispatchHandoffRole(semanticIntent = {}, { delegatedInspection = false } = {}) {
-  if (delegatedInspection) return 'coder';
+  // delegatedInspection means the work must LEAVE Dispatch, not that Coder owns it. It used to
+  // `return 'coder'` here before the router was ever consulted, which is the same defect the
+  // comment below describes for a different reason: a read-only survey the router correctly
+  // resolved to Researcher was forced back to Coder purely because it was flagged as a delegated
+  // inspection. The flag decides WHETHER to delegate; work shape decides TO WHOM. Coder remains
+  // the fallback only when nothing else can be resolved, which is the branch at the end.
   if (SemanticIntentRouter && typeof SemanticIntentRouter.resolveExecutionTarget === 'function') {
     const resolved = SemanticIntentRouter.resolveExecutionTarget(semanticIntent);
     // Bug found from a real misroute: "what are the latest updates for Crimson Desert" (pure
@@ -15251,4 +15284,13 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
   module.exports.drainNextQueuedTask = drainNextQueuedTask;
   module.exports.evaluateLoopStateWithSupervisor = evaluateLoopStateWithSupervisor;
   module.exports.getStartupCancellationRecoveryState = getStartupCancellationRecoveryState;
+  // Automatic memory extraction, plus the watermark that decides what a later pass reconsiders.
+  // Exported because this path bypasses every tool the memory tests exercise, which is exactly how
+  // its provider-routing, retry, and scope defects went unnoticed.
+  module.exports.autoSaveOrionMemory = autoSaveOrionMemory;
+  module.exports.__getOrionMemoryWatermark = convId => orionMemoryWatermarks.get(convId);
+  module.exports.__resetOrionMemoryWatermarks = () => {
+    orionMemoryWatermarks.clear();
+    orionMemoryExtractionInFlight.clear();
+  };
 }

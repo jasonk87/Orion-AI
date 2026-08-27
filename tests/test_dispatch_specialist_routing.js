@@ -102,12 +102,38 @@ test('resolveDispatchHandoffRole still defaults unclassified executable work to 
   t.end();
 });
 
-test('resolveDispatchHandoffRole still forces delegated inspections to Coder regardless of the router', t => {
-  const researchLikeButDelegated = classification({ executionTarget: 'researcher', executionScope: 'read_only' });
+// Deliberate contract change. delegatedInspection used to short-circuit to Coder BEFORE the router
+// ran, so a read-only survey the router correctly resolved to Researcher was converted back into
+// Coder work purely because it carried the flag. That is the same "a flag decides the specialist"
+// mistake as routing by evidence location: the inspection policy decides WHETHER to delegate, and
+// the shape of the work decides TO WHOM.
+test('a delegated inspection leaves Dispatch, but the router still chooses which specialist owns it', t => {
+  const researchShaped = classification({
+    executionTarget: 'researcher', executionScope: 'read_only',
+    inspectionTarget: 'project', inspectionBreadth: 'broad'
+  });
   t.equal(
-    agent.resolveDispatchHandoffRole(researchLikeButDelegated, { delegatedInspection: true }),
+    agent.resolveDispatchHandoffRole(researchShaped, { delegatedInspection: true }),
+    'researcher',
+    'a read-only survey delegated for inspection stays Researcher work'
+  );
+
+  const codeShaped = classification({
+    executionTarget: 'coder', executionScope: 'mutating',
+    inspectionTarget: 'project', inspectionBreadth: 'broad'
+  });
+  t.equal(
+    agent.resolveDispatchHandoffRole(codeShaped, { delegatedInspection: true }),
     'coder',
-    'delegatedInspection is a distinct, deliberate Coder-only path and is untouched by this fix'
+    'and diagnosis-before-a-change over the same evidence is still Coder work'
+  );
+
+  // The flag must still guarantee the work leaves Dispatch when nothing else places it.
+  const unplaceable = classification({ executionTarget: 'none', inspectionTarget: 'none' });
+  t.equal(
+    agent.resolveDispatchHandoffRole(unplaceable, { delegatedInspection: true }),
+    'coder',
+    'an unplaceable delegated inspection still falls back to a specialist rather than staying in Dispatch'
   );
   t.end();
 });

@@ -27,15 +27,28 @@
 
   function resolveTarget(semanticIntent, options) {
     if (!semanticIntent || semanticIntent.requiresExecution !== true) return 'none';
-    if (options.delegatedInspection === true) return 'coder';
     if (!SemanticIntentRouter || typeof SemanticIntentRouter.resolveExecutionTarget !== 'function') {
       return 'none';
     }
-    return SemanticIntentRouter.resolveExecutionTarget(semanticIntent, {
+    const resolved = SemanticIntentRouter.resolveExecutionTarget(semanticIntent, {
       activeOwnedTask: options.activeOwnedTask || null,
       pendingOwnedTask: options.pendingOwnedTask || null,
       recentOwnedTask: options.recentOwnedTask || null
     });
+    // delegatedInspection says the work must LEAVE Dispatch. It does not say who owns it.
+    //
+    // This used to `return 'coder'` BEFORE consulting the router, which meant an inspection the
+    // semantic router had correctly understood as read-only investigation — Researcher's declared
+    // capability — was silently converted back into Coder work. That is the same "a flag decides
+    // the specialist" mistake as routing by evidence location: the inspection policy's job is to
+    // decide whether to delegate, and the work's shape decides to whom.
+    //
+    // Coder remains the fallback ONLY when the router cannot place the work at all, which
+    // preserves the previous behavior for that case without overriding a real decision.
+    if (options.delegatedInspection === true && (resolved === 'none' || resolved === 'dispatch')) {
+      return 'coder';
+    }
+    return resolved;
   }
 
   /**

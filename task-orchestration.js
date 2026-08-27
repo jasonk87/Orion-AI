@@ -43,7 +43,15 @@
   // (coder -> operator -> coder -> operator -> ...) once more than one role can initiate a
   // handoff. This guard makes that structurally impossible rather than relying on the model
   // reading and honoring an instruction.
-  const MAX_DELEGATION_DEPTH = 3; // one hop per registered specialist role today (coder/operator/researcher)
+  // One hop per registered specialist. Hard-coding 3 re-created the same role-count assumption the
+  // registry was introduced to eliminate: adding a fourth specialist would silently cap its chains
+  // one hop short. Derived here, with 3 as the floor for environments where the registry has not
+  // evaluated yet (renderer <script> load order), so the guard can never become more permissive
+  // than it was.
+  const MAX_DELEGATION_DEPTH = Math.max(
+    3,
+    SpecialistRegistry && typeof SpecialistRegistry.list === 'function' ? SpecialistRegistry.list().length : 0
+  );
 
   function evaluateDelegationHandoff(currentChainValue, targetRoleValue) {
     const chain = uniqueStrings(Array.isArray(currentChainValue) ? currentChainValue : [])
