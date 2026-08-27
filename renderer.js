@@ -8345,8 +8345,19 @@ window.onAgentStatusChange = (running, details = {}) => {
     steerBtn.style.display = 'none';
     queueBtn.style.display = 'none';
     const conv = conversations.find(item => item.id === activeConversationId);
+    // Presence describes the conversation ON SCREEN. A run finalizing in some OTHER conversation
+    // must not paint over it: onAgentRunFinalized, which clears this pill, already early-returns
+    // unless the finished run is the active conversation — so an unscoped "Verifying" here gets
+    // set and never cleared, stranding Dispatch on "Saving the response..." while the transcript
+    // right below it correctly reads "Operator completed". A status change with no conversationId
+    // is a global/legacy caller and still applies to whatever is on screen.
+    const statusConversationId = String(details.conversationId || '');
+    const statusIsForActiveConversation = !statusConversationId
+      || statusConversationId === String(activeConversationId || '');
     if (details.status === 'finalizing') {
-      renderAgentPresence('verifying', 'Verifying', 'Saving the response and recording the canonical task state');
+      if (statusIsForActiveConversation) {
+        renderAgentPresence('verifying', 'Verifying', 'Saving the response and recording the canonical task state');
+      }
     } else if (conv && conv.awaitingPlanApproval && !conv.planApproved) {
       revealAgentPanel('A plan is ready for review.');
       renderAgentPresence('attention', 'Review needed', 'Implementation plan is waiting for approval');
