@@ -53,6 +53,35 @@ test('delegated reviews preserve read-only scope and require durable knowledge',
   t.end();
 });
 
+// Real bug: a request about Orion's own prior runs was misrouted into this exact delegated
+// project-inspection path, which is why an unrelated project (Bot-GPT) ended up with mistaken
+// remember_file_notes entries - shouldDelegate()/isReadOnlyProjectInspection() only ever checked
+// inspectionTarget against ['workspace','project'], so a historical-investigation classification
+// (now inspectionTarget='task_history') would have matched project-review logic exactly like a
+// real project inspection: it would have been "delegated" to Coder with the same
+// remember_file_notes persistence prompt, in whatever workspace happened to be active. task_history
+// is a distinct evidence domain and must never enter this policy at all - proven here directly at
+// the policy layer, independent of whether the classifier itself is fixed correctly upstream.
+test('a task_history evidence request never enters delegated project inspection, so it can never trigger remember_file_notes on an unrelated project', t => {
+  const historyIntent = inspectionIntent({
+    inspectionTarget: 'task_history',
+    inspectionBreadth: 'broad',
+    resolvedRequest: 'Find how Orion previously checked the user\'s DeepSeek balance.'
+  });
+  t.equal(policy.isReadOnlyProjectInspection(historyIntent), false,
+    'task_history is not read-only PROJECT inspection - it is a different evidence domain entirely');
+  t.equal(policy.isSourceInspectionIntent(historyIntent), false,
+    'a task-history request is never treated as a source-code inspection');
+  t.equal(policy.shouldDelegate({ mode: 'orion', semanticIntent: historyIntent, ledger: ledger(['a.js', 'b.js', 'c.js']) }), false,
+    'even with several "inspected" paths recorded, a task-history request is never delegated to Coder as a project review - that delegation is what carries the remember_file_notes persistence prompt into whatever project happens to be active');
+  // The same check holds for the narrower single-file/focused breadths, not just broad.
+  ['none', 'single_file', 'focused'].forEach(breadth => {
+    t.equal(policy.shouldDelegate({ mode: 'orion', semanticIntent: inspectionIntent({ inspectionTarget: 'task_history', inspectionBreadth: breadth }), ledger: ledger(['a.js']) }), false,
+      `task_history with inspectionBreadth=${breadth} is still never delegated as project inspection`);
+  });
+  t.end();
+});
+
 test('inspection knowledge gate identifies only materially read files without notes', t => {
   const sourceLedger = ledger(['agent.js', 'renderer.js']);
   const work = [{ toolName: 'remember_file_notes', path: 'agent.js', status: 'done' }];

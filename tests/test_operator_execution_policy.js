@@ -144,6 +144,7 @@ test('open_application activates or launches one named app and captures the visi
     },
     captureDesktopScreenshot: async (workspace, destination, prefix, options) => {
       calls.push(`capture:${options.conversationId}`);
+      t.equal(options.windowHint, 'Codex', 'the activated window identity is passed to the capture fallback');
       return {
         rel: 'orion-artifact://operator-1/screenshots/codex.png',
         png: Buffer.from('png'),
@@ -165,6 +166,30 @@ test('open_application activates or launches one named app and captures the visi
   t.equal(result.method, 'activated', 'an existing window is preferred over a duplicate launch');
   t.equal(result.path, 'orion-artifact://operator-1/screenshots/codex.png', 'the resulting screen is captured for verification');
   t.deepEqual(calls, ['hide', 'open:Codex', 'capture:operator-1', 'showInactive']);
+  t.end();
+});
+
+test('open_application keeps action success distinct from unavailable screenshot evidence', async t => {
+  let handler = null;
+  const oldWindow = shared.mainWindow;
+  shared.mainWindow = { isDestroyed: () => false, hide: () => {}, showInactive: () => {} };
+  computerUse.registerHandlers({
+    handle: (name, fn) => { if (name === 'open-application') handler = fn; }
+  }, {
+    runApplication: async appName => ({ success: true, method: 'activated', appName, windowTitle: 'Claude' }),
+    captureDesktopScreenshot: async () => { throw new Error('Captured screen image was empty.'); }
+  });
+
+  const result = await handler(null, {
+    appName: 'Claude', settleMs: 0, workspacePath: 'C:\\Users\\Owner', conversationId: 'operator-1'
+  });
+  shared.mainWindow = oldWindow;
+
+  t.equal(result.success, true, 'activating the named app remains a successful action');
+  t.equal(result.method, 'activated', 'the verified action result is preserved');
+  t.equal(result.captureSuccess, false, 'missing visual evidence is represented separately');
+  t.match(result.captureError, /image was empty/i, 'the evidence failure remains explicit');
+  t.match(result.summary, /^Activated "Claude", but could not capture/, 'the UI does not falsely claim visual verification');
   t.end();
 });
 

@@ -21,6 +21,31 @@
   ]);
   const LEVELS = Object.freeze(['low', 'medium', 'high']);
   const CONTEXT_NEEDS = Object.freeze(['none', 'recent', 'task', 'project', 'historical']);
+  // Real bug: "Can you look at some of the past runs to see how you were able to get the
+  // balance?" was answered by inspecting an unrelated active project instead of Orion's own
+  // prior execution history. inspectionTarget only ever named local_system/workspace/project -
+  // there was no evidence domain for "what Orion itself previously did," so a historical-
+  // investigation request had nowhere honest to resolve except the active workspace, which the
+  // prompt below already primes as "the project target already resolved by deterministic
+  // application code." evidenceTarget names WHOSE evidence answers the request, resolved by
+  // the model from meaning (the referent of "you"/"your last run"/"how did you do this before"),
+  // never from keyword matching. Deterministic enforcement lives in normalizeClassification:
+  // once evidenceTarget is prior_orion_runs, inspectionTarget cannot silently stay on
+  // workspace/project - see evidenceBroadenReason below.
+  //
+  // personal_memory extends the same pattern for a second, separately-diagnosed bug: a memory
+  // question ("what do you actually remember about me") was task-constructed bound to whatever
+  // project happened to be active, because memoryIntent named the request correctly but nothing
+  // in evidenceTarget's own vocabulary could say so - the only honest-looking values were
+  // active_workspace (wrong) or none (which collapses "no evidence needed" and "the evidence is
+  // Orion's own memory stores" into the same word). Jason's stated preference: inspectionTarget's
+  // 'none' should mean exactly one thing - no file/system investigation required - not carry a
+  // second, unwritten meaning of "this is actually a memory question" on top of it. personal_memory
+  // gives that second meaning its own name. inspectionTarget still deterministically resolves to
+  // 'none' for a memory question (no file investigation is ever required), so nothing downstream
+  // that already reads inspectionTarget changes behavior; evidenceTarget is what now names the
+  // evidence domain explicitly and auditably, mirroring prior_orion_runs's role for history.
+  const EVIDENCE_TARGETS = Object.freeze(['none', 'prior_orion_runs', 'active_workspace', 'personal_memory']);
   const MEMORY_INTENTS = Object.freeze([
     'none',
     'conversation_recall',
@@ -245,16 +270,18 @@
       '- status_check asks for progress/state; new_task asks for new executable work; steer_active_task changes the existing owned task; context_followup continues or accepts a prior non-plan proposal.',
       '- When priorAssistantMessage offers to perform, retry, resend, or hand off a specific action and userMessage accepts that offer, classify context_followup. Set requiresExecution from the accepted action and resolve the full request from the proposal plus recentOwnedTask when relevant.',
       '- recentOwnedTask supplies context for a retry or replacement after terminal work. It is not active-task authority and must never by itself authorize cancellation, steering, or a claim that the old task is still running.',
+      '- resumesRecentFailedTask is true only when userMessage is actually accepting a retry/resend of the SAME work described in recentOwnedTask (for example the immediately preceding assistant turn offered to retry that exact failed task and userMessage accepts). It must be false whenever userMessage responds to a different, more recent offer or request, even a bare confirmation such as "yes" - recentOwnedTask being present does not make an unrelated reply about it. Never set this true merely because a failed recentOwnedTask exists somewhere in context; it must be what the current reply is actually about.',
       '- candidateAction is an attempted action awaiting semantic adjudication, not proof of authorization. Approve its meaning only when userMessage and the supplied conversation actually request that action.',
       '- A conversational reaction or acknowledgment whose meaning depends on priorAssistantMessage is contextDependent and should request recent context. A standalone greeting or unrelated small talk is not contextDependent and should request no context.',
       '- Distinguish memory semantics explicitly. conversation_recall asks what was said, decided, or discussed in a past conversation. memory_policy asks how Orion saves, retains, or forgets information and is not a recall request. stored_memory_lookup asks what is currently stored. memory_write asks Orion to save new information.',
       '- Treat durable personal facts and preferences as candidate context for ordinary conversation too. When answering the current turn depends on a specific fact about the user, set memoryContext.needed and express the missing concept as a short standalone semantic query. Do not merely repeat userMessage, do not guess the fact value, and do not claim that the fact exists.',
       '- memoryContext only requests read-only retrieval. It never authorizes an action or changes memoryIntent. Leave it disabled when no particular durable fact or preference would materially improve the answer.',
       '- Set reasoningPolicyHint.contextNeed to historical for conversation_recall or a stored_memory_lookup that genuinely needs history. A memory_policy explanation does not need historical conversation retrieval.',
+      '- A question about what Orion remembers, knows, or has stored (conversation_recall or stored_memory_lookup - about the user, a project, or the conversation) is answered from Orion\'s own memory stores and conversation history, through recall_memory\'s own global/project/conversation scope - never by inspecting the active project\'s files. Set evidenceTarget to personal_memory and inspectionTarget to none for it regardless of which project happens to be selected; both are enforced deterministically after classification, so this applies even to a project-specific memory question.',
       '- requiresExecution describes whether satisfying the resolved request requires tools or state mutation. It does not authorize execution.',
       '- executionTarget selects who owns the immediate requested operation. Use dispatch for durable orchestration Dispatch performs itself, currently reminders and scheduled follow-ups. Otherwise choose the specialist whose capabilities match the SHAPE of the work:',
       ...specialistCapabilityGuidance(),
-      '- Choose the specialist by what the work IS, not by where its evidence happens to live. The same repository history can belong to either specialist: reading recent changes to explain a pattern, trajectory, or what a series of changes collectively means is read-only investigation and synthesis; locating the change that broke something and correcting it is diagnosis and mutation. A question that requires gathering several artifacts, comparing them, and explaining what they add up to is investigation even when every artifact is a source file or a commit.',
+      '- Choose the specialist by what the work IS, not by where its evidence happens to live. The same repository history can belong to either specialist: reading recent changes to explain a pattern, trajectory, or what a series of changes collectively means is read-only investigation and synthesis; locating the change that broke something and correcting it is diagnosis and mutation. A question that requires gathering several artifacts, comparing them, and explaining what they add up to is investigation even when every artifact is a source file or a commit, or a prior Orion task/run record instead of a file.',
       '- Classify the action the user is requesting NOW, not an action mentioned inside a reminder payload. "Remind me at 2 to start OpenAI" asks Dispatch to schedule a reminder; it does not ask Operator to start OpenAI now. Set executionTarget=dispatch, orchestrationAction=schedule_followup, and put the future reminder wording in scheduledRequest.prompt.',
       '- A plain reminder is one-shot. Set scheduledRequest.recurring=true only when the user explicitly requests repetition such as every day, weekdays, or every hour. Never infer recurrence merely because atTime is present.',
       '- scheduledRequest.deliveryOnly is true when the future event should only surface the requested reminder/message. It is false when the future event must perform fresh work such as checking weather, inspecting a build, or operating an app. Mentioning a future action inside reminder text does not authorize that action.',
@@ -263,8 +290,10 @@
       '- Honor an explicit, appropriate request for Operator or Coder. For mixed work, choose the specialist that owns the immediate next operation; code-first changes go to Coder before later UI verification by Operator.',
       '- Preserve the target specialist of an active or pending owned task when the turn steers or continues that same task. Never create a second specialist task merely because the wording is contextual.',
       '- executionScope is read_only for inspection, review, status gathering, or known commands that do not mutate durable state; mutating is for edits, installs, lifecycle changes, queue changes, approval, denial, revision, or cancellation.',
-      '- inspectionTarget identifies where evidence must come from. Use local_system for machine/process facts, workspace/project for source or project facts, and none for ordinary conversation.',
-      '- inspectionBreadth describes the source evidence needed for a workspace/project inspection: single_file means exactly one known file, focused means at most two source files, and broad means a project review or question that cannot be answered honestly without inspecting more than two files or multiple architectural surfaces. Do not use broad for local-system inspection or ordinary conversation.',
+      '- evidenceTarget names WHOSE evidence actually answers the request, resolved from meaning, never from keyword matching and never from which project or technology name happens to appear in the sentence. prior_orion_runs means the answer depends on what Orion itself previously did - its own prior task/run execution, orchestration history, or how it accomplished something before. active_workspace means the answer depends on the currently selected project\'s own code, files, or content. personal_memory means the answer depends on Orion\'s own stored memory or conversation history about the user, a project, or the conversation - not fresh file inspection. The same named entity can appear either way: "how did you do this last time," "look at your previous runs," "what did Operator do the last couple times I asked for X," "what happened in the previous attempt," and "check the history and see how you handled this before" all resolve to prior_orion_runs even when a project or technology is also named - the referent is Orion\'s own execution, not that project. "How does <project> use X," "search <project> for Y," and "did I build Z in this project" resolve to active_workspace - the referent is the project itself. "What do you remember about me," "what have I told you about GRITLIFE," and "what did we discuss earlier" resolve to personal_memory - the referent is Orion\'s stored knowledge, not a fresh look at the project. Use none when none of these apply.',
+      '- inspectionTarget identifies where evidence must come from. Use local_system for machine/process facts, workspace/project for source or project facts, task_history for Orion\'s own prior task/run/orchestration record, and none for ordinary conversation as well as for any personal_memory request (memory is read through recall_memory\'s own scope, never file inspection). inspectionTarget must be task_history, never workspace or project, whenever evidenceTarget is prior_orion_runs, and must be none whenever evidenceTarget is personal_memory - both are enforced deterministically after classification, so setting it correctly here is required, not optional.',
+      '- evidenceBroadenReason must stay empty unless a historical investigation genuinely has to widen into a specific project artifact - for example, a prior task\'s own recorded result explicitly names a script or file that is still needed to finish answering. State the concrete reason (what the history established and why it now demands that artifact). Never leave inspectionTarget on workspace/project, and never set evidenceBroadenReason, merely because a project happens to be selected.',
+      '- inspectionBreadth describes the source evidence needed for a workspace/project/task_history inspection: single_file means exactly one known file, focused means at most two files or task records, and broad means a review that cannot be answered honestly without inspecting more than two files or multiple architectural surfaces, or (for task_history) that requires comparing multiple prior Orion runs/tasks. Do not use broad for local-system inspection or ordinary conversation.',
       '- standaloneSystemOperation is true only for executable local-machine work that is not bound to a selected project.',
       '- Set reasoningPolicyHint.contextNeed to historical only when historical evidence is actually needed; casual conversation and memory_policy explanations should be none.',
       '',
@@ -275,6 +304,7 @@
         target: 'none | current_conversation | active_owned_task | pending_plan',
         resolvedRequest: '',
         contextDependent: false,
+        resumesRecentFailedTask: false,
         confidence: 0,
         needsClarification: false,
         clarificationQuestion: '',
@@ -309,7 +339,9 @@
           recurring: false,
           deliveryOnly: false
         },
-        inspectionTarget: 'none | local_system | workspace | project',
+        evidenceTarget: 'none | prior_orion_runs | active_workspace | personal_memory',
+        evidenceBroadenReason: '',
+        inspectionTarget: 'none | local_system | workspace | project | task_history',
         inspectionBreadth: 'none | single_file | focused | broad',
         standaloneSystemOperation: false
       }, null, 2),
@@ -349,6 +381,8 @@
         executionSurface: 'none',
         orchestrationAction: 'none',
         scheduledRequest: { prompt: '', purpose: '', delaySeconds: 0, repeatEverySeconds: 0, atTime: '', onDays: '', recurring: false, deliveryOnly: false },
+        evidenceTarget: 'none',
+        evidenceBroadenReason: '',
         inspectionTarget: 'none',
         inspectionBreadth: 'none',
         standaloneSystemOperation: false,
@@ -376,6 +410,8 @@
       executionSurface: 'none',
       orchestrationAction: 'none',
       scheduledRequest: { prompt: '', purpose: '', delaySeconds: 0, repeatEverySeconds: 0, atTime: '', onDays: '', recurring: false, deliveryOnly: false },
+      evidenceTarget: 'none',
+      evidenceBroadenReason: '',
       inspectionTarget: 'none',
       inspectionBreadth: 'none',
       standaloneSystemOperation: false,
@@ -427,9 +463,24 @@
     const resolution = parsed.taskResolution && typeof parsed.taskResolution === 'object'
       ? parsed.taskResolution : {};
     let resolvedRequest = string(parsed.resolvedRequest, 12000);
+    // Real bug: Dispatch built a task titled "Check DeepSeek balance + screenshot" from a bare
+    // "Yes" that was actually accepting a completely different, more recent offer ("pull up the
+    // actual memory entries and show Jason what's stored"). recentOwnedTask is "whatever was
+    // delegated most recently, ever" (conversation.lastDelegatedWork in the renderer - only
+    // overwritten by a NEWER delegation, never aged out or cleared), so once nothing new had been
+    // delegated since the failed DeepSeek task, it sat there as stale, unrelated context. The
+    // structural conditions below (context_followup + requiresExecution + contextDependent + a
+    // failed recentOwnedTask + no active/pending task) are satisfied by ANY contextual "yes," not
+    // specifically by one that is actually about that failed task - there was nothing to tell
+    // apart "yes, retry the DeepSeek check" from "yes, show me the memory entries" once a stale
+    // failed task happened to be sitting in context. resumesRecentFailedTask is the model's own
+    // judgment of whether the CURRENT reply is actually about recentOwnedTask; the deterministic
+    // override below only ever fires once that judgment says yes, so an unrelated new request can
+    // no longer have its own correctly-resolved objective silently discarded.
     const failedTaskRetry = normalizedIntent === 'context_followup'
       && parsed.requiresExecution === true
       && parsed.contextDependent === true
+      && parsed.resumesRecentFailedTask === true
       && input.recentOwnedTask
       && input.recentOwnedTask.status === 'failed'
       && input.recentOwnedTask.objective
@@ -442,9 +493,43 @@
       // non-durable routing paraphrase such as "send it to Coder" to become the new task payload.
       resolvedRequest = input.recentOwnedTask.objective;
     }
-    const inspectionTarget = ['none', 'local_system', 'workspace', 'project'].includes(parsed.inspectionTarget)
+    let evidenceTarget = EVIDENCE_TARGETS.includes(parsed.evidenceTarget) ? parsed.evidenceTarget : 'none';
+    const evidenceBroadenReason = string(parsed.evidenceBroadenReason, 500);
+    let inspectionTarget = ['none', 'local_system', 'workspace', 'project', 'task_history'].includes(parsed.inspectionTarget)
       ? parsed.inspectionTarget
       : 'none';
+    // Deterministic invariant (the enforcement half of "use models for meaning, deterministic
+    // code for invariants"): once the model has resolved evidenceTarget to Orion's own prior
+    // run/task history, the active project workspace can never silently become the investigation
+    // target just because a project happens to be selected. The only way past history legitimately
+    // widens into a specific project artifact is a stated, non-empty evidenceBroadenReason - an
+    // empty reason means no broadening was deliberately requested, so the target is corrected back
+    // to task_history regardless of what the model put in inspectionTarget.
+    if (evidenceTarget === 'prior_orion_runs' && !evidenceBroadenReason) {
+      inspectionTarget = 'task_history';
+    }
+    // Real bug: "what do you actually remember about me" was task-constructed bound to whatever
+    // project happened to be active (GRITLIFE) instead of staying a plain personal-memory answer.
+    // memoryIntent already correctly names this class of request (stored_memory_lookup /
+    // conversation_recall), but nothing tied it to inspectionTarget - the model could (and did) also
+    // set inspectionTarget to workspace/project simply because conversation.workspace was primed as
+    // "the project target already resolved," which then authorized project-bound task construction
+    // exactly like a real project question would. A memory question is always answered through
+    // recall_memory's own global/project/conversation scope, never by inspecting project files, so
+    // inspectionTarget can never legitimately be workspace/project for one - not even a genuinely
+    // project-specific memory question, since recall_memory's scope parameter (not inspectionTarget)
+    // is what selects which memory store to read.
+    //
+    // evidenceTarget is corrected the same way and takes priority over the prior_orion_runs check
+    // above: a memory question is never a task_history investigation even if the model also guessed
+    // prior_orion_runs, because memoryIntent already commits the answer to recall_memory's stores,
+    // not to search_orion_task_history. This keeps evidenceTarget non-overloaded - personal_memory
+    // names the evidence domain explicitly instead of leaving inspectionTarget=none to silently also
+    // mean "this is a memory question" on top of "no file investigation needed".
+    if (['stored_memory_lookup', 'conversation_recall'].includes(memoryIntent)) {
+      inspectionTarget = 'none';
+      evidenceTarget = 'personal_memory';
+    }
     // The classifier already names the evidence domain separately from the operation shape.
     // Treat executable local-system work as standalone even if the model omitted the redundant
     // boolean on a context-dependent confirmation such as "yes, do that".
@@ -496,6 +581,7 @@
       target,
       resolvedRequest,
       contextDependent: parsed.contextDependent === true,
+      resumesRecentFailedTask: failedTaskRetry,
       confidence: Math.max(0, Math.min(1, Number(parsed.confidence) || 0)),
       needsClarification,
       clarificationQuestion: string(
@@ -523,6 +609,8 @@
       executionSurface,
       orchestrationAction,
       scheduledRequest,
+      evidenceTarget,
+      evidenceBroadenReason,
       inspectionTarget,
       inspectionBreadth: INSPECTION_BREADTHS.includes(parsed.inspectionBreadth)
         ? parsed.inspectionBreadth
@@ -686,6 +774,7 @@
     EXECUTION_SURFACES,
     ORCHESTRATION_ACTIONS,
     INSPECTION_BREADTHS,
+    EVIDENCE_TARGETS,
     MEMORY_INTENTS,
     isRuntimeScaffoldingMessage,
     buildInput,

@@ -1241,7 +1241,7 @@ test('Dispatch routes the exact Codex screenshot request to Operator once withou
       })
     });
 
-    t.equal(harness.modelTurns, 0, 'deterministic preflight does not spend a Dispatch answer turn');
+    t.equal(harness.modelTurns, 1, 'the response model receives the finalized route for one natural acknowledgement turn');
     t.equal(operatorHandoffs.length, 1, 'exactly one Operator task is created');
     t.equal(coderHandoffs.length, 0, 'Coder is never used for native desktop inspection');
     t.equal(operatorHandoffs[0].standalone, true, 'the desktop task does not invent a project dependency');
@@ -1314,7 +1314,7 @@ test('Dispatch routes a project-bound interactive playtest directly to Operator'
       })
     });
 
-    t.equal(harness.modelTurns, 0, 'the structured execution target routes without a Dispatch model turn');
+    t.equal(harness.modelTurns, 1, 'the structured execution target reaches one route-aware acknowledgement turn');
     t.equal(operatorHandoffs.length, 1, 'the project playtest creates exactly one Operator task');
     t.equal(coderHandoffs.length, 0, 'the project binding does not force a redundant Coder task');
     t.equal(operatorHandoffs[0].path, workspace, 'Operator receives the exact project workspace');
@@ -1813,7 +1813,7 @@ test('a broad read-only project inspection preflights once to Coder without dupl
       }
     );
     t.equal(handoffs.length, 1, 'the broad inspection creates exactly one Coder task');
-    t.equal(harness.modelTurns, 0, 'Dispatch does not spend a duplicate discovery model turn first');
+    t.equal(harness.modelTurns, 1, 'Dispatch spends one route-aware acknowledgement turn without duplicating discovery');
     t.match(handoffs[0].prompt, /delegated read-only project inspection/i, 'Coder receives explicit read-only ownership');
     t.match(handoffs[0].prompt, /remember_file_notes/i, 'the task requires reusable file understanding');
     t.match(handoffs[0].prompt, /Review persistence, reload, and phone UI integration/i, 'the resolved review objective is preserved');
@@ -1875,6 +1875,72 @@ test('Projects-root Claude restart creates one standalone Operator handoff with 
     t.ok(handoffs[0].prompt.includes(rawRequest), 'the expanded prompt still preserves the requested operation');
     t.match(handoffs[0].prompt, /identify the intended local target/i, 'Operator must identify the correct local process');
     t.match(handoffs[0].prompt, /verify the result/i, 'Operator must verify the replacement process');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('contextual restart acknowledgement and execution consume the same finalized Operator route', async t => {
+  const originalFetch = global.fetch;
+  const projectsRoot = 'C:\\Users\\Owner\\Desktop\\Projects';
+  const resolvedRequest = 'Restart the Orion desktop application using its established launch method and verify it reconnects.';
+  const handoffs = [];
+  let routeReachedResponseModel = false;
+  installHarness([
+    body => {
+      const serialized = JSON.stringify(body);
+      routeReachedResponseModel = serialized.includes('[FINALIZED DISPATCH EXECUTION ROUTE]')
+        && serialized.includes('Effective target: operator')
+        && serialized.includes(resolvedRequest)
+        && serialized.includes('Execution surface: process');
+      return [{ text: "Got it - I'll have Operator restart Orion with the established launch method and verify it reconnects." }];
+    }
+  ], {
+    workspace: projectsRoot,
+    window: {
+      promoteWorkspaceToOperator: async payload => {
+        handoffs.push(payload);
+        return {
+          success: true,
+          conversationId: 'operator-contextual-restart',
+          taskId: 'task-contextual-restart',
+          title: 'Restart Orion',
+          status: 'pending'
+        };
+      }
+    }
+  });
+  const conv = conversation('contextual-restart-route', {
+    workspace: projectsRoot,
+    dispatchProjectPath: '',
+    messages: [
+      { role: 'user', text: 'Orion is not reconnecting after the update.' },
+      { role: 'assistant', text: 'I can restart Orion using the existing launch method and verify the phone reconnects.' },
+      { role: 'user', text: 'Restart it.' }
+    ]
+  });
+  try {
+    await global.window.runAgentLoop('Restart it.', 'gemini-1', conv, {
+      semanticIntent: semanticClassification({
+        intent: 'context_followup',
+        requiresExecution: true,
+        target: 'current_conversation',
+        resolvedRequest,
+        contextDependent: true,
+        reasoningPolicyHint: { complexity: 'medium', risk: 'medium', contextNeed: 'recent' },
+        executionScope: 'mutating',
+        executionTarget: 'operator',
+        executionSurface: 'process',
+        inspectionTarget: 'local_system',
+        standaloneSystemOperation: true
+      })
+    });
+    t.ok(routeReachedResponseModel, 'the acknowledgement model receives the finalized target, meaning, and surface');
+    t.equal(handoffs.length, 1, 'the contextual request creates exactly one real handoff');
+    t.match(handoffs[0].prompt, /Restart the Orion desktop application/, 'execution consumes the same resolved request shown to the response model');
+    t.equal(handoffs[0].originalUserMessage, 'Restart it.', 'the short utterance is retained only as provenance');
+    t.equal(handoffs[0].standalone, true, 'local process work stays standalone');
   } finally {
     restoreGlobals(originalFetch);
   }
@@ -4128,4 +4194,106 @@ test('the schedule that woke a pass cannot hold that same pass open forever', as
   } finally {
     restoreGlobals(originalFetch);
   }
+});
+
+// Real bug: "Can you look at some of the past runs to see how you were able to get the balance?"
+// had no deterministic tool for Orion's own execution history - window.api.listOrchestrationTasks
+// already existed for the UI, but agent.js never called it, so the model fell back to inspecting
+// whatever project was active and persisted mistaken remember_file_notes there. These tests exercise
+// the new search_orion_task_history tool directly through the real executeTool dispatch, proving it
+// reads the durable task store (not the workspace) and never touches file-inspection or
+// file-knowledge APIs.
+test('search_orion_task_history finds a matching prior run by keyword and role, ignoring unrelated tasks', async t => {
+  const originalFetch = global.fetch;
+  const listCalls = [];
+  const fileToolCalls = [];
+  installHarness([], {
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\Bot-GPT',
+    api: {
+      listOrchestrationTasks: async filters => {
+        listCalls.push(filters);
+        return {
+          success: true,
+          tasks: [
+            {
+              taskId: 'task-deepseek-1',
+              title: 'Check DeepSeek balance',
+              objective: 'Check the user\'s DeepSeek account balance and report it.',
+              originalUserMessage: 'What is my DeepSeek balance?',
+              status: 'completed',
+              target: { mode: 'operator' },
+              selectedProject: { name: '' },
+              createdAt: 1000,
+              updatedAt: 1010,
+              result: { summary: 'Opened the DeepSeek dashboard in the browser and read the balance: $12.40.' }
+            },
+            {
+              taskId: 'task-unrelated-1',
+              title: 'Fix Bot-GPT login bug',
+              objective: 'Fix the login redirect bug in Bot-GPT.',
+              originalUserMessage: 'Fix the login bug.',
+              status: 'completed',
+              target: { mode: 'coder' },
+              selectedProject: { name: 'Bot-GPT' },
+              createdAt: 900,
+              updatedAt: 950,
+              result: { summary: 'Fixed the redirect in app.py.' }
+            }
+          ]
+        };
+      },
+      listFiles: async () => { fileToolCalls.push('listFiles'); return []; },
+      readFile: async () => { fileToolCalls.push('readFile'); return ''; },
+      saveFileDigest: async () => { fileToolCalls.push('saveFileDigest'); return { success: true }; }
+    }
+  });
+  try {
+    const conv = conversation('dispatch-task-history-search');
+    const result = await agent.executeTool(
+      'search_orion_task_history',
+      { query: 'DeepSeek balance', role: 'operator' },
+      'C:\\Users\\Owner\\Desktop\\Projects\\Bot-GPT',
+      {},
+      conv
+    );
+    t.equal(listCalls.length, 1, 'the durable orchestration task store is queried');
+    t.equal(result.success, true, 'the search succeeds');
+    t.equal(result.matchedCount, 1, 'only the DeepSeek-balance task matches the query and role filter');
+    t.equal(result.tasks[0].taskId, 'task-deepseek-1', 'the matched task is the real prior DeepSeek balance run');
+    t.equal(result.tasks[0].role, 'operator', 'the executing specialist role is reported');
+    t.match(result.tasks[0].resultSummary, /\$12\.40/, 'the recorded result is surfaced as real evidence');
+    t.equal(result.tasks.some(task => task.taskId === 'task-unrelated-1'), false,
+      'the unrelated Bot-GPT task is excluded by the query filter');
+    t.deepEqual(fileToolCalls, [], 'no file-inspection or file-knowledge tool is ever touched by this tool - it only reads the task store');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('search_orion_task_history reports no match honestly instead of implying the active project is the answer', async t => {
+  const originalFetch = global.fetch;
+  installHarness([], {
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\Bot-GPT',
+    api: {
+      listOrchestrationTasks: async () => ({ success: true, tasks: [] })
+    }
+  });
+  try {
+    const conv = conversation('dispatch-task-history-empty');
+    const result = await agent.executeTool(
+      'search_orion_task_history',
+      { query: 'DeepSeek balance' },
+      'C:\\Users\\Owner\\Desktop\\Projects\\Bot-GPT',
+      {},
+      conv
+    );
+    t.equal(result.success, true, 'an empty history is a legitimate finding, not a tool failure');
+    t.equal(result.matchedCount, 0, 'no prior run matched');
+    t.match(result.note, /do not fall back to inspecting the active project/i,
+      'the tool itself tells the model not to silently substitute the active workspace when history has no answer');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
 });

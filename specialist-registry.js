@@ -75,6 +75,14 @@
         'read-only investigation that changes nothing',
         'gathering and cross-checking multiple sources',
         'historical and project evidence, including change history',
+        // Explicitly named after a real misroute: a request to look at Orion's own prior
+        // task/run history (not a project's files) was investigated as if it were project
+        // source, because nothing told the router this evidence domain existed or that it
+        // was Researcher-shaped work. Gathering and comparing several of Orion's own prior
+        // runs to explain how something was accomplished before is the same investigation
+        // shape as comparing several commits or sources - it just draws on Orion\'s own
+        // execution/orchestration record as the evidence instead of a file.
+        'Orion\'s own prior task, run, and orchestration history - comparing multiple past executions to explain how something was accomplished before',
         'comparison, synthesis, and explaining a trajectory or pattern',
         'provenance - saying where each finding came from'
       ])

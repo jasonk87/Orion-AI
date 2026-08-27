@@ -218,6 +218,38 @@ test('a screenshot taken before a semantic open cannot verify the resulting stat
   t.end();
 });
 
+test('a cropped application-window fallback remains evidence but cannot authorize pixel control', async t => {
+  const oldApi = global.window.api;
+  let actions = 0;
+  global.window.api = {
+    openApplication: async () => ({
+      success: true,
+      method: 'activated',
+      path: 'orion-artifact://operator-1/screenshots/claude.png',
+      width: 1216,
+      height: 808,
+      captureMode: 'application_window'
+    }),
+    computerAction: async () => { actions += 1; return { success: true }; }
+  };
+  const context = freshContext('desktop');
+  await agent.executeTool('open_application', { appName: 'Claude' }, '', {}, { id: 'operator-1', mode: 'operator' }, context);
+  t.equal(context.lastDesktopSnapshot.path, 'orion-artifact://operator-1/screenshots/claude.png',
+    'the cropped image remains the current visual artifact for inspection or attachment');
+  context.lastDesktopSnapshot.inspectedAt = Date.now();
+  let error = null;
+  try {
+    await agent.executeTool('computer_action', {
+      action: 'click', targetDescription: 'a coordinate in the cropped window', x: 10, y: 10
+    }, '', {}, { id: 'operator-1', mode: 'operator' }, context);
+  } catch (caught) { error = caught; }
+  t.ok(error, 'pixel control is refused');
+  t.match(error.message, /full-display capture_screen/i, 'the refusal explains how to obtain safe coordinate evidence');
+  t.equal(actions, 0, 'no desktop input is sent from cropped coordinates');
+  global.window.api = oldApi;
+  t.end();
+});
+
 test('a fresh inspection of the post-action screen is accepted and answers the question', async t => {
   await withApi({
     openChromeFavorite: async () => ({ success: true, path: 'deepseek.png', width: 1920, height: 1080 })

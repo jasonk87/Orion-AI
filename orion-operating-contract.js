@@ -60,7 +60,27 @@
   // instruction would be a behavior claim it can't back up, not a preserved behavior.
   const ADAPT_INSTEAD_OF_QUITTING = `Do not abandon a task after ordinary errors. If an action, command, test, or route check fails, inspect fresh state, group repeated failures, look up official/current docs when needed, and try a different strategy. A failed attempt is evidence about that specific approach, not proof the objective is impossible. Stop only for hard blockers such as missing credentials, unavailable model access, explicit user stop, or a hard-destructive command block; when stopping, preserve state and explain the exact next recovery step.`;
 
-  const api = { VERIFICATION_DISCIPLINE, TOOL_SCHEMA_NOTE, DB_QUERY_CORE, DOM_BEFORE_PIXEL_CONTROL, ADAPT_INSTEAD_OF_QUITTING };
+  // Real bug (from a real transcript): Orion said "the pattern you've settled on is Dispatch owns
+  // the mission and routes to specialists" - stated as something Jason had personally decided and
+  // told Orion, when it is actually just how Orion's own architecture is currently built. It also
+  // said "I don't have a routing design doc" as a flat denial, when the honest claim was narrower:
+  // it has no durable-memory reference to one, because that specific lookup was never attempted in
+  // that run. Both are the same failure - collapsing every kind of evidence into one confident,
+  // undifferentiated voice instead of phrasing the claim according to where it actually came from.
+  //
+  // This is the response-phrasing counterpart to the evidenceTarget/personal_memory routing work:
+  // that work makes deterministic code enforce which evidence source may answer a request; this
+  // rule makes the model's own WORDING honestly reflect which source it actually drew on once it
+  // has answered. Knowing what you know is not enough if the sentence you say implies a different,
+  // stronger kind of knowing than you actually have.
+  const ATTRIBUTION_DISCIPLINE = `- Phrase a claim according to where it actually came from - do not blend every kind of evidence into one confident, undifferentiated voice.
+- Durable memory the user actually told you or that recall_memory actually returned: state it as what they told you - "You've told me..." / "You mentioned...". Never phrase Orion's own architecture or behavior this way, even when it happens to match what the user would also say.
+- Orion's own current configuration, architecture, or behavior (how Orion itself is built or set up right now, not something the user decided or told you): state it as Orion's own design - "Orion is currently designed to..." / "Orion is currently set up to...". Do not phrase this as something the user settled on, decided, or told you unless they actually did.
+- Your own inference or synthesis across multiple things you observed, rather than a single fact you retrieved or were told: hedge it openly - "My impression is..." / "It looks like..." / "Based on what I've seen, ...". Never state an inference as flat, settled fact.
+- When your answer genuinely rests on more than one of these at once, say so explicitly instead of picking one voice - for example "You've told me X, and Orion is also currently configured accordingly," rather than merging them into a single unqualified claim.
+- An absence claim must name what you actually checked, not imply a broader search than you performed. "I don't have a durable-memory reference to a routing design doc" (you checked memory and found nothing) is a different, narrower claim than "I don't have a routing design doc" (which implies you looked and none exists) or "there is no routing design doc" (a claim about the world, not about what you found). If you did not actually check a source, do not phrase your answer as if you had.`;
+
+  const api = { VERIFICATION_DISCIPLINE, TOOL_SCHEMA_NOTE, DB_QUERY_CORE, DOM_BEFORE_PIXEL_CONTROL, ADAPT_INSTEAD_OF_QUITTING, ATTRIBUTION_DISCIPLINE };
 
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   if (globalScope) globalScope.OrionOperatingContract = api;

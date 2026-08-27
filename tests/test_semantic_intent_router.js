@@ -558,6 +558,10 @@ test('contextual approval exposes the immediate proposal, terminal task, and can
         target: 'current_conversation',
         resolvedRequest: 'Send the retirement wiring fix to Coder.',
         contextDependent: true,
+        // "Go for it" directly answers the immediately preceding assistant offer to retry this
+        // exact failed task - a real retry, so the model correctly marks it as resuming
+        // recentOwnedTask, not merely a bare confirmation that happens to have one in context.
+        resumesRecentFailedTask: true,
         executionScope: 'mutating',
         reasoningPolicyHint: { complexity: 'medium', risk: 'medium', contextNeed: 'task' }
       });
@@ -711,5 +715,428 @@ test('standalone Coder eligibility follows structured project dependency', t => 
 
   t.equal(router.canUseStandaloneCoderWorkspace(classification('conversation')), false,
     'ordinary conversation is never turned into a standalone task');
+  t.end();
+});
+
+// Real bug: "Can you look at some of the past runs to see how you were able to get the balance?"
+// was answered by inspecting an unrelated active project (Bot-GPT) instead of Orion's own prior
+// task/run history, then persisted mistaken file notes into that project. Root cause:
+// inspectionTarget only ever named local_system/workspace/project - there was no evidence domain
+// for "what Orion itself previously did," so a historical-investigation request had nowhere honest
+// to resolve except the active workspace, which the classifier prompt already primes as "the
+// project target already resolved." evidenceTarget now names WHOSE evidence answers the request,
+// and normalizeClassification deterministically enforces that once evidenceTarget resolves to
+// prior_orion_runs, inspectionTarget cannot silently stay on workspace/project - the model decides
+// meaning, this code enforces the invariant. These tests exercise paraphrases of the real report,
+// not the one literal sentence, and prove the correction fires regardless of what the raw model
+// output tried to put in inspectionTarget.
+
+// Overrides only (never a full baseContext() result) - this is spread as the SECOND argument to
+// baseContext(message, overrides) below, and baseContext spreads overrides last, so a fragment
+// that itself carried a userMessage would silently clobber whichever paraphrase each test passed.
+const UNRELATED_WORKSPACE_OVERRIDES = {
+  // Deliberately an unrelated active project, mirroring the real report exactly: the selected
+  // project shares no relationship to the DeepSeek-balance history being asked about.
+  workspace: { role: 'active_project', path: 'C:\\Projects\\Bot-GPT', project: { name: 'Bot-GPT', path: 'C:\\Projects\\Bot-GPT' } },
+  recentVisibleConversation: [
+    { id: 'm1', role: 'user', text: 'What do you remember about how I check my DeepSeek balance?', createdAt: 1 },
+    { id: 'm2', role: 'assistant', text: 'I have no durable memory of that procedure yet.', createdAt: 2 }
+  ]
+};
+
+const HISTORY_PARAPHRASES = [
+  'How did you do this last time?',
+  'Look at your previous runs and tell me how you got the balance.',
+  'What did Operator do the last couple times I asked for my DeepSeek balance?',
+  'Can you check the history and see how you handled this before?',
+  'What happened in the previous attempt?'
+];
+
+HISTORY_PARAPHRASES.forEach(phrase => {
+  test(`evidence resolution: "${phrase}" resolves to Orion's own run history, never the active workspace`, async t => {
+    // The mocked classify() stands in for the model and is allowed to make the OLD mistake (an
+    // inspectionTarget of workspace/project) to prove the deterministic layer - not the model's
+    // good behavior - is what actually prevents the active-workspace substitution.
+    const result = await router.classify(baseContext(phrase, UNRELATED_WORKSPACE_OVERRIDES), {
+      structureApi,
+      classify: async () => classification('context_followup', {
+        requiresExecution: true,
+        resolvedRequest: 'Find how Orion previously checked the user\'s DeepSeek balance by reviewing its own prior runs.',
+        contextDependent: true,
+        executionScope: 'read_only',
+        executionTarget: 'coder',
+        evidenceTarget: 'prior_orion_runs',
+        evidenceBroadenReason: '',
+        inspectionTarget: 'workspace',
+        inspectionBreadth: 'broad'
+      })
+    });
+    t.equal(result.evidenceTarget, 'prior_orion_runs', 'evidence resolves to Orion\'s own run history');
+    t.equal(result.inspectionTarget, 'task_history', 'inspectionTarget is corrected to task_history even though the raw output said workspace');
+    t.notEqual(result.inspectionTarget, 'workspace', 'the active project is never silently substituted as the evidence target');
+    t.notEqual(result.inspectionTarget, 'project', 'nor is it substituted as a project inspection');
+    t.end();
+  });
+});
+
+const WORKSPACE_PARAPHRASES = [
+  'How does Bot-GPT handle DeepSeek?',
+  'Search Bot-GPT for balance code.',
+  'Did I write a DeepSeek balance script in this project?'
+];
+
+WORKSPACE_PARAPHRASES.forEach(phrase => {
+  test(`evidence resolution: "${phrase}" legitimately resolves to the active project workspace`, async t => {
+    const result = await router.classify(baseContext(phrase, UNRELATED_WORKSPACE_OVERRIDES), {
+      structureApi,
+      classify: async () => classification('new_task', {
+        requiresExecution: true,
+        resolvedRequest: phrase,
+        executionScope: 'read_only',
+        executionTarget: 'coder',
+        evidenceTarget: 'active_workspace',
+        evidenceBroadenReason: '',
+        inspectionTarget: 'project',
+        inspectionBreadth: 'focused'
+      })
+    });
+    t.equal(result.evidenceTarget, 'active_workspace', 'evidence resolves to the project itself, same named entity, different referent');
+    t.equal(result.inspectionTarget, 'project', 'project inspection is preserved unchanged - the correction only fires for prior_orion_runs');
+    t.end();
+  });
+});
+
+test('mixed case: "look at the previous run and tell me which project/file it used" starts from history', async t => {
+  const result = await router.classify(baseContext(
+    'Look at the previous run and tell me which project/file it used.',
+    UNRELATED_WORKSPACE_OVERRIDES
+  ), {
+    structureApi,
+    classify: async () => classification('context_followup', {
+      requiresExecution: true,
+      resolvedRequest: 'Identify which project/file the previous relevant Orion run used.',
+      contextDependent: true,
+      executionScope: 'read_only',
+      executionTarget: 'coder',
+      evidenceTarget: 'prior_orion_runs',
+      evidenceBroadenReason: '',
+      inspectionTarget: 'task_history',
+      inspectionBreadth: 'focused'
+    })
+  });
+  t.equal(result.evidenceTarget, 'prior_orion_runs', 'history is consulted first');
+  t.equal(result.inspectionTarget, 'task_history', 'not the active project, until history actually names one');
+  t.end();
+});
+
+test('mixed case: a stated evidenceBroadenReason is the only way historical investigation may widen into a project', t => {
+  const input = router.buildInput(baseContext(
+    'Look at the previous run and tell me which project/file it used.',
+    UNRELATED_WORKSPACE_OVERRIDES
+  ), structureApi);
+  const broadened = router.normalizeClassification(classification('context_followup', {
+    requiresExecution: true,
+    resolvedRequest: 'Identify which project/file the previous relevant Orion run used, then confirm the script.',
+    contextDependent: true,
+    executionScope: 'read_only',
+    executionTarget: 'coder',
+    evidenceTarget: 'prior_orion_runs',
+    evidenceBroadenReason: 'The matched prior task\'s own recorded result explicitly names Bot-GPT/tools/ai_service.py as the script that checked the balance.',
+    inspectionTarget: 'project',
+    inspectionBreadth: 'single_file'
+  }), input);
+  t.equal(broadened.inspectionTarget, 'project', 'a real, stated reason is honored - history explicitly pointed at a project artifact');
+  t.equal(broadened.evidenceBroadenReason.length > 0, true, 'the justification is preserved and auditable, not discarded');
+  t.end();
+});
+
+test('an empty, missing, or whitespace-only evidenceBroadenReason can never silently authorize a workspace substitution', t => {
+  const input = router.buildInput(baseContext('How did you do this last time?', UNRELATED_WORKSPACE_OVERRIDES), structureApi);
+  const variants = [
+    { evidenceBroadenReason: '' },
+    { evidenceBroadenReason: '   ' },
+    {} // evidenceBroadenReason omitted entirely, the exact shape an older/non-compliant provider would emit
+  ];
+  variants.forEach((overrides, index) => {
+    const result = router.normalizeClassification(classification('context_followup', {
+      requiresExecution: true,
+      resolvedRequest: 'Find how Orion previously checked the DeepSeek balance.',
+      contextDependent: true,
+      executionScope: 'read_only',
+      executionTarget: 'coder',
+      evidenceTarget: 'prior_orion_runs',
+      inspectionTarget: 'workspace',
+      inspectionBreadth: 'broad',
+      ...overrides
+    }), input);
+    t.equal(result.inspectionTarget, 'task_history', `variant ${index}: no usable reason means the correction still fires`);
+  });
+  t.end();
+});
+
+test('evidence resolution: an unrelated active workspace never leaks into a historical request, and a missing workspace behaves the same', t => {
+  const noWorkspaceContext = baseContext('What happened in the previous attempt?', {
+    workspace: null,
+    recentVisibleConversation: UNRELATED_WORKSPACE_OVERRIDES.recentVisibleConversation
+  });
+  const input = router.buildInput(noWorkspaceContext, structureApi);
+  const result = router.normalizeClassification(classification('context_followup', {
+    requiresExecution: true,
+    resolvedRequest: 'Find what happened in the previous relevant Orion run.',
+    contextDependent: true,
+    executionScope: 'read_only',
+    executionTarget: 'coder',
+    evidenceTarget: 'prior_orion_runs',
+    evidenceBroadenReason: '',
+    inspectionTarget: 'project',
+    inspectionBreadth: 'focused'
+  }), input);
+  t.equal(result.inspectionTarget, 'task_history', 'with no active workspace at all, the request still resolves to task history, never an invented project');
+  t.end();
+});
+
+test('a task-history investigation never requires a project workspace and is eligible for a standalone specialist task', t => {
+  const historyTask = classification('context_followup', {
+    requiresExecution: true,
+    executionScope: 'read_only',
+    evidenceTarget: 'prior_orion_runs',
+    inspectionTarget: 'task_history',
+    inspectionBreadth: 'broad',
+    reasoningPolicyHint: { complexity: 'medium', risk: 'low', contextNeed: 'historical' }
+  });
+  t.equal(router.requiresProjectWorkspace(historyTask), false,
+    'task_history is not workspace or project, so no project binding is invented for it');
+  t.equal(router.canUseStandaloneSpecialistWorkspace(historyTask), true,
+    'a historical investigation may run as a standalone specialist task, not bound to whichever project is active');
+  t.end();
+});
+
+test('a multi-run historical synthesis explicitly requesting Researcher resolves to Researcher, decided by capability not keywords', t => {
+  const historySynthesis = classification('context_followup', {
+    requiresExecution: true,
+    executionScope: 'read_only',
+    executionTarget: 'researcher',
+    evidenceTarget: 'prior_orion_runs',
+    inspectionTarget: 'task_history',
+    inspectionBreadth: 'broad'
+  });
+  const input = router.buildInput(baseContext('Compare the last three times you checked my DeepSeek balance and explain what changed.'), structureApi);
+  t.equal(router.resolveExecutionTarget(historySynthesis, input), 'researcher',
+    'Researcher is read-only capable (no workspace mutation, no desktop control needed), so the explicit shape-based choice is honored');
+  t.end();
+});
+
+// Real bug: Dispatch built a task titled "Check DeepSeek balance + screenshot" from a bare "Yes"
+// that was actually accepting a completely different, more recent offer ("pull up the actual
+// memory entries and show Jason what's stored"). recentOwnedTask (conversation.lastDelegatedWork)
+// is whatever was delegated most recently, EVER - never aged out, only overwritten by a newer
+// delegation - so a stale failed task from an earlier, unrelated exchange silently intercepted an
+// unrelated confirmation. resumesRecentFailedTask is the model's own judgment of whether the
+// CURRENT reply is actually about that failed task; the deterministic override now requires it.
+const STALE_FAILED_DEEPSEEK_TASK = {
+  taskId: 'task-deepseek-balance-1',
+  title: 'Check DeepSeek balance + screenshot',
+  objective: 'Check the DeepSeek account balance and take a screenshot as proof.',
+  status: 'failed',
+  origin: { conversationId: 'dispatch-1' },
+  target: { conversationId: 'operator-1' }
+};
+
+test('a bare "Yes" confirming a new, unrelated offer is never rebound to a stale failed task', async t => {
+  const result = await router.classify(baseContext('Yes', {
+    recentOwnedTask: STALE_FAILED_DEEPSEEK_TASK,
+    recentVisibleConversation: [
+      { role: 'assistant', text: 'Want me to pull up the actual memory entries and show you what is stored?' }
+    ]
+  }), {
+    structureApi,
+    classify: async () => classification('context_followup', {
+      requiresExecution: true,
+      resolvedRequest: 'Pull up the actual stored memory entries and show Jason what is stored.',
+      contextDependent: true,
+      // The model correctly recognizes this "Yes" answers the memory-entries offer, not the old
+      // failed DeepSeek task - it must not claim resumesRecentFailedTask here.
+      resumesRecentFailedTask: false,
+      executionScope: 'read_only'
+    })
+  });
+  t.equal(result.resolvedRequest, 'Pull up the actual stored memory entries and show Jason what is stored.',
+    'the correctly-resolved new request survives instead of being overwritten');
+  t.notEqual(result.resolvedRequest, STALE_FAILED_DEEPSEEK_TASK.objective,
+    'the stale DeepSeek task never becomes the task payload for an unrelated confirmation');
+  t.equal(result.resumesRecentFailedTask, false, 'no retry override is recorded, because none fired');
+  t.end();
+});
+
+test('a genuine retry confirmation ("try that again") still preserves the exact failed-task objective', async t => {
+  const result = await router.classify(baseContext('Yes, try that again', {
+    recentOwnedTask: STALE_FAILED_DEEPSEEK_TASK,
+    recentVisibleConversation: [
+      { role: 'assistant', text: 'That DeepSeek balance check failed. Want me to try it again?' }
+    ]
+  }), {
+    structureApi,
+    classify: async () => classification('context_followup', {
+      requiresExecution: true,
+      resolvedRequest: 'Retry checking the DeepSeek balance.',
+      contextDependent: true,
+      resumesRecentFailedTask: true,
+      executionScope: 'read_only'
+    })
+  });
+  t.equal(result.resolvedRequest, STALE_FAILED_DEEPSEEK_TASK.objective,
+    'a real retry still gets the exact durable objective instead of a routing paraphrase');
+  t.equal(result.resumesRecentFailedTask, true, 'the retry override is recorded as having fired');
+  t.end();
+});
+
+test('resumesRecentFailedTask alone cannot manufacture a retry without the other structural conditions', t => {
+  const input = router.buildInput(baseContext('Yes', { recentOwnedTask: STALE_FAILED_DEEPSEEK_TASK }), structureApi);
+  // A model claiming resumesRecentFailedTask=true on a NEW task (not context_followup) must not
+  // retroactively turn it into a retry of the stale failed task.
+  const asNewTask = router.normalizeClassification(classification('new_task', {
+    requiresExecution: true,
+    resolvedRequest: 'Check the weather today.',
+    resumesRecentFailedTask: true,
+    executionScope: 'read_only'
+  }), input);
+  t.notEqual(asNewTask.resolvedRequest, STALE_FAILED_DEEPSEEK_TASK.objective,
+    'a genuinely new task is never silently rewritten into the old failed task, even if resumesRecentFailedTask is (incorrectly) true');
+  t.end();
+});
+
+// Real bug: "what do you actually remember about me" was task-constructed bound to whatever
+// project happened to be active (GRITLIFE) instead of staying a plain personal-memory answer -
+// the same class of context leak as the Bot-GPT bug, but at task-construction time for memory
+// questions specifically. A memory question is always answered through recall_memory's own
+// global/project/conversation scope, never by inspecting the active project's files.
+const ACTIVE_PROJECT_OVERRIDES = {
+  workspace: { role: 'active_project', path: 'C:\\Projects\\GRITLIFE', project: { name: 'GRITLIFE', path: 'C:\\Projects\\GRITLIFE' } }
+};
+
+test('"what do you actually remember about me" never binds to the active project', async t => {
+  const result = await router.classify(baseContext('What do you actually remember about me?', ACTIVE_PROJECT_OVERRIDES), {
+    structureApi,
+    classify: async () => classification('conversation', {
+      requiresExecution: false,
+      resolvedRequest: 'Report what Orion has stored about Jason.',
+      memoryIntent: 'stored_memory_lookup',
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' },
+      // A model reflexively treating the active project as "already resolved" for this turn -
+      // exactly the mistake the real bug made.
+      inspectionTarget: 'project',
+      inspectionBreadth: 'broad'
+    })
+  });
+  t.equal(result.memoryIntent, 'stored_memory_lookup', 'the memory question is classified correctly');
+  t.equal(result.inspectionTarget, 'none', 'inspectionTarget is corrected to none even though the raw output said project');
+  t.notEqual(result.inspectionTarget, 'project', 'GRITLIFE is never silently made the evidence source for a personal-memory question');
+  t.equal(router.requiresProjectWorkspace(result), false, 'no project binding is invented for the memory question');
+  t.end();
+});
+
+test('a conversation-recall question is also never bound to the active project, even when it names the project', async t => {
+  const result = await router.classify(baseContext('What did we discuss about GRITLIFE last time?', ACTIVE_PROJECT_OVERRIDES), {
+    structureApi,
+    classify: async () => classification('conversation', {
+      requiresExecution: false,
+      resolvedRequest: 'Recall what was previously discussed about GRITLIFE.',
+      memoryIntent: 'conversation_recall',
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' },
+      inspectionTarget: 'project'
+    })
+  });
+  t.equal(result.inspectionTarget, 'none',
+    'even a project-specific memory question is answered through recall_memory scope, not file inspection');
+  t.end();
+});
+
+// Jason's follow-up: inspectionTarget='none' was doing double duty - "no file investigation
+// needed" AND, silently, "this is actually a memory question" - a value collecting a second,
+// unwritten meaning. evidenceTarget: personal_memory gives that second meaning its own explicit
+// name, mirroring how prior_orion_runs already names "the evidence is Orion's own run history"
+// instead of leaving inspectionTarget to carry that meaning alone.
+
+test('a personal memory question resolves evidenceTarget to personal_memory, not just inspectionTarget to none', async t => {
+  const result = await router.classify(baseContext('What do you actually remember about me?', ACTIVE_PROJECT_OVERRIDES), {
+    structureApi,
+    classify: async () => classification('conversation', {
+      requiresExecution: false,
+      resolvedRequest: 'Report what Orion has stored about Jason.',
+      memoryIntent: 'stored_memory_lookup',
+      reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'historical' },
+      // The raw model output never even mentions evidenceTarget/personal_memory here - proving the
+      // deterministic layer supplies it, not just a lucky model guess.
+      inspectionTarget: 'none'
+    })
+  });
+  t.equal(result.evidenceTarget, 'personal_memory', 'evidenceTarget explicitly names the memory-store evidence domain');
+  t.equal(result.inspectionTarget, 'none', 'inspectionTarget still correctly means no file investigation is needed');
+  t.end();
+});
+
+test('evidenceTarget is corrected to personal_memory even when the raw model output guessed active_workspace or prior_orion_runs', async t => {
+  const asActiveWorkspace = await router.classify(baseContext('What have I told you about GRITLIFE before?', ACTIVE_PROJECT_OVERRIDES), {
+    structureApi,
+    classify: async () => classification('conversation', {
+      requiresExecution: false,
+      resolvedRequest: 'Recall what Jason has told Orion about GRITLIFE.',
+      memoryIntent: 'stored_memory_lookup',
+      // A model reflexively pattern-matching "GRITLIFE" to the active project - exactly the
+      // mistake that caused the original bug - must still be corrected.
+      evidenceTarget: 'active_workspace',
+      inspectionTarget: 'project'
+    })
+  });
+  t.equal(asActiveWorkspace.evidenceTarget, 'personal_memory', 'a wrong active_workspace guess is corrected for a memory question');
+  t.equal(asActiveWorkspace.inspectionTarget, 'none', 'and inspectionTarget is corrected alongside it');
+
+  const asPriorRuns = await router.classify(baseContext('What do you remember discussing with me about the balance check?', {}), {
+    structureApi,
+    classify: async () => classification('conversation', {
+      requiresExecution: false,
+      resolvedRequest: 'Recall what was discussed about the balance check.',
+      memoryIntent: 'conversation_recall',
+      // A model conflating "what do you remember discussing" with "what did you previously run" -
+      // memoryIntent already commits this to recall_memory, so prior_orion_runs must not survive.
+      evidenceTarget: 'prior_orion_runs',
+      inspectionTarget: 'task_history'
+    })
+  });
+  t.equal(asPriorRuns.evidenceTarget, 'personal_memory', 'memoryIntent wins over a prior_orion_runs guess for a genuine memory question');
+  t.equal(asPriorRuns.inspectionTarget, 'none', 'and inspectionTarget is not left on task_history');
+  t.end();
+});
+
+test('a real task-history question keeps evidenceTarget as prior_orion_runs, unaffected by the personal_memory correction', async t => {
+  const result = await router.classify(baseContext('Look at your previous runs and tell me how you got the DeepSeek balance last time.', {}), {
+    structureApi,
+    classify: async () => classification('conversation', {
+      requiresExecution: true,
+      resolvedRequest: "Review Orion's prior runs to explain how the DeepSeek balance was retrieved last time.",
+      memoryIntent: 'none',
+      evidenceTarget: 'prior_orion_runs',
+      inspectionTarget: 'workspace'
+    })
+  });
+  t.equal(result.evidenceTarget, 'prior_orion_runs', 'a non-memory historical question is untouched by the personal_memory correction');
+  t.equal(result.inspectionTarget, 'task_history', 'and the existing prior_orion_runs correction still applies on its own');
+  t.end();
+});
+
+test('an ordinary project question (not a memory question) still legitimately uses the active project', async t => {
+  const result = await router.classify(baseContext('How does GRITLIFE handle retirement calculations?', ACTIVE_PROJECT_OVERRIDES), {
+    structureApi,
+    classify: async () => classification('new_task', {
+      requiresExecution: true,
+      resolvedRequest: 'Explain how GRITLIFE handles retirement calculations.',
+      executionScope: 'read_only',
+      memoryIntent: 'none',
+      inspectionTarget: 'project',
+      inspectionBreadth: 'focused'
+    })
+  });
+  t.equal(result.inspectionTarget, 'project',
+    'the correction is scoped to memory questions only - an ordinary project question is unaffected');
   t.end();
 });

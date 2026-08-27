@@ -6,6 +6,7 @@
 const OrionOperatingContract = window.OrionOperatingContract || (typeof require === 'function' ? require('./orion-operating-contract') : null);
 const OperatorExecutionPolicy = window.OrionOperatorExecutionPolicy || (typeof require === 'function' ? require('./operator-execution-policy') : null);
 const OrionSpecialistRegistry = window.OrionSpecialistRegistry || (typeof require === 'function' ? require('./specialist-registry') : null);
+const DispatchExecutionRoute = window.OrionDispatchExecutionRoute || (typeof require === 'function' ? require('./dispatch-execution-route') : null);
 const SchedulePolicy = typeof require === 'function' ? require('./lib/schedule-policy') : null;
 const RunExitDisposition = window.OrionRunExitDisposition || (typeof require === 'function' ? require('./run-exit-disposition') : null);
 
@@ -32,6 +33,7 @@ MEMORY REASONING CONTRACT:
 - When the user gives a durable fact, store it with the appropriate memory tool before giving the final conversational acknowledgement.
 - When the user asks what Orion knows or remembers about them, inspect durable memory if the answer is not already present in the active chat context.
 - After memory tools succeed, answer naturally. Do not narrate tool use, workspace operations, policy, or system instructions.
+- Tool descriptions and the examples below illustrate the SHAPE of a fact or preference, never an actual stored value. Never state something as a known fact about the user because it resembles an example you were shown in these instructions - a claim about the user is only real if it came from recall_memory's results or the user's own words in this conversation.
 
 MEMORY EXAMPLES:
 - User: "My name is Jason Kinslow"
@@ -40,8 +42,13 @@ MEMORY EXAMPLES:
   Orion should use active chat context or recall_memory, then say: "Your name is Jason Kinslow." If the fact is not known, say: "I don't have your name saved yet."
 - User: "I hate keyword hacks; use stronger prompts and examples instead"
   Orion should treat this as a global preference about how the user wants Orion built and remember it.
+- User: "GRITLIFE stores saves in a custom binary format, not JSON"
+  This is specific to the GRITLIFE project's code and design, not to Jason personally - store it with scope='project', not 'global'.
+- Orion notices mid-task that "Claude is open right now" or "the tests are currently running"
+  This is transient state, true only for the next few minutes, not durable memory - do not call a memory tool for it at all.
 - Bad answer pattern: "I am an AI and cannot know personal information."
 - Better answer pattern: "I don't have that saved yet" or "I remember that your name is Jason Kinslow."
+- Scope is a judgment about the FACT itself, never about which workspace happens to be open. A personal fact learned while a project is active is still global; do not let an active workspace pull it into that project's memory.
 
 CRITICAL RULES:
 1. PLANNING MODE DECISION: Match the process to the size of the request. Use an implementation plan only when the task is genuinely complex and requires changes: new projects, multi-file builds, architecture changes, risky migrations, security-sensitive work, or requests where the user should review direction before code changes. For small fixes, running/opening a program, running tests, setting an entry point, showing paths, pushing when explicitly asked, read-only reviews, bug hunts, audits, or narrow follow-ups, act directly without creating implementation_plan.md. If a plan is needed, first complete a Mission Refinement / Strategy Pass and write "STRATEGY.md"; only then create "implementation_plan.md", set the checklist, show the plan in chat, and pause for explicit user approval or requested revisions before modifying source files or running commands. Every implementation plan MUST include a "## Testing Plan" section that details exact commands/tests to run, expected behaviors, edge cases, success conditions, and manual checks if automated tests are unavailable.
@@ -86,6 +93,8 @@ CRITICAL RULES:
 18A. DIAGNOSTIC RIGOR: When diagnosing why something fails or explaining how a system behaves, run this self-check before committing to your conclusion.
 ${OrionOperatingContract.VERIFICATION_DISCIPLINE}
 When tracing data, use get_symbol_index/get_file_symbols to jump straight to the responsible function instead of reading a keyhole 20-line window of a large file.
+18B. ATTRIBUTION DISCIPLINE: Verifying a claim is not the same as phrasing it honestly once verified.
+${OrionOperatingContract.ATTRIBUTION_DISCIPLINE}
 16. OPERATING SYSTEM AWARENESS: You are currently running on a Windows system. When guessing or constructing file paths outside the current workspace, ALWAYS use Windows path conventions (e.g., C:\\Users\\owner\\Desktop) with the literal resolved path — do NOT pass unexpanded PowerShell variables like $env:USERPROFILE as a path argument to any tool; resolve the path to a literal string first (e.g., C:\\Users\\owner). If you are unsure of the username, run 'echo $env:USERPROFILE' first. When searching for files on the Desktop or broad directories, ALWAYS limit recursive searches with '-Depth 2' or '-Depth 3' and add '-ErrorAction SilentlyContinue' to avoid timeouts from permission-denied folders. Never run an unbounded 'Get-ChildItem -Recurse' on C:\\ or the Desktop without a depth limit.
 19. PLANNING MODE: Exercise judgement on whether a request warrants a formal plan before taking action. Stop and create an implementation plan (using STRATEGY.md or implementation_plan.md) if the request requires major architectural changes, extensive research, or significant decision making. If you decide that a request does NOT warrant a plan (for example: one-off investigatory questions, trivial tweaks, minor bug fixes, or minor follow-ups to an existing plan), then continue your work WITHOUT making a plan or requesting user review. You have the authority to make small fixes and adjustments instantly without drafting a full blown-out plan.
 
@@ -149,11 +158,15 @@ Don't snap-route. Ask yourself first: can I handle this directly? Do I have enou
 BEFORE YOU COMMIT TO A CLAIM OR DIAGNOSIS (silent self-check, then answer):
 ${OrionOperatingContract.VERIFICATION_DISCIPLINE}
 
+HOW YOU ATTRIBUTE CLAIMS:
+${OrionOperatingContract.ATTRIBUTION_DISCIPLINE}
+
 HOW YOU COMMUNICATE:
 Casual and direct. Short when simple, fuller when it isn't. From the very first reply, acknowledge or answer the exact message Jason sent. A greeting is optional, but it must never replace the response or become the whole response. If you don't know something about his projects or context, ask — don't assume or pretend.
 
 MEMORY:
 At the start of a conversation, call recall_memory with scope="global" to orient yourself. When you learn something new — a project, a preference, a decision — use remember_fact or remember_preference immediately. When past context is relevant, surface it naturally.
+Both tools require an explicit scope: 'global' for anything true of Jason regardless of which project is open (habits, identity, how he wants Orion to operate), 'project' only for facts specific to whichever project is active. Judge this from the fact itself — never default to 'project' just because a workspace happens to be open, and never store something that is only true for the next few minutes (e.g. "a test is running").
 
 {{user_memory}}
 
@@ -233,6 +246,9 @@ EVIDENCE BEFORE COMPLETION:
 ${OrionOperatingContract.VERIFICATION_DISCIPLINE}
 - Your closing summary must be grounded in your own most recent observation — a screenshot you actually inspected, a page you actually read — not in what should have happened if everything went to plan. If you could not confirm the final state, say so plainly instead of reporting success anyway.
 
+ATTRIBUTION DISCIPLINE:
+${OrionOperatingContract.ATTRIBUTION_DISCIPLINE}
+
 ADAPT INSTEAD OF QUITTING: ${OrionOperatingContract.ADAPT_INSTEAD_OF_QUITTING}
 
 REAL-WORLD SIDE EFFECTS — PERMISSION BOUNDARY:
@@ -290,6 +306,9 @@ ${OrionOperatingContract.VERIFICATION_DISCIPLINE}
 SOURCE-CITATION DISCIPLINE:
 - Cite only URLs and sources you actually fetched with fetch_web_page or actually visited with the browser worker in this run. Never state or imply a source exists, or invent a plausible-looking URL, without having verified it is reachable and says what you are citing it for.
 - End substantive research output with a "Sources" section listing what you actually consulted. Keep it separate from the body so findings and provenance do not blur together.
+
+ATTRIBUTION DISCIPLINE:
+${OrionOperatingContract.ATTRIBUTION_DISCIPLINE}
 
 ADAPT INSTEAD OF QUITTING: ${OrionOperatingContract.ADAPT_INSTEAD_OF_QUITTING}
 
@@ -1990,6 +2009,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const resolvedRequestForRouting = contextualTaskResolution && contextualTaskResolution.success
     ? contextualTaskResolution.task.objective
     : (semanticIntent.resolvedRequest || userPrompt);
+  const dispatchRecentOwnedTask = conversation.lastDelegatedWork
+    ? {
+        taskId: conversation.lastDelegatedWork.taskId || '',
+        title: conversation.lastDelegatedWork.title || '',
+        objective: conversation.lastDelegatedWork.objective || '',
+        status: conversation.lastDelegatedWork.status || '',
+        originConversationId: conversation.id,
+        targetConversationId: conversation.lastDelegatedWork.coderConversationId || '',
+        targetMode: conversation.launchedTaskRole || 'coder'
+      }
+    : null;
   const memoryIntent = String(semanticIntent.memoryIntent || 'none');
   const recallRequested = isOrionMode && memoryIntent === 'conversation_recall';
   const memoryPolicyQuestion = isOrionMode && memoryIntent === 'memory_policy';
@@ -2952,6 +2982,19 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         semanticIntent,
         ledger: contextAcquisitionLedger
       }));
+    const finalizeDispatchRoute = intent => DispatchExecutionRoute
+      ? DispatchExecutionRoute.finalize(intent, {
+          resolvedRequest: contextualTaskResolution && contextualTaskResolution.success
+            ? resolvedRequestForRouting
+            : (intent.resolvedRequest
+              || (dispatchHandoffAuthorizedByClarification ? claimedTaskPrompt : resolvedRequestForRouting)),
+          executionSurface: claimedTaskExecutionSurface || intent.executionSurface || 'none',
+          delegatedInspection: dispatchInspectionDelegationPending,
+          activeOwnedTask: runTaskId ? claimedTaskRecord : null,
+          pendingOwnedTask: pendingSemanticPlan,
+          recentOwnedTask: dispatchRecentOwnedTask
+        })
+      : null;
     const dispatchPreflightAtGenericRoot = WorkspaceResolution
       ? WorkspaceResolution.samePath(workspacePath, getDispatchWorkspaceRoot())
       : String(workspacePath || '').toLowerCase() === String(getDispatchWorkspaceRoot() || '').toLowerCase();
@@ -2994,6 +3037,15 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     const dispatchHandoffAuthorityPrompt = dispatchHandoffAuthorizedByClarification
       ? claimedTaskPrompt
       : resolvedRequestForRouting;
+    let finalizedDispatchRoute = finalizeDispatchRoute(semanticIntent);
+    const finalizedRouteDirective = DispatchExecutionRoute
+      && DispatchExecutionRoute.buildAcknowledgementDirective(finalizedDispatchRoute);
+    if (finalizedRouteDirective) {
+      messages.splice(Math.max(0, messages.length - 1), 0, {
+        role: 'user',
+        parts: [{ text: finalizedRouteDirective }]
+      });
+    }
     const shouldPreflightDispatchHandoff = !!(
       (dispatchPreflightAuthorized || dispatchInspectionDelegationPending)
       && !dispatchPreflightIsCancellation
@@ -3173,84 +3225,6 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           currentAgentLogs.push({
             type: 'thought',
             content: 'Dispatch orchestration preflight scheduled the reminder directly without creating a specialist task.'
-          });
-        } else if (((shouldPreflightDispatchHandoff && loopCount === 1)
-              || (dispatchInspectionDelegationPending && canDelegateCurrentInspectionWorkspace()))
-            && !dispatchForcedHandoffSent) {
-          const delegatedInspection = dispatchInspectionDelegationPending
-            && DispatchInspectionPolicy
-            && DispatchInspectionPolicy.isReadOnlyProjectInspection(semanticIntent);
-          const inspectedPaths = delegatedInspection
-            ? DispatchInspectionPolicy.inspectedPaths(contextAcquisitionLedger)
-            : [];
-          const existingInspectionPacketIds = delegatedInspection
-            ? getHandoffContextPacketIds(conversation, workspacePath)
-            : [];
-          if (delegatedInspection && inspectedPaths.length > 0
-              && existingInspectionPacketIds.length === 0
-              && window.api && typeof window.api.inspectCodeContext === 'function') {
-            try {
-              const packet = await window.api.inspectCodeContext(workspacePath, {
-                query: resolvedRequestForRouting || liveUserPrompt,
-                paths: inspectedPaths,
-                budgetTokens: 12000,
-                conversationId: conversation.id,
-                runId: conversation._activeContextRunId || ''
-              });
-              rememberContextPacketForConversation(conversation, workspacePath, 'inspect_code_context', packet);
-            } catch (error) {
-              currentAgentLogs.push({
-                type: 'thought',
-                content: `Dispatch inspection handoff continued without a context packet: ${error.message || error}`
-              });
-            }
-          }
-          const taskTitle = resolveDispatchHandoffTitle({
-            semanticIntent,
-            contextualTaskResolution,
-            resolvedRequest: resolvedRequestForRouting,
-            claimedTaskTitle,
-            workspaceResolution
-          });
-          const handoffRole = resolveDispatchHandoffRole(semanticIntent, { delegatedInspection });
-          const handoffToolName = handoffToolForRole(handoffRole);
-          const handoffRoleName = handoffRoleLabel(handoffRole);
-          const handoffCall = {
-            name: handoffToolName,
-            args: {
-              prompt: delegatedInspection
-                ? DispatchInspectionPolicy.buildDelegatedObjective({
-                    resolvedRequest: resolvedRequestForRouting,
-                    userMessage: liveUserPrompt,
-                    inspectedPaths
-                  })
-                : buildForcedDispatchHandoffPrompt(resolvedRequestForRouting),
-              title: taskTitle,
-              open: false,
-              standalone: dispatchPreflightStandalone,
-              ...(dispatchPreflightStandalone ? { path: resolvedHomeDir } : {}),
-              originalUserMessage: liveUserPrompt
-            }
-          };
-          response = {
-            candidates: [{
-              finishReason: 'STOP',
-              content: {
-                parts: [
-                  { text: delegatedInspection
-                    ? "This needs a broader project inspection than Dispatch should duplicate, so I've handed the same read-only review to Coder with the project context intact."
-                    : `This needs ${handoffRoleName}'s execution tools, so I've handed it off with the task context and requirements intact.` },
-                  { functionCall: handoffCall }
-                ]
-              }
-            }]
-          };
-          dispatchForcedHandoffSent = true;
-          currentAgentLogs.push({
-            type: 'thought',
-            content: delegatedInspection
-              ? 'Dispatch inspection policy routed a broad review to Coder before another Dispatch model turn.'
-              : `Dispatch preflight routed executable work directly to ${handoffRoleName} without spending a Dispatch model turn.`
           });
         } else if (activeRunModelName.startsWith('gemini-')) {
           response = await callGeminiAPI(messagesForApiCall, activeRunModelName, config.geminiApiKey, onApiWarning, disableToolsForSemanticSafety, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
@@ -3481,6 +3455,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           }, modelName, config, { signal: getActiveRunSignal() });
           if (isExecutableHandoffIntent(adjudicatedIntent)) {
             effectiveDispatchHandoffIntent = adjudicatedIntent;
+            finalizedDispatchRoute = finalizeDispatchRoute(adjudicatedIntent);
             toolExecutionContext.authorizedDispatchHandoffIntent = adjudicatedIntent;
             handoffAuthorized = true;
             currentAgentLogs.push({
@@ -3489,6 +3464,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             });
           } else if (adjudicatedIntent && adjudicatedIntent.clarificationQuestion) {
             effectiveDispatchHandoffIntent = adjudicatedIntent;
+            finalizedDispatchRoute = finalizeDispatchRoute(adjudicatedIntent);
           }
         }
         if (!handoffAuthorized) {
@@ -3521,7 +3497,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         if (handoffAuthorized) {
           toolExecutionContext.authorizedDispatchHandoffIntent = effectiveDispatchHandoffIntent;
           const delegatedInspection = isDelegatedInspectionHandoff(effectiveDispatchHandoffIntent);
-          const expectedRole = resolveDispatchHandoffRole(effectiveDispatchHandoffIntent, { delegatedInspection });
+          const expectedRole = finalizedDispatchRoute
+            && OrionSpecialistRegistry.has(finalizedDispatchRoute.effectiveTarget)
+            ? finalizedDispatchRoute.effectiveTarget
+            : resolveDispatchHandoffRole(effectiveDispatchHandoffIntent, { delegatedInspection });
           const expectedTool = handoffToolForRole(expectedRole);
           let keptHandoff = false;
           for (let index = parts.length - 1; index >= 0; index--) {
@@ -3558,6 +3537,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           // utterance as separate provenance instead of making downstream code reverse-engineer it
           // from the resolved objective.
           call.args.originalUserMessage = liveUserPrompt;
+          if (!finalizedDispatchRoute || finalizedDispatchRoute.delegatedInspection !== true) {
+            const authoritativeRequest = finalizedDispatchRoute && finalizedDispatchRoute.resolvedRequest
+              || dispatchHandoffAuthorityPrompt;
+            call.args.prompt = buildForcedDispatchHandoffPrompt(authoritativeRequest);
+          }
           call.args.standalone = standaloneSpecialistRequest;
           if (standaloneEnvironmentRequest) call.args.path = resolvedHomeDir;
           else if (standaloneSpecialistRequest) delete call.args.path;
@@ -3582,21 +3566,37 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // the following tool response has a matching functionCall in the assistant message.
       const classifiedExecutionNeedsRealHandoff = !!(
         runMode === 'orion'
-        && effectiveDispatchHandoffIntent.requiresExecution === true
-        && effectiveDispatchHandoffIntent.executionTarget !== 'dispatch'
-        && !(DispatchInspectionPolicy && DispatchInspectionPolicy.isSourceInspectionIntent(effectiveDispatchHandoffIntent))
-        && ['new_task', 'context_followup', 'steer_active_task'].includes(effectiveDispatchHandoffIntent.intent)
+        && finalizedDispatchRoute
+        && finalizedDispatchRoute.requiresExecution === true
+        && finalizedDispatchRoute.targetKind === 'specialist'
+        && (finalizedDispatchRoute.delegatedInspection === true
+          || ['new_task', 'context_followup', 'steer_active_task'].includes(effectiveDispatchHandoffIntent.intent))
       );
       if (functionCalls.length === 0
           && !dispatchForcedHandoffSent
           && (classifiedExecutionNeedsRealHandoff || dispatchHandoffAuthorizedByClarification)) {
-        const handoffRole = resolveDispatchHandoffRole(effectiveDispatchHandoffIntent);
+        const handoffRole = finalizedDispatchRoute
+          && OrionSpecialistRegistry.has(finalizedDispatchRoute.effectiveTarget)
+          ? finalizedDispatchRoute.effectiveTarget
+          : resolveDispatchHandoffRole(effectiveDispatchHandoffIntent);
         const handoffRoleName = handoffRoleLabel(handoffRole);
-        const handoffText = `I can't execute that from Dispatch, so I'm passing it to ${handoffRoleName}.`;
+        const handoffText = `Got it - I'm handing that to ${handoffRoleName} with the request and context intact.`;
+        const forcedHandoffPrompt = finalizedDispatchRoute
+          && finalizedDispatchRoute.delegatedInspection === true
+          && DispatchInspectionPolicy
+          ? DispatchInspectionPolicy.buildDelegatedObjective({
+              resolvedRequest: finalizedDispatchRoute.resolvedRequest,
+              userMessage: liveUserPrompt,
+              inspectedPaths: DispatchInspectionPolicy.inspectedPaths(contextAcquisitionLedger)
+            })
+          : buildForcedDispatchHandoffPrompt(
+              finalizedDispatchRoute && finalizedDispatchRoute.resolvedRequest
+              || dispatchHandoffAuthorityPrompt
+            );
         const forcedCall = {
           name: handoffToolForRole(handoffRole),
           args: {
-            prompt: buildForcedDispatchHandoffPrompt(dispatchHandoffAuthorityPrompt),
+            prompt: forcedHandoffPrompt,
             title: resolveDispatchHandoffTitle({
               semanticIntent: effectiveDispatchHandoffIntent,
               contextualTaskResolution,
@@ -3610,8 +3610,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             originalUserMessage: liveUserPrompt
           }
         };
-        parts.splice(0, parts.length, { text: handoffText }, { functionCall: forcedCall });
-        textVal = handoffText;
+        if (!textVal.trim()) {
+          parts.push({ text: handoffText });
+          textVal = handoffText;
+        }
+        parts.push({ functionCall: forcedCall });
         functionCalls = [forcedCall];
         dispatchForcedHandoffSent = true;
         currentAgentLogs.push({
@@ -6127,6 +6130,7 @@ function applySemanticActionSnapshot(executionContext, result, previous) {
     // Deliberately 0: the action changed the screen, so the next state-dependent step needs its
     // own inspection of THIS image. computer_action's contract is unchanged by that.
     inspectedAt: 0,
+    captureMode: result.captureMode || 'display',
     displayId: result.displayId != null ? String(result.displayId) : (prior ? prior.displayId || '' : ''),
     availableDisplays: (prior && prior.availableDisplays) || []
   };
@@ -6467,6 +6471,64 @@ async function executeTool(name, args, workspace, config, conversation, executio
         projectPath: (resolution && resolution.projectPath) || conversation.projectPath || conversation.dispatchProjectPath || '',
         scope: resolution ? resolution.kind : (conversation.projectPath ? 'active_project' : 'standalone_specialist'),
         entrypoint: entryResult && entryResult.success ? entryResult.entrypoint : null
+      };
+    }
+
+    // Real bug: a request to see how Orion accomplished something before ("look at some of the
+    // past runs to see how you got the balance") had no deterministic tool for Orion's own
+    // execution history, only workspace-bound tools - so it fell back to inspecting whatever
+    // project happened to be active. window.api.listOrchestrationTasks already exists (backed by
+    // lib/orchestration-task-store.js) but was only ever called from renderer.js for UI display;
+    // this is the first agent-callable tool over that same durable store, giving evidenceTarget:
+    // prior_orion_runs / inspectionTarget: task_history an actual affordance to resolve to.
+    case 'search_orion_task_history': {
+      if (!window.api || typeof window.api.listOrchestrationTasks !== 'function') {
+        throw new Error('Task history is unavailable in this environment.');
+      }
+      const listed = await window.api.listOrchestrationTasks({ sort: 'desc' });
+      if (!listed || listed.success === false || !Array.isArray(listed.tasks)) {
+        throw new Error((listed && listed.error) || 'Task history listing failed.');
+      }
+      const query = String(args.query || '').trim().toLowerCase();
+      const roleFilter = ['coder', 'operator', 'researcher'].includes(String(args.role || '').toLowerCase())
+        ? String(args.role).toLowerCase()
+        : '';
+      const statusFilter = ['completed', 'failed'].includes(String(args.status || '').toLowerCase())
+        ? String(args.status).toLowerCase()
+        : '';
+      const limit = Math.max(1, Math.min(30, Number(args.limit) || 10));
+      const matches = listed.tasks.filter(task => {
+        if (!task) return false;
+        if (roleFilter && String(task.target && task.target.mode || '').toLowerCase() !== roleFilter) return false;
+        if (statusFilter && String(task.status || '').toLowerCase() !== statusFilter) return false;
+        if (!query) return true;
+        const haystack = [
+          task.title,
+          task.objective,
+          task.originalUserMessage,
+          task.result && task.result.summary
+        ].filter(Boolean).join(' \n ').toLowerCase();
+        return haystack.includes(query);
+      }).slice(0, limit);
+      return {
+        success: true,
+        query: args.query || '',
+        matchedCount: matches.length,
+        totalTasksSearched: listed.tasks.length,
+        tasks: matches.map(task => ({
+          taskId: task.taskId,
+          title: task.title,
+          role: (task.target && task.target.mode) || 'coder',
+          status: task.status,
+          project: (task.selectedProject && task.selectedProject.name) || (task.workspace && task.workspace.project && task.workspace.project.name) || '',
+          createdAt: task.createdAt,
+          updatedAt: task.updatedAt,
+          objective: String(task.objective || '').slice(0, 800),
+          resultSummary: String((task.result && task.result.summary) || '').slice(0, 1500)
+        })),
+        note: matches.length === 0
+          ? 'No prior Orion task/run matched. Do not fall back to inspecting the active project unless the user actually asked about that project, or a matched task result explicitly points to a specific project artifact.'
+          : ''
       };
     }
 
@@ -7588,6 +7650,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
         height: Number(result.height) || 0,
         capturedAt: now,
         inspectedAt: reuseInspection ? now : 0,
+        captureMode: result.captureMode || 'display',
         displayId: result.displayId != null ? String(result.displayId) : '',
         availableDisplays: Array.isArray(result.availableDisplays) ? result.availableDisplays : []
       };
@@ -7698,6 +7761,9 @@ async function executeTool(name, args, workspace, config, conversation, executio
       if (!snapshot || !snapshot.width || !snapshot.height || Date.now() - snapshot.capturedAt > 120000) {
         throw new Error('Computer use requires a fresh capture_screen from this run. Capture and inspect the visible target before acting.');
       }
+      if (snapshot.captureMode && snapshot.captureMode !== 'display') {
+        throw new Error('Computer use requires a full-display capture_screen. The current image is a cropped application-window fallback that is safe to inspect or attach, but its pixels do not map to desktop coordinates.');
+      }
       if (!snapshot.inspectedAt || snapshot.inspectedAt < snapshot.capturedAt) {
         throw new Error('Computer use requires inspect_screenshot_with_model on the fresh capture before acting. Orion will not click or type against an uninspected screen.');
       }
@@ -7718,6 +7784,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
           height: Number(result.height) || snapshot.height,
           capturedAt: Date.now(),
           inspectedAt: 0,
+          captureMode: result.captureMode || 'display',
           displayId: result.displayId != null ? String(result.displayId) : (snapshot.displayId || ''),
           availableDisplays: snapshot.availableDisplays || []
         };
@@ -7948,10 +8015,20 @@ async function executeTool(name, args, workspace, config, conversation, executio
     }
 
     case 'remember_fact': {
-      const scope = args.scope || 'project';
+      // Real bug: this used to default a missing scope to 'project', which silently bound
+      // whatever fact the model wanted stored to whichever workspace happened to be active - a
+      // personal fact learned while GRITLIFE was open would be written into GRITLIFE's memory and
+      // become invisible everywhere else. Scope is a semantic judgment about the FACT itself (does
+      // it hold regardless of which project is open, or is it specific to this one?), not something
+      // the active workspace should ever resolve on the model's behalf. The model must say which one
+      // explicitly; if it doesn't, that is treated as missing information, not as license to guess.
+      const scope = args.scope;
       const text = args.text;
       const category = args.category || 'general';
       if (!text) throw new Error("Missing 'text' parameter");
+      if (scope !== 'global' && scope !== 'project') {
+        throw new Error("remember_fact requires an explicit scope of 'global' or 'project'. Judge this from the fact itself: 'global' if it holds regardless of which project is open (user habits, identity, cross-project preferences), 'project' if it is specific to the active project's code or design. Do not assume 'project' merely because a workspace happens to be active - retry with scope set explicitly.");
+      }
       if (scope === 'global') {
         const result = await window.api.appendGlobalFact(text, category, config, !!args.pinned);
         if (!result || !result.success) throw new Error((result && result.error) || 'appendGlobalFact failed');
@@ -7973,9 +8050,15 @@ async function executeTool(name, args, workspace, config, conversation, executio
     }
 
     case 'remember_preference': {
-      const scope = args.scope || 'project';
+      // Same invariant as remember_fact above: no silent 'project' default. A preference about how
+      // Jason wants Orion to behave in general ("I hate keyword hacks") is global; a preference tied
+      // to one project's conventions ("always use TypeScript interfaces in this repo") is project.
+      const scope = args.scope;
       const text = args.text;
       if (!text) throw new Error("Missing 'text' parameter");
+      if (scope !== 'global' && scope !== 'project') {
+        throw new Error("remember_preference requires an explicit scope of 'global' or 'project'. Judge this from the preference itself: 'global' if it applies regardless of which project is open, 'project' if it is specific to the active project. Do not assume 'project' merely because a workspace happens to be active - retry with scope set explicitly.");
+      }
       if (scope === 'global') {
         const result = await window.api.appendGlobalPreference(text, config, undefined, activeConversationMode, !!args.pinned);
         if (!result || !result.success) throw new Error((result && result.error) || 'appendGlobalPreference failed');
@@ -7990,7 +8073,14 @@ async function executeTool(name, args, workspace, config, conversation, executio
     }
 
     case 'recall_memory': {
-      const scope = args.scope || 'project';
+      // Same invariant on the read side: a missing scope used to silently narrow to 'project',
+      // which is exactly how a personal question ("what do you remember about me") could end up
+      // searching only the active project's memory instead of Jason's global facts. The model must
+      // pick a scope that matches what it actually needs, not have one assumed from the workspace.
+      const scope = args.scope;
+      if (!['global', 'project', 'conversation', 'recent', 'all'].includes(scope)) {
+        throw new Error("recall_memory requires an explicit scope: 'global', 'project', 'conversation', 'recent', or 'all'. Choose based on what you actually need - do not assume 'project' merely because a workspace happens to be active; a personal or identity question should use 'global' or 'all' even while a project is open. Retry with scope set explicitly.");
+      }
       const wp = args.workspacePath || workspace;
       const output = {};
       if (scope === 'global' || scope === 'all') {
@@ -10678,7 +10768,10 @@ const INSPECTION_TOOLS = new Set([
   'get_workspace_info', 'grep_search', 'search_embeddings', 'get_symbol_index',
   // Index-backed retrieval belongs here too: these ARE workspace inspection, and omitting them
   // meant a run that used them exclusively was treated as never having inspected anything.
-  'semantic_search', 'find_references', 'get_file_symbols'
+  'semantic_search', 'find_references', 'get_file_symbols',
+  // Inspection of Orion's own execution history is still inspection - it must count the same way
+  // toward "did this turn actually gather evidence" as a workspace read does.
+  'search_orion_task_history'
 ]);
 const MEMORY_WRITE_TOOLS = new Set(['append_project_memory', 'remember_fact', 'remember_decision', 'remember_file_notes']);
 
@@ -10745,6 +10838,13 @@ function buildLocalInspectionNoToolGuidance(planningDecision) {
   }
   if (planningDecision && planningDecision.inspectionTarget === 'local_system') {
     return ' The user asked about this local computer. Call local inspection commands now, such as `systeminfo`, CPU/RAM/disk/process commands, or another available local route. Do not answer with acknowledgement only.';
+  }
+  if (planningDecision && planningDecision.inspectionTarget === 'task_history') {
+    // Real bug this guards against: a request about Orion's own prior runs was answered by
+    // inspecting the active project's files instead, because nothing pointed the model at its
+    // own execution history. Do not fall through to change_workspace/list_files/read_file here -
+    // that is exactly the active-workspace substitution this evidence domain must not make.
+    return ' The user is asking about Orion\'s own prior task/run history, not the active project. Call `search_orion_task_history` now with terms describing the prior work. Do not inspect or change to the active project workspace for this - only follow a project if a matched task result explicitly names one.';
   }
   return '';
 }
@@ -12739,6 +12839,19 @@ function buildAgentToolDeclarations() {
             parameters: { type: "OBJECT", properties: {} }
           },
           {
+            name: "search_orion_task_history",
+            description: "Searches Orion's own prior task/run history - durable orchestration records of what Orion itself previously did, by which specialist, with what result. Use this, not the active project's files, whenever the request is about what Orion did before, how it accomplished something previously, or a comparison across its own past runs (evidenceTarget=prior_orion_runs / inspectionTarget=task_history). Do not use this to inspect a project's own code or content - that is list_files/read_file/grep_search against the workspace instead.",
+            parameters: {
+              type: "OBJECT",
+              properties: {
+                query: { type: "STRING", description: "Free-text terms describing the prior work to find, matched against each task's objective, title, original request, and recorded result (e.g. 'DeepSeek balance')." },
+                role: { type: "STRING", enum: ["coder", "operator", "researcher"], description: "Optional: restrict to tasks executed by one specialist role." },
+                status: { type: "STRING", enum: ["completed", "failed", "any"], description: "Optional: restrict by terminal outcome. Defaults to any." },
+                limit: { type: "NUMBER", description: "Maximum matching tasks to return, most recent first. Defaults to 10." }
+              }
+            }
+          },
+          {
             name: "fetch_api_docs",
             description: "Downloads documentation from a URL (e.g. a markdown repo, a DevDocs JSON, or a raw webpage) and caches it persistently in ~/orion-docs-cache/<library_name>@<version>/. Use this when you are missing library documentation and want to index it for offline semantic search.",
             parameters: {
@@ -13180,7 +13293,7 @@ function buildAgentToolDeclarations() {
           },
           {
             name: 'open_application',
-            description: 'Operator-only Windows application control. After capture_screen and inspect_screenshot_with_model, safely activate an existing matching application window whether it is covered, minimized, or in the background; launch the installed Start-menu app only when no matching window exists. Then capture the resulting screen. For a named app, use this instead of clicking a guessed taskbar coordinate, shell commands, AppX/package discovery, or custom window-handle scripts.',
+            description: 'Operator-only Windows application control. Safely activate an existing matching application window whether it is covered, minimized, or in the background; launch the installed Start-menu app only when no matching window exists. It then captures the visible result. If full-display capture is unavailable but the named window can still render, the returned path is a target-window screenshot: inspect and attach that exact path instead of retrying capture_screen. A target-window screenshot is evidence for reading the app, not for desktop pixel coordinates. For a named app, use this instead of clicking a guessed taskbar coordinate, shell commands, AppX/package discovery, or custom window-handle scripts.',
             parameters: { type: 'OBJECT', properties: {
               appName: { type: 'STRING', description: 'Installed application display name, for example Codex, Calculator, or Notepad.' },
               settleMs: { type: 'NUMBER', description: 'Optional 0-10000 ms wait before capturing the resulting screen. Defaults to 1200 ms.' },
@@ -13567,16 +13680,16 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "remember_fact",
-            description: "Store a durable fact in global or project memory. Use scope='global' for cross-project facts (user habits, people, identity), scope='project' for workspace-specific facts.",
+            description: "Store a durable fact. Only for information that will still be true later - never for the current moment's state (e.g. 'the app is open right now', 'a test is currently running'); if it will be false in a few minutes, do not store it. scope is REQUIRED and must be judged from the fact itself, not from which workspace happens to be open: 'global' for facts that hold regardless of project (user habits, identity, cross-project preferences - example shape: 'the user prefers concise status updates over long explanations'), 'project' for facts specific to the active project's code or design (example shape: 'the project stores saves in a custom binary format'). These are illustrations of the KIND of thing each scope holds, not real stored facts - never treat an example in this description as something already known about the actual user.",
             parameters: {
               type: "OBJECT",
               properties: {
-                scope: { type: "STRING", description: "global or project (default: project)." },
+                scope: { type: "STRING", description: "Required: 'global' or 'project'. Judge from the fact's content - do not default to 'project' just because a workspace is active." },
                 text: { type: "STRING", description: "The fact to store." },
                 category: { type: "STRING", description: "Optional category, e.g. architecture, api, gotcha, preference." },
                 pinned: { type: "BOOLEAN", description: "Keep this durable identity fact eligible for recall even after normal age filtering." }
               },
-              required: ["text"]
+              required: ["text", "scope"]
             }
           },
           {
@@ -13594,28 +13707,29 @@ function buildAgentToolDeclarations() {
           },
           {
             name: "remember_preference",
-            description: "Store a user preference at global or project level. Call immediately when the user expresses how they like things done.",
+            description: "Store a user preference. Call immediately when the user expresses how they like things done. scope is REQUIRED and must be judged from the preference itself, not from which workspace happens to be open: 'global' for preferences about how the user wants Orion to operate in general (example shape: 'the user wants real judgment applied instead of keyword-matching shortcuts'), 'project' for preferences specific to the active project's conventions (example shape: 'the user wants TypeScript interfaces over type aliases in this repo'). These are illustrations of the KIND of thing each scope holds, not a real stored preference - never treat an example in this description as something already known about the actual user.",
             parameters: {
               type: "OBJECT",
               properties: {
-                scope: { type: "STRING", description: "global or project (default: project)." },
+                scope: { type: "STRING", description: "Required: 'global' or 'project'. Judge from the preference's content - do not default to 'project' just because a workspace is active." },
                 text: { type: "STRING", description: "The preference to store, e.g. 'Always use TypeScript interfaces over type aliases'." },
                 workspacePath: { type: "STRING", description: "Optional workspace path override (project scope only)." },
                 pinned: { type: "BOOLEAN", description: "Keep this durable preference eligible for recall even after normal age filtering." }
               },
-              required: ["text"]
+              required: ["text", "scope"]
             }
           },
           {
             name: "recall_memory",
-            description: "Read typed memory for the given scope. Use scope=conversation with a focused query when the user asks what was said earlier; returned conversationEvidence is the only memory source that licenses explicit recall claims.",
+            description: "Read typed memory. scope is REQUIRED - choose it based on what you actually need, never assume 'project' just because a workspace happens to be active. Use scope='conversation' with a focused query when the user asks what was said earlier (returned conversationEvidence is the only memory source that licenses explicit recall claims); use 'global' or 'all' for personal/identity questions even while a project is open.",
             parameters: {
               type: "OBJECT",
               properties: {
-                scope: { type: "STRING", description: "global, project, conversation, recent, or all (default: project)." },
+                scope: { type: "STRING", description: "Required: 'global', 'project', 'conversation', 'recent', or 'all'." },
                 query: { type: "STRING", description: "Focused retrieval query. Required for conversation scope and useful with recent/all." },
                 workspacePath: { type: "STRING", description: "Optional workspace path override." }
-              }
+              },
+              required: ["scope"]
             }
           },
           {

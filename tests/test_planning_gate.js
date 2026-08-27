@@ -3009,7 +3009,7 @@ test('a blank final response after real tool work is nudged to produce an actual
 // Dispatch cannot execute process mutations itself, but that boundary must route work rather than
 // return it to the user. Native application/process work belongs to Operator, and the loop must
 // synthesize that handoff deterministically without accepting a permission refusal.
-test('Dispatch preflights a kill/restart request into one Operator handoff without a Dispatch model pass', async (t) => {
+test('Dispatch finalizes a kill/restart route before one natural acknowledgement and one Operator handoff', async (t) => {
   const originalRunAgentLoop = global.window.runAgentLoop;
   const originalSetTimeout = global.setTimeout;
   const originalFetch = global.fetch;
@@ -3078,7 +3078,7 @@ test('Dispatch preflights a kill/restart request into one Operator handoff witho
     await window.runAgentLoop(request, 'gemini-1', conversation);
 
     t.equal(handoffs.length, 1, 'handoff_to_operator executes exactly once');
-    t.equal(modelTurn, 0, 'the full Dispatch model is never called before delegation');
+    t.equal(modelTurn, 1, 'Dispatch gets one route-aware phrasing turn before deterministic delegation');
     t.equal(handoffs[0].open, false, 'Dispatch remains visible to supervise the Operator task');
     t.ok(handoffs[0].prompt.includes(request), 'the handoff preserves the exact user request');
     t.ok(/identify the intended local target/i.test(handoffs[0].prompt), 'Operator is instructed to resolve which Claude process is meant');
