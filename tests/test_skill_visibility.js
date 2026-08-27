@@ -8,11 +8,12 @@
 // inherited all three by omission rather than because anyone decided it should.
 //
 // Skill visibility is now a capability on the specialist registry, the same authority that owns
-// specialist routing. Every role can discover, run AND author: create_skill takes the
-// implementation and test as string parameters and the main process writes and runs them, so
-// authoring never depended on the code tooling only Coder has. What keeps the registry trustworthy
-// is the test gate plus the provenance recorded on each manifest, both of which apply identically
-// whichever role called the tool.
+// specialist routing. Every role can discover, run and propose. AUTHORING is the one capability
+// that is not universal: create_skill writes model-authored JavaScript and executes it, and its
+// test gate cannot be a security gate because passing the test requires running that code.
+// Researcher — the role that ingests untrusted web and source material — therefore proposes
+// instead of authoring, which keeps a prompt injection from reaching host code execution. Coder
+// already holds that authority through run_command, so keeping create there is no escalation.
 
 process.env.NODE_ENV = 'test';
 global.window = {};
@@ -55,21 +56,43 @@ test('every role can discover and run skills, and each matches its declared capa
   t.end();
 });
 
-test('every role can discover, run AND author skills', t => {
-  // Authoring was briefly restricted to Coder on the theory that it needed code tooling. It does
-  // not: create_skill takes the implementation and test as STRING parameters and the main process
-  // writes and runs them, so a role without write_file or run_tests can still author. What guards
-  // the registry is the test gate plus provenance, not which role called the tool.
+test('every role can discover, run and propose; only Researcher is barred from authoring', t => {
+  // Authoring writes model-authored JavaScript to disk and executes it, and the test gate cannot be
+  // a security gate because passing it REQUIRES running that code. Researcher is the role that
+  // ingests untrusted web and source material, so it is the one place where a successful prompt
+  // injection would otherwise reach host code execution. Coder already holds that authority through
+  // run_command, so keeping create there is no escalation. Researcher keeps propose_skill, which
+  // records intent as inert data and executes nothing.
   ROLES.forEach(mode => {
     const names = toolsFor(mode);
     t.ok(names.includes('discover_skills'), mode + ' can discover skills');
     t.ok(names.includes('run_skill'), mode + ' can run skills');
-    t.ok(names.includes('create_skill'), mode + ' can author skills');
+    t.ok(names.includes('propose_skill'), mode + ' can propose skills');
+  });
+  t.notOk(toolsFor('researcher').includes('create_skill'),
+    'Researcher cannot author skills - the untrusted-input role does not get code execution');
+  ['orion', 'coder', 'operator'].forEach(mode => {
+    t.ok(toolsFor(mode).includes('create_skill'), mode + ' retains authoring');
   });
   const authors = registry.list().filter(definition => definition.skillCapabilities.create === true);
-  t.deepEqual(authors.map(definition => definition.role).sort(), ['coder', 'operator', 'researcher'],
-    'every registered specialist may author');
-  t.equal(registry.skillCapabilitiesFor('orion').create, true, 'and so may Dispatch');
+  t.deepEqual(authors.map(definition => definition.role).sort(), ['coder', 'operator'],
+    'Researcher is the only registered specialist without authoring');
+  t.equal(registry.skillCapabilitiesFor('researcher').propose, true,
+    'and it is granted proposing in exchange');
+  t.end();
+});
+
+test('propose_skill is inert: it carries no implementation and no test', t => {
+  agent.__setActiveConversationModeForTest('researcher');
+  const declaration = agent.buildAgentToolDeclarations().find(tool => tool.name === 'propose_skill');
+  agent.__setActiveConversationModeForTest('orion');
+  t.ok(declaration, 'propose_skill is declared');
+  const properties = Object.keys((declaration.parameters && declaration.parameters.properties) || {});
+  t.notOk(properties.includes('implementation'), 'a proposal cannot carry executable code');
+  t.notOk(properties.includes('test'), 'nor a test that would have to be executed to check it');
+  t.ok(properties.includes('rationale'), 'it must say why a saved skill beats redoing the work');
+  t.deepEqual((declaration.parameters.required || []).slice().sort(), ['description', 'name', 'rationale'],
+    'name, description and rationale are all required');
   t.end();
 });
 
@@ -84,7 +107,7 @@ test('skill visibility is not a fourth hand-maintained allowlist', t => {
   registry.list().forEach(definition => {
     t.equal(typeof definition.skillCapabilities, 'object',
       definition.role + ' declares skillCapabilities');
-    ['discover', 'run', 'create'].forEach(capability => {
+    ['discover', 'run', 'propose', 'create'].forEach(capability => {
       t.equal(typeof definition.skillCapabilities[capability], 'boolean',
         definition.role + '.' + capability + ' is an explicit boolean, not an omission');
     });
@@ -94,8 +117,8 @@ test('skill visibility is not a fourth hand-maintained allowlist', t => {
 
 test('an unregistered role gets no skill access at all', t => {
   const capabilities = registry.skillCapabilitiesFor('not-a-real-role');
-  t.deepEqual(capabilities, { discover: false, run: false, create: false },
-    'an unknown role cannot discover, run, or author skills');
+  t.deepEqual(capabilities, { discover: false, run: false, propose: false, create: false },
+    'an unknown role cannot discover, run, propose, or author skills');
   t.end();
 });
 
@@ -135,12 +158,17 @@ test('the authoring bar is stated as value over a fresh turn, not as a filing ha
   ROLES.forEach(mode => {
     const prompt = promptFor(mode);
     t.ok(/as reliably, cheaply, and consistently/i.test(prompt),
-      mode + ' is given the same authoring bar, since every role can author');
-    t.ok(/procedural memory/i.test(prompt),
-      mode + ' is told a skill is permanent procedural memory');
-    t.notOk(/cannot author skills/i.test(prompt),
-      mode + ' is not told it cannot author, which is no longer true');
+      mode + ' is given the same bar, whether it authors or proposes');
   });
+  ['orion', 'coder', 'operator'].forEach(mode => {
+    t.ok(/procedural memory/i.test(promptFor(mode)),
+      mode + ' is told an authored skill is permanent procedural memory');
+  });
+  const researcher = promptFor('researcher');
+  t.ok(/do not author skills/i.test(researcher),
+    'Researcher is told plainly that it does not author, so it does not try');
+  t.ok(/propose_skill/.test(researcher), 'and is pointed at propose_skill instead');
+  t.ok(/untrusted/i.test(researcher), 'with the reason stated, so it reads as deliberate rather than missing');
   t.end();
 });
 
@@ -152,9 +180,11 @@ test('the post-task authoring nudge is gated on real capability, not on a role n
     'and gates on that, so a role that loses create_skill is never nudged toward a tool it cannot see');
   // Today every role can author, so the gate is open for all of them - but it stays capability-driven
   // so revoking create for a role cannot leave a dangling nudge behind.
-  ROLES.forEach(mode => {
+  ['orion', 'coder', 'operator'].forEach(mode => {
     t.equal(registry.skillCapabilitiesFor(mode).create, true, mode + ' may author, so the nudge applies');
   });
+  t.equal(registry.skillCapabilitiesFor('researcher').create, false,
+    'Researcher may not author, so the capability-gated nudge never fires for it');
   t.end();
 });
 

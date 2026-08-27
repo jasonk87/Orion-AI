@@ -24,7 +24,7 @@
       // takes the implementation and test as STRING parameters and the main process writes and runs
       // them, so authoring never required the file/test tools only Coder has. What actually guards
       // a bad skill is the test gate plus provenance, not which role happened to call the tool.
-      skillCapabilities: Object.freeze({ discover: true, run: true, create: true }),
+      skillCapabilities: Object.freeze({ discover: true, run: true, propose: true, create: true }),
       // The work SHAPE this role owns, in the router's own vocabulary. The semantic classifier is
       // given these rather than a hand-maintained per-role paragraph, so adding a specialist to
       // this registry teaches the router about it automatically. Capability, not keywords: the
@@ -46,7 +46,7 @@
       canEditWorkspace: false,
       canControlDesktop: true,
       canInspectLocalSystem: true,
-      skillCapabilities: Object.freeze({ discover: true, run: true, create: true }),
+      skillCapabilities: Object.freeze({ discover: true, run: true, propose: true, create: true }),
       capabilitySummary: Object.freeze([
         'native desktop and application interaction',
         'live browser interaction driven through the screen',
@@ -70,7 +70,14 @@
       canEditWorkspace: false,
       canControlDesktop: false,
       canInspectLocalSystem: false,
-      skillCapabilities: Object.freeze({ discover: true, run: true, create: true }),
+      // Researcher may propose a skill but not author one. create_skill writes model-authored
+      // JavaScript to disk and executes it, and its test gate cannot be a security gate because
+      // passing the test REQUIRES running the untrusted code. Researcher is the role that ingests
+      // untrusted web and source material, so it is the one place where a successful prompt
+      // injection would otherwise have a route from read-only investigation to host code
+      // execution. Coder already holds code-execution authority via run_command, so keeping
+      // create there is no escalation.
+      skillCapabilities: Object.freeze({ discover: true, run: true, propose: true, create: false }),
       capabilitySummary: Object.freeze([
         'read-only investigation that changes nothing',
         'gathering and cross-checking multiple sources',
@@ -100,8 +107,8 @@
   // which apply identically whoever called the tool. A controlled promotion path (detect repetition
   // -> propose -> human approval -> register) remains the intended long-term route, and would sit
   // in front of create_skill for every role rather than restricting it to one.
-  const DISPATCH_SKILL_CAPABILITIES = Object.freeze({ discover: true, run: true, create: true });
-  const NO_SKILL_CAPABILITIES = Object.freeze({ discover: false, run: false, create: false });
+  const DISPATCH_SKILL_CAPABILITIES = Object.freeze({ discover: true, run: true, propose: true, create: true });
+  const NO_SKILL_CAPABILITIES = Object.freeze({ discover: false, run: false, propose: false, create: false });
 
   function skillCapabilitiesFor(value) {
     const role = normalizeRole(value);

@@ -154,6 +154,8 @@ contextBridge.exposeInMainWorld('api', {
   discoverSkills: (group) => ipcRenderer.invoke('orion:discover-skills', { group }),
   runSkill: (name, inputs) => ipcRenderer.invoke('orion:run-skill', { name, inputs }),
   createSkill: (payload) => ipcRenderer.invoke('orion:create-skill', payload),
+  proposeSkill: (payload) => ipcRenderer.invoke('orion:propose-skill', payload),
+  listSkillProposals: () => ipcRenderer.invoke('orion:list-skill-proposals'),
   listSkillGroups: () => ipcRenderer.invoke('orion:list-skill-groups'),
 
   // Global Memory
