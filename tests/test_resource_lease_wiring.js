@@ -225,9 +225,15 @@ test('the run loop releases desktop/browser/workspace leases when it ends, but n
   t.end();
 });
 
-test('a Coder/Operator run acquires a workspace lease once, gated to its own role, before the tool loop begins', t => {
-  t.ok(agentJs.includes("(activeConversationMode === 'coder' || activeConversationMode === 'operator') && workspacePath"),
-    'the workspace lease is only acquired for Coder/Operator conversations with a resolved workspace');
+test('a specialist run acquires a workspace lease once, gated to specialist roles, before the tool loop begins', t => {
+  // Was pinned to the literal coder/operator pair. That pair was never "roles that can edit the
+  // workspace" - Operator cannot edit it either - it was "roles whose run is bound to a project",
+  // which Researcher also is now that change_workspace binds its projectPath. Asking the registry
+  // keeps the gate real without re-creating the hand-maintained list that kept excluding Researcher.
+  t.ok(agentJs.includes('OrionSpecialistRegistry.has(activeConversationMode) && workspacePath'),
+    'the workspace lease is only acquired for registered specialist conversations with a resolved workspace');
+  t.notOk(agentJs.includes("(activeConversationMode === 'coder' || activeConversationMode === 'operator') && workspacePath"),
+    'and no longer hard-codes which specialists those are');
   t.ok(agentJs.includes("resourceType: 'workspace',\n        resourceKey: workspacePath,"),
     'the lease key is the actual resolved workspace path');
   t.end();

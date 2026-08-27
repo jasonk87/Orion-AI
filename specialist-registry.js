@@ -20,6 +20,11 @@
       canEditWorkspace: true,
       canControlDesktop: false,
       canInspectLocalSystem: false,
+      // Which skill-registry operations this role may perform. Every role can author: create_skill
+      // takes the implementation and test as STRING parameters and the main process writes and runs
+      // them, so authoring never required the file/test tools only Coder has. What actually guards
+      // a bad skill is the test gate plus provenance, not which role happened to call the tool.
+      skillCapabilities: Object.freeze({ discover: true, run: true, create: true }),
       // The work SHAPE this role owns, in the router's own vocabulary. The semantic classifier is
       // given these rather than a hand-maintained per-role paragraph, so adding a specialist to
       // this registry teaches the router about it automatically. Capability, not keywords: the
@@ -41,6 +46,7 @@
       canEditWorkspace: false,
       canControlDesktop: true,
       canInspectLocalSystem: true,
+      skillCapabilities: Object.freeze({ discover: true, run: true, create: true }),
       capabilitySummary: Object.freeze([
         'native desktop and application interaction',
         'live browser interaction driven through the screen',
@@ -64,6 +70,7 @@
       canEditWorkspace: false,
       canControlDesktop: false,
       canInspectLocalSystem: false,
+      skillCapabilities: Object.freeze({ discover: true, run: true, create: true }),
       capabilitySummary: Object.freeze([
         'read-only investigation that changes nothing',
         'gathering and cross-checking multiple sources',
@@ -73,6 +80,28 @@
       ])
     })
   });
+
+  // Dispatch is not a specialist and is deliberately absent from DEFINITIONS, but it owns the
+  // mission and must know which reusable procedures exist, so its skill capabilities live here
+  // too. This function is the single authority on skill-tool visibility: four hand-maintained
+  // allowlists is exactly the shape that let Researcher be a registered role the router could not
+  // route to, and repeating it for skills would reproduce that bug class.
+  //
+  // Every role may author. The thing that keeps the registry trustworthy is not a role check -
+  // it is the test gate in lib/ipc-skill.js plus the provenance recorded on each manifest, both of
+  // which apply identically whoever called the tool. A controlled promotion path (detect repetition
+  // -> propose -> human approval -> register) remains the intended long-term route, and would sit
+  // in front of create_skill for every role rather than restricting it to one.
+  const DISPATCH_SKILL_CAPABILITIES = Object.freeze({ discover: true, run: true, create: true });
+  const NO_SKILL_CAPABILITIES = Object.freeze({ discover: false, run: false, create: false });
+
+  function skillCapabilitiesFor(value) {
+    const role = normalizeRole(value);
+    if (!role || role === 'orion' || role === 'dispatch') return DISPATCH_SKILL_CAPABILITIES;
+    const definition = get(role);
+    if (!definition) return NO_SKILL_CAPABILITIES;
+    return definition.skillCapabilities || NO_SKILL_CAPABILITIES;
+  }
 
   function normalizeRole(value) {
     return String(value || '').trim().toLowerCase();
@@ -144,6 +173,7 @@
   return Object.freeze({
     DEFINITIONS,
     normalizeRole,
+    skillCapabilitiesFor,
     get,
     has,
     requireRole,

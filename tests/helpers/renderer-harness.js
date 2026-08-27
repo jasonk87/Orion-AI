@@ -82,6 +82,11 @@ function loadRenderer(options = {}) {
     parse: (text) => String(text == null ? '' : text)
   };
   win.Prism = { highlightAll() {}, highlightAllUnder() {}, highlight: (code) => code, languages: {} };
+  // index.html loads specialist-registry.js BEFORE renderer.js, and renderer.js asks it which roles
+  // are specialists. Omitting it here made the harness less faithful than production, not more:
+  // renderer code took its no-registry fallback path in every test, so a change that depended on
+  // the registry looked broken in tests while being correct in the packaged app.
+  win.OrionSpecialistRegistry = require('../../specialist-registry');
 
   const api = createApiStub(options.api || {});
   // noApi reproduces a failed preload bridge: window.api simply does not exist, which is

@@ -2599,7 +2599,7 @@ function structuredWorkspaceForConversation(conv, explicitPath = '') {
   const workspacePath = String(explicitPath || (conv && (conv.workspace || conv.projectPath || conv.dispatchProjectPath)) || '').trim();
   if (!RendererWorkspaceResolution) {
     return {
-      role: workspacePath ? ((mode === 'coder' || mode === 'operator' || mode === 'researcher') ? 'standalone_specialist' : 'active_project') : 'unresolved',
+      role: workspacePath ? (isSpecialistMode(mode) ? 'standalone_specialist' : 'active_project') : 'unresolved',
       path: workspacePath,
       project: { name: workspacePath.split(/[\\/]/).pop() || '', path: (conv && (conv.projectPath || conv.dispatchProjectPath)) || '' },
       source: 'legacy',
@@ -4213,6 +4213,29 @@ function markQueuedPromptRunning(queueId, conversationId) {
 // a standalone chat started in Coder is not the same as one started in Dispatch, even though
 // neither has a projectPath. Legacy conversations saved before this field existed infer their
 // mode from projectPath (only Coder ever had projects), so old data keeps behaving as before.
+// Single answer to "is this a registered specialist role", asked of the registry instead of
+// re-listing role names at every call site. The hand-written coder/operator/researcher triples
+// this replaces are the same shape that let Researcher be a registered role the semantic router
+// could not route to and change_workspace would not bind a project for.
+function isSpecialistMode(value) {
+  const role = String(value || '').trim().toLowerCase();
+  if (!role) return false;
+  if (window.OrionSpecialistRegistry && typeof window.OrionSpecialistRegistry.has === 'function') {
+    return window.OrionSpecialistRegistry.has(role);
+  }
+  // Same fallback shape AGENT_ROLE_DISPLAY_NAMES already uses above, and for the same reason:
+  // renderer.js is a plain <script> with no require, so if the registry script failed to load,
+  // classifying EVERY conversation as Dispatch would be far worse than briefly falling back to
+  // the roles that existed when this was written. The registry is authoritative whenever present.
+  return ['coder', 'operator', 'researcher'].includes(role);
+}
+
+// A conversation mode Orion recognizes explicitly: Dispatch, or any registered specialist.
+function isKnownConversationMode(value) {
+  const role = String(value || '').trim().toLowerCase();
+  return role === 'orion' || isSpecialistMode(role);
+}
+
 function conversationMode(conv) {
   if (!conv) return 'orion';
   // Phase 3 of the Operator architecture plan: an explicitly-tagged operator conversation is
@@ -4223,7 +4246,7 @@ function conversationMode(conv) {
   // the same fix already applied for Operator above -- without this, a Researcher conversation
   // (created from its own tab, or promoted via handoff) falls through to the projectPath-presence
   // guess below and gets silently misclassified as 'orion'.
-  if (conv.mode === 'orion' || conv.mode === 'coder' || conv.mode === 'operator' || conv.mode === 'researcher') return conv.mode;
+  if (isKnownConversationMode(conv.mode)) return conv.mode;
   return conv.projectPath ? 'coder' : 'orion';
 }
 
@@ -4342,7 +4365,7 @@ async function createNewConversation(mode = appMode) {
   const newConv = {
     id: newId,
     title: title,
-    mode: mode === 'coder' || mode === 'operator' || mode === 'researcher' ? mode : 'orion',
+    mode: isSpecialistMode(mode) ? mode : 'orion',
     projectPath: '',
     workspace: '', // will slugify on first prompt
     messages: [],
@@ -4633,11 +4656,7 @@ function getConversationRunWorkspace(conv) {
 function createPhoneConversation({ projectPath = '', dispatchProjectPath = '', contextSummary = '', mode = 'orion', title = 'New Phone Task' } = {}) {
   const convId = 'conv-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
   const requestedRole = String(mode || '').trim().toLowerCase();
-  const registeredSpecialistMode = !!(
-    window.OrionSpecialistRegistry
-    && typeof window.OrionSpecialistRegistry.has === 'function'
-    && window.OrionSpecialistRegistry.has(requestedRole)
-  );
+  const registeredSpecialistMode = isSpecialistMode(requestedRole);
   const requestedMode = requestedRole === 'orion' || registeredSpecialistMode ? requestedRole : 'orion';
   const normalizedProjectPath = String(projectPath || '').trim();
   const normalizedDispatchProjectPath = requestedMode === 'orion' ? String(dispatchProjectPath || '').trim() : '';
@@ -4998,7 +5017,7 @@ function migrateConversations() {
     // every load (unlike the one-time backfill above), so an operator- or researcher-tagged
     // conversation must count as already explicit here. Without this, the inference below would
     // silently stomp c.mode back to 'coder'/'orion' on every single app start.
-    const hasExplicitMode = c.mode === 'orion' || c.mode === 'coder' || c.mode === 'operator' || c.mode === 'researcher';
+    const hasExplicitMode = isKnownConversationMode(c.mode);
     const matchingWorkspaceProject = (!c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace))
       ? projects.find(proj => {
         const lowerWorkspace = c.workspace.toLowerCase();
@@ -5035,7 +5054,7 @@ function migrateConversations() {
       c.projectPath = '';
       updated = true;
     }
-    if ((conversationMode(c) === 'coder' || conversationMode(c) === 'operator' || conversationMode(c) === 'researcher') && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)) {
+    if (isSpecialistMode(conversationMode(c)) && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)) {
       // Find if workspace is inside any project folder
       if (matchingWorkspaceProject) {
         c.projectPath = matchingWorkspaceProject;
@@ -5931,7 +5950,7 @@ async function submitMessage() {
   if (!conv.workspace) {
     if (conv.projectPath) {
       conv.workspace = conv.projectPath;
-    } else if (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator' || conversationMode(conv) === 'researcher') {
+    } else if (isSpecialistMode(conversationMode(conv))) {
       conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id);
     }
   }
@@ -7459,7 +7478,7 @@ window.changeActiveWorkspace = function(folderPath, options = {}) {
     if (conv) {
       conv.workspace = folderPath;
       targetMode = conversationMode(conv);
-      const promoteProject = options.promoteProject === true || (options.promoteProject !== false && (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator' || conversationMode(conv) === 'researcher'));
+      const promoteProject = options.promoteProject === true || (options.promoteProject !== false && (isSpecialistMode(conversationMode(conv))));
       promoteProjectForWorkspace = promoteProject;
       if (promoteProject) {
         conv.projectPath = folderPath;
@@ -8786,7 +8805,7 @@ window.startPhoneCompanionTask = async (options = {}) => {
       if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conv.id);
       saveConversationsToStorage();
     });
-  } else if (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator' || conversationMode(conv) === 'researcher') {
+  } else if (isSpecialistMode(conversationMode(conv))) {
     saveConversationsToStorage();
   } else {
     // A blank Dispatch request is only a client-side draft. Never leave an empty conversation in
@@ -8852,7 +8871,7 @@ async function submitPhoneCompanionPromptOnce(options) {
   if (!conv.workspace) {
     if (conv.projectPath) {
       conv.workspace = conv.projectPath;
-    } else if (conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator' || conversationMode(conv) === 'researcher') {
+    } else if (isSpecialistMode(conversationMode(conv))) {
       conv.workspace = getStandaloneWorkspaceForTitle(conv.title, conv.id);
     }
   }

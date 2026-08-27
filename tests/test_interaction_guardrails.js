@@ -1035,9 +1035,11 @@ test('Dispatch uses Projects fallback while Coder standalone conversations get i
   t.ok(rendererJs.includes("return mode !== 'coder' || !c.projectPath;"), 'Dispatch and Operator lists keep their conversations even when they inspected a project workspace; only Coder filters standalone-vs-project');
   t.ok(rendererJs.includes('c.projectPath && isGeneratedStandaloneWorkspace(c.workspace)'), 'migration clears accidental project linkage from generated standalone workspaces');
   // Phase 3 of the Operator architecture plan: operator conversations get this same auto-bind
-  // treatment as Coder now (both do real workspace-bound artifact work), so the condition gained
-  // an explicit operator clause alongside coder.
-  t.ok(rendererJs.includes("(conversationMode(c) === 'coder' || conversationMode(c) === 'operator' || conversationMode(c) === 'researcher') && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)"), 'migration never promotes generated standalone workspaces or Dispatch conversations into projects, and now treats operator and researcher the same as coder');
+  // treatment as Coder (both do real workspace-bound artifact work). The condition used to name
+  // each role explicitly and gained a clause per specialist; it now asks the specialist registry,
+  // so a future role is covered without another edit here.
+  t.ok(rendererJs.includes('isSpecialistMode(conversationMode(c)) && !c.projectPath && c.workspace && !isGeneratedStandaloneWorkspace(c.workspace)'), 'migration never promotes generated standalone workspaces or Dispatch conversations into projects, and treats every registered specialist the same as coder');
+  t.notOk(rendererJs.includes("conversationMode(c) === 'coder' || conversationMode(c) === 'operator' || conversationMode(c) === 'researcher'"), 'and no longer enumerates the specialist roles by name');
   // Phase 3 of the Operator architecture plan: Operator does real workspace-bound artifact work
   // like Coder, so change_workspace promotes both into project scope now, not Coder alone. Dispatch
   // still takes the separate known-projects branch below, unaffected by this change.
@@ -1210,8 +1212,15 @@ test('Operator receives a narrower, desktop/browser-execution tool surface, not 
   t.notOk(operatorTools.includes('run_tests'), 'Operator has no test runner - there is no code to test');
   t.notOk(operatorTools.includes('update_mission_context'), 'Operator is not offered mission tracking');
   t.notOk(operatorTools.includes('start_subplan'), 'Operator is not offered subplan tracking');
-  t.notOk(operatorTools.includes('discover_skills'), 'Operator is not offered the skill registry');
-  t.notOk(operatorTools.includes('create_skill'), 'Operator cannot author skills');
+  // Deliberate reversal of the original Operator brief, which grouped the skill registry with the
+  // code/mission tooling Operator has no use for. That grouping turned out to be wrong: a skill is
+  // a saved multi-step PROCEDURE, and Operator's work - app workflows, playtests, browser routines -
+  // is exactly the kind of procedure worth saving and replaying. Authoring is open too: create_skill
+  // takes the implementation and test as string parameters and the main process writes and runs
+  // them, so it never needed the file/test tools Operator deliberately lacks.
+  t.ok(operatorTools.includes('discover_skills'), 'Operator can discover reusable Operator procedures');
+  t.ok(operatorTools.includes('run_skill'), 'Operator can replay a saved procedure instead of rebuilding it');
+  t.ok(operatorTools.includes('create_skill'), 'Operator can save a proven workflow as a skill');
   t.notOk(operatorTools.includes('step_complete'), 'Operator does not get Coder\'s test-coupled step-completion tool');
 
   // The categories the brief did name.

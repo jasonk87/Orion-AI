@@ -98,3 +98,40 @@ test('structuredWorkspaceForConversation classifies an operator workspace like C
   t.notEqual(operatorResult.role, dispatchResult.role, 'operator differs from Dispatch for the same path');
   t.end();
 });
+
+// Nine hand-written `coder || operator || researcher` chains in renderer.js were replaced by one
+// registry-driven predicate. This is the same bug class that let Researcher be a registered role
+// the semantic router could not route to: every one of those chains would have needed a manual
+// edit for a fourth specialist, and missing one fails silently as a misclassified conversation.
+test('specialist recognition in the renderer comes from the registry, not a role list', (t) => {
+  const registry = require('../specialist-registry');
+  const { win } = loadRenderer({ t });
+
+  registry.list().forEach(definition => {
+    t.ok(win.isSpecialistMode(definition.role), definition.role + ' is recognized as a specialist');
+    t.equal(win.conversationMode({ mode: definition.role }), definition.role,
+      definition.role + ' conversations classify as themselves, not as Dispatch');
+    t.ok(win.isKnownConversationMode(definition.role), definition.role + ' is a known mode');
+  });
+
+  t.notOk(win.isSpecialistMode('orion'), 'Dispatch is not a specialist');
+  t.ok(win.isKnownConversationMode('orion'), 'but it is a known conversation mode');
+  t.notOk(win.isSpecialistMode('not-a-role'), 'an unregistered role is not a specialist');
+  t.notOk(win.isKnownConversationMode('not-a-role'), 'nor a known mode');
+  t.notOk(win.isSpecialistMode(''), 'an empty mode is not a specialist');
+  t.end();
+});
+
+test('renderer specialist recognition survives the registry script failing to load', (t) => {
+  // renderer.js is a plain <script> with no require. If specialist-registry.js failed to evaluate,
+  // a registry-only implementation would classify EVERY conversation as Dispatch - far worse than
+  // the hand-written chains it replaced. Same fallback shape AGENT_ROLE_DISPLAY_NAMES already uses.
+  const { win } = loadRenderer({ t });
+  win.OrionSpecialistRegistry = undefined;
+  ['coder', 'operator', 'researcher'].forEach(role => {
+    t.ok(win.isSpecialistMode(role), role + ' is still recognized without the registry');
+    t.equal(win.conversationMode({ mode: role }), role, role + ' still classifies correctly');
+  });
+  t.notOk(win.isSpecialistMode('orion'), 'Dispatch is still not a specialist in the fallback');
+  t.end();
+});

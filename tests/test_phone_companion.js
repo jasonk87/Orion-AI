@@ -1766,8 +1766,12 @@ test('phone registered specialist modes remain bound across navigation, creation
     'the renderer persists every explicitly requested registered specialist conversation'
   );
   t.ok(
+    rendererSource.includes('isSpecialistMode(conversationMode(conv))'),
+    'standalone specialist conversations receive a durable standalone workspace'
+  );
+  t.notOk(
     rendererSource.includes("conversationMode(conv) === 'coder' || conversationMode(conv) === 'operator'"),
-    'standalone Operator conversations receive a durable standalone workspace'
+    'and the check asks the specialist registry instead of naming roles, so a new specialist is covered automatically'
   );
   t.end();
 });

@@ -1,0 +1,238 @@
+'use strict';
+
+// The skill registry was fully built and completely unreachable. main.js registered the IPC,
+// preload exposed it, agent.js declared discover_skills/run_skill/create_skill, the skills existed
+// on disk and executed correctly - and three of the four roles could not see any of it, because
+// DISPATCH/OPERATOR/RESEARCHER_TOOL_ALLOWLIST each omitted the skill tools. Coder was the only role
+// that could use skills, and it got them by ACCIDENT: Coder's tool list is an exclusion set, so it
+// inherited all three by omission rather than because anyone decided it should.
+//
+// Skill visibility is now a capability on the specialist registry, the same authority that owns
+// specialist routing. Every role can discover, run AND author: create_skill takes the
+// implementation and test as string parameters and the main process writes and runs them, so
+// authoring never depended on the code tooling only Coder has. What keeps the registry trustworthy
+// is the test gate plus the provenance recorded on each manifest, both of which apply identically
+// whichever role called the tool.
+
+process.env.NODE_ENV = 'test';
+global.window = {};
+global.fetch = async () => ({ ok: false });
+
+const test = require('tape');
+const agent = require('../agent');
+const registry = require('../specialist-registry');
+const skillLoader = require('../lib/skill-loader');
+
+const ROLES = ['orion', 'coder', 'operator', 'researcher'];
+
+function toolsFor(mode) {
+  agent.__setActiveConversationModeForTest(mode);
+  const names = agent.buildAgentToolDeclarations().map(tool => tool.name);
+  agent.__setActiveConversationModeForTest('orion');
+  return names;
+}
+
+function promptFor(mode) {
+  agent.__setActiveConversationModeForTest(mode);
+  const prompt = agent.getSystemInstruction(false, '', 'gemini-2.5-flash') || '';
+  agent.__setActiveConversationModeForTest('orion');
+  return prompt;
+}
+
+// ── Visibility comes from the registry ────────────────────────────────────────
+
+test('every role can discover and run skills, and each matches its declared capability', t => {
+  ROLES.forEach(mode => {
+    const names = toolsFor(mode);
+    const capabilities = registry.skillCapabilitiesFor(mode);
+    t.equal(names.includes('discover_skills'), capabilities.discover,
+      mode + ' discover_skills visibility matches the registry');
+    t.equal(names.includes('run_skill'), capabilities.run,
+      mode + ' run_skill visibility matches the registry');
+    t.equal(names.includes('create_skill'), capabilities.create,
+      mode + ' create_skill visibility matches the registry');
+  });
+  t.end();
+});
+
+test('every role can discover, run AND author skills', t => {
+  // Authoring was briefly restricted to Coder on the theory that it needed code tooling. It does
+  // not: create_skill takes the implementation and test as STRING parameters and the main process
+  // writes and runs them, so a role without write_file or run_tests can still author. What guards
+  // the registry is the test gate plus provenance, not which role called the tool.
+  ROLES.forEach(mode => {
+    const names = toolsFor(mode);
+    t.ok(names.includes('discover_skills'), mode + ' can discover skills');
+    t.ok(names.includes('run_skill'), mode + ' can run skills');
+    t.ok(names.includes('create_skill'), mode + ' can author skills');
+  });
+  const authors = registry.list().filter(definition => definition.skillCapabilities.create === true);
+  t.deepEqual(authors.map(definition => definition.role).sort(), ['coder', 'operator', 'researcher'],
+    'every registered specialist may author');
+  t.equal(registry.skillCapabilitiesFor('orion').create, true, 'and so may Dispatch');
+  t.end();
+});
+
+test('skill visibility is not a fourth hand-maintained allowlist', t => {
+  const agentSource = require('fs').readFileSync(require('path').join(__dirname, '..', 'agent.js'), 'utf8');
+  t.ok(agentSource.includes('skillCapabilitiesFor'),
+    'agent.js asks the registry for skill capabilities');
+  t.ok(agentSource.includes('ALL_SKILL_TOOL_NAMES.filter(name => !permittedSkillTools.has(name))'),
+    "Coder's exclusion set removes skill tools it was not granted, so nothing is inherited by omission");
+  // Every registered specialist must declare the capability, so a new role cannot be silently
+  // absent the way Researcher was absent from the router's execution targets.
+  registry.list().forEach(definition => {
+    t.equal(typeof definition.skillCapabilities, 'object',
+      definition.role + ' declares skillCapabilities');
+    ['discover', 'run', 'create'].forEach(capability => {
+      t.equal(typeof definition.skillCapabilities[capability], 'boolean',
+        definition.role + '.' + capability + ' is an explicit boolean, not an omission');
+    });
+  });
+  t.end();
+});
+
+test('an unregistered role gets no skill access at all', t => {
+  const capabilities = registry.skillCapabilitiesFor('not-a-real-role');
+  t.deepEqual(capabilities, { discover: false, run: false, create: false },
+    'an unknown role cannot discover, run, or author skills');
+  t.end();
+});
+
+// ── Guidance exists for every role, and is pull-based rather than a ritual ─────
+
+test('every role prompt explains skills, including the three that never mentioned them', t => {
+  ROLES.forEach(mode => {
+    const prompt = promptFor(mode);
+    t.ok(/SKILLS — REUSABLE PROCEDURES|SKILL REGISTRY GUIDANCE/.test(prompt),
+      mode + ' prompt has a skills section');
+    t.ok(/discover_skills/.test(prompt) && /run_skill/.test(prompt),
+      mode + ' prompt names the tools it can actually call');
+  });
+  t.end();
+});
+
+test('skill lookup is pull-based by task shape, not a check-before-every-task ritual', t => {
+  ROLES.forEach(mode => {
+    const prompt = promptFor(mode);
+    t.ok(/not a ritual/i.test(prompt), mode + ' is told explicitly that lookup is not a ritual');
+    t.ok(/[Dd]o not call discover_skills before every/.test(prompt),
+      mode + ' is told not to call discover_skills before every task');
+    t.notOk(/Before starting a complex or repetitive task, call discover_skills/.test(prompt),
+      mode + ' no longer carries the old always-check-first wording');
+  });
+  t.end();
+});
+
+test('the authoring bar is stated as value over a fresh turn, not as a filing habit', t => {
+  const coder = promptFor('coder');
+  t.ok(/as reliably, cheaply, and consistently/i.test(coder),
+    'Coder is given the actual bar for authoring a skill');
+  t.ok(/procedural memory/i.test(coder),
+    'and is told a skill is permanent procedural memory rather than a note');
+  t.ok(/Wrapping a single tool call/i.test(coder),
+    'a single-tool-call wrapper is explicitly disqualified');
+  ROLES.forEach(mode => {
+    const prompt = promptFor(mode);
+    t.ok(/as reliably, cheaply, and consistently/i.test(prompt),
+      mode + ' is given the same authoring bar, since every role can author');
+    t.ok(/procedural memory/i.test(prompt),
+      mode + ' is told a skill is permanent procedural memory');
+    t.notOk(/cannot author skills/i.test(prompt),
+      mode + ' is not told it cannot author, which is no longer true');
+  });
+  t.end();
+});
+
+test('the post-task authoring nudge is gated on real capability, not on a role name', t => {
+  const agentSource = require('fs').readFileSync(require('path').join(__dirname, '..', 'agent.js'), 'utf8');
+  t.ok(agentSource.includes("const canAuthorSkills = skillToolsFor(runMode).has('create_skill')"),
+    'the nudge asks whether this role may author');
+  t.ok(agentSource.includes('if (canAuthorSkills && !bestVisibleAnswer && !skillGateFired'),
+    'and gates on that, so a role that loses create_skill is never nudged toward a tool it cannot see');
+  // Today every role can author, so the gate is open for all of them - but it stays capability-driven
+  // so revoking create for a role cannot leave a dangling nudge behind.
+  ROLES.forEach(mode => {
+    t.equal(registry.skillCapabilitiesFor(mode).create, true, mode + ' may author, so the nudge applies');
+  });
+  t.end();
+});
+
+test('an authored skill records who made it and what prompted it', t => {
+  const ipcSource = require('fs').readFileSync(require('path').join(__dirname, '..', 'lib', 'ipc-skill.js'), 'utf8');
+  t.ok(/createdByRole:/.test(ipcSource), 'the manifest records the authoring role');
+  t.ok(/sourceTask:/.test(ipcSource), 'and the work that prompted it');
+  t.ok(/testProvidedByAuthor:/.test(ipcSource),
+    'and whether a real test was supplied rather than the generated default');
+  const agentSource = require('fs').readFileSync(require('path').join(__dirname, '..', 'agent.js'), 'utf8');
+  t.ok(/authorRole: String\(\(conversation && conversation\.mode\)/.test(agentSource),
+    'agent.js passes the calling role through so provenance is not self-reported by the model');
+  t.end();
+});
+
+// ── The machinery under it actually works ─────────────────────────────────────
+
+test('registered skills execute, so discover/run are not pointing at nothing', async t => {
+  const manifests = skillLoader.getSkillManifests();
+  t.ok(Array.isArray(manifests) && manifests.length > 0, 'the registry lists skills');
+  manifests.forEach(manifest => {
+    t.ok(manifest.name && manifest.group && manifest.description,
+      manifest.name + ' carries the metadata discovery matches against');
+  });
+  const result = await skillLoader.runSkill('word-count', { text: 'hello there world. and again!' });
+  t.equal(result.wordCount, 5, 'a registered skill runs and returns its declared output');
+  t.equal(result.sentenceCount, 2, 'and the rest of its output contract holds');
+  t.end();
+});
+
+// ── The authoring gate is a smoke check, and must at least be a real one ───────
+
+test('a test that never loads the skill is rejected, so a passing test means something', async t => {
+  const handlers = {};
+  require('../lib/ipc-skill').registerHandlers({ handle: (name, fn) => { handlers[name] = fn; } });
+  const fs = require('fs');
+  const path = require('path');
+  const skillDir = path.join(__dirname, '..', 'skills', 'utility', 'zz-gate-regression');
+  // skills/registry.json is a TRACKED file and this test registers into it. Snapshot the raw bytes
+  // and restore them verbatim rather than reconstructing the JSON: re-serializing would rewrite
+  // formatting and trailing-newline state even when the entries match, leaving the repo dirty after
+  // a green test run, and a crash mid-test could otherwise leave a probe skill committed.
+  const registryPath = path.join(__dirname, '..', 'skills', 'registry.json');
+  const registrySnapshot = fs.readFileSync(registryPath);
+  t.teardown(() => {
+    try { fs.rmSync(skillDir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
+    try { fs.writeFileSync(registryPath, registrySnapshot); } catch (_) { /* best effort */ }
+  });
+
+  const implementation = 'module.exports = async function(inputs){ return { doubled: (inputs.n || 0) * 2 }; };';
+  const base = { name: 'zz-gate-regression', group: 'utility', description: 'Gate regression probe.', implementation, authorRole: 'researcher' };
+
+  const trivial = await handlers['orion:create-skill'](null, {
+    ...base,
+    test: 'const assert = require("assert"); assert.ok(true); console.log("passed");'
+  });
+  t.equal(trivial.success, false, 'a test that asserts nothing about the skill is refused');
+  t.match(String(trivial.error || ''), /must exercise the skill/i, 'and says why');
+  t.notOk(fs.existsSync(skillDir), 'the rejected skill leaves nothing behind on disk');
+
+  const real = await handlers['orion:create-skill'](null, {
+    ...base,
+    test: 'const s = require("./index.js"); const a = require("assert"); s({ n: 4 }).then(r => { a.strictEqual(r.doubled, 8); });'
+  });
+  t.equal(real.success, true, 'a test that actually runs the skill is accepted');
+  t.equal(real.manifest.version, '1.0.0', 'a first registration is 1.0.0');
+  t.equal(real.manifest.createdByRole, 'researcher', 'provenance records the authoring role');
+
+  // Re-authoring is a new version of the same skill, not a silent in-place overwrite.
+  const second = await handlers['orion:create-skill'](null, {
+    ...base,
+    description: 'Gate regression probe, revised.',
+    authorRole: 'coder',
+    test: 'const s = require("./index.js"); const a = require("assert"); s({ n: 5 }).then(r => { a.strictEqual(r.doubled, 10); });'
+  });
+  t.equal(second.success, true, 're-authoring succeeds');
+  t.equal(second.manifest.version, '1.0.1', 'and bumps the version instead of overwriting 1.0.0');
+  t.equal(second.manifest.previousVersion, '1.0.0', 'recording what it replaced');
+  t.equal(second.manifest.createdByRole, 'coder', 'and who replaced it');
+  t.end();
+});

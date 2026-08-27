@@ -101,7 +101,8 @@ INCIDENTAL OBSERVATIONS:
 - Do not record style concerns, generic missing tests, minor duplication, TODOs, broad refactors, alternative architecture preferences, or anything mainly phrased as could/might/consider.
 - Incidental observations are silent until the final handoff unless continuing would risk immediate data loss or corruption.
 
-SKILL REGISTRY GUIDANCE: The skill registry is a library of reusable, tested capabilities. Before starting a complex or repetitive task, call discover_skills to check if a relevant skill already exists. If a task requires a capability that doesn't exist yet and would be useful in the future, use create_skill to author it — provide the JS implementation and a test that exits 0 on success. Skills are stored persistently and shared across all conversations.
+SKILL REGISTRY GUIDANCE: The skill registry stores reusable, tested PROCEDURES — a known sequence of steps with its setup knowledge, tool ordering, verification criteria, recovery behavior, and result contract. It is not a utility library, and checking it is not a ritual: do not call discover_skills before every task. Call it when the work in front of you has the shape of something that has been done before — a recurring multi-step procedure, a workflow with an established order and its own definition of done. Then execute the match with run_skill instead of rebuilding the procedure from scratch. If nothing matches, just do the work.
+The bar for authoring one with create_skill is the same question in reverse: what would a saved skill do that a fresh turn plus ordinary tools does not already do as reliably, cheaply, and consistently? Wrapping a single tool call, or anything you can do inline, fails that bar and should not be a skill. A procedure that took several passes to get right, encodes environment knowledge or verification criteria, and will recur, passes it. Provide the JS implementation and a test that exits 0 on success. Skills are permanent and shared across every conversation, so treat authoring one as writing procedural memory rather than as taking a note.
 
 MEMORY PROTOCOL:
 - SESSION START: When a workspace is active, call recall_memory with scope="all" to load project context and orient yourself before responding. Also note: \`.orion/rules.md\` is automatically pre-loaded into your context as [PROJECT GOTCHAS & RULES] — you do NOT need to read it manually, but you MUST follow it. To get project notes from prior sessions, use the read_notes tool (reads \`.orion/project-notes.md\`).
@@ -159,6 +160,12 @@ At the start of a conversation, call recall_memory with scope="global" to orient
 TOOL USE:
 ${OrionOperatingContract.TOOL_SCHEMA_NOTE} In Dispatch, use read/search/memory/workspace/handoff tools when available. You may capture and attach the browser worker, but you still cannot edit files, run commands, capture or control the native desktop, or produce other local artifacts yourself. Send code, project, and artifact work to Coder; send native desktop, application, process, and screen-control work to Operator; send real multi-step investigation and cross-sourced research to Researcher.
 
+SKILLS — REUSABLE PROCEDURES:
+- The skill registry holds saved multi-step procedures: an established order of operations with its own setup knowledge, verification criteria, and definition of done. You own the mission, so you should know when a reusable procedure already exists for it.
+- This is not a ritual. Do not call discover_skills before every request. Call it when what Jason is asking for has the shape of something already done before — a recurring workflow rather than a one-off — and then either run the matching skill yourself with run_skill or tell the specialist you hand off to that the skill exists.
+- If nothing matches, proceed normally. A missing skill is never a blocker.
+- You can author one with create_skill when a procedure proves itself, but the bar is high: what would a saved skill do that a fresh turn plus ordinary tools does not already do as reliably, cheaply, and consistently? Wrapping a single tool call, or anything you can do inline, fails that bar. A procedure that took several passes to get right, encodes setup knowledge or verification criteria, and will recur, passes it. A skill is permanent and shared across every conversation, so treat authoring one as writing procedural memory rather than as taking a note.
+
 DATABASE QUERIES (db_query):
 ${OrionOperatingContract.DB_QUERY_CORE}
 - If Jason asks for data, use this tool rather than routing to Coder just to run a SELECT.
@@ -192,6 +199,12 @@ Your goal is to carry out the requested action or sequence of actions with preci
 VOICE AND IDENTITY:
 - Own being Orion. Speak in first person as Jason's local collaborator carrying out desktop and browser actions, not as a generic model reciting "I am an AI" disclaimers.
 - You are the specialist Dispatch hands real-world desktop/browser execution to, the same way it hands code work to Coder. Report back plainly what you did and what you actually observed — Jason is trusting you to act on his real screen and real browser sessions.
+
+SKILLS — REUSABLE PROCEDURES:
+- The skill registry holds saved multi-step procedures. For Operator these are application and browser workflows: the order to open things in, which controls to drive, what the finished state looks like, and how to clean up afterwards.
+- Not a ritual. Do not call discover_skills before every task. Call it when the request looks like a workflow that has been run before — a playtest, a recurring app routine, a browser procedure — and run the match with run_skill instead of rediscovering the sequence step by step.
+- If nothing matches, do the work normally. A missing skill is never a blocker.
+- You can author one with create_skill once a workflow proves itself — an app routine or playtest sequence you had to work out step by step, including the order, the settling waits, what the finished state looks like, and the cleanup. The bar: what would a saved skill do that a fresh turn plus ordinary tools does not already do as reliably, cheaply, and consistently? Wrapping a single tool call fails that bar. A skill is permanent and shared across every conversation, so treat authoring one as writing procedural memory rather than as taking a note.
 
 TOOL PREFERENCE — DOM BEFORE PIXELS:
 ${OrionOperatingContract.DOM_BEFORE_PIXEL_CONTROL}
@@ -290,6 +303,12 @@ TASK COMPLETION:
 
 FOLLOW-UP TIMERS:
 - If you say you will check back or continue after a delay, you MUST call "schedule_followup" — do not merely say you will wait. Use "watch_condition" for "tell me when X happens" instead of polling manually. Both are durable and survive restarts; a run may fire late after the machine slept, so re-observe current state when it does rather than assuming no time passed.
+
+SKILLS — REUSABLE PROCEDURES:
+- The skill registry holds saved multi-step procedures. For research these are investigation recipes: which sources to consult and in what order, how to cross-check them, and what a defensible answer has to include.
+- Not a ritual. Do not call discover_skills before every question. Call it when the investigation has the shape of one already run before — a recurring comparison, a standing review, a repeated evidence-gathering pass — and run the match with run_skill rather than rebuilding the method.
+- If nothing matches, investigate normally. A missing skill is never a blocker.
+- You can author one with create_skill once a method proves itself — a source set worth consulting in a particular order, a cross-checking routine, the criteria a defensible answer has to meet. The bar: what would a saved skill do that a fresh turn plus ordinary tools does not already do as reliably, cheaply, and consistently? Wrapping a single search fails that bar. A skill is permanent and shared across every conversation, so treat authoring one as writing procedural memory rather than as taking a note.
 
 TOOL USE:
 - ${OrionOperatingContract.TOOL_SCHEMA_NOTE}
@@ -1924,7 +1943,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   // path for a claim this coarse), and deliberately non-blocking: a conflict here is logged as a
   // visible warning rather than aborting the run, since a workspace collision is recoverable
   // (sequential writes) in a way a literal desktop/browser collision is not.
-  if ((activeConversationMode === 'coder' || activeConversationMode === 'operator') && workspacePath
+  // Every registered specialist doing workspace-bound work claims this, not a hand-maintained pair.
+  // The pair was never "roles that can edit" — Operator cannot edit the workspace either — it was
+  // "roles whose run is bound to a project", which Researcher also is now that change_workspace
+  // binds its projectPath. The claim is non-blocking (a conflict is a visible warning, not an
+  // abort), so including a read-only role can surface a collision but never break its run.
+  if (OrionSpecialistRegistry && OrionSpecialistRegistry.has(activeConversationMode) && workspacePath
       && window.api && typeof window.api.acquireResourceLease === 'function') {
     try {
       const workspaceLease = await window.api.acquireResourceLease({
@@ -3921,9 +3945,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         }
         // Skill creation nudge: after a multi-step task (5+ tool calls) that didn't already
         // create a skill, prompt Orion to consider whether any reusable capability emerged.
+        // Only for a role the registry actually lets author skills — spending a model turn telling
+        // Dispatch, Operator or Researcher to call create_skill would nudge them toward a tool they
+        // cannot see, which costs a turn and teaches nothing.
+        const canAuthorSkills = skillToolsFor(runMode).has('create_skill');
         const didMultiStepWork = !reviewOnly && workWalkthrough.filter(i => i && i.status !== 'error').length >= 5;
         const alreadyCreatedSkill = workWalkthrough.some(i => i && i.toolName === 'create_skill');
-        if (!bestVisibleAnswer && !skillGateFired && didMultiStepWork && !alreadyCreatedSkill && !isGenericNonAnswer(textVal) && loopCount < maxLoops) {
+        if (canAuthorSkills && !bestVisibleAnswer && !skillGateFired && didMultiStepWork && !alreadyCreatedSkill && !isGenericNonAnswer(textVal) && loopCount < maxLoops) {
           skillGateFired = true;
           currentAgentLogs.push({ type: 'thought', content: 'Skill gate: multi-step task completed; nudging Orion to consider packaging a reusable skill.' });
           messages.push({
@@ -7908,7 +7936,12 @@ async function executeTool(name, args, workspace, config, conversation, executio
         inputs: args.inputs || {},
         outputs: args.outputs || {},
         implementation: args.implementation,
-        test: args.test || null
+        test: args.test || null,
+        // Provenance: every role can author skills, so the manifest records which one did and what
+        // work prompted it. Without this a registry of model-authored procedures becomes a pile of
+        // recipes nobody can trace back to a real task.
+        authorRole: String((conversation && conversation.mode) || '').toLowerCase(),
+        sourceTask: String(args.sourceTask || (conversation && conversation.title) || '')
       });
       if (!result.success) throw new Error(result.error || 'create_skill failed');
       return { success: true, manifest: result.manifest, message: `Skill '${args.name}' created and registered.` };
@@ -12568,6 +12601,25 @@ const AGENT_HANDOFF_IMPLEMENTATIONS = {
 // handoff tool (today: handoff_to_coder, handoff_to_operator, handoff_to_researcher) with no
 // exclusion. A new specialist role added to the registry becomes callable from Dispatch
 // automatically, without this allowlist needing a matching edit.
+// Maps each skill-registry capability to the tool that performs it. The registry decides which of
+// these a role may see; this is only the capability -> tool-name mapping.
+const SKILL_TOOL_BY_CAPABILITY = Object.freeze({
+  discover: 'discover_skills',
+  run: 'run_skill',
+  create: 'create_skill'
+});
+const ALL_SKILL_TOOL_NAMES = Object.freeze(Object.values(SKILL_TOOL_BY_CAPABILITY));
+
+function skillToolsFor(mode) {
+  const capabilities = OrionSpecialistRegistry && typeof OrionSpecialistRegistry.skillCapabilitiesFor === 'function'
+    ? OrionSpecialistRegistry.skillCapabilitiesFor(mode)
+    : null;
+  if (!capabilities) return new Set();
+  return new Set(Object.entries(SKILL_TOOL_BY_CAPABILITY)
+    .filter(([capability]) => capabilities[capability] === true)
+    .map(([, toolName]) => toolName));
+}
+
 const DISPATCH_TOOL_ALLOWLIST = new Set([
   'recall_memory', 'remember_fact', 'remember_preference',
   'google_search', 'fetch_web_page', 'fetch_api_docs', 'search_api_docs',
@@ -13636,15 +13688,21 @@ function buildAgentToolDeclarations() {
   const gatedTools = activeToolGateProfile && activeToolGateProfile.inspectionOnlyIntent
     ? gateFilteredTools.filter(tool => UNRESOLVED_INTENT_INSPECTION_TOOLS.has(tool.name))
     : gateFilteredTools;
+  // Skill-tool visibility is a registry capability, not a fourth hand-maintained allowlist. Before
+  // this, the three inclusion lists all omitted the skill tools while Coder's exclusion-set shape
+  // handed it all three by pure omission - so the only role that could use skills was the one
+  // nobody had decided should, and Dispatch, which owns the mission, could not even see that a
+  // reusable procedure existed.
+  const permittedSkillTools = skillToolsFor(activeConversationMode);
   if (activeConversationMode === 'orion') {
-    return gatedTools.filter(tool => DISPATCH_TOOL_ALLOWLIST.has(tool.name));
+    return gatedTools.filter(tool => DISPATCH_TOOL_ALLOWLIST.has(tool.name) || permittedSkillTools.has(tool.name));
   }
   if (activeConversationMode !== 'orion') OrionSpecialistRegistry.requireRole(activeConversationMode);
   if (activeConversationMode === 'operator') {
-    return gatedTools.filter(tool => OPERATOR_TOOL_ALLOWLIST.has(tool.name));
+    return gatedTools.filter(tool => OPERATOR_TOOL_ALLOWLIST.has(tool.name) || permittedSkillTools.has(tool.name));
   }
   if (activeConversationMode === 'researcher') {
-    return gatedTools.filter(tool => RESEARCHER_TOOL_ALLOWLIST.has(tool.name));
+    return gatedTools.filter(tool => RESEARCHER_TOOL_ALLOWLIST.has(tool.name) || permittedSkillTools.has(tool.name));
   }
   if (activeConversationMode === 'coder') {
     // Coder's tool list has always been built as an exclusion set (everything except these three
@@ -13657,7 +13715,10 @@ function buildAgentToolDeclarations() {
     // OTHER specialist (operator, researcher) remains available the same way it always was.
     const excludedTools = [
       'open_application', 'click_ui_element', 'open_chrome_favorite',
-      OrionSpecialistRegistry.handoffToolNameForRole('coder')
+      OrionSpecialistRegistry.handoffToolNameForRole('coder'),
+      // Skill tools are no longer inherited by omission: Coder keeps exactly the skill operations
+      // the registry grants it, the same as every other role.
+      ...ALL_SKILL_TOOL_NAMES.filter(name => !permittedSkillTools.has(name))
     ];
     return gatedTools.filter(tool => !excludedTools.includes(tool.name));
   }
