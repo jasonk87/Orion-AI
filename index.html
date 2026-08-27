@@ -3,6 +3,44 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!--
+    Content Security Policy for the desktop renderer.
+
+    Why this matters here specifically: window.api exposes an enormous privileged IPC surface —
+    shell execution, file mutation, desktop control, skill creation. The renderer is already
+    hardened (context isolation on, node integration off, raw markdown HTML escaped, link schemes
+    filtered), but it renders MODEL-AUTHORED content, so an XSS would inherit all of that. This is
+    the layer that makes injected script inert rather than merely unlikely.
+
+    script-src is genuinely strict: 'self' plus a hash for the one inline block below (the crash
+    trap, which must run before any app script). No 'unsafe-inline' and no 'unsafe-eval' — the
+    three inline onclick= attributes that would have forced 'unsafe-inline' were converted to a
+    delegated listener in renderer.js. If the crash trap is ever edited, this hash must be
+    recomputed or the app will boot with no crash reporting; tests/test_content_security_policy.js
+    fails loudly when they drift apart.
+
+    connect-src lists exactly the model endpoints the RENDERER itself calls. Everything else —
+    web search, page fetching, embeddings, the browser worker — goes through IPC to the main
+    process and needs no allowance here.
+
+    style-src keeps 'unsafe-inline' because the renderer sets style attributes throughout for
+    dynamic layout. That is a real concession, but injected CSS cannot reach window.api the way
+    injected script can.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="
+    default-src 'self';
+    script-src 'self' 'sha256-HW1ljP0J8WSfrKfMbYlwX6Y9z5s8AYfO68Wh+oaRje4=';
+    style-src 'self' 'unsafe-inline';
+    img-src 'self' data:;
+    font-src 'self' data:;
+    media-src 'self' data:;
+    connect-src 'self' https://generativelanguage.googleapis.com https://api.anthropic.com https://api.deepseek.com http://localhost:11434;
+    object-src 'none';
+    frame-src 'none';
+    worker-src 'none';
+    base-uri 'none';
+    form-action 'none';
+  ">
   <title>Orion AI</title>
   <!-- Google Fonts for premium typography -->
   <link rel="stylesheet" href="node_modules/prismjs/themes/prism-tomorrow.min.css">

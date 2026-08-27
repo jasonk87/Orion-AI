@@ -5256,7 +5256,7 @@ function formatDispatchToolActivity(logs = [], isRunning = false) {
     : `Worked through ${stepCount} step${stepCount === 1 ? '' : 's'}`;
   return `
     <div class="agent-logs-container dispatch-activity-log${status === 'error' ? ' error' : ''}">
-      <div class="agent-logs-header" onclick="toggleLogs(this)">
+      <div class="agent-logs-header">
         <span class="dispatch-current-tool${isRunning ? ' running' : ''}"><span class="dispatch-tool-pulse"></span>${headerLabel}</span>
         <span>▼</span>
       </div>
@@ -5306,7 +5306,7 @@ function renderDispatchWalkthroughPanel(walkthroughText) {
   `).join('');
   return `
     <div class="agent-logs-container dispatch-activity-log">
-      <div class="agent-logs-header" onclick="toggleLogs(this)">
+      <div class="agent-logs-header">
         <span>Work walkthrough · ${rows.length} item${rows.length === 1 ? '' : 's'}</span>
         <span>▼</span>
       </div>
@@ -6697,7 +6697,7 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
     
     logsHtml = `
       <div class="agent-logs-container">
-        <div class="agent-logs-header" onclick="toggleLogs(this)">
+        <div class="agent-logs-header">
           <span>🤖 Execution Logs (${logs.length} operations)</span>
           <span>${arrowSymbol}</span>
         </div>
@@ -6978,6 +6978,14 @@ function renderAiMessage(text, logs = [], conversationId = null, msgMeta = null)
 }
 
 // LOG TOGGLING HELPER
+// Delegated instead of an inline onclick= attribute. Inline handlers are script for CSP purposes,
+// so keeping them would have forced script-src to allow unsafe-inline, which is most of what a
+// CSP is there to prevent in a renderer that renders model-authored markdown.
+document.addEventListener('click', event => {
+  const header = event.target && event.target.closest && event.target.closest('.agent-logs-header');
+  if (header) window.toggleLogs(header);
+});
+
 window.toggleLogs = function(headerElement) {
   const body = headerElement.nextElementSibling;
   const arrow = headerElement.querySelector('span:last-child');
