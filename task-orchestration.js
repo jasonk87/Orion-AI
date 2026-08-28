@@ -285,18 +285,38 @@
     return messages.slice(-14);
   }
 
+  // A handoff packet carries EVIDENCE, not chatter. The objective, requirements, constraints and
+  // unresolved decisions are the specialist's actual brief; this field exists only to resolve
+  // referents the objective could not absorb ("that", "the one we discussed"), so it is a short
+  // excerpt rather than a transcript.
+  //
+  // It used to inline the last 14 messages up to 8000 characters verbatim. A real run handed
+  // Operator the entire preceding Dispatch conversation — release-notes discussion, branch
+  // commentary, security debate, and a stale claim the user had already corrected — in front of a
+  // task whose whole content was "read the DeepSeek balance from a browser favorite". That is paid
+  // for on every handoff, slows orientation, and invites the specialist to act on material that is
+  // no longer true.
+  const MAX_PRECEDING_SUMMARY_CHARS = 1200;
+  const MAX_PRECEDING_SUMMARY_MESSAGES = 4; // the last two exchanges
+  const MAX_PRECEDING_MESSAGE_CHARS = 300;
+
   function buildPrecedingSummary(input, messages) {
     const explicit = compactWhitespace(input.precedingConversationSummary || input.contextSummary || '');
-    if (explicit) return explicit.slice(0, 8000);
+    // An explicit summary was already distilled by the caller, but it is still capped: a caller
+    // passing a whole transcript through this field would reintroduce exactly the same bloat.
+    if (explicit) return explicit.slice(0, MAX_PRECEDING_SUMMARY_CHARS);
     const lines = [];
     let characters = 0;
-    for (const message of messages.slice().reverse()) {
+    for (const message of messages.slice(-MAX_PRECEDING_SUMMARY_MESSAGES).reverse()) {
       const normalizedRole = compactInline(message.role).toLowerCase();
       const role = ['assistant', 'model', 'orion'].includes(normalizedRole)
         ? 'Assistant'
         : (normalizedRole === 'user' ? 'User' : 'Context');
-      const line = `${role}: ${message.value}`;
-      if (characters + line.length > 8000) break;
+      const value = message.value.length > MAX_PRECEDING_MESSAGE_CHARS
+        ? `${message.value.slice(0, MAX_PRECEDING_MESSAGE_CHARS)}…`
+        : message.value;
+      const line = `${role}: ${value}`;
+      if (characters + line.length > MAX_PRECEDING_SUMMARY_CHARS) break;
       lines.unshift(line);
       characters += line.length + 1;
     }
