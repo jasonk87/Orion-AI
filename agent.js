@@ -5574,6 +5574,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       const notification = buildRunEndNotification({
         conversation,
         finalizedTaskState,
+        runExitDisposition,
         criticalRunError,
         autoContinueExecution,
         ranOutOfLoopBudget,
@@ -11811,13 +11812,18 @@ function firstClarifyingQuestionText(clarification) {
 
 function buildRunEndNotification(context = {}) {
   const {
-    conversation, finalizedTaskState, criticalRunError, autoContinueExecution,
-    ranOutOfLoopBudget, forceYield, forcedYieldFailure, lastTextResponse
+    conversation, finalizedTaskState, runExitDisposition, criticalRunError,
+    forcedYieldFailure, lastTextResponse
   } = context;
 
-  // A mid-plan continuation is still working — notifying here would buzz repeatedly through a
-  // long task and train you to ignore it.
-  if (finalizedTaskState === 'pending' || autoContinueExecution) return null;
+  // The durable registry may win a cancellation/completion race after the pass disposition was
+  // resolved. Preserve its canonical state while retaining the structured pending reason.
+  const effectiveDisposition = {
+    ...(runExitDisposition && typeof runExitDisposition === 'object' ? runExitDisposition : {}),
+    state: finalizedTaskState || (runExitDisposition && runExitDisposition.state) || ''
+  };
+  const notificationPolicy = RunExitDisposition.resolveRunNotificationPolicy(effectiveDisposition);
+  if (!notificationPolicy.notify) return null;
 
   const clip = (value, max) => String(value == null ? '' : value).replace(/\s+/g, ' ').trim().slice(0, max);
   const taskTitle = clip((conversation && conversation.title) || '', 48);
@@ -11826,36 +11832,33 @@ function buildRunEndNotification(context = {}) {
   let body = '';
   let kind = 'ended';
 
-  if (finalizedTaskState === 'cancelled') {
+  if (notificationPolicy.kind === 'cancelled') {
     kind = 'cancelled';
     body = 'Agent stopped.';
-  } else if (finalizedTaskState === 'failed' || criticalRunError) {
+  } else if (notificationPolicy.kind === 'failed') {
     kind = 'failed';
     const detail = clip(criticalRunError && (criticalRunError.message || criticalRunError), 110);
     body = detail ? `Task failed: ${detail}` : 'Task failed. Open Orion for the recorded error.';
-  } else if (ranOutOfLoopBudget) {
+  } else if (notificationPolicy.kind === 'action-limit') {
     kind = 'action-limit';
     body = 'Hit action limit — ask Orion to continue.';
-  } else if (forceYield) {
-    // The three reasons a run pauses for you, each answerable from the notification text.
+  } else if (notificationPolicy.kind === 'question') {
     const clarification = conversation && conversation.awaitingClarification;
-    if (clarification) {
-      kind = 'question';
-      const question = clip(firstClarifyingQuestionText(clarification), 130);
-      body = question ? `Question: ${question}` : 'Orion asked a clarifying question.';
-    } else if (conversation && conversation.awaitingPlanApproval) {
-      kind = 'plan-approval';
-      body = 'Plan ready for your approval.';
-    } else if (forcedYieldFailure) {
-      kind = 'repeated-failure';
-      const tool = clip(forcedYieldFailure.toolName || 'a tool', 40);
-      const count = Number(forcedYieldFailure.failureCount) || 3;
-      body = `Paused: ${tool} failed ${count}x. ${clip(forcedYieldFailure.error, 90)}`.trim();
-    } else {
-      kind = 'paused';
-      body = 'Paused — needs your input.';
-    }
-  } else if (finalizedTaskState === 'completed') {
+    kind = 'question';
+    const question = clip(firstClarifyingQuestionText(clarification), 130);
+    body = question ? `Question: ${question}` : 'Orion asked a clarifying question.';
+  } else if (notificationPolicy.kind === 'plan-approval') {
+    kind = 'plan-approval';
+    body = 'Plan ready for your approval.';
+  } else if (notificationPolicy.kind === 'repeated-failure') {
+    kind = 'repeated-failure';
+    const tool = clip(forcedYieldFailure && forcedYieldFailure.toolName || 'a tool', 40);
+    const count = Number(forcedYieldFailure && forcedYieldFailure.failureCount) || 3;
+    body = `Paused: ${tool} failed ${count}x. ${clip(forcedYieldFailure && forcedYieldFailure.error, 90)}`.trim();
+  } else if (notificationPolicy.kind === 'paused') {
+    kind = 'paused';
+    body = 'Paused — needs your input.';
+  } else if (notificationPolicy.kind === 'completed') {
     kind = 'completed';
     body = clip(lastTextResponse, 120) || 'Task complete';
   } else {

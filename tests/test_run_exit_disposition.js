@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { resolveRunExitDisposition } = require('../run-exit-disposition');
+const { resolveRunExitDisposition, resolveRunNotificationPolicy } = require('../run-exit-disposition');
 
 test('task-owned scheduled work keeps an execution pass pending', t => {
   const schedule = {
@@ -52,6 +52,69 @@ test('existing nonterminal reasons keep their established policies', t => {
     'plan approval stays pending');
   t.equal(resolveRunExitDisposition({ awaitingClarification: true }).reasonCode, 'awaiting_clarification',
     'clarification stays pending');
+  t.end();
+});
+
+test('user-attention reasons outrank stale background continuation signals', t => {
+  t.equal(
+    resolveRunExitDisposition({ awaitingClarification: true, automaticContinuation: true }).reasonCode,
+    'awaiting_clarification',
+    'a clarifying question cannot be hidden by auto-continuation'
+  );
+  t.equal(
+    resolveRunExitDisposition({ awaitingPlanApproval: true, scheduledFollowup: {
+      scheduleId: 'schedule-plan', sourceTaskId: 'task-plan'
+    } }).reasonCode,
+    'awaiting_plan_approval',
+    'plan approval cannot be hidden by a scheduled follow-up'
+  );
+  t.equal(
+    resolveRunExitDisposition({ repeatedToolFailure: true, delegatedChildTaskId: 'child-1' }).reasonCode,
+    'repeated_tool_failure',
+    'an actionable repeated failure cannot be hidden by delegated work'
+  );
+  t.equal(
+    resolveRunExitDisposition({
+      awaitingClarification: { questions: [{ question: 'Which device?' }] }
+    }).reasonCode,
+    'awaiting_clarification',
+    'the structured clarification shape used by the real conversation is recognized'
+  );
+  t.equal(
+    resolveRunExitDisposition({ awaitingClarification: {} }).reasonCode,
+    'mission_complete',
+    'an arbitrary truthy object cannot manufacture a clarification boundary'
+  );
+  t.end();
+});
+
+test('notification policy distinguishes user attention from background pending work', t => {
+  const question = resolveRunNotificationPolicy(resolveRunExitDisposition({ awaitingClarification: true }));
+  t.deepEqual(
+    question,
+    { notify: true, kind: 'question', reasonCode: 'awaiting_clarification', state: 'pending' },
+    'clarification is pending and still notifies'
+  );
+
+  const approval = resolveRunNotificationPolicy(resolveRunExitDisposition({ awaitingPlanApproval: true }));
+  t.equal(approval.kind, 'plan-approval', 'plan approval is actionable');
+  t.equal(approval.notify, true, 'plan approval notifies');
+
+  const scheduled = resolveRunNotificationPolicy(resolveRunExitDisposition({
+    scheduledFollowup: { scheduleId: 'schedule-2', sourceTaskId: 'task-2' }
+  }));
+  t.equal(scheduled.notify, false, 'scheduled continuation stays silent');
+
+  const automatic = resolveRunNotificationPolicy(resolveRunExitDisposition({ automaticContinuation: true }));
+  t.equal(automatic.notify, false, 'automatic continuation stays silent');
+
+  const completed = resolveRunNotificationPolicy(resolveRunExitDisposition({}));
+  t.equal(completed.notify, true, 'terminal completion notifies');
+  t.equal(completed.kind, 'completed', 'terminal completion keeps its state');
+
+  const unknownPending = resolveRunNotificationPolicy({ state: 'pending', reasonCode: 'new_manual_boundary', resumePolicy: 'manual' });
+  t.equal(unknownPending.notify, true, 'unknown manual pending work fails toward user visibility');
+  t.equal(unknownPending.kind, 'paused', 'unknown manual pending work has an explicit presentation');
   t.end();
 });
 

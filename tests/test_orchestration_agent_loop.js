@@ -3559,6 +3559,73 @@ test('repeated execution failure parks the same task pending with an honest fina
   t.end();
 });
 
+test('a real clarification pass stays pending and sends the actionable question to the phone', async t => {
+  const originalFetch = global.fetch;
+  const finalized = [];
+  const notifications = [];
+  installHarness([
+    [{
+      functionCall: {
+        name: 'ask_clarifying_questions',
+        args: {
+          intro: 'One decision before I continue:',
+          questions: [{
+            header: 'Delivery',
+            question: 'Should I notify both paired phones?',
+            options: [
+              { label: 'Both phones', description: 'Notify every paired phone.', recommended: true },
+              { label: 'This phone', description: 'Notify only the current phone.' }
+            ]
+          }]
+        }
+      }
+    }]
+  ], {
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\OrionAI',
+    api: {
+      notifyPhone: async (title, body, context) => {
+        notifications.push({ title, body, context });
+        return { success: true, phone: { success: true, sent: 1 } };
+      }
+    },
+    window: {
+      claimOrchestrationTask: async taskId => ({
+        success: true,
+        task: { taskId, status: 'active', execution: { executionId: 'exec-clarification-notification' } },
+        prompt: 'Resolve notification delivery behavior.'
+      }),
+      finalizeOrchestrationTask: async (taskId, status, details) => {
+        finalized.push({ taskId, status, details });
+        return { taskId, status };
+      },
+      onOrchestrationTaskCheckpointed: async () => {}
+    }
+  });
+  const conv = conversation('clarification-notification-task', {
+    mode: 'coder',
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects\\OrionAI',
+    planApproved: true
+  });
+  try {
+    await global.window.runAgentLoop(
+      'Resolve notification delivery behavior.',
+      'gemini-1',
+      conv,
+      { taskId: 'task-clarification-notification' }
+    );
+
+    t.equal(finalized.length, 1, 'the execution pass records one durable transition');
+    t.equal(finalized[0].status, 'pending', 'the mission remains pending while waiting for an answer');
+    t.equal(finalized[0].details.reasonCode, 'awaiting_clarification', 'the actionable reason stays structured');
+    t.equal(notifications.length, 1, 'the actionable pending state emits one phone notification');
+    t.match(notifications[0].body, /Should I notify both paired phones\?/, 'the real question reaches the phone');
+    t.notOk(/completed/i.test(notifications[0].body), 'the checkpoint is never presented as completion');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
 test('Dispatch loop preserves open and mergeable PR status without claiming merged', async t => {
   const originalFetch = global.fetch;
   installHarness([

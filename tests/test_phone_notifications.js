@@ -14,13 +14,22 @@ const sinon = require('sinon');
 global.window = global.window || {};
 global.fetch = global.fetch || (async () => ({ ok: false }));
 const agent = require('../agent.js');
+const { resolveRunExitDisposition } = require('../run-exit-disposition');
 
 const build = (context) => agent.buildRunEndNotification(context);
+const buildResolved = (signals, context = {}) => {
+  const runExitDisposition = resolveRunExitDisposition(signals);
+  return build({
+    ...context,
+    finalizedTaskState: runExitDisposition.state,
+    runExitDisposition
+  });
+};
 
 // ── What the notification says ─────────────────────────────────────────────────
 
 test('a clarifying question puts the actual question on your phone', (t) => {
-  const note = build({
+  const note = buildResolved({ awaitingClarification: true }, {
     conversation: {
       title: 'Fix action palette availability',
       awaitingClarification: {
@@ -55,7 +64,7 @@ test('question extraction handles every shape the tool can produce', (t) => {
 });
 
 test('a plan waiting for approval says so', (t) => {
-  const note = build({
+  const note = buildResolved({ awaitingPlanApproval: true }, {
     conversation: { title: 'Add family last name tracking', awaitingPlanApproval: true },
     forceYield: true
   });
@@ -66,7 +75,7 @@ test('a plan waiting for approval says so', (t) => {
 });
 
 test('a repeated-failure pause names the tool and the error', (t) => {
-  const note = build({
+  const note = buildResolved({ repeatedToolFailure: true }, {
     conversation: { title: 'Sync VISION.md' },
     forceYield: true,
     forcedYieldFailure: { toolName: 'run_command', failureCount: 3, error: 'python is not recognized' }
@@ -78,8 +87,8 @@ test('a repeated-failure pause names the tool and the error', (t) => {
   t.end();
 });
 
-test('an unexplained pause still notifies rather than going silent', (t) => {
-  const note = build({ conversation: { title: 'Something' }, forceYield: true });
+test('an unexplained user pause still notifies rather than going silent', (t) => {
+  const note = buildResolved({ awaitingUser: true }, { conversation: { title: 'Something' }, forceYield: true });
   t.equal(note.kind, 'paused', 'falls back to the generic pause');
   t.ok(note.body, 'a notification is still produced');
   t.end();
@@ -103,16 +112,68 @@ test('terminal outcomes carry their result', (t) => {
   t.ok(/HTTP 400/.test(failed.body), 'the real error reaches the phone instead of "open Orion"');
 
   t.equal(build({ conversation: {}, finalizedTaskState: 'cancelled' }).kind, 'cancelled', 'a stop is classified');
-  t.equal(build({ conversation: {}, ranOutOfLoopBudget: true }).kind, 'action-limit', 'the action limit is classified');
+  t.equal(
+    buildResolved({ actionBoundary: true }, { conversation: {}, ranOutOfLoopBudget: true }).kind,
+    'action-limit',
+    'the action limit is classified'
+  );
   t.end();
 });
 
 test('a mid-plan continuation stays silent', (t) => {
   // Buzzing on every continuation of a long plan trains you to ignore the notifications.
-  t.equal(build({ conversation: { title: 'x' }, finalizedTaskState: 'pending' }), null,
-    'a pending continuation sends nothing');
-  t.equal(build({ conversation: { title: 'x' }, autoContinueExecution: true }), null,
-    'an auto-continue sends nothing');
+  t.equal(
+    buildResolved({
+      scheduledFollowup: { scheduleId: 'schedule-1', sourceTaskId: 'task-1', dueAt: Date.now() + 1000 }
+    }, { conversation: { title: 'x' } }),
+    null,
+    'a scheduled continuation sends nothing'
+  );
+  t.equal(
+    buildResolved({ automaticContinuation: true }, { conversation: { title: 'x' }, autoContinueExecution: true }),
+    null,
+    'an automatic continuation sends nothing'
+  );
+  t.end();
+});
+
+test('the real pending clarification disposition reaches the notification builder', (t) => {
+  const runExitDisposition = resolveRunExitDisposition({
+    awaitingClarification: true,
+    automaticContinuation: true
+  });
+  const note = build({
+    conversation: {
+      title: 'Clarify delivery',
+      awaitingClarification: {
+        questions: [{ question: 'Should I notify both devices?' }]
+      }
+    },
+    finalizedTaskState: runExitDisposition.state,
+    runExitDisposition,
+    autoContinueExecution: true,
+    forceYield: true
+  });
+
+  t.equal(runExitDisposition.state, 'pending', 'the durable task correctly remains pending');
+  t.equal(runExitDisposition.reasonCode, 'awaiting_clarification', 'user attention outranks stale auto-continuation state');
+  t.equal(note.kind, 'question', 'the production state combination emits a question notification');
+  t.match(note.body, /Should I notify both devices\?/, 'the actionable question reaches the phone');
+  t.end();
+});
+
+test('terminal completion cannot be silenced by a stale continuation flag', (t) => {
+  const runExitDisposition = resolveRunExitDisposition({});
+  const note = build({
+    conversation: { title: 'Finish release' },
+    finalizedTaskState: 'completed',
+    runExitDisposition,
+    autoContinueExecution: true,
+    lastTextResponse: 'Release finished and verified.'
+  });
+
+  t.equal(note.kind, 'completed', 'canonical completion still notifies');
+  t.match(note.body, /Release finished and verified/, 'the terminal result is preserved');
   t.end();
 });
 
