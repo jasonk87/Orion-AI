@@ -266,3 +266,48 @@ test('a test that never loads the skill is rejected, so a passing test means som
   t.equal(second.manifest.createdByRole, 'coder', 'and who replaced it');
   t.end();
 });
+
+// ── Proposal store durability ─────────────────────────────────────────────────
+// Same failure class as global memory: reading a malformed file as "an empty list" means the next
+// write persists that emptiness over real data. A first run legitimately has no file; a file that
+// exists but will not parse is a failure, not an absence.
+
+test('a malformed proposals file is never mistaken for an empty proposal list', t => {
+  const fs = require('fs');
+  const path = require('path');
+  const loader = require('../lib/skill-loader');
+  const proposalsPath = path.join(__dirname, '..', 'skills', 'proposals.json');
+  const existed = fs.existsSync(proposalsPath);
+  const snapshot = existed ? fs.readFileSync(proposalsPath) : null;
+  t.teardown(() => {
+    try {
+      if (existed) fs.writeFileSync(proposalsPath, snapshot);
+      else if (fs.existsSync(proposalsPath)) fs.unlinkSync(proposalsPath);
+    } catch (_) { /* best effort */ }
+  });
+
+  // A first run has no file at all, and must still work.
+  if (fs.existsSync(proposalsPath)) fs.unlinkSync(proposalsPath);
+  const firstRun = loader.recordSkillProposal({
+    name: 'zz-first-run-probe', description: 'Probe.', rationale: 'Probe rationale.', proposedByRole: 'researcher'
+  });
+  t.equal(firstRun.name, 'zz-first-run-probe', 'a missing file is a legitimate empty start');
+
+  // A file that exists but cannot be parsed is a failure.
+  fs.writeFileSync(proposalsPath, '{ this is not a proposals array ', 'utf8');
+  const damaged = fs.readFileSync(proposalsPath, 'utf8');
+  const read = loader.readSkillProposalsWithRecovery();
+  t.equal(read.proposals, null, 'the recovery read reports failure rather than an empty list');
+  t.ok(read.error, 'and carries the parse error');
+
+  let refused = false;
+  try {
+    loader.recordSkillProposal({ name: 'zz-must-not-write', description: 'x', rationale: 'y' });
+  } catch (error) {
+    refused = /Refusing to record a skill proposal/.test(error.message);
+  }
+  t.ok(refused, 'recording refuses rather than overwriting proposals it could not read');
+  t.equal(fs.readFileSync(proposalsPath, 'utf8'), damaged,
+    'and the damaged file is left byte-identical so it can be repaired or recovered');
+  t.end();
+});

@@ -601,8 +601,16 @@ async function autoSaveOrionMemory(conversation, config, workspacePath, mode) {
   const msgs = (conversation.messages || []).filter(m => m.role === 'user' || m.role === 'assistant');
   const watermark = readOrionMemoryWatermark(conversation);
   const pending = msgs.slice(watermark);
-  const userMsgCount = pending.filter(m => m.role === 'user').length;
-  if (userMsgCount < 2) return; // too little new material — nothing worth summarizing yet
+  // Eligible as soon as there is one COMPLETED exchange after the cursor: a user message that has
+  // actually been answered. Requiring two user messages starved the tail — a conversation whose
+  // last act was a single question and its answer stayed permanently unreviewed, because making it
+  // eligible needed a second future message that might never come. "Completed" rather than merely
+  // "present" is what keeps a half-typed turn from being summarized mid-flight.
+  const completedExchanges = pending.reduce((count, message, index) => {
+    if (message.role !== 'user') return count;
+    return pending.slice(index + 1).some(later => later.role === 'assistant') ? count + 1 : count;
+  }, 0);
+  if (completedExchanges < 1) return; // nothing answered yet — nothing worth summarizing
 
   orionMemoryExtractionInFlight.add(convId);
 
@@ -649,6 +657,7 @@ ${transcript}`;
     // open became a permanent global fact. An item whose scope the model could not judge is
     // dropped, because a mis-scoped memory is worse than a missing one.
     let stored = 0;
+    const persistenceFailures = [];
     for (const item of items) {
       if (!item || !item.text || String(item.text).length < 5) continue;
       const scope = String(item.scope || '').trim().toLowerCase();
@@ -656,16 +665,40 @@ ${transcript}`;
       if (scope === 'project' && !workspacePath) continue; // nothing to scope it to
       const isPreference = item.type === 'preference';
       let result;
-      if (scope === 'global') {
-        result = isPreference
-          ? await window.api.appendGlobalPreference(item.text, config, 'auto-summary', mode)
-          : await window.api.appendGlobalFact(item.text, 'auto-summary', config);
-      } else {
-        // Project preferences have no dedicated store; they persist as project facts so they stay
-        // bound to the workspace they were learned in rather than leaking to every project.
-        result = await window.api.appendProjectFact(workspacePath, item.text, 'auto-summary', config);
+      try {
+        if (scope === 'global') {
+          result = isPreference
+            ? await window.api.appendGlobalPreference(item.text, config, 'auto-summary', mode)
+            : await window.api.appendGlobalFact(item.text, 'auto-summary', config);
+        } else {
+          // Project preferences have no dedicated store; they persist as project facts so they stay
+          // bound to the workspace they were learned in rather than leaking to every project.
+          result = await window.api.appendProjectFact(workspacePath, item.text, 'auto-summary', config);
+        }
+      } catch (error) {
+        result = { success: false, error: error && error.message ? error.message : String(error) };
       }
-      if (result && result.success !== false) stored += 1;
+      if (result && result.success !== false) {
+        stored += 1;
+      } else {
+        // A SELECTED durable item that could not be written makes the whole pass unsuccessful.
+        // Counting it as merely "not stored" while still advancing the cursor silently discarded
+        // it: the chunk it came from would never be examined again, so a memory the model had
+        // already judged worth keeping was lost to a transient write failure. Skipped items - an
+        // unscopable one, or a project item with no workspace - are NOT failures; those were
+        // deliberately not selected.
+        //
+        // Retrying a partially-stored chunk is safe: every append path dedupes by near-match
+        // (findNearDuplicateEntry in lib/memory-manager.js), so an item written before the failure
+        // is updated in place on the retry rather than duplicated.
+        persistenceFailures.push((result && result.error) || 'append returned success:false');
+      }
+    }
+    if (persistenceFailures.length) {
+      throw new Error(
+        `${persistenceFailures.length} extracted memory item(s) could not be persisted `
+        + `(${persistenceFailures[0]}); leaving the cursor in place so this chunk is retried.`
+      );
     }
     if (stored > 0) {
       console.log(`[Orion] Auto-saved ${stored} of ${items.length} extracted memory item(s) from session.`);

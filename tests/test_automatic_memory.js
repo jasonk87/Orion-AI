@@ -378,3 +378,99 @@ test('a failed pass leaves the cursor where it was, so nothing is skipped by an 
   t.equal(agent.__readOrionMemoryWatermark(conv), 40, 'and only then does the cursor advance');
   t.end();
 });
+
+// ── Tail eligibility and persistence-failure safety ───────────────────────────
+
+test('a conversation ending in one completed exchange is still reviewed', async t => {
+  agent.__resetOrionMemoryWatermarks();
+  const calls = installMemoryApi();
+  installExtractionResponder(() => geminiJson({
+    items: [{ type: 'fact', scope: 'global', text: 'A durable fact from the final exchange.' }],
+    session: { summary: '' }
+  }));
+  // Exactly one question and its answer after the cursor. Requiring two user messages left this
+  // permanently unreviewed: eligibility depended on a second future message that may never come.
+  const conv = {
+    id: 'conv_tail',
+    createdAt: Date.now(),
+    messages: [
+      { role: 'user', text: 'One last important thing before I stop.' },
+      { role: 'assistant', text: 'Noted and understood.' }
+    ]
+  };
+  await agent.autoSaveOrionMemory(conv, { modelName: 'gemini-2.5-flash', geminiApiKey: 'gem-key' }, WORKSPACE, 'orion');
+  t.equal(calls.globalFacts.length, 1, 'the final exchange is reviewed rather than starved');
+  t.equal(agent.__readOrionMemoryWatermark(conv), 2, 'and the cursor covers it');
+  t.end();
+});
+
+test('an unanswered turn is not summarized mid-flight', async t => {
+  agent.__resetOrionMemoryWatermarks();
+  const calls = installMemoryApi();
+  const seen = installExtractionResponder(() => geminiJson({ items: [], session: { summary: '' } }));
+  const conv = {
+    id: 'conv_unanswered',
+    createdAt: Date.now(),
+    messages: [{ role: 'user', text: 'A question Orion has not answered yet.' }]
+  };
+  await agent.autoSaveOrionMemory(conv, { modelName: 'gemini-2.5-flash', geminiApiKey: 'gem-key' }, WORKSPACE, 'orion');
+  t.equal(seen.length, 0, 'nothing is extracted from a turn still in flight');
+  t.equal(calls.globalFacts.length, 0, 'and nothing is stored');
+  t.equal(agent.__readOrionMemoryWatermark(conv), 0, 'the cursor stays put so the exchange is eligible once answered');
+  t.end();
+});
+
+test('a durable item that fails to persist keeps the cursor back so its chunk retries', async t => {
+  agent.__resetOrionMemoryWatermarks();
+  let failNext = true;
+  const stored = [];
+  global.window.api = {
+    appendGlobalFact: async (text) => {
+      if (failNext) return { success: false, error: 'disk full' };
+      stored.push(text);
+      return { success: true };
+    },
+    appendGlobalPreference: async () => ({ success: true }),
+    appendProjectFact: async () => ({ success: true }),
+    saveSession: async () => ({ success: true })
+  };
+  installExtractionResponder(() => geminiJson({
+    items: [{ type: 'fact', scope: 'global', text: 'A fact whose first write fails.' }],
+    session: { summary: '' }
+  }));
+  const conv = conversation('conv_persist_fail');
+  const config = { modelName: 'gemini-2.5-flash', geminiApiKey: 'gem-key' };
+
+  await agent.autoSaveOrionMemory(conv, config, WORKSPACE, 'orion');
+  t.equal(stored.length, 0, 'nothing was written');
+  t.equal(agent.__readOrionMemoryWatermark(conv), 0,
+    'the cursor did NOT advance - a selected item that could not be written makes the pass unsuccessful');
+
+  // The next idle period retries the very same chunk rather than moving past it.
+  failNext = false;
+  await agent.autoSaveOrionMemory(conv, config, WORKSPACE, 'orion');
+  t.deepEqual(stored, ['A fact whose first write fails.'],
+    'the retry stores the item that was nearly lost to a transient write failure');
+  t.ok(agent.__readOrionMemoryWatermark(conv) > 0, 'and only now does the cursor advance');
+  t.end();
+});
+
+test('an item skipped on purpose is not treated as a persistence failure', async t => {
+  agent.__resetOrionMemoryWatermarks();
+  const calls = installMemoryApi();
+  installExtractionResponder(() => geminiJson({
+    items: [
+      { type: 'fact', scope: 'global', text: 'A perfectly good global fact.' },
+      { type: 'fact', text: 'An item with no scope at all, deliberately dropped.' },
+      { type: 'fact', scope: 'project', text: 'A project item with nowhere to go.' }
+    ],
+    session: { summary: '' }
+  }));
+  // No workspace, so the project item is skipped by design rather than failing to write.
+  const conv = conversation('conv_skips_ok');
+  await agent.autoSaveOrionMemory(conv, { modelName: 'gemini-2.5-flash', geminiApiKey: 'gem-key' }, '', 'orion');
+  t.equal(calls.globalFacts.length, 1, 'the storable item is stored');
+  t.ok(agent.__readOrionMemoryWatermark(conv) > 0,
+    'deliberate skips do not block the cursor - only real write failures do');
+  t.end();
+});
