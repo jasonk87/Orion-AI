@@ -1178,8 +1178,13 @@ test('token-saving prompt cleanup keeps tool schemas authoritative', (t) => {
   // memory now works from a watermark so a long conversation can contribute more than once, with
   // an explicit per-pass cap instead of a hardcoded slice. Both halves of the bound are asserted:
   // how many messages one pass may consider, and how much of each message it may send.
-  t.ok(agentJs.includes('ORION_MEMORY_MAX_MESSAGES_PER_PASS') && agentJs.includes('pending.slice(-ORION_MEMORY_MAX_MESSAGES_PER_PASS)'),
+  t.ok(agentJs.includes('ORION_MEMORY_MAX_MESSAGES_PER_PASS') && agentJs.includes('pending.slice(0, ORION_MEMORY_MAX_MESSAGES_PER_PASS)'),
     'background memory extraction bounds how many messages a single pass considers');
+  // Oldest-first is the load-bearing half. Taking the NEWEST chunk while advancing the cursor from
+  // the oldest end left a permanent hole: 100 pending with a 40 cap meant msgs[0..59] were never
+  // examined by anything, while the same 40 were paid for twice.
+  t.notOk(agentJs.includes('pending.slice(-ORION_MEMORY_MAX_MESSAGES_PER_PASS)'),
+    'a backlog is consumed oldest-first, so the cursor and the window advance together');
   t.ok(agentJs.includes('substring(0, 300)'), 'and bounds how much of each message it sends');
   t.notOk(agentJs.includes('msgs.slice(-10)'),
     'the old fixed last-10-messages-once window is gone, so later material is still eligible');

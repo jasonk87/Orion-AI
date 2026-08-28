@@ -559,8 +559,37 @@ async function maybeSaveExplicitPreference(text, config, mode) {
 //   - it only ever looked at the last ten messages of that single pass.
 // A watermark advances only after a successful extraction, so failure retries and later material
 // is still eligible.
+// The cursor lives ON THE CONVERSATION, not in a process-lifetime Map. A Map was restart-amnesia:
+// every relaunch reset extraction to zero, so a long conversation would be re-read from the top
+// (paying for it again) while the arithmetic hole below still skipped the same middle. Conversations
+// are already persisted per-file, so storing it there makes the cursor durable for free and keeps it
+// travelling with the thing it describes.
+const ORION_MEMORY_WATERMARK_FIELD = 'memoryWatermark';
+// Retained only as a fallback for conversation objects that are not persisted (tests, transient
+// shells). A persisted conversation always prefers its own field.
 const orionMemoryWatermarks = new Map();
 const orionMemoryExtractionInFlight = new Set();
+
+function readOrionMemoryWatermark(conversation) {
+  const stored = Number(conversation && conversation[ORION_MEMORY_WATERMARK_FIELD]);
+  if (Number.isFinite(stored) && stored >= 0) return Math.floor(stored);
+  const fallback = Number(orionMemoryWatermarks.get(conversation && conversation.id));
+  return Number.isFinite(fallback) && fallback >= 0 ? Math.floor(fallback) : 0;
+}
+
+function writeOrionMemoryWatermark(conversation, value) {
+  const next = Math.max(0, Math.floor(Number(value) || 0));
+  if (conversation) conversation[ORION_MEMORY_WATERMARK_FIELD] = next;
+  if (conversation && conversation.id) orionMemoryWatermarks.set(conversation.id, next);
+  // Persist immediately. If the app closes before the next ordinary save, an un-persisted cursor
+  // would re-read everything it just paid to review.
+  try {
+    if (typeof window.markConversationDirty === 'function') window.markConversationDirty(conversation.id);
+    if (typeof window.saveConversationsToStorage === 'function') window.saveConversationsToStorage();
+  } catch (error) {
+    console.error('[Orion] Could not persist the memory watermark; the next pass may re-read this material:', error && error.message ? error.message : error);
+  }
+}
 // Bounds one extraction prompt. Everything past the watermark is eligible, but a very long idle
 // gap should not send an unbounded transcript to the utility model.
 const ORION_MEMORY_MAX_MESSAGES_PER_PASS = 40;
@@ -570,16 +599,20 @@ async function autoSaveOrionMemory(conversation, config, workspacePath, mode) {
   const convId = conversation.id;
   if (orionMemoryExtractionInFlight.has(convId)) return; // guard double-fire, NOT a permanent mark
   const msgs = (conversation.messages || []).filter(m => m.role === 'user' || m.role === 'assistant');
-  const watermark = Math.max(0, Number(orionMemoryWatermarks.get(convId)) || 0);
+  const watermark = readOrionMemoryWatermark(conversation);
   const pending = msgs.slice(watermark);
   const userMsgCount = pending.filter(m => m.role === 'user').length;
   if (userMsgCount < 2) return; // too little new material — nothing worth summarizing yet
 
   orionMemoryExtractionInFlight.add(convId);
 
-  // Everything since the last SUCCESSFUL pass, bounded so a long idle gap cannot send an
-  // unbounded transcript.
-  const considered = pending.slice(-ORION_MEMORY_MAX_MESSAGES_PER_PASS);
+  // The OLDEST unreviewed chunk, not the newest. Taking the newest while advancing the cursor from
+  // the oldest end left a permanent hole: with 100 pending and a 40-message cap, pass 1 read
+  // msgs[60..99] and moved the cursor to 40, pass 2 read the SAME msgs[60..99] and moved it to 80,
+  // pass 3 read msgs[80..99] — and msgs[0..59] were never examined by anything, ever. That both
+  // lost 60 messages and paid for the same 40 twice. Consuming from the front means the cursor and
+  // the window advance together, so a backlog drains in order and every message is reviewed once.
+  const considered = pending.slice(0, ORION_MEMORY_MAX_MESSAGES_PER_PASS);
   const transcript = considered.map(m =>
     `${m.role === 'user' ? 'Jason' : 'Orion'}: ${(m.text || '').substring(0, 300)}`
   ).join('\n');
@@ -657,10 +690,10 @@ ${transcript}`;
         openItems: Array.isArray(session.openItems) ? session.openItems : []
       });
     }
-    // Only now, after a successful extraction AND persistence pass, does the watermark move.
-    // Advancing it on failure is what made a single transient provider error permanently suppress
-    // memory for this conversation.
-    orionMemoryWatermarks.set(convId, watermark + considered.length);
+    // Only now, after a successful extraction AND persistence pass, does the watermark move, and
+    // only by exactly what was examined. Advancing it on failure is what made a single transient
+    // provider error permanently suppress memory for this conversation.
+    writeOrionMemoryWatermark(conversation, watermark + considered.length);
   } catch (error) {
     // Best-effort, but never invisible. This path silently swallowed every failure, which is why a
     // misrouted provider call could disable automatic memory indefinitely with no symptom. The
@@ -15330,6 +15363,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
   // its provider-routing, retry, and scope defects went unnoticed.
   module.exports.autoSaveOrionMemory = autoSaveOrionMemory;
   module.exports.__getOrionMemoryWatermark = convId => orionMemoryWatermarks.get(convId);
+  module.exports.__readOrionMemoryWatermark = readOrionMemoryWatermark;
   module.exports.__resetOrionMemoryWatermarks = () => {
     orionMemoryWatermarks.clear();
     orionMemoryExtractionInFlight.clear();

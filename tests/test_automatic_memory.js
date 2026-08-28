@@ -14,6 +14,14 @@
 //      was never considered.
 //   5. Every extracted item went to GLOBAL memory regardless of what it was, defeating the scope
 //      guarantee the tool path enforces.
+//
+// Two further cursor defects were found afterwards, once the watermark existed, and are covered at
+// the bottom of this file:
+//
+//   6. The pass took the NEWEST chunk while advancing the cursor from the OLDEST end, so a backlog
+//      left a permanent hole (100 pending, 40 cap: msgs[0..59] were never examined by anything)
+//      AND re-read the same 40 twice.
+//   7. The cursor lived in a process-lifetime Map, so every restart reset extraction history.
 
 process.env.NODE_ENV = 'test';
 global.window = {};
@@ -235,5 +243,138 @@ test('a conversation with too little new material is left alone', async t => {
 
   t.equal(seen.length, 0, 'no extraction call is made for a one-turn conversation');
   t.equal(calls.globalFacts.length, 0, 'and nothing is stored');
+  t.end();
+});
+
+// ── Cursor correctness: no message may fall between the floorboards ───────────
+// The first watermark implementation took the NEWEST chunk while advancing the cursor from the
+// OLDEST end. With 100 pending and a 40-message cap that meant: pass 1 read msgs[60..99] and moved
+// the cursor to 40; pass 2 read the SAME msgs[60..99] and moved it to 80; pass 3 read msgs[80..99].
+// msgs[0..59] were never examined by anything, ever — and the same 40 were paid for twice. If
+// talking to Orion is supposed to accumulate, that hole is the most important thing to close.
+
+function longConversation(id, turns) {
+  const messages = [];
+  for (let i = 0; i < turns; i += 1) {
+    messages.push({ role: 'user', text: 'USER-' + i });
+    messages.push({ role: 'assistant', text: 'ASSISTANT-' + i });
+  }
+  return { id, createdAt: Date.now(), messages };
+}
+
+// Records exactly which message texts each extraction pass was shown.
+function installTranscriptRecorder() {
+  const passes = [];
+  global.fetch = async (url, request = {}) => {
+    const body = request.body ? JSON.parse(request.body) : {};
+    const prompt = JSON.stringify(body);
+    passes.push((prompt.match(/(?:USER|ASSISTANT)-\d+/g) || []));
+    return {
+      ok: true,
+      json: async () => ({ candidates: [{ content: { parts: [{ text: JSON.stringify({ items: [], session: { summary: '' } }) }] } }] })
+    };
+  };
+  return passes;
+}
+
+test('every message in a long backlog is reviewed exactly once, in order, across passes', async t => {
+  agent.__resetOrionMemoryWatermarks();
+  installMemoryApi();
+  const passes = installTranscriptRecorder();
+  const conv = longConversation('conv_backlog', 50); // 100 messages
+  const config = { modelName: 'gemini-2.5-flash', geminiApiKey: 'gem-key' };
+
+  for (let pass = 0; pass < 3; pass += 1) {
+    await agent.autoSaveOrionMemory(conv, config, WORKSPACE, 'orion');
+  }
+
+  t.equal(passes.length, 3, 'three passes ran');
+  const seen = passes.flat();
+  t.equal(seen.length, 100, 'exactly 100 messages were shown in total - none repeated');
+  t.equal(new Set(seen).size, 100, 'and every one of them is distinct');
+
+  // Order matters: a backlog must drain oldest-first, not newest-first.
+  t.equal(passes[0][0], 'USER-0', 'the first pass starts at the very beginning of the backlog');
+  t.equal(passes[0].length, 40, 'and takes a full bounded chunk');
+  t.equal(passes[1][0], 'USER-20', 'the second pass resumes exactly where the first stopped');
+  t.equal(passes[2][passes[2].length - 1], 'ASSISTANT-49', 'the last pass finishes at the newest message');
+  t.equal(agent.__readOrionMemoryWatermark(conv), 100, 'the cursor ends at the end of the conversation');
+  t.end();
+});
+
+test('the cursor survives a restart instead of re-reading the whole conversation', async t => {
+  agent.__resetOrionMemoryWatermarks();
+  installMemoryApi();
+  const passes = installTranscriptRecorder();
+  const conv = longConversation('conv_restart', 50); // 100 messages
+  const config = { modelName: 'gemini-2.5-flash', geminiApiKey: 'gem-key' };
+
+  await agent.autoSaveOrionMemory(conv, config, WORKSPACE, 'orion');
+  t.equal(agent.__readOrionMemoryWatermark(conv), 40, 'the first pass consumed one chunk');
+
+  // Simulate a restart: process-lifetime state is gone, but the conversation was persisted and is
+  // reloaded from disk. The cursor has to come back with it.
+  agent.__resetOrionMemoryWatermarks();
+  const reloaded = JSON.parse(JSON.stringify(conv));
+  t.equal(agent.__readOrionMemoryWatermark(reloaded), 40,
+    'the reloaded conversation still knows how much has been reviewed');
+
+  await agent.autoSaveOrionMemory(reloaded, config, WORKSPACE, 'orion');
+  await agent.autoSaveOrionMemory(reloaded, config, WORKSPACE, 'orion');
+
+  const seen = passes.flat();
+  t.equal(seen.length, 100, 'across the restart, exactly 100 messages were reviewed');
+  t.equal(new Set(seen).size, 100, 'with nothing re-read and nothing skipped');
+  t.equal(agent.__readOrionMemoryWatermark(reloaded), 100, 'and the conversation is fully reviewed');
+  t.end();
+});
+
+test('the persisted cursor is written through the conversation, so a save captures it', async t => {
+  agent.__resetOrionMemoryWatermarks();
+  installMemoryApi();
+  installTranscriptRecorder();
+  let dirtyMarked = 0;
+  let saved = 0;
+  const previousDirty = global.window.markConversationDirty;
+  const previousSave = global.window.saveConversationsToStorage;
+  global.window.markConversationDirty = () => { dirtyMarked += 1; };
+  global.window.saveConversationsToStorage = () => { saved += 1; };
+  try {
+    const conv = longConversation('conv_persist', 10);
+    await agent.autoSaveOrionMemory(conv, { modelName: 'gemini-2.5-flash', geminiApiKey: 'gem-key' }, WORKSPACE, 'orion');
+    t.ok(conv.memoryWatermark > 0, 'the cursor is stored on the conversation itself');
+    t.ok(dirtyMarked > 0, 'the conversation is marked dirty so the cursor is not lost');
+    t.ok(saved > 0, 'and a save is requested immediately rather than waiting for the next one');
+  } finally {
+    global.window.markConversationDirty = previousDirty;
+    global.window.saveConversationsToStorage = previousSave;
+  }
+  t.end();
+});
+
+test('a failed pass leaves the cursor where it was, so nothing is skipped by an error', async t => {
+  agent.__resetOrionMemoryWatermarks();
+  installMemoryApi();
+  const conv = longConversation('conv_fail_cursor', 50);
+  let attempt = 0;
+  const passes = [];
+  global.fetch = async (url, request = {}) => {
+    attempt += 1;
+    const body = request.body ? JSON.parse(request.body) : {};
+    passes.push((JSON.stringify(body).match(/(?:USER|ASSISTANT)-\d+/g) || []));
+    if (attempt === 1) return { ok: false, status: 500, json: async () => ({}) };
+    return {
+      ok: true,
+      json: async () => ({ candidates: [{ content: { parts: [{ text: JSON.stringify({ items: [], session: { summary: '' } }) }] } }] })
+    };
+  };
+  const config = { modelName: 'gemini-2.5-flash', geminiApiKey: 'gem-key' };
+
+  await agent.autoSaveOrionMemory(conv, config, WORKSPACE, 'orion');
+  t.equal(agent.__readOrionMemoryWatermark(conv), 0, 'a failed pass does not advance the cursor');
+
+  await agent.autoSaveOrionMemory(conv, config, WORKSPACE, 'orion');
+  t.deepEqual(passes[1], passes[0], 'the retry re-reads exactly the chunk that failed, not the next one');
+  t.equal(agent.__readOrionMemoryWatermark(conv), 40, 'and only then does the cursor advance');
   t.end();
 });
