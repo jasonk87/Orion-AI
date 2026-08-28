@@ -7714,6 +7714,17 @@ async function executeTool(name, args, workspace, config, conversation, executio
       if (result && result.success) {
         conversation.activePreviewProcesses = conversation.activePreviewProcesses || [];
         conversation.activePreviewProcesses.push(processId);
+        // Keep the concrete window discovered by preview_app in run-local state. If a later full
+        // desktop capture is empty, the main process can capture this exact window without asking
+        // the model to rediscover or guess a title. This is never durable authority and never
+        // authorizes coordinates: application_window captures remain inspection/attachment only.
+        if (result.windowTitle) {
+          executionContext.lastPreviewWindow = {
+            processId,
+            windowHint: String(result.windowTitle),
+            capturedAt: Date.now()
+          };
+        }
         if (window.saveConversationsToStorage) window.saveConversationsToStorage();
       }
       // A crash before render is a real, reportable failure the model must act on — surface it as
@@ -7727,7 +7738,10 @@ async function executeTool(name, args, workspace, config, conversation, executio
         delayMs: args.delayMs,
         destination: args.destination || '',
         conversationId: conversation.id,
-        displayId: args.displayId || ''
+        displayId: args.displayId || '',
+        windowHint: executionContext.lastPreviewWindow
+          ? String(executionContext.lastPreviewWindow.windowHint || '')
+          : ''
       });
       if (!result.success) throw new Error(result.error || 'Screen capture failed');
       // State-freshness optimization (item 6): the main process cheaply compared this capture's
@@ -12853,7 +12867,11 @@ const DISPATCH_TOOL_ALLOWLIST = new Set([
   'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context', 'list_files', 'get_workspace_info', 'change_workspace',
   ...OrionSpecialistRegistry.handoffToolNamesFor('orion'),
   'get_coder_task_status', 'cancel_coder_task',
-  'open_url', 'click_element', 'fill_input', 'take_screenshot', 'navigate_back', 'close_browser', 'attach_image',
+  // Dispatch may inspect and navigate read-only web evidence, and may relay an image that already
+  // exists. Capturing a new visual artifact is Operator work: leaving take_screenshot here let
+  // Dispatch invent a page to capture and claim success instead of executing the finalized
+  // visual route through Operator.
+  'open_url', 'click_element', 'fill_input', 'navigate_back', 'close_browser', 'attach_image',
   'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model',
   'grep_search', 'search_embeddings', 'semantic_search',
   'get_symbol_index', 'fetch_page', 'git_diff', 'git_rollback', 'edit_config', 'get_file_symbols', 'find_references',

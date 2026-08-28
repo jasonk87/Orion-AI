@@ -50,7 +50,7 @@ test('phone companion finishes with the same dark theme and complete mission hie
   t.ok(companionHtml.includes('@media (prefers-reduced-motion: reduce)'), 'phone respects reduced motion');
   t.ok(companionHtml.includes('button.send-button::before { content: "\\\\2191"'), 'phone send icon is encoding-safe');
   t.ok(companionHtml.includes('conversation-preview-and-durable-counts-v36'), 'phone shell exposes the current UI build version');
-  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v32"), 'phone service worker cache is bumped for the current UI build');
+  t.ok(fs.readFileSync(path.join(__dirname, '../lib/ipc-server.js'), 'utf8').includes("orion-phone-companion-v33"), 'phone service worker cache is bumped for the current UI build');
   t.ok(companionHtml.includes('window.isSecureContext'), 'phone explains when browser push is blocked by an insecure context');
   t.ok(companionHtml.includes('Phone push needs HTTPS or localhost'), 'phone tells the user that HTTPS is required for push notifications');
   t.ok(companionHtml.includes("companionFetch('/api/push-subscribe'"), 'phone stores push subscriptions through the authenticated fetch path');
@@ -475,7 +475,8 @@ test('chat images open in zoomable viewers on desktop and phone', t => {
   t.ok(companionHtml.includes('id="image-lightbox"'), 'phone has a full-screen image lightbox');
   t.ok(companionHtml.includes("target.closest('.message-image')"), 'phone binds chat image taps through the real message container');
   t.ok(companionHtml.includes('setImageLightboxZoom'), 'phone exposes bounded image zoom behavior');
-  t.ok(companionHtml.includes('img.sourceConversationId || defaultConversationId'), 'relayed worker images load from their actual source conversation');
+  t.ok(companionHtml.includes('defaultConversationId || img.sourceConversationId'),
+    'relayed worker images are authorized by the visible transcript that contains the attachment');
   t.end();
 });
 

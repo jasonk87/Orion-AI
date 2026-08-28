@@ -71,7 +71,7 @@ contextBridge.exposeInMainWorld('api', {
   takeScreenshot: (workspacePath, destination, conversationId) => ipcRenderer.invoke('take-screenshot', { workspacePath, destination, conversationId }),
   showAgentBrowser: () => ipcRenderer.invoke('show-agent-browser'),
   previewApp: (workspacePath, options = {}) => ipcRenderer.invoke('preview-workspace-app', { workspacePath, command: options.command, warmupMs: options.warmupMs, destination: options.destination, processId: options.processId, timeoutMs: options.timeoutMs, conversationId: options.conversationId }),
-  captureScreen: (workspacePath, options = {}) => ipcRenderer.invoke('capture-screen', { workspacePath, destination: options.destination, delayMs: options.delayMs, conversationId: options.conversationId, displayId: options.displayId }),
+  captureScreen: (workspacePath, options = {}) => ipcRenderer.invoke('capture-screen', { workspacePath, destination: options.destination, delayMs: options.delayMs, conversationId: options.conversationId, displayId: options.displayId, windowHint: options.windowHint }),
   recordInspectedScreenshot: (workspacePath, relativePath, conversationId = '') => ipcRenderer.invoke('record-inspected-screenshot', { workspacePath, path: relativePath, conversationId }),
   computerAction: (workspacePath, action, conversationId, destination = '', displayId = '') => ipcRenderer.invoke('computer-action', { workspacePath, action, conversationId, destination, displayId }),
   openApplication: (payload = {}) => ipcRenderer.invoke('open-application', payload),

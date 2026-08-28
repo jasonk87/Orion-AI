@@ -1457,7 +1457,9 @@ test('phone image lookup hydrates a stubbed specialist source conversation after
         mode: 'operator',
         workspace: 'C:\\workspace',
         isStub: true,
-        hasMessages: true,
+        // Older/stale indexes can omit this hint even though the transcript file exists.
+        // Hydration must follow the explicit conversation request rather than this metadata.
+        hasMessages: false,
         messages: []
       }]
     }

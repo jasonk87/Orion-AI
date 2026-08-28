@@ -742,6 +742,31 @@ test('Dispatch task presentation follows one durable task from queued through pl
   t.end();
 });
 
+test('a stale terminal activeTaskId cannot override newer ongoing supervised work', t => {
+  const failedPredecessor = normalizeTaskRecord(baseTask({
+    taskId: 'task_failed_predecessor',
+    status: TASK_STATES.FAILED,
+    updatedAt: 1000
+  }));
+  const pendingOperator = normalizeTaskRecord(baseTask({
+    taskId: 'task_live_operator',
+    status: TASK_STATES.PENDING,
+    executionSurface: 'desktop',
+    target: { conversationId: 'operator-1', sessionId: 'operator-1', mode: 'operator' },
+    updatedAt: 1100
+  }));
+  const selected = selectSupervisedTask(
+    [failedPredecessor, pendingOperator],
+    'dispatch-1',
+    failedPredecessor.taskId
+  );
+  t.equal(selected.taskId, pendingOperator.taskId, 'durable pending work wins over a stale terminal run preference');
+  const presentation = describeSupervisedTaskPresentation(selected, { roleLabel: 'Operator' });
+  t.equal(presentation.status, TASK_STATES.PENDING, 'the header remains nonterminal while Operator owns the task');
+  t.equal(presentation.label, 'Operator queued', 'the user sees the actual delegated lifecycle, not FAILED');
+  t.end();
+});
+
 // Real bug: a task that is genuinely still just queued (never actually failed) briefly showed a
 // "Failed" status badge right after a handoff. Root cause: describeSupervisedTaskPresentation used
 // to read the status through normalizeTransitionStatus, which is a STRICT validator meant for

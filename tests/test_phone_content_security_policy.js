@@ -106,6 +106,8 @@ test('connect-src is same-origin only, matching what the client actually calls',
 
 test('the policy permits what the UI genuinely needs and closes the rest', t => {
   t.ok(directive('img-src').includes('data:'), 'data: images are allowed because chat attachments use them');
+  t.ok(directive('img-src').includes('blob:'),
+    'authenticated chat-image bytes may be displayed through the client\'s short-lived object URL');
   t.ok(companionHtmlJs.includes("src=\"data:'"), 'and the client really does emit data: images');
   // Nonces apply to <style> ELEMENTS, not to style="" attributes, and adding one would DISABLE
   // unsafe-inline and break every inline style in the UI. So this stays as-is, deliberately.

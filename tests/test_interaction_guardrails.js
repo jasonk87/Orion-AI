@@ -1387,6 +1387,8 @@ test('incidental observations are bounded Coder-only run notes', (t) => {
   const allowlistBlock = agentJs.slice(allowlistStart, allowlistEnd);
   t.notOk(allowlistBlock.includes('note_incidental_issue'), 'Dispatch allowlist does not include note_incidental_issue');
   t.ok(allowlistBlock.includes('ask_clarifying_questions'), 'Dispatch can pause ambiguous handoffs with the structured clarification tool');
+  t.notOk(allowlistBlock.includes("'take_screenshot'"),
+    'Dispatch cannot capture a new browser screenshot itself; structured visual work belongs to Operator');
   t.end();
 });
 

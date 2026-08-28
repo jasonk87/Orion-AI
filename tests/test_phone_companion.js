@@ -1941,7 +1941,18 @@ test('assistant screenshot references render directly in phone chat through the 
   t.ok(html.includes('data-chat-image-path'), 'conversation-scoped image references get an inline image element');
   t.ok(html.includes("companionFetch('/api/chat-image?conversationId='"), 'image bytes use the paired companion fetch path');
   t.ok(html.includes('URL.createObjectURL(await response.blob())'), 'the fetched image is displayed without persisting base64 in state');
-  t.ok(html.includes('releaseChatImageObjectUrls()'), 'object URLs are released when the transcript rerenders');
+  t.ok(html.includes('await displayMessageImage(image, objectUrl)'),
+    'the loader waits for an actual browser image load instead of equating a fetched blob with visible output');
+  t.ok(html.includes("image.addEventListener('error', onError)"),
+    'decode or CSP display failures enter the bounded retry path');
+  t.ok(html.includes('forgetChatImageObjectUrl(cacheKey, objectUrl)'),
+    'a failed display URL is invalidated before retry instead of being reused forever');
+  t.ok(html.includes('const chatImageObjectUrls = new Map()'), 'loaded object URLs are cached across transcript refreshes');
+  t.ok(html.includes('const chatImageFetches = new Map()'), 'concurrent transcript refreshes share one image fetch');
+  t.ok(html.includes("window.addEventListener('beforeunload', releaseChatImageObjectUrls)"), 'object URLs are released when the page exits');
+  t.notOk(html.includes('releaseChatImageObjectUrls();\n    messagesEl.innerHTML'), 'ordinary state refreshes do not destroy and reload every image');
+  t.ok(html.includes('const conversationId = defaultConversationId || img.sourceConversationId ||'),
+    'the containing transcript authorizes a relayed attachment instead of its source transcript');
   t.ok(html.includes('attempt < 2'), 'transient image fetch failures receive bounded retries');
   t.ok(html.includes('Image unavailable — tap to retry'), 'a persistent failure stays visible and user-retryable');
   t.notOk(html.includes("figure.style.display = 'none'"), 'a failed first fetch cannot silently erase the attachment');
@@ -1987,20 +1998,13 @@ test('paired phone retrieves a conversation-scoped Coder screenshot through the 
   t.end();
 });
 
-test('a screenshot relayed from a delegated Operator/Coder task loads even though its conversation differs from the one currently selected on the phone', async t => {
+test('an authenticated image fetch can finish after the phone navigates to a different conversation', async t => {
   const port = 1157;
   const bytes = Buffer.from('delegated-task-image-bytes');
-  // Reproduces a real dogfood bug: Dispatch delegates executable work (e.g. "navigate to Yahoo
-  // News and take a screenshot") to a specialist Operator/Coder conversation. attach_image records
-  // that image's sourceConversationId as the SPECIALIST conversation - the one the tool actually
-  // ran in - not the Dispatch conversation the result gets relayed into and that the phone has
-  // selected. The phone renders the image using that original sourceConversationId (see
-  // data-chat-image-conversation in companion-html.js), so /api/chat-image legitimately receives a
-  // conversationId that differs from device.selectedConversationId for every such relayed image.
-  // The backend logged attach_image as done/succeeded, but the phone showed "Image unavailable -
-  // tap to retry" because resolveCompanionActionConversation rejected the mismatched conversationId
-  // with a 409 - a check meant to guard state-changing actions (steer/approve-plan) against a
-  // stale view, wrongly applied to a passive, already-attached image read.
+  // Passive attachment reads must not use the selected-conversation race guard intended for
+  // state-changing actions. A fetch started in one transcript can finish after the user navigates
+  // elsewhere; readChatImageForPhone still enforces that the requested path is genuinely attached
+  // to the requested conversation.
   const { main } = await startMainWithConfig(port, {}, {
     state: {
       conversationId: 'dispatch-conv',
@@ -2029,7 +2033,7 @@ test('a screenshot relayed from a delegated Operator/Coder task loads even thoug
       null,
       session
     );
-    t.equal(image.statusCode, 200, 'a relayed image loads even when its own conversationId differs from the currently selected conversation');
+    t.equal(image.statusCode, 200, 'an attached image still loads after the selected conversation changes');
     t.equal(image.headers['content-type'], 'image/png', 'the original image MIME type is preserved');
     t.equal(Buffer.from(image.text, 'binary').toString(), bytes.toString(), 'the relayed screenshot bytes are intact');
   } finally {

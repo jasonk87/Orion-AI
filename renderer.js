@@ -10078,7 +10078,11 @@ window.readChatImageForPhone = async (payload = {}) => {
   const imagePath = String(payload.path || '');
   const conv = conversations.find(conversation => conversation.id === conversationId);
   if (!conv || !imagePath) return { success: false, error: 'Conversation image not found.' };
-  if (conv.isStub && conv.hasMessages && window.api && typeof window.api.readConversation === 'function') {
+  // Image reads can arrive before the normal phone-state hydration finishes (or after a renderer
+  // restart restored only an index stub). `hasMessages` is legacy index metadata, not proof that
+  // the persisted transcript is empty; an explicit authenticated request is sufficient reason to
+  // attempt the same harmless one-time hydration used by getPhoneCompanionState.
+  if (conv.isStub && window.api && typeof window.api.readConversation === 'function') {
     try {
       const loaded = await window.api.readConversation(conv.id);
       if (loaded && loaded.success && loaded.conversation) {

@@ -174,6 +174,51 @@ test('capture_screen with no freshnessCheck field at all (e.g. an older main-pro
   t.end();
 });
 
+test('capture_screen reuses the exact native window discovered by preview_app when display capture is unavailable', async t => {
+  const oldWindow = global.window;
+  let captureOptions = null;
+  global.window = {
+    api: {
+      previewApp: async () => ({
+        success: true,
+        processId: 'preview_conv_window_1',
+        running: true,
+        path: 'screenshots/preview.png',
+        width: 1216,
+        height: 808,
+        captureMode: 'application_window',
+        windowTitle: 'This is Life'
+      }),
+      captureScreen: async (workspace, options) => {
+        captureOptions = options;
+        return {
+          success: true,
+          path: 'screenshots/follow-up.png',
+          width: 1216,
+          height: 808,
+          captureMode: 'application_window',
+          windowTitle: 'This is Life',
+          freshnessCheck: { available: false, unchanged: false, reason: 'window_capture' }
+        };
+      },
+      killCommand: async () => ({ success: true })
+    },
+    saveConversationsToStorage: () => {}
+  };
+  const executionContext = {};
+  const conversation = { id: 'conv_window', mode: 'coder', activePreviewProcesses: [] };
+  try {
+    await agent.executeTool('preview_app', { command: 'python main.py' }, 'C:\\workspace', {}, conversation, executionContext);
+    await agent.executeTool('capture_screen', {}, 'C:\\workspace', {}, conversation, executionContext);
+  } finally {
+    global.window = oldWindow;
+  }
+  t.equal(captureOptions.windowHint, 'This is Life', 'the known preview window is forwarded without model guessing');
+  t.equal(executionContext.lastDesktopSnapshot.captureMode, 'application_window', 'the fallback remains explicitly non-coordinate evidence');
+  t.equal(executionContext.lastDesktopSnapshot.windowTitle, undefined, 'only safe capture metadata enters the coordinate snapshot');
+  t.end();
+});
+
 // ── end-to-end: a reused inspection is sufficient for computer_action to proceed ─────────────────
 
 test('computer_action proceeds off a capture_screen-reused inspection without a separate inspect_screenshot_with_model call', async t => {

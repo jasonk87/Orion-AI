@@ -36,13 +36,20 @@ function createMainWindow({ minimized = false } = {}) {
   };
 }
 
+const powerCalls = [];
+const fakePowerSaveBlocker = {
+  start: mode => { powerCalls.push(['start', mode]); return 77; },
+  stop: id => powerCalls.push(['stop', id]),
+  isStarted: id => id === 77
+};
+
 const dependencies = {
   BrowserWindow: FakeIndicatorWindow,
   screen: {
     getDisplayMatching: () => ({ workArea: { x: 0, y: 0, width: 1920, height: 1040 } }),
     getPrimaryDisplay: () => ({ workArea: { x: 0, y: 0, width: 1920, height: 1040 } })
   },
-  electron: {}
+  electron: { powerSaveBlocker: fakePowerSaveBlocker }
 };
 
 function resetShared(previous) {
@@ -50,6 +57,8 @@ function resetShared(previous) {
   shared.operatorControlSession = previous.operatorControlSession;
   shared.operatorControlWindow = previous.operatorControlWindow;
   FakeIndicatorWindow.instances.length = 0;
+  control.releaseDisplayWakeLease();
+  powerCalls.length = 0;
 }
 
 test('computer/browser control minimizes Orion and shows a passive monitor indicator for the exact task', async t => {
@@ -75,6 +84,7 @@ test('computer/browser control minimizes Orion and shows a passive monitor indic
     const html = decodeURIComponent(indicator.url.split(',')[1]);
 
     t.ok(begun.success, 'the task-scoped control session starts');
+    t.deepEqual(powerCalls, [['start', 'prevent-display-sleep']], 'the interactive display stays awake for the takeover');
     t.deepEqual(mainWindow.calls, ['minimize'], 'Orion minimizes once at takeover start');
     t.equal(indicator.options.focusable, false, 'the indicator cannot steal keyboard focus');
     t.ok(indicator.calls.some(call => call[0] === 'ignoreMouse' && call[1] === true), 'the indicator is click-through');
@@ -90,6 +100,7 @@ test('computer/browser control minimizes Orion and shows a passive monitor indic
 
     const ended = await control.endControlSession({ taskId: 'task_operator_1' });
     t.ok(ended.ended, 'the owning task ends its control session');
+    t.deepEqual(powerCalls, [['start', 'prevent-display-sleep'], ['stop', 77]], 'the display-awake lease ends with the owning task');
     t.ok(indicator.destroyed, 'its indicator is removed');
     t.deepEqual(mainWindow.calls, ['minimize', 'restore', 'showInactive'], 'Orion restores only after the owning task ends and does not take focus');
   } finally {
@@ -147,6 +158,7 @@ test('indicator startup failure cannot strand Orion minimized', async t => {
       error = caught;
     }
     t.match(String(error && error.message || ''), /overlay load failed/, 'the real indicator failure is reported');
+    t.deepEqual(powerCalls, [['start', 'prevent-display-sleep'], ['stop', 77]], 'failed takeover startup cannot leak its display-awake lease');
     t.notOk(shared.operatorControlSession, 'no phantom active session remains');
     t.deepEqual(mainWindow.calls, ['minimize', 'restore', 'showInactive'], 'the failed startup rolls the window state back without taking focus');
   } finally {

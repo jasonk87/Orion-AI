@@ -327,12 +327,9 @@ test('/api/chat-image serves an authenticated image attached to the selected con
 test('/api/chat-image requires a conversation id and image path, but does not require the currently selected conversation', async (t) => {
   // This route used to require conversationId to equal device.selectedConversationId (the same
   // "stale view" guard used for state-changing actions like steer/approve-plan), which meant a
-  // screenshot attached inside a delegated Operator/Coder task - whose sourceConversationId is
-  // that specialist conversation, not the Dispatch conversation its result gets relayed into and
-  // that the phone has selected - was permanently rejected with 409, even though the backend had
-  // genuinely attached the image. See tests/test_phone_companion.js's
-  // "a screenshot relayed from a delegated Operator/Coder task..." test for the real regression
-  // this reproduces and the fix. This route's real authorization now lives entirely in
+  // passive image request that finished after a phone navigation was permanently rejected with
+  // 409, even though the backend had genuinely attached the image. See the corresponding
+  // navigation-race test in tests/test_phone_companion.js. This route's real authorization lives in
   // readChatImageForPhone (the conversation must exist and must actually have this exact path
   // attached to one of its messages) - a differing-but-valid conversationId is expected input,
   // not something to reject here.

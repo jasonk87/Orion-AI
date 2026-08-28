@@ -1194,12 +1194,19 @@
     const byNewest = (a, b) => Number(b.updatedAt || b.createdAt || 0)
       - Number(a.updatedAt || a.createdAt || 0)
       || compactInline(a.taskId).localeCompare(compactInline(b.taskId));
-    let selected = activeTaskId
+    const preferred = activeTaskId
       ? tasks.find(task => compactInline(task.taskId) === activeTaskId)
       : null;
-    selected = selected
-      || tasks.filter(task => task.status === TASK_STATES.ACTIVE).sort(byNewest)[0]
-      || tasks.filter(task => task.status === TASK_STATES.PENDING).sort(byNewest)[0]
+    const active = tasks.filter(task => task.status === TASK_STATES.ACTIVE).sort(byNewest)[0];
+    const pending = tasks.filter(task => task.status === TASK_STATES.PENDING).sort(byNewest)[0];
+    // `activeTaskId` comes from a live run snapshot, not from the durable store transaction that
+    // creates/claims the next specialist task. During that handoff boundary it can briefly name a
+    // terminal predecessor. Never let that stale preference paint the visible conversation FAILED
+    // or COMPLETE while newer durable work is pending/active. It remains a valid preference only
+    // while it is itself nonterminal, or as terminal history when no ongoing mission exists.
+    let selected = (preferred && [TASK_STATES.ACTIVE, TASK_STATES.PENDING].includes(preferred.status))
+      ? preferred
+      : (active || pending || preferred)
       || tasks.sort(byNewest)[0]
       || null;
     if (!selected || options.followDescendants !== true) return selected;

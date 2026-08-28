@@ -14,3 +14,6 @@ config.json
 *.bak
 .DS_Store
 Thumbs.db
+
+# Disposable conversation artifacts written by tests and by local runs.
+artifacts/
