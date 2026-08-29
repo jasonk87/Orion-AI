@@ -87,6 +87,11 @@ function loadRenderer(options = {}) {
   // renderer code took its no-registry fallback path in every test, so a change that depended on
   // the registry looked broken in tests while being correct in the packaged app.
   win.OrionSpecialistRegistry = require('../../specialist-registry');
+  // Same reasoning, same failure mode: index.html loads orchestration-contracts.js before
+  // renderer.js, and renderer.js reads it as RendererOrchestrationContracts. Without it every
+  // contract-guarded branch (completion-gate narration, specialist-report bounding) took its
+  // absent-module fallback in tests only - so a relay defect could pass here and still ship.
+  win.OrionOrchestrationContracts = require('../../orchestration-contracts');
 
   const api = createApiStub(options.api || {});
   // noApi reproduces a failed preload bridge: window.api simply does not exist, which is

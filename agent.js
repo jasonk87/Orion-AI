@@ -5401,8 +5401,21 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       awaitingUser: forceYield,
       pendingWork: hasPendingWork || durableBoundaryWork
     });
+    // The report the specialist just wrote is what the supervisor relays onward, so it is bounded
+    // on a structural boundary and marked when cut - never silently decapitated mid-word. The
+    // role label comes from the registry so the marker names the conversation that still holds
+    // the complete text.
+    const reportingSpecialist = OrionSpecialistRegistry.has(activeConversationMode)
+      ? OrionSpecialistRegistry.get(activeConversationMode)
+      : null;
+    const boundedResultSummary = OrchestrationContracts
+      && typeof OrchestrationContracts.truncateSpecialistReport === 'function'
+      ? OrchestrationContracts.truncateSpecialistReport(userFacingResultSummary, {
+        fullReportLocation: reportingSpecialist ? `${reportingSpecialist.label} conversation` : ''
+      }).text
+      : userFacingResultSummary;
     const runResult = {
-      summary: userFacingResultSummary.slice(0, 5000),
+      summary: boundedResultSummary,
       changedFiles: [...new Set(
         (workWalkthrough || [])
           .filter(item => isFileMutationItem(item) && item.path)

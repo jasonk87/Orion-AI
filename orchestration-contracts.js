@@ -747,7 +747,54 @@
     return output;
   }
 
+  // A specialist's final report is the deliverable, not chatter, so it reaches the supervisor
+  // whole wherever possible. Two independent hard `.slice(0, 5000)` calls used to cut it with no
+  // marker of any kind: a real Researcher investigation arrived in Dispatch ending mid-table-row
+  // at "`_find", and nothing downstream - not Dispatch, not the user - could tell a complete
+  // report from a decapitated one. A bound is still required, because this text lands in the
+  // supervisor transcript and then in every later context window. So it stays bounded, but it
+  // cuts on a structural boundary and it says that it cut.
+  const SPECIALIST_REPORT_MAX_CHARS = 20000;
+  // Reserved so the marker fits INSIDE the budget. The relay re-runs this helper on text the
+  // agent already truncated; keeping the result at or under the cap makes that second pass a
+  // no-op instead of a second cut that would eat the first marker.
+  const REPORT_MARKER_RESERVE = 200;
+  // Honor a boundary only while it keeps most of the budget. A report written as one enormous
+  // line would otherwise lose far more than the cap actually requires.
+  const REPORT_BOUNDARY_FLOOR_RATIO = 0.6;
+
+  function truncateSpecialistReport(text, options = {}) {
+    const value = String(text == null ? '' : text);
+    const requested = Number(options.maxChars);
+    const maxChars = Number.isFinite(requested) && requested > 0
+      ? Math.floor(requested)
+      : SPECIALIST_REPORT_MAX_CHARS;
+    if (value.length <= maxChars) {
+      return { text: value, truncated: false, originalLength: value.length, keptLength: value.length };
+    }
+    const budget = Math.max(1, maxChars - REPORT_MARKER_RESERVE);
+    const head = value.slice(0, budget);
+    const floor = Math.floor(budget * REPORT_BOUNDARY_FLOOR_RATIO);
+    let cut = -1;
+    for (const separator of ['\n\n', '\n', ' ']) {
+      const index = head.lastIndexOf(separator);
+      if (index >= floor) { cut = index; break; }
+    }
+    const kept = (cut > 0 ? head.slice(0, cut) : head).replace(/\s+$/, '');
+    const location = String(options.fullReportLocation || '').trim();
+    const marker = `\n\n[Orion] Report truncated at ${kept.length} of ${value.length} characters.`
+      + (location ? ` The complete report is in the ${location}.` : '');
+    return {
+      text: kept + marker,
+      truncated: true,
+      originalLength: value.length,
+      keptLength: kept.length
+    };
+  }
+
   return {
+    SPECIALIST_REPORT_MAX_CHARS,
+    truncateSpecialistReport,
     isRecallRequest,
     hasExplicitRecallClaim,
     hasRecallUncertaintyDisclosure,

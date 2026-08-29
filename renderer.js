@@ -10791,8 +10791,20 @@ function summarizeCoderCompletion(durableTask, coderConv) {
   };
   summary = stripGeneratedWalkthroughTail(summary)
     .replace(/\n{3,}/g, '\n\n')
-    .trim()
-    .slice(0, 5000);
+    .trim();
+  // Same bound and the same marker the agent applied when it recorded the result. Text the agent
+  // already truncated fits inside the cap, so this pass leaves it untouched rather than cutting a
+  // second time and eating the first marker. This path still matters for results recorded by
+  // older builds and for the final-message fallback above, neither of which went through it.
+  if (RendererOrchestrationContracts
+      && typeof RendererOrchestrationContracts.truncateSpecialistReport === 'function') {
+    const relayRole = coderConv ? conversationMode(coderConv) : '';
+    summary = RendererOrchestrationContracts.truncateSpecialistReport(summary, {
+      fullReportLocation: AGENT_ROLE_DISPLAY_NAMES[relayRole]
+        ? `${AGENT_ROLE_DISPLAY_NAMES[relayRole]} conversation`
+        : ''
+    }).text;
+  }
   return {
     summary,
     changedFiles: Array.isArray(result.changedFiles) ? result.changedFiles.slice(0, 20) : [],
