@@ -820,6 +820,15 @@ let agentExecutionMode = 'idle';
 // (appMode), since a conversation's identity must not depend on which sidebar tab happens to be
 // focused when a background/phone-triggered run executes.
 let activeConversationMode = 'orion';
+// A live reference to the running turn's work walkthrough, so the completion gate can count the
+// file mutations THIS run actually recorded. It settles a blast-radius requirement that was
+// seeded from a pre-run prediction: a run that mutated nothing has no blast radius to cover.
+// A reference rather than a counter because the two append sites are separate branches, where
+// incrementing by hand would double-count in one path and miss the other.
+let currentRunWalkthrough = [];
+function currentRunFileMutations() {
+  return currentRunWalkthrough.filter(isFileMutationItem).length;
+}
 let resolvedHomeDir = 'C:\\Users\\Owner';
 let currentAgentLogs = [];
 // Signature of the last observed browser page state (url/title/content), used to detect when a
@@ -944,6 +953,14 @@ const OPERATIONAL_CONTEXT_TOOL_DECLARATIONS = [
       notInspected: { type: 'ARRAY', items: { type: 'STRING' } },
       outOfScope: { type: 'ARRAY', items: { type: 'STRING' } }
     } }
+  },
+  {
+    name: 'declare_coverage_unsatisfiable',
+    description: 'Declares that a REQUIRED coverage surface genuinely cannot apply to this task, with the reason why. Use this instead of re-scoping the frontier when a required surface does not fit the work - required surfaces cannot be dropped or marked out of scope. The declaration is carried to the user for review rather than silently passing the gate.',
+    parameters: { type: 'OBJECT', properties: {
+      surface: { type: 'STRING', description: 'The exact required surface that cannot be covered.' },
+      reason: { type: 'STRING', description: 'Why it cannot apply to this task. Required.' }
+    }, required: ['surface', 'reason'] }
   },
   {
     name: 'record_adversarial_review',
@@ -2200,6 +2217,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const runMessageToken = `agent-run-${conversation.id || 'conversation'}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   let activeRunMessage = null;
   let workWalkthrough = [];
+  // Same array, so the gate always counts what this run has recorded so far.
+  currentRunWalkthrough = workWalkthrough;
   const persistedVisualArtifactKeys = new Set();
   const attachedResponseImages = [];
   let forceYield = false;
@@ -7506,6 +7525,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
     case 'set_coverage_frontier':
     case 'update_coverage_frontier':
     case 'record_adversarial_review':
+    case 'declare_coverage_unsatisfiable':
       if (agentExecutionMode === 'direct' || agentExecutionMode === 'answer') {
         return { blocked: true, reason: `${name} is not available in ${agentExecutionMode} mode. Operational planning tools are for long-running multi-step tasks only. Answer the user directly using read tools.` };
       }
@@ -8577,7 +8597,10 @@ async function mutateOperationalContext(workspace, action, args = {}) {
   if (window.updateOperationalContext) window.updateOperationalContext(transition.state);
   let completionGateInfo = null;
   if (action === 'evaluate_win_conditions' && transition.state.winConditions.length > 0 && transition.state.winConditions.every(condition => condition.status === 'satisfied') && agentExecutionMode !== 'direct' && agentExecutionMode !== 'answer') {
-    const completionGate = OperationalContext.evaluateCompletionGate(transition.state, { explicitRequirements: [] });
+    const completionGate = OperationalContext.evaluateCompletionGate(transition.state, {
+      explicitRequirements: [],
+      recordedFileMutations: currentRunFileMutations()
+    });
     if (completionGate.status !== 'ready_for_final') {
       completionGateInfo = `All win conditions are now satisfied, but the mission is not yet ready to finish: ${buildCompletionGateMessage(completionGate)}`;
     }
@@ -8607,6 +8630,9 @@ function buildCompletionGateMessage(gate) {
   if (gate.pendingWinConditions && gate.pendingWinConditions.length) parts.push(`Pending win conditions: ${gate.pendingWinConditions.map(item => item.title).join('; ')}`);
   if (gate.pendingRequirements && gate.pendingRequirements.length) parts.push(`Pending requirements: ${gate.pendingRequirements.map(item => item.title).join('; ')}`);
   if (gate.missingCoverage && gate.missingCoverage.length) parts.push(`Coverage still required: ${gate.missingCoverage.join('; ')}`);
+  if (gate.unsatisfiableSurfaces && gate.unsatisfiableSurfaces.length) {
+    parts.push(`Declared unsatisfiable (carried to the user for review): ${gate.unsatisfiableSurfaces.map(item => `${item.surface} - ${item.reason}`).join('; ')}`);
+  }
   if (gate.blockers && gate.blockers.length) parts.push(`Active blockers: ${gate.blockers.map(item => item.title).join('; ')}`);
   if (gate.remainingMinorBlockers && gate.remainingMinorBlockers.length) parts.push(`Remaining minor blockers: ${gate.remainingMinorBlockers.map(item => item.title).join('; ')}`);
   if (gate.backlogCandidates && gate.backlogCandidates.length) parts.push(`Backlog candidates: ${gate.backlogCandidates.map(item => item.title).join('; ')}`);
@@ -8645,7 +8671,8 @@ function shouldEscapeRepeatedCompletionGateBlock({ gate, signature, previousSign
 
 function evaluateWorkingStateCompletion(state, conversation) {
   return OperationalContext.evaluateCompletionGate(state, {
-    explicitRequirements: conversation && conversation.tasks ? conversation.tasks : []
+    explicitRequirements: conversation && conversation.tasks ? conversation.tasks : [],
+    recordedFileMutations: currentRunFileMutations()
   });
 }
 
@@ -10341,7 +10368,7 @@ const INTERNAL_GATE_MAINTENANCE_TOOLS = new Set([
   'record_discovery', 'record_evidence', 'record_blocker', 'resolve_blocker',
   'convert_blocker_to_backlog', 'promote_discovery', 'discard_noise',
   'set_coverage_frontier', 'update_coverage_frontier', 'evaluate_win_conditions',
-  'record_adversarial_review', 'set_task_checklist', 'update_notes',
+  'record_adversarial_review', 'declare_coverage_unsatisfiable', 'set_task_checklist', 'update_notes',
   'append_project_memory', 'remember_file_notes', 'remember_fact', 'remember_decision'
 ]);
 

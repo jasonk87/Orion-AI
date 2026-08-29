@@ -39,6 +39,24 @@
       required: value.required !== false,
       risk,
       requiredSurfaces,
+      // The surfaces the RUN was required to cover, as opposed to any the model later added for
+      // itself. Sealed: the model may add surfaces and report evidence against them, but it can
+      // neither drop these nor declare them out of scope. A gate the gated party can rewrite is
+      // not a gate - and rewriting is exactly how a real run escaped it, replacing a blast-radius
+      // requirement it could not meet with four things it had already finished.
+      sealedSurfaces: uniqueText(value.sealedSurfaces),
+      // The valve. A surface that genuinely cannot apply is declared here WITH a reason, which
+      // holds the mission open as a visible checkpoint instead of silently passing.
+      unsatisfiable: Array.isArray(value.unsatisfiable)
+        ? value.unsatisfiable
+          .filter(entry => entry && typeof entry === 'object' && cleanText(entry.surface, 300))
+          .map(entry => ({
+            surface: cleanText(entry.surface, 300),
+            reason: cleanText(entry.reason, 2000),
+            at: entry.at || null
+          }))
+          .slice(0, 40)
+        : [],
       inspected: uniqueText(value.inspected),
       verified: uniqueText(value.verified),
       inferredOnly: uniqueText(value.inferredOnly),
@@ -280,8 +298,48 @@
         if (!coverage || coverage.requiredSurfaces.length === 0) {
           throw new Error('Coverage frontier requires at least one required surface');
         }
-        state.coverageFrontier = coverage;
+        const existing = state.coverageFrontier;
+        if (existing && existing.sealedSurfaces.length) {
+          // Sealed surfaces survive every later set_coverage_frontier. Calling this again widens
+          // the bar or re-states it; it can never narrow it. Evidence already gathered is kept,
+          // because a call meant to ADD a surface must not quietly erase what was already proven.
+          const preserved = uniqueText([...existing.sealedSurfaces, ...coverage.requiredSurfaces]);
+          const dropped = existing.sealedSurfaces.filter(surface =>
+            !coverage.requiredSurfaces.some(candidate => candidate.toLowerCase() === surface.toLowerCase()));
+          state.coverageFrontier = {
+            ...coverage,
+            requiredSurfaces: preserved,
+            sealedSurfaces: existing.sealedSurfaces,
+            unsatisfiable: existing.unsatisfiable,
+            inspected: uniqueText([...existing.inspected, ...coverage.inspected]),
+            verified: uniqueText([...existing.verified, ...coverage.verified]),
+            outOfScope: uniqueText([...existing.outOfScope, ...coverage.outOfScope]),
+            adversarialReview: existing.adversarialReview || coverage.adversarialReview
+          };
+          event.summary = dropped.length
+            ? `Coverage frontier widened to ${preserved.length} surface(s); ${dropped.length} sealed surface(s) cannot be dropped`
+            : `Coverage frontier set for ${preserved.length} surface(s)`;
+          break;
+        }
+        // First seeding of a mission's frontier. Whatever is required now becomes the sealed bar.
+        state.coverageFrontier = { ...coverage, sealedSurfaces: coverage.requiredSurfaces.slice() };
         event.summary = `Coverage frontier set for ${coverage.requiredSurfaces.length} surface(s)`;
+        break;
+      }
+      case 'declare_coverage_unsatisfiable': {
+        if (!state.coverageFrontier) throw new Error('No coverage frontier exists');
+        const surface = cleanText(args.surface, 300);
+        const reason = cleanText(args.reason, 2000);
+        if (!surface) throw new Error('Naming the surface that cannot be covered is required');
+        if (!reason) throw new Error('A reason is required: this holds the mission open for review rather than passing it');
+        const known = state.coverageFrontier.requiredSurfaces
+          .some(candidate => candidate.toLowerCase() === surface.toLowerCase());
+        if (!known) throw new Error(`"${surface}" is not a required surface on this mission`);
+        state.coverageFrontier.unsatisfiable = [
+          ...state.coverageFrontier.unsatisfiable.filter(entry => entry.surface.toLowerCase() !== surface.toLowerCase()),
+          { surface, reason, at: now }
+        ];
+        event.summary = `Declared "${surface}" unsatisfiable, pending review`;
         break;
       }
       case 'update_coverage_frontier': {
@@ -761,6 +819,7 @@
       pendingRequirements: details.pendingRequirements || []
       ,
       missingCoverage: details.missingCoverage || [],
+      unsatisfiableSurfaces: details.unsatisfiableSurfaces || [],
       coverageFrontier: details.coverageFrontier || null
     };
   }
@@ -841,9 +900,20 @@
       const inferredOnly = new Set(coverage.inferredOnly.map(value => value.toLowerCase()));
       const notInspected = new Set(coverage.notInspected.map(value => value.toLowerCase()));
       const outOfScope = new Set(coverage.outOfScope.map(value => value.toLowerCase()));
+      const sealed = new Set(coverage.sealedSurfaces.map(value => value.toLowerCase()));
+      const unsatisfiable = new Set(coverage.unsatisfiable.map(entry => entry.surface.toLowerCase()));
+      // A blast-radius requirement is seeded before the run does anything, from a prediction about
+      // the request. When the run then mutates nothing there is no blast radius to cover, and the
+      // surface is unsatisfiable by construction - a commit-and-push was held open by exactly this.
+      // Absence of mutation is evidence, so it settles the surface rather than blocking on it.
+      const mutatedNothing = options.recordedFileMutations === 0;
       coverage.requiredSurfaces.forEach(surface => {
         const key = surface.toLowerCase();
-        if (outOfScope.has(key)) return;
+        if (unsatisfiable.has(key)) return;
+        if (mutatedNothing && /blast radius|impact analysis/i.test(surface)) return;
+        // Out-of-scope settles a surface the model itself added. It cannot retire a sealed one -
+        // that was the second way a run rewrote its own bar instead of meeting it.
+        if (outOfScope.has(key) && !sealed.has(key)) return;
         if (!inspected.has(key) || inferredOnly.has(key) || notInspected.has(key)) {
           missingCoverage.push(`${surface}: not directly inspected`);
           return;
@@ -857,12 +927,20 @@
       if (missingCoverage.length) reasons.push('Required impact surfaces remain inferred, uninspected, unverified, or lack adversarial review.');
     }
 
+    // The valve's output. A surface declared unsatisfiable does not block completion - that is
+    // what keeps a mis-seeded frontier from deadlocking a run - but it rides on the gate result
+    // in both directions so it reaches the user instead of disappearing.
+    const unsatisfiableSurfaces = coverage && coverage.required !== false
+      ? coverage.unsatisfiable.map(entry => ({ surface: entry.surface, reason: entry.reason }))
+      : [];
+
     if (reasons.length || missingEvidence.length || pendingWinConditions.length || pendingRequirements.length || missingCoverage.length) {
       return makeGate('continue_work', reasons, {
         missingEvidence,
         pendingWinConditions,
         pendingRequirements,
         missingCoverage,
+        unsatisfiableSurfaces,
         coverageFrontier: coverage
       });
     }
@@ -872,6 +950,7 @@
         ? 'Mission has evidence-backed satisfied win conditions and only minor non-terminal blockers remain as backlog candidates.'
         : 'Mission has evidence-backed satisfied win conditions, no active completion-blocking blockers, and verification evidence.'
     ], {
+      unsatisfiableSurfaces,
       remainingMinorBlockers: remainingMinorBlockers.map(item => ({ id: item.id, title: item.title, details: item.details, severity: item.severity, nature: item.nature })),
       backlogCandidates: remainingMinorBlockers.map(item => ({ id: item.id, title: item.title, details: item.details, severity: item.severity, nature: item.nature }))
     });
