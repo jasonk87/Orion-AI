@@ -2543,7 +2543,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const comprehensiveAudit = semanticIntent.inspectionBreadth === 'broad';
   const runReasoningPolicy = ReasoningPolicy
     ? ReasoningPolicy.select({
-        phase: agentExecutionMode === 'answer' ? 'casual_conversation' : 'implementation',
+        // mechanical_execution already exists for exactly this - a known command over existing
+        // state. Routing mechanical work there also stops it seeding a coverage frontier, since
+        // coverage is only required for the analysis/implementation phases.
+        phase: agentExecutionMode === 'answer'
+          ? 'casual_conversation'
+          : (semanticIntent.workShape === 'mechanical' ? 'mechanical_execution' : 'implementation'),
         hint: semanticIntent.reasoningPolicyHint || {},
         contextDependent: semanticIntent.contextDependent === true,
         complexity: semanticIntent.reasoningPolicyHint && semanticIntent.reasoningPolicyHint.complexity,
@@ -10718,8 +10723,18 @@ async function classifyPlanningNeed(userPrompt, modelName, config, recentMessage
     };
   }
   const conversational = ['conversation', 'status_check'].includes(semanticIntent.intent);
+  // A plan exists so the user can weigh in on HOW before the work commits to an approach. That
+  // is worth an approval gate for authoring work, where the how is genuinely open. It is pure
+  // ceremony for a known procedure over existing state: a commit-and-push earned a 1500-word
+  // plan and an approval gate because the classifier scored 23 changed files as high impact -
+  // sizing the diff rather than judging the work. Committing two hundred files decides nothing
+  // that committing two would not.
+  //
+  // Only an affirmative 'mechanical' skips the gate. An absent or unrecognized shape keeps the
+  // old behavior, so a classifier failure can never quietly wave a real change past review.
+  const mechanical = semanticIntent.workShape === 'mechanical';
   return {
-    mode: !requiresExecution && conversational ? 'answer' : (requiresExecution && !readOnly && highImpact ? 'plan' : 'direct'),
+    mode: !requiresExecution && conversational ? 'answer' : (requiresExecution && !readOnly && highImpact && !mechanical ? 'plan' : 'direct'),
     reviewOnly: !!(readOnly && ['workspace', 'project'].includes(semanticIntent.inspectionTarget)),
     reason: `Derived from shared semantic intent (${semanticIntent.intent || 'unknown'}) and ${policy.effort} impact policy.`,
     needsLocalInspection: semanticIntent.inspectionTarget && semanticIntent.inspectionTarget !== 'none',

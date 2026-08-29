@@ -294,6 +294,7 @@
       '- evidenceTarget names WHOSE evidence actually answers the request, resolved from meaning, never from keyword matching and never from which project or technology name happens to appear in the sentence. prior_orion_runs means the answer depends on what Orion itself previously did - its own prior task/run execution, orchestration history, or how it accomplished something before. active_workspace means the answer depends on the currently selected project\'s own code, files, or content. personal_memory means the answer depends on Orion\'s own stored memory or conversation history about the user, a project, or the conversation - not fresh file inspection. The same named entity can appear either way: "how did you do this last time," "look at your previous runs," "what did Operator do the last couple times I asked for X," "what happened in the previous attempt," and "check the history and see how you handled this before" all resolve to prior_orion_runs even when a project or technology is also named - the referent is Orion\'s own execution, not that project. "How does <project> use X," "search <project> for Y," and "did I build Z in this project" resolve to active_workspace - the referent is the project itself. "What do you remember about me," "what have I told you about GRITLIFE," and "what did we discuss earlier" resolve to personal_memory - the referent is Orion\'s stored knowledge, not a fresh look at the project. Use none when none of these apply.',
       '- inspectionTarget identifies where evidence must come from. Use local_system for machine/process facts, workspace/project for source or project facts, task_history for Orion\'s own prior task/run/orchestration record, and none for ordinary conversation as well as for any personal_memory request (memory is read through recall_memory\'s own scope, never file inspection). inspectionTarget must be task_history, never workspace or project, whenever evidenceTarget is prior_orion_runs, and must be none whenever evidenceTarget is personal_memory - both are enforced deterministically after classification, so setting it correctly here is required, not optional.',
       '- evidenceBroadenReason must stay empty unless a historical investigation genuinely has to widen into a specific project artifact - for example, a prior task\'s own recorded result explicitly names a script or file that is still needed to finish answering. State the concrete reason (what the history established and why it now demands that artifact). Never leave inspectionTarget on workspace/project, and never set evidenceBroadenReason, merely because a project happens to be selected.',
+      '- workShape describes the SHAPE of the work, never its size. mechanical means a known, fully specified procedure over state that already exists - commit and push existing work, run a build or test suite, install a dependency, restart a service - where the how is already determined and there is nothing left to decide. authoring means the work creates or changes source or content, so how to do it is an open question: implementing a feature, fixing a bug, refactoring, writing a document. investigation is read-only gathering or analysis. A large mechanical job is still mechanical: committing two hundred files decides nothing that committing two would not. A small authoring job is still authoring.',
       '- inspectionBreadth describes the source evidence needed for a workspace/project/task_history inspection: single_file means exactly one known file, focused means at most two files or task records, and broad means a review that cannot be answered honestly without inspecting more than two files or multiple architectural surfaces, or (for task_history) that requires comparing multiple prior Orion runs/tasks. Do not use broad for local-system inspection or ordinary conversation.',
       '- standaloneSystemOperation is true only for executable local-machine work that is not bound to a selected project.',
       '- Set reasoningPolicyHint.contextNeed to historical only when historical evidence is actually needed; casual conversation and memory_policy explanations should be none.',
@@ -344,6 +345,7 @@
         evidenceBroadenReason: '',
         inspectionTarget: 'none | local_system | workspace | project | task_history',
         inspectionBreadth: 'none | single_file | focused | broad',
+        workShape: 'none | mechanical | authoring | investigation',
         standaloneSystemOperation: false
       }, null, 2),
       '',
@@ -415,6 +417,7 @@
       evidenceBroadenReason: '',
       inspectionTarget: 'none',
       inspectionBreadth: 'none',
+      workShape: 'none',
       standaloneSystemOperation: false,
       classifierError: string(error && (error.message || error), 1000)
     };
@@ -613,6 +616,12 @@
       evidenceTarget,
       evidenceBroadenReason,
       inspectionTarget,
+      // Unrecognized or missing shape normalizes to empty, never to mechanical. Skipping the
+      // planning gate requires the model to AFFIRM that the work is mechanical; absence of the
+      // signal keeps the stricter path.
+      workShape: ['mechanical', 'authoring', 'investigation'].includes(String(parsed.workShape || '').toLowerCase())
+        ? String(parsed.workShape).toLowerCase()
+        : '',
       inspectionBreadth: INSPECTION_BREADTHS.includes(parsed.inspectionBreadth)
         ? parsed.inspectionBreadth
         : 'none',
