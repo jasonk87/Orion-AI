@@ -851,7 +851,7 @@ test('the Workspace Files panel fills available sidebar height instead of being 
 // API key is configured, because this function erases and replaces them before the page is ever
 // shown. Claude and DeepSeek must be built into this same JS-generated list, not just added to the
 // static HTML (which would recreate the identical invisible-option bug).
-test('the model dropdown is rebuilt from a single JS source that includes Claude and DeepSeek', (t) => {
+test('the model dropdown is rebuilt from one JS source that includes Claude, DeepSeek, and Groq', (t) => {
   t.ok(renderer.includes("modelSelect.innerHTML = ''"), 'initModelDropdown fully rebuilds the dropdown from scratch');
   t.ok(renderer.includes("claudeGroup.label = 'Claude'"), 'a Claude optgroup is built in JS, not left to static HTML');
   t.ok(renderer.includes("value: 'claude-opus-4-8'") && renderer.includes("value: 'claude-sonnet-5'"),
@@ -859,10 +859,17 @@ test('the model dropdown is rebuilt from a single JS source that includes Claude
   t.ok(renderer.includes("deepseekGroup.label = 'DeepSeek'"), 'a DeepSeek optgroup is built in JS, not left to static HTML');
   t.ok(renderer.includes("value: 'deepseek-v4-flash'") && renderer.includes("value: 'deepseek-v4-pro'"),
     'the JS-built DeepSeek list includes both V4 tiers');
+  t.ok(renderer.includes("groqGroup.label = 'Groq'"), 'a Groq optgroup is built in the same canonical JS list');
+  t.ok(renderer.includes("value: 'groq:openai/gpt-oss-120b'")
+    && renderer.includes("value: 'groq:qwen/qwen3.6-27b'"),
+  'the Groq list includes the free tool-capable text and multimodal choices');
+  t.notOk(renderer.includes("value: 'groq:groq/compound'"),
+    'Compound is not misrepresented as compatible with Orion local function tools');
   // The static HTML list should not carry Claude/DeepSeek options that initModelDropdown() would
   // just erase anyway — that duplication is exactly what caused them to silently never appear.
   t.notOk(html.includes('value="claude-opus-4-8"'), 'index.html no longer has a dead duplicate Claude option');
   t.notOk(html.includes('value="deepseek-v4-flash"'), 'index.html no longer has a dead duplicate DeepSeek option');
+  t.ok(html.includes('id="setting-groq-api-key"'), 'Settings exposes the Groq key as a password field');
   t.end();
 });
 

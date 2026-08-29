@@ -34,7 +34,7 @@
     img-src 'self' data:;
     font-src 'self' data:;
     media-src 'self' data:;
-    connect-src 'self' https://generativelanguage.googleapis.com https://api.anthropic.com https://api.deepseek.com https://api.openai.com http://localhost:11434;
+    connect-src 'self' https://generativelanguage.googleapis.com https://api.anthropic.com https://api.deepseek.com https://api.openai.com https://api.groq.com http://localhost:11434;
     object-src 'none';
     frame-src 'none';
     worker-src 'none';
@@ -542,6 +542,13 @@
           <label for="setting-openai-api-key">OpenAI API Key:</label>
           <input type="password" id="setting-openai-api-key" placeholder="sk-...">
           <small class="form-help">Required to use the ChatGPT model in the model dropdown. Saved locally.</small>
+        </div>
+
+        <div class="form-group">
+          <label for="setting-groq-api-key">Groq API Key:</label>
+          <input type="password" id="setting-groq-api-key" placeholder="gsk_...">
+          <small class="form-help">Required for the free-plan Groq models. Saved locally and never packaged.</small>
+        </div>
 
         <div class="form-group">
           <label for="setting-google-search-engine-id">Google Search Engine ID:</label>

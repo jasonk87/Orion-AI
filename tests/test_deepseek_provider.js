@@ -356,16 +356,10 @@ test('resolveUtilityModelName routes deepseek models to deepseek-v4-flash for ut
   t.end();
 });
 
-// The user explicitly asked: "add the escalation for them to be the flash/pro version of itself" —
-// getNextModelForHighDemand generalizes the existing Gemini-only escalation chain so DeepSeek
-// (and Gemini) both work, while providers with no defined next tier (Claude, Ollama) still return
-// null, unchanged from before this generalization.
-test('getNextModelForHighDemand escalates deepseek-v4-flash to deepseek-v4-pro, and preserves existing gemini/claude/ollama behavior', (t) => {
-  t.equal(agent.getNextModelForHighDemand('deepseek-v4-flash'), 'deepseek-v4-pro', 'deepseek flash escalates to the pro version of itself');
-  t.equal(agent.getNextModelForHighDemand('deepseek-v4-pro'), null, 'deepseek pro has no further tier to escalate to');
-  t.equal(agent.getNextModelForHighDemand('gemini-2.5-flash-lite'), 'gemini-2.5-flash', 'gemini escalation is unchanged');
-  t.equal(agent.getNextModelForHighDemand('claude-sonnet-5'), null, 'claude has no defined next tier (unchanged behavior)');
-  t.equal(agent.getNextModelForHighDemand('llama3'), null, 'ollama/unknown models have no defined next tier (unchanged behavior)');
+test('getNextModelForHighDemand never replaces the user-selected model', (t) => {
+  for (const model of ['deepseek-v4-flash', 'deepseek-v4-pro', 'gemini-2.5-flash-lite', 'claude-sonnet-5', 'llama3']) {
+    t.equal(agent.getNextModelForHighDemand(model), null, `${model} has no automatic next tier`);
+  }
   t.end();
 });
 
@@ -379,14 +373,14 @@ test('the agent loop dispatches deepseek-* models to callDeepSeekAPI', (t) => {
   t.end();
 });
 
-test('the reactive per-file escalation and proactive deep-task upgrade both use the generalized escalation helper', (t) => {
+test('the agent loop contains no proactive or reactive model-escalation call site', (t) => {
   const fs = require('fs');
   const path = require('path');
   const agentSource = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
   const matches = agentSource.match(/getNextModelForHighDemand\(/g) || [];
-  t.ok(matches.length >= 2, 'getNextModelForHighDemand is used at both escalation call sites (proactive + reactive)');
-  t.notOk(agentSource.includes("activeRunModelName.startsWith('gemini-') ? getNextGeminiModelForHighDemand(activeRunModelName) : null"),
-    'the reactive escalation no longer gates on a hardcoded gemini-only check');
+  t.equal(matches.length, 1, 'only the compatibility function declaration remains');
+  t.notOk(/Proactively using|Escalating to .* after .* syntax\/regression/.test(agentSource),
+    'no task-complexity or edit-failure path swaps models');
   t.end();
 });
 

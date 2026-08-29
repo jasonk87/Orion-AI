@@ -246,8 +246,9 @@ async function startMainWithConfig(port, config, handlers) {
     os: osMock
   });
   main.resetCompanionServer();
-  main.startPhoneCompanionServer();
-  await new Promise(resolve => setTimeout(resolve, 150));
+  // The server performs asynchronous pairing-code setup before it starts listening. Await the
+  // real startup promise so callers never race a fixed sleep against a busy test machine.
+  await main.startPhoneCompanionServer();
   return { main, fsMock, electron, webPushCalls };
 }
 
@@ -415,27 +416,43 @@ test('Phone Companion v2 serves pairing shell but protects APIs', async (t) => {
 
 test('Phone Companion startup announcement uses pairing QR metadata, not legacy token URL', async (t) => {
   const { main, electron } = await startMainWithConfig(1135);
-  await new Promise(resolve => setTimeout(resolve, 2800));
+  try {
+    // The product intentionally delays this card so window startup stays responsive. Poll for
+    // the observable event instead of assuming a 2.8-second wall-clock sleep is always enough.
+    const deadline = Date.now() + 8000;
+    let announcement;
+    while (!announcement && Date.now() < deadline) {
+      announcement = electron.calls.find(call => call.includes('showPhoneCompanionPairingCard'));
+      if (!announcement) await new Promise(resolve => setTimeout(resolve, 50));
+    }
 
-  const announcement = electron.calls.find(call => call.includes('showPhoneCompanionPairingCard'));
-  t.ok(announcement, 'startup uses structured pairing card renderer');
-  t.notOk(electron.calls.some(call => call.includes('appendSystemMessage') && call.includes('Phone Companion')), 'startup does not use legacy appendSystemMessage announcement');
-  t.notOk(announcement.includes('?token='), 'announcement does not include legacy token URL');
-  t.ok(announcement.includes('?pair='), 'announcement includes short-lived pair URL');
-  t.ok(announcement.includes('qrSvg'), 'announcement includes QR SVG metadata');
-  t.ok(announcement.includes("dedupeKey: 'phone-companion-pairing'"), 'announcement carries stable pairing dedupe metadata');
+    t.ok(announcement, 'startup uses structured pairing card renderer');
+    t.notOk(electron.calls.some(call => call.includes('appendSystemMessage') && call.includes('Phone Companion')), 'startup does not use legacy appendSystemMessage announcement');
+    if (announcement) {
+      t.notOk(announcement.includes('?token='), 'announcement does not include legacy token URL');
+      t.ok(announcement.includes('?pair='), 'announcement includes short-lived pair URL');
+      t.ok(announcement.includes('qrSvg'), 'announcement includes QR SVG metadata');
+      t.ok(announcement.includes("dedupeKey: 'phone-companion-pairing'"), 'announcement carries stable pairing dedupe metadata');
+    } else {
+      t.fail('announcement content assertions require the structured pairing card call');
+      t.fail('announcement content assertions require the structured pairing card call');
+      t.fail('announcement content assertions require the structured pairing card call');
+      t.fail('announcement content assertions require the structured pairing card call');
+    }
 
-  const payload = await main.buildCompanionPairingAnnouncement({
-    address: '127.0.0.1',
-    port: 1135,
-    pairingCode: 'pair-code-123456',
-    expiresAt: new Date(Date.now() + 60000).toISOString()
-  });
-  t.notOk(payload.pairUrl.includes('?token='), 'pairing payload never exposes token URL');
-  t.ok(payload.pairUrl.includes('?pair='), 'pairing payload exposes pair URL');
-  t.ok(payload.qrSvg.includes('<svg'), 'pairing payload contains scannable QR SVG');
-
-  await closeServer(main.getCompanionServer());
+    const payload = await main.buildCompanionPairingAnnouncement({
+      address: '127.0.0.1',
+      port: 1135,
+      pairingCode: 'pair-code-123456',
+      expiresAt: new Date(Date.now() + 60000).toISOString()
+    });
+    t.notOk(payload.pairUrl.includes('?token='), 'pairing payload never exposes token URL');
+    t.ok(payload.pairUrl.includes('?pair='), 'pairing payload exposes pair URL');
+    t.ok(payload.qrSvg.includes('<svg'), 'pairing payload contains scannable QR SVG');
+  } finally {
+    const server = main.getCompanionServer();
+    if (server) await closeServer(server);
+  }
 });
 
 test('Phone Companion pairing payload is available through IPC for top-bar button startup', async (t) => {

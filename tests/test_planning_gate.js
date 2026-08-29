@@ -1774,12 +1774,9 @@ test('a plain launch request is blocked from silently editing source files after
   t.end();
 });
 
-// Regression: after a strategy-change nudge, the model may still fail to fix the file — that
-// points at a raw capability limit (miscounting lines across a large edit), not a missing
-// guardrail. Once the repeated-edit-failure threshold hits, escalate to a stronger model for the
-// turns needed to fix the file, then revert once it gets a clean edit so the rest of the run
-// doesn't silently stay on the more expensive model for no reason.
-test('repeated edit failures escalate to a stronger model, then revert once the file is fixed', async (t) => {
+// Repeated failures should improve recovery guidance and reasoning effort, never override the
+// model the user deliberately chose.
+test('repeated edit failures preserve the user-selected model throughout recovery', async (t) => {
   const originalRunAgentLoop = global.window.runAgentLoop;
   const originalSetTimeout = global.setTimeout;
   const originalFetch = global.fetch;
@@ -1796,7 +1793,7 @@ test('repeated edit failures escalate to a stronger model, then revert once the 
     readFile: async () => 'x'.repeat(20000),
     patchFile: async (workspace, filePath) => {
       patchCallCount++;
-      // First 3 patches introduce a syntax error; the 4th (after escalation) is clean.
+      // First 3 patches introduce a syntax error; the 4th is clean.
       const broken = patchCallCount <= 3;
       return {
         success: true,
@@ -1837,9 +1834,9 @@ test('repeated edit failures escalate to a stronger model, then revert once the 
     if (turnCount === 2) return patchCall('a'); // 1st edit, streak=1, still original model
     if (turnCount === 3) return patchCall('c'); // 2nd edit, streak=2, still original model, needs-read set
     if (turnCount === 4) return readCall();      // satisfy edit-thrash guard
-    if (turnCount === 5) return patchCall('e'); // 3rd edit, streak=3 -> escalation triggers after this
-    if (turnCount === 6) return readCall();      // satisfy edit-thrash guard again (request now uses escalated model)
-    if (turnCount === 7) return patchCall('g'); // 4th edit, this one is clean -> reverts after this
+    if (turnCount === 5) return patchCall('e'); // 3rd edit, streak=3 -> stronger recovery guidance
+    if (turnCount === 6) return readCall();      // satisfy edit-thrash guard again
+    if (turnCount === 7) return patchCall('g'); // 4th edit, this one is clean
     return {
       ok: true,
       json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: 'server.js is fixed now.' }] } }] })
@@ -1851,10 +1848,10 @@ test('repeated edit failures escalate to a stronger model, then revert once the 
     await window.runAgentLoop('fix the syntax error in server.js', 'gemini-2.5-flash-lite', conversation);
 
     t.equal(modelsRequested[0], 'gemini-2.5-flash-lite', 'the first turn (read) uses the originally selected model');
-    t.equal(modelsRequested[4], 'gemini-2.5-flash-lite', 'the request that triggers escalation (3rd failing patch) still uses the original model — escalation applies to the NEXT call');
-    t.equal(modelsRequested[5], 'gemini-2.5-flash', 'right after the 3rd consecutive failure the loop is escalated to the stronger model');
-    t.equal(modelsRequested[6], 'gemini-2.5-flash', 'the clean fix attempt still runs on the escalated model');
-    t.equal(modelsRequested[7], 'gemini-2.5-flash-lite', 'after the clean edit the loop reverts to the originally selected model');
+    t.equal(modelsRequested[4], 'gemini-2.5-flash-lite', 'the third failing patch uses the selected model');
+    t.equal(modelsRequested[5], 'gemini-2.5-flash-lite', 'the recovery read still uses the selected model');
+    t.equal(modelsRequested[6], 'gemini-2.5-flash-lite', 'the clean fix attempt still uses the selected model');
+    t.equal(modelsRequested[7], 'gemini-2.5-flash-lite', 'the final answer remains on the selected model');
   } finally {
     global.window.runAgentLoop = originalRunAgentLoop;
     global.fetch = originalFetch;
@@ -2469,11 +2466,7 @@ test('resolveUtilityModelName maps to the cheapest tier in each Gemini family an
   t.end();
 });
 
-// Phase 2 of the reliability/cost pass: instead of only reacting after repeated edit
-// failures already happened, a "deep" task (per classifyPlanningNeed's new taskComplexity
-// field) proactively upgrades the model for the WHOLE run from turn 1, before any damage
-// can occur. The user's selection is a floor, never a ceiling.
-test('a task classified as deep complexity proactively upgrades the model from turn 1', async (t) => {
+test('a task classified as deep complexity preserves the explicit model from turn 1', async (t) => {
   const originalRunAgentLoop = global.window.runAgentLoop;
   const originalFetch = global.fetch;
 
@@ -2519,7 +2512,8 @@ test('a task classified as deep complexity proactively upgrades the model from t
         allowDowngrade: false
       }
     });
-    t.equal(modelsRequested[0], 'gemini-2.5-flash', 'turn 1 is already upgraded to the stronger model for a deep task, even when the durable handoff profile names the lower tier');
+    t.equal(modelsRequested[0], 'gemini-2.5-flash-lite', 'deep complexity changes reasoning policy, not the durable handoff model');
+    t.notOk(conversation._proactiveDeepTaskModel, 'no hidden upgraded model is persisted');
   } finally {
     global.window.runAgentLoop = originalRunAgentLoop;
     global.fetch = originalFetch;
@@ -2705,16 +2699,7 @@ test('a task classified as light complexity never downgrades below the user\'s e
   t.end();
 });
 
-// Regression: a real transcript showed the proactive deep-task model upgrade only lasting for
-// the planning turn — the moment the user approved the plan, execution silently reverted to the
-// base model (gemini-2.5-flash-lite), which then repeatedly corrupted the file with syntax
-// errors before the REACTIVE escalation eventually kicked in. Root cause: the plan-approval
-// branch's planningDecision never carries taskComplexity (only classifyPlanningNeed sets it), so
-// without persisting the upgrade on the conversation object, a fresh runAgentLoop call for the
-// approval turn recomputed taskComplexity as "standard" and used the raw base model for all the
-// actual editing. The fix persists the upgrade on conversation._proactiveDeepTaskModel so it
-// survives into the approval/execution call.
-test('a proactive deep-task model upgrade survives into the plan-approval/execution turn instead of silently reverting', async (t) => {
+test('plan approval and execution preserve the same explicit model without hidden upgrade state', async (t) => {
   const originalRunAgentLoop = global.window.runAgentLoop;
   const originalFetch = global.fetch;
 
@@ -2758,9 +2743,9 @@ test('a proactive deep-task model upgrade survives into the plan-approval/execut
   try {
     // Turn 1: fresh task, classified deep -> plan is written and pauses for approval.
     await window.runAgentLoop('fix the apex velocity game and get it working properly', 'gemini-2.5-flash-lite', conversation);
-    t.equal(modelsRequested[0], 'gemini-2.5-flash', 'the planning turn itself is already upgraded for a deep task');
+    t.equal(modelsRequested[0], 'gemini-2.5-flash-lite', 'the deep planning turn uses the selected model');
     t.equal(conversation.awaitingPlanApproval, true, 'the plan is written and pauses for approval');
-    t.equal(conversation._proactiveDeepTaskModel, 'gemini-2.5-flash', 'the upgrade is persisted on the conversation for the approval turn to reuse');
+    t.notOk(conversation._proactiveDeepTaskModel, 'no model override is persisted on the conversation');
 
     // Turn 2: a brand-new runAgentLoop call for the user's "approve" reply. This is exactly the
     // call that silently reverted to the base model before this fix.
@@ -2785,7 +2770,7 @@ test('a proactive deep-task model upgrade survives into the plan-approval/execut
       };
     };
     await window.runAgentLoop('approved, go ahead', 'gemini-2.5-flash-lite', conversation);
-    t.equal(modelsRequested[1], 'gemini-2.5-flash', 'the approval/execution turn keeps the upgraded model instead of reverting to the base model');
+    t.equal(modelsRequested[1], 'gemini-2.5-flash-lite', 'the approval/execution turn keeps the selected model');
   } finally {
     global.window.runAgentLoop = originalRunAgentLoop;
     global.fetch = originalFetch;

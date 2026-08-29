@@ -57,9 +57,9 @@ test('ChatGPT never escalates to a stronger model', t => {
   t.end();
 });
 
-test('escalation for every other provider is unchanged', t => {
-  t.equal(agent.getNextModelForHighDemand('deepseek-v4-flash'), 'deepseek-v4-pro', 'DeepSeek flash still escalates');
-  t.equal(agent.getNextModelForHighDemand('deepseek-v4-pro'), null, 'and pro still has nowhere to go');
+test('model escalation is disabled for every provider', t => {
+  t.equal(agent.getNextModelForHighDemand('deepseek-v4-flash'), null, 'DeepSeek stays on the user selection');
+  t.equal(agent.getNextModelForHighDemand('gemini-2.5-flash-lite'), null, 'Gemini stays on the user selection');
   t.end();
 });
 
@@ -155,6 +155,33 @@ test('a missing OpenAI key fails with an actionable message instead of a network
     t.match(error.message, /OpenAI API key is not configured/i, 'names the missing key');
     t.match(error.message, /Settings/i, 'and where to add it');
   }
+  t.end();
+});
+
+test('exhausted OpenAI credits surface immediately instead of leaving the run retrying on Thinking', async t => {
+  let attempts = 0;
+  captureRequest(t, () => {
+    attempts++;
+    return {
+      ok: false,
+      status: 429,
+      text: async () => JSON.stringify({
+        error: {
+          type: 'insufficient_quota',
+          code: 'credit_balance_exhausted',
+          message: 'You have no credits remaining. Add credits to continue using the API.'
+        }
+      })
+    };
+  });
+
+  try {
+    await agent.callOpenAIAPI([{ role: 'user', parts: [{ text: 'hello' }] }], MODEL, 'sk-test', () => {}, true);
+    t.fail('credit exhaustion should reject the request');
+  } catch (error) {
+    t.match(error.message, /no credits remaining/i, 'the real billing error reaches the agent loop');
+  }
+  t.equal(attempts, 1, 'a permanent billing failure is not retried');
   t.end();
 });
 

@@ -67,6 +67,10 @@ test('a user stop ends every provider retry loop', (t) => {
 test('auth, billing, and malformed-request failures abort instead of retrying 15 times', (t) => {
   const nonRetryable = agent.createNonRetryableModelError('HTTP 401: invalid API key');
   t.ok(agent.isUnretryableModelError(nonRetryable), 'a non-retryable API error aborts');
+  t.ok(agent.isNonRetryableModelHttpStatus(429, 'You have no credits remaining.'),
+    'an exhausted credit balance is permanent and aborts');
+  t.notOk(agent.isNonRetryableModelHttpStatus(429, 'Requests per minute exceeded; retry later.'),
+    'an ordinary temporary 429 still retries');
   t.end();
 });
 

@@ -252,17 +252,20 @@ test('review-only and plan-revision turns are filtered to their own gates', (t) 
   t.end();
 });
 
-test('unresolved intent exposes evidence tools but no action tools', (t) => {
+test('unresolved Dispatch intent exposes safe orientation tools but no source or action tools', (t) => {
   const names = toolNamesForProfile({ inspectionOnlyIntent: true }, 'orion');
-  for (const allowed of ['read_file', 'grep_search', 'list_files', 'get_workspace_info']) {
+  for (const allowed of ['get_workspace_info']) {
     t.ok(names.has(allowed), `${allowed} remains available for grounded clarification`);
+  }
+  for (const specialistOwned of ['read_file', 'grep_search', 'list_files']) {
+    t.notOk(names.has(specialistOwned), `${specialistOwned} remains specialist-owned even when intent is unresolved`);
   }
   for (const blocked of ['handoff_to_coder', 'cancel_coder_task', 'change_workspace', 'edit_config']) {
     t.notOk(names.has(blocked), `${blocked} is unavailable until executable intent is established`);
   }
   agent.setActiveToolGateProfile({ inspectionOnlyIntent: true });
   t.equal(agent.getSemanticIntentToolGate('read_file').allowed, true,
-    'the runtime gate independently permits evidence collection');
+    'the semantic gate does not pretend source reads are unsafe; the Dispatch role boundary removes them from its declared surface');
   t.equal(agent.getSemanticIntentToolGate('handoff_to_coder').allowed, false,
     'the runtime gate independently rejects an undeclared action call');
   agent.setActiveToolGateProfile(null);

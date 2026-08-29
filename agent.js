@@ -141,7 +141,7 @@ WHO YOU'RE TALKING TO:
 Jason. Solo developer. Casual, direct — he wants the answer, not the explanation. He'll give you context as it comes up. Don't ask for everything upfront.
 
 HOW YOU WORK:
-Handle directly: conversation, strategy, planning, a quick web search or two, reading and discussing code or docs, answering questions, and browser screenshots. You can look at files and search the web to back up what you say, but you cannot write, edit, run commands, capture the native desktop, or operate the desktop yourself — you are read-only by design. You may attach a browser screenshot or existing safe image to your response when Jason asks to see it.
+Handle directly: conversation, strategy, planning, a quick web search or two, discussing code or documents already supplied in the conversation or returned by a specialist, answering questions, and browser screenshots. Fresh workspace/project source inspection belongs to Researcher, even when it appears to require only one file. You can search the web to back up a quick answer, but you cannot write, edit, run commands, capture the native desktop, operate the desktop, or begin your own project source survey. You may attach a browser screenshot or existing safe image to your response when Jason asks to see it.
 Route to the coder: anything requiring file changes, writing or debugging code, running tests, building or fixing features, running local commands tied to a codebase, or producing local files/artifacts for Jason. Before routing, make sure you understand the task well enough to hand it off clearly — ask Jason to clarify if you don't. When you route something, tell him. Don't go quiet. Report back with a clean summary when it's done.
 
 Route to the operator: anything requiring hands-on desktop or browser execution that isn't code work — clicking through an application UI, filling in a web form, driving a multi-step browser workflow, launching or monitoring a local process/app, or capturing and inspecting the desktop/screen to verify something happened. Same rule as Coder: understand the task first, tell Jason when you route it, report back when it's done. If a request is genuinely both (e.g. "build this feature, then click through it to confirm it works"), route the code portion to Coder first and hand the verification portion to Operator once Coder reports back — don't try to make one specialist do the other's job.
@@ -150,7 +150,7 @@ Route to the researcher: real multi-step investigation that needs finding and cr
 
 Permission boundary rule: when Jason asks for an executable or mutating operation that Dispatch cannot perform, or for research deeper than a quick inline answer, you MUST call handoff_to_coder, handoff_to_operator, or handoff_to_researcher, whichever fits the work. Never refuse the task or tell Jason to perform it manually merely because Dispatch is read-only. If the target is genuinely ambiguous, use inspect_environment for read-only identification or tell the specialist to identify it safely as part of the handoff.
 
-Context ownership: for an obvious build/fix/edit/test request, route early from the known workspace and task description. Do not deeply inspect source merely to decide that Coder should do the work. Handle a focused read-only question directly when it needs at most one or two source files. Delegate broader project reviews as read-only inspections so one specialist owns the source survey, persists version-bound file notes/project knowledge, and reports back through Dispatch — choose that specialist by the shape of the work, not by the fact that it is an inspection: a survey whose point is gathering, comparing and synthesizing evidence is Researcher's, while one that is really diagnosis ahead of a change is Coder's. If a focused discussion later becomes implementation, use handoff_to_coder; Orion will transfer exact validated context packets so Coder can start from that evidence instead of rediscovering the project.
+Context ownership: for an obvious build/fix/edit/test request, route early from the known workspace and task description. Do not inspect source merely to decide that Coder should do the work. Any fresh read-only workspace/project source inspection routes to Researcher immediately so one specialist owns the survey, persists version-bound file notes/project knowledge, and reports grounded findings back through Dispatch. A request whose mission includes changing, building, testing, or repairing the project routes to Coder; Coder may inspect what it must as part of that owned implementation task. If a discussion later becomes implementation, use handoff_to_coder and transfer Researcher's validated findings so Coder does not rediscover the project.
 
 HOW YOU THINK:
 Don't snap-route. Ask yourself first: can I handle this directly? Do I have enough context to give the coder a clear task? Is this a coding problem or a planning conversation first? Think it through, then act.
@@ -1602,7 +1602,9 @@ async function evaluateLoopStateWithSupervisorDecision(modelName, workWalkthroug
     const messages = [{ role: 'user', parts: [{ text: prompt }] }];
     let responseText = '';
     let resp;
-    if (modelName.startsWith('deepseek')) {
+    if (isGroqModelName(modelName)) {
+      resp = await callGroqAPI(messages, modelName, config?.groqApiKey || '', () => {}, true);
+    } else if (modelName.startsWith('deepseek')) {
       resp = await callDeepSeekAPI(messages, modelName, config?.deepseekApiKey || '', () => {}, true);
     } else if (modelName.startsWith('gpt-')) {
       resp = await callOpenAIAPI(messages, modelName, config?.openaiApiKey || '', () => {}, true);
@@ -1652,7 +1654,9 @@ async function evaluateLoopStateWithSupervisorLegacy(modelName, workWalkthrough,
     let responseText = '';
     
     let resp;
-    if (modelName.startsWith('deepseek')) {
+    if (isGroqModelName(modelName)) {
+      resp = await callGroqAPI(messages, modelName, config?.groqApiKey || '', () => {}, true);
+    } else if (modelName.startsWith('deepseek')) {
       resp = await callDeepSeekAPI(messages, modelName, config?.deepseekApiKey || '', () => {}, true);
     } else if (modelName.startsWith('gpt-')) {
       resp = await callOpenAIAPI(messages, modelName, config?.openaiApiKey || '', () => {}, true);
@@ -2161,13 +2165,6 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   config.modelName = modelName || config.modelName || 'gemini-2.5-flash-lite';
   let activeRunModelName = config.modelName;
   config.activeRunModelName = activeRunModelName;
-  // Preserved so a temporary escalation to a stronger model (see the repeated-edit-failure
-  // handling below) can revert once the file it was escalated for gets a clean edit, instead of
-  // silently staying on the more expensive model for the rest of the conversation.
-  const userSelectedModelName = activeRunModelName;
-  const allowTaskModelEscalation = !options.executionProfile
-    || options.executionProfile.allowEscalation !== false;
-  let modelEscalatedForEditKey = null;
   const promptSource = options.source || 'user';
   const isPlanRevision = options.planRevision === true || promptSource === 'plan-revision';
   const isInternalPrompt = !!options.internalPrompt || isPlanRevision || promptSource === 'followup'
@@ -2180,8 +2177,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const promptImages = Array.isArray(options.images) ? options.images.filter(img => img && img.data && img.mimeType) : [];
   const hasPromptImages = promptImages.length > 0;
 
-  // Route to Gemini 2.5 Flash if images are present and current model doesn't support vision
-  if (hasPromptImages && !activeRunModelName.startsWith('gemini-')) {
+  // Route only text-only selections to Gemini for an image-bearing turn. Multimodal providers
+  // keep the user's exact model choice; this is capability routing, never a quality escalation.
+  if (hasPromptImages && !modelSupportsDirectVision(activeRunModelName)) {
     const visionModel = 'gemini-2.5-flash';
     if (window.appendSystemMessage) {
       window.appendSystemMessage(
@@ -2479,44 +2477,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
     };
   }
 
-  // Proactive model tier selection: pick capability up front instead of only reacting after
-  // repeated edit failures already happened. The user's selected model is a FLOOR, never a
-  // ceiling — a "deep" task (multi-file implementation, non-trivial refactor, or anything
-  // plan-worthy) is upgraded one tier for the whole run, but a "light" task never downgrades
-  // below what the user explicitly picked. Reuses the existing escalation family-mapping so a
-  // later reactive escalation (see repeated-edit-failure handling below) still composes cleanly
-  // on top of this baseline instead of fighting it.
-  //
-  // A deep-task upgrade must survive the WHOLE approved-plan lifecycle (planning -> approval ->
-  // execution -> auto-continue), not just the single call where classifyPlanningNeed happened to
-  // return "deep". Plan-approval replies and internal follow-ups re-enter runAgentLoop as fresh
-  // calls with a fresh local activeRunModelName, and their own planningDecision never carries
-  // taskComplexity (only classifyPlanningNeed sets it) — without persisting the decision on the
-  // conversation object, the upgrade silently evaporates right as real execution starts, which is
-  // exactly when the model most needs the extra capability.
+  // Model identity is user-owned. Complexity, failures, planning, and continuation may change
+  // reasoning effort when Auto is selected, but they never replace the selected model. Clear
+  // legacy persisted upgrade fields so an older unfinished conversation cannot revive that
+  // retired behavior after an update.
   if (resetMissionState) {
-    // A genuinely new task: forget any previous mission's upgrade and let it recompute fresh.
     delete conversation._proactiveDeepTaskModel;
     delete conversation._proactiveDeepTaskBaseModel;
-  }
-  const taskComplexity = planningDecision.taskComplexity || (planningDecision.mode === 'plan' ? 'deep' : 'standard');
-  if (taskComplexity === 'deep' && allowTaskModelEscalation) {
-    const upgraded = getNextModelForHighDemand(userSelectedModelName);
-    if (upgraded) {
-      activeRunModelName = upgraded;
-      config.activeRunModelName = activeRunModelName;
-      conversation._proactiveDeepTaskModel = upgraded;
-      conversation._proactiveDeepTaskBaseModel = userSelectedModelName;
-      currentAgentLogs.push(`[Model] Proactively using ${activeRunModelName} for this deep task (upgraded from ${userSelectedModelName}).`);
-      if (window.appendSystemMessage) window.appendSystemMessage(`Using ${activeRunModelName} for this task — it looks like it needs a stronger model than ${userSelectedModelName}.`, { conversationId: conversation.id });
-    }
-  } else if (conversation._proactiveDeepTaskModel && conversation._proactiveDeepTaskBaseModel === userSelectedModelName) {
-    // This call didn't freshly classify complexity (a plan-approval reply, an internal follow-up,
-    // or an already-approved continuation) but a deep-task upgrade is still active for the
-    // current unresolved mission and the user hasn't changed their model selection since — keep
-    // using it instead of reverting to the base model mid-execution.
-    activeRunModelName = conversation._proactiveDeepTaskModel;
-    config.activeRunModelName = activeRunModelName;
   }
 
   // A genuinely new task resets the auto-continue budget and stall tracking so prior runs
@@ -3202,7 +3169,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // Call API (Gemini or Ollama) with automatic transient error retry and warnings
       let response;
       try {
-        agentSubStatus = `Calling ${activeRunModelName.startsWith('gemini-') ? 'Gemini' : (activeRunModelName.startsWith('claude') ? 'Claude (' + activeRunModelName + ')' : (activeRunModelName.startsWith('deepseek') ? 'DeepSeek (' + activeRunModelName + ')' : (activeRunModelName.startsWith('gpt-') ? 'ChatGPT (' + activeRunModelName + ')' : 'Ollama (' + activeRunModelName + ')')))} API...`;
+        agentSubStatus = `Calling ${activeRunModelName.startsWith('gemini-') ? 'Gemini' : (activeRunModelName.startsWith('claude') ? 'Claude (' + activeRunModelName + ')' : (activeRunModelName.startsWith('deepseek') ? 'DeepSeek (' + activeRunModelName + ')' : (activeRunModelName.startsWith('gpt-') ? 'ChatGPT (' + activeRunModelName + ')' : (isGroqModelName(activeRunModelName) ? 'Groq (' + groqApiModelName(activeRunModelName) + ')' : 'Ollama (' + activeRunModelName + ')'))))} API...`;
         persistCurrentAgentLogs({ render: true });
         const modelCallDelayMs = Math.min(Math.max(parseInt(config.modelCallDelayMs, 10) || 0, 0), 60000);
         if (modelCallDelayMs > 0) {
@@ -3334,6 +3301,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           response = await callOpenAIAPI(messagesForApiCall, activeRunModelName, config.openaiApiKey, onApiWarning, disableToolsForSemanticSafety, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
         } else if (activeRunModelName.startsWith('deepseek')) {
           response = await callDeepSeekAPI(messagesForApiCall, activeRunModelName, config.deepseekApiKey, onApiWarning, disableToolsForSemanticSafety, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
+        } else if (isGroqModelName(activeRunModelName)) {
+          response = await callGroqAPI(messagesForApiCall, activeRunModelName, config.groqApiKey, onApiWarning, disableToolsForSemanticSafety, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
         } else {
           response = await callOllamaAPI(messagesForApiCall, activeRunModelName, onApiWarning, disableToolsForSemanticSafety, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
         }
@@ -4671,37 +4640,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             if (failureStreak >= 3 && result && typeof result === 'object' && !Array.isArray(result)) {
               const escalation = await buildRepeatedEditFailureEscalation(workspacePath, args.path, failureStreak);
               result.message = `${result.message || ''}\n\n${escalation}`;
-              // Repeated syntax/regression errors on the same file despite a strategy-change nudge
-              // suggest the current model can't reliably reconstruct this file's code, not just a
-              // tooling gap — escalate to a stronger model for the turns needed to fix it, then
-              // revert once this file gets a clean edit so the rest of the run doesn't silently
-              // stay on the more expensive model.
-              if (!modelEscalatedForEditKey && allowTaskModelEscalation) {
-                const strongerModel = getNextModelForHighDemand(activeRunModelName);
-                if (strongerModel) {
-                  modelEscalatedForEditKey = editKey;
-                  activeRunModelName = strongerModel;
-                  config.activeRunModelName = strongerModel;
-                  const escalationNote = `Escalating to ${strongerModel} after ${failureStreak} consecutive syntax/regression errors editing ${args.path}.`;
-                  currentAgentLogs.push({ type: 'thought', content: escalationNote });
-                  if (window.appendSystemMessage) window.appendSystemMessage(escalationNote, { conversationId: conversation.id });
-                }
-              }
             }
           } else {
             consecutiveEditFailureCounts.delete(editKey);
-            if (modelEscalatedForEditKey === editKey) {
-              // Revert to the proactive deep-task baseline if one is still active for this
-              // mission, not all the way past it to the user's raw selection — the task is
-              // still deep even though this one file is now fixed.
-              const revertTarget = conversation._proactiveDeepTaskModel || userSelectedModelName;
-              const revertNote = `${args.path} was edited cleanly; reverting to ${revertTarget}.`;
-              currentAgentLogs.push({ type: 'thought', content: revertNote });
-              if (window.appendSystemMessage) window.appendSystemMessage(revertNote, { conversationId: conversation.id });
-              activeRunModelName = revertTarget;
-              config.activeRunModelName = revertTarget;
-              modelEscalatedForEditKey = null;
-            }
           }
         }
         if (toolName === 'delete_created_file' && args.path && !isFailedToolResult(result)) {
@@ -8023,7 +7964,8 @@ async function executeTool(name, args, workspace, config, conversation, executio
         goal: args.goal,
         modelName: activeModelName,
         apiKey: config.geminiApiKey,
-        openaiApiKey: config.openaiApiKey
+        openaiApiKey: config.openaiApiKey,
+        groqApiKey: config.groqApiKey
       });
       // Immutable evidence may answer more than one static question. Freshness is enforced by the
       // action epoch in OperatorExecutionPolicy and by lastDesktopSnapshot below: an old image may
@@ -10580,19 +10522,24 @@ async function callUtilityModel(prompt, modelName, config, requireJson = true, o
   // provider refuses.
   const utilityProviderKey = modelName.startsWith('deepseek')
     ? 'deepseek'
-    : (modelName.startsWith('gpt-') ? 'openai' : '');
+    : (modelName.startsWith('gpt-')
+        ? 'openai'
+        : (isGroqModelName(modelName) ? 'groq' : ''));
   if (utilityProviderKey) {
     const utilityProvider = OPENAI_COMPATIBLE_PROVIDERS[utilityProviderKey];
-    const utilityApiKey = utilityProviderKey === 'openai' ? config.openaiApiKey : config.deepseekApiKey;
+    const utilityApiKey = utilityProviderKey === 'openai'
+      ? config.openaiApiKey
+      : (utilityProviderKey === 'groq' ? config.groqApiKey : config.deepseekApiKey);
     if (!utilityApiKey) return null;
     try {
       const response = await fetchWithTimeout(utilityProvider.url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${utilityApiKey}` },
         body: JSON.stringify({
-          model: modelName,
+          model: utilityProvider.normalizeModelName ? utilityProvider.normalizeModelName(modelName) : modelName,
           messages: [{ role: 'user', content: prompt }],
           ...(utilityProvider.sendsReasoningControls === false ? {} : providerControls),
+          ...(utilityProvider.extraRequestFields || {}),
           ...(utilityProvider.sendsTemperature !== false
             && (!providerControls.thinking || providerControls.thinking.type === 'disabled')
             ? { temperature: 0 }
@@ -12728,17 +12675,24 @@ function describeModelApiError(status, errorText) {
   return { status, message, retryDelayMs };
 }
 
-function isGeminiHighDemandError(status, message) {
-  return status === 503 && /currently experiencing high demand|spikes in demand|high demand/i.test(String(message || ''));
-}
-
 function isGeminiHardQuotaError(status, message) {
   if (status !== 429) return false;
   return /monthly spending cap|project spend cap|ai\.studio\/spend|billing/i.test(String(message || ''));
 }
 
-function isNonRetryableModelHttpStatus(status) {
-  return status === 400 || status === 401 || status === 402 || status === 403;
+function isPermanentModelQuotaError(status, message = '') {
+  if (status !== 429) return false;
+  return /insufficient_quota|credit_balance_exhausted|no credits remaining|run out of credits|billing quota|monthly spending cap|project spend cap/i
+    .test(String(message || ''));
+}
+
+function isNonRetryableModelHttpStatus(status, message = '') {
+  // 429 is overloaded: ordinary request/token rate limits should retry, but an exhausted balance
+  // cannot recover through backoff. Treat the latter like auth/billing/malformed-request failures
+  // so the agent loop can replace "Thinking..." with the real error immediately.
+  return status === 400 || status === 401 || status === 402 || status === 403
+    || status === 404 || status === 422
+    || isPermanentModelQuotaError(status, message);
 }
 
 function createNonRetryableModelError(message) {
@@ -12770,32 +12724,33 @@ function isUnretryableModelError(error) {
   return false;
 }
 
-function getNextGeminiModelForHighDemand(modelName) {
-  const fallbackChain = {
-    'gemini-3.1-flash-lite': 'gemini-3.5-flash',
-    'gemini-3.5-flash': 'gemini-3.1-pro-preview',
-    'gemini-2.5-flash-lite': 'gemini-2.5-flash',
-    'gemini-2.5-flash': 'gemini-2.5-pro'
-  };
-  return fallbackChain[modelName] || null;
+const GROQ_MODEL_PREFIX = 'groq:';
+
+function isGroqModelName(modelName) {
+  return String(modelName || '').startsWith(GROQ_MODEL_PREFIX);
 }
 
-// Provider-aware version of the escalation chain above, used by both the proactive deep-task
-// upgrade and the reactive repeated-edit-failure escalation. DeepSeek's lineup is a flat two-tier
-// flash->pro chain (unlike Gemini's multi-family ladder), so it doesn't need its own model-tier
-// classification logic — it escalates to "the pro version of itself," exactly as requested. Claude
-// and Ollama models have no defined next tier and return null, same as before this generalization.
-function getNextModelForHighDemand(modelName) {
+function groqApiModelName(modelName) {
   const name = String(modelName || '');
-  if (name.startsWith('gemini-')) return getNextGeminiModelForHighDemand(name);
-  // ChatGPT models never escalate. This is deliberate and load-bearing, not an oversight of the
-  // chain table below: Orion offers exactly one ChatGPT model, so there is no stronger sibling to
-  // route up to, and silently swapping in a different family mid-run would change both the
-  // provider and the bill behind the user's selection. Selecting ChatGPT means the whole run uses
-  // ChatGPT. Returning null here is what makes the proactive deep-task upgrade a no-op.
-  if (name.startsWith('gpt-')) return null;
-  const deepseekChain = { 'deepseek-v4-flash': 'deepseek-v4-pro' };
-  return deepseekChain[name] || null;
+  return isGroqModelName(name) ? name.slice(GROQ_MODEL_PREFIX.length) : name;
+}
+
+function modelSupportsDirectVision(modelName) {
+  const name = String(modelName || '').toLowerCase();
+  return name.startsWith('gemini-')
+    || name.startsWith('gpt-')
+    || name === 'groq:qwen/qwen3.6-27b';
+}
+
+// Retained as compatibility exports for tests/extensions that previously queried the escalation
+// graph. Model selection is now authoritative: no provider, task complexity, high-demand response,
+// or edit-failure path is allowed to replace what the user selected.
+function getNextGeminiModelForHighDemand() {
+  return null;
+}
+
+function getNextModelForHighDemand() {
+  return null;
 }
 
 // classifyPlanningNeed/classifyPlanApprovalIntent/countTokens/compactHistory are all small,
@@ -12815,6 +12770,9 @@ function resolveUtilityModelName(modelName) {
   // DeepSeek routes utility calls to its own cheap flash tier instead of Gemini — unlike Claude,
   // a DeepSeek-only setup shouldn't need a Gemini key just for classification/token-counting.
   if (name.startsWith('deepseek')) return 'deepseek-v4-flash';
+  // Groq's free models are already the selected cost tier and keep their provider for utility
+  // calls. The internal prefix is stripped only at the HTTP boundary.
+  if (isGroqModelName(name)) return name;
   // ChatGPT keeps its own model for utility calls. gpt-5.6-luna is already the cheap tier of its
   // family, and routing bookkeeping to Gemini the way Claude does would make a ChatGPT-only setup
   // require a second provider's key just to classify and count tokens.
@@ -12936,7 +12894,11 @@ function skillToolsFor(mode) {
 const DISPATCH_TOOL_ALLOWLIST = new Set([
   'recall_memory', 'remember_fact', 'remember_preference',
   'google_search', 'fetch_web_page', 'fetch_api_docs', 'search_api_docs',
-  'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context', 'list_files', 'get_workspace_info', 'change_workspace',
+  // Dispatch supervises project/source inspection but does not perform it. Keeping these tools out
+  // of its actual capability set makes the Researcher boundary hold even if a provider returns a
+  // malformed or low-confidence semantic classification. Existing conversation evidence and
+  // durable project memory remain available below.
+  'get_workspace_info', 'change_workspace',
   ...OrionSpecialistRegistry.handoffToolNamesFor('orion'),
   'get_coder_task_status', 'cancel_coder_task',
   // Dispatch may inspect and navigate read-only web evidence, and may relay an image that already
@@ -12945,9 +12907,8 @@ const DISPATCH_TOOL_ALLOWLIST = new Set([
   // visual route through Operator.
   'open_url', 'click_element', 'fill_input', 'navigate_back', 'close_browser', 'attach_image',
   'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model',
-  'grep_search', 'search_embeddings', 'semantic_search',
-  'get_symbol_index', 'fetch_page', 'git_diff', 'git_rollback', 'edit_config', 'get_file_symbols', 'find_references',
-  'read_notes', 'read_project_memory', 'remember_file_notes',
+  'fetch_page', 'git_rollback', 'edit_config',
+  'read_notes', 'read_project_memory',
   'inspect_environment',
   'db_query',
   'ask_clarifying_questions',
@@ -14420,7 +14381,7 @@ async function callAnthropicAPI(messages, modelName, apiKey, onWarning, disableT
       const retryDelayMs = Math.min(apiError.retryDelayMs || delay, MODEL_API_MAX_RETRY_WAIT_MS);
 
       // Auth, billing, and malformed-request failures are not worth retrying.
-      if (isNonRetryableModelHttpStatus(status)) {
+      if (isNonRetryableModelHttpStatus(status, apiError.message)) {
         throw createNonRetryableModelError(`Anthropic API HTTP ${status}: ${apiError.message}`);
       }
       if (i === attempts) {
@@ -14457,10 +14418,11 @@ function convertGeminiToDeepSeekTools(declarations) {
   }));
 }
 
-function convertGeminiToDeepSeekMessages(geminiMessages) {
+function convertGeminiToDeepSeekMessages(geminiMessages, options = {}) {
   const out = [];
   let toolCallCounter = 0;
   let lastToolCallIds = [];
+  const includeReasoningContinuity = options.includeReasoningContinuity !== false;
 
   // Reasoning content is replayed for the MOST RECENT assistant turn only. Sending every prior
   // turn's chain-of-thought made each request larger than the last — by turn 60 the history
@@ -14509,9 +14471,9 @@ function convertGeminiToDeepSeekMessages(geminiMessages) {
       // assistant turn that performed tool calls. Older/sanitized Orion histories may have
       // tool calls without the hidden reasoning part; include a minimal continuity marker so
       // DeepSeek does not reject the whole request with a 400.
-      if (reasoningContent) {
+      if (includeReasoningContinuity && reasoningContent) {
         assistantMsg.reasoning_content = reasoningContent;
-      } else if (toolCalls.length > 0) {
+      } else if (includeReasoningContinuity && toolCalls.length > 0) {
         assistantMsg.reasoning_content = '[Orion internal note: reasoning_content was not preserved for this earlier tool-call turn; continue from the tool calls and tool results.]';
       }
       if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
@@ -14562,7 +14524,7 @@ function boundedToolOutputPreview(value, maxChars = 800) {
   return `${text.slice(0, edge)}\n... ${text.length - (edge * 2)} characters omitted ...\n${text.slice(-edge)}`;
 }
 
-function buildEmergencyToolResultReceipt(name, response, originalLength) {
+function buildEmergencyToolResultReceipt(name, response, originalLength, providerLabel = 'DeepSeek') {
   const source = response && typeof response === 'object' ? response : {};
   const receipt = {
     trimmed: true,
@@ -14575,10 +14537,10 @@ function buildEmergencyToolResultReceipt(name, response, originalLength) {
     }
     if (source.stdout != null) receipt.stdoutPreview = boundedToolOutputPreview(source.stdout);
     if (source.stderr != null) receipt.stderrPreview = boundedToolOutputPreview(source.stderr);
-    receipt.note = `This ${name} output was too large to fit safely in the DeepSeek request. The execution result and bounded output edges are preserved here; rerun a narrower command only if exact omitted output is required.`;
+    receipt.note = `This ${name} output was too large to fit safely in the ${providerLabel} request. The execution result and bounded output edges are preserved here; rerun a narrower command only if exact omitted output is required.`;
     return receipt;
   }
-  receipt.note = `This ${name} output was too large to fit safely in the DeepSeek request. Use inspect_code_context, get_file_symbols, grep_search with contextLines, or a narrower read_file range to retrieve the exact relevant source.`;
+  receipt.note = `This ${name} output was too large to fit safely in the ${providerLabel} request. Use inspect_code_context, get_file_symbols, grep_search with contextLines, or a narrower read_file range to retrieve the exact relevant source.`;
   return receipt;
 }
 
@@ -14629,7 +14591,8 @@ function fitDeepSeekMessagesToContextWindow(messages, modelName, systemText, too
         response: buildEmergencyToolResultReceipt(
           candidate.name,
           candidate.response,
-          candidate.originalLength
+          candidate.originalLength,
+          options.providerLabel || 'DeepSeek'
         )
       }
     };
@@ -14641,7 +14604,7 @@ function fitDeepSeekMessagesToContextWindow(messages, modelName, systemText, too
 
   if (estimatedTokens > maxInputTokens) {
     throw createNonRetryableModelError(
-      `Orion blocked an oversized DeepSeek request locally (${estimatedTokens} estimated input tokens; safe limit ${maxInputTokens}). `
+      `Orion blocked an oversized ${options.providerLabel || 'DeepSeek'} request locally (${estimatedTokens} estimated input tokens; safe limit ${maxInputTokens}). `
       + 'The remaining context is not reducible tool output. Start a new task or compact the conversation before retrying.'
     );
   }
@@ -14680,6 +14643,19 @@ const OPENAI_COMPATIBLE_PROVIDERS = {
     sendsTemperature: false,
     defaultReasoningPolicy: () => ({}),
     fallbackReasoningControls: {}
+  },
+  groq: {
+    label: 'Groq',
+    url: 'https://api.groq.com/openai/v1/chat/completions',
+    missingKeyMessage: 'Groq API key is not configured. Add it in Settings to use Groq models.',
+    sendsReasoningControls: true,
+    sendsTemperature: false,
+    includeReasoningContinuity: false,
+    normalizeModelName: groqApiModelName,
+    defaultReasoningPolicy: () => ({ effort: 'medium' }),
+    fallbackReasoningControls: { reasoning_effort: 'medium' },
+    extraRequestFields: { reasoning_format: 'parsed' },
+    maxInputTokens: Math.floor(131072 * DEEPSEEK_SAFE_INPUT_RATIO)
   }
 };
 
@@ -14692,11 +14668,17 @@ async function callOpenAICompatibleAPI(providerKey, messages, modelName, apiKey,
   const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
   const systemText = getSystemInstruction(disableTools, orionCachedMemoryBlock, modelName);
   const deepseekTools = disableTools ? undefined : convertGeminiToDeepSeekTools(buildAgentToolDeclarations());
-  const fitted = fitDeepSeekMessagesToContextWindow(processedMessages, modelName, systemText, deepseekTools, options);
+  const fitted = fitDeepSeekMessagesToContextWindow(processedMessages, modelName, systemText, deepseekTools, {
+    ...options,
+    maxInputTokens: Number(options.maxInputTokens) > 0 ? Number(options.maxInputTokens) : provider.maxInputTokens,
+    providerLabel: provider.label
+  });
   if (fitted.collapsedToolResults > 0 && onWarning) {
     onWarning(`Context safety collapsed ${fitted.collapsedToolResults} oversized tool result(s) before calling ${modelName}. Orion will retrieve narrower exact source instead.`);
   }
-  const deepseekMessages = [{ role: 'system', content: systemText }, ...convertGeminiToDeepSeekMessages(fitted.messages)];
+  const compatibleMessages = [{ role: 'system', content: systemText }, ...convertGeminiToDeepSeekMessages(fitted.messages, {
+    includeReasoningContinuity: provider.includeReasoningContinuity !== false
+  })];
 
   const reasoningControls = provider.sendsReasoningControls === false
     ? {}
@@ -14707,9 +14689,10 @@ async function callOpenAICompatibleAPI(providerKey, messages, modelName, apiKey,
         )
       : provider.fallbackReasoningControls);
   const requestBody = {
-    model: modelName,
-    messages: deepseekMessages,
+    model: provider.normalizeModelName ? provider.normalizeModelName(modelName) : modelName,
+    messages: compatibleMessages,
     ...reasoningControls,
+    ...(provider.extraRequestFields || {}),
     ...(provider.sendsTemperature !== false
       && (!reasoningControls.thinking || reasoningControls.thinking.type === 'disabled')
       ? { temperature: 0 }
@@ -14736,7 +14719,8 @@ async function callOpenAICompatibleAPI(providerKey, messages, modelName, apiKey,
         const message = (data.choices && data.choices[0] && data.choices[0].message) || {};
         const finishReason = data.choices && data.choices[0] && data.choices[0].finish_reason;
         const parts = [];
-        if (message.reasoning_content) parts.push({ text: message.reasoning_content, thought: true, _deepseekReasoningContent: true });
+        const reasoningText = message.reasoning_content || message.reasoning || '';
+        if (reasoningText) parts.push({ text: reasoningText, thought: true, _deepseekReasoningContent: true });
         if (message.content) parts.push({ text: message.content });
         
         if (finishReason === 'length') {
@@ -14760,7 +14744,7 @@ async function callOpenAICompatibleAPI(providerKey, messages, modelName, apiKey,
       const apiError = describeModelApiError(status, errorText);
       const retryDelayMs = Math.min(apiError.retryDelayMs || delay, MODEL_API_MAX_RETRY_WAIT_MS);
 
-      if (isNonRetryableModelHttpStatus(status)) {
+      if (isNonRetryableModelHttpStatus(status, apiError.message)) {
         throw createNonRetryableModelError(`${provider.label} API HTTP ${status}: ${apiError.message}`);
       }
       if (i === attempts) {
@@ -14782,6 +14766,10 @@ async function callOpenAICompatibleAPI(providerKey, messages, modelName, apiKey,
 
 function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTools = false, options = {}) {
   return callOpenAICompatibleAPI('deepseek', messages, modelName, apiKey, onWarning, disableTools, options);
+}
+
+function callGroqAPI(messages, modelName, apiKey, onWarning, disableTools = false, options = {}) {
+  return callOpenAICompatibleAPI('groq', messages, modelName, apiKey, onWarning, disableTools, options);
 }
 
 // ChatGPT talks to the Responses API, not chat/completions. That is forced by the provider, not a
@@ -14949,7 +14937,7 @@ async function callOpenAIAPI(messages, modelName, apiKey, onWarning, disableTool
       const apiError = describeModelApiError(status, errorText);
       const retryDelayMs = Math.min(apiError.retryDelayMs || delay, MODEL_API_MAX_RETRY_WAIT_MS);
 
-      if (isNonRetryableModelHttpStatus(status)) {
+      if (isNonRetryableModelHttpStatus(status, apiError.message)) {
         throw createNonRetryableModelError(`ChatGPT API HTTP ${status}: ${apiError.message}`);
       }
       if (i === attempts) {
@@ -15118,7 +15106,7 @@ function normalizeScreenshotInspectionResult({ text, path, goal, providerName })
   };
 }
 
-async function inspectScreenshotWithModel({ imageBase64, mimeType, path, goal, modelName, apiKey, openaiApiKey }) {
+async function inspectScreenshotWithModel({ imageBase64, mimeType, path, goal, modelName, apiKey, openaiApiKey, groqApiKey }) {
   if (!modelName) throw new Error('Active chat model is required for multimodal screenshot inspection.');
   // ChatGPT reads its own screenshots. gpt-5.6 accepts image input, so borrowing Gemini here
   // would send the user's screen to a second provider they did not select - and would fail
@@ -15126,8 +15114,17 @@ async function inspectScreenshotWithModel({ imageBase64, mimeType, path, goal, m
   if (modelName.startsWith('gpt-') && openaiApiKey) {
     return await inspectScreenshotWithOpenAI({ imageBase64, mimeType, path, goal, modelName, apiKey: openaiApiKey });
   }
+  if (modelName === 'groq:qwen/qwen3.6-27b' && groqApiKey) {
+    return await inspectScreenshotWithGroq({ imageBase64, mimeType, path, goal, modelName, apiKey: groqApiKey });
+  }
   if (modelName.startsWith('gemini-')) {
     return await inspectScreenshotWithGemini({ imageBase64, mimeType, path, goal, modelName, apiKey });
+  }
+  if (isGroqModelName(modelName)) {
+    if (apiKey) {
+      return await inspectScreenshotWithGemini({ imageBase64, mimeType, path, goal, modelName: 'gemini-2.5-flash', apiKey });
+    }
+    throw new Error(`${groqApiModelName(modelName)} is text-only for Orion screenshot inspection. Configure a Gemini API key or select Groq Qwen 3.6 Vision.`);
   }
   if (apiKey) {
     return await inspectScreenshotWithGemini({ imageBase64, mimeType, path, goal, modelName: 'gemini-2.5-flash', apiKey });
@@ -15207,6 +15204,35 @@ async function inspectScreenshotWithOpenAI({ imageBase64, mimeType, path, goal, 
   return normalizeScreenshotInspectionResult({ text, path, goal, providerName: modelName });
 }
 
+async function inspectScreenshotWithGroq({ imageBase64, mimeType, path, goal, modelName, apiKey }) {
+  const response = await fetchWithTimeout('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model: groqApiModelName(modelName),
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: buildScreenshotInspectionPrompt(goal) },
+          { type: 'image_url', image_url: { url: `data:${mimeType || 'image/png'};base64,${imageBase64}` } }
+        ]
+      }],
+      reasoning_effort: 'none',
+      response_format: { type: 'json_object' }
+    })
+  }, MODEL_API_REQUEST_TIMEOUT_MS, 'Groq vision screenshot inspection');
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`Groq vision inspection failed HTTP ${response.status}: ${errText}`);
+  }
+
+  const data = await response.json();
+  const text = data && data.choices && data.choices[0]
+    && data.choices[0].message && data.choices[0].message.content;
+  return normalizeScreenshotInspectionResult({ text, path, goal, providerName: groqApiModelName(modelName) });
+}
+
 async function inspectScreenshotWithOllama({ imageBase64, path, goal, modelName }) {
   const response = await fetchWithTimeout('http://localhost:11434/api/chat', {
     method: 'POST',
@@ -15284,6 +15310,8 @@ window.quickOrionLLMCall = async function(systemPrompt, userMessages, config, op
     : null;
   if (/anthropic|claude/i.test(modelName)) {
     resp = await callAnthropicAPI(messages, modelName, config.anthropicApiKey || '', () => {}, true, { reasoningPolicy });
+  } else if (isGroqModelName(modelName)) {
+    resp = await callGroqAPI(messages, modelName, config.groqApiKey || '', () => {}, true, { reasoningPolicy });
   } else if (/deepseek/i.test(modelName)) {
     resp = await callDeepSeekAPI(messages, modelName, config.deepseekApiKey || '', () => {}, true, { reasoningPolicy });
   } else if (/^gpt-/i.test(modelName)) {
@@ -15410,19 +15438,6 @@ async function callGeminiAPI(messages, modelName, apiKey, onWarning, disableTool
         throw createNonRetryableModelError(`HTTP ${status}: ${apiError.message}`);
       }
 
-      if (isGeminiHighDemandError(status, apiError.message)) {
-        const fallbackModelName = getNextGeminiModelForHighDemand(activeModelName);
-        if (fallbackModelName) {
-          if (onWarning) {
-            onWarning(`Gemini API returned HTTP ${status} (High Demand) for ${activeModelName}. Temporarily switching this request to ${fallbackModelName}; your selected default model is unchanged.`);
-          }
-          activeModelName = fallbackModelName;
-          delay = 1500;
-          i -= 1;
-          continue;
-        }
-      }
-      
       const isTransient = [429, 500, 502, 503, 504].includes(status);
       if (!isTransient || i === attempts) {
         const retryText = apiError.retryDelayMs ? ` Retry after about ${Math.ceil(apiError.retryDelayMs / 1000)} seconds.` : '';
@@ -15673,9 +15688,13 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     estimateDeepSeekRequestTokens,
     fitDeepSeekMessagesToContextWindow,
     callDeepSeekAPI,
+    callGroqAPI,
     callOpenAIAPI,
     callUtilityModel,
     getNextModelForHighDemand,
+    isGroqModelName,
+    groqApiModelName,
+    modelSupportsDirectVision,
     persistCompactedConversation,
     compactHistory,
     summarizeToolStart,
@@ -15702,6 +15721,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     callGeminiAPI,
     inspectScreenshotWithModel,
     inspectScreenshotWithGemini,
+    inspectScreenshotWithGroq,
     inspectScreenshotWithOllama,
     diagnoseModelApiFailure,
     expandCommonWindowsPath,
@@ -15729,6 +15749,10 @@ function diagnoseModelApiFailure(errorText) {
   if (text.includes('monthly spending cap') || text.includes('project spend cap') || text.includes('ai.studio/spend')) {
     return 'Diagnosis: the Gemini project has hit a monthly spend cap. This is a hard billing limit, not a temporary model rate limit; retries or model escalation will not continue until the AI Studio spend cap or billing configuration is changed.';
   }
+  if (text.includes('insufficient_quota') || text.includes('credit_balance_exhausted')
+      || text.includes('no credits remaining') || text.includes('run out of credits')) {
+    return 'Diagnosis: the OpenAI API account has no credits remaining. This is a hard billing limit, not a temporary rate limit; add API credits before retrying.';
+  }
   if (text.includes('429') || text.includes('quota') || text.includes('resource has been exhausted')) {
     return 'Diagnosis: the model provider is rate-limiting or quota-limiting requests. Orion should pause the request loop, preserve state, and resume after cooldown.';
   }
@@ -15754,6 +15778,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
   module.exports.__setAgentExecutionModeForTest = (mode) => { agentExecutionMode = mode; };
   module.exports.computeNextModelRetryDelay = computeNextModelRetryDelay;
   module.exports.isUnretryableModelError = isUnretryableModelError;
+  module.exports.isNonRetryableModelHttpStatus = isNonRetryableModelHttpStatus;
   module.exports.createUserStopError = createUserStopError;
   module.exports.createNonRetryableModelError = createNonRetryableModelError;
   module.exports.MODEL_API_MAX_RETRY_WAIT_MS = MODEL_API_MAX_RETRY_WAIT_MS;

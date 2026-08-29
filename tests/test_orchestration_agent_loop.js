@@ -374,7 +374,8 @@ test('Dispatch answers safely when the semantic classifier times out', async t =
     t.ok(Date.now() - startedAt < 1000, 'the stalled preflight is bounded');
     t.equal(harness.modelTurns, 1, 'the normal answer model still runs once');
     t.equal(toolsWereExposed, true, 'classifier failure retains a deliberately narrow evidence surface');
-    t.ok(offeredToolNames.includes('read_file'), 'the fallback can still inspect the named project');
+    t.notOk(offeredToolNames.includes('read_file'), 'classifier failure cannot make Dispatch inspect project source directly');
+    t.ok(offeredToolNames.includes('get_workspace_info'), 'the fallback can still orient itself without reading source');
     t.notOk(offeredToolNames.includes('handoff_to_coder'), 'the fallback cannot create executable work');
     t.notOk(offeredToolNames.includes('cancel_coder_task'), 'the fallback cannot mutate task lifecycle state');
     t.equal(finalAssistant.text, "Hey Jason — I'm here. What's going on?", 'classifier failure does not replace conversation with an error gate');
@@ -1823,7 +1824,7 @@ test('Coder finalization keeps the user-facing result separate from the generate
   t.end();
 });
 
-test('a broad read-only project inspection preflights once to Coder without duplicate Dispatch discovery', async t => {
+test('a fresh read-only project inspection preflights once to Researcher without any Dispatch source discovery', async t => {
   const originalFetch = global.fetch;
   const workspace = 'C:\\Users\\Owner\\Desktop\\Projects\\GRITLIFE';
   const handoffs = [];
@@ -1831,11 +1832,11 @@ test('a broad read-only project inspection preflights once to Coder without dupl
     projects: [workspace],
     workspace,
     window: {
-      promoteWorkspaceToCoder: async payload => {
+      promoteWorkspaceToResearcher: async payload => {
         handoffs.push(payload);
         return {
           success: true,
-          conversationId: 'coder-broad-inspection',
+          conversationId: 'researcher-source-inspection',
           taskId: 'task-broad-inspection',
           title: payload.title,
           status: 'pending'
@@ -1864,14 +1865,15 @@ test('a broad read-only project inspection preflights once to Coder without dupl
           reasoningPolicyHint: { complexity: 'high', risk: 'medium', contextNeed: 'project' },
           executionScope: 'read_only',
           inspectionTarget: 'project',
-          inspectionBreadth: 'broad',
+          inspectionBreadth: 'single_file',
+          executionTarget: 'coder',
           standaloneSystemOperation: false
         }
       }
     );
-    t.equal(handoffs.length, 1, 'the broad inspection creates exactly one Coder task');
+    t.equal(handoffs.length, 1, 'even a single-file inspection creates exactly one Researcher task');
     t.equal(harness.modelTurns, 1, 'Dispatch spends one route-aware acknowledgement turn without duplicating discovery');
-    t.match(handoffs[0].prompt, /delegated read-only project inspection/i, 'Coder receives explicit read-only ownership');
+    t.match(handoffs[0].prompt, /delegated read-only project inspection/i, 'Researcher receives explicit read-only ownership');
     t.match(handoffs[0].prompt, /remember_file_notes/i, 'the task requires reusable file understanding');
     t.match(handoffs[0].prompt, /Review persistence, reload, and phone UI integration/i, 'the resolved review objective is preserved');
   } finally {
@@ -3021,6 +3023,10 @@ test('a model API failure finalizes durable work as failed, never completed', as
     t.equal(finalized[0].status, 'failed', 'the provider failure is recorded as failed');
     t.notEqual(finalized[0].status, 'completed', 'an API error cannot be reported as completion');
     t.match(finalized[0].details.reason, /api key/i, 'the durable failure keeps the real provider reason');
+    const assistantMessage = conv.messages.filter(message => message.role === 'assistant').at(-1);
+    t.ok(assistantMessage, 'the failed run retains an assistant-side result');
+    t.match(assistantMessage.text, /Error contacting Model API/i, 'the provider error replaces the Thinking placeholder');
+    t.notEqual(assistantMessage.text, 'Thinking...', 'a failed request cannot leave the conversation stuck on Thinking');
   } finally {
     restoreGlobals(originalFetch);
   }

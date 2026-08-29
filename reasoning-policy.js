@@ -157,6 +157,15 @@
         ? { thinking: { type: 'disabled' } }
         : { thinking: { type: 'enabled' }, reasoning_effort: effort };
     }
+    if (modelName.startsWith('groq:')) {
+      // Groq's Chat Completions API exposes model-specific reasoning controls. GPT-OSS and
+      // Qwen 3.8 accept low/medium/high; neither accepts Orion's "max", so Ultra maps to high.
+      // Qwen 3.6 only supports the binary none/default control documented by Groq.
+      if (modelName.includes('qwen/qwen3.6-27b')) {
+        return { reasoning_effort: effort === 'low' ? 'none' : 'default' };
+      }
+      return { reasoning_effort: effort === 'max' ? 'high' : effort };
+    }
     if (modelName.startsWith('gemini-3')) {
       return { thinkingConfig: { thinkingLevel: effort === 'max' ? 'high' : effort } };
     }

@@ -272,8 +272,22 @@ test('previously correct routing is unchanged', t => {
   );
   t.equal(route({ standaloneSystemOperation: true }), 'operator', 'standalone machine work stays with Operator');
   t.equal(route({ inspectionTarget: 'local_system' }), 'operator', 'local-system evidence stays with Operator');
-  t.equal(route({ inspectionTarget: 'project' }), 'coder',
-    'project evidence with no explicit specialist still defaults to Coder');
+  t.equal(route({
+    executionScope: 'read_only',
+    inspectionTarget: 'project',
+    inspectionBreadth: 'single_file'
+  }), 'researcher', 'fresh read-only project source inspection defaults to Researcher');
+  t.equal(route({
+    executionScope: 'read_only',
+    executionTarget: 'coder',
+    inspectionTarget: 'project',
+    inspectionBreadth: 'focused'
+  }), 'researcher', 'the structured source-inspection boundary corrects a model-selected Coder target');
+  t.equal(route({
+    executionScope: 'mutating',
+    inspectionTarget: 'project',
+    inspectionBreadth: 'focused'
+  }), 'coder', 'project work whose mission includes mutation still defaults to Coder');
   t.equal(route({ executionTarget: 'none' }), 'coder', 'unclassified executable work still defaults to Coder');
   t.end();
 });

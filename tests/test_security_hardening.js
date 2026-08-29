@@ -115,6 +115,7 @@ test('config failures and command retention safeguards are wired', (t) => {
   t.ok(configJs.includes("return path.join(base, 'config.json');"), 'config is stored under userData');
   t.ok(configJs.includes('throw e;'), 'config write failures propagate');
   t.ok(configJs.includes('SECRET_CONFIG_FIELDS'), 'config protects saved credential fields');
+  t.ok(configJs.includes("'groqApiKey'"), 'Groq credentials receive the same protected merge behavior as other provider secrets');
   t.ok(configJs.includes('DEFAULT_CONFIG_VALUES'), 'config restores safe companion defaults when fields are absent');
   t.ok(configJs.includes("replace(/^\\uFEFF/, '')"), 'config reader tolerates UTF-8 BOMs');
   t.ok(configJs.includes('mergeConfigWithSource'), 'config merges existing/source secrets before writing');

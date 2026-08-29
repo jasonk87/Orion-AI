@@ -43,7 +43,10 @@ function pill(win) {
   };
 }
 
-test('a specialist finalizing does not hijack the presence of the conversation you are watching', async (t) => {
+test('run presence stays scoped to the conversation that owns it', async (t) => {
+  // One Dispatch renderer covers all off-screen and legacy-unscoped transitions. Loading the
+  // entire production renderer once per assertion made this small contract needlessly sensitive
+  // to machine load in the full suite.
   const { win } = boot(t, DISPATCH);
   win.renderAgentPresence('idle', 'Ready', '');
 
@@ -55,45 +58,34 @@ test('a specialist finalizing does not hijack the presence of the conversation y
     'Dispatch does not display another conversation\'s finalization state');
   t.doesNotMatch(shown.detail, /Saving the response and recording the canonical task state/,
     'and does not show its finalization detail line');
-  t.end();
-});
-
-test('the stuck pill is cleared even when the finished run is not the conversation on screen', async (t) => {
-  const { win } = boot(t, DISPATCH);
-
   // Reproduce the exact reported sequence: finalize the specialist, then complete it, all while
   // Dispatch is the active view.
   win.onAgentStatusChange(false, { status: 'finalizing', conversationId: OPERATOR, taskId: 'task_1' });
   await win.onAgentRunFinalized(OPERATOR, 'completed', { taskId: 'task_1' });
 
-  const shown = pill(win);
-  t.doesNotMatch(shown.detail, /Saving the response and recording the canonical task state/,
+  const afterCompletion = pill(win);
+  t.doesNotMatch(afterCompletion.detail, /Saving the response and recording the canonical task state/,
     'the Verifying detail is not left stranded after the task reaches a terminal state');
-  t.notEqual(shown.label, 'Verifying',
+  t.notEqual(afterCompletion.label, 'Verifying',
     'the pill does not sit on Verifying after the run is over');
-  t.end();
-});
 
-test('watching the specialist itself still shows its finalization and then its completion', async (t) => {
-  const { win } = boot(t, OPERATOR);
-  win.onAgentStatusChange(false, { status: 'finalizing', conversationId: OPERATOR, taskId: 'task_1' });
-  t.equal(pill(win).label, 'Verifying',
-    'the conversation actually finalizing still reports it');
-  t.match(pill(win).detail, /Saving the response/,
-    'with its detail line intact');
-
-  await win.onAgentRunFinalized(OPERATOR, 'completed', { taskId: 'task_1' });
-  t.equal(pill(win).label, 'Complete', 'and then reports completion');
-  t.end();
-});
-
-test('a status change with no conversationId still drives the active presence', async (t) => {
   // Older/global callers omit conversationId. Those must keep working rather than being
   // silently dropped, or the pill would stop updating for ordinary local runs.
-  const { win } = boot(t, DISPATCH);
   win.renderAgentPresence('idle', 'Ready', '');
   win.onAgentStatusChange(false, { status: 'finalizing' });
   t.equal(pill(win).label, 'Verifying',
     'an unscoped finalization still applies to whatever is on screen');
+
+  // A second renderer is necessary here because activeConversationId is module-scoped state:
+  // verify the specialist's own UI still receives the same transitions that Dispatch ignores.
+  const { win: specialistWin } = boot(t, OPERATOR);
+  specialistWin.onAgentStatusChange(false, { status: 'finalizing', conversationId: OPERATOR, taskId: 'task_1' });
+  t.equal(pill(specialistWin).label, 'Verifying',
+    'the conversation actually finalizing still reports it');
+  t.match(pill(specialistWin).detail, /Saving the response/,
+    'with its detail line intact');
+
+  await specialistWin.onAgentRunFinalized(OPERATOR, 'completed', { taskId: 'task_1' });
+  t.equal(pill(specialistWin).label, 'Complete', 'and then reports completion');
   t.end();
 });

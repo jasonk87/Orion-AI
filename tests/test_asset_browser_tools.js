@@ -240,7 +240,7 @@ test('active Ollama screenshot inspection sends screenshot to the chat model', a
   t.end();
 });
 
-test('Gemini fallback records the model actually used for the current response', async (t) => {
+test('Gemini high-demand retry preserves the exact user-selected model', async (t) => {
   const originalFetch = global.fetch;
   const requestUrls = [];
   const warnings = [];
@@ -278,9 +278,9 @@ test('Gemini fallback records the model actually used for the current response',
   );
 
   t.ok(requestUrls[0].includes('/models/gemini-2.5-flash-lite:generateContent'), 'first request uses the selected model');
-  t.ok(requestUrls[1].includes('/models/gemini-2.5-flash:generateContent'), 'fallback request uses the escalated model');
-  t.equal(result._orionActiveModelName, 'gemini-2.5-flash', 'records the model that produced the response');
-  t.ok(warnings.some(warning => warning.includes('Temporarily switching this request to gemini-2.5-flash')), 'emits fallback warning');
+  t.ok(requestUrls[1].includes('/models/gemini-2.5-flash-lite:generateContent'), 'retry stays on the selected model');
+  t.equal(result._orionActiveModelName, 'gemini-2.5-flash-lite', 'records the unchanged selected model');
+  t.notOk(warnings.some(warning => /switching|stronger model/i.test(warning)), 'retry never changes model identity');
 
   global.fetch = originalFetch;
   t.end();

@@ -1,7 +1,10 @@
 (function initDispatchInspectionPolicy(globalScope) {
   'use strict';
 
-  const MAX_DISPATCH_SOURCE_FILES = 2;
+  // Kept as an exported compatibility value for older callers. Fresh project/source inspection
+  // now belongs to Researcher from the first file; Dispatch discusses evidence already present in
+  // the conversation but does not begin a parallel source survey of its own.
+  const MAX_DISPATCH_SOURCE_FILES = 0;
   const INSPECTION_BREADTHS = Object.freeze(['none', 'single_file', 'focused', 'broad']);
 
   function normalizeBreadth(value) {
@@ -30,12 +33,7 @@
 
   function shouldDelegate(options = {}) {
     if (String(options.mode || '').toLowerCase() !== 'orion') return false;
-    if (!isReadOnlyProjectInspection(options.semanticIntent)) return false;
-    const breadth = normalizeBreadth(options.semanticIntent.inspectionBreadth);
-    const fileCount = Number.isFinite(Number(options.fileCount))
-      ? Number(options.fileCount)
-      : inspectedPaths(options.ledger).length;
-    return breadth === 'broad' || fileCount > MAX_DISPATCH_SOURCE_FILES;
+    return isSourceInspectionIntent(options.semanticIntent);
   }
 
   function buildDelegatedObjective(options = {}) {
@@ -51,7 +49,7 @@
       'Return a grounded report to Dispatch with the files/surfaces inspected, concrete findings, uncertainties, and any recommended next action.'
     ];
     if (paths.length) {
-      lines.push('', `Dispatch reached its focused-inspection limit after these files: ${paths.join(', ')}. Continue from that evidence instead of restarting the review.`);
+      lines.push('', `Dispatch already has validated evidence from these files: ${paths.join(', ')}. Continue from that evidence instead of restarting the review.`);
     }
     return lines.join('\n').trim();
   }

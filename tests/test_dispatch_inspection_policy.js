@@ -24,17 +24,15 @@ function ledger(paths) {
   };
 }
 
-test('Dispatch keeps one/two-file inspections and delegates broader project reviews', t => {
-  t.equal(policy.shouldDelegate({ mode: 'orion', semanticIntent: inspectionIntent(), ledger: ledger(['a.js']) }), false,
-    'one source file stays with Dispatch');
-  t.equal(policy.shouldDelegate({ mode: 'orion', semanticIntent: inspectionIntent(), ledger: ledger(['a.js', 'b.js']) }), false,
-    'two source files stay with Dispatch');
-  t.equal(policy.shouldDelegate({ mode: 'orion', semanticIntent: inspectionIntent(), ledger: ledger(['a.js', 'b.js', 'c.js']) }), true,
-    'the third material source file crosses the deterministic ownership boundary');
+test('Dispatch delegates every fresh read-only source inspection before reading the first file', t => {
+  t.equal(policy.shouldDelegate({ mode: 'orion', semanticIntent: inspectionIntent({ inspectionBreadth: 'single_file' }), ledger: ledger([]) }), true,
+    'a single-file source inspection starts with Researcher rather than Dispatch');
+  t.equal(policy.shouldDelegate({ mode: 'orion', semanticIntent: inspectionIntent(), ledger: ledger([]) }), true,
+    'a focused source inspection delegates before Dispatch acquires duplicate evidence');
+  t.equal(policy.shouldDelegate({ mode: 'orion', semanticIntent: inspectionIntent({ inspectionBreadth: 'broad' }), ledger: ledger([]) }), true,
+    'a broad review follows the same ownership rule');
   t.equal(policy.isSourceInspectionIntent(inspectionIntent({ inspectionBreadth: 'none' })), false,
     'a read-only executable command is not mistaken for a source review without inspection scope');
-  t.equal(policy.shouldDelegate({ mode: 'orion', semanticIntent: inspectionIntent({ inspectionBreadth: 'broad' }), ledger: ledger([]) }), true,
-    'a semantically broad review routes before Dispatch duplicates the survey');
   t.equal(policy.shouldDelegate({ mode: 'coder', semanticIntent: inspectionIntent({ inspectionBreadth: 'broad' }), ledger: ledger([]) }), false,
     'Coder never hands its own inspection back to itself');
   t.equal(policy.shouldDelegate({ mode: 'orion', semanticIntent: inspectionIntent({ executionScope: 'mutating' }), ledger: ledger(['a.js', 'b.js', 'c.js']) }), false,
@@ -47,7 +45,7 @@ test('delegated reviews preserve read-only scope and require durable knowledge',
     resolvedRequest: 'Audit project persistence behavior.',
     inspectedPaths: ['state.js', 'renderer.js', 'ipc.js']
   });
-  t.match(objective, /read-only project inspection/i, 'Coder is not granted an implicit source-edit mandate');
+  t.match(objective, /read-only project inspection/i, 'Researcher receives explicit read-only scope rather than an edit mandate');
   t.match(objective, /remember_file_notes/i, 'the handoff explicitly requires version-bound file knowledge');
   t.match(objective, /state\.js, renderer\.js, ipc\.js/i, 'the already-inspected boundary is transferred');
   t.end();
@@ -73,7 +71,7 @@ test('a task_history evidence request never enters delegated project inspection,
   t.equal(policy.isSourceInspectionIntent(historyIntent), false,
     'a task-history request is never treated as a source-code inspection');
   t.equal(policy.shouldDelegate({ mode: 'orion', semanticIntent: historyIntent, ledger: ledger(['a.js', 'b.js', 'c.js']) }), false,
-    'even with several "inspected" paths recorded, a task-history request is never delegated to Coder as a project review - that delegation is what carries the remember_file_notes persistence prompt into whatever project happens to be active');
+    'even with several "inspected" paths recorded, a task-history request is never delegated as a project review - that delegation is what carries the remember_file_notes persistence prompt into whatever project happens to be active');
   // The same check holds for the narrower single-file/focused breadths, not just broad.
   ['none', 'single_file', 'focused'].forEach(breadth => {
     t.equal(policy.shouldDelegate({ mode: 'orion', semanticIntent: inspectionIntent({ inspectionTarget: 'task_history', inspectionBreadth: breadth }), ledger: ledger(['a.js']) }), false,

@@ -1062,7 +1062,9 @@ test('Dispatch uses Projects fallback while Coder standalone conversations get i
   t.ok(agentJs.includes('change_workspace alone must not add folders to Coder'), 'handoff tool declaration teaches the model that workspace inspection is not project promotion');
   t.ok(agentJs.includes('window.promoteWorkspaceToCoder'), 'handoff_to_coder executes through the renderer promotion API');
   t.ok(agentJs.includes('getHandoffContextPacketIds') && agentJs.includes('loadInheritedContextReceipt'), 'agent transfers and hydrates shared context receipts instead of restarting discovery');
-  t.ok(agentJs.includes('Do not deeply inspect source merely to decide that Coder should do the work'), 'Dispatch routes obvious implementation tasks before deep source inspection');
+  t.ok(agentJs.includes('Do not inspect source merely to decide that Coder should do the work')
+    && agentJs.includes('Any fresh read-only workspace/project source inspection routes to Researcher immediately'),
+  'Dispatch routes implementation early and gives fresh read-only source inspection to Researcher');
   t.ok(agentJs.includes('isGeneratedStandaloneWorkspacePath') && agentJs.includes('getDispatchWorkspaceRoot()'), 'agent ignores generated Dispatch workspaces and falls back to the Projects root');
   t.ok(agentJs.includes('formatKnownProjectsForSystemFacts'), 'agent can include registered project paths in Dispatch context');
   t.ok(rendererJs.includes('function createPhoneConversation'), 'phone conversations use a dedicated constructor');
@@ -1390,6 +1392,14 @@ test('incidental observations are bounded Coder-only run notes', (t) => {
   t.ok(allowlistBlock.includes('ask_clarifying_questions'), 'Dispatch can pause ambiguous handoffs with the structured clarification tool');
   t.notOk(allowlistBlock.includes("'take_screenshot'"),
     'Dispatch cannot capture a new browser screenshot itself; structured visual work belongs to Operator');
+  [
+    'read_file', 'read_multiple_files', 'read_multiple_ranges', 'inspect_code_context', 'list_files',
+    'grep_search', 'search_embeddings', 'semantic_search', 'get_symbol_index', 'get_file_symbols',
+    'find_references', 'git_diff', 'remember_file_notes'
+  ].forEach(toolName => {
+    t.notOk(allowlistBlock.includes(`'${toolName}'`),
+      `Dispatch cannot perform fresh source inspection with ${toolName}; Researcher owns it`);
+  });
   t.end();
 });
 
@@ -1463,6 +1473,10 @@ test('stuck diagnosis prefers adapting or preserving state over quitting', (t) =
   const spendCapAdvice = agent.diagnoseModelApiFailure('HTTP 429 Your project has exceeded its monthly spending cap. Please go to AI Studio at https://ai.studio/spend');
   t.ok(spendCapAdvice.includes('monthly spend cap'), 'monthly spend caps get a specific diagnosis');
   t.ok(spendCapAdvice.includes('retries or model escalation will not continue'), 'monthly spend caps do not encourage retry loops');
+
+  const exhaustedCreditAdvice = agent.diagnoseModelApiFailure('ChatGPT API HTTP 429: You have no credits remaining.');
+  t.ok(exhaustedCreditAdvice.includes('no credits remaining'), 'OpenAI credit exhaustion gets a specific diagnosis');
+  t.ok(exhaustedCreditAdvice.includes('hard billing limit'), 'exhausted credits are not presented as a temporary cooldown');
 
   const authAdvice = agent.diagnoseModelApiFailure('HTTP 401 invalid api key');
   t.ok(authAdvice.includes('hard blocker'), 'credential errors are treated as real blockers');

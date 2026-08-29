@@ -43,6 +43,7 @@ let appConfig = {
   anthropicApiKey: '',
   deepseekApiKey: '',
   openaiApiKey: '',
+  groqApiKey: '',
   googleSearchEngineId: '3354e92e98ab54b31',
   googleSearchApiKey: '',
   defaultModel: 'gemini-2.5-flash-lite',
@@ -59,6 +60,10 @@ let appConfig = {
     'gemini-2.5-flash-lite': 1000000,
     'gemini-2.5-flash': 1000000,
     'gemini-2.5-pro': 1000000,
+    'groq:openai/gpt-oss-120b': 131072,
+    'groq:openai/gpt-oss-20b': 131072,
+    'groq:qwen/qwen3.8-27b': 131072,
+    'groq:qwen/qwen3.6-27b': 131072,
     default: 128000
   },
   commandTimeoutMs: 120000,
@@ -228,6 +233,7 @@ const el = {
   settingAnthropicApiKey: document.getElementById('setting-anthropic-api-key'),
   settingDeepseekApiKey: document.getElementById('setting-deepseek-api-key'),
   settingOpenaiApiKey: document.getElementById('setting-openai-api-key'),
+  settingGroqApiKey: document.getElementById('setting-groq-api-key'),
   settingGoogleSearchEngineId: document.getElementById('setting-google-search-engine-id'),
   settingGoogleSearchApiKey: document.getElementById('setting-google-search-api-key'),
   settingWorkspacePath: document.getElementById('setting-workspace-path'),
@@ -685,6 +691,7 @@ async function loadSettings() {
   if (el.settingAnthropicApiKey) el.settingAnthropicApiKey.value = appConfig.anthropicApiKey || '';
   if (el.settingDeepseekApiKey) el.settingDeepseekApiKey.value = appConfig.deepseekApiKey || '';
   if (el.settingOpenaiApiKey) el.settingOpenaiApiKey.value = appConfig.openaiApiKey || '';
+  if (el.settingGroqApiKey) el.settingGroqApiKey.value = appConfig.groqApiKey || '';
   el.settingGoogleSearchEngineId.value = appConfig.googleSearchEngineId || '';
   el.settingGoogleSearchApiKey.value = appConfig.googleSearchApiKey || '';
   el.settingWorkspacePath.value = appConfig.defaultWorkspacePath || '';
@@ -788,6 +795,26 @@ async function initModelDropdown() {
     chatgptGroup.appendChild(opt);
   });
   modelSelect.appendChild(chatgptGroup);
+
+  // Groq free-plan models that can participate in Orion's LOCAL function-tool loop. Compound is
+  // intentionally absent: Groq documents it as built-in-tools-only, so presenting it here would
+  // make Orion advertise local tools the model cannot call. Qwen 3.6 is the multimodal choice;
+  // the other Groq options use the existing explicit Gemini vision route when an image is needed.
+  const groqModels = [
+    { value: 'groq:openai/gpt-oss-120b', name: 'GPT-OSS 120B (Free)' },
+    { value: 'groq:openai/gpt-oss-20b', name: 'GPT-OSS 20B (Free)' },
+    { value: 'groq:qwen/qwen3.8-27b', name: 'Qwen 3.8 27B (Free)' },
+    { value: 'groq:qwen/qwen3.6-27b', name: 'Qwen 3.6 27B Vision (Free)' }
+  ];
+  const groqGroup = document.createElement('optgroup');
+  groqGroup.label = 'Groq';
+  groqModels.forEach(m => {
+    const opt = document.createElement('option');
+    opt.value = m.value;
+    opt.textContent = m.name;
+    groqGroup.appendChild(opt);
+  });
+  modelSelect.appendChild(groqGroup);
 
   // Try to load saved model from localStorage or config
   let defaultModel = localStorage.getItem('ag2_default_model') || appConfig.defaultModel || 'gemini-2.5-flash-lite';
@@ -960,6 +987,7 @@ function setupSettingsModal() {
     if (el.settingAnthropicApiKey) appConfig.anthropicApiKey = el.settingAnthropicApiKey.value.trim();
     if (el.settingDeepseekApiKey) appConfig.deepseekApiKey = el.settingDeepseekApiKey.value.trim();
     if (el.settingOpenaiApiKey) appConfig.openaiApiKey = el.settingOpenaiApiKey.value.trim();
+    if (el.settingGroqApiKey) appConfig.groqApiKey = el.settingGroqApiKey.value.trim();
     appConfig.googleSearchEngineId = el.settingGoogleSearchEngineId.value.trim();
     appConfig.googleSearchApiKey = el.settingGoogleSearchApiKey.value.trim();
     appConfig.defaultWorkspacePath = el.settingWorkspacePath.value.trim();

@@ -677,6 +677,20 @@
       return true;
     }
 
+    // Fresh read-only project/source inspection has one structural owner: Researcher. This rule is
+    // based entirely on the classifier's structured scope, evidence target, and breadth—not words
+    // in the user's message. It runs before the model's explicit specialist preference so an
+    // otherwise-correct inspection cannot drift back into Dispatch or Coder and duplicate source
+    // discovery. A task that includes workspace mutation still routes to Coder below.
+    const inspectionBreadth = string(classification.inspectionBreadth, 40).toLowerCase();
+    const needsReadOnlySourceInspection = executionScope === 'read_only'
+      && ['workspace', 'project'].includes(inspectionTarget)
+      && ['single_file', 'focused', 'broad'].includes(inspectionBreadth)
+      && !needsDesktopControl;
+    if (needsReadOnlySourceInspection && specialist('researcher') && capableOf('researcher')) {
+      return 'researcher';
+    }
+
     // The classifier's explicit specialist choice is honored whenever that specialist can do the
     // work. This is the ordering fix: evidence LOCATION no longer overrides work SHAPE. Reading a
     // repository's history to explain a trajectory is Researcher work that happens to involve a
