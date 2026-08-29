@@ -6474,6 +6474,46 @@ async function executeSpecialistHandoff(targetRole, args, workspace, conversatio
   };
 }
 
+function classifyPostEditRegression(baselineResult, postEditResult) {
+  const baselinePassed = !!(
+    baselineResult
+    && baselineResult.success === true
+    && baselineResult.outcome === 'passed'
+    && baselineResult.ranToCompletion === true
+  );
+  const actualRegression = !!(
+    baselinePassed
+    && postEditResult
+    && postEditResult.outcome === 'failed'
+    && postEditResult.ranToCompletion === true
+  );
+  const inconclusive = !!(
+    baselinePassed
+    && postEditResult
+    && postEditResult.success !== true
+    && !actualRegression
+  );
+  return {
+    baselinePassed,
+    actualRegression,
+    inconclusive,
+    outcome: String(postEditResult?.outcome || (postEditResult?.success === true ? 'passed' : 'unknown')),
+    ranToCompletion: postEditResult?.ranToCompletion === true
+  };
+}
+
+function buildPostEditRegressionFeedback(baselineResult, postEditResult, editLabel) {
+  const classification = classifyPostEditRegression(baselineResult, postEditResult);
+  if (classification.actualRegression) {
+    return `\n[WARNING] REGRESSION DETECTED: Regression tests ran to completion and failed after this ${editLabel}. Please inspect your change.`;
+  }
+  if (classification.inconclusive) {
+    const label = classification.outcome.replace(/_/g, ' ');
+    return `\n[WARNING] POST-EDIT REGRESSION CHECK INCONCLUSIVE: The test run ${label}. It did not run to completion, so this is not evidence of a regression. Re-run the appropriate verification before declaring the change complete.`;
+  }
+  return '';
+}
+
 async function executeTool(name, args, workspace, config, conversation, executionContext = {}) {
   console.log(`Executing tool ${name} with args:`, args);
 
@@ -6884,10 +6924,9 @@ async function executeTool(name, args, workspace, config, conversation, executio
       }
       
       // Optional regression testing BEFORE edit
-      let beforePass = true;
+      let beforeTestResult = null;
       if (config.autoTest) {
-        const testRes = await window.runRegressionTests();
-        beforePass = testRes.success;
+        beforeTestResult = await window.runRegressionTests();
       }
       
       const writeRes = isGovernanceArtifact
@@ -6915,9 +6954,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
       }
       if (config.autoTest) {
         const testRes = await window.runRegressionTests();
-        if (beforePass && !testRes.success) {
-          testFeedback += "\n[WARNING] REGRESSION DETECTED: Regression tests failed after this write. Please review your modifications.";
-        }
+        testFeedback += buildPostEditRegressionFeedback(beforeTestResult, testRes, 'write');
       }
       const missingHtmlRefs = isGovernanceArtifact ? [] : await findMissingHtmlLocalReferences(workspace, args.path, args.content);
       if (missingHtmlRefs.length) {
@@ -6979,10 +7016,9 @@ async function executeTool(name, args, workspace, config, conversation, executio
       const newContent = fileData.substring(0, index) + args.replacement + fileData.substring(index + args.target.length);
       
       // Optional regression testing BEFORE edit
-      let beforePass = true;
+      let beforeTestResult = null;
       if (config.autoTest) {
-        const testRes = await window.runRegressionTests();
-        beforePass = testRes.success;
+        beforeTestResult = await window.runRegressionTests();
       }
       
       const writeRes = await window.api.writeFile(workspace, args.path, newContent);
@@ -6998,9 +7034,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
       }
       if (config.autoTest) {
         const testRes = await window.runRegressionTests();
-        if (beforePass && !testRes.success) {
-          testFeedback += "\n[WARNING] REGRESSION DETECTED: Regression tests failed after this edit. Please inspect your change.";
-        }
+        testFeedback += buildPostEditRegressionFeedback(beforeTestResult, testRes, 'edit');
       }
 
       return {
@@ -7014,10 +7048,9 @@ async function executeTool(name, args, workspace, config, conversation, executio
       if (!args.path) throw new Error("Missing 'path' parameter");
       if (!args.operation || !args.operation.type) throw new Error("Missing 'operation' parameter");
 
-      let beforePass = true;
+      let beforeTestResult = null;
       if (config.autoTest) {
-        const testRes = await window.runRegressionTests();
-        beforePass = testRes.success;
+        beforeTestResult = await window.runRegressionTests();
       }
 
       const patchRes = await window.api.patchFile(workspace, args.path, args.operation);
@@ -7032,9 +7065,7 @@ async function executeTool(name, args, workspace, config, conversation, executio
       }
       if (config.autoTest) {
         const testRes = await window.runRegressionTests();
-        if (beforePass && !testRes.success) {
-          testFeedback += "\n[WARNING] REGRESSION DETECTED: Regression tests failed after this patch. Please inspect your change.";
-        }
+        testFeedback += buildPostEditRegressionFeedback(beforeTestResult, testRes, 'patch');
       }
 
       return { ...patchRes, message: `${patchRes.message || 'File patched successfully.'}${testFeedback}` };
@@ -15339,6 +15370,8 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     buildPostEditEvidencePrompt,
     buildFinalVerificationSummary,
     getUserFacingWorkRevision,
+    classifyPostEditRegression,
+    buildPostEditRegressionFeedback,
     buildCompletionGateLoopSignature,
     shouldEscapeRepeatedCompletionGateBlock,
     stripEchoedSystemScaffold,

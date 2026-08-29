@@ -1167,6 +1167,7 @@ test('token-saving prompt cleanup keeps tool schemas authoritative', (t) => {
   t.ok(dispatchTools.every(name => coderTools.includes(name) || name === 'handoff_to_coder'),
     'Dispatch is offered only tools that exist in the full surface, plus the one handoff tool Coder deliberately excludes for itself');
   t.notOk(dispatchTools.includes('patch_file'), 'Dispatch is not offered direct file editing');
+  t.notOk(dispatchTools.includes('take_screenshot'), 'Dispatch cannot capture browser or desktop screenshots itself; visual capture belongs to Operator');
   t.ok(dispatchTools.includes('handoff_to_coder'), 'Dispatch keeps the handoff tool it exists to use');
   t.ok(agentJs.includes("'inspect_binary_asset', 'list_asset_metadata', 'inspect_screenshot', 'inspect_screenshot_with_model'"), 'Dispatch can inspect existing project artwork through read-only visual tools');
   t.ok(agentJs.includes('conversation._systemFactsSignature'), 'stable system facts are tracked by conversation signature');

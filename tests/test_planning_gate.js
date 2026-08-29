@@ -1880,7 +1880,13 @@ test('a real detected regression stops the run with a specific message, not a ge
     // First call (before the edit) reports passing; second call (after the edit) reports failing —
     // matching the tool handler's own beforePass/afterPass comparison that decides whether to embed
     // the "[WARNING] REGRESSION DETECTED...]" text.
-    return { success: regressionCheckCount % 2 === 1, output: regressionCheckCount % 2 === 1 ? 'ok' : 'FAIL: 1 test failed' };
+    const passed = regressionCheckCount % 2 === 1;
+    return {
+      success: passed,
+      outcome: passed ? 'passed' : 'failed',
+      ranToCompletion: true,
+      output: passed ? 'ok' : 'FAIL: 1 test failed'
+    };
   };
   global.window.api = {
     readFile: async () => '',
@@ -1947,6 +1953,44 @@ test('a real detected regression stops the run with a specific message, not a ge
     delete global.window.runRegressionTests;
   }
 
+  t.end();
+});
+
+test('post-edit timeout is inconclusive and never becomes a regression warning', async (t) => {
+  const baseline = { success: true, outcome: 'passed', ranToCompletion: true, output: 'all passing' };
+  const timedOut = { success: false, outcome: 'timed_out', ranToCompletion: false, output: 'still running' };
+  const classification = agent.classifyPostEditRegression(baseline, timedOut);
+  t.equal(classification.actualRegression, false, 'a timeout is not classified as a code regression');
+  t.equal(classification.inconclusive, true, 'the incomplete verification remains explicitly inconclusive');
+
+  let regressionCalls = 0;
+  global.window.runRegressionTests = async () => (++regressionCalls === 1 ? baseline : timedOut);
+  global.window.syncWorkspaceFiles = () => {};
+  global.window.api = {
+    patchFile: async () => ({ success: true, changed: true, message: 'File patched successfully.' }),
+    runCommand: async () => ({ code: 0, stdout: '', stderr: '' })
+  };
+
+  try {
+    const result = await agent.executeTool(
+      'patch_file',
+      { path: 'notes.txt', operation: { type: 'replace', target: 'before', replacement: 'after' } },
+      '/test/workspace',
+      { autoTest: true },
+      { id: 'post-edit-timeout' },
+      {}
+    );
+    t.equal(result.success, true, 'the successful edit remains successful');
+    t.notOk(/REGRESSION DETECTED/.test(result.message), 'the edit result does not contain the canonical regression signal');
+    t.ok(/INCONCLUSIVE/.test(result.message), 'the result accurately asks for later verification');
+
+    const item = { toolName: 'patch_file', status: 'running' };
+    agent.updateWalkthroughItem(item, 'patch_file', { path: 'notes.txt' }, result, null);
+    t.equal(item.regressionDetected, false, 'the loop will not add the file to brokenFiles or trigger regression escalation');
+  } finally {
+    delete global.window.runRegressionTests;
+    delete global.window.syncWorkspaceFiles;
+  }
   t.end();
 });
 

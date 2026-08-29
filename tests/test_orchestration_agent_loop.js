@@ -1260,6 +1260,63 @@ test('Dispatch routes the exact Codex screenshot request to Operator once withou
   t.end();
 });
 
+test('Dispatch routes a generic screenshot-and-send request to Operator instead of capturing it itself', async t => {
+  const originalFetch = global.fetch;
+  const rawRequest = "Okay, let's try this one more time. See if you can take a screenshot and send it to me. Everything should be working now";
+  const operatorHandoffs = [];
+  const harness = installHarness([], {
+    workspace: 'C:\\Users\\Owner\\Desktop\\Projects',
+    window: {
+      promoteWorkspaceToOperator: async payload => {
+        operatorHandoffs.push(payload);
+        return {
+          success: true,
+          conversationId: 'operator-generic-screenshot',
+          taskId: 'task-operator-generic-screenshot',
+          title: payload.title,
+          status: 'pending',
+          workspacePath: payload.path
+        };
+      },
+      startOperatorTaskMonitor: () => {}
+    }
+  });
+  const conv = conversation('dispatch-generic-screenshot');
+  try {
+    await global.window.runAgentLoop(rawRequest, 'gemini-1', conv, {
+      semanticIntent: semanticClassification({
+        intent: 'new_task',
+        requiresExecution: true,
+        target: 'current_conversation',
+        resolvedRequest: 'Capture the current desktop screen and return the screenshot in this chat.',
+        reasoningPolicyHint: { complexity: 'low', risk: 'low', contextNeed: 'none' },
+        executionScope: 'read_only',
+        executionTarget: 'operator',
+        executionSurface: 'desktop',
+        inspectionTarget: 'local_system',
+        standaloneSystemOperation: true,
+        taskResolution: {
+          title: 'Capture and send the current screen',
+          requirements: ['Capture the current desktop screen', 'Return the screenshot in chat'],
+          constraints: [],
+          unresolvedDecisions: []
+        }
+      })
+    });
+
+    t.equal(harness.modelTurns, 1, 'Dispatch only phrases the finalized route');
+    t.equal(operatorHandoffs.length, 1, 'exactly one Operator task is created');
+    t.equal(operatorHandoffs[0].standalone, true, 'the visual task does not invent a project dependency');
+    t.match(operatorHandoffs[0].prompt, /capture the current desktop screen/i, 'the task preserves the resolved visual objective');
+    const finalAssistant = [...conv.messages].reverse().find(message => message.role === 'assistant');
+    t.match(finalAssistant.text, /Operator has task .* queued/i, 'Dispatch reports the real visual specialist');
+    t.notOk(/take_screenshot|attach_image/.test(finalAssistant.text), 'Dispatch does not narrate a direct screenshot-tool execution');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
 test('Dispatch routes a project-bound interactive playtest directly to Operator', async t => {
   const originalFetch = global.fetch;
   const workspace = 'C:\\Users\\Owner\\Desktop\\Projects\\This is Life';
