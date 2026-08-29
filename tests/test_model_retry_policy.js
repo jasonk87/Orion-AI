@@ -79,8 +79,13 @@ test('genuinely transient failures still retry', (t) => {
 });
 
 test('every provider retry loop shares one abort policy and one backoff', (t) => {
-  // Guards the regression directly: the three loops must not grow private copies again.
-  // Matched against the retry loops only, not the whole file.
+  // Guards the regression directly: no retry loop may grow a private copy of the policy again.
+  //
+  // The counts below are DERIVED from how many provider retry loops actually exist rather than
+  // pinned to a number. They were pinned at "three providers" and went stale the moment ChatGPT
+  // was added as a fourth - failing not because a loop had diverged, but because the file had
+  // legitimately grown one more compliant loop. A count that has to be edited every time a
+  // provider is added stops testing the invariant and starts testing the provider census.
   const fs = require('fs');
   const path = require('path');
   const source = fs.readFileSync(path.join(__dirname, '../agent.js'), 'utf8');
@@ -91,10 +96,16 @@ test('every provider retry loop shares one abort policy and one backoff', (t) =>
   const privateBackoff = source.match(/delay = (Math\.min\(delay \* 2|delay \* 2 \+ Math\.random)/g) || [];
   t.equal(privateBackoff.length, 0, 'no provider re-implements the backoff formula inline');
 
-  const sharedBackoff = source.match(/delay = computeNextModelRetryDelay\(/g) || [];
-  t.equal(sharedBackoff.length, 6, 'all three providers use the shared backoff on both their HTTP and network paths');
+  // One retry loop per provider, identified by the bounded-attempt header they all share.
+  const retryLoops = source.match(/for \(let i = 1; i <= attempts; i\+\+\) \{/g) || [];
+  t.ok(retryLoops.length >= 4, `every provider has a bounded retry loop (found ${retryLoops.length})`);
 
   const sharedAbort = source.match(/isUnretryableModelError\((err|e)\)/g) || [];
-  t.equal(sharedAbort.length, 3, 'all three providers use the shared abort policy');
+  t.equal(sharedAbort.length, retryLoops.length,
+    'each retry loop aborts through the shared policy exactly once - no loop opted out');
+
+  const sharedBackoff = source.match(/delay = computeNextModelRetryDelay\(/g) || [];
+  t.equal(sharedBackoff.length, retryLoops.length * 2,
+    'and each backs off through the shared formula on both its HTTP and its network path');
   t.end();
 });

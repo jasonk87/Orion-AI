@@ -173,6 +173,19 @@
       const supportsEffort = /(?:fable-5|mythos(?:-5|-preview)|opus-(?:4-5|4-6|4-7|4-8|5)|sonnet-(?:4-6|5))/.test(modelName);
       return supportsEffort ? { output_config: { effort } } : {};
     }
+    // ChatGPT reasons under Orion's policy like every other provider. The effort levels this engine
+    // resolves (low/medium/high/max) are all accepted by gpt-5.6 verbatim, so each maps to itself
+    // and no level is silently collapsed into a neighbour.
+    //
+    // The shape matters: `reasoning: { effort }` is the Responses API field. It is NOT valid on
+    // chat/completions alongside function tools - that combination is a hard 400 - which is
+    // precisely why callOpenAIAPI targets /v1/responses. Anything that sends these controls to a
+    // chat/completions endpoint must drop them instead.
+    //
+    // Checked before the Ollama gpt-oss pattern below, which would otherwise capture these names.
+    if (/^gpt-(?!oss)/.test(modelName)) {
+      return { reasoning: { effort } };
+    }
     if (/(?:qwen3|gpt-oss|deepseek-r1|deepseek-v3\.1)/.test(modelName)) {
       const ollamaEffort = modelName.includes('gpt-oss') && effort === 'max' ? 'high' : effort;
       return { think: ollamaEffort };

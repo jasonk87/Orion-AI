@@ -375,7 +375,7 @@ function getSystemInstruction(disableTools = false, cachedMemory = '', modelName
     const prompts = { coder: SYSTEM_INSTRUCTION, operator: OPERATOR_INSTRUCTION, researcher: RESEARCHER_INSTRUCTION };
     base = prompts[specialist.promptKey];
     if (!base) throw new Error(`No system prompt is registered for Orion specialist role "${specialist.role}".`);
-    if (modelName && (modelName.startsWith('deepseek') || modelName.includes('pro') || modelName.includes('claude-3-7'))) {
+    if (modelName && (modelName.startsWith('deepseek') || modelName.startsWith('gpt-') || modelName.includes('pro') || modelName.includes('claude-3-7'))) {
       base = `SYSTEM AWARENESS: You are currently running on ${modelName}, which features a large context window. Read entire files when they fit the active acquisition budget and whole-file structure matters. Oversized reads are capped so one tool result cannot crowd out the task; use inspect_code_context, semantic_search, or get_symbol_index for very large files.\n\n` + base;
     } else if (modelName) {
       base = `SYSTEM AWARENESS: You are currently running on ${modelName}. Use your tools efficiently and prefer targeted reads.\n\n` + base;
@@ -1604,6 +1604,8 @@ async function evaluateLoopStateWithSupervisorDecision(modelName, workWalkthroug
     let resp;
     if (modelName.startsWith('deepseek')) {
       resp = await callDeepSeekAPI(messages, modelName, config?.deepseekApiKey || '', () => {}, true);
+    } else if (modelName.startsWith('gpt-')) {
+      resp = await callOpenAIAPI(messages, modelName, config?.openaiApiKey || '', () => {}, true);
     } else if (modelName.includes('claude')) {
       resp = await callAnthropicAPI(messages, modelName, config?.anthropicApiKey || '', () => {}, true);
     } else if (modelName.includes('gemini')) {
@@ -1652,6 +1654,8 @@ async function evaluateLoopStateWithSupervisorLegacy(modelName, workWalkthrough,
     let resp;
     if (modelName.startsWith('deepseek')) {
       resp = await callDeepSeekAPI(messages, modelName, config?.deepseekApiKey || '', () => {}, true);
+    } else if (modelName.startsWith('gpt-')) {
+      resp = await callOpenAIAPI(messages, modelName, config?.openaiApiKey || '', () => {}, true);
     } else if (modelName.includes('claude')) {
       resp = await callAnthropicAPI(messages, modelName, config?.anthropicApiKey || '', () => {}, true);
     } else if (modelName.includes('gemini')) {
@@ -3198,7 +3202,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // Call API (Gemini or Ollama) with automatic transient error retry and warnings
       let response;
       try {
-        agentSubStatus = `Calling ${activeRunModelName.startsWith('gemini-') ? 'Gemini' : (activeRunModelName.startsWith('claude') ? 'Claude (' + activeRunModelName + ')' : (activeRunModelName.startsWith('deepseek') ? 'DeepSeek (' + activeRunModelName + ')' : 'Ollama (' + activeRunModelName + ')'))} API...`;
+        agentSubStatus = `Calling ${activeRunModelName.startsWith('gemini-') ? 'Gemini' : (activeRunModelName.startsWith('claude') ? 'Claude (' + activeRunModelName + ')' : (activeRunModelName.startsWith('deepseek') ? 'DeepSeek (' + activeRunModelName + ')' : (activeRunModelName.startsWith('gpt-') ? 'ChatGPT (' + activeRunModelName + ')' : 'Ollama (' + activeRunModelName + ')')))} API...`;
         persistCurrentAgentLogs({ render: true });
         const modelCallDelayMs = Math.min(Math.max(parseInt(config.modelCallDelayMs, 10) || 0, 0), 60000);
         if (modelCallDelayMs > 0) {
@@ -3326,6 +3330,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           response = await callGeminiAPI(messagesForApiCall, activeRunModelName, config.geminiApiKey, onApiWarning, disableToolsForSemanticSafety, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
         } else if (activeRunModelName.startsWith('claude')) {
           response = await callAnthropicAPI(messagesForApiCall, activeRunModelName, config.anthropicApiKey, onApiWarning, disableToolsForSemanticSafety, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
+        } else if (activeRunModelName.startsWith('gpt-')) {
+          response = await callOpenAIAPI(messagesForApiCall, activeRunModelName, config.openaiApiKey, onApiWarning, disableToolsForSemanticSafety, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
         } else if (activeRunModelName.startsWith('deepseek')) {
           response = await callDeepSeekAPI(messagesForApiCall, activeRunModelName, config.deepseekApiKey, onApiWarning, disableToolsForSemanticSafety, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
         } else {
@@ -8016,7 +8022,8 @@ async function executeTool(name, args, workspace, config, conversation, executio
         path: imagePath,
         goal: args.goal,
         modelName: activeModelName,
-        apiKey: config.geminiApiKey
+        apiKey: config.geminiApiKey,
+        openaiApiKey: config.openaiApiKey
       });
       // Immutable evidence may answer more than one static question. Freshness is enforced by the
       // action epoch in OperatorExecutionPolicy and by lastDesktopSnapshot below: an old image may
@@ -10568,27 +10575,38 @@ async function callUtilityModel(prompt, modelName, config, requireJson = true, o
   const providerControls = ReasoningPolicy && reasoningPolicy
     ? ReasoningPolicy.providerControls(modelName, reasoningPolicy)
     : {};
-  if (modelName.startsWith('deepseek')) {
-    if (!config.deepseekApiKey) return null;
+  // DeepSeek and ChatGPT share one chat-completions branch here for the same reason they share
+  // callOpenAICompatibleAPI: the request is identical apart from host, key, and the fields the
+  // provider refuses.
+  const utilityProviderKey = modelName.startsWith('deepseek')
+    ? 'deepseek'
+    : (modelName.startsWith('gpt-') ? 'openai' : '');
+  if (utilityProviderKey) {
+    const utilityProvider = OPENAI_COMPATIBLE_PROVIDERS[utilityProviderKey];
+    const utilityApiKey = utilityProviderKey === 'openai' ? config.openaiApiKey : config.deepseekApiKey;
+    if (!utilityApiKey) return null;
     try {
-      const response = await fetchWithTimeout('https://api.deepseek.com/chat/completions', {
+      const response = await fetchWithTimeout(utilityProvider.url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.deepseekApiKey}` },
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${utilityApiKey}` },
         body: JSON.stringify({
           model: modelName,
           messages: [{ role: 'user', content: prompt }],
-          ...providerControls,
-          ...(!providerControls.thinking || providerControls.thinking.type === 'disabled' ? { temperature: 0 } : {}),
+          ...(utilityProvider.sendsReasoningControls === false ? {} : providerControls),
+          ...(utilityProvider.sendsTemperature !== false
+            && (!providerControls.thinking || providerControls.thinking.type === 'disabled')
+            ? { temperature: 0 }
+            : {}),
           ...(requireJson ? { response_format: { type: 'json_object' } } : {})
         }),
         signal: options.signal
-      }, Number(options.timeoutMs) || UTILITY_MODEL_REQUEST_TIMEOUT_MS, 'DeepSeek utility request');
+      }, Number(options.timeoutMs) || UTILITY_MODEL_REQUEST_TIMEOUT_MS, `${utilityProvider.label} utility request`);
       if (!response.ok) return null;
       const data = await response.json();
       return (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || null;
     } catch (e) {
       if ((options.signal && options.signal.aborted) || isUserStopError(e)) throw e;
-      console.error('DeepSeek utility call failed:', e);
+      console.error(`${utilityProvider.label} utility call failed:`, e);
       return null;
     }
   } else if (modelName.startsWith('gemini-')) {
@@ -12770,6 +12788,12 @@ function getNextGeminiModelForHighDemand(modelName) {
 function getNextModelForHighDemand(modelName) {
   const name = String(modelName || '');
   if (name.startsWith('gemini-')) return getNextGeminiModelForHighDemand(name);
+  // ChatGPT models never escalate. This is deliberate and load-bearing, not an oversight of the
+  // chain table below: Orion offers exactly one ChatGPT model, so there is no stronger sibling to
+  // route up to, and silently swapping in a different family mid-run would change both the
+  // provider and the bill behind the user's selection. Selecting ChatGPT means the whole run uses
+  // ChatGPT. Returning null here is what makes the proactive deep-task upgrade a no-op.
+  if (name.startsWith('gpt-')) return null;
   const deepseekChain = { 'deepseek-v4-flash': 'deepseek-v4-pro' };
   return deepseekChain[name] || null;
 }
@@ -12791,6 +12815,10 @@ function resolveUtilityModelName(modelName) {
   // DeepSeek routes utility calls to its own cheap flash tier instead of Gemini — unlike Claude,
   // a DeepSeek-only setup shouldn't need a Gemini key just for classification/token-counting.
   if (name.startsWith('deepseek')) return 'deepseek-v4-flash';
+  // ChatGPT keeps its own model for utility calls. gpt-5.6-luna is already the cheap tier of its
+  // family, and routing bookkeeping to Gemini the way Claude does would make a ChatGPT-only setup
+  // require a second provider's key just to classify and count tokens.
+  if (name.startsWith('gpt-')) return name;
   if (!name.startsWith('gemini-')) return name;
   if (name.startsWith('gemini-3')) return 'gemini-3.1-flash-lite';
   if (name.startsWith('gemini-2.5')) return 'gemini-2.5-flash-lite';
@@ -14620,9 +14648,46 @@ function fitDeepSeekMessagesToContextWindow(messages, modelName, systemText, too
   return { messages: fitted, estimatedTokens, collapsedToolResults, maxInputTokens };
 }
 
-async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTools = false, options = {}) {
-  if (!apiKey) throw createNonRetryableModelError('DeepSeek API key is not configured. Add it in Settings to use DeepSeek models.');
-  const url = 'https://api.deepseek.com/chat/completions';
+// DeepSeek and OpenAI speak the same chat-completions dialect, so ONE implementation serves both
+// instead of a second near-copy that drifts out of sync. Everything a provider does differently
+// lives in this descriptor; the request building, retry loop, and response translation below are
+// shared verbatim.
+const OPENAI_COMPATIBLE_PROVIDERS = {
+  deepseek: {
+    label: 'DeepSeek',
+    url: 'https://api.deepseek.com/chat/completions',
+    missingKeyMessage: 'DeepSeek API key is not configured. Add it in Settings to use DeepSeek models.',
+    sendsReasoningControls: true,
+    sendsTemperature: true,
+    defaultReasoningPolicy: modelName => ({ effort: modelName === 'deepseek-v4-pro' ? 'max' : 'high' }),
+    fallbackReasoningControls: { thinking: { type: 'enabled' }, reasoning_effort: 'high' }
+  },
+  openai: {
+    label: 'ChatGPT',
+    url: 'https://api.openai.com/v1/chat/completions',
+    missingKeyMessage: 'OpenAI API key is not configured. Add it in Settings to use ChatGPT models.',
+    // This descriptor serves ONLY the utility path (classification, token counting, compaction) -
+    // short, tool-free, JSON-mode calls where chat/completions is the simpler endpoint. Real agent
+    // turns go through callOpenAIAPI and the Responses API instead, because tools and reasoning
+    // effort cannot coexist here.
+    //
+    // Both suppressions below are hard 400s, not preferences. Reasoning controls are dropped
+    // because the policy engine now emits the Responses-shaped `reasoning: { effort }`, which this
+    // endpoint does not accept - and a utility classification does not need effort control anyway.
+    // Temperature is withheld because the GPT-5 reasoning family rejects a non-default value;
+    // omitting it is always safe, sending it fails the whole request.
+    sendsReasoningControls: false,
+    sendsTemperature: false,
+    defaultReasoningPolicy: () => ({}),
+    fallbackReasoningControls: {}
+  }
+};
+
+async function callOpenAICompatibleAPI(providerKey, messages, modelName, apiKey, onWarning, disableTools = false, options = {}) {
+  const provider = OPENAI_COMPATIBLE_PROVIDERS[providerKey];
+  if (!provider) throw createNonRetryableModelError(`No OpenAI-compatible provider is registered as "${providerKey}".`);
+  if (!apiKey) throw createNonRetryableModelError(provider.missingKeyMessage);
+  const url = provider.url;
 
   const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
   const systemText = getSystemInstruction(disableTools, orionCachedMemoryBlock, modelName);
@@ -14633,17 +14698,22 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
   }
   const deepseekMessages = [{ role: 'system', content: systemText }, ...convertGeminiToDeepSeekMessages(fitted.messages)];
 
-  const reasoningControls = ReasoningPolicy
-    ? ReasoningPolicy.providerControls(
-        modelName,
-        options.reasoningPolicy || { effort: modelName === 'deepseek-v4-pro' ? 'max' : 'high' }
-      )
-    : { thinking: { type: 'enabled' }, reasoning_effort: 'high' };
+  const reasoningControls = provider.sendsReasoningControls === false
+    ? {}
+    : (ReasoningPolicy
+      ? ReasoningPolicy.providerControls(
+          modelName,
+          options.reasoningPolicy || provider.defaultReasoningPolicy(modelName)
+        )
+      : provider.fallbackReasoningControls);
   const requestBody = {
     model: modelName,
     messages: deepseekMessages,
     ...reasoningControls,
-    ...(!reasoningControls.thinking || reasoningControls.thinking.type === 'disabled' ? { temperature: 0 } : {})
+    ...(provider.sendsTemperature !== false
+      && (!reasoningControls.thinking || reasoningControls.thinking.type === 'disabled')
+      ? { temperature: 0 }
+      : {})
   };
   if (!disableTools) requestBody.tools = deepseekTools;
 
@@ -14659,7 +14729,7 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
         },
         body: JSON.stringify(requestBody),
         signal: options.signal
-      }, MODEL_API_REQUEST_TIMEOUT_MS, 'DeepSeek chat completions request');
+      }, MODEL_API_REQUEST_TIMEOUT_MS, `${provider.label} chat completions request`);
 
       if (response.ok) {
         const data = await response.json();
@@ -14691,23 +14761,212 @@ async function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTo
       const retryDelayMs = Math.min(apiError.retryDelayMs || delay, MODEL_API_MAX_RETRY_WAIT_MS);
 
       if (isNonRetryableModelHttpStatus(status)) {
-        throw createNonRetryableModelError(`DeepSeek API HTTP ${status}: ${apiError.message}`);
+        throw createNonRetryableModelError(`${provider.label} API HTTP ${status}: ${apiError.message}`);
       }
       if (i === attempts) {
-        throw new Error(`DeepSeek API HTTP ${status} after ${attempts} attempts: ${apiError.message}`);
+        throw new Error(`${provider.label} API HTTP ${status} after ${attempts} attempts: ${apiError.message}`);
       }
-      if (onWarning) onWarning(`DeepSeek API HTTP ${status} for ${modelName}; retrying in ${Math.ceil(retryDelayMs / 1000)}s (attempt ${i}/${attempts}).`);
+      if (onWarning) onWarning(`${provider.label} API HTTP ${status} for ${modelName}; retrying in ${Math.ceil(retryDelayMs / 1000)}s (attempt ${i}/${attempts}).`);
       await sleepRespectingStop(retryDelayMs);
       delay = computeNextModelRetryDelay(delay, apiError.retryDelayMs);
     } catch (err) {
       if (isUnretryableModelError(err)) throw err;
       if (i === attempts) throw err;
-      if (onWarning) onWarning(`DeepSeek API request failed (${err.message}); retrying (attempt ${i}/${attempts}).`);
+      if (onWarning) onWarning(`${provider.label} API request failed (${err.message}); retrying (attempt ${i}/${attempts}).`);
       await sleepRespectingStop(delay);
       delay = computeNextModelRetryDelay(delay, 0);
     }
   }
-  throw new Error('DeepSeek API: exhausted retries.');
+  throw new Error(`${provider.label} API: exhausted retries.`);
+}
+
+function callDeepSeekAPI(messages, modelName, apiKey, onWarning, disableTools = false, options = {}) {
+  return callOpenAICompatibleAPI('deepseek', messages, modelName, apiKey, onWarning, disableTools, options);
+}
+
+// ChatGPT talks to the Responses API, not chat/completions. That is forced by the provider, not a
+// style choice: gpt-5.6 answers a tool-carrying chat/completions request that also asks for
+// reasoning with "Function tools with reasoning_effort are not supported for gpt-5.6-luna in
+// /v1/chat/completions", and Orion sends function tools on every agent call. Responses is the one
+// endpoint where function tools, reasoning effort, and image input coexist - which is exactly the
+// three things this agent needs at once.
+
+function convertGeminiToOpenAIResponsesTools(declarations) {
+  // Responses declares a function tool FLAT - name/description/parameters at the top level, with
+  // no nested { function: {...} } wrapper the way chat/completions requires.
+  return (declarations || []).map(fd => ({
+    type: 'function',
+    name: fd.name,
+    description: fd.description,
+    parameters: lowercaseJsonSchemaTypes(JSON.parse(JSON.stringify(fd.parameters || { type: 'OBJECT', properties: {} })))
+  }));
+}
+
+function convertGeminiToOpenAIResponsesInput(geminiMessages) {
+  const input = [];
+  let callCounter = 0;
+  let lastCallIds = [];
+  (geminiMessages || []).forEach(msg => {
+    if (msg.role === 'user') {
+      const content = [];
+      (msg.parts || []).forEach(p => {
+        if (p.text) content.push({ type: 'input_text', text: p.text });
+        // Multimodal input. Responses takes image_url as a PLAIN STRING (chat/completions wraps it
+        // in an object), and a base64 data URL is accepted directly - which is what Orion has
+        // after reading a screenshot off disk.
+        if (p.inlineData) {
+          content.push({
+            type: 'input_image',
+            image_url: `data:${p.inlineData.mimeType};base64,${p.inlineData.data}`,
+            detail: 'auto'
+          });
+        }
+      });
+      if (content.length === 0) content.push({ type: 'input_text', text: '(no content)' });
+      input.push({ role: 'user', content });
+    } else if (msg.role === 'model') {
+      // Prior-turn reasoning is never replayed. Responses keeps reasoning server-side, and echoing
+      // it back would grow every request the way it used to on the DeepSeek path.
+      const text = (msg.parts || [])
+        .filter(p => p.text && !p.thought && !p._deepseekReasoningContent)
+        .map(p => p.text)
+        .join('');
+      if (text) input.push({ role: 'assistant', content: text });
+      lastCallIds = [];
+      (msg.parts || []).forEach(p => {
+        if (!p.functionCall) return;
+        const callId = p.functionCall._openaiCallId || `call_orion_${callCounter++}`;
+        lastCallIds.push(callId);
+        input.push({
+          type: 'function_call',
+          call_id: callId,
+          name: p.functionCall.name,
+          arguments: JSON.stringify(p.functionCall.args || {})
+        });
+      });
+    } else if (msg.role === 'tool') {
+      // A tool result is its own top-level item correlated by call_id, not a message with a role.
+      let idx = 0;
+      (msg.parts || []).forEach(p => {
+        if (!p.functionResponse) return;
+        const responseObj = p.functionResponse.response || {};
+        const output = typeof responseObj === 'object' ? JSON.stringify(responseObj) : String(responseObj);
+        input.push({
+          type: 'function_call_output',
+          call_id: lastCallIds[idx] || `call_orion_orphan_${callCounter++}`,
+          output
+        });
+        idx++;
+      });
+    }
+  });
+  return input;
+}
+
+async function callOpenAIAPI(messages, modelName, apiKey, onWarning, disableTools = false, options = {}) {
+  if (!apiKey) throw createNonRetryableModelError('OpenAI API key is not configured. Add it in Settings to use ChatGPT models.');
+  const url = 'https://api.openai.com/v1/responses';
+
+  const processedMessages = disableTools ? sanitizeMessagesForTextOnly(messages) : messages;
+  const systemText = getSystemInstruction(disableTools, orionCachedMemoryBlock, modelName);
+  const openaiTools = disableTools ? undefined : convertGeminiToOpenAIResponsesTools(buildAgentToolDeclarations());
+  // gpt-5.6-luna's context window (~1.05M) is within a rounding error of the DeepSeek budget this
+  // fitter already enforces, and the fitter's job here is collapsing oversized tool results, which
+  // is provider-independent. Reusing it keeps one context-safety policy rather than two.
+  const fitted = fitDeepSeekMessagesToContextWindow(processedMessages, modelName, systemText, openaiTools, options);
+  if (fitted.collapsedToolResults > 0 && onWarning) {
+    onWarning(`Context safety collapsed ${fitted.collapsedToolResults} oversized tool result(s) before calling ${modelName}. Orion will retrieve narrower exact source instead.`);
+  }
+
+  // Orion's reasoning policy drives the model's reasoning effort directly - the levels line up
+  // one-to-one with what gpt-5.6 accepts (none/low/medium/high/xhigh/max), so no translation table
+  // is needed and no level is silently collapsed into another.
+  const reasoningControls = ReasoningPolicy
+    ? ReasoningPolicy.providerControls(modelName, options.reasoningPolicy || { effort: 'high' })
+    : { reasoning: { effort: 'high' } };
+
+  const requestBody = {
+    model: modelName,
+    // System guidance is a top-level parameter here, not the first message.
+    instructions: systemText,
+    input: convertGeminiToOpenAIResponsesInput(fitted.messages),
+    ...reasoningControls
+  };
+  if (!disableTools) requestBody.tools = openaiTools;
+
+  const attempts = MODEL_API_MAX_ATTEMPTS;
+  let delay = 1500;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const response = await fetchWithTimeout(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify(requestBody),
+        signal: options.signal
+      }, MODEL_API_REQUEST_TIMEOUT_MS, 'ChatGPT responses request');
+
+      if (response.ok) {
+        const data = await response.json();
+        const parts = [];
+        (Array.isArray(data.output) ? data.output : []).forEach(item => {
+          if (!item) return;
+          if (item.type === 'message') {
+            (item.content || []).forEach(block => {
+              if (block && block.type === 'output_text' && block.text) parts.push({ text: block.text });
+            });
+          } else if (item.type === 'reasoning') {
+            // Reasoning summaries are surfaced as thought parts so the walkthrough can show them,
+            // and are filtered back out when the history is replayed.
+            const summary = (item.summary || [])
+              .map(entry => (entry && entry.text) || '')
+              .filter(Boolean)
+              .join('\n');
+            if (summary) parts.push({ text: summary, thought: true });
+          } else if (item.type === 'function_call') {
+            let args = item.arguments;
+            if (typeof args === 'string') {
+              try { args = JSON.parse(args); } catch (_) { args = {}; }
+            }
+            const functionCall = { name: item.name, args: args || {} };
+            const callId = item.call_id || item.id;
+            if (callId) functionCall._openaiCallId = callId;
+            parts.push({ functionCall });
+          }
+        });
+
+        const incompleteReason = data.incomplete_details && data.incomplete_details.reason;
+        if (data.status === 'incomplete' && incompleteReason === 'max_output_tokens') {
+          parts.push({ functionCall: { name: 'SYSTEM_ERROR', args: { error: 'Your output was truncated because it exceeded the maximum token limit. Keep internal reasoning shorter and use patch_file for smaller, targeted edits.' } } });
+        }
+        return { _orionActiveModelName: modelName, candidates: [{ content: { parts } }] };
+      }
+
+      const errorText = await response.text();
+      const status = response.status;
+      const apiError = describeModelApiError(status, errorText);
+      const retryDelayMs = Math.min(apiError.retryDelayMs || delay, MODEL_API_MAX_RETRY_WAIT_MS);
+
+      if (isNonRetryableModelHttpStatus(status)) {
+        throw createNonRetryableModelError(`ChatGPT API HTTP ${status}: ${apiError.message}`);
+      }
+      if (i === attempts) {
+        throw new Error(`ChatGPT API HTTP ${status} after ${attempts} attempts: ${apiError.message}`);
+      }
+      if (onWarning) onWarning(`ChatGPT API HTTP ${status} for ${modelName}; retrying in ${Math.ceil(retryDelayMs / 1000)}s (attempt ${i}/${attempts}).`);
+      await sleepRespectingStop(retryDelayMs);
+      delay = computeNextModelRetryDelay(delay, apiError.retryDelayMs);
+    } catch (err) {
+      if (isUnretryableModelError(err)) throw err;
+      if (i === attempts) throw err;
+      if (onWarning) onWarning(`ChatGPT API request failed (${err.message}); retrying (attempt ${i}/${attempts}).`);
+      await sleepRespectingStop(delay);
+      delay = computeNextModelRetryDelay(delay, 0);
+    }
+  }
+  throw new Error('ChatGPT API: exhausted retries.');
 }
 
 // Lightweight per-turn token savings, distinct from compactHistory's heavyweight summarization
@@ -14859,8 +15118,14 @@ function normalizeScreenshotInspectionResult({ text, path, goal, providerName })
   };
 }
 
-async function inspectScreenshotWithModel({ imageBase64, mimeType, path, goal, modelName, apiKey }) {
+async function inspectScreenshotWithModel({ imageBase64, mimeType, path, goal, modelName, apiKey, openaiApiKey }) {
   if (!modelName) throw new Error('Active chat model is required for multimodal screenshot inspection.');
+  // ChatGPT reads its own screenshots. gpt-5.6 accepts image input, so borrowing Gemini here
+  // would send the user's screen to a second provider they did not select - and would fail
+  // outright for a ChatGPT-only setup with no Gemini key.
+  if (modelName.startsWith('gpt-') && openaiApiKey) {
+    return await inspectScreenshotWithOpenAI({ imageBase64, mimeType, path, goal, modelName, apiKey: openaiApiKey });
+  }
   if (modelName.startsWith('gemini-')) {
     return await inspectScreenshotWithGemini({ imageBase64, mimeType, path, goal, modelName, apiKey });
   }
@@ -14903,6 +15168,42 @@ async function inspectScreenshotWithGemini({ imageBase64, mimeType, path, goal, 
   const text = data.candidates && data.candidates[0] && data.candidates[0].content &&
     data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
     data.candidates[0].content.parts[0].text;
+  return normalizeScreenshotInspectionResult({ text, path, goal, providerName: modelName });
+}
+
+async function inspectScreenshotWithOpenAI({ imageBase64, mimeType, path, goal, modelName, apiKey }) {
+  // Same Responses endpoint the agent loop uses, so image input has exactly one shape in this file.
+  // No tools are sent, so reasoning effort would be legal here - but a screenshot reading is a
+  // bounded perception task, not a reasoning one, so it runs at the model's default and returns
+  // JSON directly.
+  const response = await fetchWithTimeout('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model: modelName,
+      input: [{
+        role: 'user',
+        content: [
+          { type: 'input_text', text: buildScreenshotInspectionPrompt(goal) },
+          { type: 'input_image', image_url: `data:${mimeType || 'image/png'};base64,${imageBase64}`, detail: 'auto' }
+        ]
+      }],
+      text: { format: { type: 'json_object' } }
+    })
+  }, MODEL_API_REQUEST_TIMEOUT_MS, 'ChatGPT vision screenshot inspection');
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`ChatGPT vision inspection failed HTTP ${response.status}: ${errText}`);
+  }
+
+  const data = await response.json();
+  const text = (Array.isArray(data.output) ? data.output : [])
+    .filter(item => item && item.type === 'message')
+    .flatMap(item => item.content || [])
+    .filter(block => block && block.type === 'output_text' && block.text)
+    .map(block => block.text)
+    .join('');
   return normalizeScreenshotInspectionResult({ text, path, goal, providerName: modelName });
 }
 
@@ -14985,6 +15286,8 @@ window.quickOrionLLMCall = async function(systemPrompt, userMessages, config, op
     resp = await callAnthropicAPI(messages, modelName, config.anthropicApiKey || '', () => {}, true, { reasoningPolicy });
   } else if (/deepseek/i.test(modelName)) {
     resp = await callDeepSeekAPI(messages, modelName, config.deepseekApiKey || '', () => {}, true, { reasoningPolicy });
+  } else if (/^gpt-/i.test(modelName)) {
+    resp = await callOpenAIAPI(messages, modelName, config.openaiApiKey || '', () => {}, true, { reasoningPolicy });
   } else {
     resp = await callGeminiAPI(messages, modelName || 'gemini-2.5-flash', config.geminiApiKey || '', () => {}, true, { reasoningPolicy });
   }
@@ -15370,6 +15673,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     estimateDeepSeekRequestTokens,
     fitDeepSeekMessagesToContextWindow,
     callDeepSeekAPI,
+    callOpenAIAPI,
     callUtilityModel,
     getNextModelForHighDemand,
     persistCompactedConversation,

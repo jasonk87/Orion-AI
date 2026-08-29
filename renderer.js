@@ -42,6 +42,7 @@ let appConfig = {
   geminiApiKey: '',
   anthropicApiKey: '',
   deepseekApiKey: '',
+  openaiApiKey: '',
   googleSearchEngineId: '3354e92e98ab54b31',
   googleSearchApiKey: '',
   defaultModel: 'gemini-2.5-flash-lite',
@@ -226,6 +227,7 @@ const el = {
   settingApiKey: document.getElementById('setting-api-key'),
   settingAnthropicApiKey: document.getElementById('setting-anthropic-api-key'),
   settingDeepseekApiKey: document.getElementById('setting-deepseek-api-key'),
+  settingOpenaiApiKey: document.getElementById('setting-openai-api-key'),
   settingGoogleSearchEngineId: document.getElementById('setting-google-search-engine-id'),
   settingGoogleSearchApiKey: document.getElementById('setting-google-search-api-key'),
   settingWorkspacePath: document.getElementById('setting-workspace-path'),
@@ -682,6 +684,7 @@ async function loadSettings() {
   el.settingApiKey.value = appConfig.geminiApiKey || '';
   if (el.settingAnthropicApiKey) el.settingAnthropicApiKey.value = appConfig.anthropicApiKey || '';
   if (el.settingDeepseekApiKey) el.settingDeepseekApiKey.value = appConfig.deepseekApiKey || '';
+  if (el.settingOpenaiApiKey) el.settingOpenaiApiKey.value = appConfig.openaiApiKey || '';
   el.settingGoogleSearchEngineId.value = appConfig.googleSearchEngineId || '';
   el.settingGoogleSearchApiKey.value = appConfig.googleSearchApiKey || '';
   el.settingWorkspacePath.value = appConfig.defaultWorkspacePath || '';
@@ -769,6 +772,22 @@ async function initModelDropdown() {
     deepseekGroup.appendChild(opt);
   });
   modelSelect.appendChild(deepseekGroup);
+
+  // Static ChatGPT list. Deliberately ONE model: Orion offers no stronger ChatGPT sibling, so
+  // getNextModelForHighDemand never escalates a gpt- selection and the run stays on what was
+  // picked. See the gpt- branch there.
+  const chatgptModels = [
+    { value: 'gpt-5.6-luna', name: 'ChatGPT GPT-5.6 Luna' }
+  ];
+  const chatgptGroup = document.createElement('optgroup');
+  chatgptGroup.label = 'ChatGPT';
+  chatgptModels.forEach(m => {
+    const opt = document.createElement('option');
+    opt.value = m.value;
+    opt.textContent = m.name;
+    chatgptGroup.appendChild(opt);
+  });
+  modelSelect.appendChild(chatgptGroup);
 
   // Try to load saved model from localStorage or config
   let defaultModel = localStorage.getItem('ag2_default_model') || appConfig.defaultModel || 'gemini-2.5-flash-lite';
@@ -940,6 +959,7 @@ function setupSettingsModal() {
     appConfig.geminiApiKey = el.settingApiKey.value.trim();
     if (el.settingAnthropicApiKey) appConfig.anthropicApiKey = el.settingAnthropicApiKey.value.trim();
     if (el.settingDeepseekApiKey) appConfig.deepseekApiKey = el.settingDeepseekApiKey.value.trim();
+    if (el.settingOpenaiApiKey) appConfig.openaiApiKey = el.settingOpenaiApiKey.value.trim();
     appConfig.googleSearchEngineId = el.settingGoogleSearchEngineId.value.trim();
     appConfig.googleSearchApiKey = el.settingGoogleSearchApiKey.value.trim();
     appConfig.defaultWorkspacePath = el.settingWorkspacePath.value.trim();
