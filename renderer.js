@@ -2523,6 +2523,7 @@ function setupChatHandlers() {
   document.getElementById('btn-steer').addEventListener('click', triggerSteer);
   document.getElementById('btn-queue').addEventListener('click', triggerQueue);
   el.messagesContainer.addEventListener('click', handleQueuedPromptActionClick);
+  el.messagesContainer.addEventListener('click', handleShowEarlierMessagesClick);
   const addFileButton = document.getElementById('btn-add-file');
   if (addFileButton) {
     addFileButton.addEventListener('click', () => {
@@ -5865,12 +5866,61 @@ async function selectConversation(id, options = {}) {
     if (orionSplashEl) orionSplashEl.style.display = 'none';
     el.welcomeSplash.style.display = 'none';
     el.messagesContainer.style.display = 'flex';
-    el.messagesContainer.innerHTML = '';
-    
-    const replayMessages = conv.messages
-      .filter(isConversationMessageVisible)
-      .map(normalizeConversationMessageForReplay);
-    replayMessages.forEach(replayMsg => {
+    renderConversationTranscript(conv);
+  }
+
+  // Reload tasks & tests
+  updateTasksChecklist(conv.tasks);
+  updateTestResultsPanel(conv.testResults);
+  refreshOperationalContext(conv.workspace);
+  loadRunArtifacts();
+  if (conv.awaitingPlanApproval && !conv.planApproved) {
+    revealAgentPanel('A plan is ready for review.');
+    renderAgentPresence('attention', 'Review needed', 'Implementation plan is waiting for approval');
+  } else if (!(window.isAgentRunning && window.isAgentRunning())) {
+    renderAgentPresence('idle', 'Ready', '');
+  }
+
+  // Scroll to bottom
+  scrollChatToBottom();
+
+  // Focus the input box so the user can immediately type
+  el.chatInput.focus();
+}
+
+// A long conversation used to render EVERY message on open - every bubble, tool log, markdown
+// block and image. That is what made scrolling and typing stutter once a conversation got long:
+// the cost grew without bound while the newest messages, the ones actually being read, stayed the
+// same handful. Only the newest window is rendered now, with the rest reachable on demand.
+//
+// The transcript itself is untouched - this bounds RENDERING, not history. Nothing is dropped from
+// conv.messages, from disk, or from what the model receives.
+const TRANSCRIPT_WINDOW_MESSAGES = 40;
+// How many more each "show earlier" reveals. Larger than the initial window because someone who
+// asks for history is usually scanning back through it, not peeking at one message.
+const TRANSCRIPT_WINDOW_STEP = 60;
+let transcriptWindowConversationId = '';
+let transcriptWindowExtra = 0;
+
+function renderConversationTranscript(conv) {
+  if (!conv || !el.messagesContainer) return;
+  // Expansion belongs to the conversation being read. Opening a different one starts bounded
+  // again, but re-rendering the SAME conversation keeps whatever history the user chose to reveal.
+  if (transcriptWindowConversationId !== conv.id) {
+    transcriptWindowConversationId = conv.id;
+    transcriptWindowExtra = 0;
+  }
+  el.messagesContainer.innerHTML = '';
+
+  const replayMessages = conv.messages
+    .filter(isConversationMessageVisible)
+    .map(normalizeConversationMessageForReplay);
+  const windowSize = TRANSCRIPT_WINDOW_MESSAGES + transcriptWindowExtra;
+  const hiddenCount = Math.max(0, replayMessages.length - windowSize);
+  const visibleMessages = hiddenCount > 0 ? replayMessages.slice(hiddenCount) : replayMessages;
+  if (hiddenCount > 0) renderEarlierMessagesControl(hiddenCount);
+
+  visibleMessages.forEach(replayMsg => {
       const replayLogs = Array.isArray(replayMsg.logs) ? replayMsg.logs : [];
       window.clearActiveAiBubble();
       if (replayMsg.role === 'user') {
@@ -5906,25 +5956,46 @@ async function selectConversation(id, options = {}) {
     }
     window.clearActiveAiBubble();
     removeLegacyPhoneCompanionTokenBubbles();
+}
+
+// The control that stands in for everything above the window. It states the real count rather than
+// a vague "older messages", so it is obvious that nothing was lost.
+function renderEarlierMessagesControl(hiddenCount) {
+  const bubble = document.createElement('div');
+  bubble.className = 'message-bubble';
+  bubble.dataset.transcriptWindowControl = 'true';
+  const reveal = Math.min(hiddenCount, TRANSCRIPT_WINDOW_STEP);
+  bubble.innerHTML = `
+    <div class="message-body" style="text-align:center; font-size:0.8rem; color: var(--text-muted);">
+      <button type="button" class="btn-secondary" data-transcript-show-earlier="1"
+        style="font-size:0.8rem; padding:6px 14px;">Show ${reveal} earlier message${reveal === 1 ? '' : 's'}</button>
+      <div style="margin-top:6px;">${hiddenCount} earlier message${hiddenCount === 1 ? '' : 's'} in this conversation</div>
+    </div>
+  `;
+  el.messagesContainer.appendChild(bubble);
+}
+
+function handleShowEarlierMessagesClick(event) {
+  const trigger = event.target.closest('[data-transcript-show-earlier]');
+  if (!trigger) return;
+  // Expand the conversation that is actually ON SCREEN, not whatever activeConversationId happens
+  // to hold. Those are normally the same, but activeConversationId is also written by background
+  // navigation sync, and when it had moved on this handler silently found nothing and returned -
+  // the button rendered and did nothing at all. The rendered id cannot drift from what the reader
+  // is looking at, because renderConversationTranscript is what sets it.
+  const conv = conversations.find(c => c.id === transcriptWindowConversationId)
+    || conversations.find(c => c.id === activeConversationId);
+  if (!conv) return;
+  // Revealing history must not move the reader. Growing the transcript upward shifts everything
+  // below it down by exactly the height that was added, so scrollTop is compensated by that delta
+  // and the message they were looking at stays under the cursor.
+  const previousHeight = el.messagesContainer.scrollHeight;
+  const previousTop = el.chatFeed ? el.chatFeed.scrollTop : 0;
+  transcriptWindowExtra += TRANSCRIPT_WINDOW_STEP;
+  renderConversationTranscript(conv);
+  if (el.chatFeed) {
+    el.chatFeed.scrollTop = previousTop + (el.messagesContainer.scrollHeight - previousHeight);
   }
-  
-  // Reload tasks & tests
-  updateTasksChecklist(conv.tasks);
-  updateTestResultsPanel(conv.testResults);
-  refreshOperationalContext(conv.workspace);
-  loadRunArtifacts();
-  if (conv.awaitingPlanApproval && !conv.planApproved) {
-    revealAgentPanel('A plan is ready for review.');
-    renderAgentPresence('attention', 'Review needed', 'Implementation plan is waiting for approval');
-  } else if (!(window.isAgentRunning && window.isAgentRunning())) {
-    renderAgentPresence('idle', 'Ready', '');
-  }
-  
-  // Scroll to bottom
-  scrollChatToBottom();
-  
-  // Focus the input box so the user can immediately type
-  el.chatInput.focus();
 }
 
 // Submits User prompt to Gemini Agent Loop
@@ -8510,7 +8581,7 @@ window.getPhoneCompanionState = async (targetConversationId) => {
   const queuedForResolvedConversation = Array.isArray(window.promptQueue)
     && window.promptQueue.some(q => q && q.conversationId === resolvedId);
   const normalizedPhoneMessages = conv && conv.messages
-    ? conv.messages.filter(isConversationMessageVisible).slice(-40).map(normalizeConversationMessageForReplay)
+    ? conv.messages.filter(isConversationMessageVisible).slice(-TRANSCRIPT_WINDOW_MESSAGES).map(normalizeConversationMessageForReplay)
     : [];
   const recoveredAssistantMessage = buildMissingAssistantResponseMessage(normalizedPhoneMessages, {
     queued: queuedForResolvedConversation
