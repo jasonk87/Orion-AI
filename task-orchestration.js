@@ -1204,10 +1204,27 @@
     // terminal predecessor. Never let that stale preference paint the visible conversation FAILED
     // or COMPLETE while newer durable work is pending/active. It remains a valid preference only
     // while it is itself nonterminal, or as terminal history when no ongoing mission exists.
+    // A named-but-missing preference is a HANDOFF IN FLIGHT, not an absence of work. The moment a
+    // handoff commits, the conversation already points at the new task id, but that record reaches
+    // this view a beat later - it is still being written and read back. In that window there is no
+    // matching record here, and falling through to "newest of anything" resurrected the previous
+    // run's terminal record: a conversation that had just delegated fresh work sat there reading
+    // FAILED until the specialist claimed it. Awaiting a specific task is never evidence that an
+    // older, unrelated task's failure is the current state, so terminal history is not a legal
+    // stand-in for it. Nonterminal work still wins, because that IS current.
+    // "Not loaded yet" means the awaited task is absent from the INPUT entirely. A task that is
+    // present but filtered out here is a different situation with a different right answer: it was
+    // superseded by a newer continuation, or belongs to another conversation, and falling through
+    // to the newest record is exactly how its successor gets shown. Only genuine absence means a
+    // handoff is still in flight.
+    const awaitingUnloadedTask = !!activeTaskId
+      && !preferred
+      && !(Array.isArray(tasksValue) ? tasksValue : []).some(task =>
+        task && typeof task === 'object' && compactInline(task.taskId) === activeTaskId);
     let selected = (preferred && [TASK_STATES.ACTIVE, TASK_STATES.PENDING].includes(preferred.status))
       ? preferred
       : (active || pending || preferred)
-      || tasks.sort(byNewest)[0]
+      || (awaitingUnloadedTask ? null : tasks.sort(byNewest)[0])
       || null;
     if (!selected || options.followDescendants !== true) return selected;
 
