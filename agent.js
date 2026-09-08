@@ -1698,6 +1698,30 @@ async function evaluateLoopStateWithSupervisorLegacy(modelName, workWalkthrough,
   }
 }
 
+// Whether a classifier failure can be safely ignored for this turn.
+//
+// Pure and exported so the rule is testable on its own: the runtime path that uses
+// it lives inside a very large async turn function, and the behaviour it guards -
+// a specialist quietly losing its write tools - is invisible until someone tries to
+// commit and cannot.
+//
+// Dispatch is never exempt. It is the role that decides what the user meant, so a
+// failed classifier there genuinely leaves it with nothing to stand on. A specialist
+// is different: it is only ever running because Dispatch already classified the
+// request, chose the role, and handed over an explicit objective.
+function isSemanticClarificationRecoverable({
+  classifierUnavailable = false,
+  classifierError = '',
+  isDispatch = true,
+  taskId = '',
+  taskObjective = ''
+} = {}) {
+  const classifierFailed = classifierUnavailable === true || !!classifierError;
+  if (!classifierFailed) return false;
+  if (isDispatch) return false;
+  return !!(String(taskId || '').trim() || String(taskObjective || '').trim());
+}
+
 async function evaluateLoopStateWithSupervisor(modelName, workWalkthrough, disableTools, config, contextReceipt = {}) {
   const decision = await evaluateLoopStateWithSupervisorDecision(modelName, workWalkthrough, disableTools, config, contextReceipt);
   return decision && decision.status === 'stuck';
@@ -2051,8 +2075,35 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   } finally {
     intentClassificationMs = Date.now() - semanticClassificationStartedAt;
   }
-  const semanticClarificationRequired = semanticIntent.intent === 'clarification_required'
-    || semanticIntent.needsClarification === true;
+  // A classifier that FAILED is not the same as a user who was ambiguous.
+  //
+  // semantic-intent-router sets classifierError only from its catch path, and
+  // classifierUnavailable only when nothing is bound, so together they mean "the
+  // classifier did not run" rather than "the request was unclear".
+
+  // A specialist executing a durable task already had its intent decided: Dispatch
+  // classified the request, chose the role, and handed over an explicit objective.
+  // Re-deciding that mid-task because the classifier threw is not a safety win - it
+  // strips Coder of the very tools the task exists to use.
+  //
+  // This is the bug behind "there is no write-capable command tool available to run
+  // git add, git commit, or git push": run_command is not in Coder's exclusion set
+  // and never was. The turn had been forced into the unresolved-intent gate, whose
+  // tool surface is inspection-only, so Coder could read the repository, verify it,
+  // run its tests - and then truthfully report it had no way to commit. The sibling
+  // symptom is the canned "I could not safely determine whether that refers to the
+  // current task or plan", which left the durable task pending forever while the UI
+  // showed it as failed.
+  const semanticClarificationIsRecoverable = isSemanticClarificationRecoverable({
+    classifierUnavailable: semanticIntent.classifierUnavailable,
+    classifierError: semanticIntent.classifierError,
+    isDispatch: isOrionMode,
+    taskId: runTaskId,
+    taskObjective: claimedTaskPrompt
+  });
+  const semanticClarificationRequired = (semanticIntent.intent === 'clarification_required'
+    || semanticIntent.needsClarification === true)
+    && !semanticClarificationIsRecoverable;
   const taskBoundSemanticClarification = semanticClarificationRequired && !!(runTaskId || pendingSemanticPlan);
   const turnReasoningPolicy = ReasoningPolicy
     ? ReasoningPolicy.select({
@@ -3251,8 +3302,13 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         // can use the visible exchange instead of emitting a canned, repeatable gate. Its tool
         // surface is reduced to inspection-only capabilities until intent is resolved. Exact
         // task/plan-bound ambiguity remains a deterministic no-tool clarification below.
-        const inspectionOnlyIntent = semanticIntent.classifierUnavailable === true
-          || (semanticClarificationRequired && !taskBoundSemanticClarification);
+        // classifierUnavailable is checked through the same recoverable-failure test as
+        // the clarification flags above, not on its own. On its own it re-imposed the
+        // inspection-only surface even after the turn had established that a routed
+        // specialist mission makes the classifier's opinion unnecessary.
+        const inspectionOnlyIntent = !semanticClarificationIsRecoverable
+          && (semanticIntent.classifierUnavailable === true
+            || (semanticClarificationRequired && !taskBoundSemanticClarification));
         const disableToolsForSemanticSafety = taskBoundSemanticClarification;
         setActiveToolGateProfile({
           reviewOnly,
@@ -15674,6 +15730,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     recordPhoneNotificationOutcome,
     firstClarifyingQuestionText,
     setActiveToolGateProfile,
+    isSemanticClarificationRecoverable,
     getToolsBlockedByActiveGate,
     getSemanticIntentToolGate,
     PLANNING_BLOCKED_TOOLS,
