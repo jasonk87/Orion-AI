@@ -3182,7 +3182,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       : resolvedRequestForRouting;
     let finalizedDispatchRoute = finalizeDispatchRoute(semanticIntent);
     const finalizedRouteDirective = DispatchExecutionRoute
-      && DispatchExecutionRoute.buildAcknowledgementDirective(finalizedDispatchRoute);
+      && DispatchExecutionRoute.buildAcknowledgementDirective(finalizedDispatchRoute, semanticIntent);
     if (finalizedRouteDirective) {
       messages.splice(Math.max(0, messages.length - 1), 0, {
         role: 'user',
@@ -3716,13 +3716,17 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       // receives a no-tool permission refusal/manual deflection, synthesize the allowed specialist
       // handoff as part of this same model turn. Mutating `parts` keeps provider history valid:
       // the following tool response has a matching functionCall in the assistant message.
+      // Same predicate the acknowledgement directive used, not a second copy of the rule.
+      //
+      // These two were separate expressions that had to agree and did not: the directive
+      // told Dispatch "the runtime will execute this finalized route even if you only
+      // provide the acknowledgement" for ANY specialist route, while this condition also
+      // required the intent to be one of three names. For anything else Dispatch was
+      // truthfully told it need not call the tool, didn't, and nothing queued the work.
       const classifiedExecutionNeedsRealHandoff = !!(
         runMode === 'orion'
-        && finalizedDispatchRoute
-        && finalizedDispatchRoute.requiresExecution === true
-        && finalizedDispatchRoute.targetKind === 'specialist'
-        && (finalizedDispatchRoute.delegatedInspection === true
-          || ['new_task', 'context_followup', 'steer_active_task'].includes(effectiveDispatchHandoffIntent.intent))
+        && DispatchExecutionRoute
+        && DispatchExecutionRoute.runtimeWillExecuteRoute(finalizedDispatchRoute, effectiveDispatchHandoffIntent)
       );
       if (functionCalls.length === 0
           && !dispatchForcedHandoffSent

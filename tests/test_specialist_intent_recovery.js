@@ -121,3 +121,75 @@ test('scheduling is the only thing Dispatch routes deterministically', (t) => {
     'a specialist handoff is NOT synthesized - this is why an unmade handoff has to be caught after the answer');
   t.end();
 });
+
+// ── The promise the code made to itself ───────────────────────────────────────
+//
+// The real defect behind "I'll route this to Coder... " with nothing queued was not model
+// behaviour. buildAcknowledgementDirective told Dispatch "the runtime will execute this
+// finalized route even if you only provide the acknowledgement" for ANY specialist route,
+// while agent.js only synthesized the handoff when the intent was one of three names. For
+// every other intent Dispatch was truthfully told it did not need to call the tool, so it
+// didn't, and nothing queued the work. The model did exactly as instructed.
+//
+// Both sides now read runtimeWillExecuteRoute. The intent set is deliberately unchanged, so
+// this repairs the promise without letting anything create a task that could not before.
+
+const dispatchRoute = require('../dispatch-execution-route.js');
+
+function routeFor(intentName, overrides = {}) {
+  const intent = Object.assign({
+    intent: intentName,
+    requiresExecution: true,
+    executionTarget: 'coder',
+    executionScope: 'project',
+    resolvedRequest: 'Commit uncommitted Music Life work and push it'
+  }, overrides);
+  const route = dispatchRoute.finalize(intent, { resolvedRequest: intent.resolvedRequest });
+  return { intent, route };
+}
+
+test('what the directive promises is what the runtime does', (t) => {
+  for (const name of ['new_task', 'context_followup', 'steer_active_task',
+                      'approve_plan', 'status_check', 'cancel_active_task', 'conversation']) {
+    const { intent, route } = routeFor(name);
+    const runtimeExecutes = dispatchRoute.runtimeWillExecuteRoute(route, intent);
+    const directive = dispatchRoute.buildAcknowledgementDirective(route, intent);
+    const promisesRuntime = /runtime will execute this finalized route/.test(directive);
+    const demandsToolCall = /you must call handoff_to_coder yourself/.test(directive);
+    t.equal(promisesRuntime, runtimeExecutes,
+      `${name}: the directive only promises runtime execution when the runtime will actually do it`);
+    t.equal(demandsToolCall, !runtimeExecutes,
+      `${name}: when the runtime will not queue it, Dispatch is told to call the tool itself`);
+  }
+  t.end();
+});
+
+test('the set of intents that can queue work is unchanged', (t) => {
+  const queues = ['new_task', 'context_followup', 'steer_active_task'];
+  for (const name of queues) {
+    const { intent, route } = routeFor(name);
+    t.ok(dispatchRoute.runtimeWillExecuteRoute(route, intent), `${name} still queues automatically`);
+  }
+  for (const name of ['approve_plan', 'deny_plan', 'cancel_active_task', 'status_check', 'conversation']) {
+    const { intent, route } = routeFor(name);
+    t.notOk(dispatchRoute.runtimeWillExecuteRoute(route, intent),
+      `${name} still cannot create a task on its own - the fix widened nothing`);
+  }
+  t.end();
+});
+
+test('a delegated inspection always queues, whatever the intent is called', (t) => {
+  const intent = { intent: 'conversation', requiresExecution: true, executionTarget: 'coder' };
+  const route = dispatchRoute.finalize(intent, { delegatedInspection: true, resolvedRequest: 'survey it' });
+  t.ok(dispatchRoute.runtimeWillExecuteRoute(route, intent),
+    'work that must leave Dispatch is queued regardless of the intent label');
+  t.end();
+});
+
+test('a route with no specialist promises nothing at all', (t) => {
+  const intent = { intent: 'conversation', requiresExecution: false };
+  const route = dispatchRoute.finalize(intent, {});
+  t.notOk(dispatchRoute.runtimeWillExecuteRoute(route, intent), 'nothing to execute');
+  t.equal(dispatchRoute.buildAcknowledgementDirective(route, intent), '', 'and nothing is promised');
+  t.end();
+});

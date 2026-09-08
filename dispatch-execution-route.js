@@ -51,6 +51,38 @@
     return resolved;
   }
 
+  // Intents whose resolved route the runtime carries out on its own.
+  //
+  // Not a new list - it is the one agent.js already used to decide whether to synthesize
+  // the handoff. It lives here now because buildAcknowledgementDirective was promising the
+  // model something on a strictly weaker condition than the runtime tested, and the two
+  // silently disagreed.
+  const RUNTIME_EXECUTED_INTENTS = Object.freeze([
+    'new_task',
+    'context_followup',
+    'steer_active_task'
+  ]);
+
+  /**
+   * Whether the runtime itself will perform this route without the model calling a tool.
+   *
+   * One source of truth for a promise the code makes to itself. Dispatch used to be told
+   * "the runtime will execute this finalized route even if you only provide the
+   * acknowledgement" whenever a specialist was targeted, while agent.js only synthesized a
+   * handoff for the three intents above. Any other intent produced exactly the failure that
+   * wording invites: Dispatch wrote "I'll route this to Coder to inspect the Music Life
+   * repo, commit any legitimate uncommitted work, and push it to GitHub", made no tool call
+   * because it had been told it did not need to, and the turn ended with nothing queued.
+   *
+   * The set is deliberately unchanged, so nothing can now create a task that could not
+   * before. Only the promise is corrected.
+   */
+  function runtimeWillExecuteRoute(route, semanticIntent = {}) {
+    if (!route || route.requiresExecution !== true || route.targetKind !== 'specialist') return false;
+    if (route.delegatedInspection === true) return true;
+    return RUNTIME_EXECUTED_INTENTS.includes(clean(semanticIntent && semanticIntent.intent));
+  }
+
   /**
    * Finalize the one route Dispatch and the execution layer will both consume.
    * This function only resolves meaning/capability facts. It performs no handoff and mutates no
@@ -91,8 +123,12 @@
     });
   }
 
-  function buildAcknowledgementDirective(route) {
+  function buildAcknowledgementDirective(route, semanticIntent = {}) {
     if (!route || route.requiresExecution !== true || route.targetKind !== 'specialist') return '';
+    const runtimeExecuted = runtimeWillExecuteRoute(route, semanticIntent);
+    const handoffTool = SpecialistRegistry && typeof SpecialistRegistry.handoffToolNameForRole === 'function'
+      ? (SpecialistRegistry.handoffToolNameForRole(route.effectiveTarget) || 'the matching handoff tool')
+      : 'the matching handoff tool';
     const facts = route.capabilityFacts.map(fact => `- ${fact}`).join('\n');
     return [
       '[FINALIZED DISPATCH EXECUTION ROUTE]',
@@ -107,10 +143,14 @@
       'Do not claim a different specialist will do it. Do not claim Dispatch must do the execution.',
       'Do not refuse because Dispatch lacks the execution tools, ask the user to repeat the request,',
       'or ask what a contextual reference means when Resolved request already makes it explicit.',
-      'You may call the matching handoff tool, but the runtime will execute this finalized route even',
-      'if you only provide the acknowledgement. Do not inspect or redo the specialist work in Dispatch.'
+      runtimeExecuted
+        ? 'You may call the matching handoff tool, but the runtime will execute this finalized route even'
+          + ' if you only provide the acknowledgement. Do not inspect or redo the specialist work in Dispatch.'
+        : `The runtime will NOT queue this for you on this turn, so you must call ${handoffTool} yourself as`
+          + ' part of this reply. An acknowledgement on its own leaves the user waiting for work that was'
+          + ' never started. Do not inspect or redo the specialist work in Dispatch.'
     ].join('\n');
   }
 
-  return Object.freeze({ finalize, buildAcknowledgementDirective });
+  return Object.freeze({ finalize, buildAcknowledgementDirective, runtimeWillExecuteRoute });
 });
