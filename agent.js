@@ -2281,6 +2281,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   let finalAnswerQualityLoopExtensions = 0;
   let memoryConfidenceCorrections = 0;
   let statusAccuracyCorrections = 0;
+  let dispatchDelegationNudges = 0;
   let criticalRunError = null;
   let lastBoundarySupervisorStatus = '';
   let automaticContinuationQueued = false;
@@ -3867,6 +3868,46 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             role: 'user',
             parts: [{
               text: '[SYSTEM: Planning Mode is active and no checklist or implementation plan has been created for this request. Either create the implementation plan and checklist with tools now, or give a complete direct answer that does not promise later action.]'
+            }]
+          });
+          continue;
+        }
+        // Dispatch said it would route, and then didn't.
+        //
+        // Observed: "Can you submit any uncommitted work for my music life project to
+        // GitHub" produced "I'll route this to Coder to inspect the Music Life repo,
+        // commit any legitimate uncommitted work, and push it to GitHub" - and then the
+        // turn ended READY with no handoff_to_coder call and no task queued.
+        //
+        // Nothing caught it. shouldHaveUsedToolsButDidNot accepts any non-empty text,
+        // on the stated assumption that "the shared semantic result drives inspection/
+        // handoff before the model call". That is only true for scheduling:
+        // buildDispatchOrchestrationCall exclusively emits schedule_followup, so a
+        // handoff still depends on the model actually calling the tool. When it narrates
+        // the routing instead, the promise is the whole turn.
+        //
+        // dispatchPreflightAuthorized is already the router's own judgment that this turn
+        // requires execution by a specialist, so it is the right condition: this fires
+        // only where a handoff was expected, and only when no tool ran at all. One nudge,
+        // then the turn is allowed to finish however it will - the loop must still be able
+        // to terminate.
+        if (dispatchPreflightAuthorized
+            && (workWalkthrough || []).length === 0
+            && dispatchDelegationNudges < 1
+            && loopCount < maxLoops) {
+          dispatchDelegationNudges++;
+          const delegationRole = resolveDispatchHandoffRole(semanticIntent, {
+            delegatedInspection: dispatchInspectionDelegationPending
+          });
+          const delegationTool = handoffToolForRole(delegationRole);
+          currentAgentLogs.push({
+            type: 'thought',
+            content: `Delegation guard: the reply described routing to ${handoffRoleLabel(delegationRole)} without calling ${delegationTool}.`
+          });
+          messages.push({
+            role: 'user',
+            parts: [{
+              text: `[SYSTEM: You described handing this work to ${handoffRoleLabel(delegationRole)} but did not call ${delegationTool}, so nothing was queued and the user is waiting on work that was never started. Call ${delegationTool} now with the task description and any findings you already have. If you genuinely cannot delegate this, say plainly what is blocking it instead of describing a handoff that did not happen.]`
             }]
           });
           continue;

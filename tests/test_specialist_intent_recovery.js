@@ -75,3 +75,49 @@ test('the exemption is narrow', (t) => {
   t.equal(recoverable(), false, 'the default is the safe one');
   t.end();
 });
+
+// ── Dispatch promising a handoff it never made ────────────────────────────────
+//
+// Second reported failure, same conversation shape: "Can you submit any uncommitted work
+// for my music life project to GitHub" produced "I'll route this to Coder to inspect the
+// Music Life repo, commit any legitimate uncommitted work, and push it to GitHub." Then
+// the turn went READY with no handoff_to_coder call and no queued task.
+//
+// shouldHaveUsedToolsButDidNot accepts any non-empty text, on the stated assumption that
+// "the shared semantic result drives inspection/handoff before the model call". That holds
+// for scheduling only - buildDispatchOrchestrationCall emits schedule_followup and nothing
+// else - so a handoff still depends on the model choosing to call the tool, and narrating
+// it instead was accepted as a finished turn.
+
+test('a bare text answer is still treated as a complete turn', (t) => {
+  t.equal(agent.shouldHaveUsedToolsButDidNot("I'll route this to Coder.", [], 'commit my work'), false,
+    'the general guard deliberately does not phrase-match prose, so it cannot catch this on its own');
+  t.equal(agent.shouldHaveUsedToolsButDidNot('', [], 'commit my work'), true,
+    'an empty answer is still caught');
+  t.equal(agent.shouldHaveUsedToolsButDidNot('anything', [{ name: 'read_file' }], 'commit my work'), false,
+    'a turn that actually used a tool is never nudged');
+  t.end();
+});
+
+test('scheduling is the only thing Dispatch routes deterministically', (t) => {
+  const scheduled = agent.buildDispatchOrchestrationCall({
+    requiresExecution: true,
+    executionTarget: 'dispatch',
+    orchestrationAction: 'schedule_followup',
+    intent: 'new_task',
+    scheduledRequest: { prompt: 'remind me', delaySeconds: 60 }
+  });
+  t.equal(scheduled && scheduled.name, 'schedule_followup',
+    'a scheduling intent is turned into a real call without the model');
+
+  const handoff = agent.buildDispatchOrchestrationCall({
+    requiresExecution: true,
+    executionTarget: 'coder',
+    orchestrationAction: 'none',
+    intent: 'new_task',
+    taskResolution: { title: 'Commit uncommitted work' }
+  });
+  t.equal(handoff, null,
+    'a specialist handoff is NOT synthesized - this is why an unmade handoff has to be caught after the answer');
+  t.end();
+});
