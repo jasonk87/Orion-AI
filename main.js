@@ -253,6 +253,7 @@ function createWindow() {
 // ── Register all IPC handlers ──────────────────────────────────────────────────
 
 function registerAllHandlers() {
+  require('./lib/ipc-codex').registerHandlers(ipcMain, { app, shell: require('electron').shell });
   const { getWorkspaceEntrypoint } = ipcWorkspace;
   const { readAppConfig, atomicWriteFileSync } = require('./lib/config');
   const { startStaticWorkspaceServer } = ipcServer;

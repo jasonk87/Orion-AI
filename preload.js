@@ -1,6 +1,16 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('api', {
+  codexStatus: () => ipcRenderer.invoke('codex:status'),
+  codexLogin: () => ipcRenderer.invoke('codex:login'),
+  codexCancelLogin: (loginId) => ipcRenderer.invoke('codex:login-cancel', loginId),
+  codexComplete: (input) => ipcRenderer.invoke('codex:complete', input),
+  codexCancel: (requestId) => ipcRenderer.invoke('codex:cancel', requestId),
+  onCodexDelta: (callback) => {
+    const listener = (_event, value) => callback(value);
+    ipcRenderer.on('codex:delta', listener);
+    return () => ipcRenderer.removeListener('codex:delta', listener);
+  },
   // Window Controls
   closeWindow: () => ipcRenderer.send('window-close'),
   minimizeWindow: () => ipcRenderer.send('window-minimize'),

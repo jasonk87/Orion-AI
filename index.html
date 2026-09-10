@@ -545,6 +545,16 @@
         </div>
 
         <div class="form-group">
+          <label>ChatGPT Subscription (Codex)</label>
+          <p id="codex-account-status" role="status">Checking your local Codex login…</p>
+          <button type="button" id="codex-sign-in" class="btn">Sign in with ChatGPT</button>
+          <button type="button" id="codex-refresh" class="btn">Refresh account and models</button>
+          <button type="button" id="codex-cancel-login" class="btn" hidden>Cancel sign-in</button>
+          <small class="form-help">Uses your local Codex login and subscription limits. Model access and reasoning options come from your account.</small>
+          <p id="codex-quota-status" class="form-help"></p>
+        </div>
+
+        <div class="form-group">
           <label for="setting-groq-api-key">Groq API Key:</label>
           <input type="password" id="setting-groq-api-key" placeholder="gsk_...">
           <small class="form-help">Required for the free-plan Groq models. Saved locally and never packaged.</small>
@@ -723,6 +733,7 @@
   <script src="supervisor-orchestration.js"></script>
   <script src="prompt-submission.js"></script>
   <script src="operator-execution-policy.js"></script>
+  <script src="codex-provider.js"></script>
   <script src="renderer.js"></script>
   <script src="agent.js"></script>
 </body>

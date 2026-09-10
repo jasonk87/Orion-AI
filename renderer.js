@@ -717,6 +717,80 @@ async function loadSettings() {
   restoreReasoningEffortSelection();
 }
 
+let codexAccountStatus = null;
+let codexLoginId = null;
+let codexLoginTimer = null;
+
+window.getCodexModelInfo = value => (codexAccountStatus?.models || []).find(model => `codex:${model.model}` === value);
+
+function getModelReasoningLevels(model = appConfig.defaultModel) {
+  if (String(model || '').startsWith('codex:')) {
+    return [{ value: 'auto', label: 'Auto' }, ...(window.getCodexModelInfo(model)?.supportedReasoningEfforts || [])
+      .map(option => ({ value: option.reasoningEffort, label: option.reasoningEffort, description: option.description }))];
+  }
+  return window.OrionReasoningPolicy?.EFFORT_OVERRIDES || [{ value: 'auto', label: 'Auto' }];
+}
+
+function normalizeSelectedReasoning(value) {
+  if (String(appConfig.defaultModel || '').startsWith('codex:')) {
+    return getModelReasoningLevels().some(option => option.value === value) ? value : 'auto';
+  }
+  return window.OrionReasoningPolicy ? window.OrionReasoningPolicy.normalizeEffortOverride(value) : value || 'auto';
+}
+
+async function refreshCodexSubscription() {
+  if (!window.api.codexStatus) return;
+  const statusEl = document.getElementById('codex-account-status');
+  const quotaEl = document.getElementById('codex-quota-status');
+  try {
+    const status = await window.api.codexStatus();
+    codexAccountStatus = status.connected ? status : { ...status, models: codexAccountStatus?.models || [] };
+    if (statusEl) statusEl.textContent = status.connected
+      ? `Connected${status.account?.email ? ` as ${status.account.email}` : ''} · ${status.account?.planType || 'ChatGPT'}`
+      : status.error || 'Sign in with ChatGPT to connect.';
+    const quota = status.quota;
+    const buckets = quota?.rateLimitsByLimitId ? Object.values(quota.rateLimitsByLimitId) : quota?.rateLimits ? [quota.rateLimits] : [];
+    if (quotaEl) quotaEl.textContent = buckets.map(bucket => {
+      const windows = [bucket.primary, bucket.secondary].filter(Boolean).map(limit => {
+        const remaining = Number.isFinite(limit.usedPercent) ? `${Math.max(0, 100 - limit.usedPercent)}% remaining` : 'Usage unavailable';
+        const reset = limit.resetsAt ? `; resets ${new Date(limit.resetsAt * 1000).toLocaleString()}` : '';
+        return remaining + reset;
+      });
+      return `${bucket.limitName || bucket.limitId || 'Codex'}: ${windows.join(' · ')}`;
+    }).join('\n') || status.quotaError || '';
+    const selected = el.modelSelect?.value;
+    el.modelSelect?.querySelectorAll('[data-codex-unavailable]').forEach(option => option.remove());
+    el.modelSelect?.querySelector('[data-codex-models]')?.remove();
+    if (codexAccountStatus.models?.length && el.modelSelect) {
+      const group = document.createElement('optgroup');
+      group.label = 'ChatGPT Subscription (Codex)';
+      group.dataset.codexModels = 'true';
+      for (const model of codexAccountStatus.models) {
+        const option = document.createElement('option');
+        option.value = `codex:${model.model}`;
+        option.textContent = model.displayName;
+        group.appendChild(option);
+      }
+      el.modelSelect.appendChild(group);
+    }
+    if (selected && el.modelSelect) {
+      if (selected.startsWith('codex:') && ![...el.modelSelect.options].some(option => option.value === selected)) {
+        const unavailable = document.createElement('option');
+        unavailable.dataset.codexUnavailable = 'true';
+        unavailable.value = selected;
+        unavailable.textContent = `${selected.slice(6)} (Codex unavailable — refresh in Settings)`;
+        el.modelSelect.appendChild(unavailable);
+      }
+      if ([...el.modelSelect.options].some(option => option.value === selected)) el.modelSelect.value = selected;
+    }
+    if (el.reasoningSelect && String(appConfig.defaultModel || '').startsWith('codex:')) restoreReasoningEffortSelection();
+    return status;
+  } catch (error) {
+    if (statusEl) statusEl.textContent = error.message;
+    return { success: false, error: error.message };
+  }
+}
+
 async function initModelDropdown() {
   const modelSelect = el.modelSelect;
   if (!modelSelect) return;
@@ -816,6 +890,8 @@ async function initModelDropdown() {
   });
   modelSelect.appendChild(groqGroup);
 
+  await refreshCodexSubscription();
+
   // Try to load saved model from localStorage or config
   let defaultModel = localStorage.getItem('ag2_default_model') || appConfig.defaultModel || 'gemini-2.5-flash-lite';
   
@@ -850,6 +926,15 @@ async function initModelDropdown() {
       break;
     }
   }
+  if (!found && defaultModel.startsWith('codex:')) {
+    const unavailable = document.createElement('option');
+    unavailable.dataset.codexUnavailable = 'true';
+    unavailable.value = defaultModel;
+    unavailable.textContent = `${defaultModel.slice(6)} (Codex unavailable — refresh in Settings)`;
+    modelSelect.appendChild(unavailable);
+    modelSelect.value = defaultModel;
+    found = true;
+  }
   if (!found) {
     // If preference not found (e.g. Ollama model deleted/stopped), default to flash-lite
     for (let i = 0; i < modelSelect.options.length; i++) {
@@ -869,9 +954,12 @@ async function initModelDropdown() {
 // user changes it back. Sticky on purpose — same behavior as the model select beside it.
 function restoreReasoningEffortSelection() {
   if (!el.reasoningSelect) return;
-  const normalize = window.OrionReasoningPolicy
-    ? window.OrionReasoningPolicy.normalizeEffortOverride
-    : value => value || 'auto';
+  el.reasoningSelect.replaceChildren(...getModelReasoningLevels().map(level => {
+    const option = document.createElement('option');
+    option.value = level.value; option.textContent = level.label; option.title = level.description || '';
+    return option;
+  }));
+  const normalize = normalizeSelectedReasoning;
   const saved = normalize(localStorage.getItem('ag2_reasoning_effort') || appConfig.reasoningEffort || 'auto');
   el.reasoningSelect.value = saved;
   if (!el.reasoningSelect.value) el.reasoningSelect.value = 'auto';
@@ -901,9 +989,7 @@ async function persistSelectionConfig() {
 }
 
 window.setReasoningEffortSelection = async (value) => {
-  const normalize = window.OrionReasoningPolicy
-    ? window.OrionReasoningPolicy.normalizeEffortOverride
-    : v => v || 'auto';
+  const normalize = normalizeSelectedReasoning;
   const level = normalize(value);
   const previousLevel = appConfig.reasoningEffort || 'auto';
   const previousRevision = Number(appConfig.reasoningSelectionRevision) || 0;
@@ -947,6 +1033,7 @@ async function setModelPreferenceSelection(modelValue) {
   }
   el.modelSelect.value = modelValue;
   appConfig.defaultModel = modelValue;
+  restoreReasoningEffortSelection();
   bumpSelectionRevision('model');
   localStorage.setItem('ag2_default_model', modelValue);
   try {
@@ -974,8 +1061,38 @@ function normalizePhoneHttpsOrigin(value) {
 }
 
 function setupSettingsModal() {
+  document.getElementById('codex-refresh')?.addEventListener('click', refreshCodexSubscription);
+  document.getElementById('codex-sign-in')?.addEventListener('click', async () => {
+    const result = await window.api.codexLogin();
+    const statusEl = document.getElementById('codex-account-status');
+    if (!result.success) { statusEl.textContent = result.error; return; }
+    codexLoginId = result.loginId;
+    statusEl.textContent = 'Complete sign-in in your browser.';
+    document.getElementById('codex-cancel-login').hidden = false;
+    const deadline = Date.now() + 180000;
+    const checkLogin = async () => {
+      if (!codexLoginId) return;
+      const status = await refreshCodexSubscription();
+      if (status?.connected || Date.now() > deadline) {
+        if (!status?.connected) await window.api.codexCancelLogin(codexLoginId);
+        codexLoginId = null;
+        document.getElementById('codex-cancel-login').hidden = true;
+      } else codexLoginTimer = setTimeout(checkLogin, 2000);
+    };
+    clearTimeout(codexLoginTimer);
+    codexLoginTimer = setTimeout(checkLogin, 2000);
+  });
+  document.getElementById('codex-cancel-login')?.addEventListener('click', async () => {
+    const loginId = codexLoginId;
+    codexLoginId = null;
+    clearTimeout(codexLoginTimer);
+    if (loginId) await window.api.codexCancelLogin(loginId);
+    document.getElementById('codex-cancel-login').hidden = true;
+    await refreshCodexSubscription();
+  });
   el.btnSettings.addEventListener('click', () => {
     el.settingsModal.classList.add('active');
+    refreshCodexSubscription();
   });
   
   el.btnSettingsClose.addEventListener('click', () => {
@@ -7708,6 +7825,7 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
       rootOriginConversationId: String(options.rootOriginConversationId || options.sourceConversationId || ''),
       source: coderTaskSource,
       semanticIntent,
+      executionPlan: Array.isArray(options.executionPlan) ? options.executionPlan : undefined,
       executionProfile,
       timestamp: Date.now()
     });
@@ -7797,6 +7915,9 @@ window.promoteWorkspaceToCoder = async function(options = {}) {
         : looseFindings,
       constraints: preflightTask ? preflightTask.constraints : [],
       semanticIntent,
+      executionPlan: preflightTask && Array.isArray(preflightTask.executionPlan)
+        ? preflightTask.executionPlan
+        : (Array.isArray(options.executionPlan) ? options.executionPlan : undefined),
       unresolvedDecisions: preflightTask ? preflightTask.unresolvedDecisions : [],
       source: coderTaskSource,
       modelSelectValue: (preflightTask && preflightTask.executionProfile && preflightTask.executionProfile.requestedModel)
@@ -7951,6 +8072,7 @@ window.promoteWorkspaceToOperator = async function(options = {}) {
       rootOriginConversationId: String(options.rootOriginConversationId || options.sourceConversationId || ''),
       source: operatorTaskSource,
       semanticIntent,
+      executionPlan: Array.isArray(options.executionPlan) ? options.executionPlan : undefined,
       executionProfile,
       executionSurface: options.executionSurface || (semanticIntent && semanticIntent.executionSurface) || 'desktop',
       timestamp: Date.now()
@@ -8037,6 +8159,9 @@ window.promoteWorkspaceToOperator = async function(options = {}) {
         : looseFindings,
       constraints: preflightTask ? preflightTask.constraints : [],
       semanticIntent,
+      executionPlan: preflightTask && Array.isArray(preflightTask.executionPlan)
+        ? preflightTask.executionPlan
+        : (Array.isArray(options.executionPlan) ? options.executionPlan : undefined),
       unresolvedDecisions: preflightTask ? preflightTask.unresolvedDecisions : [],
       source: operatorTaskSource,
       modelSelectValue: (preflightTask && preflightTask.executionProfile && preflightTask.executionProfile.requestedModel)
@@ -8191,6 +8316,7 @@ window.promoteWorkspaceToResearcher = async function(options = {}) {
       delegationChain: Array.isArray(options.delegationChain) ? options.delegationChain : [],
       source: researcherTaskSource,
       semanticIntent,
+      executionPlan: Array.isArray(options.executionPlan) ? options.executionPlan : undefined,
       executionProfile,
       timestamp: Date.now()
     });
@@ -8276,6 +8402,9 @@ window.promoteWorkspaceToResearcher = async function(options = {}) {
         : looseFindings,
       constraints: preflightTask ? preflightTask.constraints : [],
       semanticIntent,
+      executionPlan: preflightTask && Array.isArray(preflightTask.executionPlan)
+        ? preflightTask.executionPlan
+        : (Array.isArray(options.executionPlan) ? options.executionPlan : undefined),
       unresolvedDecisions: preflightTask ? preflightTask.unresolvedDecisions : [],
       source: researcherTaskSource,
       modelSelectValue: (preflightTask && preflightTask.executionProfile && preflightTask.executionProfile.requestedModel)
@@ -9719,13 +9848,9 @@ window.getPhoneCompanionModels = () => {
       models.push({ value: opt.value, label: opt.textContent.trim(), group });
     }
   }
-  const reasoning = window.OrionReasoningPolicy
-    ? window.OrionReasoningPolicy.normalizeEffortOverride(appConfig.reasoningEffort)
-    : (appConfig.reasoningEffort || 'auto');
-  const reasoningLevels = window.OrionReasoningPolicy
-    ? window.OrionReasoningPolicy.EFFORT_OVERRIDES.map(option => ({ ...option }))
-    : [{ value: 'auto', label: 'Auto' }];
-  return { current, models, reasoning, reasoningLevels, selectionRevisions: getSelectionRevisions() };
+  const reasoning = normalizeSelectedReasoning(appConfig.reasoningEffort);
+  const reasoningLevels = getModelReasoningLevels(current).map(option => ({ ...option }));
+  return { current, models, reasoning, reasoningLevels, codex: codexAccountStatus, selectionRevisions: getSelectionRevisions() };
 };
 
 window.setPhoneCompanionReasoning = async (level) => {

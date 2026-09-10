@@ -289,6 +289,8 @@
       '- executionSurface describes Operator work without relying on keyword rules: desktop for visible native application/screen interaction, browser for live page interaction or capturing a browser page, process for process lifecycle/monitoring that does not require visual control, and none for Coder or non-executable work.',
       '- Capturing and returning a screenshot is executable visual work owned by Operator, including a screenshot of a browser page. Dispatch may inspect supplied evidence and retrieve web information, but it does not choose an arbitrary page, capture it itself, and claim that image delivery succeeded. Set requiresExecution=true and executionTarget=operator; use browser when the requested subject is a live browser page and desktop for the OS screen or a native app.',
       '- Honor an explicit, appropriate request for Operator or Coder. For mixed work, choose the specialist that owns the immediate next operation; code-first changes go to Coder before later UI verification by Operator.',
+      '- A request can contain several executable operations owned by different specialists. When no one registered specialist can perform the whole request, populate executionPlan with every operation in dependency order. Each stage must be self-contained and must describe only the work its executionTarget can perform. The first stage is the immediate route; later stages are durable continuation work that the first specialist must hand off after its own stage succeeds. Keep resolvedRequest as the complete mission. Use an empty executionPlan when one specialist can own the whole mission.',
+      '- Never discard a requested operation merely because another operation comes first. For example, local process lifecycle work followed by committing and pushing a project is an Operator stage followed by a Coder stage; source changes followed by native UI verification are a Coder stage followed by an Operator stage. This is semantic decomposition by capability, never word or phrase matching.',
       '- Preserve the target specialist of an active or pending owned task when the turn steers or continues that same task. Never create a second specialist task merely because the wording is contextual.',
       '- executionScope is read_only for inspection, review, status gathering, or known commands that do not mutate durable state; mutating is for edits, installs, lifecycle changes, queue changes, approval, denial, revision, or cancellation.',
       '- evidenceTarget names WHOSE evidence actually answers the request, resolved from meaning, never from keyword matching and never from which project or technology name happens to appear in the sentence. prior_orion_runs means the answer depends on what Orion itself previously did - its own prior task/run execution, orchestration history, or how it accomplished something before. active_workspace means the answer depends on the currently selected project\'s own code, files, or content. personal_memory means the answer depends on Orion\'s own stored memory or conversation history about the user, a project, or the conversation - not fresh file inspection. The same named entity can appear either way: "how did you do this last time," "look at your previous runs," "what did Operator do the last couple times I asked for X," "what happened in the previous attempt," and "check the history and see how you handled this before" all resolve to prior_orion_runs even when a project or technology is also named - the referent is Orion\'s own execution, not that project. "How does <project> use X," "search <project> for Y," and "did I build Z in this project" resolve to active_workspace - the referent is the project itself. "What do you remember about me," "what have I told you about GRITLIFE," and "what did we discuss earlier" resolve to personal_memory - the referent is Orion\'s stored knowledge, not a fresh look at the project. Use none when none of these apply.',
@@ -330,6 +332,14 @@
         executionScope: 'none | read_only | mutating',
         executionTarget: executionTargetSchemaValue(),
         executionSurface: 'none | desktop | browser | process',
+        executionPlan: [{
+          executionTarget: executionTargetSchemaValue(),
+          resolvedRequest: '',
+          executionScope: 'read_only | mutating',
+          executionSurface: 'none | desktop | browser | process',
+          inspectionTarget: 'none | local_system | workspace | project | task_history',
+          standaloneSystemOperation: false
+        }],
         orchestrationAction: 'none | schedule_followup',
         scheduledRequest: {
           prompt: '',
@@ -382,6 +392,7 @@
         executionScope: 'none',
         executionTarget: 'none',
         executionSurface: 'none',
+        executionPlan: [],
         orchestrationAction: 'none',
         scheduledRequest: { prompt: '', purpose: '', delaySeconds: 0, repeatEverySeconds: 0, atTime: '', onDays: '', recurring: false, deliveryOnly: false },
         evidenceTarget: 'none',
@@ -411,6 +422,7 @@
       executionScope: 'none',
       executionTarget: 'none',
       executionSurface: 'none',
+      executionPlan: [],
       orchestrationAction: 'none',
       scheduledRequest: { prompt: '', purpose: '', delaySeconds: 0, repeatEverySeconds: 0, atTime: '', onDays: '', recurring: false, deliveryOnly: false },
       evidenceTarget: 'none',
@@ -537,14 +549,83 @@
     // The classifier already names the evidence domain separately from the operation shape.
     // Treat executable local-system work as standalone even if the model omitted the redundant
     // boolean on a context-dependent confirmation such as "yes, do that".
-    const standaloneSystemOperation = parsed.standaloneSystemOperation === true
+    let standaloneSystemOperation = parsed.standaloneSystemOperation === true
       || (parsed.requiresExecution === true
         && inspectionTarget === 'local_system'
         && ['new_task', 'context_followup'].includes(normalizedIntent));
+    let executionScope = ['none', 'read_only', 'mutating'].includes(parsed.executionScope)
+      ? parsed.executionScope
+      : (parsed.requiresExecution === true ? 'mutating' : 'none');
+    let requestedExecutionSurface = EXECUTION_SURFACES.includes(parsed.executionSurface)
+      ? parsed.executionSurface
+      : 'none';
+
+    // A single executionTarget cannot honestly represent a mission whose operations cross
+    // specialist capability boundaries. Normalize the classifier's semantic decomposition one
+    // stage at a time, validating every target through the same registry-driven resolver used for
+    // ordinary routes. Consecutive or repeated ownership is collapsed: one specialist should
+    // finish all of its contiguous work before handing off, and the delegation loop guard quite
+    // correctly refuses to send a later task back to a role already in the chain.
+    const executionPlan = [];
+    const seenPlanRoles = new Set();
+    if (parsed.requiresExecution === true
+        && !input.activeOwnedTask
+        && !input.pendingOwnedTask
+        && ['new_task', 'context_followup'].includes(normalizedIntent)) {
+      for (const rawStage of Array.isArray(parsed.executionPlan) ? parsed.executionPlan : []) {
+        if (!rawStage || typeof rawStage !== 'object') continue;
+        const stageRequest = string(rawStage.resolvedRequest, 4000);
+        if (!stageRequest) continue;
+        const stageInspectionTarget = ['none', 'local_system', 'workspace', 'project', 'task_history'].includes(rawStage.inspectionTarget)
+          ? rawStage.inspectionTarget
+          : 'none';
+        const stageScope = ['read_only', 'mutating'].includes(rawStage.executionScope)
+          ? rawStage.executionScope
+          : 'mutating';
+        const stageSurface = EXECUTION_SURFACES.includes(rawStage.executionSurface)
+          ? rawStage.executionSurface
+          : 'none';
+        const stageStandalone = rawStage.standaloneSystemOperation === true
+          || stageInspectionTarget === 'local_system';
+        const stageTarget = resolveExecutionTarget({
+          intent: 'new_task',
+          requiresExecution: true,
+          executionTarget: rawStage.executionTarget,
+          executionScope: stageScope,
+          executionSurface: stageSurface,
+          inspectionTarget: stageInspectionTarget,
+          standaloneSystemOperation: stageStandalone,
+          inspectionBreadth: rawStage.inspectionBreadth || 'none'
+        }, {});
+        if (!specialist(stageTarget) || seenPlanRoles.has(stageTarget)) continue;
+        seenPlanRoles.add(stageTarget);
+        executionPlan.push({
+          executionTarget: stageTarget,
+          resolvedRequest: stageRequest,
+          executionScope: stageScope,
+          executionSurface: stageSurface,
+          inspectionTarget: stageInspectionTarget,
+          standaloneSystemOperation: stageStandalone
+        });
+      }
+    }
+    // A one-stage plan adds no information and must not create a special continuation contract.
+    if (executionPlan.length < 2) executionPlan.length = 0;
+    if (executionPlan.length) {
+      const firstStage = executionPlan[0];
+      executionScope = firstStage.executionScope;
+      requestedExecutionSurface = firstStage.executionSurface;
+      inspectionTarget = firstStage.inspectionTarget;
+      standaloneSystemOperation = firstStage.standaloneSystemOperation;
+      parsed.executionTarget = firstStage.executionTarget;
+    }
+
     const executionTarget = resolveExecutionTarget({
       ...parsed,
       intent: normalizedIntent,
       requiresExecution: parsed.requiresExecution === true,
+      executionScope,
+      executionSurface: requestedExecutionSurface,
       inspectionTarget,
       standaloneSystemOperation
     }, input);
@@ -553,10 +634,10 @@
     // surface and made every non-Operator classification look surface-less.
     const resolvedSpecialist = specialist(executionTarget);
     const executionSurface = resolvedSpecialist
-      && EXECUTION_SURFACES.includes(parsed.executionSurface)
+      && EXECUTION_SURFACES.includes(requestedExecutionSurface)
       && Array.isArray(resolvedSpecialist.executionSurfaces)
-      && resolvedSpecialist.executionSurfaces.includes(parsed.executionSurface)
-      ? parsed.executionSurface
+      && resolvedSpecialist.executionSurfaces.includes(requestedExecutionSurface)
+      ? requestedExecutionSurface
       : 'none';
     const requestedOrchestrationAction = ORCHESTRATION_ACTIONS.includes(parsed.orchestrationAction)
       ? parsed.orchestrationAction
@@ -606,11 +687,10 @@
         constraints: strings(resolution.constraints),
         unresolvedDecisions: strings(resolution.unresolvedDecisions)
       },
-      executionScope: ['none', 'read_only', 'mutating'].includes(parsed.executionScope)
-        ? parsed.executionScope
-        : (parsed.requiresExecution === true ? 'mutating' : 'none'),
+      executionScope,
       executionTarget,
       executionSurface,
+      executionPlan,
       orchestrationAction,
       scheduledRequest,
       evidenceTarget,

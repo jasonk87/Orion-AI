@@ -51,6 +51,41 @@ test('route directive gives the response model authoritative facts without askin
   t.end();
 });
 
+test('compound execution route exposes the whole specialist chain while queuing only its first owner', t => {
+  const route = routeApi.finalize(intent({
+    resolvedRequest: 'Stop Music Life, then commit and push its repository changes.',
+    executionTarget: 'operator',
+    executionSurface: 'process',
+    executionPlan: [
+      {
+        executionTarget: 'operator',
+        resolvedRequest: 'Stop the running Music Life process and verify it exited.',
+        executionScope: 'mutating',
+        executionSurface: 'process',
+        inspectionTarget: 'local_system',
+        standaloneSystemOperation: true
+      },
+      {
+        executionTarget: 'coder',
+        resolvedRequest: 'Review, commit, and push the intended Music Life repository changes.',
+        executionScope: 'mutating',
+        executionSurface: 'none',
+        inspectionTarget: 'project',
+        standaloneSystemOperation: false
+      }
+    ]
+  }), {});
+
+  t.equal(route.effectiveTarget, 'operator', 'only the immediate dependency is selected for Dispatch handoff');
+  t.deepEqual(route.executionPlan.map(stage => stage.executionTarget), ['operator', 'coder'], 'the complete ordered chain reaches execution');
+  t.deepEqual(route.remainingExecutionPlan.map(stage => stage.executionTarget), ['coder'], 'remaining work is explicit rather than hidden in prose');
+  const directive = routeApi.buildAcknowledgementDirective(route, { intent: 'new_task' });
+  t.match(directive, /1\. Operator: Stop the running Music Life process/, 'Dispatch sees the first stage');
+  t.match(directive, /2\. Coder: Review, commit, and push/, 'Dispatch sees the required continuation');
+  t.match(directive, /Only the first stage is queued directly/, 'the directive forbids two unrelated root tasks');
+  t.end();
+});
+
 test('non-executable conversation does not receive a handoff acknowledgement directive', t => {
   const route = routeApi.finalize(intent({
     intent: 'conversation',

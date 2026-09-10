@@ -82,7 +82,7 @@
     return { allowed: true, reason: '', chain, nextChain };
   }
 
-  const SCHEMA_VERSION = 6;
+  const SCHEMA_VERSION = 7;
   const TASK_STATES = Object.freeze({
     PENDING: 'pending',
     ACTIVE: 'active',
@@ -151,6 +151,33 @@
       if (output.length >= limit) break;
     }
     return output;
+  }
+
+  function normalizeExecutionPlan(values) {
+    const plan = [];
+    const seenRoles = new Set();
+    for (const rawStage of Array.isArray(values) ? values : []) {
+      if (!rawStage || typeof rawStage !== 'object') continue;
+      const executionTarget = compactInline(rawStage.executionTarget || rawStage.targetMode).toLowerCase();
+      const resolvedRequest = compactWhitespace(rawStage.resolvedRequest || rawStage.objective || rawStage.prompt || '');
+      if (!resolvedRequest || !SpecialistRegistry || !SpecialistRegistry.has(executionTarget) || seenRoles.has(executionTarget)) continue;
+      seenRoles.add(executionTarget);
+      plan.push({
+        executionTarget,
+        resolvedRequest,
+        executionScope: ['read_only', 'mutating'].includes(compactInline(rawStage.executionScope).toLowerCase())
+          ? compactInline(rawStage.executionScope).toLowerCase()
+          : 'mutating',
+        executionSurface: ['none', 'desktop', 'browser', 'process'].includes(compactInline(rawStage.executionSurface).toLowerCase())
+          ? compactInline(rawStage.executionSurface).toLowerCase()
+          : 'none',
+        inspectionTarget: ['none', 'local_system', 'workspace', 'project', 'task_history'].includes(compactInline(rawStage.inspectionTarget).toLowerCase())
+          ? compactInline(rawStage.inspectionTarget).toLowerCase()
+          : 'none',
+        standaloneSystemOperation: rawStage.standaloneSystemOperation === true
+      });
+    }
+    return plan;
   }
 
   function normalizeImageAttachments(inputValue, limit = 4) {
@@ -480,7 +507,9 @@
       || fallbacks.reasoningEffort
       || 'auto'
     ).toLowerCase() || 'auto';
-    const requestedReasoning = requestedReasoningValue === 'ultra'
+    const codexReasoning = requestedModel.startsWith('codex:')
+      && ['auto', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(requestedReasoningValue);
+    const requestedReasoning = codexReasoning ? requestedReasoningValue : requestedReasoningValue === 'ultra'
       ? 'max'
       : (['auto', 'low', 'medium', 'high', 'max'].includes(requestedReasoningValue)
           ? requestedReasoningValue
@@ -629,6 +658,7 @@
     )
       ? compactInline(input.executionSurface || semanticIntent.executionSurface).toLowerCase()
       : 'none';
+    const executionPlan = normalizeExecutionPlan(input.executionPlan || semanticIntent.executionPlan);
 
     const task = {
       schemaVersion: SCHEMA_VERSION,
@@ -647,6 +677,7 @@
       contextPacketIds: taskContextPacketIds(input),
       executionProfile,
       executionSurface,
+      executionPlan,
       origin,
       target,
       parentTaskId,
@@ -752,6 +783,7 @@
       executionSurface: ['none', 'desktop', 'browser', 'process'].includes(compactInline(record.executionSurface).toLowerCase())
         ? compactInline(record.executionSurface).toLowerCase()
         : 'none',
+      executionPlan: normalizeExecutionPlan(record.executionPlan),
       continuation: continuationRecord && compactWhitespace(continuationRecord.input || continuationRecord.prompt || '')
         ? {
             input: compactWhitespace(continuationRecord.input || continuationRecord.prompt || ''),
@@ -1053,6 +1085,17 @@
       `Origin session: ${task.origin.sessionId || '(unknown)'}`,
       `Origin message: ${task.origin.messageId || '(unknown)'}`
     ];
+    if (task.executionPlan.length > 1) {
+      sections.push(
+        '',
+        'Ordered specialist execution plan (every stage remains part of this mission):',
+        ...task.executionPlan.map((stage, index) => {
+          const definition = SpecialistRegistry && SpecialistRegistry.get(stage.executionTarget);
+          return `${index + 1}. ${definition ? definition.label : stage.executionTarget}: ${stage.resolvedRequest}`;
+        }),
+        'Complete and verify your stage, then hand off the remaining stages to the next named specialist. Do not declare the mission complete while later stages remain.'
+      );
+    }
     if (task.parentTaskId) {
       sections.push(
         `Parent task: ${task.parentTaskId}`,
@@ -1091,6 +1134,7 @@
         : 'Waiting for a scheduled follow-up.';
     }
     if (reasonCode === 'automatic_action_boundary') return 'Checkpointed — continuing automatically.';
+    if (reasonCode === 'awaiting_execution_plan_handoff') return 'Checkpointed — assigning the next specialist stage automatically.';
     if (reasonCode === 'awaiting_delegated_task') return 'Waiting for a delegated task.';
     if (reasonCode === 'awaiting_plan_approval') return 'Waiting for plan approval.';
     if (reasonCode === 'awaiting_clarification' || reasonCode === 'awaiting_input') {

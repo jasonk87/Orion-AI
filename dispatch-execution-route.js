@@ -107,6 +107,23 @@
       : (effectiveTarget === 'dispatch'
           ? ['Dispatch owns this orchestration action directly.']
           : ['No execution handoff is authorized for this turn.']);
+    const executionPlan = (Array.isArray(semanticIntent.executionPlan) ? semanticIntent.executionPlan : [])
+      .map(stage => {
+        const target = clean(stage && stage.executionTarget).toLowerCase();
+        const definition = SpecialistRegistry && SpecialistRegistry.get(target);
+        const stageRequest = clean(stage && stage.resolvedRequest);
+        if (!definition || !stageRequest) return null;
+        return Object.freeze({
+          executionTarget: target,
+          targetLabel: definition.label,
+          resolvedRequest: stageRequest,
+          executionScope: clean(stage.executionScope).toLowerCase() || 'mutating',
+          executionSurface: clean(stage.executionSurface).toLowerCase() || 'none',
+          inspectionTarget: clean(stage.inspectionTarget).toLowerCase() || 'none',
+          standaloneSystemOperation: stage.standaloneSystemOperation === true
+        });
+      })
+      .filter(Boolean);
 
     return Object.freeze({
       requiresExecution,
@@ -115,6 +132,8 @@
       targetLabel: specialist ? specialist.label : (effectiveTarget === 'dispatch' ? 'Dispatch' : ''),
       resolvedRequest,
       executionSurface,
+      executionPlan: Object.freeze(executionPlan),
+      remainingExecutionPlan: Object.freeze(executionPlan.slice(1)),
       capabilityFacts: Object.freeze(capabilityFacts),
       delegatedInspection: options.delegatedInspection === true,
       activeOwnedTaskTarget: taskTargetMode(options.activeOwnedTask),
@@ -130,6 +149,15 @@
       ? (SpecialistRegistry.handoffToolNameForRole(route.effectiveTarget) || 'the matching handoff tool')
       : 'the matching handoff tool';
     const facts = route.capabilityFacts.map(fact => `- ${fact}`).join('\n');
+    const plan = route.executionPlan.length > 1
+      ? [
+          'Ordered specialist execution plan:',
+          ...route.executionPlan.map((stage, index) =>
+            `${index + 1}. ${stage.targetLabel}: ${stage.resolvedRequest}`
+          ),
+          'Every stage is part of the accepted mission. Only the first stage is queued directly; its owner must hand off the remaining stage after successful verification.'
+        ]
+      : [];
     return [
       '[FINALIZED DISPATCH EXECUTION ROUTE]',
       `Effective target: ${route.effectiveTarget}`,
@@ -137,6 +165,7 @@
       `Execution surface: ${route.executionSurface}`,
       'Relevant capability facts:',
       facts,
+      ...plan,
       '',
       'This route is already finalized by deterministic capability and task-ownership code.',
       `Acknowledge the user's exact request naturally and consistently with ${route.targetLabel} performing it.`,

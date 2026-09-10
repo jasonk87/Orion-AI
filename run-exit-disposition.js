@@ -35,6 +35,7 @@
   const SILENT_PENDING_REASONS = new Set([
     'scheduled_followup',
     'automatic_action_boundary',
+    'awaiting_execution_plan_handoff',
     'awaiting_delegated_task'
   ]);
 
@@ -78,6 +79,13 @@
     if (input.awaitingUser === true) return pending('awaiting_input', 'user');
 
     if (input.delegatedChildTaskId) return pending('awaiting_delegated_task', 'manual');
+
+    // A pass can finish while a later specialist stage in the same durable mission remains
+    // unassigned. That is continuation work, not mission completion. The current owner is resumed
+    // automatically so it can perform the required handoff without asking the user to babysit it.
+    if (input.executionPlanPending === true) {
+      return pending('awaiting_execution_plan_handoff', 'automatic');
+    }
 
     const schedule = normalizeSchedule(input.scheduledFollowup);
     if (schedule) return pending('scheduled_followup', 'scheduled', schedule);

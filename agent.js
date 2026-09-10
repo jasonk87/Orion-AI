@@ -860,6 +860,7 @@ const OrchestrationContracts = window.OrionOrchestrationContracts || (typeof req
 const DispatchIntent = window.OrionDispatchIntent || (typeof require === 'function' ? require('./dispatch-intent') : null);
 const SemanticIntentRouter = window.OrionSemanticIntentRouter || (typeof require === 'function' ? require('./semantic-intent-router') : null);
 const ReasoningPolicy = window.OrionReasoningPolicy || (typeof require === 'function' ? require('./reasoning-policy') : null);
+const CodexProvider = window.OrionCodexProvider || (typeof require === 'function' ? require('./codex-provider') : null);
 const DispatchInspectionPolicy = window.OrionDispatchInspectionPolicy || (typeof require === 'function' ? require('./dispatch-inspection-policy') : null);
 const TaskOrchestration = window.OrionTaskOrchestration || (typeof require === 'function' ? require('./task-orchestration') : null);
 
@@ -1619,7 +1620,9 @@ async function evaluateLoopStateWithSupervisorDecision(modelName, workWalkthroug
     const messages = [{ role: 'user', parts: [{ text: prompt }] }];
     let responseText = '';
     let resp;
-    if (isGroqModelName(modelName)) {
+    if (CodexProvider.isModel(modelName)) {
+      resp = await callCodexSubscription(messages, modelName, () => {}, true);
+    } else if (isGroqModelName(modelName)) {
       resp = await callGroqAPI(messages, modelName, config?.groqApiKey || '', () => {}, true);
     } else if (modelName.startsWith('deepseek')) {
       resp = await callDeepSeekAPI(messages, modelName, config?.deepseekApiKey || '', () => {}, true);
@@ -1671,7 +1674,9 @@ async function evaluateLoopStateWithSupervisorLegacy(modelName, workWalkthrough,
     let responseText = '';
     
     let resp;
-    if (isGroqModelName(modelName)) {
+    if (CodexProvider.isModel(modelName)) {
+      resp = await callCodexSubscription(messages, modelName, () => {}, true);
+    } else if (isGroqModelName(modelName)) {
       resp = await callGroqAPI(messages, modelName, config?.groqApiKey || '', () => {}, true);
     } else if (modelName.startsWith('deepseek')) {
       resp = await callDeepSeekAPI(messages, modelName, config?.deepseekApiKey || '', () => {}, true);
@@ -3246,6 +3251,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       let response;
       try {
         agentSubStatus = `Calling ${activeRunModelName.startsWith('gemini-') ? 'Gemini' : (activeRunModelName.startsWith('claude') ? 'Claude (' + activeRunModelName + ')' : (activeRunModelName.startsWith('deepseek') ? 'DeepSeek (' + activeRunModelName + ')' : (activeRunModelName.startsWith('gpt-') ? 'ChatGPT (' + activeRunModelName + ')' : (isGroqModelName(activeRunModelName) ? 'Groq (' + groqApiModelName(activeRunModelName) + ')' : 'Ollama (' + activeRunModelName + ')'))))} API...`;
+        if (CodexProvider.isModel(activeRunModelName)) agentSubStatus = 'Calling ChatGPT Subscription (Codex)…';
         persistCurrentAgentLogs({ render: true });
         const modelCallDelayMs = Math.min(Math.max(parseInt(config.modelCallDelayMs, 10) || 0, 0), 60000);
         if (modelCallDelayMs > 0) {
@@ -3373,6 +3379,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           currentAgentLogs.push({
             type: 'thought',
             content: 'Dispatch orchestration preflight scheduled the reminder directly without creating a specialist task.'
+          });
+        } else if (CodexProvider.isModel(activeRunModelName)) {
+          response = await callCodexSubscription(messagesForApiCall, activeRunModelName, onApiWarning, disableToolsForSemanticSafety, {
+            signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy,
+            requestedEffort: requestedReasoningEffort,
+            onText: text => { if (text) window.renderAiMessage(text, currentAgentLogs); }
           });
         } else if (activeRunModelName.startsWith('gemini-')) {
           response = await callGeminiAPI(messagesForApiCall, activeRunModelName, config.geminiApiKey, onApiWarning, disableToolsForSemanticSafety, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
@@ -3692,7 +3704,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           if (!finalizedDispatchRoute || finalizedDispatchRoute.delegatedInspection !== true) {
             const authoritativeRequest = finalizedDispatchRoute && finalizedDispatchRoute.resolvedRequest
               || dispatchHandoffAuthorityPrompt;
-            call.args.prompt = buildForcedDispatchHandoffPrompt(authoritativeRequest);
+            call.args.prompt = buildForcedDispatchHandoffPrompt(authoritativeRequest, finalizedDispatchRoute);
           }
           call.args.standalone = standaloneSpecialistRequest;
           if (standaloneEnvironmentRequest) call.args.path = resolvedHomeDir;
@@ -3747,7 +3759,8 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
             })
           : buildForcedDispatchHandoffPrompt(
               finalizedDispatchRoute && finalizedDispatchRoute.resolvedRequest
-              || dispatchHandoffAuthorityPrompt
+              || dispatchHandoffAuthorityPrompt,
+              finalizedDispatchRoute
             );
         const forcedCall = {
           name: handoffToolForRole(handoffRole),
@@ -5446,9 +5459,41 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       && approvalIntent
       && approvalIntent.intent === 'deny'
     );
-    const structuredContinuation = hasOperationalMissionState(workingState) || pendingChecklist.length > 0;
+    const claimedExecutionPlan = Array.isArray(claimedTaskRecord && claimedTaskRecord.executionPlan)
+      ? claimedTaskRecord.executionPlan
+      : [];
+    const currentPlanRole = OrionSpecialistRegistry.normalizeRole(
+      claimedTaskRecord && claimedTaskRecord.target && claimedTaskRecord.target.mode
+      || activeConversationMode
+    );
+    const currentPlanIndex = claimedExecutionPlan.findIndex(stage =>
+      OrionSpecialistRegistry.normalizeRole(stage && stage.executionTarget) === currentPlanRole
+    );
+    const nextExecutionPlanStage = currentPlanIndex >= 0
+      ? claimedExecutionPlan[currentPlanIndex + 1] || null
+      : null;
+    const executionPlanPending = !!(
+      runTaskId
+      && nextExecutionPlanStage
+      && !(delegatedChildTask && delegatedChildTask.taskId)
+      && !userRequestedStop
+      && !criticalRunError
+    );
+    if (executionPlanPending) {
+      autoContinueExecution = true;
+      currentAgentLogs.push({
+        type: 'thought',
+        content: `The execution pass ended before the required ${handoffRoleLabel(nextExecutionPlanStage.executionTarget)} continuation was assigned. The durable mission remains pending and will resume automatically.`
+      });
+    }
+    const structuredContinuation = hasOperationalMissionState(workingState)
+      || pendingChecklist.length > 0
+      || executionPlanPending;
+    const executionPlanContinuationPrompt = executionPlanPending
+      ? `[ORION INTERNAL CONTINUATION - not a user message] The durable mission still has an unassigned next stage. Call ${handoffToolForRole(nextExecutionPlanStage.executionTarget)} now for: ${String(nextExecutionPlanStage.resolvedRequest || '').slice(0, 2000)} Transfer your verified findings and preserve the existing parent/root task lineage. Do not redo your completed stage or report the mission complete before this handoff succeeds.`
+      : '';
     const automaticContinuationPrompt = autoContinueExecution
-      ? buildAutomaticTaskContinuationPrompt(structuredContinuation)
+      ? (executionPlanContinuationPrompt || buildAutomaticTaskContinuationPrompt(structuredContinuation))
       : '';
     const awaitingUserAtExit = !!(
       forceYield
@@ -5464,6 +5509,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
       planDenied: currentTaskDeniedByPlanDecision,
       criticalError: criticalRunError,
       delegatedChildTaskId: awaitingDelegatedChild ? delegatedChildTask.taskId : '',
+      executionPlanPending,
       scheduledFollowup,
       automaticContinuation: autoContinueExecution,
       awaitingPlanApproval: conversation.awaitingPlanApproval,
@@ -5595,8 +5641,9 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         taskId: runTaskId,
         structuredPlan: structuredContinuation,
         reasoningEffort: requestedReasoningEffort,
-        executionProfile: options.executionProfile
-      });
+          executionProfile: options.executionProfile,
+          continuationPrompt: automaticContinuationPrompt
+        });
     }
 
     const persistReconciledTaskMessage = async (text) => {
@@ -5895,7 +5942,8 @@ function enqueueAutomaticTaskContinuation({
   taskId = '',
   structuredPlan = false,
   reasoningEffort = 'auto',
-  executionProfile = null
+  executionProfile = null,
+  continuationPrompt = ''
 } = {}) {
   if (!conversation || !conversation.id || conversation.awaitingPlanApproval) return false;
   if (!Array.isArray(window.promptQueue)) window.promptQueue = [];
@@ -5909,7 +5957,7 @@ function enqueueAutomaticTaskContinuation({
   if (continuationAlreadyQueued) return true;
 
   window.promptQueue.push({
-    prompt: buildAutomaticTaskContinuationPrompt(structuredPlan),
+    prompt: String(continuationPrompt || '').trim() || buildAutomaticTaskContinuationPrompt(structuredPlan),
     modelSelectValue: modelName,
     reasoningEffort,
     executionProfile: executionProfile && typeof executionProfile === 'object'
@@ -6401,6 +6449,13 @@ async function executeSpecialistHandoff(targetRole, args, workspace, conversatio
     ? executionContext.claimedTaskRecord
     : null;
   const parentTaskId = String(executionContext.runTaskId || '').trim();
+  const sourceExecutionPlan = Array.isArray(parentTask && parentTask.executionPlan)
+    ? parentTask.executionPlan
+    : (Array.isArray(authorizedHandoffIntent.executionPlan) ? authorizedHandoffIntent.executionPlan : []);
+  const targetPlanIndex = sourceExecutionPlan.findIndex(stage =>
+    OrionSpecialistRegistry.normalizeRole(stage && stage.executionTarget) === role
+  );
+  const executionPlan = targetPlanIndex >= 0 ? sourceExecutionPlan.slice(targetPlanIndex) : [];
 
   // ── Delegation-chain depth/loop guard (real, code-enforced — not the old prose-only
   // "don't create another handoff for the same completed child" instruction) ─────────────────
@@ -6492,6 +6547,7 @@ async function executeSpecialistHandoff(targetRole, args, workspace, conversatio
     ),
     precedingConversationSummary: parentContextSummary,
     delegationChain,
+    executionPlan,
     // Operator-only field. Harmless to omit for coder/researcher promote() implementations since
     // they simply won't read it; kept role-conditional rather than always-present so a
     // non-Operator target's task packet doesn't carry a meaningless executionSurface value.
@@ -10639,6 +10695,14 @@ function resolveForcedEffortForPhase(config, phase) {
 }
 
 async function callUtilityModel(prompt, modelName, config, requireJson = true, options = {}) {
+  if (CodexProvider.isModel(modelName)) {
+    const request = CodexProvider.buildRequest([{ role: 'user', parts: [{ text: prompt }] }], modelName,
+      requireJson ? 'Answer with valid JSON only.' : 'Answer concisely.', [], {
+        effort: 'low', timeoutMs: Number(options.timeoutMs) || UTILITY_MODEL_REQUEST_TIMEOUT_MS
+      });
+    const result = await CodexProvider.complete(window.api, request, { signal: options.signal || getActiveRunSignal() });
+    return result.text;
+  }
   const utilityPhase = options.phase || 'intent_classification';
   const reasoningPolicy = options.reasoningPolicy || (ReasoningPolicy
     ? ReasoningPolicy.select({
@@ -10925,8 +10989,31 @@ function shouldHaveUsedToolsButDidNot(text, workWalkthrough, userPrompt = '', co
   return false;
 }
 
-function buildForcedDispatchHandoffPrompt(userPrompt) {
+function buildForcedDispatchHandoffPrompt(userPrompt, finalizedRoute = null) {
   const originalRequest = String(userPrompt || '').trim();
+  const executionPlan = finalizedRoute && Array.isArray(finalizedRoute.executionPlan)
+    ? finalizedRoute.executionPlan
+    : [];
+  if (executionPlan.length > 1) {
+    const first = executionPlan[0];
+    const remaining = executionPlan.slice(1);
+    const planLines = executionPlan.map((stage, index) =>
+      `${index + 1}. ${stage.targetLabel || handoffRoleLabel(stage.executionTarget)}: ${stage.resolvedRequest}`
+    );
+    const next = remaining[0];
+    const nextTool = handoffToolForRole(next.executionTarget);
+    return [
+      `Carry out the first stage of this ordered mission from Dispatch: "${originalRequest.replace(/"/g, "'").slice(0, 2000)}"`,
+      '',
+      'Ordered execution plan:',
+      ...planLines,
+      '',
+      `You own stage 1 (${first.targetLabel || handoffRoleLabel(first.executionTarget)}). Perform and verify that stage now.`,
+      `After it succeeds, call ${nextTool} with all remaining stages and your verified findings. The child task must preserve this mission's durable parent/root lineage.`,
+      'Do not perform another specialist\'s stage yourself. Do not report the mission complete while any later stage remains unassigned or unfinished.',
+      'Identify the intended local target if needed and do not return the task to the user merely because Dispatch itself is read-only.'
+    ].join('\n');
+  }
   return `Execute this request from Dispatch in the local environment: "${originalRequest.replace(/"/g, "'").slice(0, 2000)}"\n\nIdentify the intended local target if needed, perform the operation safely using the existing launch/configuration method, and verify the result. Do not return the task to the user merely because Dispatch itself is read-only.`;
 }
 
@@ -12879,6 +12966,7 @@ function groqApiModelName(modelName) {
 }
 
 function modelSupportsDirectVision(modelName) {
+  if (CodexProvider.isModel(modelName)) return !!window.getCodexModelInfo?.(modelName)?.inputModalities?.includes('image');
   const name = String(modelName || '').toLowerCase();
   return name.startsWith('gemini-')
     || name.startsWith('gpt-')
@@ -14994,6 +15082,20 @@ function convertGeminiToOpenAIResponsesInput(geminiMessages) {
   return input;
 }
 
+async function callCodexSubscription(messages, modelName, onWarning, disableTools = false, options = {}) {
+  if (!window.api?.codexComplete) throw createNonRetryableModelError('ChatGPT Subscription is unavailable. Restart Orion with the latest build.');
+  const declarations = disableTools ? [] : buildAgentToolDeclarations();
+  const requested = options.requestedEffort;
+  const forced = requested && requested !== 'auto';
+  const request = CodexProvider.buildRequest(messages, modelName,
+    getSystemInstruction(disableTools, orionCachedMemoryBlock, modelName), declarations, {
+      effort: forced ? requested : options.reasoningPolicy?.effort,
+      forcedEffort: !!forced, timeoutMs: options.timeoutMs
+    });
+  const result = await CodexProvider.complete(window.api, request, options);
+  return { _orionActiveModelName: modelName, candidates: [{ content: { parts: CodexProvider.parseResponse(result.text, declarations) } }] };
+}
+
 async function callOpenAIAPI(messages, modelName, apiKey, onWarning, disableTools = false, options = {}) {
   if (!apiKey) throw createNonRetryableModelError('OpenAI API key is not configured. Add it in Settings to use ChatGPT models.');
   const url = 'https://api.openai.com/v1/responses';
@@ -15250,6 +15352,13 @@ function normalizeScreenshotInspectionResult({ text, path, goal, providerName })
 }
 
 async function inspectScreenshotWithModel({ imageBase64, mimeType, path, goal, modelName, apiKey, openaiApiKey, groqApiKey }) {
+  if (CodexProvider.isModel(modelName)) {
+    const request = CodexProvider.buildRequest([{ role: 'user', parts: [
+      { text: buildScreenshotInspectionPrompt(goal) }, { inlineData: { mimeType, data: imageBase64 } }
+    ] }], modelName, 'Inspect the supplied image and return the requested JSON.', []);
+    const result = await CodexProvider.complete(window.api, request, { signal: getActiveRunSignal() });
+    return normalizeScreenshotInspectionResult({ text: result.text, path, goal, providerName: modelName });
+  }
   if (!modelName) throw new Error('Active chat model is required for multimodal screenshot inspection.');
   // ChatGPT reads its own screenshots. gpt-5.6 accepts image input, so borrowing Gemini here
   // would send the user's screen to a second provider they did not select - and would fail
@@ -15834,6 +15943,7 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     callDeepSeekAPI,
     callGroqAPI,
     callOpenAIAPI,
+    callCodexSubscription,
     callUtilityModel,
     getNextModelForHighDemand,
     isGroqModelName,

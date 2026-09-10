@@ -48,6 +48,9 @@ test('existing nonterminal reasons keep their established policies', t => {
   );
   t.equal(resolveRunExitDisposition({ delegatedChildTaskId: 'child-1' }).reasonCode, 'awaiting_delegated_task',
     'delegated child work stays pending');
+  const plannedHandoff = resolveRunExitDisposition({ executionPlanPending: true });
+  t.equal(plannedHandoff.reasonCode, 'awaiting_execution_plan_handoff', 'an unassigned later specialist stage stays pending');
+  t.equal(plannedHandoff.resumePolicy, 'automatic', 'the current owner resumes to assign the required child without user babysitting');
   t.equal(resolveRunExitDisposition({ awaitingPlanApproval: true }).reasonCode, 'awaiting_plan_approval',
     'plan approval stays pending');
   t.equal(resolveRunExitDisposition({ awaitingClarification: true }).reasonCode, 'awaiting_clarification',
@@ -107,6 +110,9 @@ test('notification policy distinguishes user attention from background pending w
 
   const automatic = resolveRunNotificationPolicy(resolveRunExitDisposition({ automaticContinuation: true }));
   t.equal(automatic.notify, false, 'automatic continuation stays silent');
+
+  const plannedHandoff = resolveRunNotificationPolicy(resolveRunExitDisposition({ executionPlanPending: true }));
+  t.equal(plannedHandoff.notify, false, 'automatic specialist-chain continuation stays silent');
 
   const completed = resolveRunNotificationPolicy(resolveRunExitDisposition({}));
   t.equal(completed.notify, true, 'terminal completion notifies');

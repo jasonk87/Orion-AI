@@ -1109,6 +1109,21 @@ test('Dispatch execution authority comes from structured intent, not request/ref
   t.end();
 });
 
+test('compound Dispatch handoff prompt makes the next specialist continuation mandatory', t => {
+  const prompt = agent.buildForcedDispatchHandoffPrompt('Stop Music Life, then push its changes.', {
+    executionPlan: [
+      { executionTarget: 'operator', targetLabel: 'Operator', resolvedRequest: 'Stop Music Life and verify it exited.' },
+      { executionTarget: 'coder', targetLabel: 'Coder', resolvedRequest: 'Review, commit, and push its legitimate repository changes.' }
+    ]
+  });
+
+  t.match(prompt, /1\. Operator: Stop Music Life/, 'the immediate operation is explicit');
+  t.match(prompt, /2\. Coder: Review, commit, and push/, 'the later repository operation cannot disappear');
+  t.match(prompt, /call handoff_to_coder/, 'the first owner receives a concrete continuation action');
+  t.match(prompt, /Do not report the mission complete while any later stage remains/, 'the parent cannot declare success early');
+  t.end();
+});
+
 test('Dispatch handoff recovery no longer derives authority from narrated response prose', (t) => {
   t.equal(agent.looksLikeIntendedCoderHandoff, undefined, 'narrated Coder intent has no phrase classifier');
   t.equal(agent.looksLikeUnexecutedDispatchAction, undefined, 'generic action narration has no phrase classifier');

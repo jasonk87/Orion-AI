@@ -456,6 +456,59 @@ test('specialist selection distinguishes desktop operation from code and artifac
   t.end();
 });
 
+test('a mixed process and repository mission keeps every specialist stage in dependency order', t => {
+  const input = router.buildInput({
+    userMessage: 'Check whether Music Life is running and stop it, then commit and push its uncommitted work.'
+  });
+  const result = router.normalizeClassification(classification('new_task', {
+    requiresExecution: true,
+    resolvedRequest: 'Stop the running Music Life game, then review, commit, and push legitimate uncommitted Music Life changes.',
+    executionScope: 'mutating',
+    executionTarget: 'operator',
+    executionSurface: 'process',
+    inspectionTarget: 'local_system',
+    executionPlan: [
+      {
+        executionTarget: 'operator',
+        resolvedRequest: 'Find the running Music Life process and stop it safely, then verify it exited.',
+        executionScope: 'mutating',
+        executionSurface: 'process',
+        inspectionTarget: 'local_system'
+      },
+      {
+        executionTarget: 'coder',
+        resolvedRequest: 'Inspect the Music Life repository changes, exclude junk, commit the intended work, and push the current branch.',
+        executionScope: 'mutating',
+        executionSurface: 'none',
+        inspectionTarget: 'project'
+      }
+    ]
+  }), input);
+
+  t.equal(result.executionTarget, 'operator', 'the first executable dependency owns the immediate route');
+  t.equal(result.executionPlan.length, 2, 'neither requested operation is discarded');
+  t.deepEqual(result.executionPlan.map(stage => stage.executionTarget), ['operator', 'coder'], 'the ordered specialist chain is preserved');
+  t.equal(result.executionPlan[1].inspectionTarget, 'project', 'the repository stage retains its own capability facts');
+  t.equal(result.standaloneSystemOperation, true, 'the immediate local process stage gets the correct execution boundary');
+  t.end();
+});
+
+test('invalid and repeated execution-plan roles cannot create an impossible delegation loop', t => {
+  const input = router.buildInput({ userMessage: 'Run a compound task.' });
+  const result = router.normalizeClassification(classification('new_task', {
+    requiresExecution: true,
+    resolvedRequest: 'Run a compound task.',
+    executionPlan: [
+      { executionTarget: 'operator', resolvedRequest: 'Inspect the desktop.', executionScope: 'read_only', executionSurface: 'desktop', inspectionTarget: 'local_system' },
+      { executionTarget: 'operator', resolvedRequest: 'Inspect it again.', executionScope: 'read_only', executionSurface: 'desktop', inspectionTarget: 'local_system' },
+      { executionTarget: 'not-a-specialist', resolvedRequest: '', executionScope: 'mutating', inspectionTarget: 'project' }
+    ]
+  }), input);
+
+  t.deepEqual(result.executionPlan, [], 'fewer than two distinct valid owners collapses to the ordinary single-owner route');
+  t.end();
+});
+
 test('reminder payload actions remain Dispatch-owned scheduling instead of Operator work', async t => {
   const reminder = await router.classify(baseContext('Remind me at 2 PM to start OpenAI.'), {
     structureApi,

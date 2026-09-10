@@ -27,10 +27,11 @@ const path = require('path');
 const repoRoot = path.join(__dirname, '..');
 
 function parseArgs(argv) {
-  const args = { port: 9222, app: '' };
+  const args = { port: 9222, app: '', codex: false };
   for (let i = 2; i < argv.length; i++) {
     if (argv[i] === '--port') args.port = Number(argv[++i]);
     else if (argv[i] === '--app') args.app = argv[++i];
+    else if (argv[i] === '--codex') args.codex = true;
   }
   return args;
 }
@@ -238,6 +239,26 @@ async function main() {
 
     const title = await evaluate('document.title');
     console.log(`Window loaded: "${title}"`);
+
+    if (args.codex) {
+      const subscription = await evaluate(`(async () => {
+        await refreshCodexSubscription();
+        const models = window.getPhoneCompanionModels().models.filter(model => model.value.startsWith('codex:'));
+        if (!models.length) throw new Error('No subscription models in the packaged picker');
+        const selected = models[0].value;
+        await window.setPhoneCompanionModel(selected);
+        const levels = window.getPhoneCompanionModels().reasoningLevels;
+        const effort = levels.find(level => level.value !== 'auto')?.value || 'auto';
+        await window.setReasoningEffortSelection(effort);
+        let chunks = 0;
+        const answer = await callCodexSubscription([{ role: 'user', parts: [{ text: 'Reply exactly ORION-PACKAGED-OK.' }] }], selected, () => {}, true, {
+          requestedEffort: effort, onText: () => chunks++
+        });
+        return { model: selected, models: models.length, effort, chunks, text: answer.candidates[0].content.parts.map(part => part.text || '').join('') };
+      })()`);
+      if (!subscription.text.includes('ORION-PACKAGED-OK') || !subscription.chunks) failures.push('Packaged subscription provider failed its streamed response check.');
+      else console.log('Packaged subscription IPC, model/reasoning picker, and streamed response PASSED:', JSON.stringify(subscription));
+    }
 
     if (failures.length === 0) console.log('\nSmoke test PASSED: packaged app booted with no script faults.');
   } catch (error) {

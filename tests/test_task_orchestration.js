@@ -148,6 +148,43 @@ test('specialist child tasks preserve parent lineage without surrendering root D
   t.end();
 });
 
+test('ordered specialist execution plans survive persistence and restart rendering', t => {
+  const executionPlan = [
+    {
+      executionTarget: 'operator',
+      resolvedRequest: 'Stop Music Life and verify the process exited.',
+      executionScope: 'mutating',
+      executionSurface: 'process',
+      inspectionTarget: 'local_system',
+      standaloneSystemOperation: true
+    },
+    {
+      executionTarget: 'coder',
+      resolvedRequest: 'Review, commit, and push the intended repository changes.',
+      executionScope: 'mutating',
+      executionSurface: 'none',
+      inspectionTarget: 'project',
+      standaloneSystemOperation: false
+    }
+  ];
+  const built = buildTaskPacket({
+    originalUserMessage: 'Stop Music Life, then push its changes.',
+    resolvedObjective: 'Stop Music Life, then push its changes.',
+    targetMode: 'operator',
+    workspacePath: 'C:\\Users\\Owner',
+    executionPlan,
+    timestamp: 1000
+  });
+  t.equal(built.success, true, 'the compound mission produces a durable task');
+  const restored = normalizeTaskRecord(JSON.parse(JSON.stringify(built.task)));
+  t.deepEqual(restored.executionPlan.map(stage => stage.executionTarget), ['operator', 'coder'], 'restart preserves every ordered owner');
+  const prompt = renderTaskPrompt(restored);
+  t.match(prompt, /1\. Operator: Stop Music Life/, 'the resumed first specialist sees its stage');
+  t.match(prompt, /2\. Coder: Review, commit, and push/, 'the later stage remains visible after restart');
+  t.match(prompt, /Do not declare the mission complete while later stages remain/, 'restart retains the continuation invariant');
+  t.end();
+});
+
 test('a parent waiting on Operator is presented as delegated work, not completed or generically queued', t => {
   const presentation = describeSupervisedTaskPresentation(normalizeTaskRecord(baseTask({
     status: 'pending',

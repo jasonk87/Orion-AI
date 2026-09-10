@@ -1493,6 +1493,81 @@ test('Coder delegation to Operator keeps the same parent task pending until chil
   t.end();
 });
 
+test('a specialist pass cannot complete while a later durable execution-plan stage is unassigned', async t => {
+  const originalFetch = global.fetch;
+  const parentTaskId = 'task-operator-compound-mission';
+  const finalized = [];
+  const executionPlan = [
+    {
+      executionTarget: 'operator',
+      resolvedRequest: 'Stop Music Life and verify its process exited.',
+      executionScope: 'mutating',
+      executionSurface: 'process',
+      inspectionTarget: 'local_system',
+      standaloneSystemOperation: true
+    },
+    {
+      executionTarget: 'coder',
+      resolvedRequest: 'Review, commit, and push the intended Music Life repository changes.',
+      executionScope: 'mutating',
+      executionSurface: 'none',
+      inspectionTarget: 'project',
+      standaloneSystemOperation: false
+    }
+  ];
+  installHarness([[{ text: 'The process is stopped. Everything is done.' }]], {
+    window: {
+      claimOrchestrationTask: async taskId => ({
+        success: true,
+        task: {
+          taskId,
+          status: 'active',
+          title: 'Stop Music Life and submit changes',
+          objective: 'Stop Music Life, then submit its legitimate repository changes.',
+          originalUserMessage: 'Stop Music Life, then push its changes.',
+          target: { conversationId: 'operator-compound-worker', mode: 'operator' },
+          executionPlan,
+          execution: { executionId: 'exec-operator-compound' }
+        },
+        prompt: 'Stop Music Life, then submit its legitimate repository changes.'
+      }),
+      finalizeOrchestrationTask: async (taskId, status, details) => {
+        finalized.push({ taskId, status, details });
+        return { taskId, status };
+      },
+      onOrchestrationTaskCheckpointed: async () => {}
+    }
+  });
+  global.window.promptQueue = [];
+  global.setTimeout = (fn, delay, ...args) => {
+    if (delay === 100 || delay === 500) return null;
+    return nativeSetTimeout(fn, delay, ...args);
+  };
+  const conv = conversation('operator-compound-worker', {
+    mode: 'operator',
+    workspace: 'C:\\Users\\Owner'
+  });
+  try {
+    await global.window.runAgentLoop(
+      'Stop Music Life, then submit its legitimate repository changes.',
+      'gemini-1',
+      conv,
+      { taskId: parentTaskId, internalPrompt: true }
+    );
+    t.equal(finalized.length, 1, 'the pass produces one canonical durable transition');
+    t.equal(finalized[0].status, 'pending', 'a model-authored done claim cannot terminate the unfinished mission');
+    t.equal(finalized[0].details.reasonCode, 'awaiting_execution_plan_handoff', 'the missing handoff is structured state');
+    t.equal(finalized[0].details.resumePolicy, 'automatic', 'Orion resumes the same task without user babysitting');
+    t.match(finalized[0].details.continuation.input, /call handoff_to_coder now/i, 'the exact required next specialist is persisted');
+    t.equal(global.window.promptQueue.length, 1, 'the same task gets one automatic continuation');
+    t.equal(global.window.promptQueue[0].taskId, parentTaskId, 'the continuation preserves mission identity');
+    t.match(global.window.promptQueue[0].prompt, /call handoff_to_coder now/i, 'the resumed pass receives the exact missing action');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
 test('a task-bound handoff to Coder preserves parent and root Dispatch ownership', async t => {
   const originalFetch = global.fetch;
   const workspace = 'C:\\Users\\Owner\\Desktop\\Projects\\OrionAI';
@@ -1934,6 +2009,77 @@ test('Projects-root Claude restart creates one standalone Operator handoff with 
     t.ok(handoffs[0].prompt.includes(rawRequest), 'the expanded prompt still preserves the requested operation');
     t.match(handoffs[0].prompt, /identify the intended local target/i, 'Operator must identify the correct local process');
     t.match(handoffs[0].prompt, /verify the result/i, 'Operator must verify the replacement process');
+  } finally {
+    restoreGlobals(originalFetch);
+  }
+  t.end();
+});
+
+test('compound process then repository request cannot end after Dispatch inspection without a durable handoff', async t => {
+  const originalFetch = global.fetch;
+  const projectsRoot = 'C:\\Users\\Owner\\Desktop\\Projects';
+  const rawRequest = 'Can you see if Music Life is running? If it is, kill it. Also check for uncommitted work and push it to GitHub.';
+  const operatorHandoffs = [];
+  const compoundIntent = semanticClassification({
+    intent: 'new_task',
+    requiresExecution: true,
+    target: 'current_conversation',
+    resolvedRequest: 'Stop the running Music Life game, then review, commit, and push legitimate uncommitted Music Life changes.',
+    executionScope: 'mutating',
+    executionTarget: 'operator',
+    executionSurface: 'process',
+    inspectionTarget: 'local_system',
+    standaloneSystemOperation: true,
+    executionPlan: [
+      {
+        executionTarget: 'operator',
+        resolvedRequest: 'Find the running Music Life process and stop it safely, then verify it exited.',
+        executionScope: 'mutating',
+        executionSurface: 'process',
+        inspectionTarget: 'local_system',
+        standaloneSystemOperation: true
+      },
+      {
+        executionTarget: 'coder',
+        resolvedRequest: 'Inspect the Music Life repository changes, exclude junk, commit the intended work, and push the current branch.',
+        executionScope: 'mutating',
+        executionSurface: 'none',
+        inspectionTarget: 'project',
+        standaloneSystemOperation: false
+      }
+    ]
+  });
+  installHarness([
+    [{ text: 'Dispatch can only inspect these things, so I cannot safely terminate the process or push changes.' }]
+  ], {
+    workspace: projectsRoot,
+    semanticClassification: compoundIntent,
+    window: {
+      promoteWorkspaceToOperator: async payload => {
+        operatorHandoffs.push(payload);
+        return {
+          success: true,
+          conversationId: 'operator-music-life-chain',
+          taskId: 'task-music-life-chain',
+          title: 'Stop Music Life and submit changes',
+          status: 'pending'
+        };
+      }
+    }
+  });
+  const conv = conversation('dispatch-music-life-chain', {
+    workspace: projectsRoot,
+    dispatchProjectPath: ''
+  });
+  try {
+    await global.window.runAgentLoop(rawRequest, 'gemini-1', conv, { semanticIntent: compoundIntent });
+    t.equal(operatorHandoffs.length, 1, 'Dispatch creates one durable task even when its response model refuses');
+    t.equal(operatorHandoffs[0].standalone, true, 'the immediate process stage runs with local-system authority');
+    t.match(operatorHandoffs[0].prompt, /1\. Operator: Find the running Music Life process/, 'the first stage is assigned to Operator');
+    t.match(operatorHandoffs[0].prompt, /2\. Coder: Inspect the Music Life repository changes/, 'the repository continuation reaches the durable task');
+    t.match(operatorHandoffs[0].prompt, /call handoff_to_coder/, 'Operator is required to continue through Coder after verification');
+    t.deepEqual(operatorHandoffs[0].executionPlan.map(stage => stage.executionTarget), ['operator', 'coder'], 'the durable handoff carries the structured plan, not only rendered instructions');
+    t.equal(conv.lastOwnedTaskId, 'task-music-life-chain', 'Dispatch retains supervision of the compound mission');
   } finally {
     restoreGlobals(originalFetch);
   }
