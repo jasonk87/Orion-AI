@@ -27,12 +27,13 @@ const path = require('path');
 const repoRoot = path.join(__dirname, '..');
 
 function parseArgs(argv) {
-  const args = { port: 9222, app: '', codex: false, ollama: false };
+  const args = { port: 9222, app: '', codex: false, ollama: false, ollamaConversation: '' };
   for (let i = 2; i < argv.length; i++) {
     if (argv[i] === '--port') args.port = Number(argv[++i]);
     else if (argv[i] === '--app') args.app = argv[++i];
     else if (argv[i] === '--codex') args.codex = true;
     else if (argv[i] === '--ollama') args.ollama = true;
+    else if (argv[i] === '--ollama-conversation') args.ollamaConversation = argv[++i];
   }
   return args;
 }
@@ -240,6 +241,49 @@ async function main() {
 
     const title = await evaluate('document.title');
     console.log(`Window loaded: "${title}"`);
+
+    if (args.ollamaConversation) {
+      await evaluate(`(async () => {
+        await refreshOllamaModels();
+        const model = ${JSON.stringify(args.ollamaConversation)};
+        await window.setPhoneCompanionModel(model);
+        const conv = createPhoneConversation({ title: 'Ollama greeting verification' });
+        conv.messages.push({ role: 'user', text: "What's up?", source: 'phone', createdAt: Date.now() });
+        window.__ollamaConversationProbe = { done: false };
+        const nativeFetch = window.fetch;
+        const requestFacts = [];
+        window.fetch = async (url, options) => {
+          if (String(url).endsWith('/api/chat') && options?.body) {
+            const body = JSON.parse(options.body);
+            if (body.messages?.some(message => message.content === "What's up?")) {
+              requestFacts.push({ model: body.model, roles: body.messages.map(message => message.role),
+                userMessages: body.messages.filter(message => message.role === 'user').map(message => message.content),
+                messageChars: JSON.stringify(body.messages).length, tools: body.tools?.length || 0 });
+            }
+          }
+          return nativeFetch(url, options);
+        };
+        window.runAgentLoop("What's up?", model, conv, { source: 'phone' }).then(() => {
+          window.fetch = nativeFetch;
+          window.__ollamaConversationProbe = { done: true, model, requestFacts,
+            text: conv.messages.filter(message => message.role === 'assistant').map(message => message.text).join('\\n'),
+            logs: conv.messages.flatMap(message => message.logs || []).filter(log => log.type === 'error').map(log => log.content) };
+        }, error => { window.fetch = nativeFetch; window.__ollamaConversationProbe = { done: true, error: error.message }; });
+      })()`);
+      const deadline = Date.now() + 180000;
+      let result;
+      do {
+        await sleep(1000);
+        result = await evaluate('window.__ollamaConversationProbe');
+      } while (!result.done && Date.now() < deadline);
+      if (!result.done || result.error || !result.text?.trim() || result.logs?.length) throw new Error('Packaged Ollama conversation failed: ' + JSON.stringify(result));
+      const request = result.requestFacts?.[0];
+      if (!request || JSON.stringify(request.roles) !== JSON.stringify(['system', 'user'])
+          || JSON.stringify(request.userMessages) !== JSON.stringify(["What's up?"])) {
+        throw new Error('Packaged greeting included synthetic dialogue: ' + JSON.stringify(result.requestFacts));
+      }
+      console.log('Packaged phone-style Ollama conversation:', JSON.stringify(result));
+    }
 
     if (args.ollama) {
       const local = await evaluate(`(async () => {

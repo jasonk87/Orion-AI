@@ -131,6 +131,84 @@ function restoreGlobals(originalFetch) {
   global.setTimeout = nativeSetTimeout;
 }
 
+test('a real local Dispatch conversation keeps runtime guidance out of the user role and omits irrelevant tools', async t => {
+  const originalFetch = global.fetch;
+  installHarness([], { api: { readFile: async () => 'Unrelated workspace note: investigate old restoration project.' } });
+  const requests = [];
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    const classifier = JSON.stringify(body).includes('Classify the current user turn. Return JSON only.');
+    if (!classifier) requests.push(body);
+    return { ok: true, json: async () => ({ done: true, done_reason: 'stop', message: {
+      content: classifier ? JSON.stringify(semanticClassification()) : 'Not much — how are you doing?'
+    } }) };
+  };
+  try {
+    const conv = conversation('ollama-greeting');
+    await runAgentLoop("What's up?", 'ollama:qwen3.5:4b', conv);
+    const replyRequest = requests.find(body => body.messages?.some(message => message.content === "What's up?"));
+    t.ok(replyRequest, 'the real greeting reaches the local provider');
+    t.notOk(replyRequest.tools, 'a semantically plain conversation does not carry the agent tool catalog');
+    t.notOk(JSON.stringify(replyRequest.messages).includes('Unrelated workspace note'), 'scoped work notes are not casual dialogue');
+    t.notOk(JSON.stringify(replyRequest.messages).includes('ORION SYSTEM FACTS'), 'environment orientation is not a user message');
+    t.deepEqual(replyRequest.messages.map(message => message.role), ['system', 'user'], 'fresh greeting has only identity and the real user turn');
+    t.ok(replyRequest.messages.filter(message => message.content?.startsWith('[REASONING POLICY:')).every(message => message.role === 'system'));
+    t.ok(conv.messages.some(message => message.role === 'assistant' && message.text === 'Not much — how are you doing?'));
+  } finally { restoreGlobals(originalFetch); }
+  t.end();
+});
+
+test('local output-limit continuation retains the actual conversation and partial response', async t => {
+  const originalFetch = global.fetch;
+  installHarness([]);
+  const requests = [];
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    const classifier = JSON.stringify(body).includes('Classify the current user turn. Return JSON only.');
+    if (!classifier) requests.push(body);
+    return { ok: true, json: async () => ({ done: true, done_reason: !classifier && requests.length === 1 ? 'length' : 'stop', message: {
+      content: classifier ? JSON.stringify(semanticClassification()) : requests.length === 1 ? 'You chose' : 'You chose Comet for the bicycle.'
+    } }) };
+  };
+  try {
+    const conv = conversation('ollama-followup', { messages: [
+      { role: 'user', text: 'I like Comet for my bicycle.' }, { role: 'assistant', text: 'Comet fits.' }
+    ] });
+    await runAgentLoop('Which name did I like?', 'ollama:qwen3.5:4b', conv);
+    t.equal(requests.length, 2, 'truncated generation is continued, not finalized');
+    t.ok(requests[1].messages.some(message => message.role === 'user' && message.content === 'I like Comet for my bicycle.'));
+    t.ok(requests[1].messages.some(message => message.role === 'assistant' && message.content === 'You chose'), 'partial reply survives continuation');
+    t.equal(requests[1].messages.at(-1).role, 'system', 'runtime continuation is not a new user request');
+    t.ok(conv.messages.some(message => message.text === 'You chose Comet for the bicycle.'));
+  } finally { restoreGlobals(originalFetch); }
+  t.end();
+});
+
+test('a local classifier outage keeps conversational context and the existing inspection-only authority', async t => {
+  const originalFetch = global.fetch;
+  installHarness([], { api: { readFile: async () => 'Unrelated workspace note: old restoration project.' } });
+  let replyRequest;
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    if (JSON.stringify(body).includes('Classify the current user turn. Return JSON only.')) throw new Error('local classifier timed out');
+    replyRequest = body;
+    return { ok: true, json: async () => ({ done: true, done_reason: 'stop', message: { content: 'Hi! How are you?' } }) };
+  };
+  try {
+    const conv = conversation('ollama-classifier-unavailable');
+    await runAgentLoop("What's up?", 'ollama:qwen3.5:4b', conv);
+    t.deepEqual(replyRequest.messages.map(message => message.role), ['system', 'user'], 'failed classification cannot reintroduce pretend dialogue');
+    t.equal(replyRequest.messages.at(-1).content, "What's up?");
+    t.notOk(JSON.stringify(replyRequest.messages).includes('Unrelated workspace note'));
+    const tools = replyRequest.tools.map(tool => tool.function.name);
+    t.ok(tools.includes('inspect_environment'), 'safe inspection fallback remains available');
+    t.notOk(tools.includes('write_file'), 'classification failure does not authorize mutation');
+    t.notOk(tools.includes('handoff_to_coder'), 'classification failure does not authorize delegation');
+    t.ok(conv.messages.some(message => message.text === 'Hi! How are you?'));
+  } finally { restoreGlobals(originalFetch); }
+  t.end();
+});
+
 test('Dispatch keeps the immediately preceding completion in context for a conversational reaction', async t => {
   const originalFetch = global.fetch;
   let completionReachedModel = false;

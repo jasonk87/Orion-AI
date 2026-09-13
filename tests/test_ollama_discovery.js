@@ -17,17 +17,19 @@ test('Ollama discovers installed names and capabilities, deduplicates and caches
       { name: 'deepseek-r1:8b', digest }, { name: 'deepseek-r1:8b', digest }, { name: 'vector:latest', digest: 'vector' }, { name: null }
     ] });
     const name = JSON.parse(options.body).model;
-    return reply({ capabilities: name === 'vector:latest' ? ['embedding'] : ['completion', 'thinking'] });
+    return reply({ capabilities: name === 'vector:latest' ? ['embedding'] : ['completion', 'thinking'],
+      model_info: { 'general.architecture': 'local', 'local.context_length': digest === 'one' ? 16384 : 32768 } });
   } });
   const first = discover();
   t.equal(discover(), first, 'concurrent callers share discovery');
   const result = await first;
   t.deepEqual(result.models.map(model => model.value), ['ollama:deepseek-r1:8b', 'ollama:vector:latest']);
   t.deepEqual(result.models[0].capabilities, ['completion', 'thinking']);
-  await discover();
+  t.equal(result.models[0].contextLength, 16384, 'context budget comes from the installed model metadata');
+  t.equal((await discover()).models[0].contextLength, 16384, 'cached metadata retains context length');
   t.equal(calls.filter(call => call.url.endsWith('/show')).length, 2, 'unchanged models reuse capability metadata');
   digest = 'two';
-  await discover();
+  t.equal((await discover()).models[0].contextLength, 32768, 'changed model refreshes its context budget');
   t.equal(calls.filter(call => call.url.endsWith('/show')).length, 3, 'changed model refreshes capabilities');
   t.ok(calls.every(call => /^http:\/\/127\.0\.0\.1:11434\/api\/(tags|show)$/.test(call.url)), 'discovery never downloads or generates');
   const handlers = {};
@@ -112,7 +114,7 @@ test('local cloud-like names stay on Ollama for agent, utility and vision calls'
   const requests = [];
   global.fetch = async (url, options) => {
     requests.push({ url, body: JSON.parse(options.body) });
-    return reply({ message: { content: '{"status":"satisfied","confidence":1,"observations":["visible"]}' } });
+    return reply({ done: true, done_reason: 'stop', message: { content: '{"status":"satisfied","confidence":1,"observations":["visible"]}' } });
   };
   t.teardown(() => { global.fetch = originalFetch; delete window.getOllamaModelInfo; });
   window.getOllamaModelInfo = () => ({ capabilities: ['completion', 'vision'] });

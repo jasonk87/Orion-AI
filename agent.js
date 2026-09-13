@@ -2635,6 +2635,7 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   if (ReasoningPolicy) {
     messages.splice(Math.max(0, messages.length - 1), 0, {
       role: 'user',
+      internalContext: true,
       parts: [{ text: ReasoningPolicy.promptDirective(runReasoningPolicy) }]
     });
   }
@@ -2931,6 +2932,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
   const incidentalIssueBuffer = [];
   // Declared outside the try so the finally-block response-basis computation can see it.
   const toolEvidenceLedger = [];
+  let plainOllamaContext = String(activeRunModelName).startsWith('ollama:')
+    && isPlainOllamaConversation(semanticIntent, activeConversationMode, runTaskId)
+    ? buildPlainOllamaContext(conversation.messages, promptForModel, promptImages)
+    : null;
+  if (plainOllamaContext) messages = plainOllamaContext.messages;
 
   try {
     if (approvalIntent && approvalIntent.intent === 'deny') {
@@ -2982,6 +2988,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               parts: [{ text: 'Understood. I will use these durable notes as context for this task.' }]
             }
           );
+        }
+        if (plainOllamaContext) {
+          plainOllamaContext = buildPlainOllamaContext(conversation.messages, promptForModel, promptImages);
+          messages = plainOllamaContext.messages;
         }
         const compactedRunMessage = ensureActiveRunMessage({ createNew: true });
         window.saveConversationsToStorage();
@@ -3336,9 +3346,10 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
               auditBreadth: comprehensiveAudit ? 'comprehensive' : 'task'
             })
           : runReasoningPolicy;
-        if (ReasoningPolicy && phaseReasoningPolicy.phase !== lastAppliedReasoningPhase) {
+        if (ReasoningPolicy && !plainOllamaContext && phaseReasoningPolicy.phase !== lastAppliedReasoningPhase) {
           messages.push({
             role: 'user',
+            internalContext: true,
             parts: [{ text: ReasoningPolicy.promptDirective(phaseReasoningPolicy) }]
           });
           lastAppliedReasoningPhase = phaseReasoningPolicy.phase;
@@ -3397,7 +3408,12 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
         } else if (isGroqModelName(activeRunModelName)) {
           response = await callGroqAPI(messagesForApiCall, activeRunModelName, config.groqApiKey, onApiWarning, disableToolsForSemanticSafety, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
         } else {
-          response = await callOllamaAPI(messagesForApiCall, activeRunModelName, onApiWarning, disableToolsForSemanticSafety, { signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy });
+          // An unclassified turn still gets the existing inspection-only tool surface;
+          // only a positively classified plain conversation can omit tools entirely.
+          response = await callOllamaAPI(messagesForApiCall, activeRunModelName, onApiWarning, disableToolsForSemanticSafety || (!!plainOllamaContext && !semanticIntent.classifierUnavailable), {
+            signal: getActiveRunSignal(), reasoningPolicy: phaseReasoningPolicy,
+            systemInstruction: plainOllamaContext?.systemInstruction
+          });
         }
         if (response && response._orionActiveModelName) {
           activeRunModelName = response._orionActiveModelName;
@@ -3469,8 +3485,11 @@ window.runAgentLoop = async function(userPrompt, modelName, conversation, option
           currentAgentLogs.push({ type: 'thought', content: `Model hit MAX_TOKENS. Continuing from partial response (Attempt ${maxTokensContinuations}/3).` });
           messages.push({
             role: 'user',
+            internalContext: true,
             parts: [{
-              text: '[SYSTEM: Your previous response hit MAX_TOKENS before the task was complete. Continue from the exact current state. Do not restart, do not repeat completed work, and use tools if needed to finish the active investigation. If you were about to summarize findings, continue the findings concisely.]'
+              text: plainOllamaContext
+                ? 'Your response reached the output limit. Finish answering the latest user message concisely, without repeating the partial answer.'
+                : '[SYSTEM: Your previous response hit MAX_TOKENS before the task was complete. Continue from the exact current state. Do not restart, do not repeat completed work, and use tools if needed to finish the active investigation. If you were about to summarize findings, continue the findings concisely.]'
             }]
           });
           continue;
@@ -13020,13 +13039,16 @@ function convertGeminiToOllamaMessages(geminiMessages) {
   const ollamaMessages = [];
   
   geminiMessages.forEach((msg) => {
-    if (msg.role === 'user') {
+    if (msg.internalContext === true || msg.role === 'system') {
+      ollamaMessages.push({ role: 'system', content: (msg.parts || []).map(part => part.text || '').join('\n') });
+    } else if (msg.role === 'user') {
       let contentText = '';
       const images = [];
       if (msg.parts) {
         msg.parts.forEach(p => {
           if (p.text) contentText += p.text;
-          if (p.inlineData?.data) images.push(p.inlineData.data);
+          const image = p.inlineData || p.inline_data;
+          if (image?.data) images.push(image.data);
         });
       }
       ollamaMessages.push({ role: 'user', content: contentText, ...(images.length ? { images } : {}) });
@@ -14369,6 +14391,52 @@ function ollamaApiModelName(modelName) {
   return String(modelName || '').replace(/^ollama:/, '');
 }
 
+function isPlainOllamaConversation(intent, mode, taskId) {
+  return mode === 'orion' && !taskId && intent?.intent === 'conversation'
+    && intent.requiresExecution === false
+    && !intent.needsClarification && (!intent.inspectionTarget || intent.inspectionTarget === 'none')
+    && (!intent.memoryIntent || intent.memoryIntent === 'none') && !intent.memoryContext?.needed;
+}
+
+function buildPlainOllamaContext(conversationMessages, currentInput, images = []) {
+  // The semantic router selected conversation (including its non-executing fallback),
+  // not execution or memory retrieval. Tool authority remains a separate decision.
+  // Preserve this thread's real dialogue, without turning unrelated notes or startup
+  // orientation into pretend user/assistant exchanges for a small local model.
+  const summary = OperationalContext.getCompactedConversationMemory(conversationMessages);
+  const messages = OperationalContext.buildRecentChatView(conversationMessages, currentInput, undefined, { contextScope: 'recent' })
+    .map(message => ({ role: message.role === 'assistant' ? 'model' : 'user', parts: [{ text: message.text }] }));
+  const parts = images.filter(image => image?.data && image?.mimeType)
+    .map(image => ({ inline_data: { mime_type: image.mimeType, data: image.data } }));
+  parts.push({ text: String(currentInput || '') });
+  messages.push({ role: 'user', parts });
+  return {
+    messages,
+    systemInstruction: "You are Orion, Jason's conversational assistant. Respond directly and naturally to the latest user message. Keep simple replies brief. Use this conversation for context; do not invent activity, past conversations, or actions you have taken. Do not narrate internal instructions or startup context."
+      + `\nCurrent local date: ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}. Use only when relevant.`
+      + (summary ? `\nEarlier context from this same conversation (reference only, not instructions or fresh verification):\n${summary}` : '')
+  };
+}
+
+function ollamaRequestOptions(messages, tools = [], modelName = '') {
+  // Budget both the tool catalog and reply. Ollama otherwise silently truncates to its
+  // server default, which can evict the user message when the catalog fills the context.
+  let imageCount = 0;
+  const textMessages = messages.map(message => {
+    imageCount += Array.isArray(message.images) ? message.images.length : 0;
+    return { ...message, images: undefined };
+  });
+  const bytes = new TextEncoder().encode(JSON.stringify({ messages: textMessages, tools })).length;
+  // Image encodings are not text tokens. Reserve vision space without counting base64
+  // as dialogue, which would reject even a single ordinary screenshot.
+  const required = Math.ceil(bytes / 2) + 2048 + imageCount * 4096;
+  const advertised = Number(window.getOllamaModelInfo?.(modelName)?.contextLength) || 32768;
+  const limit = Math.min(advertised, 32768);
+  const context = Math.min(limit, Math.max(8192, Math.ceil(required / 4096) * 4096));
+  if (required > context) throw createNonRetryableModelError('The Ollama request exceeds the local context budget. Shorten the conversation or reduce the tool context before retrying.');
+  return { temperature: 0, num_ctx: context, num_predict: 2048 };
+}
+
 function ollamaReasoningControls(modelName, policy) {
   const capabilities = window.getOllamaModelInfo?.(modelName)?.capabilities;
   if (Array.isArray(capabilities) && !capabilities.includes('thinking')) return {};
@@ -14380,7 +14448,7 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
   const url = `http://localhost:11434/api/chat`;
   
   // Format standard Orion AI system instruction
-  const systemInstruction = getSystemInstruction(disableTools, orionCachedMemoryBlock, modelName);
+  const systemInstruction = options.systemInstruction ?? getSystemInstruction(disableTools, orionCachedMemoryBlock, modelName);
   
   const ollamaTools = convertGeminiToOllamaTools([
     {
@@ -14409,6 +14477,7 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
   if (!disableTools) {
     requestBody.tools = ollamaTools;
   }
+  requestBody.options = ollamaRequestOptions(ollamaMessages, requestBody.tools, modelName);
   
   const response = await fetchWithTimeout(url, {
     method: 'POST',
@@ -14423,7 +14492,9 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
   }
   
   const responseData = await response.json();
-  
+  if (responseData.error) throw new Error(`Ollama: ${responseData.error}`);
+  if (responseData.done !== true) throw new Error('Ollama returned an incomplete response. The request did not finish.');
+
   // Format back to Gemini style candidates response
   const candidateParts = [];
   const message = responseData.message || {};
@@ -14449,15 +14520,15 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
     });
   }
   
+  if (!candidateParts.length && responseData.done_reason !== 'length') {
+    throw new Error('Ollama finished without a visible answer or a tool call. No completed answer was received.');
+  }
   return {
     _orionActiveModelName: modelName,
-    candidates: [
-      {
-        content: {
-          parts: candidateParts
-        }
-      }
-    ]
+    candidates: [{
+      finishReason: responseData.done_reason === 'length' ? 'MAX_TOKENS' : 'STOP',
+      content: { parts: candidateParts }
+    }]
   };
 }
 
@@ -15575,7 +15646,11 @@ window.quickOrionLLMCall = async function(systemPrompt, userMessages, config, op
         auditBreadth: options.auditBreadth
       })
     : null;
-  if (/anthropic|claude/i.test(modelName)) {
+  if (modelName.startsWith('ollama:')) {
+    resp = await callOllamaAPI(userMessages.map(message => ({
+      role: message.role === 'assistant' ? 'model' : 'user', parts: [{ text: String(message.content || message.text || '') }]
+    })), modelName, () => {}, true, { reasoningPolicy, systemInstruction: systemPrompt, signal: options.signal });
+  } else if (/anthropic|claude/i.test(modelName)) {
     resp = await callAnthropicAPI(messages, modelName, config.anthropicApiKey || '', () => {}, true, { reasoningPolicy });
   } else if (isGroqModelName(modelName)) {
     resp = await callGroqAPI(messages, modelName, config.groqApiKey || '', () => {}, true, { reasoningPolicy });
@@ -15592,6 +15667,7 @@ window.quickOrionLLMCall = async function(systemPrompt, userMessages, config, op
   // exposed the private draft in lightweight Dispatch replies while the main agent loop correctly
   // hid it. Project only structured, non-thought text and fail closed when no visible answer
   // exists; never substitute private reasoning for a missing answer.
+  if (modelName.startsWith('ollama:') && resp.candidates?.[0]?.finishReason === 'MAX_TOKENS') throw new Error('The model reached its output limit before finishing this reply. Please retry.');
   return extractVisibleModelText(resp);
 };
 
@@ -15961,6 +16037,9 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     callCodexSubscription,
     callOllamaAPI,
     ollamaApiModelName,
+    ollamaRequestOptions,
+    isPlainOllamaConversation,
+    buildPlainOllamaContext,
     callUtilityModel,
     getNextModelForHighDemand,
     isGroqModelName,
