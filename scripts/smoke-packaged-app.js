@@ -27,11 +27,12 @@ const path = require('path');
 const repoRoot = path.join(__dirname, '..');
 
 function parseArgs(argv) {
-  const args = { port: 9222, app: '', codex: false };
+  const args = { port: 9222, app: '', codex: false, ollama: false };
   for (let i = 2; i < argv.length; i++) {
     if (argv[i] === '--port') args.port = Number(argv[++i]);
     else if (argv[i] === '--app') args.app = argv[++i];
     else if (argv[i] === '--codex') args.codex = true;
+    else if (argv[i] === '--ollama') args.ollama = true;
   }
   return args;
 }
@@ -239,6 +240,31 @@ async function main() {
 
     const title = await evaluate('document.title');
     console.log(`Window loaded: "${title}"`);
+
+    if (args.ollama) {
+      const local = await evaluate(`(async () => {
+        const discovery = await refreshOllamaModels();
+        if (!discovery?.success) throw new Error(discovery?.error || 'Ollama discovery failed');
+        const expected = discovery.models.filter(model => !model.capabilities || model.capabilities.includes('completion')).map(model => model.value).sort();
+        const listed = window.getPhoneCompanionModels().models.filter(model => model.value.startsWith('ollama:')).map(model => model.value).sort();
+        if (!expected.length || JSON.stringify(expected) !== JSON.stringify(listed)) throw new Error('Installed Ollama catalog differs from the desktop/phone picker');
+        for (const model of expected) {
+          await window.setPhoneCompanionModel(model);
+          if (window.getSelectedModel() !== model) throw new Error('Could not select ' + model);
+        }
+        await refreshOllamaModels();
+        if (window.getPhoneCompanionModels().current !== expected[expected.length - 1]) throw new Error('Refresh changed the selected model');
+        const probe = discovery.models.find(model => model.capabilities?.includes('completion') && !model.capabilities.includes('thinking'));
+        let response = '';
+        if (probe) {
+          const answer = await callOllamaAPI([{ role: 'user', parts: [{ text: 'Reply with only OK.' }] }], probe.value, () => {}, true);
+          response = answer.candidates[0].content.parts.map(part => part.text || '').join('');
+          if (!response.trim()) throw new Error('Local model returned no response');
+        }
+        return { models: listed, probe: probe?.value, response, status: document.getElementById('ollama-model-status').textContent };
+      })()`);
+      console.log('Packaged Ollama discovery, selection, and phone catalog PASSED:', JSON.stringify(local));
+    }
 
     if (args.codex) {
       const subscription = await evaluate(`(async () => {

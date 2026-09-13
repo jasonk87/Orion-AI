@@ -720,6 +720,57 @@ async function loadSettings() {
 let codexAccountStatus = null;
 let codexLoginId = null;
 let codexLoginTimer = null;
+let ollamaModelCatalog = [];
+let ollamaRefreshPromise = null;
+let ollamaRefreshTimer = null;
+
+window.getOllamaModelInfo = value => ollamaModelCatalog.find(model => model.value === value || model.name === value);
+
+function addUnavailableOllamaOption(value) {
+  const option = document.createElement('option');
+  option.dataset.ollamaUnavailable = 'true';
+  option.value = value;
+  option.textContent = `${value.replace(/^ollama:/, '')} (Ollama unavailable)`;
+  el.modelSelect.appendChild(option);
+}
+
+function refreshOllamaModels() {
+  if (ollamaRefreshPromise) return ollamaRefreshPromise;
+  if (!window.api.ollamaModels || !el.modelSelect) return Promise.resolve();
+  ollamaRefreshPromise = (async () => {
+    const statusEl = document.getElementById('ollama-model-status');
+    try {
+      const result = await window.api.ollamaModels();
+      if (!result.success || !Array.isArray(result.models)) throw new Error(result.error || 'Ollama discovery is unavailable.');
+      const selected = el.modelSelect.value;
+      ollamaModelCatalog = result.models;
+      const chatModels = ollamaModelCatalog.filter(model => !Array.isArray(model.capabilities) || model.capabilities.includes('completion'));
+      el.modelSelect.querySelector('[data-ollama-models]')?.remove();
+      el.modelSelect.querySelectorAll('[data-ollama-unavailable]').forEach(option => option.remove());
+      if (chatModels.length) {
+        const group = document.createElement('optgroup');
+        group.dataset.ollamaModels = 'true';
+        group.label = 'Ollama (Local)';
+        for (const model of chatModels) {
+          const option = document.createElement('option');
+          option.value = model.value;
+          option.textContent = model.name + (model.capabilities?.includes('vision') ? ' · Vision' : '');
+          group.appendChild(option);
+        }
+        el.modelSelect.appendChild(group);
+      }
+      if (selected.startsWith('ollama:') && ![...el.modelSelect.options].some(option => option.value === selected)) addUnavailableOllamaOption(selected);
+      if ([...el.modelSelect.options].some(option => option.value === selected)) el.modelSelect.value = selected;
+      if (statusEl) statusEl.textContent = `${chatModels.length} installed chat model${chatModels.length === 1 ? '' : 's'} available. ${ollamaModelCatalog.length - chatModels.length} non-chat model(s) excluded.`;
+      return result;
+    } catch (error) {
+      // Keep the last good list and the user's provider choice across disconnects.
+      if (statusEl) statusEl.textContent = `${error.message} Keeping your model selection; retrying automatically.`;
+      return { success: false, error: error.message };
+    } finally { ollamaRefreshPromise = null; }
+  })();
+  return ollamaRefreshPromise;
+}
 
 window.getCodexModelInfo = value => (codexAccountStatus?.models || []).find(model => `codex:${model.model}` === value);
 
@@ -890,31 +941,19 @@ async function initModelDropdown() {
   });
   modelSelect.appendChild(groqGroup);
 
-  await refreshCodexSubscription();
+  await Promise.all([refreshCodexSubscription(), refreshOllamaModels()]);
+  if (!ollamaRefreshTimer) ollamaRefreshTimer = setInterval(refreshOllamaModels, 30000);
 
   // Try to load saved model from localStorage or config
   let defaultModel = localStorage.getItem('ag2_default_model') || appConfig.defaultModel || 'gemini-2.5-flash-lite';
   
-  // Fetch Ollama models
-  try {
-    const response = await fetch('http://localhost:11434/api/tags');
-    if (response.ok) {
-      const data = await response.json();
-      if (data.models && data.models.length > 0) {
-        const ollamaGroup = document.createElement('optgroup');
-        ollamaGroup.label = 'Ollama';
-        
-        data.models.forEach(m => {
-          const opt = document.createElement('option');
-          opt.value = m.name; // e.g. "llama3:latest"
-          opt.textContent = m.name;
-          ollamaGroup.appendChild(opt);
-        });
-        modelSelect.appendChild(ollamaGroup);
-      }
+  // Migrate old unqualified local selections without confusing similarly named API models.
+  if (![...modelSelect.options].some(option => option.value === defaultModel)) {
+    const installed = ollamaModelCatalog.find(model => model.name === defaultModel);
+    if (installed && [...modelSelect.options].some(option => option.value === installed.value)) {
+      defaultModel = installed.value;
+      localStorage.setItem('ag2_default_model', defaultModel);
     }
-  } catch (e) {
-    console.log("Ollama local service is not available or not running:", e.message);
   }
   
   // Select active preference (fallback to gemini-2.5-flash-lite if option doesn't exist)
@@ -932,6 +971,11 @@ async function initModelDropdown() {
     unavailable.value = defaultModel;
     unavailable.textContent = `${defaultModel.slice(6)} (Codex unavailable — refresh in Settings)`;
     modelSelect.appendChild(unavailable);
+    modelSelect.value = defaultModel;
+    found = true;
+  }
+  if (!found && defaultModel.startsWith('ollama:')) {
+    addUnavailableOllamaOption(defaultModel);
     modelSelect.value = defaultModel;
     found = true;
   }
@@ -1061,6 +1105,7 @@ function normalizePhoneHttpsOrigin(value) {
 }
 
 function setupSettingsModal() {
+  document.getElementById('ollama-refresh')?.addEventListener('click', refreshOllamaModels);
   document.getElementById('codex-refresh')?.addEventListener('click', refreshCodexSubscription);
   document.getElementById('codex-sign-in')?.addEventListener('click', async () => {
     const result = await window.api.codexLogin();
@@ -1092,6 +1137,7 @@ function setupSettingsModal() {
   });
   el.btnSettings.addEventListener('click', () => {
     el.settingsModal.classList.add('active');
+    refreshOllamaModels();
     refreshCodexSubscription();
   });
   

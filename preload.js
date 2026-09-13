@@ -1,6 +1,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('api', {
+  ollamaModels: () => ipcRenderer.invoke('ollama:models'),
   codexStatus: () => ipcRenderer.invoke('codex:status'),
   codexLogin: () => ipcRenderer.invoke('codex:login'),
   codexCancelLogin: (loginId) => ipcRenderer.invoke('codex:login-cancel', loginId),

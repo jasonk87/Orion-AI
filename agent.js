@@ -10785,13 +10785,13 @@ async function callUtilityModel(prompt, modelName, config, requireJson = true, o
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: modelName,
+          model: ollamaApiModelName(modelName),
           messages: [
             { role: 'system', content: "You are a concise, technical summarizer utility." },
             { role: 'user', content: prompt }
           ],
           stream: false,
-          ...(providerControls.think !== undefined ? { think: providerControls.think } : {}),
+          ...ollamaReasoningControls(modelName, reasoningPolicy),
           options: { temperature: 0 }
         }),
         signal: options.signal
@@ -12966,6 +12966,7 @@ function groqApiModelName(modelName) {
 }
 
 function modelSupportsDirectVision(modelName) {
+  if (String(modelName || '').startsWith('ollama:')) return !!window.getOllamaModelInfo?.(modelName)?.capabilities?.includes('vision');
   if (CodexProvider.isModel(modelName)) return !!window.getCodexModelInfo?.(modelName)?.inputModalities?.includes('image');
   const name = String(modelName || '').toLowerCase();
   return name.startsWith('gemini-')
@@ -13021,12 +13022,14 @@ function convertGeminiToOllamaMessages(geminiMessages) {
   geminiMessages.forEach((msg) => {
     if (msg.role === 'user') {
       let contentText = '';
+      const images = [];
       if (msg.parts) {
         msg.parts.forEach(p => {
           if (p.text) contentText += p.text;
+          if (p.inlineData?.data) images.push(p.inlineData.data);
         });
       }
-      ollamaMessages.push({ role: 'user', content: contentText });
+      ollamaMessages.push({ role: 'user', content: contentText, ...(images.length ? { images } : {}) });
     } else if (msg.role === 'model') {
       let contentText = '';
       let toolCalls = [];
@@ -14362,6 +14365,17 @@ function convertGeminiToOllamaTools(geminiTools) {
   return ollamaTools;
 }
 
+function ollamaApiModelName(modelName) {
+  return String(modelName || '').replace(/^ollama:/, '');
+}
+
+function ollamaReasoningControls(modelName, policy) {
+  const capabilities = window.getOllamaModelInfo?.(modelName)?.capabilities;
+  if (Array.isArray(capabilities) && !capabilities.includes('thinking')) return {};
+  const controls = ReasoningPolicy ? ReasoningPolicy.providerControls(modelName, policy || ReasoningPolicy.select({ phase: 'implementation' })) : {};
+  return controls.think !== undefined ? { think: controls.think } : {};
+}
+
 async function callOllamaAPI(messages, modelName, onWarning, disableTools = false, options = {}) {
   const url = `http://localhost:11434/api/chat`;
   
@@ -14382,16 +14396,14 @@ async function callOllamaAPI(messages, modelName, onWarning, disableTools = fals
   ollamaMessages.push(...convertGeminiToOllamaMessages(messages));
   
   const requestBody = {
-    model: modelName,
+    model: ollamaApiModelName(modelName),
     messages: ollamaMessages,
     stream: false,
     options: {
       temperature: 0
     }
   };
-  const reasoningControls = ReasoningPolicy
-    ? ReasoningPolicy.providerControls(modelName, options.reasoningPolicy || ReasoningPolicy.select({ phase: 'implementation' }))
-    : {};
+  const reasoningControls = ollamaReasoningControls(modelName, options.reasoningPolicy);
   if (reasoningControls.think !== undefined) requestBody.think = reasoningControls.think;
   
   if (!disableTools) {
@@ -15352,6 +15364,9 @@ function normalizeScreenshotInspectionResult({ text, path, goal, providerName })
 }
 
 async function inspectScreenshotWithModel({ imageBase64, mimeType, path, goal, modelName, apiKey, openaiApiKey, groqApiKey }) {
+  if (String(modelName || '').startsWith('ollama:') && modelSupportsDirectVision(modelName)) {
+    return await inspectScreenshotWithOllama({ imageBase64, path, goal, modelName });
+  }
   if (CodexProvider.isModel(modelName)) {
     const request = CodexProvider.buildRequest([{ role: 'user', parts: [
       { text: buildScreenshotInspectionPrompt(goal) }, { inlineData: { mimeType, data: imageBase64 } }
@@ -15490,7 +15505,7 @@ async function inspectScreenshotWithOllama({ imageBase64, path, goal, modelName 
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: modelName,
+      model: ollamaApiModelName(modelName),
       messages: [{
         role: 'user',
         content: buildScreenshotInspectionPrompt(goal),
@@ -15944,6 +15959,8 @@ if (typeof module !== 'undefined' && process.env.NODE_ENV === 'test') {
     callGroqAPI,
     callOpenAIAPI,
     callCodexSubscription,
+    callOllamaAPI,
+    ollamaApiModelName,
     callUtilityModel,
     getNextModelForHighDemand,
     isGroqModelName,
